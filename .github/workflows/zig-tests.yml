@@ -30,7 +30,6 @@ jobs:
     runs-on: arc-antfly-standard
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
-      arm64_codec: ${{ steps.detect.outputs.arm64_codec }}
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
@@ -49,7 +48,6 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             {
               echo "zig_tests=true"
-              echo "arm64_codec=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -60,7 +58,6 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
-            echo "arm64_codec=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
                 echo "e2e=false"
@@ -86,7 +83,6 @@ jobs:
           else
             {
               echo "zig_tests=true"
-              echo "arm64_codec=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -106,18 +102,6 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
-            zig/build.zig \
-            zig/build.zig.zon \
-            zig/pkg/antfly/src/encoding/streamvbyte.zig \
-            zig/pkg/antfly/src/encoding/chunked_coder.zig \
-            .github/workflows/zig-tests.yml
-          then
-            echo "arm64_codec=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "arm64_codec=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -202,9 +186,21 @@ jobs:
         run: scripts/test-backup-s3-integration.sh
 
   arm64-codec:
-    name: arm64-codec
+    name: ${{ (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
     needs: changes
-    if: needs.changes.outputs.arm64_codec == 'true'
+    if: |
+      (
+        (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
+        (
+          needs.changes.outputs.zig_tests == 'true' ||
+          needs.changes.outputs.model_check == 'true' ||
+          needs.changes.outputs.trace_validate == 'true'
+        )
+      ) ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:

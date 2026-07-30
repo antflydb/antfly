@@ -1481,6 +1481,15 @@ fn resolveDownloadUrl(
     }
 }
 
+fn downloadClientConfig() httpx.ClientConfig {
+    return .{
+        .keep_alive = false,
+        // Model artifacts are streamed directly to disk. The client's
+        // in-memory 100 MiB default would otherwise truncate larger payloads.
+        .max_response_size = std.math.maxInt(usize),
+    };
+}
+
 /// Download a single file from HuggingFace Hub.
 fn downloadFile(
     allocator: std.mem.Allocator,
@@ -1524,9 +1533,7 @@ fn downloadFile(
     const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/main/{s}", .{ config.base_url, owner, name, filename });
     defer allocator.free(url);
 
-    var client = httpx.Client.initWithConfig(allocator, io, .{
-        .keep_alive = false,
-    });
+    var client = httpx.Client.initWithConfig(allocator, io, downloadClientConfig());
     defer client.deinit();
 
     const download_url = try resolveDownloadUrl(allocator, &client, url, headers_buf[0..n_headers]);
@@ -2171,6 +2178,11 @@ fn reserveEphemeralPort(io: std.Io) !u16 {
 
 fn testTmpPath(allocator: std.mem.Allocator, tmp: anytype, tail: []const u8) ![]u8 {
     return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], tail });
+}
+
+test "streaming model downloads are not capped by the in-memory response limit" {
+    const config = downloadClientConfig();
+    try std.testing.expectEqual(std.math.maxInt(usize), config.max_response_size);
 }
 
 test "downloadFile resumes from partial file with 206 response" {

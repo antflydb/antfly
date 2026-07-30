@@ -359,16 +359,15 @@ def _model_path(spec: ModelSpec) -> Path:
 
 
 def _looks_like_model_dir(path: Path) -> bool:
-    if not path.exists():
+    if not path.is_dir():
         return False
-    for filename in ("config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json"):
-        if (path / filename).exists():
-            return True
-    if any(path.glob("*.gguf")):
-        return True
-    if (path / "onnx").is_dir():
-        return True
-    return False
+    if any(path.rglob("*.part")):
+        return False
+    payload_suffixes = (".gguf", ".onnx", ".safetensors", ".bin")
+    return any(
+        candidate.is_file() and candidate.name.endswith(payload_suffixes)
+        for candidate in path.rglob("*")
+    )
 
 
 def model_available(spec: ModelSpec) -> bool:

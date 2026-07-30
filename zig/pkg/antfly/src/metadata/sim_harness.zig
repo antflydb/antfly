@@ -6326,8 +6326,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     defer workflow.deinit();
     const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-    _ = try requireLeasedReconcile(cluster.node(reconcile_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
 
     const split_route = try waitForPublicSplitRoute(&cluster, catalog_sources[0..], "docs", leader_index, 48);
     const left_group = split_route.left_group;
@@ -6523,8 +6522,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer workflow.deinit();
     const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-    _ = try requireLeasedReconcile(cluster.node(reconcile_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
 
     const split_route = try waitForPublicSplitRoute(&cluster, catalog_sources[0..], "docs", leader_index, 48);
     const left_group = split_route.left_group;
@@ -6563,8 +6561,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer merge_workflow.deinit();
     const merge_reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     try merge_workflow.bootstrapDesiredFromCommitted(&cluster.node(merge_reconcile_index));
-    _ = try requireLeasedReconcile(cluster.node(merge_reconcile_index), merge_workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedMergeTransition(cluster.node(merge_reconcile_index), merge_workflow.controlLoop());
     try std.testing.expect(try cluster.waitForGroupStatusCount(left_group, .active, 3, 48));
     try std.testing.expect(try cluster.waitForGroupStatus(right_group, .absent, 48));
 
@@ -10103,8 +10100,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, 48401, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    _ = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedSplitTransition(cluster.node(query_index), workflow.controlLoop());
 
     var left_host: ?usize = null;
     var right_host: ?usize = null;
@@ -10391,8 +10387,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, 48501, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    _ = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedMergeTransition(cluster.node(query_index), workflow.controlLoop());
 
     var receiver_host: ?usize = null;
     for (0..3) |i| {
