@@ -1706,7 +1706,9 @@ pub const ProvisionedTableWriteCache = struct {
             .schema_json = owned_entry.schema_json,
         };
         errdefer self.retireFailedOpenLocked(&cached);
-        try owned_entry.db.drainResolverBackfill();
+        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
+            try owned_entry.db.drainResolverBackfill();
+        }
         return cached;
     }
 
@@ -7176,7 +7178,9 @@ pub const ProvisionedTableWriteSource = struct {
         // cluster-wide) in the multinode autograph e2e. The promotion and
         // resolution workers started by this open drain the same backlog
         // asynchronously instead.
-        if (mode != .default_async) try cached.db.drainResolverBackfill();
+        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
+            try cached.db.drainResolverBackfill();
+        }
         // DB.open starts and resumes derived workers before the cache can
         // attach its provisioned visibility hook. A short persisted replay
         // tail can therefore finish during open and miss the post-watermark
@@ -14502,7 +14506,9 @@ pub const HostedProvisionedTableWriteSource = struct {
             defer cache.mutex.unlock();
             cache.write_cache.retireFailedOpenLocked(&cached);
         }
-        try cached.db.drainResolverBackfill();
+        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
+            try cached.db.drainResolverBackfill();
+        }
         return cached;
     }
 
@@ -17167,6 +17173,25 @@ const ManagedDbOpenMode = enum {
     query_readonly,
     status_only,
 };
+
+fn managedDbOpenModeDrainsResolverBackfill(mode: ManagedDbOpenMode) bool {
+    // default_async is the Raft apply path. Resolver/promotion catch-up can
+    // issue cross-shard writes whose completion requires future Raft applies,
+    // so waiting here creates a cyclic dependency and wedges every group on
+    // this apply thread. DB.open already starts the background workers that
+    // drain the same backlog without blocking replicated application.
+    return mode != .default_async;
+}
+
+test "managed db open modes never drain resolver backfill on raft apply" {
+    try std.testing.expect(!managedDbOpenModeDrainsResolverBackfill(.default_async));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.default));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.writer_no_replay));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.startup_catch_up));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.restore_repair));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.query_readonly));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.status_only));
+}
 
 fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAAsyncEffectMirror) ?db_mod.HAAsyncEffectMirror {
     return switch (mode) {

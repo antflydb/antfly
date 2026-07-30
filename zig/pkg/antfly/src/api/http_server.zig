@@ -19731,6 +19731,79 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") == null);
 
+    // Discovery is not the authorization boundary: a read-only client may
+    // retain an older write-tool schema and hand-craft tools/call. The current
+    // request identity must still prevent the mutation from reaching a route.
+    var denied_builtin_write = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"writes\":{\"doc:a\":{\"title\":\"forbidden\"}}}}}",
+    });
+    defer denied_builtin_write.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), denied_builtin_write.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied_builtin_write.body, "\"message\":\"unknown tool\"") != null);
+
+    var denied_extension_write = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"store_doc\",\"arguments\":{\"title\":\"forbidden\"}}}",
+    });
+    defer denied_extension_write.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), denied_extension_write.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied_extension_write.body, "\"message\":\"unknown tool\"") != null);
+
+    const write_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:writer","tenant":"tenant-1","tables":["docs"],"operations":["write"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(write_payload);
+    const write_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, write_payload);
+    defer std.testing.allocator.free(write_token);
+    const write_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = write_token },
+    };
+    var write_init = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &write_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer write_init.deinit(std.testing.allocator);
+    const write_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = write_init.headers[0].value },
+        .{ .name = trusted_principal_header, .value = write_token },
+    };
+    var denied_cross_table_write = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &write_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"memories\",\"writes\":{\"doc:a\":{\"title\":\"forbidden\"}}}}}",
+    });
+    defer denied_cross_table_write.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), denied_cross_table_write.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"text\":\"permission denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"isError\":true") != null);
+
+    var denied_unscoped_write = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &write_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"writes\":{\"doc:a\":{\"title\":\"forbidden\"}}}}}",
+    });
+    defer denied_unscoped_write.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), denied_unscoped_write.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"text\":\"permission denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"isError\":true") != null);
+
     var ard_catalog_resp = try server.handle(.{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
@@ -27703,7 +27776,7 @@ test "api runtime status upsert keeps one authoritative observation per group" {
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, items.items[0].metadata.freshness);
 }
 
-test "api runtime status quarantine wins freshness without bypassing generation fences" {
+test "api runtime status quarantine remains visible across healthy replica observations" {
     const alloc = std.testing.allocator;
     var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
     var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
@@ -27760,6 +27833,8 @@ test "api runtime status quarantine wins freshness without bypassing generation 
     };
     try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &newer_healthy);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.rebuild_state_quarantine, items.items[0].metadata.source);
+    try std.testing.expectEqual(@as(u64, 7), items.items[0].metadata.store_id);
+    try std.testing.expectEqual(@as(u64, 8), items.items[0].metadata.node_id);
 
     var next_topology = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7002,

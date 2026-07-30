@@ -285,6 +285,7 @@ pub const GraphIndexOptions = struct {
     reverse_lsm_root_generation: u64 = 0,
     edge_type_configs: []const EdgeTypeConfig = &.{},
     rebuild_root_path: ?[]const u8 = null,
+    rebuild_owner_generation: u64 = 0,
     algebraic_semiring_traversal: bool = false,
 };
 
@@ -340,6 +341,7 @@ pub const GraphIndex = struct {
     edge_type_configs: []const EdgeTypeConfig,
     rebuild_root_path: ?[]u8,
     rebuild_storage: ?lsm_backend.Storage,
+    rebuild_owner_generation: u64,
     algebraic_semiring_traversal: bool,
     edge_count: u64,
     node_count: u64,
@@ -721,6 +723,7 @@ pub const GraphIndex = struct {
             .edge_type_configs = opts.edge_type_configs,
             .rebuild_root_path = if (opts.rebuild_root_path) |path| try alloc.dupe(u8, path) else null,
             .rebuild_storage = opts.reverse_lsm_storage,
+            .rebuild_owner_generation = opts.rebuild_owner_generation,
             .algebraic_semiring_traversal = opts.algebraic_semiring_traversal,
             .edge_count = loaded_stats.edge_count,
             .node_count = loaded_stats.node_count,
@@ -1219,7 +1222,10 @@ pub const GraphIndex = struct {
         var txn_active = true;
         errdefer if (txn_active) txn.abort();
         const rebuild_state = if (self.rebuild_root_path) |path|
-            backfill_state_mod.RebuildState.initWithStorage(path, self.rebuild_storage)
+            if (self.rebuild_owner_generation != 0)
+                backfill_state_mod.RebuildState.initOwned(path, self.rebuild_storage, self.rebuild_owner_generation)
+            else
+                backfill_state_mod.RebuildState.initWithStorage(path, self.rebuild_storage)
         else
             null;
 

@@ -16655,7 +16655,7 @@ pub const DB = struct {
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
             const persisted_resume = try rebuild_state.checkWithIo(alloc, self.core.index_manager.checkpointIo());
             errdefer if (persisted_resume) |buf| alloc.free(buf);
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
@@ -16716,7 +16716,7 @@ pub const DB = struct {
             const entry = &self.core.index_manager.dense_indexes.items[dense_index_idx];
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
             const active_count = entry.index.stats().active_count;
             if (candidate.invalid_generation_error) |last_error| {
                 try generation_repairs.append(alloc, .{
@@ -16838,7 +16838,7 @@ pub const DB = struct {
             });
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(self.alloc, entry.config.name);
             defer self.alloc.free(rebuild_root_path);
-            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
             try rebuild_state.updateWithIo(self.core.index_manager.checkpointIo(), target.resume_from orelse "");
         }
     }
@@ -16848,7 +16848,7 @@ pub const DB = struct {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
             const applied_sequence = try self.core.loadAppliedSequence(alloc, entry.config.name);
             const target_sequence = try self.probeDerivedReplayTargetSequence(
                 alloc,
@@ -16915,7 +16915,7 @@ pub const DB = struct {
                 if (applied_sequence < target_sequence) try self.core.saveAppliedSequence(entry.config.name, target_sequence);
                 const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
-                const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+                const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
                 try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = target_sequence,
@@ -17216,7 +17216,7 @@ pub const DB = struct {
                     const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
                     const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
                     defer persist.alloc.free(rebuild_root_path);
-                    const rebuild_state = persist.db.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+                    const rebuild_state = persist.db.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
                     try rebuild_state.updateWithIo(persist.db.core.index_manager.checkpointIo(), last_key);
                     const owned_key = try persist.alloc.dupe(u8, last_key);
                     errdefer persist.alloc.free(owned_key);
@@ -18712,7 +18712,7 @@ pub const DB = struct {
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
                     if (self.core.textIndexEntry(cfg.name)) |entry| {
-                        const rebuild_state = self.core.index_manager.rebuildState(.full_text, entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18734,7 +18734,7 @@ pub const DB = struct {
                         }
                         const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                         defer alloc.free(rebuild_root_path);
-                        const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
                         if (item.doc_count < visible_doc_count) {
                             if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                                 item.backfill_active = true;
@@ -18766,7 +18766,7 @@ pub const DB = struct {
                         else
                             sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
-                        const rebuild_state = self.core.index_manager.rebuildState(.sparse_vector, entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18788,7 +18788,7 @@ pub const DB = struct {
                         item.node_count = graph_stats.node_count;
                         item.doc_count = graph_stats.node_count;
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
-                        const rebuild_state = self.core.index_manager.rebuildState(.graph, entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.graph, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18849,6 +18849,40 @@ pub const DB = struct {
         };
     }
 
+    fn applyStatusOnlyRebuildStateStats(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        item: *types.DBIndexStats,
+    ) !void {
+        if (cfg.kind == .algebraic) return;
+        const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root_path);
+        const rebuild_state = self.core.index_manager.rebuildState(cfg.kind, rebuild_root_path, cfg);
+        const resume_key = rebuild_state.checkWithIo(
+            alloc,
+            self.core.index_manager.checkpointIo(),
+        ) catch |err| switch (err) {
+            error.InvalidRebuildState => {
+                item.load_error = try alloc.dupe(u8, @errorName(err));
+                item.repair_degraded = true;
+                item.backfill_active = false;
+                item.backfill_progress = 0;
+                return;
+            },
+            else => return err,
+        };
+        defer if (resume_key) |key| alloc.free(key);
+        const key = resume_key orelse return;
+        const byte_range = self.core.byteRange();
+        item.backfill_active = true;
+        item.backfill_progress = backfill_state_mod.estimateProgressForKey(
+            byte_range.start,
+            byte_range.end,
+            key,
+        );
+    }
+
     fn statusOnlyStats(self: *DB, alloc: Allocator) !types.DBStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
@@ -18888,6 +18922,7 @@ pub const DB = struct {
             };
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
+            try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             try applyDurableIndexRepairStats(
                 alloc,
@@ -18903,9 +18938,11 @@ pub const DB = struct {
                 item.backfill_active = item.backfill_active or applied_sequence < target_sequence;
             }
             if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                if (item.load_error) |previous| alloc.free(previous);
                 item.load_error = try alloc.dupe(u8, load_error);
                 applyTerminalLoadFailureStatus(&item);
             } else if (try self.loadPersistedIndexLoadFailure(alloc, cfg.name)) |load_error| {
+                if (item.load_error) |previous| alloc.free(previous);
                 item.load_error = load_error;
                 applyTerminalLoadFailureStatus(&item);
             }
@@ -42384,6 +42421,14 @@ test "db status_only open reads index catalog without loading index state" {
         const indexes = try status_db.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, indexes);
         try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        var full_text_generation: u64 = 0;
+        for (indexes) |config| {
+            if (std.mem.eql(u8, config.name, "ft_v1")) {
+                full_text_generation = config.coverage_generation;
+                break;
+            }
+        }
+        try std.testing.expect(full_text_generation != 0);
 
         const stats = try status_db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
@@ -42399,6 +42444,36 @@ test "db status_only open reads index catalog without loading index state" {
             try std.testing.expect(item.root_node > 0);
         }
         try std.testing.expect(saw_dense);
+
+        const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1", .{std.mem.span(path)});
+        defer alloc.free(rebuild_root);
+        const stale_generation = if (full_text_generation == 1) 2 else full_text_generation - 1;
+        const stale_state = backfill_state_mod.RebuildState.initOwned(rebuild_root, null, stale_generation);
+        defer stale_state.clear() catch {};
+        try stale_state.update("doc:stale");
+
+        const stale_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, stale_stats);
+        const stale_ft = blk: {
+            for (stale_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(!stale_ft.backfill_active);
+
+        const current_state = backfill_state_mod.RebuildState.initOwned(rebuild_root, null, full_text_generation);
+        defer current_state.clear() catch {};
+        try current_state.update("doc:a");
+        const rebuilding_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, rebuilding_stats);
+        const rebuilding_ft = blk: {
+            for (rebuilding_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(rebuilding_ft.backfill_active);
     }
 }
 
@@ -66751,7 +66826,11 @@ test "db dense artifact rebuild persists state through external index storage" {
 
     const rebuild_root_path = try db.denseIndexRebuildStatePathAlloc(alloc, "dense_idx");
     defer alloc.free(rebuild_root_path);
-    const rebuild_state = db.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+    const rebuild_state = db.core.index_manager.rebuildState(
+        .dense_vector,
+        rebuild_root_path,
+        db.core.index_manager.denseIndex("dense_idx").?.config,
+    );
     try rebuild_state.updateWithIo(db.core.index_manager.checkpointIo(), "");
     const persisted_cursor = (try rebuild_state.checkWithIo(alloc, db.core.index_manager.checkpointIo())) orelse
         return error.MissingExternalRebuildState;

@@ -6152,6 +6152,7 @@ fn collectLocalStoreStatusReport(
     var progress_sum: f64 = 0.0;
     for (backfill_markers) |marker| {
         if (!storeStatusBackfillMarkerMatchesStore(marker, store.store_id, true)) continue;
+        if (!backfillMarkerMatchesRuntimeGeneration(marker, store.runtime_statuses)) continue;
         try accumulateStoreStatusBackfillProgress(
             alloc,
             ranges,
@@ -6232,6 +6233,7 @@ fn collectSharedRootLocalStoreStatusReports(
         const range = findRangeByGroupId(ranges, marker.group_id) orelse continue;
         const store_id = try resolveSharedRootStoreAffinity(alloc, io, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
         const report_index = findStoreStatusReportIndex(reports, store_id) orelse continue;
+        if (!backfillMarkerMatchesRuntimeGeneration(marker, stores[report_index].runtime_statuses)) continue;
         try accumulateStoreStatusBackfillProgress(
             alloc,
             ranges,
@@ -6794,6 +6796,7 @@ const StoreStatusBackfillMarker = struct {
     store_id: ?u64,
     group_id: u64,
     path: []const u8,
+    owner_generation: ?u64 = null,
     state: State = .absent,
 
     const State = union(enum) {
@@ -6894,12 +6897,17 @@ fn scanStoreStatusBackfillMarkersWithIo(
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, "/rebuild.state")) continue;
+        if (backfill_state_mod.ownerGenerationFromPath(entry.path) == null and
+            !std.mem.endsWith(u8, entry.path, "/rebuild.state"))
+        {
+            continue;
+        }
         const parsed = parseStoreStatusBackfillMarkerPath(entry.path) orelse continue;
         try markers.append(alloc, .{
             .store_id = parsed.store_id,
             .group_id = parsed.group_id,
             .path = try alloc.dupe(u8, entry.path),
+            .owner_generation = backfill_state_mod.ownerGenerationFromPath(entry.path),
         });
     }
     if (markers.items.len == 0) {
@@ -6950,7 +6958,11 @@ fn refreshStoreStatusBackfillMarkerResumeKeys(
 }
 
 fn rebuildStateForPath(path: []const u8) backfill_state_mod.RebuildState {
-    return backfill_state_mod.RebuildState.init(std.fs.path.dirname(path) orelse ".");
+    const root_path = std.fs.path.dirname(path) orelse ".";
+    if (backfill_state_mod.ownerGenerationFromPath(path)) |generation| {
+        return backfill_state_mod.RebuildState.initOwned(root_path, null, generation);
+    }
+    return backfill_state_mod.RebuildState.init(root_path);
 }
 
 fn collectStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
@@ -7051,6 +7063,56 @@ fn storeStatusBackfillMarkerMatchesStore(marker: StoreStatusBackfillMarker, stor
     return include_unassigned;
 }
 
+fn backfillMarkerMatchesRuntimeGeneration(
+    marker: StoreStatusBackfillMarker,
+    runtime_statuses: []const metadata_table_manager.RuntimeGroupStatusReport,
+) bool {
+    const marker_generation = marker.owner_generation orelse return true;
+    const index_dir = std.fs.path.dirname(marker.path) orelse return true;
+    const index_name = std.fs.path.basename(index_dir);
+    for (runtime_statuses) |status| {
+        if (status.group_id != marker.group_id) continue;
+        for (status.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, index_name)) continue;
+            // A current runtime identity is authoritative for same-name
+            // replacement. Ignore a stale worker's generation cursor instead
+            // of reporting duplicate progress or quarantining the replacement.
+            if (index.coverage_generation != 0) {
+                return index.coverage_generation == marker_generation;
+            }
+        }
+    }
+    // Missing runtime status is not evidence of staleness. Preserve marker
+    // visibility until the data runtime publishes an authoritative generation.
+    return true;
+}
+
+test "metadata service ignores stale rebuild generation markers after replacement" {
+    const marker = StoreStatusBackfillMarker{
+        .store_id = 7,
+        .group_id = 9501,
+        .path = "store-7/group-9501/table-db/indexes/search_idx/rebuild.state.g-000000000000005f",
+        .owner_generation = 95,
+    };
+    var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "search_idx",
+        .kind = "full_text",
+        .coverage_generation = 96,
+    }};
+    const statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 9501,
+        .indexes = &indexes,
+    }};
+
+    try std.testing.expect(!backfillMarkerMatchesRuntimeGeneration(marker, &statuses));
+    indexes[0].coverage_generation = 95;
+    try std.testing.expect(backfillMarkerMatchesRuntimeGeneration(marker, &statuses));
+
+    var legacy = marker;
+    legacy.owner_generation = null;
+    try std.testing.expect(backfillMarkerMatchesRuntimeGeneration(legacy, &statuses));
+}
+
 const rebuild_state_quarantine_source = "rebuild_state_quarantine";
 const rebuild_state_quarantine_error = "InvalidRebuildState";
 
@@ -7081,6 +7143,7 @@ fn collectStoreRuntimeStatusesWithQuarantinedBackfills(
     for (markers) |marker| {
         if (marker.state != .corrupt) continue;
         if (!storeStatusBackfillMarkerMatchesStore(marker, store_id, include_unassigned)) continue;
+        if (!backfillMarkerMatchesRuntimeGeneration(marker, base.items)) continue;
 
         const overlay_index = findRuntimeStatusIndexByGroup(overlays.items, marker.group_id) orelse blk: {
             var overlay = if (findRuntimeStatusIndexByGroup(base.items, marker.group_id)) |base_index|
@@ -10950,7 +11013,7 @@ test "metadata service caches corrupt rebuild state and publishes quarantine sta
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), index_root);
-    const rebuild_state = backfill_state_mod.RebuildState.init(index_root);
+    const rebuild_state = backfill_state_mod.RebuildState.initOwned(index_root, null, 95);
     try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
     const state_path = try rebuild_state.pathAlloc(std.testing.allocator);
     defer std.testing.allocator.free(state_path);

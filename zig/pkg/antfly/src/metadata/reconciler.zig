@@ -863,6 +863,14 @@ pub const Reconciler = struct {
                         .table_id = table.table_id,
                         .donor_group_id = right.group_id,
                         .receiver_group_id = left.group_id,
+                        // Independently-created adjacent ranges own distinct
+                        // doc-identity namespaces and require reassignment.
+                        // Split siblings retain one namespace and avoid that
+                        // extra transition. Planning reaches this point only
+                        // when reassignment is safe; non-empty incompatible
+                        // namespaces remain fenced above.
+                        .allow_doc_identity_reassignment = table_manager.rangeDocIdentityShardId(left) != table_manager.rangeDocIdentityShardId(right) or
+                            table_manager.rangeDocIdentityRangeId(left) != table_manager.rangeDocIdentityRangeId(right),
                         .automatic = true,
                     };
                     try merge_intents.append(self.alloc, intent);

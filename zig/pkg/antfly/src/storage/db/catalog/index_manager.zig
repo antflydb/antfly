@@ -1926,13 +1926,14 @@ pub const IndexManager = struct {
             .reverse_lsm_root_generation = self.lsm_root_generation,
             .edge_type_configs = entry.edge_type_configs,
             .rebuild_root_path = path,
+            .rebuild_owner_generation = coverageGenerationForConfig(entry.config),
             .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
         });
     }
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
-        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
         try entry.persistent.resetAllForRebuild();
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
@@ -1976,7 +1977,7 @@ pub const IndexManager = struct {
         capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
-        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
         try checkRepairCancelled(cancel_check);
         try entry.persistent.resetAllForRebuild();
@@ -3558,6 +3559,7 @@ pub const IndexManager = struct {
         self: *const IndexManager,
         kind: types.IndexKind,
         root_path: []const u8,
+        cfg: types.IndexConfig,
     ) backfill_state_mod.RebuildState {
         const storage = switch (kind) {
             .full_text => self.text_lsm_storage,
@@ -3566,7 +3568,11 @@ pub const IndexManager = struct {
             .graph => self.graph_lsm_storage,
             .algebraic => null,
         };
-        return backfill_state_mod.RebuildState.initWithStorage(root_path, storage);
+        return backfill_state_mod.RebuildState.initOwned(
+            root_path,
+            storage,
+            coverageGenerationForConfig(cfg),
+        );
     }
 
     const GeneratedArtifactCleanupPlan = struct {
@@ -7967,7 +7973,7 @@ pub const IndexManager = struct {
         if (builtin.is_test) test_text_backfill_invocations += 1;
         self.beginTextBackfill();
         defer self.endTextBackfill();
-        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -8165,7 +8171,7 @@ pub const IndexManager = struct {
     ) !void {
         self.beginTextBackfill();
         defer self.endTextBackfill();
-        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -8935,7 +8941,7 @@ pub const IndexManager = struct {
                     self.alloc.free(persisted_ranges);
                 }
 
-                const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
+                const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
                 var resume_from = rebuild_state.checkWithIo(self.alloc, self.checkpointIo()) catch |err| {
                     std.log.warn("full_text open failed step=rebuild_state_check name={s} err={s}", .{
                         cfg.name,
@@ -9162,7 +9168,7 @@ pub const IndexManager = struct {
                 index_moved = true;
                 errdefer self.freeSparseIndexEntry(&entry);
 
-                const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path);
+                const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
                 const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
@@ -9238,6 +9244,7 @@ pub const IndexManager = struct {
                     .reverse_lsm_root_generation = self.lsm_root_generation,
                     .edge_type_configs = graph_cfg.edge_type_configs,
                     .rebuild_root_path = path,
+                    .rebuild_owner_generation = coverageGenerationForConfig(cfg),
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
                 });
                 var index_moved = false;
@@ -9260,7 +9267,7 @@ pub const IndexManager = struct {
                 graph_cfg_moved = true;
                 errdefer self.freeGraphIndexEntry(&entry);
 
-                const rebuild_state = self.rebuildState(.graph, entry.rebuild_root_path);
+                const rebuild_state = self.rebuildState(.graph, entry.rebuild_root_path, entry.config);
                 const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
                 const reverse_edges = (try entry.index.stats(self.alloc)).edge_count;
@@ -10400,7 +10407,7 @@ pub const IndexManager = struct {
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
-        const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -14884,7 +14891,12 @@ test "dense rebuild state uses configured durable storage" {
     });
     defer manager.deinit();
 
-    const state = manager.rebuildState(.dense_vector, "__test/db/indexes/dense");
+    const state = manager.rebuildState(.dense_vector, "__test/db/indexes/dense", .{
+        .name = "dense",
+        .kind = .dense_vector,
+        .config_json = "{}",
+        .coverage_generation = 11,
+    });
     try state.updateWithIo(std.testing.io, "doc:m");
     const loaded = (try state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
     defer alloc.free(loaded);

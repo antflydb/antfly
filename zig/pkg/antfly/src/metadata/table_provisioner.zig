@@ -1281,12 +1281,10 @@ fn localRangeHasSchemaVersionIndex(
     else
         try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
 
-    // A rebuild marker is the durable, authoritative statement that this
-    // schema index is not ready. Check it before opening the DB: schema
-    // progress is polled by the metadata lifecycle while the resident writer
-    // can spend minutes backfilling a large corpus. Reopening the same DB in
-    // query mode on every poll maps the complete retained read index and scans
-    // primary LSM metadata even though the answer is already on disk here.
+    // Preserve the cheap pre-generation marker fast path during rolling
+    // upgrades. Generation-owned markers are resolved by the status-only open
+    // below: its catalog identity distinguishes the current cursor from a
+    // stale same-name worker without mapping retained index state.
     const rebuild_state_root = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ path, target_name });
     defer alloc.free(rebuild_state_root);
     const rebuild_state = db_mod.backfill_state.RebuildState.init(rebuild_state_root);
@@ -3342,7 +3340,7 @@ test "table provisioner schema progress probes do not take a writer lease" {
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
 }
 
-test "table provisioner schema progress returns not ready from rebuild marker without opening DB" {
+test "table provisioner schema progress reads generation-owned rebuild state from status-only catalog" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-table-provisioner-progress-rebuild-marker";
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -3354,13 +3352,30 @@ test "table provisioner schema progress returns not ready from rebuild marker wi
     defer alloc.free(db_path);
     const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
     defer alloc.free(index_root);
-    try fs_paths.createDirPathPortable(io_impl.io(), index_root);
-    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
+    var coverage_generation: u64 = 0;
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        try db.addIndex(.{
+            .name = "full_text_index_v2",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        const configs = try db.listIndexes(alloc);
+        defer db_mod.types.freeIndexConfigs(alloc, configs);
+        for (configs) |config| {
+            if (!std.mem.eql(u8, config.name, "full_text_index_v2")) continue;
+            coverage_generation = config.coverage_generation;
+            break;
+        }
+    }
+    try std.testing.expect(coverage_generation != 0);
+    const rebuild_state = db_mod.backfill_state.RebuildState.initOwned(index_root, null, coverage_generation);
     try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
 
-    // There is deliberately no DB at db_path. If the progress probe attempts
-    // DB.open instead of trusting the durable marker, this call fails rather
-    // than returning the expected in-progress result.
+    // The lightweight status-only open reads the authoritative catalog
+    // generation without mapping retained full-text state. That lets it ignore
+    // stale same-name workers while still observing the current marker.
     try std.testing.expect(!try localRangeHasSchemaVersionIndex(
         alloc,
         path,
