@@ -9266,6 +9266,41 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn snapshotRuntimeStatusesFromStorageBestEffort(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        // Cold inspection may open the same logical root as a foreground
+        // writer. Never block the status path or race an in-process writer;
+        // the next poll can retry after the owner releases the source lock.
+        if (!self.local_db_mutex.tryLock()) return null;
+        defer self.local_db_mutex.unlock();
+
+        var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(
+            alloc,
+            self.catalog,
+            self.replica_root_dir,
+            self.backend_runtime,
+            table_name,
+            .status_only,
+        )) orelse return null;
+        errdefer recovered.deinit(alloc);
+        if (runtimeStatusesNeedColdVisibilityRefresh(&recovered)) {
+            recovered.deinit(alloc);
+            recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(
+                alloc,
+                self.catalog,
+                self.replica_root_dir,
+                self.backend_runtime,
+                table_name,
+                .query_readonly,
+            )) orelse return null;
+        }
+        markRecoveredRuntimeStatuses(&recovered);
+        return recovered;
+    }
+
     fn recoverRuntimeStatusesFromStorage(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -9273,13 +9308,8 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const snapshot_cache = self.runtime_status_cache orelse return null;
         const publication_token = try snapshot_cache.capturePublicationToken(table_name);
-        var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, .status_only)) orelse return null;
+        var recovered = (try self.snapshotRuntimeStatusesFromStorageBestEffort(alloc, table_name)) orelse return null;
         errdefer recovered.deinit(alloc);
-        if (runtimeStatusesNeedColdVisibilityRefresh(&recovered)) {
-            recovered.deinit(alloc);
-            recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, .query_readonly)) orelse return null;
-        }
-        markRecoveredRuntimeStatuses(&recovered);
         for (recovered.items) |item| _ = try snapshot_cache.publishGroup(publication_token, table_name, item);
         self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &recovered);
         return recovered;
@@ -9290,44 +9320,39 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
+        if (self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
+            const snapshot_cache = self.runtime_status_cache orelse return null;
+            return try snapshot_cache.snapshot(alloc, table_name);
+        }
         if (self.runtime_status_cache == null) {
             // Standalone/uncached sources have no owner-published status plane
             // to consult. Their caller holds status admission, so a cold
             // read-only inspection is serialized with structural publication
             // without opening a competing writer or changing cache semantics.
-            var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(
-                alloc,
-                self.catalog,
-                self.replica_root_dir,
-                self.backend_runtime,
-                table_name,
-                .status_only,
-            )) orelse return null;
-            errdefer recovered.deinit(alloc);
-            if (runtimeStatusesNeedColdVisibilityRefresh(&recovered)) {
-                recovered.deinit(alloc);
-                recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(
-                    alloc,
-                    self.catalog,
-                    self.replica_root_dir,
-                    self.backend_runtime,
-                    table_name,
-                    .query_readonly,
-                )) orelse return null;
-            }
-            markRecoveredRuntimeStatuses(&recovered);
-            return recovered;
+            return try self.snapshotRuntimeStatusesFromStorageBestEffort(alloc, table_name);
         }
         // Keep the hot HTTP status path on the cached status plane. After a
         // process restart the cache is empty, or can contain only a synthetic
-        // dense placeholder; recover once from durable status snapshots, and
-        // only load query-visible index state when the cheap snapshot is
-        // clearly missing dense visibility for existing primary documents.
+        // dense placeholder. Production sources delegate recovery to the
+        // coalesced runtime owner so status polling never opens a DB inline.
+        // Standalone sources without that owner retain guarded synchronous
+        // recovery for compatibility.
         const snapshot_cache = self.runtime_status_cache.?;
-        var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+        var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse {
+            if (self.local_change_hook != null) {
+                self.notifyLocalChange(table_name, .runtime_status);
+                return null;
+            }
+            return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+        };
         errdefer cached.deinit(alloc);
         const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
         if (needs_cold_refresh) {
+            if (self.local_change_hook != null) {
+                for (cached.items) |*status| status.metadata.freshness = .stale;
+                self.notifyLocalChange(table_name, .runtime_status);
+                return cached;
+            }
             cached.deinit(alloc);
             return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
         }
@@ -18119,6 +18144,17 @@ const RuntimeStatusPublicationKind = enum {
     terminal_startup,
 };
 
+fn refreshRuntimeStatusStatsIfAvailable(
+    alloc: std.mem.Allocator,
+    status: *runtime_status.LocalTableRuntimeStatus,
+    db: *db_mod.DB,
+) !bool {
+    const fresh_stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return false;
+    db_mod.types.freeDBStats(alloc, status.stats);
+    status.stats = fresh_stats;
+    return true;
+}
+
 fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -18215,7 +18251,17 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
             var status = cached_status;
             defer status.deinit(alloc);
-            const startup = startupCatchUpStatsForPhase(phase, db);
+            var startup = startupCatchUpStatsForPhase(phase, db);
+            const cached_startup = status.stats.async_indexing.startup;
+            if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
+                startup.wal_retention_known = true;
+                startup.wal_retained_segments = cached_startup.wal_retained_segments;
+                startup.wal_retained_bytes = cached_startup.wal_retained_bytes;
+            }
+            // Startup publication must remain non-blocking, but when the
+            // writer is immediately readable replace stale table counters
+            // before layering the startup progress fields onto them.
+            _ = try refreshRuntimeStatusStatsIfAvailable(alloc, &status, db);
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
@@ -18256,7 +18302,16 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
                 status = cached_status;
                 status_initialized = true;
                 status_from_cached_best_effort = true;
-                if (runtimeStatusNeedsAuthoritativeLifecycleRefresh(status)) {
+                if (cached_best_effort_source == .startup_catch_up or
+                    status.stats.async_indexing.startup.active)
+                {
+                    // Crossing out of startup is a lifecycle edge. Refresh
+                    // exact counters opportunistically, but preserve the
+                    // cached observation if a foreground apply owns the DB.
+                    if (!try refreshRuntimeStatusStatsIfAvailable(alloc, &status, db)) {
+                        db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
+                    }
+                } else if (runtimeStatusNeedsAuthoritativeLifecycleRefresh(status)) {
                     const fresh_stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse
                         return error.WriterLocked;
                     db_mod.types.freeDBStats(alloc, status.stats);
@@ -18897,6 +18952,9 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
             }
             var merged_existing = status.stats.async_indexing.startup;
             db_mod.types.accumulateStartupCatchUpStats(&merged_existing, merged_startup);
+            if (db) |managed_db| {
+                _ = try refreshRuntimeStatusStatsIfAvailable(alloc, &status, managed_db);
+            }
             status.stats.async_indexing.startup = merged_existing;
             if (db) |managed_db| {
                 applyStartupCatchUpAsyncOverlay(&status, managed_db.snapshotAsyncIndexingStats(), status.stats.async_indexing.startup);
@@ -26480,6 +26538,58 @@ test "provisioned table write source runtime status is best effort when local db
     try std.testing.expect(statuses == null);
 }
 
+test "provisioned table write source cold status delegates to refresh owner" {
+    const alloc = std.testing.allocator;
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Hook = struct {
+        calls: usize = 0,
+        kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.kind = kind;
+        }
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-cold-status-delegation", NoCatalog.iface());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    var hook = Hook{};
+    source.setLocalChangeHook(.{
+        .ptr = &hook,
+        .on_change = Hook.onChange,
+    });
+
+    if (try source.source().localRuntimeStatuses(alloc, "docs")) |owned_statuses| {
+        var statuses = owned_statuses;
+        defer statuses.deinit(alloc);
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.runtime_status, hook.kind.?);
+}
+
 test "provisioned table write source runtime statuses reconcile empty embeddings indexes" {
     const alloc = std.testing.allocator;
 
@@ -26646,9 +26756,17 @@ test "provisioned table write source runtime status repairs cold dense placehold
     try std.testing.expect(statuses.items[0].stats.indexes[0].doc_count > 0 or statuses.items[0].stats.indexes[0].node_count > 0 or statuses.items[0].stats.indexes[0].root_node > 0);
 }
 
-test "provisioned table write source runtime status stays cache-only without shared snapshot" {
+test "provisioned table write source recovers durable status without shared snapshot" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-runtime-cache";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/antfly-api-provisioned-write-runtime-cache",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26691,27 +26809,9 @@ test "provisioned table write source runtime status stays cache-only without sha
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
+    var source = ProvisionedTableWriteSource.init(path, WarmCatalog.iface());
     source.write_cache = &write_cache;
 
     lockAtomic(&source.local_db_mutex);
@@ -26719,7 +26819,12 @@ test "provisioned table write source runtime status stays cache-only without sha
     source.local_db_mutex.unlock();
     defer cached.deinit(alloc);
 
-    try std.testing.expect((try source.source().localRuntimeStatuses(alloc, "docs")) == null);
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")) orelse
+        return error.MissingRuntimeStatusSnapshot;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqualStrings("semantic_idx", statuses.items[0].stats.indexes[0].name);
 }
 
 test "provisioned table write cache retires stale db when index metadata changes" {
@@ -30533,11 +30638,18 @@ test "provisioned replicated sync marks local runtime status dirty" {
 
     const Hook = struct {
         calls: usize = 0,
+        data_calls: usize = 0,
+        runtime_status_calls: usize = 0,
         kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
 
         fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
+            switch (kind) {
+                .data => self.data_calls += 1,
+                .runtime_status => self.runtime_status_calls += 1,
+                else => {},
+            }
             self.kind = kind;
         }
     };
@@ -30568,12 +30680,17 @@ test "provisioned replicated sync marks local runtime status dirty" {
         .sync_level = .full_index,
     });
     try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 1), hook.data_calls);
 
     hook.calls = 0;
+    hook.data_calls = 0;
+    hook.runtime_status_calls = 0;
     hook.kind = null;
     try source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
 
-    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 1), hook.data_calls);
+    try std.testing.expect(hook.runtime_status_calls > 0);
+    try std.testing.expectEqual(hook.data_calls + hook.runtime_status_calls, hook.calls);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 }
 
@@ -31425,31 +31542,12 @@ test "provisioned table read source serves profiled dense query without runtime 
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-warmed-read-cache-profiled-query", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
-
-    {
-        var db = try openManagedDbWithIndexesJson(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-        );
-        defer db.close();
-        try db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" },
-                .{ .key = "doc:b", .value = "{\"_embeddings\":{\"semantic_idx\":[2,1]}}" },
-            },
-            .sync_level = .full_index,
-        });
-    }
 
     var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    _ = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
 
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
@@ -31458,9 +31556,14 @@ test "provisioned table read source serves profiled dense query without runtime 
     write_source.read_cache = &read_cache;
     write_source.write_cache = &write_cache;
     write_source.runtime_status_cache = &snapshot_cache;
-    write_source.markWriteCacheDirty("docs");
-
-    try std.testing.expect((try write_source.source().localRuntimeStatuses(alloc, "docs")) == null);
+    _ = try write_source.applyReplicatedBatchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"semantic_idx\":[1,2]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"semantic_idx\":[2,1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    try write_source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
 
     var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     read_source.cache = &read_cache;
@@ -32591,7 +32694,8 @@ test "runtime status snapshot with startup phase refreshes live table stats for 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, statuses.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.catching_up, statuses.items[0].metadata.freshness);
-    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.source_doc_count);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.artifact_rebuild, statuses.items[0].stats.async_indexing.startup.phase);
     try std.testing.expect(statuses.items[0].stats.async_indexing.startup.active);
     try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retention_known);
@@ -32674,7 +32778,8 @@ test "startup runtime status snapshot with live db refreshes table stats during 
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.source_doc_count);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.artifact_rebuild, statuses.items[0].stats.async_indexing.startup.phase);
     try std.testing.expect(statuses.items[0].stats.async_indexing.startup.active);
     try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retention_known);
@@ -32869,12 +32974,15 @@ test "runtime status snapshot with idle phase refreshes live stats after startup
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.source_doc_count);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.idle, statuses.items[0].stats.async_indexing.startup.phase);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
     try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retention_known);
-    try std.testing.expectEqual(@as(u64, 7), statuses.items[0].stats.async_indexing.startup.wal_retained_segments);
-    try std.testing.expectEqual(@as(u64, 456), statuses.items[0].stats.async_indexing.startup.wal_retained_bytes);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retained_segments > 0);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retained_bytes > 0);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retained_segments != 7);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retained_bytes != 456);
 }
 
 test "idle startup runtime status publish is live when startup flag is still set" {
