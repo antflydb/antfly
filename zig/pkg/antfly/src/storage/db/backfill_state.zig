@@ -19,6 +19,14 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
 
 const rebuild_state_name = "rebuild.state";
+const rebuild_state_magic = "AFRBST01";
+const rebuild_state_version: u32 = 1;
+const rebuild_state_key_length_bytes = @sizeOf(u32);
+const rebuild_state_checksum_bytes = @sizeOf(u32);
+const rebuild_state_header_bytes = rebuild_state_magic.len + @sizeOf(@TypeOf(rebuild_state_version)) + rebuild_state_key_length_bytes;
+const rebuild_state_max_key_bytes = 64 * 1024;
+const rebuild_state_max_encoded_bytes = rebuild_state_header_bytes + rebuild_state_max_key_bytes + rebuild_state_checksum_bytes;
+const rebuild_state_max_read_bytes = rebuild_state_max_encoded_bytes + 1;
 var temp_nonce: u64 = 0;
 
 pub const RebuildState = struct {
@@ -37,17 +45,23 @@ pub const RebuildState = struct {
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        return std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => null,
-            error.NotDir => null,
+        const encoded = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(rebuild_state_max_read_bytes)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            error.NotDir => return null,
+            error.StreamTooLong => return error.InvalidRebuildState,
             else => return err,
         };
+        defer alloc.free(encoded);
+        return try decodeState(alloc, encoded);
     }
 
     pub fn update(self: RebuildState, key: []const u8) !void {
         if (builtin.os.tag == .freestanding) {
             return;
         }
+        const encoded = try encodeState(std.heap.page_allocator, key);
+        defer std.heap.page_allocator.free(encoded);
+
         const path = try self.pathAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(path);
         temp_nonce +%= 1;
@@ -69,7 +83,7 @@ pub const RebuildState = struct {
             else => return err,
         };
 
-        writeStateFile(io, tmp_path, key) catch |err| switch (err) {
+        writeStateFile(io, tmp_path, encoded) catch |err| switch (err) {
             error.NotDir => return,
             else => return err,
         };
@@ -81,7 +95,7 @@ pub const RebuildState = struct {
                         error.NotDir => return,
                         else => return parent_err,
                     };
-                    writeStateFile(io, path, key) catch |write_err| switch (write_err) {
+                    writeStateFile(io, path, encoded) catch |write_err| switch (write_err) {
                         error.NotDir => return,
                         else => return write_err,
                     };
@@ -97,7 +111,7 @@ pub const RebuildState = struct {
                         error.NotDir => return,
                         else => return parent_err,
                     };
-                    writeStateFile(io, path, key) catch |write_err| switch (write_err) {
+                    writeStateFile(io, path, encoded) catch |write_err| switch (write_err) {
                         error.NotDir => return,
                         else => return write_err,
                     };
@@ -107,6 +121,7 @@ pub const RebuildState = struct {
                 else => return err,
             };
         }
+        try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
     }
 
     pub fn clear(self: RebuildState) !void {
@@ -181,14 +196,61 @@ fn renameAbsolutePortable(old_path: []const u8, new_path: []const u8) !void {
     }
 }
 
-fn writeStateFile(io: std.Io, path: []const u8, key: []const u8) !void {
+fn encodeState(alloc: Allocator, key: []const u8) ![]u8 {
+    if (key.len > rebuild_state_max_key_bytes or key.len > std.math.maxInt(u32)) {
+        return error.RebuildStateTooLarge;
+    }
+
+    const encoded = try alloc.alloc(u8, rebuild_state_header_bytes + key.len + rebuild_state_checksum_bytes);
+    @memcpy(encoded[0..rebuild_state_magic.len], rebuild_state_magic);
+
+    var pos = rebuild_state_magic.len;
+    std.mem.writeInt(u32, encoded[pos..][0..@sizeOf(@TypeOf(rebuild_state_version))], rebuild_state_version, .little);
+    pos += @sizeOf(@TypeOf(rebuild_state_version));
+    std.mem.writeInt(u32, encoded[pos..][0..rebuild_state_key_length_bytes], @intCast(key.len), .little);
+    pos += rebuild_state_key_length_bytes;
+    @memcpy(encoded[pos .. pos + key.len], key);
+    pos += key.len;
+    std.mem.writeInt(u32, encoded[pos..][0..rebuild_state_checksum_bytes], std.hash.Crc32.hash(encoded[0..pos]), .little);
+    return encoded;
+}
+
+fn decodeState(alloc: Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len < rebuild_state_header_bytes + rebuild_state_checksum_bytes) {
+        return error.InvalidRebuildState;
+    }
+    if (!std.mem.eql(u8, encoded[0..rebuild_state_magic.len], rebuild_state_magic)) {
+        return error.InvalidRebuildState;
+    }
+
+    var pos = rebuild_state_magic.len;
+    const version = std.mem.readInt(u32, encoded[pos..][0..@sizeOf(@TypeOf(rebuild_state_version))], .little);
+    if (version != rebuild_state_version) return error.InvalidRebuildState;
+    pos += @sizeOf(@TypeOf(rebuild_state_version));
+
+    const key_len: usize = std.mem.readInt(u32, encoded[pos..][0..rebuild_state_key_length_bytes], .little);
+    pos += rebuild_state_key_length_bytes;
+    if (key_len > rebuild_state_max_key_bytes or encoded.len - pos - rebuild_state_checksum_bytes != key_len) {
+        return error.InvalidRebuildState;
+    }
+
+    const checksum_offset = encoded.len - rebuild_state_checksum_bytes;
+    const stored_checksum = std.mem.readInt(u32, encoded[checksum_offset..][0..rebuild_state_checksum_bytes], .little);
+    if (stored_checksum != std.hash.Crc32.hash(encoded[0..checksum_offset])) {
+        return error.InvalidRebuildState;
+    }
+    return try alloc.dupe(u8, encoded[pos..checksum_offset]);
+}
+
+fn writeStateFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
     defer file.close(io);
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(key);
+    try writer.interface.writeAll(contents);
     try writer.end();
+    try file.sync(io);
 }
 
 pub fn estimateProgressForKey(range_start: []const u8, range_end: []const u8, current_key: []const u8) f64 {
@@ -214,12 +276,10 @@ fn keyToU64(key: []const u8) u64 {
 }
 
 test "rebuild state round trips and clears" {
-    const path = "/tmp/antfly-backfill-state-test";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    try fs_paths.createDirPathPortable(io_impl.io(), path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
 
     const state = RebuildState.init(path);
     try std.testing.expect((try state.check(std.testing.allocator)) == null);
@@ -227,8 +287,59 @@ test "rebuild state round trips and clears" {
     const loaded = (try state.check(std.testing.allocator)) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(loaded);
     try std.testing.expectEqualStrings("doc:m", loaded);
+    try state.update("");
+    const empty = (try state.check(std.testing.allocator)) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
     try state.clear();
     try std.testing.expect((try state.check(std.testing.allocator)) == null);
+}
+
+test "rebuild state rejects key corruption" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-corrupt", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    const state = RebuildState.init(path);
+    try state.update("doc:m");
+    const state_path = try state.pathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(state_path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        state_path,
+        std.testing.allocator,
+        .limited(rebuild_state_max_encoded_bytes),
+    );
+    defer std.testing.allocator.free(encoded);
+    encoded[rebuild_state_header_bytes + 4] = 'z';
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded });
+
+    try std.testing.expectError(error.InvalidRebuildState, state.check(std.testing.allocator));
+    // Validation quarantines the cursor; it must not silently clear it.
+    try std.testing.expectError(error.InvalidRebuildState, state.check(std.testing.allocator));
+}
+
+test "rebuild state rejects truncation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-truncated", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    const state = RebuildState.init(path);
+    try state.update("doc:m");
+    const state_path = try state.pathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(state_path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        state_path,
+        std.testing.allocator,
+        .limited(rebuild_state_max_encoded_bytes),
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded[0 .. encoded.len - 1] });
+
+    try std.testing.expectError(error.InvalidRebuildState, state.check(std.testing.allocator));
 }
 
 test "rebuild state estimates progress from resume key" {

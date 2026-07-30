@@ -6874,8 +6874,6 @@ fn refreshStoreStatusBackfillMarkerResumeKeys(
     replica_root_dir: []const u8,
     markers: []StoreStatusBackfillMarker,
 ) !bool {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     var any_missing = false;
 
     for (markers) |*marker| {
@@ -6885,15 +6883,17 @@ fn refreshStoreStatusBackfillMarkerResumeKeys(
         }
         const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
         defer alloc.free(state_path);
-        marker.resume_key = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                any_missing = true;
-                break :blk null;
-            },
+        marker.resume_key = rebuildStateForPath(state_path).check(alloc) catch |err| switch (err) {
+            error.InvalidRebuildState => null,
             else => return err,
         };
+        if (marker.resume_key == null) any_missing = true;
     }
     return any_missing;
+}
+
+fn rebuildStateForPath(path: []const u8) backfill_state_mod.RebuildState {
+    return backfill_state_mod.RebuildState.init(std.fs.path.dirname(path) orelse ".");
 }
 
 fn collectStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
@@ -9779,14 +9779,7 @@ test "metadata service auto-reports local store backfill status during runRound"
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -9903,14 +9896,7 @@ test "metadata service reports automatic store status across shared multi-store 
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -10050,14 +10036,7 @@ test "metadata service reports automatic store status across explicit multi-stor
 
     const left_state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{left_db_path});
     defer std.testing.allocator.free(left_state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), left_state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:g");
-        try writer.end();
-    }
+    try rebuildStateForPath(left_state_path).update("doc:g");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -10177,14 +10156,7 @@ test "metadata service prefers placement-role-compatible store affinity in share
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -10224,14 +10196,7 @@ test "metadata service shared-root reports survive transient rebuild marker remo
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     const markers = try collectStoreStatusBackfillMarkers(std.testing.allocator, replica_root);
     defer freeStoreStatusBackfillMarkers(std.testing.allocator, markers);
@@ -10412,14 +10377,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.replace(
         std.testing.allocator,
@@ -10540,14 +10498,7 @@ test "metadata service lifecycle round discovers backfill markers immediately" {
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     try std.testing.expectEqual(@as(usize, 0), svc.store_status_backfill_marker_cache.markers.len);
     svc.store_status_backfill_marker_cache.rescan_requested = true;
@@ -10682,14 +10633,7 @@ test "metadata service cached backfill markers rescan immediately after disappea
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     var cache = StoreStatusBackfillMarkerCache{};
     defer cache.deinit(std.testing.allocator);
@@ -10792,14 +10736,7 @@ test "metadata service prefers planned store affinity in shared roots" {
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     const stores = [_]metadata_table_manager.StoreRecord{
         .{ .store_id = 91, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 880 },
