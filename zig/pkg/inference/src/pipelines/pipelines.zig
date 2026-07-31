@@ -20,6 +20,9 @@ pub const adapters = @import("adapters.zig");
 
 pub const EmbeddingPipeline = @import("embedding.zig").EmbeddingPipeline;
 pub const EmbeddingConfig = @import("embedding.zig").EmbeddingConfig;
+pub const SparseEmbeddingPipeline = @import("sparse_embedding.zig").SparseEmbeddingPipeline;
+pub const SparseEmbeddingConfig = @import("sparse_embedding.zig").SparseEmbeddingConfig;
+pub const SparseVector = @import("sparse_embedding.zig").SparseVector;
 pub const ChunkingPipeline = @import("chunking.zig").ChunkingPipeline;
 pub const ChunkingConfig = @import("chunking.zig").ChunkingConfig;
 pub const Chunk = @import("chunking.zig").Chunk;
@@ -70,6 +73,7 @@ pub const JsonGrammar = grammar.JsonGrammar;
 
 test {
     _ = @import("embedding.zig");
+    _ = @import("sparse_embedding.zig");
     _ = @import("chunking.zig");
     _ = @import("reranking.zig");
     _ = @import("classification.zig");

@@ -219,11 +219,26 @@ pub const EmbeddingPipeline = struct {
             return try self.embedWithBatchPlan(texts, plan);
         }
 
+        return self.embedDirect(texts, texts.len);
+    }
+
+    /// Execute one backend batch. `texts` contains only caller-provided rows;
+    /// any required static-batch padding is added after tokenization by copying
+    /// the final encoded row. This keeps fixed-batch compatibility from
+    /// multiplying tokenizer and prefix-allocation work on short tail batches.
+    fn embedDirect(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        execution_batch: usize,
+    ) ![][]f32 {
+        if (texts.len == 0 or execution_batch < texts.len) return error.InvalidInputShape;
+
+        const text_session = self.textEncodingSession();
         const alloc = self.allocator;
         const input_info = text_session.inputInfo();
         const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
         const fixed_len = hasFixedTextSequenceLength(input_info);
-        const batch = texts.len;
+        const batch = execution_batch;
         const admitted_tokens = std.math.mul(usize, batch, max_len) catch
             return error.ResourceLimitExceeded;
         var run_permit = try text_session.admit(.{
@@ -236,7 +251,7 @@ pub const EmbeddingPipeline = struct {
         });
         defer run_permit.deinit();
 
-        const encoded = try alloc.alloc(EncodeResult, batch);
+        const encoded = try alloc.alloc(EncodeResult, texts.len);
         defer alloc.free(encoded);
         var encoded_count: usize = 0;
         defer {
@@ -263,9 +278,13 @@ pub const EmbeddingPipeline = struct {
         const all_mask = try alloc.alloc(i32, batch * effective_len);
         defer alloc.free(all_mask);
 
-        for (encoded[0..batch], 0..) |result, i| {
+        for (encoded, 0..) |result, i| {
             @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], result.ids[0..effective_len]);
             @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], result.attention_mask[0..effective_len]);
+        }
+        for (texts.len..batch) |i| {
+            @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], all_ids[(texts.len - 1) * effective_len .. texts.len * effective_len]);
+            @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], all_mask[(texts.len - 1) * effective_len .. texts.len * effective_len]);
         }
 
         // Convert i32 token IDs to i64 for ONNX Runtime (expects int64 tensors)
@@ -366,6 +385,7 @@ pub const EmbeddingPipeline = struct {
         texts: []const []const u8,
         plan: TextSessionBatchPlan,
     ) anyerror![][]f32 {
+        if (plan.batch_size == 0) return error.InvalidInputShape;
         const embeddings = try self.allocator.alloc([]f32, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -373,25 +393,14 @@ pub const EmbeddingPipeline = struct {
             self.allocator.free(embeddings);
         }
 
-        const padded = if (plan.pad_final_batch and texts.len % plan.batch_size != 0)
-            try self.allocator.alloc([]const u8, plan.batch_size)
-        else
-            null;
-        defer if (padded) |items| self.allocator.free(items);
-
         var offset: usize = 0;
         while (offset < texts.len) {
             const real_count = @min(plan.batch_size, texts.len - offset);
-            const batch_texts: []const []const u8 = if (real_count == plan.batch_size)
-                texts[offset .. offset + real_count]
-            else blk: {
-                const items = padded orelse return error.InvalidInputShape;
-                @memcpy(items[0..real_count], texts[offset .. offset + real_count]);
-                @memset(items[real_count..], texts[offset + real_count - 1]);
-                break :blk items;
-            };
-
-            const batch_embeddings = try self.embed(batch_texts);
+            if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
+            const batch_embeddings = try self.embedDirect(
+                texts[offset .. offset + real_count],
+                plan.batch_size,
+            );
             if (batch_embeddings.len != plan.batch_size) {
                 freeEmbeddingSlices(self.allocator, batch_embeddings);
                 return error.UnexpectedOutputShape;

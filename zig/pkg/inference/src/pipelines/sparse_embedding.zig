@@ -74,9 +74,22 @@ pub const SparseEmbeddingPipeline = struct {
         if (embedding_mod.textSessionBatchPlan(self.session, texts.len)) |plan| {
             return self.embedWithBatchPlan(texts, plan);
         }
+        return self.embedDirect(texts, texts.len);
+    }
+
+    /// Execute one backend batch while tokenizing only caller-provided rows.
+    /// Static-batch padding duplicates the final encoded row, avoiding repeated
+    /// tokenizer work and temporary allocations on every short tail batch.
+    fn embedDirect(
+        self: *SparseEmbeddingPipeline,
+        texts: []const []const u8,
+        execution_batch: usize,
+    ) ![]SparseVector {
+        if (texts.len == 0 or execution_batch < texts.len) return error.InvalidInputShape;
+
         const alloc = self.allocator;
         const max_len = self.config.max_length;
-        const batch = texts.len;
+        const batch = execution_batch;
         const tokens = std.math.mul(usize, batch, max_len) catch
             return error.ResourceLimitExceeded;
         var run_permit = try self.session.admit(.{
@@ -100,6 +113,10 @@ pub const SparseEmbeddingPipeline = struct {
             defer result.deinit();
             @memcpy(all_ids[i * max_len .. (i + 1) * max_len], result.ids);
             @memcpy(all_mask[i * max_len .. (i + 1) * max_len], result.attention_mask);
+        }
+        for (texts.len..batch) |i| {
+            @memcpy(all_ids[i * max_len .. (i + 1) * max_len], all_ids[(texts.len - 1) * max_len .. texts.len * max_len]);
+            @memcpy(all_mask[i * max_len .. (i + 1) * max_len], all_mask[(texts.len - 1) * max_len .. texts.len * max_len]);
         }
 
         // Convert to i64 for ONNX
@@ -178,6 +195,7 @@ pub const SparseEmbeddingPipeline = struct {
         texts: []const []const u8,
         plan: embedding_mod.TextSessionBatchPlan,
     ) anyerror![]SparseVector {
+        if (plan.batch_size == 0) return error.InvalidInputShape;
         const alloc = self.allocator;
         const results = try alloc.alloc(SparseVector, texts.len);
         var initialized: usize = 0;
@@ -186,25 +204,14 @@ pub const SparseEmbeddingPipeline = struct {
             alloc.free(results);
         }
 
-        const padded = if (plan.pad_final_batch and texts.len % plan.batch_size != 0)
-            try alloc.alloc([]const u8, plan.batch_size)
-        else
-            null;
-        defer if (padded) |items| alloc.free(items);
-
         var offset: usize = 0;
         while (offset < texts.len) {
             const real_count = @min(plan.batch_size, texts.len - offset);
-            const batch_texts: []const []const u8 = if (real_count == plan.batch_size)
-                texts[offset .. offset + real_count]
-            else blk: {
-                const items = padded orelse return error.InvalidInputShape;
-                @memcpy(items[0..real_count], texts[offset .. offset + real_count]);
-                @memset(items[real_count..], texts[offset + real_count - 1]);
-                break :blk items;
-            };
-
-            const batch_results = try self.embed(batch_texts);
+            if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
+            const batch_results = try self.embedDirect(
+                texts[offset .. offset + real_count],
+                plan.batch_size,
+            );
             if (batch_results.len != plan.batch_size) {
                 for (batch_results) |*result| result.deinit(alloc);
                 alloc.free(batch_results);
@@ -674,6 +681,7 @@ test "sparse embedding chunks and pads fixed-batch sessions" {
 
     try std.testing.expectEqual(@as(usize, 2), session_state.run_count);
     try std.testing.expectEqual(@as(usize, 2), session_state.max_batch_seen);
+    try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count);
     try std.testing.expectEqual(@as(usize, 3), vectors.len);
     for (vectors, [_]u32{ 1, 2, 3 }) |vector, expected_index| {
         try std.testing.expectEqualSlices(u32, &.{expected_index}, vector.indices);
@@ -754,6 +762,8 @@ fn FakeStaticBatchSparseSession(comptime fixed_batch: usize) type {
 }
 
 const FakeSparseTokenizer = struct {
+    encode_count: usize = 0,
+
     fn tokenizer(self: *FakeSparseTokenizer) Tokenizer {
         return .{
             .ptr = self,
@@ -770,8 +780,10 @@ const FakeSparseTokenizer = struct {
         };
     }
 
-    fn encode(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+    fn encode(raw: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
         if (text.len == 0) return error.InvalidInput;
+        const self: *FakeSparseTokenizer = @ptrCast(@alignCast(raw));
+        self.encode_count += 1;
         const ids = try allocator.alloc(i32, 1);
         ids[0] = text[0];
         return ids;
