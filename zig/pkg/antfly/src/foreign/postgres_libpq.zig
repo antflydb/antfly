@@ -700,9 +700,9 @@ pub const Executor = struct {
         alloc.destroy(self);
     }
 
-    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
+    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, execution_deadline_ns);
+        return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, execution_deadline_ns, cancellation);
     }
 
     fn statistics(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
@@ -1044,7 +1044,7 @@ pub const Executor = struct {
     }
 
     fn queryPreparedAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
-        return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, null);
+        return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, null, null);
     }
 
     fn queryPreparedAllocWithDeadline(
@@ -1053,7 +1053,9 @@ pub const Executor = struct {
         dsn: []const u8,
         prepared: sql.PreparedQuery,
         execution_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !foreign_source.QueryResult {
+        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
         var owned = prepared;
         defer owned.deinit(alloc);
 
@@ -1061,6 +1063,7 @@ pub const Executor = struct {
         var lease = try self.acquireConnection(dsn, execution_deadline_ns);
         defer lease.release();
         std.log.info("postgres libpq query connected sql_len={d}", .{owned.sql_text.len});
+        if (cancellation) |value| if (value.load(.acquire)) { lease.invalidate(); return error.Cancelled; };
         const result = self.execPreparedWithDeadline(lease.conn, alloc, owned, execution_deadline_ns) catch |err| {
             if (invalidatesConnection(err)) lease.invalidate();
             return err;
@@ -2923,14 +2926,14 @@ const LazyExecutor = struct {
         alloc.destroy(self);
     }
 
-    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
+    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const executor = self.ensureExecutor(execution_deadline_ns) catch |err| {
             var owned = prepared;
             owned.deinit(alloc);
             return err;
         };
-        return try executor.asQueryExecutor().query(alloc, dsn, prepared, execution_deadline_ns);
+        return try executor.asQueryExecutor().query(alloc, dsn, prepared, execution_deadline_ns, cancellation);
     }
 
     fn statistics(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
