@@ -3575,6 +3575,56 @@ test "bool fallback applies native doc number constraints" {
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
 }
 
+test "exact inclusive term range preserves prefix constant scores" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "app", .freq = 1, .norm = 10 },
+            .{ .term = "apple", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "app", .freq = 1, .norm = 10 },
+            .{ .term = "application", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{}", .terms = &.{
+            .{ .term = "banana", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+
+    var prefix = try execute(alloc, snap, .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "app", .boost = 2.5 } },
+        .k = 10,
+    });
+    defer prefix.deinit();
+    var exact = try execute(alloc, snap, .{
+        .query = .{ .term_range = .{
+            .field = "title",
+            .min = "app",
+            .max = "app",
+            .inclusive_min = true,
+            .inclusive_max = true,
+            .boost = 2.5,
+        } },
+        .k = 10,
+    });
+    defer exact.deinit();
+
+    try std.testing.expectEqual(prefix.total_hits, exact.total_hits);
+    try std.testing.expectEqual(prefix.hits.len, exact.hits.len);
+    for (prefix.hits, exact.hits) |prefix_hit, exact_hit| {
+        try std.testing.expectEqual(prefix_hit.doc_id, exact_hit.doc_id);
+        try std.testing.expectApproxEqAbs(prefix_hit.score, exact_hit.score, 0.00001);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.5), exact_hit.score, 0.00001);
+    }
+}
+
 test "optional pure should preserves zero baseline and text scores" {
     const alloc = std.testing.allocator;
     const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{

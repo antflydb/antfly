@@ -306,7 +306,22 @@ pub const PrefixFilter = struct {
     prefix: []const u8,
     boost: f32 = 1.0,
 
+    pub const ExecutionStats = struct {
+        dictionary_terms_decoded: u64 = 0,
+        matching_terms: u64 = 0,
+    };
+
     pub fn execute(self: PrefixFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithStats(alloc, seg, null);
+    }
+
+    pub fn executeWithStats(
+        self: PrefixFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        stats: ?*ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        if (stats) |out| out.* = .{};
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
@@ -320,13 +335,17 @@ pub const PrefixFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        while (try term_iter.next()) |entry| {
+        while (true) {
+            const next_entry = try term_iter.next();
+            if (stats) |out| out.dictionary_terms_decoded = term_iter.decodedTermCount();
+            const entry = next_entry orelse break;
             if (entry.term.len < self.prefix.len) continue;
             if (!std.mem.startsWith(u8, entry.term, self.prefix)) {
                 // FST terms are sorted; if we've passed the prefix range, stop
                 if (std.mem.order(u8, entry.term[0..self.prefix.len], self.prefix) == .gt) break;
                 continue;
             }
+            if (stats) |out| out.matching_terms += 1;
             // Term matches prefix — union its postings
             switch (entry.result) {
                 .postings => |p| {
@@ -2043,10 +2062,15 @@ test "prefix filter seeks late range in large term dictionary" {
 
     const seg = &writer.snapshot().segments[0];
     const filter = Filter{ .prefix = .{ .field = "body", .prefix = "zz-" } };
-    var bm = try filter.execute(alloc, seg);
+    var stats: PrefixFilter.ExecutionStats = .{};
+    var bm = try filter.prefix.executeWithStats(alloc, seg, &stats);
     defer bm.deinit();
     try testing.expectEqual(@as(usize, 1), bm.cardinality());
     try testing.expect(bm.contains(0));
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    // The late seek may decode the tail of one dictionary block, but it must
+    // not revisit the thousands of lexicographically earlier entries.
+    try testing.expect(stats.dictionary_terms_decoded < 128);
 }
 
 test "multi-segment filter execution" {

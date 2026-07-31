@@ -7265,6 +7265,9 @@ pub fn build(b: *std.Build) void {
             "streaming phrase scorer matches randomized positional reference",
             "phrase filter exact adjacency",
             "phrase filter with slop",
+            "prefix filter seeks late range in large term dictionary",
+            "exact inclusive term range preserves prefix constant scores",
+            "multi_match bool_prefix preserves root semantics and bounds shingle prefixes",
             "PostingsIterator positional seek decodes only selected records",
             "PostingsIterator deferred positional seek decodes only accepted candidates",
             "PostingsIterator streams deferred grouped positions without scratch arrays",
@@ -7304,7 +7307,6 @@ pub fn build(b: *std.Build) void {
             "bool fallback applies native doc number constraints",
             "db text kernel search matches projected search without stored bodies",
             "split preserves postings when text segments omit source bodies",
-            "background text stats use postings when segment source is omitted",
             "text score query exposes score top k sort profile",
         },
         .test_runner = .{

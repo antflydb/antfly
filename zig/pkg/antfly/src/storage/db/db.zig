@@ -70648,6 +70648,8 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
             .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\",\"state\":\"draft\"}" },
             .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\",\"state\":\"published\"}" },
             .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\",\"state\":\"published\"}" },
+            .{ .key = "doc:5", .value = "{\"name\":\"The Happy Catalog\",\"description\":\"Stop-word prefix coverage\",\"state\":\"published\"}" },
+            .{ .key = "doc:6", .value = "{\"name\":\"Happiness Catalog\",\"description\":\"Stemmed root coverage\",\"state\":\"published\"}" },
         },
         .sync_level = .full_index,
     });
@@ -70712,6 +70714,29 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     defer filtered_bool_prefix_results.deinit();
     try std.testing.expectEqual(@as(u32, 2), filtered_bool_prefix_results.total_hits);
     try std.testing.expectEqual(@as(usize, 2), filtered_bool_prefix_results.hits.len);
+
+    var stop_word_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "the",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer stop_word_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), stop_word_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:5", stop_word_prefix_results.hits[0].id);
+
+    var stemmed_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "happy",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer stemmed_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 2), stemmed_prefix_results.total_hits);
 }
 
 test "db versioned full text indexes reload matching schema mappings after reopen" {

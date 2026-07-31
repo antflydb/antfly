@@ -1424,10 +1424,14 @@ pub const search_as_you_type_3gram_analyzer = Analyzer{
     .filters = &.{ .lowercase, .{ .shingle = .{ .min = 3, .max = 3 } } },
 };
 
+pub const search_as_you_type_max_shingle_size: u8 = 3;
+pub const search_as_you_type_min_prefix_length: u8 = 2;
+pub const search_as_you_type_max_prefix_length: u8 = 20;
+
 /// Search-as-you-type prefix subfield: unicode_words → lowercase → shingle(1..3) → edge_ngram(min=2, max=20)
 pub const search_as_you_type_index_prefix_analyzer = Analyzer{
     .tokenizer = .unicode_words,
-    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 1, .max = 3 } }, .{ .edge_ngram = .{ .min = 2, .max = 20 } } },
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 1, .max = search_as_you_type_max_shingle_size } }, .{ .edge_ngram = .{ .min = search_as_you_type_min_prefix_length, .max = search_as_you_type_max_prefix_length } } },
 };
 
 pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
