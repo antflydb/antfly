@@ -3435,6 +3435,7 @@ pub fn build(b: *std.Build) void {
         "managed host service preserves leader-routed observation roles from transition ops",
         "managed host service seeds queued transitions from projected metadata store",
         "raft runtime cadence validates independent intervals",
+        "hosted shard db adapter rediscovers median key after stale leader route",
         "shard operation adapter metadata runtime dispatches actions",
         "transition destination requires a stable healthy voter set",
         "transition retry jitter is bounded and desynchronizes services",
