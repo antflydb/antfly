@@ -1252,7 +1252,7 @@ pub const PersistentIndex = struct {
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
         return switch (self.main_store_owner) {
             .lmdb, .mem => null,
-            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 

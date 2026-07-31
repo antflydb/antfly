@@ -289,6 +289,10 @@ pub const Options = struct {
     backend: backend_types.OpenOptions = .{},
     flush_threshold: usize = 8,
     flush_threshold_bytes: u64 = 0,
+    // Rotate and flush a non-empty mutable table after this much write-idle
+    // time. Zero disables idle flushing. The deadline is renewed by each
+    // mutation, so sustained write throughput still uses the size threshold.
+    mutable_idle_flush_after_ns: u64 = 0,
     recovery_replay_flush_threshold: usize = 64 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
@@ -1379,6 +1383,7 @@ pub const Backend = struct {
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
     active_bulk_ingest_batches: usize = 0,
     mutable: ActiveMemTable = .{},
+    mutable_idle_flush_deadline_ns: u64 = 0,
     mutable_wal_range: WalSegmentRange = .{},
     empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
@@ -1943,6 +1948,18 @@ pub const Backend = struct {
         self.scheduleMaintenanceJobIfNeededLocked();
     }
 
+    pub fn noteWriteMutationLocked(self: *Backend) void {
+        if (self.options.mutable_idle_flush_after_ns > 0 and
+            self.mutable.entries.items.len > 0 and
+            !self.options.backend.read_only)
+        {
+            self.mutable_idle_flush_deadline_ns = self.nowNs() +| self.options.mutable_idle_flush_after_ns;
+        } else {
+            self.mutable_idle_flush_deadline_ns = 0;
+        }
+        self.notePotentialMaintenanceDebtLocked();
+    }
+
     fn wakeMaintenanceWorker(self: *Backend) void {
         if (self.options.maintenance_waker) |waker| waker.wake();
     }
@@ -2201,7 +2218,10 @@ pub const Backend = struct {
                 self.obsolete_paths.items.len != before_obsolete_paths;
         }
 
-        if (self.shouldFlushMutable() or try self.shouldFlushMutableForWalPressureLocked()) {
+        if (self.shouldFlushMutableForIdleLocked() or
+            self.shouldFlushMutable() or
+            try self.shouldFlushMutableForWalPressureLocked())
+        {
             try self.rotateMutableToImmutable();
         }
         if (self.activeImmutableMemtableCount() > 0) {
@@ -2999,6 +3019,7 @@ pub const Backend = struct {
         self.immutable_memtables.appendAssumeCapacity(rotated);
         self.immutable_wal_ranges.appendAssumeCapacity(self.mutable_wal_range);
         self.mutable_wal_range = .{};
+        self.mutable_idle_flush_deadline_ns = 0;
         self.write_stats.immutable_rotations += 1;
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
@@ -4527,6 +4548,10 @@ pub const Backend = struct {
         return self.mutable.entries.items.len >= self.effectiveFlushThreshold();
     }
 
+    fn shouldFlushMutableForIdleLocked(self: *Backend) bool {
+        return if (self.nextMutableIdleFlushDelayNsLocked()) |delay_ns| delay_ns == 0 else false;
+    }
+
     fn shouldFlushMutableDuringRecoveryReplay(self: *const Backend) bool {
         if (self.mutable.entries.items.len == 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
@@ -5170,6 +5195,35 @@ pub const Backend = struct {
         return self.nextObsoleteReclaimDelayNsLocked();
     }
 
+    pub fn nextMaintenanceWakeDelayNsBestEffort(self: *Backend) ?u64 {
+        if (!self.mu.tryLock()) return null;
+        defer self.mu.unlock();
+
+        var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
+        if (self.nextMutableIdleFlushDelayNsLocked()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        return delay_ns;
+    }
+
+    fn nextMutableIdleFlushDelayNsLocked(self: *Backend) ?u64 {
+        if (self.options.mutable_idle_flush_after_ns == 0 or
+            self.mutable_idle_flush_deadline_ns == 0 or
+            self.mutable.entries.items.len == 0 or
+            self.root_dir == null or
+            self.storage == null or
+            self.options.backend.read_only or
+            self.bulkIngestActive()) return null;
+
+        const now_ns = self.nowNs();
+        const delay_ns = if (self.mutable_idle_flush_deadline_ns <= now_ns)
+            0
+        else
+            self.mutable_idle_flush_deadline_ns - now_ns;
+        if (delay_ns == 0) self.cached_maintenance_hint.store(1, .release);
+        return delay_ns;
+    }
+
     fn nextObsoleteReclaimDelayNsLocked(self: *Backend) ?u64 {
         if (self.obsolete_paths.items.len == 0) return null;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return null;
@@ -5407,7 +5461,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
                 self.recordError(err);
                 return null;
             };
-            if (!progressed) return self.backend.nextObsoleteReclaimDelayNsBestEffort();
+            if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
         }
         lockWorkerMutex(&self.mutex);
@@ -7354,6 +7408,53 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+}
+
+test "lsm backend idle mutable deadline checkpoints retained wal" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-idle-mutable-checkpoint";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .mutable_idle_flush_after_ns = 100,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+
+    const first_deadline = backend.mutable_idle_flush_deadline_ns;
+    storage.tick = first_deadline - 1;
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "bravo");
+        try txn.commit();
+    }
+    try std.testing.expect(backend.mutable_idle_flush_deadline_ns > first_deadline);
+
+    storage.tick = backend.mutable_idle_flush_deadline_ns;
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+    try std.testing.expect(try backend.runMaintenanceStep());
+
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("bravo", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
 }
 
 fn expectWalRetentionCacheMatchesStorage(backend: *Backend) !void {

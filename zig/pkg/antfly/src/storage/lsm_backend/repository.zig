@@ -23,12 +23,21 @@ const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
 
 const max_run_file_read_bytes = 512 * 1024 * 1024;
+// Run splitting is based on logical entry bytes, while the reader limit covers
+// the complete encoded table (entry blocks, offsets, Bloom filters, block
+// bounds, checksums, and the footer). Reserve enough space for that metadata;
+// the writer also rejects any finished file that exceeds the hard reader cap.
+const max_run_file_write_payload_bytes = max_run_file_read_bytes * 7 / 8;
 const max_manifest_read_bytes = 128 * 1024 * 1024;
 const table_write_buffer_size = 256 * 1024;
 const table_builder_accounting_step_bytes: u64 = 64 * 1024;
 
 pub fn maxRunFileReadBytes() usize {
     return max_run_file_read_bytes;
+}
+
+pub fn maxRunFileWritePayloadBytes() usize {
+    return max_run_file_write_payload_bytes;
 }
 
 pub fn maxManifestReadBytes() usize {
@@ -351,6 +360,7 @@ pub fn persistRunFileWithStorageAccounted(
         root_dir,
         run.id,
         state.entries.items.len,
+        max_run_file_read_bytes,
         lsm_table_file.default_filter_config,
         compression_policy,
         prefix_extractor,
@@ -907,6 +917,7 @@ pub const StreamingRunFileWriter = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     tracked_builder_bytes: u64 = 0,
     last_reported_builder_bytes: u64 = 0,
+    max_file_bytes: usize = max_run_file_read_bytes,
 
     pub fn initInPlace(
         self: *StreamingRunFileWriter,
@@ -915,12 +926,17 @@ pub const StreamingRunFileWriter = struct {
         root_dir: []const u8,
         run_id: u64,
         expected_entries: usize,
+        max_file_bytes: usize,
         bloom_config: bloom.Config,
         compression_policy: lsm_table_file.CompressionPolicy,
         prefix_extractor: lsm_table_file.PrefixExtractor,
         resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !void {
-        self.* = .{ .allocator = allocator, .resource_manager = resource_manager };
+        self.* = .{
+            .allocator = allocator,
+            .resource_manager = resource_manager,
+            .max_file_bytes = max_file_bytes,
+        };
         try ensureOpenDirsWithStorage(storage, root_dir);
         self.path = try runPath(allocator, root_dir, run_id);
         errdefer {
@@ -982,6 +998,7 @@ pub const StreamingRunFileWriter = struct {
         self.observeBuilderWorkingSet(true);
         var encoded = try self.encoder.finish();
         errdefer encoded.filter.deinit(self.allocator);
+        if (encoded.size_bytes > self.max_file_bytes) return error.TableFileTooLarge;
         self.observeBuilderWorkingSet(true);
         self.encoder_active = false;
         self.encoder.deinit();
@@ -1085,6 +1102,44 @@ test "repository run table index load surfaces missing run file" {
         error.FileNotFound,
         loadRunTableIndexAllocWithStorage(storage.storage(), allocator, missing_path),
     );
+}
+
+test "repository refuses to publish a streaming run above the reader cap" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    try std.testing.expect(maxRunFileWritePayloadBytes() < maxRunFileReadBytes());
+
+    const root_dir = "/repository-streaming-run-reader-cap";
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage.storage(),
+        allocator,
+        root_dir,
+        1,
+        1,
+        32,
+        .{},
+        .none,
+        .none,
+        null,
+    );
+    var writer_active = true;
+    defer if (writer_active) writer.deinit();
+
+    try writer.appendEntry(.{
+        .namespace_name = "docs",
+        .key = "doc:a",
+        .value = "alpha",
+    });
+    try std.testing.expectError(error.TableFileTooLarge, writer.finish());
+    writer.deinit();
+    writer_active = false;
+
+    const path = try runPath(allocator, root_dir, 1);
+    defer allocator.free(path);
+    try std.testing.expectError(error.FileNotFound, storage.storage().readFileAlloc(allocator, path, 1024));
 }
 
 test "repository rejects forged run metadata length before allocating" {

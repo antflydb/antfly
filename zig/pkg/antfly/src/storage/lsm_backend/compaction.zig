@@ -2025,6 +2025,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 backend.root_dir.?,
                 run_id,
                 expected_entries,
+                repository_mod.maxRunFileReadBytes(),
                 backend.options.bloom,
                 backend.options.table_block_compression,
                 backend.options.table_prefix_extractor,
@@ -2583,6 +2584,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         backend.root_dir.?,
         run_id,
         entries.len,
+        repository_mod.maxRunFileReadBytes(),
         backend.options.bloom,
         backend.options.table_block_compression,
         backend.options.table_prefix_extractor,
@@ -2695,7 +2697,11 @@ fn disarmRun(run: *Run) void {
 }
 
 fn targetRunFileBytes(comptime BackendType: type, backend: *BackendType) usize {
-    return @max(@as(usize, 1), @min(backend.options.max_run_file_bytes, lsm_table_file.max_entry_data_len));
+    return @max(@as(usize, 1), @min(
+        backend.options.max_run_file_bytes,
+        lsm_table_file.max_entry_data_len,
+        repository_mod.maxRunFileWritePayloadBytes(),
+    ));
 }
 
 fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, target_bytes: usize, partition_prefix_bytes: usize) usize {

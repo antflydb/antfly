@@ -4907,6 +4907,7 @@ pub const DataServer = struct {
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
             const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
+            var maintenance_progressed = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
                 const did_work = live_write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
@@ -4931,6 +4932,7 @@ pub const DataServer = struct {
                     completed = true;
                     break;
                 }
+                maintenance_progressed = true;
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
                 if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
@@ -4940,6 +4942,14 @@ pub const DataServer = struct {
                 }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
+            // Runtime table status caches include physical LSM state. A flush,
+            // checkpoint, compaction, or obsolete-file reclaim invalidates
+            // those bytes even when no request mutates the logical table.
+            if (maintenance_progressed) {
+                self.invalidateRuntimeStatusDiskUsageCache();
+                self.runtime_status_dirty.store(true, .release);
+                self.markStoreStatusDirtyImmediate();
+            }
             // Bulk loads can leave leaf postings with stale quantized payloads
             // (deferred splits), which forces exact member scoring on every
             // query that visits them. Drain a bounded amount of that repair
@@ -8595,6 +8605,12 @@ pub const DataServer = struct {
             .lsm_root_generation = lsm_root_generation,
         }) catch {};
         return disk_bytes;
+    }
+
+    fn invalidateRuntimeStatusDiskUsageCache(self: *DataServer) void {
+        lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+        defer self.runtime_status_disk_usage_cache_mutex.unlock();
+        self.runtime_status_disk_usage_cache.clearRetainingCapacity();
     }
 
     fn joinLocalGroupStatusRefreshThread(self: *DataServer) void {

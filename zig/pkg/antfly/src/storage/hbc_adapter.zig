@@ -1701,7 +1701,7 @@ pub const HBCIndex = struct {
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
         return switch (self.env_owner) {
-            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
             .lmdb => null,
         };
     }

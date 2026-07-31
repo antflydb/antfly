@@ -218,7 +218,9 @@ fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTabl
 
 fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     const BackendType = @TypeOf(backend.*);
-    if (@hasDecl(BackendType, "notePotentialMaintenanceDebtLocked")) {
+    if (@hasDecl(BackendType, "noteWriteMutationLocked")) {
+        backend.noteWriteMutationLocked();
+    } else if (@hasDecl(BackendType, "notePotentialMaintenanceDebtLocked")) {
         backend.notePotentialMaintenanceDebtLocked();
     } else if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) {
         backend.notePotentialMaintenanceDebt();
