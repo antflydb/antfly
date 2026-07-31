@@ -479,6 +479,9 @@ func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location, co
 			fmt.Fprintf(os.Stderr, "  - %s: %s\n", table.Name, table.Status)
 		}
 	}
+	if result.Status != "completed" {
+		return fmt.Errorf("cluster backup did not complete: status %s", result.Status)
+	}
 	return nil
 }
 

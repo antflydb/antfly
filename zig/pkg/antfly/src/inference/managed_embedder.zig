@@ -219,20 +219,24 @@ const RequestPacer = struct {
 
     fn acquire(self: *RequestPacer, io: std.Io, deadline_ns: ?u64) !void {
         if (self.capacity <= 1.0) {
-            lockAtomic(&self.mutex);
-            const now_ns = monotonicNowNs();
-            const send_at_ns = @max(now_ns, self.next_send_ns);
-            const wait_ns = send_at_ns - now_ns;
-            if (deadline_ns) |deadline| {
-                if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
+            while (true) {
+                lockAtomic(&self.mutex);
+                const now_ns = monotonicNowNs();
+                if (now_ns >= self.next_send_ns) {
+                    self.next_send_ns = now_ns +| self.interval_ns +| pacing_safety_margin_ns;
                     self.mutex.unlock();
-                    return error.Timeout;
+                    return;
                 }
+                const wait_ns = self.next_send_ns - now_ns;
+                if (deadline_ns) |deadline| {
+                    if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
+                        self.mutex.unlock();
+                        return error.Timeout;
+                    }
+                }
+                self.mutex.unlock();
+                try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
             }
-            self.next_send_ns = send_at_ns +| self.interval_ns +| pacing_safety_margin_ns;
-            self.mutex.unlock();
-            if (wait_ns > 0) try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
-            return;
         }
 
         while (true) {

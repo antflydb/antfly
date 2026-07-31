@@ -17,6 +17,7 @@ pub const config = @import("config.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
+pub const remote_content_runtime = @import("remote_content_runtime.zig");
 pub const health_server = @import("health_server.zig");
 pub const prometheus = @import("prometheus.zig");
 pub const group_ids = @import("group_ids.zig");
@@ -31,6 +32,7 @@ test {
     _ = http;
     _ = audio_runtime;
     _ = secrets;
+    _ = remote_content_runtime;
     _ = health_server;
     _ = prometheus;
     _ = group_ids;
@@ -38,8 +40,4 @@ test {
     _ = fs_paths;
     _ = byte_copy;
     _ = cache_budget;
-}
-
-test "cache budget atomically enforces its hard limit" {
-    try cache_budget.testHardLimit();
 }

@@ -16,7 +16,8 @@ const std = @import("std");
 const lsm_table_file = @import("table_file.zig");
 
 pub const magic = "ALSMMAN1";
-pub const version: u32 = 8;
+pub const version: u32 = 9;
+const checksum_len: usize = @sizeOf(u32);
 
 pub const RunMeta = struct {
     id: u64,
@@ -151,23 +152,30 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
         try appendU32(allocator, &bytes, @intCast(obsolete.path.len));
         try bytes.appendSlice(allocator, obsolete.path);
     }
+    try appendU32(allocator, &bytes, std.hash.Crc32.hash(bytes.items));
 
     return try bytes.toOwnedSlice(allocator);
 }
 
 pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest {
+    const body = try verifiedBody(raw);
     var cursor: usize = 0;
-    if (raw.len < magic.len + 12) return error.InvalidManifest;
-    if (!std.mem.eql(u8, raw[0..magic.len], magic)) return error.InvalidManifest;
+    if (body.len < magic.len + 20) return error.InvalidManifest;
+    if (!std.mem.eql(u8, body[0..magic.len], magic)) return error.InvalidManifest;
     cursor += magic.len;
 
-    const found_version = try readU32(raw, &cursor);
+    const found_version = try readU32(body, &cursor);
     if (found_version != version) return error.UnsupportedVersion;
 
+    const next_run_id = try readU64(body, &cursor);
+    const run_count: usize = @intCast(try readU32(body, &cursor));
+    const obsolete_count: usize = @intCast(try readU32(body, &cursor));
+    if (run_count > (body.len - cursor) / 84) return error.InvalidManifest;
+    if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
     var out: OwnedManifest = .{
-        .next_run_id = try readU64(raw, &cursor),
-        .runs = try allocator.alloc(OwnedRunMeta, @intCast(try readU32(raw, &cursor))),
-        .obsolete_paths = try allocator.alloc(OwnedObsoletePathMeta, @intCast(try readU32(raw, &cursor))),
+        .next_run_id = next_run_id,
+        .runs = try allocator.alloc(OwnedRunMeta, run_count),
+        .obsolete_paths = try allocator.alloc(OwnedObsoletePathMeta, obsolete_count),
     };
     errdefer {
         allocator.free(out.runs);
@@ -184,60 +192,68 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
     }
 
     for (out.runs) |*run| {
-        const id = try readU64(raw, &cursor);
-        const level = try readU32(raw, &cursor);
-        const size_bytes = try readU64(raw, &cursor);
-        const compression_stats = try readCompressionStats(raw, &cursor);
-        const path_len: usize = @intCast(try readU32(raw, &cursor));
-        const smallest_namespace_len: usize = @intCast(try readU32(raw, &cursor));
-        const smallest_len: usize = @intCast(try readU32(raw, &cursor));
-        const largest_namespace_len: usize = @intCast(try readU32(raw, &cursor));
-        const largest_len: usize = @intCast(try readU32(raw, &cursor));
-        const entry_count = try readU32(raw, &cursor);
+        const id = try readU64(body, &cursor);
+        const level = try readU32(body, &cursor);
+        const size_bytes = try readU64(body, &cursor);
+        const compression_stats = try readCompressionStats(body, &cursor);
+        const path_len: usize = @intCast(try readU32(body, &cursor));
+        const smallest_namespace_len: usize = @intCast(try readU32(body, &cursor));
+        const smallest_len: usize = @intCast(try readU32(body, &cursor));
+        const largest_namespace_len: usize = @intCast(try readU32(body, &cursor));
+        const largest_len: usize = @intCast(try readU32(body, &cursor));
+        const entry_count = try readU32(body, &cursor);
+        if (id == 0 or path_len == 0) return error.InvalidManifest;
 
         run.* = .{
             .id = id,
             .level = level,
             .size_bytes = size_bytes,
             .compression_stats = compression_stats,
-            .path = try allocator.dupe(u8, try readSlice(raw, &cursor, path_len)),
-            .smallest_namespace_name = if (smallest_namespace_len > 0) try allocator.dupe(u8, try readSlice(raw, &cursor, smallest_namespace_len)) else null,
-            .smallest_key = try allocator.dupe(u8, try readSlice(raw, &cursor, smallest_len)),
-            .largest_namespace_name = if (largest_namespace_len > 0) try allocator.dupe(u8, try readSlice(raw, &cursor, largest_namespace_len)) else null,
-            .largest_key = try allocator.dupe(u8, try readSlice(raw, &cursor, largest_len)),
+            .path = try allocator.dupe(u8, try readSlice(body, &cursor, path_len)),
+            .smallest_namespace_name = if (smallest_namespace_len > 0) try allocator.dupe(u8, try readSlice(body, &cursor, smallest_namespace_len)) else null,
+            .smallest_key = try allocator.dupe(u8, try readSlice(body, &cursor, smallest_len)),
+            .largest_namespace_name = if (largest_namespace_len > 0) try allocator.dupe(u8, try readSlice(body, &cursor, largest_namespace_len)) else null,
+            .largest_key = try allocator.dupe(u8, try readSlice(body, &cursor, largest_len)),
             .entry_count = entry_count,
         };
         initialized += 1;
     }
 
     for (out.obsolete_paths) |*obsolete| {
-        const delete_after_ns = try readU64(raw, &cursor);
-        const path_len: usize = @intCast(try readU32(raw, &cursor));
+        const delete_after_ns = try readU64(body, &cursor);
+        const path_len: usize = @intCast(try readU32(body, &cursor));
+        if (path_len == 0) return error.InvalidManifest;
         obsolete.* = .{
             .delete_after_ns = delete_after_ns,
-            .path = try allocator.dupe(u8, try readSlice(raw, &cursor, path_len)),
+            .path = try allocator.dupe(u8, try readSlice(body, &cursor, path_len)),
         };
         obsolete_initialized += 1;
     }
 
-    if (cursor != raw.len) return error.InvalidManifest;
+    if (cursor != body.len) return error.InvalidManifest;
     return out;
 }
 
 pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !BorrowedManifest {
+    const body = try verifiedBody(raw);
     var cursor: usize = 0;
-    if (raw.len < magic.len + 12) return error.InvalidManifest;
-    if (!std.mem.eql(u8, raw[0..magic.len], magic)) return error.InvalidManifest;
+    if (body.len < magic.len + 20) return error.InvalidManifest;
+    if (!std.mem.eql(u8, body[0..magic.len], magic)) return error.InvalidManifest;
     cursor += magic.len;
 
-    const found_version = try readU32(raw, &cursor);
+    const found_version = try readU32(body, &cursor);
     if (found_version != version) return error.UnsupportedVersion;
 
+    const next_run_id = try readU64(body, &cursor);
+    const run_count: usize = @intCast(try readU32(body, &cursor));
+    const obsolete_count: usize = @intCast(try readU32(body, &cursor));
+    if (run_count > (body.len - cursor) / 84) return error.InvalidManifest;
+    if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
     const out: BorrowedManifest = .{
         .raw = raw,
-        .next_run_id = try readU64(raw, &cursor),
-        .runs = try allocator.alloc(BorrowedRunMeta, @intCast(try readU32(raw, &cursor))),
-        .obsolete_paths = try allocator.alloc(BorrowedObsoletePathMeta, @intCast(try readU32(raw, &cursor))),
+        .next_run_id = next_run_id,
+        .runs = try allocator.alloc(BorrowedRunMeta, run_count),
+        .obsolete_paths = try allocator.alloc(BorrowedObsoletePathMeta, obsolete_count),
     };
     errdefer {
         allocator.free(out.runs);
@@ -245,42 +261,52 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
     }
 
     for (out.runs) |*run| {
-        const id = try readU64(raw, &cursor);
-        const level = try readU32(raw, &cursor);
-        const size_bytes = try readU64(raw, &cursor);
-        const compression_stats = try readCompressionStats(raw, &cursor);
-        const path_len: usize = @intCast(try readU32(raw, &cursor));
-        const smallest_namespace_len: usize = @intCast(try readU32(raw, &cursor));
-        const smallest_len: usize = @intCast(try readU32(raw, &cursor));
-        const largest_namespace_len: usize = @intCast(try readU32(raw, &cursor));
-        const largest_len: usize = @intCast(try readU32(raw, &cursor));
-        const entry_count = try readU32(raw, &cursor);
+        const id = try readU64(body, &cursor);
+        const level = try readU32(body, &cursor);
+        const size_bytes = try readU64(body, &cursor);
+        const compression_stats = try readCompressionStats(body, &cursor);
+        const path_len: usize = @intCast(try readU32(body, &cursor));
+        const smallest_namespace_len: usize = @intCast(try readU32(body, &cursor));
+        const smallest_len: usize = @intCast(try readU32(body, &cursor));
+        const largest_namespace_len: usize = @intCast(try readU32(body, &cursor));
+        const largest_len: usize = @intCast(try readU32(body, &cursor));
+        const entry_count = try readU32(body, &cursor);
+        if (id == 0 or path_len == 0) return error.InvalidManifest;
 
         run.* = .{
             .id = id,
             .level = level,
             .size_bytes = size_bytes,
             .compression_stats = compression_stats,
-            .path = try readSlice(raw, &cursor, path_len),
-            .smallest_namespace_name = if (smallest_namespace_len > 0) try readSlice(raw, &cursor, smallest_namespace_len) else null,
-            .smallest_key = try readSlice(raw, &cursor, smallest_len),
-            .largest_namespace_name = if (largest_namespace_len > 0) try readSlice(raw, &cursor, largest_namespace_len) else null,
-            .largest_key = try readSlice(raw, &cursor, largest_len),
+            .path = try readSlice(body, &cursor, path_len),
+            .smallest_namespace_name = if (smallest_namespace_len > 0) try readSlice(body, &cursor, smallest_namespace_len) else null,
+            .smallest_key = try readSlice(body, &cursor, smallest_len),
+            .largest_namespace_name = if (largest_namespace_len > 0) try readSlice(body, &cursor, largest_namespace_len) else null,
+            .largest_key = try readSlice(body, &cursor, largest_len),
             .entry_count = entry_count,
         };
     }
 
     for (out.obsolete_paths) |*obsolete| {
-        const delete_after_ns = try readU64(raw, &cursor);
-        const path_len: usize = @intCast(try readU32(raw, &cursor));
+        const delete_after_ns = try readU64(body, &cursor);
+        const path_len: usize = @intCast(try readU32(body, &cursor));
+        if (path_len == 0) return error.InvalidManifest;
         obsolete.* = .{
             .delete_after_ns = delete_after_ns,
-            .path = try readSlice(raw, &cursor, path_len),
+            .path = try readSlice(body, &cursor, path_len),
         };
     }
 
-    if (cursor != raw.len) return error.InvalidManifest;
+    if (cursor != body.len) return error.InvalidManifest;
     return out;
+}
+
+fn verifiedBody(raw: []const u8) ![]const u8 {
+    if (raw.len < checksum_len) return error.InvalidManifest;
+    const body = raw[0 .. raw.len - checksum_len];
+    const expected = std.mem.readInt(u32, raw[raw.len - checksum_len ..][0..checksum_len], .little);
+    if (std.hash.Crc32.hash(body) != expected) return error.InvalidManifest;
+    return body;
 }
 
 fn appendU32(allocator: std.mem.Allocator, bytes: *std.ArrayListUnmanaged(u8), value: u32) !void {
@@ -485,4 +511,30 @@ test "manifest borrowed codec round trips run metadata" {
 
 test "manifest codec rejects invalid header" {
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(std.testing.allocator, "bad"));
+}
+
+test "manifest codec rejects plausible checksummed run metadata corruption" {
+    const encoded = try encodeAlloc(std.testing.allocator, .{
+        .next_run_id = 8,
+        .runs = &.{.{
+            .id = 7,
+            .level = 0,
+            .size_bytes = 700,
+            .path = "runs/000007.tbl",
+            .smallest_namespace_name = null,
+            .smallest_key = "doc:a",
+            .largest_namespace_name = null,
+            .largest_key = "doc:z",
+            .entry_count = 24,
+        }},
+    });
+    defer std.testing.allocator.free(encoded);
+
+    // Preserve a structurally plausible level while invalidating the checksum.
+    const level_offset = magic.len + @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32) * 2 + @sizeOf(u64);
+    encoded[level_offset] ^= 0x01;
+    try std.testing.expectError(
+        error.InvalidManifest,
+        decodeAlloc(std.testing.allocator, encoded),
+    );
 }

@@ -4053,6 +4053,8 @@ pub export fn antfly_db_search_json(
             if (full_result) |*value| value.deinit();
         }
         if (!agg_source_is_full) {
+            if (result.total_hits > aggregations_mod.max_aggregation_source_hits)
+                return capi.mapError(error.QueryCandidateBudgetExceeded);
             var agg_req = req;
             agg_req.offset = 0;
             agg_req.limit = if (result.total_hits == 0) 1 else result.total_hits;

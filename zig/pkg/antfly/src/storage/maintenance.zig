@@ -164,7 +164,7 @@ pub const Coordinator = struct {
         runtime.io().?.randomSecure(std.mem.asBytes(&seed_random)) catch {
             seed_random = std.hash.Wyhash.hash(0x616e74666c792d6d, std.mem.asBytes(&seed));
         };
-        return initWithSeed(allocator, source, runtime, seed_random);
+        return try initWithSeed(allocator, source, runtime, seed_random);
     }
 
     fn initWithSeed(
@@ -172,12 +172,12 @@ pub const Coordinator = struct {
         source: Source,
         runtime: *background_runtime.BackendRuntime,
         seed: u64,
-    ) Coordinator {
+    ) !Coordinator {
         return .{
             .allocator = allocator,
             .source = source,
             .durable_jobs = runtime.durable_jobs,
-            .job_owner_id = runtime.allocOwnerId(),
+            .job_owner_id = try runtime.allocOwnerId(),
             .id_seed = if (seed == 0) 1 else seed,
         };
     }
@@ -413,9 +413,9 @@ test "storage maintenance job ids are namespaced by server boot" {
     };
     var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer runtime.deinit();
-    var first = Coordinator.initWithSeed(std.testing.allocator, source, runtime.ptr(), 11);
+    var first = try Coordinator.initWithSeed(std.testing.allocator, source, runtime.ptr(), 11);
     defer first.deinit();
-    var second = Coordinator.initWithSeed(std.testing.allocator, source, runtime.ptr(), 12);
+    var second = try Coordinator.initWithSeed(std.testing.allocator, source, runtime.ptr(), 12);
     defer second.deinit();
     const first_id = first.nextJobIdLocked().?;
     const second_id = second.nextJobIdLocked().?;

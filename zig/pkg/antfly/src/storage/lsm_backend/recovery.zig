@@ -154,6 +154,13 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
         defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
         try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
+        // A durable file or manifest below a newly-created root cannot make
+        // the root's own parent entry survive a crash. Publish that structural
+        // boundary once, before any transaction can report full durability.
+        // Existing-manifest opens skip this path and pay no startup fsync.
+        if (backend.options.backend.durability == .full) {
+            try backend.storage.?.syncParentAbsolute(backend.root_dir.?);
+        }
         if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {

@@ -1164,6 +1164,38 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     if (metaF32(view, &key_buf, arch, "final_logit_softcapping")) |value| config.final_logit_softcapping = value;
 
     if (metaF32(view, &key_buf, arch, "rope.freq_base_swa")) |value| config.rope_local_theta = value;
+    applyAntflyMultimodalGgufMetadata(view, &config);
+
+    // DeepSeek V4. Every field below was previously reachable only from an HF
+    // config.json, so a real ds4 GGUF got family defaults and nothing else -- the
+    // hash-MoE layer count in particular, without which the first layers are treated as
+    // scored-routing layers and demand a router bias the file does not carry.
+    if (config.family == .deepseek_v4) {
+        if (metaU32(view, &key_buf, arch, "hash_layer_count")) |value| config.deepseek_v4_hash_moe_layers = value;
+        if (metaU32(view, &key_buf, arch, "attention.q_lora_rank")) |value| config.deepseek_v4_q_lora_rank = value;
+        if (metaU32(view, &key_buf, arch, "attention.kv_lora_rank")) |value| config.deepseek_v4_kv_lora_rank = value;
+        // For MLA architectures llama.cpp writes the RoPE'd slice of the head as
+        // rope.dimension_count, which is what qk_rope_head_dim means here. The generic
+        // path already reads the same key to derive rope_partial_factor.
+        if (metaU32(view, &key_buf, arch, "rope.dimension_count")) |value| config.deepseek_v4_qk_rope_head_dim = value;
+        if (metaU32(view, &key_buf, arch, "attention.output_lora_rank")) |value| config.deepseek_v4_o_lora_rank = value;
+        if (metaU32(view, &key_buf, arch, "attention.output_group_count")) |value| config.deepseek_v4_o_groups = value;
+        if (metaU32(view, &key_buf, arch, "attention.indexer.head_count")) |value| config.deepseek_v4_index_n_heads = value;
+        if (metaU32(view, &key_buf, arch, "attention.indexer.key_length")) |value| config.deepseek_v4_index_head_dim = value;
+        if (metaU32(view, &key_buf, arch, "attention.indexer.top_k")) |value| config.deepseek_v4_index_topk = value;
+        if (metaU32(view, &key_buf, arch, "nextn_predict_layers")) |value| config.deepseek_v4_num_nextn_predict_layers = value;
+        if (metaU32(view, &key_buf, arch, "hyper_connection.count")) |value| config.deepseek_v4_hc_mult = value;
+        if (metaU32(view, &key_buf, arch, "hyper_connection.sinkhorn_iterations")) |value| config.deepseek_v4_hc_sinkhorn_iters = value;
+        if (metaF32(view, &key_buf, arch, "hyper_connection.epsilon")) |value| config.deepseek_v4_hc_eps = value;
+        if (metaF32(view, &key_buf, arch, "attention.compress_rope_freq_base")) |value| config.deepseek_v4_compress_rope_theta = value;
+        if (metaF32(view, &key_buf, arch, "expert_weights_scale")) |value| config.deepseek_v4_routed_scaling_factor = value;
+        if (metaBool(view, &key_buf, arch, "expert_weights_norm")) |value| config.deepseek_v4_norm_topk_prob = value;
+        if (metaU32(view, &key_buf, arch, "rope.scaling.original_context_length")) |value| config.deepseek_v4_original_seq_len = value;
+        if (metaF32(view, &key_buf, arch, "rope.scaling.yarn_beta_fast")) |value| config.deepseek_v4_beta_fast = value;
+        if (metaF32(view, &key_buf, arch, "rope.scaling.yarn_beta_slow")) |value| config.deepseek_v4_beta_slow = value;
+        if (metaF32(view, &key_buf, arch, "rope.scaling.factor")) |value| config.deepseek_v4_rope_factor = value;
+        parseDeepseekV4CompressRatiosFromGguf(&config, view, arch);
+    }
 
     // Gemma 4: shared KV cache and per-layer GQA. Apply explicit global head
     // metadata before deriving rope_partial_factor from rope.dimension_count.
@@ -1229,6 +1261,30 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     return config;
 }
 
+fn applyAntflyMultimodalGgufMetadata(view: gguf_metadata.View, config: *Config) void {
+    if (ggufTokenId(view, "inference.multimodal.image_token_id")) |value| config.image_token_index = value;
+    if (ggufTokenId(view, "inference.multimodal.boi_token_id")) |value| config.boi_token_index = value;
+    if (ggufTokenId(view, "inference.multimodal.eoi_token_id")) |value| config.eoi_token_index = value;
+    if (ggufMetadataU32(view, "inference.multimodal.tokens_per_image")) |value| config.mm_tokens_per_image = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.hidden_size")) |value| config.vision_hidden_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.embedding_length")) |value| config.vision_embed_dim = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.block_count")) |value| config.vision_num_hidden_layers = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.attention.head_count")) |value| config.vision_num_attention_heads = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.feed_forward_length")) |value| config.vision_intermediate_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.image_size")) |value| config.vision_image_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.patch_size")) |value| config.vision_patch_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.mlp_ratio")) |value| config.vision_mlp_ratio = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.spatial_merge_size")) |value| config.vision_spatial_merge_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.temporal_patch_size")) |value| config.vision_temporal_patch_size = value;
+    if (view.getBool("inference.multimodal.vision.use_quick_gelu")) |value| config.vision_use_quick_gelu = value;
+}
+
+fn ggufMetadataU32(view: gguf_metadata.View, key: []const u8) ?u32 {
+    const value = view.getU64(key) orelse return null;
+    if (value > std.math.maxInt(u32)) return null;
+    return @intCast(value);
+}
+
 fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) void {
     if (ggufTokenId(view, "tokenizer.ggml.eos_token_id")) |token_id| {
         addEosTokenId(config, token_id);
@@ -1287,6 +1343,51 @@ fn metaBool(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []
 }
 
 /// Read element at index from an i32/u32 metadata array.
+/// Populate the DeepSeek V4 per-layer attention schedule from the GGUF
+/// `attention.compress_ratios` array.
+///
+/// Mirrors `parseDeepseekV4CompressRatios`, which reads the same values out of an HF
+/// config.json: 0 means sliding attention, and the two configured compress rates select
+/// compressed-sparse or heavily-compressed attention. The array carries one entry per
+/// block plus a trailing entry for the MTP layer, so it is clamped to the block count.
+/// Without this the schedule stays `.unknown` and dispatch fails with
+/// UnsupportedDeepSeekV4AttentionSchedule.
+fn parseDeepseekV4CompressRatiosFromGguf(config: *Config, view: gguf_metadata.View, arch: []const u8) void {
+    var key_buf: [96]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}.attention.compress_ratios", .{arch}) catch return;
+    const entry = view.find(key) orelse return;
+    const arr = switch (entry.value) {
+        .array => |value| value,
+        else => return,
+    };
+
+    const schedule_len = @min(@min(arr.values.len, deepseek_v4_max_layers), @as(usize, @intCast(config.num_hidden_layers)));
+    if (schedule_len == 0) return;
+
+    config.deepseek_v4_sliding_attention_layers = 0;
+    config.deepseek_v4_compressed_sparse_attention_layers = 0;
+    config.deepseek_v4_heavily_compressed_attention_layers = 0;
+    config.deepseek_v4_attention_schedule_len = @intCast(schedule_len);
+
+    for (arr.values[0..schedule_len], 0..) |value, idx| {
+        const ratio: u32 = switch (value) {
+            .i32 => |v| if (v >= 0) @intCast(v) else continue,
+            .u32 => |v| v,
+            else => continue,
+        };
+        if (ratio == 0) {
+            config.deepseek_v4_sliding_attention_layers += 1;
+            config.deepseek_v4_attention_schedule[idx] = .sliding_attention;
+        } else if (config.deepseek_v4_compress_rate_csa > 0 and ratio == config.deepseek_v4_compress_rate_csa) {
+            config.deepseek_v4_compressed_sparse_attention_layers += 1;
+            config.deepseek_v4_attention_schedule[idx] = .compressed_sparse_attention;
+        } else if (config.deepseek_v4_compress_rate_hca > 0 and ratio == config.deepseek_v4_compress_rate_hca) {
+            config.deepseek_v4_heavily_compressed_attention_layers += 1;
+            config.deepseek_v4_attention_schedule[idx] = .heavily_compressed_attention;
+        }
+    }
+}
+
 fn metaI32FromArrayAt(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8, index: usize) ?u32 {
     const key = std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, suffix }) catch return null;
     const entry = view.find(key) orelse return null;
@@ -1342,7 +1443,7 @@ fn metaSlidingPatternFromBoolArray(view: gguf_metadata.View, buf: *[96]u8, arch:
     }
 }
 
-fn detectFamily(model_type: []const u8) ModelFamily {
+pub fn detectFamily(model_type: []const u8) ModelFamily {
     const families = .{
         .{ "gpt2", ModelFamily.gpt2 },
         .{ "gpt_neo", ModelFamily.gpt_neo },
@@ -1372,6 +1473,12 @@ fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "deepseek-v4-pro", ModelFamily.deepseek_v4 },
         .{ "deepseek-v4-pro-base", ModelFamily.deepseek_v4 },
         .{ "deepseekv4", ModelFamily.deepseek_v4 },
+        // The name llama.cpp actually writes to general.architecture, and the prefix it
+        // uses for every metadata key ("deepseek4.block_count", ...). Every spelling
+        // above is an HF config.json model_type; without this one no real DeepSeek V4
+        // GGUF is recognized, which left the whole deepseek_v4 implementation
+        // unreachable from the format it was written for.
+        .{ "deepseek4", ModelFamily.deepseek_v4 },
         .{ "gemma", ModelFamily.gemma },
         .{ "gemma2", ModelFamily.gemma },
         .{ "gemma3", ModelFamily.gemma },
@@ -1489,6 +1596,20 @@ fn applyFamilyDefaults(config: *Config) void {
 pub fn isGenerativeModel(model_type: []const u8) bool {
     if (std.mem.eql(u8, model_type, "jina_embeddings_v5")) return false;
     return detectFamily(model_type) != .other;
+}
+
+/// Whether GGUF tensor names can be mapped onto the HF-style names the runtime expects.
+///
+/// This is a mechanical fact about the code, deliberately independent of `supportLevel`.
+/// A mapping can exist for a family we refuse to generate with, and it is still needed:
+/// colqwen2 rides the qwen2 mapping as a multimodal embedding backbone, and the deepseek
+/// and phi mappings are exercised by tests. Deriving this from the policy tier meant
+/// demoting a family silently disabled its tensor names too.
+pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
+    return switch (family) {
+        .llama, .mistral, .qwen2, .qwen3, .gemma, .bitnet, .phi, .deepseek_v4 => true,
+        .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => false,
+    };
 }
 
 fn parseDeepseekV4ScoringFunc(value: []const u8) DeepseekV4ScoringFunc {

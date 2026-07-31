@@ -110,16 +110,19 @@ pub const TransitionController = struct {
         record: transition_state.SplitTransitionRecord,
         observation: transition_state.SplitObservation,
     ) SplitExecutionStateTag {
-        return if (record.rollback_reason != null)
-            if (observation.status.phase == .rolled_back) .rolled_back else .rolling_back
-        else switch (observation.status.phase) {
+        // Runtime terminal state is authoritative. A rollback request can race
+        // irreversible source cutover and must not strand the transition after
+        // storage reports finalization.
+        if (observation.status.phase == .finalized) return .finalized;
+        if (observation.status.phase == .rolled_back) return .rolled_back;
+        if (record.rollback_reason != null) return .rolling_back;
+        return switch (observation.status.phase) {
             .prepare => .awaiting_source_start,
             .bootstrap_peer => .bootstrapping_destination,
             .replay_deltas => .replay_blocked,
             .cutover_ready => .ready_to_finalize,
-            .finalized => .finalized,
             .rolling_back => .rolling_back,
-            .rolled_back => if (record.split_key != null) .awaiting_source_start else .rolled_back,
+            .finalized, .rolled_back => unreachable,
         };
     }
 
@@ -130,23 +133,27 @@ pub const TransitionController = struct {
     ) TransitionDecision {
         return switch (tag) {
             .awaiting_source_start => .{
-                .next_phase = if (observation.status.phase == .rolled_back) .prepare else .bootstrap_peer,
-                .action = if (observation.status.phase == .rolled_back)
+                .next_phase = if (observation.status.source_split_phase == null) .prepare else .bootstrap_peer,
+                .action = if (observation.status.source_split_phase == null)
                     if (record.split_key) |split_key| .{
                         .prepare_split_source = .{
                             .transition_id = record.transition_id,
+                            .attempt_epoch = record.attempt_epoch,
                             .source_group_id = record.source_group_id,
                             .destination_group_id = record.destination_group_id,
                             .split_key = split_key,
                             .source_range_end = record.source_range_end,
+                            .table_contract = record.table_contract,
                         },
                     } else .none
                 else
                     .{
                         .start_split_source = .{
                             .transition_id = record.transition_id,
+                            .attempt_epoch = record.attempt_epoch,
                             .source_group_id = record.source_group_id,
                             .destination_group_id = record.destination_group_id,
+                            .table_contract = record.table_contract,
                         },
                     },
             },
@@ -155,8 +162,10 @@ pub const TransitionController = struct {
                 .action = .{
                     .bootstrap_split_destination = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -165,8 +174,10 @@ pub const TransitionController = struct {
                 .action = .{
                     .catch_up_split_destination = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -175,8 +186,10 @@ pub const TransitionController = struct {
                 .action = .{
                     .finalize_split_source = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -189,8 +202,10 @@ pub const TransitionController = struct {
                 .action = if (observation.status.phase == .rolled_back) .none else .{
                     .rollback_split = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -205,16 +220,18 @@ pub const TransitionController = struct {
         record: transition_state.MergeTransitionRecord,
         observation: transition_state.MergeObservation,
     ) MergeExecutionStateTag {
-        return if (record.rollback_reason != null)
-            if (observation.receiver.phase == .rolled_back) .rolled_back else .rolling_back
-        else switch (observation.receiver.phase) {
+        if (observation.receiver.phase == .finalized) return .finalized;
+        if (observation.receiver.phase == .rolled_back) {
+            return if (record.rollback_reason != null) .rolled_back else .awaiting_receiver_acceptance;
+        }
+        if (record.rollback_reason != null) return .rolling_back;
+        return switch (observation.receiver.phase) {
             .prepare => .awaiting_receiver_acceptance,
             .bootstrap_peer => .bootstrapping_receiver,
             .replay_deltas => .replay_blocked,
             .cutover_ready => .ready_to_finalize,
-            .finalized => .finalized,
             .rolling_back => .rolling_back,
-            .rolled_back => .awaiting_receiver_acceptance,
+            .finalized, .rolled_back => unreachable,
         };
     }
 
@@ -232,6 +249,7 @@ pub const TransitionController = struct {
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
                         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -243,6 +261,7 @@ pub const TransitionController = struct {
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
                         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -254,6 +273,7 @@ pub const TransitionController = struct {
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
                         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -268,6 +288,8 @@ pub const TransitionController = struct {
                         .transition_id = record.transition_id,
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
+                        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -282,9 +304,28 @@ pub const TransitionController = struct {
 test "transition controller plans split start bootstrap and finalize actions" {
     const split_record = transition_state.SplitTransitionRecord{
         .transition_id = 10,
+        .attempt_epoch = 1,
         .source_group_id = 41,
         .destination_group_id = 42,
+        .split_key = "doc:m",
     };
+
+    const prepare = TransitionController.planSplit(split_record, .{
+        .status = .{
+            .phase = .prepare,
+            .source_split_phase = null,
+            .bootstrapped = false,
+            .replay_required = false,
+            .replay_caught_up = false,
+            .cutover_ready = false,
+            .destination_ready_for_reads = false,
+            .source_delta_sequence = 0,
+            .dest_delta_sequence = 0,
+        },
+    });
+    try std.testing.expectEqual(transition_state.TransitionPhase.prepare, prepare.next_phase);
+    try std.testing.expect(prepare.action == .prepare_split_source);
+    try std.testing.expectEqualStrings("doc:m", prepare.action.prepare_split_source.split_key);
 
     const start = TransitionController.planSplit(split_record, .{
         .status = .{
@@ -444,6 +485,9 @@ test "transition controller plans merge accept catch-up and rollback actions" {
     });
     try std.testing.expectEqual(transition_state.TransitionPhase.rolling_back, rollback.next_phase);
     try std.testing.expect(rollback.action == .rollback_merge);
+    try std.testing.expect(
+        rollback.action.rollback_merge.allow_doc_identity_reassignment,
+    );
 }
 
 test "transition controller preserves merge doc identity reassignment flag on finalize" {
@@ -487,9 +531,59 @@ test "transition controller preserves merge doc identity reassignment flag on fi
     try std.testing.expect(finalize.action.finalize_merge.allow_doc_identity_reassignment);
 }
 
+test "transition controller treats observed finalization as authoritative over late rollback" {
+    const split = TransitionController.planSplit(.{
+        .transition_id = 21,
+        .attempt_epoch = 1,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .rolling_back,
+        .rollback_reason = "late cancellation",
+    }, .{ .status = .{
+        .phase = .finalized,
+        .source_split_phase = .none,
+        .bootstrapped = true,
+        .replay_required = false,
+        .replay_caught_up = true,
+        .cutover_ready = true,
+        .destination_ready_for_reads = true,
+        .source_delta_sequence = 4,
+        .dest_delta_sequence = 4,
+    } });
+    try std.testing.expectEqual(transition_state.TransitionPhase.finalized, split.next_phase);
+    try std.testing.expect(split.action == .none);
+
+    const finalized_merge_status: @import("../data/mod.zig").MergeTransitionStatus = .{
+        .phase = .finalized,
+        .donor_group_id = 81,
+        .receiver_group_id = 82,
+        .receiver_accepts_donor_range = true,
+        .bootstrapped = true,
+        .replay_required = false,
+        .replay_caught_up = true,
+        .cutover_ready = true,
+        .receiver_ready_for_reads = true,
+        .donor_delta_sequence = 4,
+        .receiver_delta_sequence = 4,
+    };
+    const merge = TransitionController.planMerge(.{
+        .transition_id = 22,
+        .donor_group_id = 81,
+        .receiver_group_id = 82,
+        .phase = .rolling_back,
+        .rollback_reason = "late cancellation",
+    }, .{
+        .donor = finalized_merge_status,
+        .receiver = finalized_merge_status,
+    });
+    try std.testing.expectEqual(transition_state.TransitionPhase.finalized, merge.next_phase);
+    try std.testing.expect(merge.action == .none);
+}
+
 test "transition controller describes split and merge execution states" {
     const split = TransitionController.describeSplit(.{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 11,
     }, .{

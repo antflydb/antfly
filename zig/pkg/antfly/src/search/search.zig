@@ -369,6 +369,7 @@ pub const BoolQuery = struct {
     should: []const SearchQuery = &.{},
     must_not: []const SearchQuery = &.{},
     min_should: u32 = 0,
+    pure_should_optional: bool = false,
     boost: f32 = 1.0,
 };
 
@@ -1203,8 +1204,17 @@ fn executeGeoShape(
 ) !SearchResult {
     return executeFilterQuery(alloc, snap, .{ .geo_shape = .{
         .field = gq.field,
+        .relation = geoShapeFilterRelation(gq.relation),
         .polygons = gq.polygons,
     } }, request, gq.boost);
+}
+
+fn geoShapeFilterRelation(relation: GeoShapeRelation) query_mod.GeoShapeRelation {
+    return switch (relation) {
+        .intersects => .intersects,
+        .within => .within,
+        .contains => .contains,
+    };
 }
 
 fn executeWildcard(
@@ -1347,6 +1357,28 @@ fn buildAllDocsScoreMap(alloc: Allocator, snap: *const index_mod.IndexSnapshot) 
     defer alloc.free(doc_ids);
     for (doc_ids) |doc_id| {
         try map.put(alloc, doc_id, 1.0);
+    }
+    return map;
+}
+
+fn buildOptionalShouldBaseScoreMap(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    request: SearchRequest,
+) !ScoreMap {
+    var map: ScoreMap = .{};
+    errdefer map.deinit(alloc);
+    const doc_ids = if (request.filter_doc_nums_positive)
+        try snap.executeFilter(alloc, .{ .doc_num = .{
+            .doc_nums = request.filter_doc_nums,
+        } })
+    else
+        try snap.executeFilter(alloc, .{ .match_all = {} });
+    defer alloc.free(doc_ids);
+    for (doc_ids) |doc_id| {
+        if (!containsSortedU32(request.exclude_doc_nums, doc_id)) {
+            try map.put(alloc, doc_id, 0.0);
+        }
     }
     return map;
 }
@@ -2101,10 +2133,17 @@ fn executeSimpleTextBool(
     const text_field = field orelse return null;
     if (snap.global_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
 
-    const effective_min_should: u32 = if (should_terms.items.len > 0 and bq.min_should == 0 and must_terms.items.len == 0) 1 else bq.min_should;
+    const effective_min_should: u32 = if (should_terms.items.len > 0 and
+        bq.min_should == 0 and
+        must_terms.items.len == 0 and
+        !bq.pure_should_optional) 1 else bq.min_should;
     if (effective_min_should > should_terms.items.len) {
         return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
     }
+    // Optional pure-should queries require a zero-score candidate baseline.
+    // The all-hit path builds that baseline from the already-resolved positive
+    // document constraint, avoiding a full-index scan when a filter supplied it.
+    if (bq.pure_should_optional and must_terms.items.len == 0) return null;
 
     // A pure, minimum-one disjunction is exactly the query shape handled by
     // the production Block-Max WAND scorer. Keep constrained, prohibited,
@@ -2222,7 +2261,10 @@ fn executeBoolAllHit(
     var combined: ScoreMap = .{};
     var initialized = false;
     errdefer combined.deinit(alloc);
-    const effective_min_should: u32 = if (bq.should.len > 0 and bq.min_should == 0 and bq.must.len == 0) 1 else bq.min_should;
+    const effective_min_should: u32 = if (bq.should.len > 0 and
+        bq.min_should == 0 and
+        bq.must.len == 0 and
+        !bq.pure_should_optional) 1 else bq.min_should;
 
     for (bq.must) |sub_query| {
         const sub_hits = try executeQueryAllScored(alloc, snap, sub_query, request);
@@ -2233,6 +2275,11 @@ fn executeBoolAllHit(
         } else {
             try intersectScoresWithHits(alloc, &combined, sub_hits);
         }
+    }
+
+    if (bq.pure_should_optional and bq.must.len == 0) {
+        combined = try buildOptionalShouldBaseScoreMap(alloc, snap, request);
+        initialized = true;
     }
 
     if (bq.should.len > 0) {
@@ -2391,6 +2438,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         } },
         .geo_shape => |gq| .{ .geo_shape = .{
             .field = gq.field,
+            .relation = geoShapeFilterRelation(gq.relation),
             .polygons = gq.polygons,
         } },
         .match => |mq| blk: {
@@ -2421,13 +2469,26 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must);
             const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should);
             const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not);
-            const effective_min_should: u32 = if (should.len > 0 and bq.min_should == 0 and must.len == 0) 1 else bq.min_should;
-            break :blk .{ .bool_filter = .{
-                .must = must,
-                .should = should,
-                .must_not = must_not,
-                .min_should_match = effective_min_should,
-            } };
+            const filter_must = if (bq.pure_should_optional and must.len == 0) required: {
+                const match_all = try alloc.alloc(query_mod.Filter, 1);
+                match_all[0] = .{ .match_all = {} };
+                break :required match_all;
+            } else must;
+            const effective_min_should: u32 = if (should.len > 0 and
+                bq.min_should == 0 and
+                filter_must.len == 0 and
+                !bq.pure_should_optional) 1 else bq.min_should;
+            break :blk .{
+                .bool_filter = .{
+                    // The bitmap engine uses a missing required branch to infer a
+                    // one-clause should minimum. Preserve optional scoring should
+                    // semantics with an internal match-all membership anchor.
+                    .must = filter_must,
+                    .should = should,
+                    .must_not = must_not,
+                    .min_should_match = effective_min_should,
+                },
+            };
         },
         else => return error.InvalidArgument,
     };
@@ -2560,7 +2621,11 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .geo_shape => |gq| .{
-            .filter = .{ .geo_shape = .{ .field = gq.field, .polygons = gq.polygons } },
+            .filter = .{ .geo_shape = .{
+                .field = gq.field,
+                .relation = geoShapeFilterRelation(gq.relation),
+                .polygons = gq.polygons,
+            } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -3243,7 +3308,7 @@ fn collectStatsBatched(
 ) !void {
     // Build a set of matching doc IDs per segment
     for (snap.segments, 0..) |*seg, seg_idx| {
-        const section_data = seg.reader.getSection(field, .typed_doc_values) orelse continue;
+        const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse continue;
         var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
 
         // Collect local doc IDs that belong to this segment
@@ -3323,7 +3388,7 @@ fn readF64ForDoc(
 ) !?f64 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     return switch (reader.value_type) {
         .f64_val => try reader.getF64(resolved.local_id),
@@ -3344,7 +3409,7 @@ fn readBytesForDoc(
 ) !?[]u8 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .bytes_val) return null;
 
@@ -3372,7 +3437,7 @@ fn readU64ForDoc(
 ) !?u64 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .u64_val) return null;
     return try reader.getU64(resolved.local_id);
@@ -3387,7 +3452,7 @@ fn readGeoPointForDoc(
 ) !?geo_mod.GeoPoint {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
@@ -3508,6 +3573,60 @@ test "bool fallback applies native doc number constraints" {
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqual(@as(u32, 0), result.hits[0].doc_id);
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
+}
+
+test "optional pure should preserves zero baseline and text scores" {
+    const alloc = std.testing.allocator;
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "beta", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+    const candidates = [_]u32{ 0, 1 };
+
+    var direct = try execute(alloc, snap, .{
+        .query = .{ .term = .{ .field = "title", .term = "alpha" } },
+        .k = 10,
+        .filter_doc_nums = &candidates,
+        .filter_doc_nums_positive = true,
+    });
+    defer direct.deinit();
+    const optional_query: SearchQuery = .{ .bool_query = .{
+        .should = &.{.{ .term = .{ .field = "title", .term = "alpha" } }},
+        .pure_should_optional = true,
+    } };
+    var optional = try execute(alloc, snap, .{
+        .query = optional_query,
+        .k = 10,
+        .filter_doc_nums = &candidates,
+        .filter_doc_nums_positive = true,
+    });
+    defer optional.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), optional.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), optional.hits.len);
+    try std.testing.expectEqualStrings("doc1", optional.hits[0].id.?);
+    try std.testing.expectApproxEqAbs(direct.hits[0].score, optional.hits[0].score, 0.00001);
+    try std.testing.expectEqual(@as(f32, 0.0), optional.hits[1].score);
+
+    var filter_arena = std.heap.ArenaAllocator.init(alloc);
+    defer filter_arena.deinit();
+    const membership_filter = try searchQueryToFilterArena(
+        filter_arena.allocator(),
+        optional_query,
+    );
+    const membership = try snap.executeFilter(alloc, membership_filter);
+    defer alloc.free(membership);
+    try std.testing.expectEqualSlices(u32, &candidates, membership);
 }
 
 test "search match query with analysis" {
@@ -4344,7 +4463,7 @@ test "resolveDocId across segments" {
     try std.testing.expect(snap.resolveDocId(3) == null);
 
     // storedDoc by global ID
-    const stored = snap.storedDoc(2).?;
+    const stored = (try snap.storedDoc(2)).?;
     try std.testing.expectEqualStrings("c", stored.id);
 }
 

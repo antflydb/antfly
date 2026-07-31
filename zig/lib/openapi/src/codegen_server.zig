@@ -313,13 +313,13 @@ pub const ServerGenerator = struct {
             for (op.query_params) |p| {
                 const field_name = try naming.zigFieldName(self.arena, p.name);
                 if (p.required) {
-                    try self.w.line(".{s} = ctx.query(\"{s}\") orelse return ctx.status(400).json(.{{ .@\"error\" = \"missing_query_param\", .message = \"Missing required query parameter: {s}\" }}),", .{
+                    try self.w.line(".{s} = (try ctx.queryDecoded(\"{s}\")) orelse return ctx.status(400).json(.{{ .@\"error\" = \"missing_query_param\", .message = \"Missing required query parameter: {s}\" }}),", .{
                         field_name,
                         p.name,
                         p.name,
                     });
                 } else {
-                    try self.w.line(".{s} = ctx.query(\"{s}\"),", .{
+                    try self.w.line(".{s} = try ctx.queryDecoded(\"{s}\"),", .{
                         field_name,
                         p.name,
                     });

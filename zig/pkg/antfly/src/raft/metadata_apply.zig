@@ -224,6 +224,7 @@ test "metadata applier submits transition changes through sink" {
     try applier.apply(.{
         .upsert_split_transition = .{
             .transition_id = 501,
+            .attempt_epoch = 1,
             .source_group_id = 11,
             .destination_group_id = 12,
         },

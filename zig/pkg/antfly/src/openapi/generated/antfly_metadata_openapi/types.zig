@@ -544,7 +544,7 @@ pub const BatchRequest = struct {
     inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
@@ -785,6 +785,7 @@ pub const ClusterStatus = struct {
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
 };
 
@@ -797,6 +798,7 @@ pub const ClusterTopology = struct {
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
@@ -1938,7 +1940,7 @@ pub const QueryProfile = struct {
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -2158,7 +2160,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -2217,19 +2219,19 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
-    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
+    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
-    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
+    /// Mandatory filters from prior interactions. These are converted to structured Antfly predicates and applied to every table and every search tool invocation, including generated follow-ups, graph/tree traversal, aggregations, and root scans.
     accumulated_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    /// Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
     decisions: ?[]const AgentDecision = null,
@@ -2349,7 +2351,7 @@ pub const RetrievalAgentUsage = struct {
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -2458,6 +2460,20 @@ pub const RetrievalStrategy = enum {
     }
 };
 
+/// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
+pub const RuntimeConfigStatus = struct {
+    /// Generation of the fully validated and atomically published configuration.
+    generation: ?i64 = null,
+    /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
+    hash: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
+    last_reload_failed: ?bool = null,
+    /// Whether requests are using the last-known-good snapshot after a failed reload.
+    stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
+};
+
 /// Emitted when an error occurs during retrieval
 pub const SSEError = struct {
     /// Error message
@@ -2559,7 +2575,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
@@ -2610,8 +2626,18 @@ pub const SecretStatus = enum {
 
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
+    /// Generation of the currently published secret-store snapshot.
+    generation: ?i64 = null,
+    /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
+    supports_source_generation: ?bool = null,
+    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
+    source_generation: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed to load.
+    last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
 };
 
 pub const SecretWriteRequest = struct {
@@ -3174,7 +3200,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+    /// Value for operation (not required for $unset). Type depends on the supported operator.
     value: ?std.json.Value = null,
 };
 
@@ -3184,15 +3210,8 @@ pub const TransformOpType = enum {
     @"$set_on_insert",
     @"$unset",
     @"$inc",
-    @"$push",
-    @"$pull",
     @"$add_to_set",
-    @"$pop",
-    @"$mul",
-    @"$min",
     @"$max",
-    @"$current_date",
-    @"$rename",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -3200,15 +3219,8 @@ pub const TransformOpType = enum {
             .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
-            .@"$push" => "$push",
-            .@"$pull" => "$pull",
             .@"$add_to_set" => "$addToSet",
-            .@"$pop" => "$pop",
-            .@"$mul" => "$mul",
-            .@"$min" => "$min",
             .@"$max" => "$max",
-            .@"$current_date" => "$currentDate",
-            .@"$rename" => "$rename",
         };
         try jw.write(s);
     }
@@ -3223,15 +3235,8 @@ pub const TransformOpType = enum {
             .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
-            .{ "$push", .@"$push" },
-            .{ "$pull", .@"$pull" },
             .{ "$addToSet", .@"$add_to_set" },
-            .{ "$pop", .@"$pop" },
-            .{ "$mul", .@"$mul" },
-            .{ "$min", .@"$min" },
             .{ "$max", .@"$max" },
-            .{ "$currentDate", .@"$current_date" },
-            .{ "$rename", .@"$rename" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

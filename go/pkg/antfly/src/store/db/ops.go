@@ -205,36 +205,25 @@ func DecodeProto(data []byte, kvStoreOp *Op) error {
 	return nil
 }
 
-// WriteBackupToBlobStore writes a backup file to an S3-compatible blob store.
-func WriteBackupToBlobStore(ctx context.Context, bucketURL, filePath string, s3Info *common.S3Info) error {
-	// e.g. "s3://my-bucket-name/optional/prefix"
-	bucket, prefix, err := common.ParseS3URL(bucketURL)
+// WriteBackupToBlobStore writes a backup file to an authorized S3 location.
+func WriteBackupToBlobStore(ctx context.Context, filePath string, s3Info *common.S3Info) error {
+	bucket := s3Info.Bucket
+	prefix := s3Info.Prefix
+	minioClient, err := s3Info.EnsureBucket(ctx)
 	if err != nil {
-		return fmt.Errorf("parsing bucket URL: %w", err)
-	}
-	minioClient, err := s3Info.NewMinioClient()
-	if err != nil {
-		return fmt.Errorf("creating S3 client: %w", err)
-	}
-	if ok, err := minioClient.BucketExists(ctx, bucket); err != nil {
-		return fmt.Errorf("checking if bucket %s exists: %w", bucket, err)
-	} else if !ok {
-		return fmt.Errorf("bucket %s does not exist", bucket)
+		return err
 	}
 	// Construct object key with optional prefix
 	objectKey := path.Base(filePath)
 	if prefix != "" {
 		objectKey = path.Join(prefix, objectKey)
 	}
-	if _, err := minioClient.FPutObject(ctx, bucket, objectKey, filePath, minio.PutObjectOptions{}); err != nil {
-		_ = minioClient.RemoveObject(
-			context.Background(),
-			bucket,
-			objectKey,
-			minio.RemoveObjectOptions{
-				ForceDelete: true,
-			},
-		)
+	options := minio.PutObjectOptions{ContentType: "application/octet-stream"}
+	options.SetMatchETagExcept("*")
+	if _, err := minioClient.FPutObject(ctx, bucket, objectKey, filePath, options); err != nil {
+		if common.IsS3CreateConflict(err) {
+			return fmt.Errorf("%w: %s", common.ErrBackupAlreadyExists, objectKey)
+		}
 		return fmt.Errorf("uploading file to object store: %w", err)
 	}
 	return nil

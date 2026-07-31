@@ -939,18 +939,17 @@ pub fn applyStoredSearchPatternFilters(
 
     const source = result;
     const original_hits_len = result.hits.len;
-    var owned = result;
 
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
     defer missing_indices.deinit(alloc);
-    for (owned.hits, 0..) |hit, i| {
+    for (result.hits, 0..) |hit, i| {
         if (needs_stored and hit.stored_data == null) try missing_indices.append(alloc, i);
     }
 
     const loaded_many = if (needs_stored and executor.load_many_stored != null and missing_indices.items.len > 0) blk: {
         const keys = try alloc.alloc([]const u8, missing_indices.items.len);
         defer alloc.free(keys);
-        for (missing_indices.items, 0..) |hit_index, i| keys[i] = owned.hits[hit_index].id;
+        for (missing_indices.items, 0..) |hit_index, i| keys[i] = result.hits[hit_index].id;
         break :blk try executor.load_many_stored.?(executor.ctx, alloc, keys);
     } else null;
     defer if (loaded_many) |values| freeOptionalOwnedBytes(alloc, values);
@@ -958,9 +957,14 @@ pub fn applyStoredSearchPatternFilters(
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
 
+    // Decide first and commit second. Every fallible parse/load/match happens
+    // while the caller still owns an untouched result, so errors preserve the
+    // input. The commit phase only moves or destroys already-owned hits.
+    const keep_hits = try alloc.alloc(bool, result.hits.len);
+    defer alloc.free(keep_hits);
     var loaded_missing_index: usize = 0;
     var kept_len: usize = 0;
-    for (owned.hits, 0..) |*hit, i| {
+    for (result.hits, 0..) |hit, i| {
         _ = arena_state.reset(.retain_capacity);
         const hit_alloc = arena_state.allocator();
         const batch_loaded_stored = if (needs_stored and hit.stored_data == null and loaded_many != null) blk: {
@@ -975,7 +979,7 @@ pub fn applyStoredSearchPatternFilters(
             else
                 try executor.load_stored(executor.ctx, alloc, hit.id);
             const stored = maybe_stored orelse {
-                hit.deinit(alloc);
+                keep_hits[i] = false;
                 continue;
             };
             defer if (hit.stored_data == null and loaded_many == null) alloc.free(stored);
@@ -984,19 +988,19 @@ pub fn applyStoredSearchPatternFilters(
 
         var keep = true;
         if (has_positive_doc_ids) {
-            keep = resolvedPatternContainsHit(native_include, hit.*);
+            keep = resolvedPatternContainsHit(native_include, hit);
         }
         if (keep and resolved_include.active) {
-            keep = resolvedPatternContainsHit(resolved_include, hit.*);
+            keep = resolvedPatternContainsHit(resolved_include, hit);
         }
         if (keep and req.exclude_doc_ids.len > 0) {
-            keep = !resolvedPatternContainsHit(native_exclude, hit.*);
+            keep = !resolvedPatternContainsHit(native_exclude, hit);
         }
         if (keep and resolved_exclude.all) {
             keep = false;
         }
         if (keep and resolved_exclude.active) {
-            keep = !resolvedPatternContainsHit(resolved_exclude, hit.*);
+            keep = !resolvedPatternContainsHit(resolved_exclude, hit);
         }
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
@@ -1012,23 +1016,28 @@ pub fn applyStoredSearchPatternFilters(
                 try compiled_exclusion.?.matches(hit_alloc, hit.id, .null));
         }
 
+        keep_hits[i] = keep;
+        if (keep) kept_len += 1;
+    }
+
+    const filtered_hits: []types.SearchHit = if (kept_len == 0)
+        &.{}
+    else
+        try alloc.alloc(types.SearchHit, kept_len);
+    var output_index: usize = 0;
+    for (result.hits, keep_hits) |*hit, keep| {
         if (keep) {
-            if (kept_len != i) {
-                owned.hits[kept_len] = hit.*;
-                hit.* = undefined;
-            }
-            kept_len += 1;
+            filtered_hits[output_index] = hit.*;
+            hit.* = undefined;
+            output_index += 1;
         } else {
             hit.deinit(alloc);
         }
     }
+    if (result.hits.len > 0) alloc.free(result.hits);
 
-    if (kept_len == 0) {
-        if (owned.hits.len > 0) alloc.free(owned.hits);
-        owned.hits = &.{};
-    } else if (kept_len != owned.hits.len) {
-        owned.hits = try alloc.realloc(owned.hits, kept_len);
-    }
+    var owned = result;
+    owned.hits = filtered_hits;
     rewriteLocalTotal(&owned, source, original_hits_len, kept_len);
     return owned;
 }
@@ -1060,6 +1069,7 @@ pub fn postprocessTextSearchResult(
         .func = processor.is_visible,
         .filter_many = processor.filter_visible_many,
     });
+    errdefer filtered.deinit();
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
@@ -1096,6 +1106,7 @@ pub fn postprocessVectorSearchResult(
         .func = processor.is_visible,
         .filter_many = processor.filter_visible_many,
     });
+    errdefer filtered.deinit();
     if (chunk_backed) {
         filtered = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
@@ -1712,6 +1723,39 @@ test "postprocessTextSearchResult forwards batch stored loader to pattern filter
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "search result postprocessing releases owned hits when stored filtering fails" {
+    const alloc = std.testing.allocator;
+    const Failure = struct {
+        fn loadStored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestStoredLoadFailure;
+        }
+    };
+    const processor = SearchResultPostprocessor{
+        .ctx = null,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = Failure.loadStored,
+    };
+    const request = types.SearchRequest{ .filter_query_json = "{\"term\":{\"title\":\"alpha\"}}" };
+
+    var text_hits = try alloc.alloc(types.SearchHit, 1);
+    text_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    try std.testing.expectError(error.TestStoredLoadFailure, postprocessTextSearchResult(alloc, request, .{
+        .alloc = alloc,
+        .hits = text_hits,
+        .total_hits = 1,
+    }, false, processor));
+
+    var vector_hits = try alloc.alloc(types.SearchHit, 1);
+    vector_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    try std.testing.expectError(error.TestStoredLoadFailure, postprocessVectorSearchResult(alloc, request, .{
+        .alloc = alloc,
+        .hits = vector_hits,
+        .total_hits = 1,
+    }, false, processor));
 }
 
 const TestChunkParentShaper = struct {

@@ -649,6 +649,8 @@ pub const Backend = struct {
         wal_append_ns: u64 = 0,
         wal_sync_records: u64 = 0,
         wal_sync_ns: u64 = 0,
+        wal_segment_syncs: u64 = 0,
+        wal_index_syncs: u64 = 0,
         wal_replay_records: u64 = 0,
         wal_replay_entries: u64 = 0,
         wal_replay_bytes: u64 = 0,
@@ -1274,7 +1276,7 @@ pub const Backend = struct {
     };
 
     const L0OverlapCache = struct {
-        const max_run_ids = 64;
+        const max_run_ids = compaction_mod.max_exact_l0_overlap_runs;
 
         valid: bool = false,
         threshold: usize = 0,
@@ -1623,22 +1625,33 @@ pub const Backend = struct {
         if (force and !self.options.backend.read_only and self.options.wal_enabled) {
             var wal_lock = try self.acquireWalOperationLock(.exclusive);
             defer wal_lock.release();
-            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
+            _ = try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
         }
         try self.finalizeDeferredStorageWorkLocked();
     }
 
     pub fn syncReplayState(self: *Backend) !void {
-        if (self.root_dir == null) return;
+        _ = try self.syncReplayStateWithStats();
+    }
+
+    pub fn syncReplayStateWithStats(self: *Backend) !wal_mod.SyncResult {
+        if (self.root_dir == null) return .{};
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         if (!self.options.backend.read_only and self.options.wal_enabled) {
             var wal_lock = try self.acquireWalOperationLock(.exclusive);
             defer wal_lock.release();
-            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
-            return;
+            return try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
         }
         try self.finalizeDeferredStorageWorkLocked();
+        return .{};
+    }
+
+    pub fn commitProvidesDurability(self: *const Backend) bool {
+        return self.root_dir != null and
+            !self.options.backend.read_only and
+            self.options.wal_enabled and
+            self.options.wal_sync_on_commit;
     }
 
     pub fn snapshotReadStats(self: *const Backend) ReadStats {
@@ -1958,6 +1971,13 @@ pub const Backend = struct {
         if (threshold == 0) return 0;
         var l0_count: usize = 0;
         while (l0_count < self.runs.items.len and self.runs.items[l0_count].level == 0) : (l0_count += 1) {}
+        // Above the soft limit, normal L0 pressure already schedules
+        // compaction. Exact overlap scoring is O(n^2) and runs under `mu`, so
+        // performing it during overload can block point and batch reads for
+        // seconds. Zero here means "not independently scored"; L0 run/byte
+        // pressure remains fully represented by the surrounding metrics.
+        const soft_limit = self.effectiveL0SoftLimitRuns();
+        if (soft_limit == 0 or l0_count > @min(soft_limit, compaction_mod.max_exact_l0_overlap_runs)) return 0;
         const l0_runs = self.runs.items[0..l0_count];
         if (self.l0_overlap_cache.lookup(l0_runs, threshold)) |cached| return cached;
         const result = compaction_mod.largestL0OverlapRunCount(l0_runs, threshold);
@@ -3000,7 +3020,7 @@ pub const Backend = struct {
         self.immutable_flush_job_in_flight = true;
         self.background_executor.submit(.commit_durable, self, runImmutableFlushJob, deinitImmutableFlushJob) catch |err| {
             self.immutable_flush_job_in_flight = false;
-            if (err == error.BackgroundOwnerClosing) return;
+            if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) return;
             std.log.warn("lsm immutable flush background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -3033,7 +3053,7 @@ pub const Backend = struct {
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
             self.maintenance_job_in_flight = false;
-            if (err == error.BackgroundOwnerClosing) return;
+            if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) return;
             std.log.warn("lsm maintenance background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -3044,12 +3064,19 @@ pub const Backend = struct {
 
         const max_steps = @max(@as(usize, 1), self.options.background_maintenance_max_steps);
         var steps: usize = 0;
+        var made_progress = false;
         while (steps < max_steps and !self.closing.load(.acquire)) : (steps += 1) {
             const progressed = try self.runMaintenanceStep();
             if (!progressed) break;
+            made_progress = true;
         }
 
-        self.clearMaintenanceJobInFlight(true);
+        // A positive maintenance score is only a hint: overlap or level
+        // pressure can remain non-zero when no valid compaction plan exists.
+        // Do not immediately resubmit that same no-op job forever. A later
+        // write, flush, or a job that actually made progress will schedule the
+        // next pass.
+        self.clearMaintenanceJobInFlight(made_progress);
     }
 
     fn clearMaintenanceJobInFlight(self: *Backend, maybe_reschedule: bool) void {
@@ -3522,6 +3549,8 @@ pub const Backend = struct {
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
         self.write_stats.wal_append_bytes += append_result.bytes;
+        self.write_stats.wal_segment_syncs += append_result.segment_syncs;
+        self.write_stats.wal_index_syncs += append_result.index_syncs;
         const append_ns = self.writeStatsElapsedNs(start_ns);
         self.write_stats.wal_append_ns += append_ns;
         if (self.options.wal_sync_on_commit) {
@@ -4860,6 +4889,7 @@ pub const Backend = struct {
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             }
+            self.scheduleMaintenanceAfterBulkIngestLocked();
             return;
         }
         self.active_bulk_ingest_batches -= 1;
@@ -4870,6 +4900,13 @@ pub const Backend = struct {
                 }
             }
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            self.scheduleMaintenanceAfterBulkIngestLocked();
+        }
+    }
+
+    fn scheduleMaintenanceAfterBulkIngestLocked(self: *Backend) void {
+        if (self.active_bulk_ingest_batches == 0) {
+            self.scheduleMaintenanceJobIfNeededLocked();
         }
     }
 
@@ -4888,6 +4925,7 @@ pub const Backend = struct {
     fn abortBulkIngestSessionLocked(self: *Backend) void {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         self.active_bulk_ingest_batches -= 1;
+        self.scheduleMaintenanceAfterBulkIngestLocked();
     }
 
     pub fn markManifestDirty(self: *Backend) void {
@@ -5425,7 +5463,7 @@ pub const BackendHandle = struct {
             if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
             owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
             const runtime = owned_runtime.?.ptr();
-            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            const executor = BackgroundExecutor.init(runtime, try runtime.allocOwnerId());
             resolved_options.background_executor = &executor;
             if (resolved_options.read_runtime == null) {
                 if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
@@ -5465,7 +5503,7 @@ pub const BackendHandle = struct {
             if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
             owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
             const runtime = owned_runtime.?.ptr();
-            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            const executor = BackgroundExecutor.init(runtime, try runtime.allocOwnerId());
             resolved_options.background_executor = &executor;
             if (resolved_options.read_runtime == null) {
                 if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
@@ -5948,6 +5986,25 @@ test "lsm backend caches exact L0 overlap score until immutable run IDs change" 
     stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 3), stats.overlapping_l0_runs);
     try std.testing.expectEqual(@as(usize, 3), backend.l0_overlap_cache.run_count);
+}
+
+test "lsm backend bounds exact overlap scoring above soft L0 pressure" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .compact_threshold_runs = 4,
+        .l0_overlap_compact_threshold_runs = 2,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 16,
+    });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 5, 1024);
+    compaction_mod.sortRuns(backend.runs.items);
+
+    const stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 5), stats.l0_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.compactable_l0_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.overlapping_l0_runs);
+    try std.testing.expect(!backend.l0_overlap_cache.valid);
+    try std.testing.expect(backend.maintenanceScore() > 0);
 }
 
 test "lsm backend tight base level target reports lower-level overflow" {
@@ -7071,6 +7128,103 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
 }
 
+test "lsm backend detached no-op maintenance does not resubmit forever" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+        submitted_count: usize = 0,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+            self.submitted_count += 1;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 784);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-no-op-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    for (0..2) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "key:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    // The job was admitted while work was possible, but a bulk session makes
+    // the actual pass a no-op. It must not busy-resubmit itself.
+    try backend.beginBulkIngestSession();
+    var job = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try job.run(job.ptr);
+    job.deinit(job.ptr);
+
+    try std.testing.expect(backend.maintenanceScore() > 0);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    // Ending the transient blocker must give existing debt exactly one fresh
+    // opportunity to run. If the hint is still non-actionable, that job stops
+    // without recreating the original loop.
+    backend.abortBulkIngestSession();
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expectEqual(@as(usize, 2), lane.submitted_count);
+    try backend.beginBulkIngestSession();
+    var retry_after_abort = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try retry_after_abort.run(retry_after_abort.ptr);
+    retry_after_abort.deinit(retry_after_abort.ptr);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expectEqual(@as(usize, 3), lane.submitted_count);
+    var retry_after_finish = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try retry_after_finish.run(retry_after_finish.ptr);
+    retry_after_finish.deinit(retry_after_finish.ptr);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+}
+
 test "lsm backends share one threaded runtime durable lane" {
     if (builtin.os.tag == .freestanding) return;
 
@@ -7082,8 +7236,8 @@ test "lsm backends share one threaded runtime durable lane" {
     var second_storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer second_storage.deinit();
 
-    const first_executor = BackgroundExecutor.init(runtime.ptr(), runtime.ptr().allocOwnerId());
-    const second_executor = BackgroundExecutor.init(runtime.ptr(), runtime.ptr().allocOwnerId());
+    const first_executor = BackgroundExecutor.init(runtime.ptr(), try runtime.ptr().allocOwnerId());
+    const second_executor = BackgroundExecutor.init(runtime.ptr(), try runtime.ptr().allocOwnerId());
     var first = try Backend.open(std.testing.allocator, "/lsm-background-shared-runtime-first", .{
         .storage = first_storage.storage(),
         .background_executor = &first_executor,
@@ -8964,7 +9118,7 @@ test "lsm backend persisted compaction streams run blocks without full run loads
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.isSourceRunPath(path)) self.source_trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -8978,6 +9132,16 @@ test "lsm backend persisted compaction streams run blocks without full run loads
         fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().appendFileAbsolute(self.backing.allocator, path, contents, sync);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -9009,6 +9173,9 @@ test "lsm backend persisted compaction streams run blocks without full run loads
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
         .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .sync_contents_absolute = CountingStorage.syncFileContentsAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
@@ -10019,7 +10186,7 @@ test "lsm backend shared cache owns loaded table allocations" {
             return self.backing.storage().readFileRangeAlloc(allocator, path, offset, len);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, path, self.run_path)) try self.expectCacheAllocator(allocator);
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -10033,6 +10200,16 @@ test "lsm backend shared cache owns loaded table allocations" {
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -10068,6 +10245,9 @@ test "lsm backend shared cache owns loaded table allocations" {
         .file_size = Context.fileSize,
         .read_file_trailer_alloc = Context.readFileTrailerAlloc,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_contents_absolute = Context.syncFileContentsAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -10394,6 +10574,16 @@ test "lsm backend reuses cached raw table bytes to avoid fragmented index reads"
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -10421,6 +10611,9 @@ test "lsm backend reuses cached raw table bytes to avoid fragmented index reads"
         .read_file_range_alloc = CountingHostContext.readFileRangeAlloc,
         .file_size = CountingHostContext.fileSize,
         .write_file_absolute = CountingHostContext.writeFileAbsolute,
+        .sync_contents_absolute = CountingHostContext.syncFileContentsAbsolute,
+        .sync_parent_absolute = CountingHostContext.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = CountingHostContext.renameAbsolute,
         .delete_file_absolute = CountingHostContext.deleteFileAbsolute,
         .delete_tree = CountingHostContext.deleteTree,
@@ -10514,7 +10707,7 @@ test "lsm backend avoids full run table load on bloom negative" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -10525,6 +10718,16 @@ test "lsm backend avoids full run table load on bloom negative" {
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -10556,6 +10759,9 @@ test "lsm backend avoids full run table load on bloom negative" {
         .file_size = Context.fileSize,
         .read_file_trailer_alloc = Context.readFileTrailerAlloc,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_contents_absolute = Context.syncFileContentsAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -10687,7 +10893,7 @@ test "lsm backend no-cache point reads reuse local index and block cache" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -10859,7 +11065,7 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11045,7 +11251,7 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11056,6 +11262,16 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -11087,6 +11303,9 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         .file_size = Context.fileSize,
         .read_file_trailer_alloc = Context.readFileTrailerAlloc,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_contents_absolute = Context.syncFileContentsAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -11550,7 +11769,7 @@ test "lsm backend block filter avoids candidate block read on run-bloom false po
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -12415,6 +12634,80 @@ test "lsm backend point getManySorted reuses cached run blocks below sorted thre
 
     const cache_stats = cache.snapshotStats();
     try std.testing.expect(cache_stats.run_table_block.inserts + cache_stats.run_table_physical_block.inserts > 0);
+}
+
+test "lsm backend cache-backed batch probes do not require the backend mutex" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-cache-batch-with-maintenance-lock";
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .cache = &cache,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "artifact:00000000:dense", "value-0");
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    const ReadTxn = @TypeOf(read);
+    const Worker = struct {
+        const Context = struct {
+            txn: *ReadTxn,
+            stage: std.atomic.Value(u8) = .init(0),
+            value: ?[]const u8 = null,
+            result: ?anyerror = null,
+        };
+
+        fn run(ctx: *Context) void {
+            const keys = [_][]const u8{"artifact:00000000:dense"};
+            var values: [1]?[]const u8 = .{null};
+            ctx.stage.store(1, .release);
+            ctx.txn.getManySorted(.{ .name = "docs" }, &keys, &values) catch |err| {
+                ctx.result = err;
+                ctx.stage.store(2, .release);
+                return;
+            };
+            ctx.value = values[0];
+            ctx.stage.store(2, .release);
+        }
+    };
+
+    var ctx = Worker.Context{ .txn = &read };
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    var thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    while (ctx.stage.load(.acquire) == 0) platform.time.yieldBriefly();
+    sleepForTest(100 * std.time.ns_per_ms);
+    const completed_without_backend_lock = ctx.stage.load(.acquire) == 2;
+
+    runtime_mod.unlockBackend(Backend, &backend, locked);
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(completed_without_backend_lock);
+    if (ctx.result) |err| return err;
+    try std.testing.expectEqualStrings("value-0", ctx.value.?);
 }
 
 test "lsm backend getManySorted searches prefix-compressed physical blocks directly" {
@@ -13356,7 +13649,7 @@ test "lsm repository loads v4 table index from trailer plus metadata read" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, path, self.run_path)) self.run_trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -13744,6 +14037,16 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -13775,6 +14078,9 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
         .read_file_range_alloc = Context.readFileRangeAlloc,
         .file_size = Context.fileSize,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_contents_absolute = Context.syncFileContentsAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -15073,6 +15379,16 @@ test "lsm backend reloads persisted manifest and run files over host storage" {
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -15100,6 +15416,9 @@ test "lsm backend reloads persisted manifest and run files over host storage" {
         .read_file_range_alloc = HostContext.readFileRangeAlloc,
         .file_size = HostContext.fileSize,
         .write_file_absolute = HostContext.writeFileAbsolute,
+        .sync_contents_absolute = HostContext.syncFileContentsAbsolute,
+        .sync_parent_absolute = HostContext.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = HostContext.renameAbsolute,
         .delete_file_absolute = HostContext.deleteFileAbsolute,
         .delete_tree = HostContext.deleteTree,

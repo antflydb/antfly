@@ -32,6 +32,9 @@ pub const Request = struct {
     query_owned: bool = false,
     query_builder: ?std.ArrayListUnmanaged(u8) = null,
     context: ?*anyopaque = null,
+    /// Optional caller-specific response ceiling. Client execution clamps
+    /// this to the configured client-wide maximum.
+    max_response_size: ?usize = null,
 
     const Self = @This();
 

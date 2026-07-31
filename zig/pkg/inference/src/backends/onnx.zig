@@ -19,11 +19,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const Session = @import("session.zig").Session;
 const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
+pub const ExecutionProvider = @import("backend_runtime.zig").OnnxExecutionProvider;
 
 const c = @cImport({
     @cInclude("onnxruntime_c_api.h");
@@ -32,23 +34,38 @@ const c = @cImport({
 
 const OrtApi = c.OrtApi;
 
-var global_api: ?*const OrtApi = null;
-var global_env: ?*c.OrtEnv = null;
+var global_api = std.atomic.Value(?*const OrtApi).init(null);
+var global_env = std.atomic.Value(?*c.OrtEnv).init(null);
+var global_init_mutex: std.atomic.Mutex = .unlocked;
 
 fn getApi() *const OrtApi {
-    if (global_api) |api| return api;
-    global_api = c.OrtGetApiBase().*.GetApi.?(c.ORT_API_VERSION);
-    return global_api.?;
+    if (global_api.load(.acquire)) |api| return api;
+    platform.sync.lockYielding(&global_init_mutex);
+    defer global_init_mutex.unlock();
+    return getApiLocked();
+}
+
+fn getApiLocked() *const OrtApi {
+    if (global_api.load(.monotonic)) |api| return api;
+    const api = c.OrtGetApiBase().*.GetApi.?(c.ORT_API_VERSION);
+    global_api.store(api, .release);
+    return api;
 }
 
 fn initEnv() !void {
-    if (global_env != null) return;
-    const api = getApi();
-    const status = api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "antfly", &global_env);
+    if (global_env.load(.acquire) != null) return;
+    platform.sync.lockYielding(&global_init_mutex);
+    defer global_init_mutex.unlock();
+    if (global_env.load(.monotonic) != null) return;
+
+    const api = getApiLocked();
+    var env: ?*c.OrtEnv = null;
+    const status = api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "antfly", &env);
     if (status) |s| {
         defer api.ReleaseStatus.?(s);
         return error.OrtEnvCreationFailed;
     }
+    global_env.store(env.?, .release);
 }
 
 /// Check an ORT status and return an error if non-null.
@@ -139,6 +156,11 @@ pub const OnnxSession = struct {
 
 pub const SessionOptions = struct {
     low_memory: bool = false,
+    execution_provider: ExecutionProvider = .automatic,
+    /// Hard ceiling for allocations made through this ORT session's CUDA arena.
+    /// ModelManager supplies an admitted model+workspace cap; standalone users
+    /// retain ORT's documented unlimited default.
+    cuda_memory_limit_bytes: usize = std.math.maxInt(usize),
 };
 
 pub const RetainedInput = struct {
@@ -325,19 +347,14 @@ pub fn createSessionWithOptions(
         try checkStatus(api, api.SetSessionExecutionMode.?(session_options.?, c.ORT_SEQUENTIAL));
     }
 
-    // Only probe CUDA on Linux builds where a CUDA-enabled ORT is plausible.
-    // On macOS this only produces noisy provider-library failures before ORT
-    // falls back to CPU anyway.
-    if (builtin.os.tag == .linux) {
-        var cuda_opts: c.OrtCUDAProviderOptions = std.mem.zeroes(c.OrtCUDAProviderOptions);
-        cuda_opts.device_id = 0;
-        const cuda_status = api.SessionOptionsAppendExecutionProvider_CUDA.?(session_options.?, &cuda_opts);
-        if (cuda_status) |s| {
-            defer api.ReleaseStatus.?(s);
-            std.log.info("CUDA provider unavailable, falling back to CPU", .{});
-        } else {
-            std.log.info("CUDA execution provider enabled (device 0)", .{});
-        }
+    const execution_provider = try resolveExecutionProvider(options.execution_provider);
+    if (execution_provider == .cuda) {
+        try appendCudaExecutionProvider(
+            api,
+            session_options.?,
+            options.cuda_memory_limit_bytes,
+        );
+        std.log.info("CUDA execution provider enabled (device 0)", .{});
     }
 
     // Ensure the model path is null-terminated for the C API.
@@ -347,7 +364,12 @@ pub fn createSessionWithOptions(
 
     // Create session from model file
     var ort_session: ?*c.OrtSession = null;
-    try checkStatus(api, api.CreateSession.?(global_env.?, path_z.ptr, session_options.?, &ort_session));
+    try checkStatus(api, api.CreateSession.?(
+        global_env.load(.acquire).?,
+        path_z.ptr,
+        session_options.?,
+        &ort_session,
+    ));
 
     const impl = try allocator.create(OnnxSession);
     impl.* = .{
@@ -368,6 +390,74 @@ pub fn createSessionWithOptions(
         .ptr = impl,
         .vtable = &onnx_vtable,
     };
+}
+
+/// Resolve automatic provider selection before callers reserve resources.
+/// Probing only creates provider options; session creation receives the
+/// resolved value and never silently changes resource domains after admission.
+pub fn resolveExecutionProvider(
+    requested: ExecutionProvider,
+) !ExecutionProvider {
+    return switch (requested) {
+        .cpu => .cpu,
+        .cuda => if (builtin.os.tag == .linux)
+            .cuda
+        else
+            error.OrtCudaProviderUnavailable,
+        .automatic => blk: {
+            if (builtin.os.tag != .linux) break :blk .cpu;
+            const api = getApi();
+            var session_options: ?*c.OrtSessionOptions = null;
+            const create_status = api.CreateSessionOptions.?(&session_options);
+            if (create_status) |status| {
+                defer api.ReleaseStatus.?(status);
+                return error.OrtSessionOptionsFailed;
+            }
+            defer api.ReleaseSessionOptions.?(session_options.?);
+            appendCudaExecutionProvider(
+                api,
+                session_options.?,
+                std.math.maxInt(usize),
+            ) catch {
+                std.log.info("CUDA provider unavailable, selecting ONNX CPU execution", .{});
+                break :blk .cpu;
+            };
+            break :blk .cuda;
+        },
+    };
+}
+
+fn appendCudaExecutionProvider(
+    api: *const OrtApi,
+    session_options: *c.OrtSessionOptions,
+    memory_limit_bytes: usize,
+) !void {
+    if (builtin.os.tag != .linux) return error.OrtCudaProviderUnavailable;
+    var cuda_opts = cudaProviderOptions(memory_limit_bytes);
+    const status = api.SessionOptionsAppendExecutionProvider_CUDA.?(
+        session_options,
+        &cuda_opts,
+    );
+    if (status) |provider_status| {
+        defer api.ReleaseStatus.?(provider_status);
+        return error.OrtCudaProviderUnavailable;
+    }
+}
+
+fn cudaProviderOptions(memory_limit_bytes: usize) c.OrtCUDAProviderOptions {
+    var options: c.OrtCUDAProviderOptions = std.mem.zeroes(c.OrtCUDAProviderOptions);
+    options.device_id = 0;
+    // @cImport sees the C struct, so the C++ default constructor documented by
+    // ORT is not executed. Initialize every non-zero default explicitly.
+    options.gpu_mem_limit = memory_limit_bytes;
+    options.do_copy_in_default_stream = 1;
+    return options;
+}
+
+test "CUDA provider options preserve ORT C++ defaults and admitted limit" {
+    const options = cudaProviderOptions(1234);
+    try std.testing.expectEqual(@as(usize, 1234), options.gpu_mem_limit);
+    try std.testing.expectEqual(@as(c_int, 1), options.do_copy_in_default_stream);
 }
 
 const onnx_vtable = Session.VTable{

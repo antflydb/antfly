@@ -2853,9 +2853,17 @@ paths:
         - All shard data (compressed with zstd)
 
 
-        The backup creates a cluster-level manifest that tracks all included tables
+        A non-empty backup publishes a cluster-level manifest only after every
 
-        and their individual backup locations.
+        requested table backup is durable. The manifest is the final commit
+
+        point and records complete expected/completed table counts. A `partial`
+
+        or `failed` attempt returns per-table diagnostics but does not publish a
+
+        restorable aggregate manifest. A cluster with no selected tables returns
+
+        `400` without writing a backup artifact.
 
 
         Backup IDs are immutable. Reusing an ID that already has a published
@@ -2896,6 +2904,8 @@ paths:
             is fully successful, while `partial` or `failed` reports per-table
 
             failures even though the request itself was processed successfully.
+
+            Only `completed` publishes a restorable cluster manifest.
           content:
             application/json:
               schema:
@@ -7396,6 +7406,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
     ClusterTopology:
@@ -7424,6 +7436,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
         data:
@@ -8892,10 +8906,64 @@ components:
       type: object
       description: Non-secret status for the local secrets file store, when one is available.
       properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the currently published secret-store snapshot.
+        supports_source_generation:
+          type: boolean
+          description: Whether this store can expose one exact opaque source-generation acknowledgement.
+            This remains true when a single loaded file predates the generation field, and is false for
+            layered stores whose served snapshot has multiple publication sources.
+          x-omitzero: false
+        source_generation:
+          type: string
+          nullable: true
+          description: Opaque, non-secret generation embedded by the control plane in the currently applied
+            secrets file. It is null for files without an acknowledgement generation and never derives
+            from secret values.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed to load.
+          x-omitzero: false
         stale:
           type: boolean
           description: Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
           x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
+    RuntimeConfigStatus:
+      type: object
+      description: Non-secret status for the applied config.json snapshot. Hot publication accepts validated
+        remote_content-only changes; startup-only changes remain stale until restart.
+      properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the fully validated and atomically published configuration.
+        hash:
+          type: string
+          description: Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters
+            match the operator config-hash annotation.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed loading, semantic validation, or
+            requires restart because startup-only fields changed.
+          x-omitzero: false
+        stale:
+          type: boolean
+          description: Whether requests are using the last-known-good snapshot after a failed reload.
+          x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
     SecretStatus:
       type: string
       enum:
@@ -9946,15 +10014,15 @@ components:
         - $setOnInsert
         - $unset
         - $inc
-        - $push
-        - $pull
         - $addToSet
-        - $pop
-        - $mul
-        - $min
         - $max
-        - $currentDate
-        - $rename
+      x-enum-varnames:
+        - SET
+        - SET_ON_INSERT
+        - UNSET
+        - INC
+        - ADD_TO_SET
+        - MAX
       description: MongoDB-style update operator
     TransformOp:
       type: object
@@ -9969,8 +10037,7 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: $.views
         value:
-          description: Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+          description: Value for operation (not required for $unset). Type depends on the supported operator.
     Transform:
       type: object
       required:
@@ -10007,8 +10074,9 @@ components:
           - op: $inc
             path: $.views
             value: 1
-          - op: $currentDate
+          - op: $set
             path: $.lastViewed
+            value: '2026-07-28T12:00:00Z'
     ScanKeysRequest:
       type: object
       description: >
@@ -10075,20 +10143,24 @@ components:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
           description: >
-            Antfly query to filter documents. Only documents matching this query
+            Structured subset of the Antfly query AST used to filter a primary-key
 
-            are included in results. Uses the sear library for efficient per-document
+            scan. Only documents matching this query are included in results.
 
-            matching without requiring a full index.
+            Because scans do not open a text index, text-index-only variants such
+
+            as phrase and multi-match queries are rejected with a validation error
+
+            instead of being evaluated with slower stored-document semantics.
 
 
             Examples:
 
-            - Status filtering: `{"query": "status:published"}`
+            - Status filtering: `{"term":{"path":"/status","value":"published"}}`
 
-            - Date ranges: `{"query": "created_at:>2023-01-01"}`
+            - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
 
-            - Field matching: `{"query": "category:technology"}`
+            - Field existence: `{"exists":{"path":"/category"}}`
         limit:
           type: integer
           minimum: 1
@@ -10212,16 +10284,16 @@ components:
 
             - Multiple operations per document are applied in sequence
 
-            - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+            - Supports numeric and set-like operations ($inc, $max, $addToSet)
 
 
             Common use cases:
 
             - Increment counters (views, likes, votes)
 
-            - Update timestamps ($currentDate)
+            - Update timestamps ($set)
 
-            - Manage arrays (add/remove tags, items)
+            - Add unique array values ($addToSet)
 
             - Update nested fields without overwriting the entire document
           items:
@@ -10232,11 +10304,12 @@ components:
                 - op: $inc
                   path: $.views
                   value: 1
-                - op: $currentDate
+                - op: $set
                   path: $.lastViewed
+                  value: '2026-07-28T12:00:00Z'
             - key: user:456
               operations:
-                - op: $push
+                - op: $addToSet
                   path: $.tags
                   value: vip
         sync_level:
@@ -10828,6 +10901,7 @@ components:
           example: portable
         table_names:
           type: array
+          minItems: 1
           maxItems: 256
           uniqueItems: true
           items:
@@ -11817,6 +11891,13 @@ components:
         **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
 
         call, using the queries to determine available tables and indexes.
+
+
+        Authenticated row filters are enforced on every initial and generated
+
+        operation in both modes, including scans, aggregates, and graph/tree
+
+        traversal. They cannot be replaced or weakened by model tool arguments.
       required:
         - query
         - queries
@@ -11838,6 +11919,19 @@ components:
             In pipeline mode (max_internal_iterations=0), these are executed directly.
 
             In agentic mode, these declare which table and indexes are available.
+
+
+            `filter_query` and `exclusion_query` are mandatory table predicates
+
+            for retrieval-agent execution. Predicates declared by any query for
+
+            a table are conjoined (or unioned for exclusions) and applied to
+
+            every initial query, generated refinement, probe, aggregation,
+
+            graph/tree traversal, root scan, and follow-up for that table.
+
+            They cannot be weakened by generated operations.
           example:
             - table: docs
               semantic_search: How do I configure OAuth?
@@ -11862,13 +11956,17 @@ components:
           items:
             $ref: '#/components/schemas/FilterSpec'
           description: >
-            Pre-applied filters from prior interactions. These are applied to
+            Mandatory filters from prior interactions. These are converted to
 
-            all search tool invocations.
+            structured Antfly predicates and applied to every table and every
+
+            search tool invocation, including generated follow-ups, graph/tree
+
+            traversal, aggregations, and root scans.
         session_id:
           type: string
-          description: Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed
-            back to the client but does not imply server-side session persistence.
+          description: Correlation identifier for a bounded agent interaction. This is echoed back to
+            the client and does not imply server-side session persistence.
         decisions:
           type: array
           items:
@@ -12263,16 +12361,16 @@ components:
 
             - `bool.must` is scoring query input.
 
-            - `bool.filter` is a non-scoring structured filter.
+            - `bool.filter` is non-scoring query input.
 
-            - `bool.must_not` is a structured exclusion filter.
+            - `bool.must_not` is non-scoring exclusion query input.
 
 
-            The same AST accepts direct structured filters using `field` or JSON-pointer
+            Filter branches accept the same query variants as `filter_query` and
 
-            `path`, scalar `term` values, multi-value `terms`, and `exists`.
+            `exclusion_query`. Structured clauses use the native document-value
 
-            Query-string objects remain supported as a full-text escape hatch.
+            path; text clauses are resolved through the text index before scoring.
           example:
             bool:
               must:
@@ -14526,9 +14624,8 @@ components:
         op:
           type: string
           description: >
-            Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-
-            `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`,
+            `$max`.
 
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
 
@@ -16498,14 +16595,6 @@ components:
           $ref: '#/components/schemas/Boost'
       required:
         - term
-    Fuzziness:
-      description: The fuzziness of the query. Can be an integer or "auto".
-      anyOf:
-        - type: integer
-          format: int32
-        - type: string
-          enum:
-            - auto
     MatchQuery:
       type: object
       properties:
@@ -16517,16 +16606,6 @@ components:
           type: string
         boost:
           $ref: '#/components/schemas/Boost'
-        prefix_length:
-          type: integer
-          format: int32
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-        operator:
-          type: string
-          enum:
-            - or
-            - and
       required:
         - match
     MultiMatchBody:
@@ -16556,6 +16635,16 @@ components:
           $ref: '#/components/schemas/MultiMatchBody'
       required:
         - multi_match
+    Fuzziness:
+      description: The fuzziness of the query. Can be an integer or "auto".
+      anyOf:
+        - type: integer
+          format: int32
+          minimum: 0
+          maximum: 2
+        - type: string
+          enum:
+            - auto
     MatchPhraseQuery:
       type: object
       properties:
@@ -16611,6 +16700,8 @@ components:
         prefix_length:
           type: integer
           format: int32
+          minimum: 0
+          maximum: 255
         fuzziness:
           $ref: '#/components/schemas/Fuzziness'
         field:
@@ -17105,10 +17196,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17278,6 +17369,153 @@ components:
         degraded:
           type: boolean
           description: Whether coverage is complete under best_effort but includes terminal failures.
+    EnrichmentRuntimeStatus:
+      type: object
+      additionalProperties: false
+      description: Runtime state for the durable embeddings enrichment worker.
+      required:
+        - enabled
+        - target_sequence
+        - applied_sequence
+        - pending_sequence_count
+        - projection_checkpoint_status
+        - projection_checkpoint_applied_sequence
+        - projection_checkpoint_generation
+        - projection_checkpoint_config_fingerprint
+        - projection_checkpoint_identity_consistent
+        - checkpoint_replay_tail_sequence_count
+        - processed_requests
+        - error_count
+        - retryable_error_count
+        - fatal_error_count
+        - retrying
+        - worker_failed
+        - worker_started
+        - stalled
+        - skip_by_hash_count
+        - skipped_source_count
+        - codec_decode_failures
+        - embed_batches_started
+        - embed_batches_completed
+        - embed_items_started
+        - embed_items_completed
+        - active_embed_batch_items
+        - active_embed_batch_bytes
+        - active_embed_batch_max_bytes
+        - active_embed_batch_started_ms
+        - last_embed_batch_items
+        - last_embed_batch_bytes
+        - last_embed_batch_max_bytes
+        - last_embed_batch_completed_ms
+        - last_embed_batch_ns
+        - total_embed_ns
+      properties:
+        enabled:
+          type: boolean
+        target_sequence:
+          type: integer
+          format: uint64
+        applied_sequence:
+          type: integer
+          format: uint64
+        pending_sequence_count:
+          type: integer
+          format: uint64
+        projection_checkpoint_status:
+          type: string
+        projection_checkpoint_applied_sequence:
+          type: integer
+          format: uint64
+        projection_checkpoint_generation:
+          type: integer
+          format: uint64
+        projection_checkpoint_config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+        projection_checkpoint_identity_consistent:
+          type: boolean
+          description: Whether every shard contributing to this status reports the same checkpoint generation
+            and configuration identity.
+        checkpoint_replay_tail_sequence_count:
+          type: integer
+          format: uint64
+        processed_requests:
+          type: integer
+          format: uint64
+        error_count:
+          type: integer
+          format: uint64
+        retryable_error_count:
+          type: integer
+          format: uint64
+        fatal_error_count:
+          type: integer
+          format: uint64
+        retrying:
+          type: boolean
+        worker_failed:
+          type: boolean
+        worker_started:
+          type: boolean
+          description: Whether the background enrichment worker is currently running.
+        stalled:
+          type: boolean
+          description: Whether work is pending with no running worker, retry, or terminal failure explaining
+            the backlog.
+        skip_by_hash_count:
+          type: integer
+          format: uint64
+        skipped_source_count:
+          type: integer
+          format: uint64
+        codec_decode_failures:
+          type: integer
+          format: uint64
+        embed_batches_started:
+          type: integer
+          format: uint64
+        embed_batches_completed:
+          type: integer
+          format: uint64
+        embed_items_started:
+          type: integer
+          format: uint64
+        embed_items_completed:
+          type: integer
+          format: uint64
+        active_embed_batch_items:
+          type: integer
+          format: uint64
+        active_embed_batch_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_started_ms:
+          type: integer
+          format: uint64
+        last_embed_batch_items:
+          type: integer
+          format: uint64
+        last_embed_batch_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_completed_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock completion time in Unix milliseconds for the most recently completed
+            embedding batch.
+        last_embed_batch_ns:
+          type: integer
+          format: uint64
+          description: Elapsed duration in nanoseconds for the most recently completed embedding batch.
+        total_embed_ns:
+          type: integer
+          format: uint64
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -17424,14 +17662,7 @@ components:
           type: integer
           format: uint64
         enrichment_runtime:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
-          properties:
-            pending_sequence_count:
-              type: integer
-              format: uint64
-          description: Embedding enrichment worker runtime diagnostics.
+          $ref: '#/components/schemas/EnrichmentRuntimeStatus'
         hbc_cache:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -17458,10 +17689,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17663,10 +17894,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17955,10 +18186,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -19578,6 +19809,8 @@ components:
         max_depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 64
           description: Maximum traversal depth
         min_weight:
           x-go-type-skip-optional-pointer: true
@@ -19592,6 +19825,8 @@ components:
         max_results:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 10000
           description: Maximum number of results (traversal)
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
@@ -19606,6 +19841,8 @@ components:
         k:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 100
           description: Number of paths to find (k-shortest-paths)
         node_filter:
           $ref: '#/components/schemas/NodeFilter'
@@ -19792,6 +20029,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Document key
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Owning table for a cross-table node; omitted for nodes in the queried table
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -21544,11 +21785,11 @@ components:
 
             Models are automatically unloaded after this duration of inactivity.
 
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
 
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
 
-            where all models are loaded at startup and never unloaded.
+            still be evicted under resource pressure or to enforce max_loaded_models.
           default: 5m
           example: 5m
         max_loaded_models:
@@ -21558,8 +21799,10 @@ components:
 
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
 
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+
+            Defaults to 10.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -21678,11 +21921,9 @@ components:
           description: >
             Per-model loading strategy overrides. Maps model names to their loading strategy.
 
-            Models not in this map use the default strategy based on keep_alive:
+            Models not in this map load on demand. keep_alive controls their idle
 
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-
-            - If keep_alive="0": eager loading (load at startup, never unload)
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
 
             When a model has strategy "eager" in this map:

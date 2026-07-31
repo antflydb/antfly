@@ -123,6 +123,17 @@ pub const HostedReplicaStatus = enum {
     failed,
 };
 
+pub const PreparedReplica = struct {
+    factory: ReplicaDescriptorFactory,
+    descriptor: raft_engine.runtime.ReplicaDescriptor,
+    bootstrap_prepared: bool,
+
+    pub fn deinit(self: *PreparedReplica, alloc: std.mem.Allocator) void {
+        self.factory.freeDescriptor(alloc, &self.descriptor);
+        self.* = undefined;
+    }
+};
+
 pub const BootstrapStatusKind = enum {
     backup_db_snapshot_restore,
 };
@@ -165,6 +176,9 @@ pub const HostMetrics = struct {
     runtime_pending_apply_bytes: usize = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
+    runtime_snapshot_compaction_completions: usize = 0,
+    runtime_snapshot_compaction_failures: usize = 0,
+    runtime_snapshot_compaction_candidates: usize = 0,
     backup_bootstrap_attempts: usize = 0,
     backup_bootstrap_failures: usize = 0,
     backup_bootstrap_successes: usize = 0,
@@ -294,52 +308,139 @@ pub const Host = struct {
     }
 
     pub fn ensureReplica(self: *Host, record: catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
-        if (self.runtime_host.group(record.group_id) == null) {
-            if (record.backup_restore_bootstrap != null) {
-                self.noteBootstrapPreparing(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
-                if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
-                    bootstrapper.prepareBackupRestore(record) catch |err| {
-                        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                        return err;
-                    };
-                } else if (self.cfg.replica_root_dir) |replica_root_dir| {
-                    backup_restore.applyBackupRestoreFromRecord(
-                        self.alloc,
-                        replica_root_dir,
-                        record.group_id,
-                        record.backup_restore_bootstrap.?,
-                    ) catch |err| {
-                        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                        return err;
-                    };
-                } else {
-                    self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, error.MissingBackupRestoreBootstrapHandler, record.backup_restore_bootstrap);
-                    return error.MissingBackupRestoreBootstrapHandler;
-                }
+        const prepare_bootstrap = !self.hasReplica(record.group_id) and record.backup_restore_bootstrap != null;
+        if (prepare_bootstrap) self.noteReplicaBootstrapPreparing(record);
+        var prepared = self.prepareReplica(record, prepare_bootstrap) catch |err| {
+            if (prepare_bootstrap) self.noteReplicaBootstrapPreparationFailure(record, err);
+            return err;
+        };
+        defer prepared.deinit(self.alloc);
+        return try self.installPreparedReplica(record, &prepared);
+    }
+
+    pub fn hasReplica(self: *Host, group_id: u64) bool {
+        return self.runtime_host.group(group_id) != null;
+    }
+
+    /// Performs filesystem, descriptor, and catalog durability work without
+    /// mutating the live Raft runtime. Callers must serialize reconcile plans,
+    /// but Raft progress may continue concurrently while this method runs.
+    pub fn prepareReplica(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+    ) !PreparedReplica {
+        return try self.prepareReplicaWithCatalog(record, prepare_bootstrap, true);
+    }
+
+    /// Builds a descriptor and any replacement filesystem generation without
+    /// publishing catalog admission. Reconciliation commits all catalog
+    /// mutations together after its desired-state epoch is revalidated.
+    pub fn prepareReplicaUnpublished(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+    ) !PreparedReplica {
+        return try self.prepareReplicaWithCatalog(record, prepare_bootstrap, false);
+    }
+
+    fn prepareReplicaWithCatalog(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+        persist_catalog: bool,
+    ) !PreparedReplica {
+        const should_prepare_bootstrap = prepare_bootstrap and record.backup_restore_bootstrap != null;
+        if (should_prepare_bootstrap) {
+            try record.backup_restore_bootstrap.?.validate();
+            if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
+                try bootstrapper.prepareBackupRestore(record);
+            } else {
+                return error.MissingBackupRestoreBootstrapHandler;
             }
         }
 
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
-        var desc = try factory.buildDescriptor(record);
-        defer factory.freeDescriptor(self.alloc, &desc);
-
-        desc.group.raft_config.trace_logger = self.cfg.trace_logger orelse
+        var descriptor = try factory.buildDescriptor(record);
+        errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
             if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
 
-        const result = self.runtime_host.ensureReplica(desc) catch |err| {
-            if (record.backup_restore_bootstrap != null) {
+        // Persist admission before publication. A crash between these steps
+        // leaves a recoverable catalog entry instead of an untracked live group.
+        if (persist_catalog) if (self.deps.replica_catalog) |replica_catalog| {
+            try replica_catalog.upsertReplica(record);
+        };
+        return .{
+            .factory = factory,
+            .descriptor = descriptor,
+            .bootstrap_prepared = should_prepare_bootstrap,
+        };
+    }
+
+    /// Publishes a fully prepared descriptor into the single-owner runtime.
+    /// This method must execute under the runtime owner's serialization lock.
+    pub fn installPreparedReplica(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepared: *PreparedReplica,
+    ) !raft_engine.runtime.EnsureReplicaResult {
+        const result = self.runtime_host.ensureReplica(prepared.descriptor) catch |err| {
+            if (prepared.bootstrap_prepared) {
                 self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
             }
             return err;
         };
         self.metrics.ensure_replica_calls += 1;
-        if (record.backup_restore_bootstrap != null) {
+        if (prepared.bootstrap_prepared) {
             self.noteBootstrapSuccess(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
         }
-        if (self.deps.replica_catalog) |replica_catalog| {
-            try replica_catalog.upsertReplica(record);
-        }
         return result;
+    }
+
+    pub fn noteReplicaBootstrapPreparing(self: *Host, record: catalog.ReplicaRecord) void {
+        if (record.backup_restore_bootstrap == null) return;
+        self.noteBootstrapPreparing(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
+    }
+
+    pub fn noteReplicaBootstrapPreparationFailure(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        err: anyerror,
+    ) void {
+        if (record.backup_restore_bootstrap == null) return;
+        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
+    }
+
+    pub fn cancelReplicaBootstrapPreparation(self: *Host, record: catalog.ReplicaRecord) void {
+        if (record.backup_restore_bootstrap == null or self.hasReplica(record.group_id)) return;
+        self.clearBootstrapStatus(record.group_id);
+    }
+
+    pub fn replicaCatalogRevision(self: *Host) ?u64 {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return replica_catalog.revision();
+    }
+
+    pub fn commitReplicaCatalog(
+        self: *Host,
+        expected_revision: ?u64,
+        upserts: []const catalog.ReplicaRecord,
+        removals: []const u64,
+    ) !void {
+        const replica_catalog = self.deps.replica_catalog orelse return;
+        try replica_catalog.applyBatch(
+            expected_revision orelse return error.MissingReplicaCatalogRevision,
+            upserts,
+            removals,
+        );
+    }
+
+    pub fn removePreparedReplica(self: *Host, group_id: u64) !void {
+        if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
+        try self.runtime_host.removeReplica(group_id);
+        self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *Host, alloc: std.mem.Allocator) !usize {
@@ -359,12 +460,15 @@ pub const Host = struct {
     }
 
     pub fn removeReplica(self: *Host, group_id: u64) !void {
-        try self.runtime_host.removeReplica(group_id);
-        self.metrics.remove_replica_calls += 1;
-        self.clearBootstrapStatus(group_id);
+        if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
+        // Persist removal intent before tearing down the live owner. A catalog
+        // failure therefore remains retryable through normal reconciliation.
         if (self.deps.replica_catalog) |replica_catalog| {
             _ = try replica_catalog.removeReplica(group_id);
         }
+        try self.runtime_host.removeReplica(group_id);
+        self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
     }
 
     pub fn refreshPeerEndpoints(self: *Host, group_id: u64, node_id: u64) !usize {
@@ -486,6 +590,9 @@ pub const Host = struct {
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
+        snapshot.runtime_snapshot_compaction_completions = runtime_metrics.snapshot_compaction_completions;
+        snapshot.runtime_snapshot_compaction_failures = runtime_metrics.snapshot_compaction_failures;
+        snapshot.runtime_snapshot_compaction_candidates = runtime_metrics.snapshot_compaction_candidates;
         return snapshot;
     }
 
@@ -493,20 +600,20 @@ pub const Host = struct {
         return try self.runtime_host.listGroupIds(alloc);
     }
 
-    pub fn runRound(self: *Host, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        return try self.runRoundBounded(default_max_inbound_messages_per_round, max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *Host, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        return try self.runRoundBounded(default_max_inbound_messages_per_round, max_tick_groups, max_ready_steps);
     }
 
     pub fn runRoundBounded(
         self: *Host,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
         const inbound_start_ns = platform_time.monotonicNs();
         _ = try self.drainInboundMessages(max_inbound_messages);
         const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
-        var round = try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
+        var round = try self.runtime_host.runRound(max_tick_groups, max_ready_steps);
         round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
         round.elapsed_ns += round.inbound_drain_elapsed_ns;
         return round;
@@ -964,17 +1071,17 @@ pub const HttpHost = struct {
         return try self.host.removePeerRoute(group_id, node_id);
     }
 
-    pub fn runRound(self: *HttpHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        return try self.host.runRound(max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *HttpHost, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        return try self.host.runRound(max_tick_groups, max_ready_steps);
     }
 
     pub fn runRoundBounded(
         self: *HttpHost,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        return try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        return try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
     }
 
     pub fn campaignGroup(self: *HttpHost, group_id: u64) !void {
@@ -1080,11 +1187,55 @@ test "host can ensure and remove a replica" {
         }
     };
 
+    const RemovalCatalog = struct {
+        fail_remove: bool = true,
+        remove_calls: usize = 0,
+
+        fn iface(self: *@This()) catalog.ReplicaCatalog {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .upsert_replica = upsertReplica,
+                    .remove_replica = removeReplica,
+                    .list_replicas = listReplicas,
+                    .revision = revision,
+                    .apply_batch = applyBatch,
+                },
+            };
+        }
+
+        fn upsertReplica(_: *anyopaque, _: catalog.ReplicaRecord) !void {}
+
+        fn removeReplica(ptr: *anyopaque, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remove_calls += 1;
+            if (self.fail_remove) return error.InjectedCatalogRemovalFailure;
+            return true;
+        }
+
+        fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
+            return try alloc.alloc(catalog.ReplicaRecord, 0);
+        }
+
+        fn revision(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn applyBatch(
+            _: *anyopaque,
+            _: u64,
+            _: []const catalog.ReplicaRecord,
+            _: []const u64,
+        ) !void {}
+    };
+
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var replica_catalog = RemovalCatalog{};
     var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
         .descriptor_factory = factory.iface(),
+        .replica_catalog = replica_catalog.iface(),
     });
     defer host.deinit();
 
@@ -1096,8 +1247,13 @@ test "host can ensure and remove a replica" {
     try std.testing.expectEqual(.active, host.status(41));
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().hosted_groups);
 
+    try std.testing.expectError(error.InjectedCatalogRemovalFailure, host.removeReplica(41));
+    try std.testing.expectEqual(.active, host.status(41));
+
+    replica_catalog.fail_remove = false;
     try host.removeReplica(41);
     try std.testing.expectEqual(.absent, host.status(41));
+    try std.testing.expectEqual(@as(usize, 2), replica_catalog.remove_calls);
 }
 
 test "host rejects live snapshot uploads addressed to another node" {
@@ -1448,8 +1604,12 @@ test "host invokes backup restore bootstrapper exactly once before creating a re
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-91",
+            .artifact_backup_id = "snap-91",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-91/groups/91",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
 
@@ -1484,8 +1644,12 @@ test "host invokes backup restore bootstrapper exactly once before creating a re
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-91",
+            .artifact_backup_id = "snap-91",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-91/groups/91",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
     try std.testing.expectEqual(@as(usize, 1), bootstrapper.count);
@@ -1549,8 +1713,12 @@ test "host records backup restore bootstrap failure when no handler is available
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-92",
+            .artifact_backup_id = "snap-92",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-92/groups/92",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     }));
 
@@ -1581,8 +1749,12 @@ test "host records committed bootstrap durability as pending instead of failed" 
     defer host.deinit();
     const restore: catalog.BackupRestoreBootstrapRecord = .{
         .backup_id = "snap-pending",
+        .artifact_backup_id = "snap-pending",
         .location = "file:///tmp/backups",
         .snapshot_path = "snap-pending/groups/94",
+        .connection = "backup-store",
+        .artifact_size_bytes = 4096,
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     };
 
     host.noteBootstrapPreparing(94, .backup_db_snapshot_restore, restore);
@@ -1599,7 +1771,7 @@ test "host records committed bootstrap durability as pending instead of failed" 
     try std.testing.expectEqual(@as(usize, 0), metrics.backup_bootstrap_successes);
 }
 
-test "host records backup restore bootstrap failure details" {
+test "host does not perform path restore without a bootstrap authority owner" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -1658,15 +1830,19 @@ test "host records backup restore bootstrap failure details" {
     });
     defer host.deinit();
 
-    try std.testing.expectError(error.InvalidBackupLocation, host.ensureReplica(.{
+    try std.testing.expectError(error.MissingBackupRestoreBootstrapHandler, host.ensureReplica(.{
         .group_id = 93,
         .replica_id = 1,
         .local_node_id = 1,
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-93",
-            .location = "file://relative/path",
+            .artifact_backup_id = "snap-93",
+            .location = "file:///tmp/backups",
             .snapshot_path = "snap-93/groups/93",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     }));
 
@@ -1676,7 +1852,7 @@ test "host records backup restore bootstrap failure details" {
     try std.testing.expectEqual(.failed, bootstrap_status.phase);
     try std.testing.expectEqual(@as(u64, 1), bootstrap_status.attempts);
     try std.testing.expect(bootstrap_status.last_updated_at_millis > 0);
-    try std.testing.expectEqualStrings("InvalidBackupLocation", bootstrap_status.last_error orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings("MissingBackupRestoreBootstrapHandler", bootstrap_status.last_error orelse return error.TestExpectedEqual);
     try std.testing.expectEqualStrings("snap-93", bootstrap_status.backup_id orelse return error.TestExpectedEqual);
     try std.testing.expectEqualStrings("snap-93/groups/93", bootstrap_status.snapshot_path orelse return error.TestExpectedEqual);
     const host_metrics = host.metricsSnapshot();
@@ -1685,7 +1861,45 @@ test "host records backup restore bootstrap failure details" {
     try std.testing.expectEqual(@as(usize, 1), host_metrics.backup_bootstrap_failures);
 }
 
-test "host falls back to replica root backup restore when no bootstrapper is installed" {
+const TestBackupRestoreBootstrapper = struct {
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    open_options: @import("../api/backups.zig").OpenOptions,
+
+    fn iface(self: *@This()) BackupRestoreBootstrapper {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .prepare_backup_restore = prepareBackupRestore },
+        };
+    }
+
+    fn prepareBackupRestore(ptr: *anyopaque, record: catalog.ReplicaRecord) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try backup_restore.applyBackupRestoreFromRecordWithOptions(
+            self.alloc,
+            self.replica_root_dir,
+            record.group_id,
+            record.backup_restore_bootstrap orelse return error.MissingBootstrapRecord,
+            self.open_options,
+        );
+    }
+};
+
+fn testBackupRestoreNodeConfig(alloc: std.mem.Allocator) !@import("../common/config.zig").Config {
+    return @import("../common/config.zig").Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
+test "host restores through an explicitly authorized bootstrap owner" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -1771,10 +1985,20 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testBackupRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -1787,6 +2011,8 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/91",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -1798,11 +2024,20 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var bootstrapper = TestBackupRestoreBootstrapper{
+        .alloc = std.testing.allocator,
+        .replica_root_dir = replica_root,
+        .open_options = .{
+            .node_config = &node_config,
+            .io = io_impl.io(),
+        },
+    };
     var host = Host.init(std.testing.allocator, .{
         .local_node_id = 1,
         .replica_root_dir = replica_root,
     }, .{
         .descriptor_factory = factory.iface(),
+        .backup_restore_bootstrapper = bootstrapper.iface(),
     });
     defer host.deinit();
 
@@ -1813,8 +2048,12 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap1",
+            .artifact_backup_id = "snap1",
             .location = restore_location,
             .snapshot_path = "snap1/groups/91",
+            .connection = "test-backups",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         },
     });
 
@@ -1918,10 +2157,28 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testBackupRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    var bootstrapper = TestBackupRestoreBootstrapper{
+        .alloc = std.testing.allocator,
+        .replica_root_dir = replica_root,
+        .open_options = .{
+            .node_config = &node_config,
+            .io = io_impl.io(),
+        },
+    };
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -1934,6 +2191,8 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/92",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -1954,6 +2213,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         }, .{
             .descriptor_factory = factory.iface(),
             .replica_catalog = file_catalog.catalog(),
+            .backup_restore_bootstrapper = bootstrapper.iface(),
         });
         defer host.deinit();
 
@@ -1964,8 +2224,12 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "snap1",
+                .artifact_backup_id = "snap1",
                 .location = restore_location,
                 .snapshot_path = "snap1/groups/92",
+                .connection = "test-backups",
+                .artifact_size_bytes = artifact_integrity.size_bytes,
+                .artifact_sha256 = artifact_integrity.sha256,
             },
         });
     }
@@ -1984,6 +2248,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         }, .{
             .descriptor_factory = restarted_factory.iface(),
             .replica_catalog = reopened_catalog.catalog(),
+            .backup_restore_bootstrapper = bootstrapper.iface(),
         });
         defer restarted_host.deinit();
 

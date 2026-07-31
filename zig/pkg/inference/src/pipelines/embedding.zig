@@ -224,6 +224,17 @@ pub const EmbeddingPipeline = struct {
         const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
         const fixed_len = hasFixedTextSequenceLength(input_info);
         const batch = texts.len;
+        const admitted_tokens = std.math.mul(usize, batch, max_len) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try text_session.admit(.{
+            .batch = batch,
+            .sequence = max_len,
+            .input_bytes = std.math.mul(usize, admitted_tokens, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, admitted_tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
         const encoded = try alloc.alloc(EncodeResult, batch);
         defer alloc.free(encoded);
@@ -280,7 +291,14 @@ pub const EmbeddingPipeline = struct {
         const inputs = input_set.slice();
 
         if (self.text_projection) |proj| {
-            if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
+            if (try self.tryEmbedTextResidentProjection(
+                inputs,
+                all_mask,
+                batch,
+                effective_len,
+                proj,
+                &run_permit,
+            )) |resident_embeddings| {
                 return resident_embeddings;
             }
         } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
@@ -289,7 +307,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run inference
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try text_session.run(inputs, alloc);
+        var outputs = try run_permit.run(inputs, alloc);
         logEmbedTiming("text.encoder", batch, encoder_start);
         defer {
             for (outputs) |*o| o.deinit();
@@ -489,12 +507,53 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim] embeddings.
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
-        const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
+        return self.embedImagesBatch(images) catch |err| {
+            if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
+                return self.embedImagesIndividually(images);
+            }
+            return err;
+        };
+    }
+
+    fn embedImagesBatch(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
+        const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
 
         const alloc = self.allocator;
         const img_size = self.config.image_size;
         const batch = images.len;
+        const pixel_elements = std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                std.math.mul(usize, batch, 3) catch
+                    return error.ResourceLimitExceeded,
+                img_size,
+            ) catch return error.ResourceLimitExceeded,
+            img_size,
+        ) catch return error.ResourceLimitExceeded;
+        const pixel_bytes = std.math.mul(usize, pixel_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var encoded_bytes: usize = 0;
+        for (images) |encoded| {
+            encoded_bytes = std.math.add(usize, encoded_bytes, encoded.len) catch
+                return error.ResourceLimitExceeded;
+        }
+        var run_permit = try vs.admit(.{
+            .batch = batch,
+            // Pixel area is fully represented by input_bytes. Patch/token
+            // sequence length is backend-specific and must not be guessed from
+            // raw pixels for the transformer activation profile.
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = std.math.add(
+                usize,
+                encoded_bytes,
+                std.math.mul(usize, pixel_bytes, 2) catch
+                    return error.ResourceLimitExceeded,
+            ) catch return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
@@ -525,18 +584,15 @@ pub const EmbeddingPipeline = struct {
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
-                vs,
                 &.{pv_tensor},
                 proj,
                 .image,
                 batch,
                 "image.encoder.resident",
                 "image.projection.resident",
+                &run_permit,
             ) catch |err| {
                 if (self.residentProjectionRequired()) return err;
-                if (batch > 1 and shouldFallbackBatchedImageError(err)) {
-                    return self.embedImagesIndividually(images);
-                }
                 return err;
             };
             if (resident) |embeddings| return embeddings;
@@ -544,10 +600,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run vision encoder
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = vs.run(&.{pv_tensor}, alloc) catch |err| {
-            if (batch > 1 and shouldFallbackBatchedImageError(err)) {
-                return self.embedImagesIndividually(images);
-            }
+        const outputs = run_permit.run(&.{pv_tensor}, alloc) catch |err| {
             return err;
         };
         logEmbedTiming("image.encoder", batch, encoder_start);
@@ -557,9 +610,6 @@ pub const EmbeddingPipeline = struct {
         }
 
         const embeddings = self.imageEmbeddingsFromOutputs(outputs, batch) catch |err| {
-            if (batch > 1 and shouldFallbackBatchedImageError(err)) {
-                return self.embedImagesIndividually(images);
-            }
             return err;
         };
         return embeddings;
@@ -699,9 +749,18 @@ pub const EmbeddingPipeline = struct {
 
     /// Embed a batch of PCM audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
-    pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
-        const as = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+    pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        return self.embedAudioPcmBatch(audio_clips) catch |err| {
+            if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
+                return self.embedAudioPcmIndividually(audio_clips);
+            }
+            return err;
+        };
+    }
+
+    fn embedAudioPcmBatch(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
+        const as = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
 
         const alloc = self.allocator;
         const batch = audio_clips.len;
@@ -717,7 +776,40 @@ pub const EmbeddingPipeline = struct {
         const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
         const n_frames = clapInputFeatureFrames(as, default_frames);
         const n_mels = audio.CLAP_CONFIG.n_mels;
-        const all_mels = try alloc.alloc(f32, batch * clap_channels * n_frames * n_mels);
+        const feature_elements = std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                std.math.mul(usize, batch, clap_channels) catch
+                    return error.ResourceLimitExceeded,
+                n_frames,
+            ) catch return error.ResourceLimitExceeded,
+            n_mels,
+        ) catch return error.ResourceLimitExceeded;
+        const feature_bytes = std.math.mul(usize, feature_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var pcm_bytes: usize = 0;
+        for (audio_clips) |clip| {
+            pcm_bytes = std.math.add(
+                usize,
+                pcm_bytes,
+                std.math.mul(usize, clip.samples.len, @sizeOf(f32)) catch
+                    return error.ResourceLimitExceeded,
+            ) catch return error.ResourceLimitExceeded;
+        }
+        var run_permit = try as.admit(.{
+            .batch = batch,
+            .sequence = n_frames,
+            .input_bytes = feature_bytes,
+            .host_preprocess_bytes = std.math.add(
+                usize,
+                pcm_bytes,
+                std.math.mul(usize, feature_bytes, 2) catch
+                    return error.ResourceLimitExceeded,
+            ) catch return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
+        const all_mels = try alloc.alloc(f32, feature_elements);
         @memset(all_mels, 0.0);
         defer alloc.free(all_mels);
 
@@ -780,18 +872,18 @@ pub const EmbeddingPipeline = struct {
 
         if (self.audio_projection) |proj| {
             if (try self.tryEmbedResidentProjection(
-                as,
                 run_inputs,
                 proj,
                 .audio,
                 batch,
                 "audio.encoder.resident",
                 "audio.projection.resident",
+                &run_permit,
             )) |embeddings| return embeddings;
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try as.run(run_inputs, alloc);
+        var outputs = try run_permit.run(run_inputs, alloc);
         logEmbedTiming("audio.encoder", batch, encoder_start);
         logEmbedTensorShapes(self.print_timing, "audio.outputs", outputs);
         defer {
@@ -817,7 +909,7 @@ pub const EmbeddingPipeline = struct {
 
         if (batch > 1 and !outputsContainBatchRows(outputs, batch)) {
             logEmbedFallback(self.print_timing, "audio.individual", batch);
-            return self.embedAudioPcmIndividually(audio_clips);
+            return error.BatchedAudioOutputCollapsed;
         }
 
         const embeddings = switch (outputs[0].shape.len) {
@@ -835,7 +927,7 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
-    fn embedAudioPcmIndividually(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
+    fn embedAudioPcmIndividually(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         const alloc = self.allocator;
         const embeddings = try alloc.alloc([]f32, audio_clips.len);
         var initialized: usize = 0;
@@ -874,8 +966,19 @@ pub const EmbeddingPipeline = struct {
         for (embeddings) |embedding| {
             if (embedding.len != in_dim) return error.ShapeMismatch;
         }
+        const input_elements = std.math.mul(usize, batch, in_dim) catch
+            return error.ResourceLimitExceeded;
+        const input_bytes = std.math.mul(usize, input_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try proj.admit(.{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = input_bytes,
+            .host_preprocess_bytes = input_bytes,
+        });
+        defer run_permit.deinit();
 
-        const packed_embeddings = try alloc.alloc(f32, batch * in_dim);
+        const packed_embeddings = try alloc.alloc(f32, input_elements);
         defer alloc.free(packed_embeddings);
         for (embeddings, 0..) |embedding, b| {
             @memcpy(packed_embeddings[b * in_dim ..][0..in_dim], embedding);
@@ -886,7 +989,7 @@ pub const EmbeddingPipeline = struct {
         defer proj_input.deinit();
 
         const projection_start = embedTimingStart(self.print_timing);
-        var proj_outputs = try proj.run(&.{proj_input}, alloc);
+        var proj_outputs = try run_permit.run(&.{proj_input}, alloc);
         logEmbedTiming("projection", batch, projection_start);
         defer {
             for (proj_outputs) |*o| o.deinit();
@@ -1183,9 +1286,17 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
         proj: backends.Session,
+        permit: *session_mod.RunPermit,
     ) !?[][]f32 {
+        const expected_dim = projectionInputDim(proj) orelse
+            return self.residentProjectionFallback(
+                .text,
+                "text.projection.resident",
+                batch,
+                "unknown_projection_input_dim",
+            );
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try self.session.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -1201,9 +1312,17 @@ pub const EmbeddingPipeline = struct {
         };
         defer pooled.deinit();
 
+        const resident_shape = [_]i64{ @intCast(batch), @intCast(expected_dim) };
         const resident_input = [_]session_mod.ResidentInput{.{
             .value = pooled.value,
             .backend = pooled.backend,
+            .estimated_bytes = std.math.mul(
+                usize,
+                std.math.mul(usize, batch, expected_dim) catch
+                    return error.ResourceLimitExceeded,
+                @sizeOf(f32),
+            ) catch return error.ResourceLimitExceeded,
+            .shape = &resident_shape,
         }};
         const projection_start = embedTimingStart(self.print_timing);
         var proj_outputs = (proj.runResidentInputs(&resident_input, self.allocator) catch |err| switch (err) {
@@ -1220,19 +1339,19 @@ pub const EmbeddingPipeline = struct {
 
     fn tryEmbedResidentProjection(
         self: *EmbeddingPipeline,
-        encoder: backends.Session,
         inputs: []const Tensor,
         proj: backends.Session,
         modality: ResidentProjectionModality,
         batch: usize,
         encoder_phase: []const u8,
         projection_phase: []const u8,
+        permit: *session_mod.RunPermit,
     ) !?[][]f32 {
         const expected_dim = projectionInputDim(proj) orelse
             return self.residentProjectionFallback(modality, projection_phase, batch, "unknown_projection_input_dim");
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try encoder.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
             return self.residentProjectionFallback(modality, encoder_phase, batch, "unsupported");
         logEmbedTiming(encoder_phase, batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -1248,9 +1367,17 @@ pub const EmbeddingPipeline = struct {
         };
         defer selected.deinit();
 
+        const resident_shape = [_]i64{ @intCast(batch), @intCast(expected_dim) };
         const resident_input = [_]session_mod.ResidentInput{.{
             .value = selected.value,
             .backend = selected.backend,
+            .estimated_bytes = std.math.mul(
+                usize,
+                std.math.mul(usize, batch, expected_dim) catch
+                    return error.ResourceLimitExceeded,
+                @sizeOf(f32),
+            ) catch return error.ResourceLimitExceeded,
+            .shape = &resident_shape,
         }};
         const projection_start = embedTimingStart(self.print_timing);
         var proj_outputs = (proj.runResidentInputs(&resident_input, self.allocator) catch |err| switch (err) {

@@ -33,6 +33,7 @@ jobs:
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
+      backup_s3: ${{ steps.detect.outputs.backup_s3 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -50,6 +51,7 @@ jobs:
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
+              echo "backup_s3=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -61,12 +63,14 @@ jobs:
                 echo "e2e=false"
                 echo "model_check=true"
                 echo "trace_validate=true"
+                echo "backup_s3=false"
               } >> "$GITHUB_OUTPUT"
             else
               {
                 echo "e2e=true"
                 echo "model_check=false"
                 echo "trace_validate=false"
+                echo "backup_s3=true"
               } >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -82,6 +86,7 @@ jobs:
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
+              echo "backup_s3=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -89,6 +94,7 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
             ':(glob)scripts/ci/**' \
+            scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -101,6 +107,7 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
             ':(glob)scripts/ci/**' \
+            scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -108,6 +115,20 @@ jobs:
             echo "e2e=false" >> "$GITHUB_OUTPUT"
           else
             echo "e2e=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            scripts/test-backup-s3-integration.sh \
+            zig/build.zig \
+            zig/lib/httpx \
+            zig/lib/objectstore \
+            zig/pkg/antfly/src/api/backups.zig \
+            zig/pkg/antfly/src/serverless/remote_uri.zig \
+            .github/workflows/zig-tests.yml
+          then
+            echo "backup_s3=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "backup_s3=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -139,8 +160,90 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-  zig-base:
-    name: zig-base
+  backup-s3-integration:
+    name: backup-s3-integration
+    needs: changes
+    # Opt in explicitly to avoid GitHub-hosted runner charges while this
+    # service-backed integration is temporarily disabled.
+    if: needs.changes.outputs.backup_s3 == 'true' && vars.ENABLE_BACKUP_S3_INTEGRATION == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Run backup listing against MinIO
+        run: scripts/test-backup-s3-integration.sh
+
+  arm64-codec:
+    name: ${{ (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
+    needs: changes
+    if: |
+      (
+        (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
+        (
+          needs.changes.outputs.zig_tests == 'true' ||
+          needs.changes.outputs.model_check == 'true' ||
+          needs.changes.outputs.trace_validate == 'true'
+        )
+      ) ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-publish-arm64
+    timeout-minutes: 20
+    env:
+      ZIG_VERSION: "0.16.0"
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify native Linux ARM64 runner
+        run: |
+          set -euo pipefail
+          uname -srm
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "aarch64"
+
+      - name: Install Zig
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl xz-utils
+          curl -fsSL \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
+            -C "$RUNNER_TEMP/zig" \
+            --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "$ZIG_VERSION"
+
+      - name: Run StreamVByte codec tests
+        run: |
+          set -euo pipefail
+          zig test zig/pkg/antfly/src/encoding/streamvbyte.zig
+          zig test -O ReleaseFast zig/pkg/antfly/src/encoding/streamvbyte.zig
+          zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
+          zig test -O ReleaseFast zig/pkg/antfly/src/encoding/chunked_coder.zig
+
+  zig-base-tests:
+    name: zig-base / x86_64
     needs: changes
     if: (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && (needs.changes.outputs.zig_tests == 'true' || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true')
     runs-on: arc-antfly-heavy
@@ -182,9 +285,11 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      # ARC exposes the node CPU count instead of the pod quota. Bound both
-      # zig build's process fan-out and std.Io.Threaded pool sizing to the same
-      # budget used by zig-full so teardown remains reliable under contention.
+      # ARC exposes the node CPU count instead of the pod quota. Keep the
+      # process affinity aligned with the pod CPU budget, and independently
+      # give Zig one memory-heavy process slot on the 15 GiB runner. A single
+      # unit artifact can approach half that budget while compiling or running;
+      # it still retains the full CPU set for its internal parallel work.
       - name: Compute CPU bound for unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
@@ -192,6 +297,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+          echo "build_jobs=1" >> "$GITHUB_OUTPUT"
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
@@ -298,7 +404,7 @@ jobs:
 
           (
             set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="${ZIG_BUILD_FLAGS} -j${{ steps.cpus.outputs.build_jobs }}" 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
@@ -343,6 +449,16 @@ jobs:
           wait "$unit_pid" || status="$?"
           kill "$watchdog_pid" 2>/dev/null || true
           wait "$watchdog_pid" 2>/dev/null || true
+          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
+            echo "::group::unit failure cgroup memory"
+            for metric in memory.current memory.peak memory.max memory.events; do
+              if [ -r "/sys/fs/cgroup/$metric" ]; then
+                echo "[$metric]"
+                cat "/sys/fs/cgroup/$metric"
+              fi
+            done
+            echo "::endgroup::"
+          fi
           exit "$status"
 
       - name: Set up Java for TLA+
@@ -359,8 +475,8 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
         run: scripts/ci/zig-tla-verify.sh
 
-  zig-full:
-    name: zig-full
+  zig-full-tests:
+    name: zig-full / x86_64
     needs: changes
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
@@ -401,19 +517,32 @@ jobs:
 
       # The in-process cluster simulations size their thread pools from the
       # visible CPU count, which on ARC reflects the node rather than the pod
-      # quota. The resulting burst can starve the runner agent long enough for
-      # GitHub to declare the runner lost (~10 min of missed heartbeats), which
-      # is how most full-suite failures present. Bound the test steps to a
-      # fixed CPU set so pools and zig build parallelism stay within budget.
+      # quota. Give Zig one memory-heavy process slot while retaining the full
+      # pod CPU set inside that process.
       - name: Compute CPU bound for heavy test steps
         id: cpus
         run: |
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+          echo "build_jobs=1" >> "$GITHUB_OUTPUT"
 
       - name: Run full Zig unit tests
-        run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test
+        run: |
+          set +e
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="${ZIG_BUILD_FLAGS} -j${{ steps.cpus.outputs.build_jobs }}"
+          status="$?"
+          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
+            echo "::group::unit failure cgroup memory"
+            for metric in memory.current memory.peak memory.max memory.events; do
+              if [ -r "/sys/fs/cgroup/$metric" ]; then
+                echo "[$metric]"
+                cat "/sys/fs/cgroup/$metric"
+              fi
+            done
+            echo "::endgroup::"
+          fi
+          exit "$status"
 
       - name: Set up Java for TLA+
         uses: actions/setup-java@v5
@@ -466,6 +595,55 @@ jobs:
         working-directory: zig
         run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test ${ZIG_BUILD_FLAGS}
 
+  zig-base:
+    name: zig-base
+    needs: [changes, zig-base-tests, arm64-codec]
+    if: |
+      always() &&
+      (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
+      (
+        needs.changes.result != 'success' ||
+        needs.changes.outputs.zig_tests == 'true' ||
+        needs.changes.outputs.model_check == 'true' ||
+        needs.changes.outputs.trace_validate == 'true'
+      )
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Verify zig-base shards
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          X86_64_RESULT: ${{ needs.zig-base-tests.result }}
+          ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES_RESULT" = "success"
+          test "$X86_64_RESULT" = "success"
+          test "$ARM64_CODEC_RESULT" = "success"
+
+  zig-full:
+    name: zig-full
+    needs: [changes, zig-full-tests, arm64-codec]
+    if: |
+      always() &&
+      (
+        github.event_name == 'merge_group' ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        github.event_name == 'workflow_dispatch' ||
+        github.event.schedule == '0 8 * * *'
+      )
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Verify zig-full shards
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          X86_64_RESULT: ${{ needs.zig-full-tests.result }}
+          ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES_RESULT" = "success"
+          test "$X86_64_RESULT" = "success"
+          test "$ARM64_CODEC_RESULT" = "success"
+
   e2e-base:
     name: e2e-base
     needs: changes
@@ -507,13 +685,20 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
+      - name: Compute CPU bound for E2E
+        id: e2e_cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
-        run: scripts/ci/zig-e2e-base-linux.sh
+        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
   e2e-full:
     name: e2e-full
@@ -554,6 +739,13 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Compute CPU bound for E2E
+        id: e2e_cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust WASI target
         uses: dtolnay/rust-toolchain@stable
@@ -596,7 +788,7 @@ jobs:
           ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
 
       - name: Run Antfly inference full E2E
         id: inference_full_e2e
@@ -607,7 +799,7 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
       - name: Report full E2E result
         if: always()

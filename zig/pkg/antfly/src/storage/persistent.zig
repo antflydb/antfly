@@ -268,7 +268,14 @@ const SegmentFileStore = struct {
         errdefer allocator.free(owned_root);
 
         if (storage) |provided| {
-            if (create_if_missing) try provided.createDirPath(owned_root);
+            if (create_if_missing) {
+                try provided.createDirPath(owned_root);
+                // Segment publication fsyncs each immutable file and its
+                // containing directory. Publish the directory entry itself
+                // first so those acknowledged files remain reachable after a
+                // crash that follows initial index creation.
+                try provided.syncParentAbsolute(owned_root);
+            }
             return .{
                 .allocator = allocator,
                 .root_dir = owned_root,
@@ -280,7 +287,10 @@ const SegmentFileStore = struct {
         errdefer allocator.destroy(owner);
         owner.* = try storage_io.NativeStorage.init(allocator, io_runtime);
         errdefer owner.deinit();
-        if (create_if_missing) try owner.storage().createDirPath(owned_root);
+        if (create_if_missing) {
+            try owner.storage().createDirPath(owned_root);
+            try owner.storage().syncParentAbsolute(owned_root);
+        }
 
         return .{
             .allocator = allocator,
@@ -313,7 +323,10 @@ const SegmentFileStore = struct {
         try writer.appendSlice(bytes);
         active = false;
         writer.finish() catch |err| {
-            if (builtin.os.tag != .freestanding) std.log.err("text segment atomic finish failed: {s}", .{@errorName(err)});
+            // The atomic writer preserves the previously published segment on
+            // failure and the caller receives the error for retry/rollback.
+            // This is an operational write failure, not an invariant breach.
+            if (builtin.os.tag != .freestanding) std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
             return err;
         };
 
@@ -466,6 +479,12 @@ const AtomicSegmentSink = struct {
         try self.flush();
         return try self.writer.crc32Prefix(len_prefix);
     }
+
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.flush();
+        return try self.writer.crc32Range(offset, range_len);
+    }
 };
 
 const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
@@ -475,6 +494,7 @@ const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
     .append_ntimes = AtomicSegmentSink.appendNTimes,
     .write_at = AtomicSegmentSink.writeAt,
     .crc32_prefix = AtomicSegmentSink.crc32Prefix,
+    .crc32_range = AtomicSegmentSink.crc32Range,
 };
 
 fn walCommitBackendForOptions(backend: lmdb.CommitBackend) wal_mod.CommitBackend {
@@ -609,6 +629,21 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.close(),
+        }
+        self.* = undefined;
+    }
+
+    fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
+        switch (self.*) {
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .mem => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
         }
         self.* = undefined;
     }
@@ -1119,6 +1154,20 @@ pub const PersistentIndex = struct {
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
+        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
+        if (self.segment_files) |*store| store.close();
+        self.unlockStorage();
+        self.* = undefined;
+    }
+
+    /// Tears down a pre-crash owner without allowing it to flush, compact, or
+    /// reclaim files after storage has been rolled back to a durable snapshot.
+    pub fn abandonAfterCrash(self: *PersistentIndex) void {
+        self.lockStorage();
+        self.writer.deinit();
+        self.wal.abandonAfterCrash();
+        self.main_store.deinit();
+        self.main_store_owner.abandonAfterCrash(self.alloc);
         if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
@@ -1741,7 +1790,7 @@ pub const PersistentIndex = struct {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
                 defer reader.deinit();
                 for (0..reader.doc_count) |doc_idx| {
-                    const stored = reader.storedDoc(@intCast(doc_idx)) orelse continue;
+                    const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
                 }
             }
@@ -2557,7 +2606,7 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
 
     if (reader.doc_count == 0) return error.EmptySegment;
 
-    if (reader.storedFieldsOmitted()) {
+    if (try reader.storedFieldsOmitted()) {
         const range = (try reader.docKeyRange()) orelse return error.InvalidSegment;
         const min_doc_key = try alloc.dupe(u8, range.min_key);
         errdefer alloc.free(min_doc_key);
@@ -2575,7 +2624,7 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
     errdefer if (max_key) |key| alloc.free(key);
 
     for (0..reader.doc_count) |doc_idx| {
-        const stored = reader.storedDoc(@intCast(doc_idx)) orelse continue;
+        const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
         if (min_key == null or std.mem.order(u8, stored.id, min_key.?) == .lt) {
             if (min_key) |key| alloc.free(key);
             min_key = try alloc.dupe(u8, stored.id);
@@ -3353,7 +3402,7 @@ test "persistent index snapshots use mapped segment files when native storage is
     const snap = idx.snapshot();
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(snap.segments[0].data.isFileBacked());
-    try std.testing.expectEqualStrings("doc:a", snap.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:a", (try snap.storedDoc(0)).?.id);
 }
 
 test "persistent index deletes replaced segment files only after retained snapshot release" {

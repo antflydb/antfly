@@ -16,6 +16,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Stats = struct {
+    cpu_available: bool = false,
+    user_cpu_ns: u64 = 0,
+    system_cpu_ns: u64 = 0,
     available: bool = false,
     resident_bytes: u64 = 0,
     peak_resident_bytes: u64 = 0,
@@ -45,6 +48,10 @@ pub fn pressureWorkingSetBytes(stats: Stats) u64 {
 
 pub fn snapshot() Stats {
     var stats = pressureSnapshot();
+    const cpu = processCpuSnapshot();
+    stats.cpu_available = cpu.available;
+    stats.user_cpu_ns = cpu.user_ns;
+    stats.system_cpu_ns = cpu.system_ns;
     if (!stats.available or builtin.os.tag != .macos) return stats;
 
     const malloc_stats = darwin.mallocStats();
@@ -52,6 +59,31 @@ pub fn snapshot() Stats {
     stats.malloc_allocated_bytes = malloc_stats.allocated_bytes;
     stats.malloc_zone_bytes = malloc_stats.zone_bytes;
     return stats;
+}
+
+const CpuStats = struct {
+    available: bool = false,
+    user_ns: u64 = 0,
+    system_ns: u64 = 0,
+};
+
+fn processCpuSnapshot() CpuStats {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{};
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    return .{
+        .available = true,
+        .user_ns = timevalNs(usage.utime),
+        .system_ns = timevalNs(usage.stime),
+    };
+}
+
+fn timevalNs(value: anytype) u64 {
+    if (value.sec < 0 or value.usec < 0) return 0;
+    const seconds: u64 = @intCast(value.sec);
+    const microseconds: u64 = @intCast(value.usec);
+    const seconds_ns = std.math.mul(u64, seconds, std.time.ns_per_s) catch std.math.maxInt(u64);
+    const microseconds_ns = std.math.mul(u64, microseconds, std.time.ns_per_us) catch std.math.maxInt(u64);
+    return seconds_ns +| microseconds_ns;
 }
 
 /// Low-overhead OS memory-pressure sample for hot qualification loops. This

@@ -22,7 +22,7 @@ pub const lsm_backend = support.lsm_backend;
 pub const storage_backend = support.backend_types;
 pub const db_types = support.db_types;
 
-test {
+test "embedded package surfaces are reachable" {
     _ = db;
     _ = api;
     _ = host_environment;

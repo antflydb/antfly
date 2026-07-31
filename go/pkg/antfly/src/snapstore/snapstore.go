@@ -91,6 +91,33 @@ type LocalSnapStore struct {
 	snapDir string // Base directory for storing snapshots
 }
 
+type snapshotContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r snapshotContextReader) Read(data []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(data)
+}
+
+func syncDirectory(dirPath string) error {
+	dir, err := os.Open(dirPath) //nolint:gosec // internal snapshot directory
+	if err != nil {
+		return fmt.Errorf("opening snapshot directory for sync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("syncing snapshot directory: %w", err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("closing snapshot directory: %w", err)
+	}
+	return nil
+}
+
 // NewLocalSnapStore creates a new filesystem-based snapshot store.
 // It constructs the snapshot directory path from the provided parameters and creates it if it doesn't exist.
 func NewLocalSnapStore(dataDir string, shardID, nodeID types.ID) (*LocalSnapStore, error) {
@@ -137,39 +164,46 @@ func (s *LocalSnapStore) Put(ctx context.Context, snapID string, r io.Reader) er
 	if err := validateSnapID(snapID); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	finalPath := s.archiveFilePath(snapID)
 
-	// Write to temporary file first for atomic operation
-	tempPath := finalPath + ".tmp"
-	defer func() { _ = os.Remove(tempPath) }() // Clean up temp file on error
-
-	tempFile, err := os.Create(tempPath) //nolint:gosec // G304: internal file I/O, not user-controlled
+	tempFile, err := os.CreateTemp(
+		s.snapDir,
+		"."+filepath.Base(finalPath)+".tmp-*",
+	) //nolint:gosec // internal snapshot directory
 	if err != nil {
-		return fmt.Errorf("creating temp file %s: %w", tempPath, err)
+		return fmt.Errorf("creating temporary snapshot file: %w", err)
 	}
-
-	// Copy data to temp file
-	if _, err := io.Copy(tempFile, r); err != nil {
+	tempPath := tempFile.Name()
+	defer func() {
 		_ = tempFile.Close()
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := io.Copy(tempFile, snapshotContextReader{ctx: ctx, reader: r}); err != nil {
 		return fmt.Errorf("writing snapshot data: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if err := tempFile.Sync(); err != nil {
-		_ = tempFile.Close()
 		return fmt.Errorf("syncing temp file: %w", err)
 	}
 
 	if err := tempFile.Close(); err != nil {
 		return fmt.Errorf("closing temp file: %w", err)
 	}
-
-	// Atomic rename
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.Rename(tempPath, finalPath); err != nil {
 		return fmt.Errorf("renaming %s to %s: %w", tempPath, finalPath, err)
 	}
-
-	return nil
+	return syncDirectory(s.snapDir)
 }
 
 // Delete removes a snapshot file.
@@ -253,8 +287,24 @@ func (s *LocalSnapStore) CreateSnapshot(ctx context.Context, snapID string, sour
 	if err := validateSnapID(snapID); err != nil {
 		return 0, err
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 
 	archiveFile := s.archiveFilePath(snapID)
+	tempFile, err := os.CreateTemp(
+		s.snapDir,
+		"."+filepath.Base(archiveFile)+".tmp-*",
+	)
+	if err != nil {
+		return 0, fmt.Errorf("creating temporary snapshot archive: %w", err)
+	}
+	tempPath := tempFile.Name()
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return 0, fmt.Errorf("closing temporary snapshot archive: %w", err)
+	}
+	defer func() { _ = os.Remove(tempPath) }()
 
 	// Build archive options with metadata
 	archiveOpts := common.CreateArchiveOptions{
@@ -268,10 +318,26 @@ func (s *LocalSnapStore) CreateSnapshot(ctx context.Context, snapID string, sour
 		}
 	}
 
-	// Create the snapshot archive with metadata
-	archiveInfo, err := common.CreateArchiveWithOptions(sourceDir, archiveFile, archiveOpts)
+	// The archive is built under a unique sibling path, then atomically
+	// published. A crash can leave only an unreferenced temp file, never a
+	// partial archive at the stable snapshot path.
+	archiveInfo, err := common.CreateArchiveWithOptionsContext(
+		ctx,
+		sourceDir,
+		tempPath,
+		archiveOpts,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("creating snapshot archive: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tempPath, archiveFile); err != nil {
+		return 0, fmt.Errorf("publishing snapshot archive: %w", err)
+	}
+	if err := syncDirectory(s.snapDir); err != nil {
+		return 0, err
 	}
 
 	return archiveInfo.Size(), nil
@@ -294,7 +360,12 @@ func (s *LocalSnapStore) ExtractSnapshot(ctx context.Context, snapID string, tar
 	}
 
 	// Extract the archive with auto-detection and metadata parsing
-	result, err := common.ExtractArchiveWithResult(archiveFile, targetDir, removeExisting)
+	result, err := common.ExtractArchiveWithResultContext(
+		ctx,
+		archiveFile,
+		targetDir,
+		removeExisting,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("extracting snapshot archive: %w", err)
 	}

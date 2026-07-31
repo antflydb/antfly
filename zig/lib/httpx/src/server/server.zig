@@ -24,13 +24,16 @@
 //! direct TLS support.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const array_list_writer_mod = @import("../util/array_list_writer.zig");
 const arrayListWriter = array_list_writer_mod.arrayListWriter;
 const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
+const posix = std.posix;
 const Allocator = mem.Allocator;
 const Io = std.Io;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
+const encoding = @import("../util/encoding.zig");
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -109,7 +112,24 @@ pub const ServerConfig = struct {
 fn routeErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        error.SyntaxError,
+        error.UnexpectedToken,
+        error.MissingField,
+        error.UnknownField,
+        error.InvalidRequest,
+        => 400,
         else => 500,
+    };
+}
+
+fn routeErrorBody(code: u16) []const u8 {
+    return switch (code) {
+        400 => "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
+        404 => "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
+        408 => "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
+        413 => "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        431 => "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
+        else => "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
     };
 }
 
@@ -121,6 +141,7 @@ pub const Context = struct {
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
     data: ?std.StringHashMap(DataEntry) = null,
+    decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
 
     // H1 streaming field (set by the server, null for HTTP/2).
@@ -160,6 +181,8 @@ pub const Context = struct {
 
     /// Releases context resources. Calls destructors for data entries that have them.
     pub fn deinit(self: *Self) void {
+        for (self.decoded_query_values.items) |value| self.allocator.free(value);
+        self.decoded_query_values.deinit(self.allocator);
         if (self.data) |*data| {
             var it = data.iterator();
             while (it.next()) |entry| {
@@ -200,6 +223,16 @@ pub const Context = struct {
     pub fn query(self: *const Self, name: []const u8) ?[]const u8 {
         const query_str = self.request.uri.query orelse return null;
         return common.queryValue(query_str, name);
+    }
+
+    /// Returns one application/x-www-form-urlencoded query value, decoded
+    /// exactly once into request-owned memory.
+    pub fn queryDecoded(self: *Self, name: []const u8) !?[]const u8 {
+        const raw = self.query(name) orelse return null;
+        const decoded = try encoding.PercentEncoding.decodeFormData(self.allocator, raw);
+        errdefer self.allocator.free(decoded);
+        try self.decoded_query_values.append(self.allocator, decoded);
+        return decoded;
     }
 
     /// Returns a request header by name.
@@ -693,9 +726,12 @@ pub const Server = struct {
     const ConnectionControl = struct {
         socket: *Socket,
         h2: ?*H2Connection = null,
-        closed: std.atomic.Value(bool) = .init(false),
+        interrupted: std.atomic.Value(bool) = .init(false),
 
-        fn close(self: *@This(), graceful: bool) void {
+        /// Interrupts in-flight I/O without releasing the descriptor. The
+        /// connection fiber is the sole descriptor owner and closes it after
+        /// its handler has unwound.
+        fn interrupt(self: *@This(), graceful: bool) void {
             if (graceful) {
                 if (self.h2) |h2| {
                     h2.write_mutex.lockUncancelable(h2.io);
@@ -703,9 +739,8 @@ pub const Server = struct {
                     h2.write_mutex.unlock(h2.io);
                 }
             }
-            if (!self.closed.swap(true, .acq_rel)) {
+            if (!self.interrupted.swap(true, .acq_rel)) {
                 self.socket.shutdown();
-                self.socket.close();
             }
         }
     };
@@ -854,8 +889,6 @@ pub const Server = struct {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
-        std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
-
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
@@ -903,7 +936,7 @@ pub const Server = struct {
             connection.socket = conn.socket;
             connection.control = .{ .socket = &connection.socket };
             self.registerConnection(&connection.control) catch {
-                connection.control.close(false);
+                connection.socket.close();
                 self.allocator.destroy(connection);
                 self.conn_semaphore.post(self.io);
                 continue;
@@ -1013,7 +1046,7 @@ pub const Server = struct {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
         defer self.conn_semaphore.post(self.io);
         defer self.allocator.destroy(connection);
-        defer connection.control.close(false);
+        defer connection.socket.close();
         defer self.unregisterConnection(&connection.control);
         var sock = connection.socket;
 
@@ -1849,7 +1882,7 @@ pub const Server = struct {
         self.lockConnectionControls();
         defer self.connection_controls_mutex.unlock();
         const graceful = self.shutdown_mode.load(.acquire) == 1;
-        for (self.connection_controls.items) |control| control.close(graceful);
+        for (self.connection_controls.items) |control| control.interrupt(graceful);
     }
 
     fn setH2Control(self: *Self, control: *ConnectionControl, h2: *H2Connection) void {
@@ -1983,12 +2016,20 @@ pub const Server = struct {
         }
     }
 
-    /// Sends an HTTP/2 error response (just a HEADERS frame with :status).
+    /// Sends the same safe JSON error envelope used by HTTP/1.
     fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
+        const body = routeErrorBody(code);
+        var length_buf: [32]u8 = undefined;
+        const length = try std.fmt.bufPrint(&length_buf, "{d}", .{body.len});
+        const extra = [_]hpack.HeaderEntry{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "content-length", .value = length },
+        };
         var status_buf: [3]u8 = undefined;
-        const h2_headers = try H2Connection.buildResponseHeaders(code, &.{}, &status_buf, self.allocator);
+        const h2_headers = try H2Connection.buildResponseHeaders(code, &extra, &status_buf, self.allocator);
         defer self.allocator.free(h2_headers);
-        try h2.sendHeaders(writer, stream_id, h2_headers, true);
+        try h2.sendHeaders(writer, stream_id, h2_headers, false);
+        try h2.writeDataBlocking(writer, stream_id, body, true);
     }
 
     /// Like `sendH2Error` but acquires the write mutex first.
@@ -2003,6 +2044,8 @@ pub const Server = struct {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
+        resp.body = routeErrorBody(code);
+        try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
         try ensureContentLengthHeader(&resp);
         try ensureDateHeader(self.io, &resp);
 
@@ -2345,10 +2388,57 @@ test "ServerConfig defaults" {
 }
 
 test "routeErrorStatus maps oversized route errors to payload too large" {
+    try std.testing.expectEqual(@as(u16, 400), routeErrorStatus(error.SyntaxError));
+    try std.testing.expectEqual(@as(u16, 400), routeErrorStatus(error.MissingField));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.ValueTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.BodyTooLarge));
     try std.testing.expectEqual(@as(u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
+        routeErrorBody(400),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
+        routeErrorBody(404),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
+        routeErrorBody(408),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        routeErrorBody(413),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
+        routeErrorBody(431),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
+        routeErrorBody(500),
+    );
+}
+
+test "Context queryDecoded decodes percent escapes exactly once" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(
+        allocator,
+        .GET,
+        "/backup?location=s3%3A%2F%2Fbucket%2Fa%2520b&plus=a+b",
+    );
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const location = (try ctx.queryDecoded("location")).?;
+    try std.testing.expectEqualStrings("s3://bucket/a%20b", location);
+    const plus = (try ctx.queryDecoded("plus")).?;
+    try std.testing.expectEqualStrings("a b", plus);
+    const location_again = (try ctx.queryDecoded("location")).?;
+    try std.testing.expectEqualStrings(location, location_again);
+    try std.testing.expectEqual(@as(usize, 3), ctx.decoded_query_values.items.len);
 }
 
 test "Context max_file_size default and override" {
@@ -2849,6 +2939,26 @@ test "cross-thread graceful shutdown is listener-owned" {
     try std.testing.expect(!server.running);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expect(elapsed < std.time.ns_per_s);
+}
+
+test "connection interruption preserves the fiber-owned descriptor" {
+    if (builtin.os.tag == .windows) return;
+
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+
+    var client = try Socket.connect(listener.getLocalAddress(), io);
+    defer client.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+
+    var control = Server.ConnectionControl{ .socket = &accepted.socket };
+    control.interrupt(false);
+
+    const rc = posix.system.fcntl(accepted.socket.handle, posix.F.GETFD, @as(usize, 0));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
 }
 
 test "immediate stop preempts graceful request drain" {

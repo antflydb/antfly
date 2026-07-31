@@ -35,6 +35,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var filters: std.ArrayList([]const u8) = .empty;
     defer filters.deinit(allocator);
+    var skip_filters: std.ArrayList([]const u8) = .empty;
+    defer skip_filters.deinit(allocator);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -46,10 +48,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             continue;
+        } else if (std.mem.startsWith(u8, arg, "--test-filter=")) {
+            const filter = arg["--test-filter=".len..];
+            if (filter.len == 0) @panic("missing value after --test-filter=");
+            try filters.append(allocator, filter);
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
             i += 1;
             if (i >= args.len) @panic("missing value after --test-filter");
             try filters.append(allocator, args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
+            const filter = arg["--skip-test-filter=".len..];
+            if (filter.len == 0) @panic("missing value after --skip-test-filter=");
+            try skip_filters.append(allocator, filter);
+        } else if (std.mem.eql(u8, arg, "--skip-test-filter")) {
+            i += 1;
+            if (i >= args.len) @panic("missing value after --skip-test-filter");
+            try skip_filters.append(allocator, args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.panic("unrecognized command line argument: {s}", .{arg});
         } else {
             try filters.append(allocator, arg);
         }
@@ -58,7 +74,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const test_fn_list = builtin.test_functions;
     const list_tests_path = getenvSpan("ANTFLY_INFERENCE_TEST_LIST_FILE");
     if (list_tests_path) |path| {
-        try writeSelectedRuntimeTests(path, test_fn_list, filters.items);
+        try writeSelectedRuntimeTests(path, test_fn_list, filters.items, skip_filters.items);
         return;
     }
     const runtime_offset = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET") orelse 0;
@@ -72,7 +88,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var leak_count: usize = 0;
 
     for (test_fn_list) |test_fn| {
-        if (!matchesAnyFilter(test_fn.name, filters.items)) continue;
+        if (!matchesSelected(test_fn.name, filters.items, skip_filters.items)) continue;
         matched_count += 1;
         if (matched_count <= runtime_offset) continue;
         if (selected_count >= runtime_limit) break;
@@ -128,12 +144,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
 }
 
 fn matchesAnyFilter(name: []const u8, filters: []const []const u8) bool {
-    if (filters.len == 0) return true;
     for (filters) |filter| {
         if (filter.len == 0) continue;
         if (std.mem.indexOf(u8, name, filter) != null) return true;
     }
     return false;
+}
+
+fn matchesSelected(
+    name: []const u8,
+    filters: []const []const u8,
+    skip_filters: []const []const u8,
+) bool {
+    if (filters.len != 0 and !matchesAnyFilter(name, filters)) return false;
+    return !matchesAnyFilter(name, skip_filters);
 }
 
 fn getenvSpan(comptime name: [:0]const u8) ?[]const u8 {
@@ -147,14 +171,19 @@ fn getenvUsize(comptime name: [:0]const u8) ?usize {
     return std.fmt.parseUnsigned(usize, value, 10) catch null;
 }
 
-fn writeSelectedRuntimeTests(path: []const u8, test_fn_list: []const std.builtin.TestFn, filters: []const []const u8) !void {
+fn writeSelectedRuntimeTests(
+    path: []const u8,
+    test_fn_list: []const std.builtin.TestFn,
+    filters: []const []const u8,
+    skip_filters: []const []const u8,
+) !void {
     var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
     defer file.close(std.testing.io);
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(std.testing.io, &buf);
     for (test_fn_list) |test_fn| {
-        if (!matchesAnyFilter(test_fn.name, filters)) continue;
+        if (!matchesSelected(test_fn.name, filters, skip_filters)) continue;
         try writer.interface.writeAll(test_fn.name);
         try writer.interface.writeAll("\n");
     }

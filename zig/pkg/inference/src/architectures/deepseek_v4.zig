@@ -195,9 +195,9 @@ fn recountSchedules(config: *gpt_config.Config) void {
 }
 
 pub fn normalizeGgufGlobalWeightKey(key: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, key, "hc_head.fn") or std.mem.eql(u8, key, "hc_head_fn.weight") or std.mem.eql(u8, key, "hc_head_fn")) return "model.hc_head.hc_fn";
-    if (std.mem.eql(u8, key, "hc_head.base") or std.mem.eql(u8, key, "hc_head_base.weight") or std.mem.eql(u8, key, "hc_head_base")) return "model.hc_head.hc_base";
-    if (std.mem.eql(u8, key, "hc_head.scale") or std.mem.eql(u8, key, "hc_head_scale.weight") or std.mem.eql(u8, key, "hc_head_scale")) return "model.hc_head.hc_scale";
+    if (std.mem.eql(u8, key, "hc_head.fn") or std.mem.eql(u8, key, "hc_head_fn.weight") or std.mem.eql(u8, key, "hc_head_fn") or std.mem.eql(u8, key, "output_hc_fn.weight")) return "model.hc_head.hc_fn";
+    if (std.mem.eql(u8, key, "hc_head.base") or std.mem.eql(u8, key, "hc_head_base.weight") or std.mem.eql(u8, key, "hc_head_base") or std.mem.eql(u8, key, "output_hc_base.weight")) return "model.hc_head.hc_base";
+    if (std.mem.eql(u8, key, "hc_head.scale") or std.mem.eql(u8, key, "hc_head_scale.weight") or std.mem.eql(u8, key, "hc_head_scale") or std.mem.eql(u8, key, "output_hc_scale.weight")) return "model.hc_head.hc_scale";
     return null;
 }
 
@@ -235,10 +235,10 @@ pub fn normalizeGgufWeightKey(layer: usize, suffix: []const u8, buf: *[256]u8) ?
     if (std.mem.eql(u8, suffix, "ffn_gate_inp.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.mlp.gate.weight", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "ffn_gate_inp.bias") or std.mem.eql(u8, suffix, "ffn_gate_inp.e_score_correction_bias") or std.mem.eql(u8, suffix, "exp_probs_b")) {
+    if (std.mem.eql(u8, suffix, "ffn_gate_inp.bias") or std.mem.eql(u8, suffix, "ffn_gate_inp.e_score_correction_bias") or std.mem.eql(u8, suffix, "exp_probs_b") or std.mem.eql(u8, suffix, "exp_probs_b.bias")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.mlp.gate.e_score_correction_bias", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "ffn_gate_inp.tid2eid") or std.mem.eql(u8, suffix, "ffn_gate_tid2eid")) {
+    if (std.mem.eql(u8, suffix, "ffn_gate_inp.tid2eid") or std.mem.eql(u8, suffix, "ffn_gate_tid2eid") or std.mem.eql(u8, suffix, "ffn_gate_tid2eid.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.mlp.gate.tid2eid", .{layer}) catch null;
     }
     if (std.mem.eql(u8, suffix, "ffn_gate_shexp.weight")) {
@@ -250,22 +250,22 @@ pub fn normalizeGgufWeightKey(layer: usize, suffix: []const u8, buf: *[256]u8) ?
     if (std.mem.eql(u8, suffix, "ffn_down_shexp.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.mlp.shared_experts.down_proj.weight", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "attn_hc_fn.weight") or std.mem.eql(u8, suffix, "attn_hc.fn") or std.mem.eql(u8, suffix, "hc_attn_fn")) {
+    if (std.mem.eql(u8, suffix, "attn_hc_fn.weight") or std.mem.eql(u8, suffix, "attn_hc.fn") or std.mem.eql(u8, suffix, "hc_attn_fn") or std.mem.eql(u8, suffix, "hc_attn_fn.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.attn_hc.fn", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "attn_hc_base.weight") or std.mem.eql(u8, suffix, "attn_hc.base") or std.mem.eql(u8, suffix, "hc_attn_base")) {
+    if (std.mem.eql(u8, suffix, "attn_hc_base.weight") or std.mem.eql(u8, suffix, "attn_hc.base") or std.mem.eql(u8, suffix, "hc_attn_base") or std.mem.eql(u8, suffix, "hc_attn_base.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.attn_hc.base", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "attn_hc_scale.weight") or std.mem.eql(u8, suffix, "attn_hc.scale") or std.mem.eql(u8, suffix, "hc_attn_scale")) {
+    if (std.mem.eql(u8, suffix, "attn_hc_scale.weight") or std.mem.eql(u8, suffix, "attn_hc.scale") or std.mem.eql(u8, suffix, "hc_attn_scale") or std.mem.eql(u8, suffix, "hc_attn_scale.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.attn_hc.scale", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "ffn_hc_fn.weight") or std.mem.eql(u8, suffix, "ffn_hc.fn") or std.mem.eql(u8, suffix, "hc_ffn_fn")) {
+    if (std.mem.eql(u8, suffix, "ffn_hc_fn.weight") or std.mem.eql(u8, suffix, "ffn_hc.fn") or std.mem.eql(u8, suffix, "hc_ffn_fn") or std.mem.eql(u8, suffix, "hc_ffn_fn.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.ffn_hc.fn", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "ffn_hc_base.weight") or std.mem.eql(u8, suffix, "ffn_hc.base") or std.mem.eql(u8, suffix, "hc_ffn_base")) {
+    if (std.mem.eql(u8, suffix, "ffn_hc_base.weight") or std.mem.eql(u8, suffix, "ffn_hc.base") or std.mem.eql(u8, suffix, "hc_ffn_base") or std.mem.eql(u8, suffix, "hc_ffn_base.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.ffn_hc.base", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "ffn_hc_scale.weight") or std.mem.eql(u8, suffix, "ffn_hc.scale") or std.mem.eql(u8, suffix, "hc_ffn_scale")) {
+    if (std.mem.eql(u8, suffix, "ffn_hc_scale.weight") or std.mem.eql(u8, suffix, "ffn_hc.scale") or std.mem.eql(u8, suffix, "hc_ffn_scale") or std.mem.eql(u8, suffix, "hc_ffn_scale.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.ffn_hc.scale", .{layer}) catch null;
     }
     if (std.mem.eql(u8, suffix, "attn_compressor_kv.weight") or std.mem.eql(u8, suffix, "attn_compress_kv.weight")) {
@@ -274,22 +274,22 @@ pub fn normalizeGgufWeightKey(layer: usize, suffix: []const u8, buf: *[256]u8) ?
     if (std.mem.eql(u8, suffix, "attn_compressor_gate.weight") or std.mem.eql(u8, suffix, "attn_compress_gate.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.gate_proj.weight", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "attn_compressor_position_bias") or std.mem.eql(u8, suffix, "attn_compress_ape")) {
+    if (std.mem.eql(u8, suffix, "attn_compressor_position_bias") or std.mem.eql(u8, suffix, "attn_compress_ape") or std.mem.eql(u8, suffix, "attn_compressor_ape.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.position_bias", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "attn_compressor_kv_norm.weight") or std.mem.eql(u8, suffix, "attn_compress_norm.weight")) {
+    if (std.mem.eql(u8, suffix, "attn_compressor_kv_norm.weight") or std.mem.eql(u8, suffix, "attn_compress_norm.weight") or std.mem.eql(u8, suffix, "attn_compressor_norm.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.kv_norm.weight", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "indexer.compress_kv.weight")) {
+    if (std.mem.eql(u8, suffix, "indexer.compress_kv.weight") or std.mem.eql(u8, suffix, "indexer_compressor_kv.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.indexer.kv_proj.weight", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "indexer.compress_gate.weight")) {
+    if (std.mem.eql(u8, suffix, "indexer.compress_gate.weight") or std.mem.eql(u8, suffix, "indexer_compressor_gate.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.indexer.gate_proj.weight", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "indexer.compress_ape")) {
+    if (std.mem.eql(u8, suffix, "indexer.compress_ape") or std.mem.eql(u8, suffix, "indexer_compressor_ape.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.indexer.position_bias", .{layer}) catch null;
     }
-    if (std.mem.eql(u8, suffix, "indexer.compress_norm.weight")) {
+    if (std.mem.eql(u8, suffix, "indexer.compress_norm.weight") or std.mem.eql(u8, suffix, "indexer_compressor_norm.weight")) {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.compressor.indexer.kv_norm.weight", .{layer}) catch null;
     }
     if (std.mem.eql(u8, suffix, "indexer.attn_q_b.weight")) {

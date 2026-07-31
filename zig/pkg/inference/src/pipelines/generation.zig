@@ -421,6 +421,251 @@ pub const SpeculativeDecodeStats = struct {
 /// Return `true` to continue generation, `false` to stop early.
 pub const TokenCallback = *const fn (ctx: *anyopaque, token_text: []const u8) bool;
 
+const StreamingTextState = struct {
+    emitted_text: []u8,
+    /// Set from the model contract, independently of tokenizer resolution.
+    /// A channel-aware model must never fall back to decoding its raw generated
+    /// tokens merely because one of the protocol tokens is missing or malformed.
+    final_channel_required: bool = false,
+    final_channel_end_token_id: ?i32 = null,
+    /// Exact token sequence for `<|channel>final\n<channel|>`. A bare
+    /// `<channel|>` also terminates private/intermediate channel headers, so it
+    /// is not sufficient evidence that subsequent content is public.
+    final_channel_header_token_ids: []const i32 = &.{},
+    channel_start_token_id: ?i32 = null,
+    turn_end_token_id: ?i32 = null,
+    inspected_token_count: usize = 0,
+    final_channel_content_start: ?usize = null,
+    final_channel_content_end: ?usize = null,
+    saw_final_channel: bool = false,
+};
+
+const gemma4_thought_channel_prompt_suffix = "<|channel>thought\n<channel|>";
+const gemma4_final_channel_prompt_suffix = "<|channel>final\n<channel|>";
+
+/// Grammar-constrained generation must start in a public channel because the
+/// grammar applies to the first generated token. Leaving the normal private
+/// `thought` channel open would make the grammar reject the final-channel
+/// transition and the fail-closed response projection would correctly withhold
+/// the entire result.
+fn openGemma4FinalChannelForGrammar(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, prompt, &std.ascii.whitespace);
+    const trailing = prompt[trimmed.len..];
+    if (std.mem.endsWith(u8, trimmed, gemma4_final_channel_prompt_suffix)) {
+        return allocator.dupe(u8, prompt);
+    }
+    if (!std.mem.endsWith(u8, trimmed, gemma4_thought_channel_prompt_suffix)) {
+        return error.GrammarRequiresGemma4ChannelPrompt;
+    }
+
+    const prefix_len = trimmed.len - gemma4_thought_channel_prompt_suffix.len;
+    const result = try allocator.alloc(
+        u8,
+        prefix_len + gemma4_final_channel_prompt_suffix.len + trailing.len,
+    );
+    errdefer allocator.free(result);
+    @memcpy(result[0..prefix_len], trimmed[0..prefix_len]);
+    @memcpy(
+        result[prefix_len .. prefix_len + gemma4_final_channel_prompt_suffix.len],
+        gemma4_final_channel_prompt_suffix,
+    );
+    @memcpy(result[result.len - trailing.len ..], trailing);
+    return result;
+}
+
+fn finalChannelContentStart(token_ids: []const i64, marker_id: ?i32) ?usize {
+    const marker = marker_id orelse return null;
+    var start: ?usize = null;
+    for (token_ids, 0..) |token_id, idx| {
+        if (token_id == marker) start = idx + 1;
+    }
+    return start;
+}
+
+const FinalChannelRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn completeFinalChannelRange(
+    token_ids: []const i64,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
+    turn_end_id: ?i32,
+) ?FinalChannelRange {
+    const start = findTokenSequenceEndingAtOrAfter(
+        token_ids,
+        final_header_token_ids,
+        0,
+    ) orelse return null;
+    var end = token_ids.len;
+    for (token_ids[start..], start..) |token_id, idx| {
+        if ((turn_end_id != null and token_id == turn_end_id.?) or
+            (channel_start_id != null and token_id == channel_start_id.?))
+        {
+            end = idx;
+            break;
+        }
+    }
+    return .{ .start = start, .end = end };
+}
+
+fn finalChannelTokenSlice(token_ids: []const i64, marker_id: ?i32) []const i64 {
+    const start = finalChannelContentStart(token_ids, marker_id) orelse return token_ids;
+    return token_ids[start..];
+}
+
+fn finalResponseTokenSlice(
+    token_ids: []const i64,
+    final_channel_required: bool,
+    marker_id: ?i32,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
+    turn_end_id: ?i32,
+) []const i64 {
+    if (!final_channel_required) return token_ids;
+    if (marker_id == null or
+        turn_end_id == null or
+        channel_start_id == null or
+        final_header_token_ids.len == 0)
+    {
+        return token_ids[0..0];
+    }
+    if (completeFinalChannelRange(
+        token_ids,
+        final_header_token_ids,
+        channel_start_id,
+        turn_end_id,
+    )) |range| {
+        return token_ids[range.start..range.end];
+    }
+    // The generation prompt for a channel-aware model opens the private
+    // `thought` channel. Until the exact final-channel header is present, every
+    // generated token is private regardless of whether generation ended by
+    // length, EOS, cancellation, or a malformed protocol boundary.
+    return token_ids[0..0];
+}
+
+fn resolveTokenId(
+    tokenizer: tokenizer_mod.Tokenizer,
+    allocator: std.mem.Allocator,
+    token_text: []const u8,
+) !?i32 {
+    const ids = try tokenizer.encode(allocator, token_text);
+    defer allocator.free(ids);
+    if (ids.len != 1) return null;
+    return ids[0];
+}
+
+fn findTokenSequenceEndingAtOrAfter(
+    token_ids: []const i64,
+    pattern: []const i32,
+    first_uninspected_end: usize,
+) ?usize {
+    if (pattern.len == 0 or token_ids.len < pattern.len) return null;
+    const first_end = @max(first_uninspected_end, pattern.len - 1);
+    for (first_end..token_ids.len) |end| {
+        if (token_ids[end] != pattern[pattern.len - 1]) continue;
+        const start = end + 1 - pattern.len;
+        var matches = true;
+        for (pattern, 0..) |expected, offset| {
+            if (token_ids[start + offset] != expected) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return end + 1;
+    }
+    return null;
+}
+
+fn emitDecodedDeltaForTokenizer(
+    tokenizer: tokenizer_mod.Tokenizer,
+    allocator: std.mem.Allocator,
+    generated_token_ids: []const i64,
+    state: *StreamingTextState,
+    on_token_fn: TokenCallback,
+    on_token_ctx: *anyopaque,
+) !bool {
+    var projected_ids = generated_token_ids;
+    if (state.final_channel_required) {
+        if (state.final_channel_end_token_id == null) return true;
+        const turn_end = state.turn_end_token_id orelse return true;
+        const channel_start_token = state.channel_start_token_id orelse return true;
+        if (state.final_channel_header_token_ids.len == 0) return true;
+
+        if (state.final_channel_content_start == null) {
+            // Generation grows monotonically. Only consider newly appended
+            // sequence ends, while allowing the header itself to straddle
+            // callbacks. This is O(new tokens * short header length) and never
+            // rescans a potentially long reasoning prefix.
+            const first_uninspected_end = @min(state.inspected_token_count, generated_token_ids.len);
+            if (findTokenSequenceEndingAtOrAfter(
+                generated_token_ids,
+                state.final_channel_header_token_ids,
+                first_uninspected_end,
+            )) |content_start| {
+                state.final_channel_content_start = content_start;
+                state.saw_final_channel = true;
+                // Let the turn-end scan below cover content appended in the
+                // same speculative batch as the final-channel header.
+                state.inspected_token_count = content_start;
+            } else {
+                state.inspected_token_count = generated_token_ids.len;
+            }
+        }
+
+        const channel_start = state.final_channel_content_start orelse return true;
+        if (state.final_channel_content_end == null) {
+            const scan_start = @max(
+                channel_start,
+                @min(state.inspected_token_count, generated_token_ids.len),
+            );
+            const turn_end_offset = std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                turn_end,
+            );
+            const next_channel_offset = std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                channel_start_token,
+            );
+            const content_end_offset = if (turn_end_offset) |turn_offset|
+                if (next_channel_offset) |channel_offset|
+                    @min(turn_offset, channel_offset)
+                else
+                    turn_offset
+            else
+                next_channel_offset;
+            if (content_end_offset) |offset| {
+                state.final_channel_content_end = scan_start + offset;
+            }
+            state.inspected_token_count = generated_token_ids.len;
+        }
+        const channel_end = state.final_channel_content_end orelse generated_token_ids.len;
+        projected_ids = generated_token_ids[channel_start..channel_end];
+    }
+
+    const decoded_ids = try allocator.alloc(i32, projected_ids.len);
+    defer allocator.free(decoded_ids);
+    for (projected_ids, 0..) |token_id, idx| decoded_ids[idx] = @intCast(token_id);
+
+    const decoded_text = try tokenizer.decode(allocator, decoded_ids);
+    defer allocator.free(decoded_text);
+
+    const prefix_len = std.mem.indexOfDiff(u8, state.emitted_text, decoded_text) orelse @min(state.emitted_text.len, decoded_text.len);
+    const delta = decoded_text[prefix_len..];
+
+    allocator.free(state.emitted_text);
+    state.emitted_text = try allocator.dupe(u8, decoded_text);
+    if (delta.len == 0) return true;
+    return on_token_fn(on_token_ctx, delta);
+}
+
 pub const KvView = struct {
     sequence_id: runtime.kv.manager.SequenceId,
     pool_id: runtime.kv.block.KvPoolId,
@@ -2208,6 +2453,10 @@ pub const NativeGenerationPipeline = struct {
     ) !GenerationResult {
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const grammar_opens_public_final_channel =
+            config.grammar != null and
+            self.gpt_config.family == .gemma and
+            self.gpt_config.hasPle();
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
         defer fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
@@ -2222,14 +2471,19 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Format prompt
-        const prompt = if (self.prompt_override) |override|
+        var prompt = if (self.prompt_override) |override|
             try allocator.dupe(u8, override)
         else if (self.chat_template) |ct|
             try ct.apply(allocator, messages, true)
         else
             try formatMessages(allocator, messages);
-        const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer allocator.free(prompt);
+        if (grammar_opens_public_final_channel) {
+            const public_prompt = try openGemma4FinalChannelForGrammar(allocator, prompt);
+            allocator.free(prompt);
+            prompt = public_prompt;
+        }
+        const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         // Tokenize
         var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
@@ -2557,8 +2811,40 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
-        var emitted_text: []u8 = if (stream_enabled) try allocator.dupe(u8, "") else &.{};
-        defer if (stream_enabled) allocator.free(emitted_text);
+        const final_channel_required =
+            self.gpt_config.family == .gemma and
+            self.gpt_config.hasPle() and
+            !grammar_opens_public_final_channel;
+        // Resolve the channel protocol once for the whole request. Buffered and
+        // streaming callers must use the same exact final-header projection;
+        // resolving only the generic terminator at completion can expose a
+        // malformed trailing private channel.
+        const final_channel_end = if (final_channel_required)
+            try self.resolveFinalChannelEndTokenId()
+        else
+            null;
+        const turn_end = if (final_channel_end != null)
+            try self.resolveTurnEndTokenId()
+        else
+            null;
+        const channel_start = if (final_channel_end != null)
+            try self.resolveChannelStartTokenId()
+        else
+            null;
+        const owned_final_channel_header = if (final_channel_end) |marker|
+            try self.resolveFinalChannelHeaderTokenIds(marker)
+        else
+            null;
+        defer if (owned_final_channel_header) |ids| allocator.free(ids);
+        var streaming_text = StreamingTextState{
+            .emitted_text = if (stream_enabled) try allocator.dupe(u8, "") else &.{},
+            .final_channel_required = final_channel_required,
+            .final_channel_end_token_id = final_channel_end,
+            .final_channel_header_token_ids = owned_final_channel_header orelse &.{},
+            .channel_start_token_id = channel_start,
+            .turn_end_token_id = turn_end,
+        };
+        defer if (stream_enabled) allocator.free(streaming_text.emitted_text);
         var penalty_state = SamplingPenaltyState.init(hasSamplingPenalties(config));
         defer penalty_state.deinit(allocator);
         try penalty_state.seedFromHistory(allocator, token_ids[0..seq_len]);
@@ -2598,7 +2884,7 @@ pub const NativeGenerationPipeline = struct {
                 prompt_token_count,
                 if (stream_enabled) on_token_fn else null,
                 if (stream_enabled) on_token_ctx else null,
-                if (stream_enabled) &emitted_text else null,
+                if (stream_enabled) &streaming_text else null,
             )) |decode_result| {
                 tokens_generated = decode_result.tokens_generated;
                 finish_reason = decode_result.finish_reason;
@@ -2787,7 +3073,7 @@ pub const NativeGenerationPipeline = struct {
             if (stream_enabled) {
                 const keep_streaming = try self.emitDecodedDelta(
                     token_ids[prompt_token_count..seq_len],
-                    &emitted_text,
+                    &streaming_text,
                     on_token_fn.?,
                     on_token_ctx.?,
                 );
@@ -2907,7 +3193,7 @@ pub const NativeGenerationPipeline = struct {
                     if (stream_enabled and result.accepted > 0) {
                         const keep_streaming = try self.emitDecodedDelta(
                             token_ids[prompt_token_count..seq_len],
-                            &emitted_text,
+                            &streaming_text,
                             on_token_fn.?,
                             on_token_ctx.?,
                         );
@@ -2993,7 +3279,7 @@ pub const NativeGenerationPipeline = struct {
                             prompt_token_count,
                             if (stream_enabled) on_token_fn else null,
                             if (stream_enabled) on_token_ctx else null,
-                            if (stream_enabled) &emitted_text else null,
+                            if (stream_enabled) &streaming_text else null,
                         );
                         if (speculative_stats.mtp_profile.enabled) {
                             speculative_stats.mtp_profile.fallback_calls += 1;
@@ -3026,7 +3312,7 @@ pub const NativeGenerationPipeline = struct {
                             prompt_token_count,
                             if (stream_enabled) on_token_fn else null,
                             if (stream_enabled) on_token_ctx else null,
-                            if (stream_enabled) &emitted_text else null,
+                            if (stream_enabled) &streaming_text else null,
                         );
                         if (speculative_stats.mtp_profile.enabled) {
                             speculative_stats.mtp_profile.fallback_calls += 1;
@@ -3063,7 +3349,7 @@ pub const NativeGenerationPipeline = struct {
                 prompt_token_count,
                 if (stream_enabled) on_token_fn else null,
                 if (stream_enabled) on_token_ctx else null,
-                if (stream_enabled) &emitted_text else null,
+                if (stream_enabled) &streaming_text else null,
             );
             tokens_generated = decode_result.tokens_generated;
             finish_reason = decode_result.finish_reason;
@@ -3073,13 +3359,26 @@ pub const NativeGenerationPipeline = struct {
             );
         }
 
-        // Decode only the generated tokens
+        // Decode only the generated tokens. Channel-aware models project both the
+        // public text and public token IDs from the same slice so callers cannot
+        // reconstruct a withheld reasoning channel from GenerationResult.token_ids.
         const gen_start = prompt_token_count;
-        const gen_ids = try allocator.alloc(i32, seq_len - gen_start);
-        for (0..gen_ids.len) |i| gen_ids[i] = @intCast(token_ids[gen_start + i]);
+        const final_channel_end_token_id = streaming_text.final_channel_end_token_id;
+        const turn_end_token_id = streaming_text.turn_end_token_id;
+        const projected_gen_token_ids = finalResponseTokenSlice(
+            token_ids[gen_start..seq_len],
+            streaming_text.final_channel_required,
+            final_channel_end_token_id,
+            streaming_text.final_channel_header_token_ids,
+            streaming_text.channel_start_token_id,
+            turn_end_token_id,
+        );
+        const projected_gen_ids = try allocator.alloc(i32, projected_gen_token_ids.len);
+        errdefer allocator.free(projected_gen_ids);
+        for (projected_gen_token_ids, 0..) |token_id, idx| projected_gen_ids[idx] = @intCast(token_id);
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const text = try self.tokenizer.decode(allocator, gen_ids);
+        const text = try self.tokenizer.decode(allocator, projected_gen_ids);
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
             .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
@@ -3136,7 +3435,7 @@ pub const NativeGenerationPipeline = struct {
         }
         return .{
             .text = text,
-            .token_ids = gen_ids,
+            .token_ids = projected_gen_ids,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
@@ -3539,28 +3838,51 @@ pub const NativeGenerationPipeline = struct {
         }
     }
 
+    fn resolveFinalChannelEndTokenId(self: *NativeGenerationPipeline) !?i32 {
+        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        return resolveTokenId(self.tokenizer, self.allocator, "<channel|>");
+    }
+
+    fn resolveFinalChannelHeaderTokenIds(
+        self: *NativeGenerationPipeline,
+        final_channel_end_token_id: i32,
+    ) !?[]i32 {
+        const ids = try self.tokenizer.encode(
+            self.allocator,
+            "<|channel>final\n<channel|>",
+        );
+        errdefer self.allocator.free(ids);
+        if (ids.len == 0 or ids[ids.len - 1] != final_channel_end_token_id) {
+            self.allocator.free(ids);
+            return null;
+        }
+        return ids;
+    }
+
+    fn resolveChannelStartTokenId(self: *NativeGenerationPipeline) !?i32 {
+        return resolveTokenId(self.tokenizer, self.allocator, "<|channel>");
+    }
+
+    fn resolveTurnEndTokenId(self: *NativeGenerationPipeline) !?i32 {
+        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        return resolveTokenId(self.tokenizer, self.allocator, "<turn|>");
+    }
+
     fn emitDecodedDelta(
         self: *NativeGenerationPipeline,
         generated_token_ids: []const i64,
-        emitted_text: *[]u8,
+        state: *StreamingTextState,
         on_token_fn: TokenCallback,
         on_token_ctx: *anyopaque,
     ) !bool {
-        const allocator = self.allocator;
-        const decoded_ids = try allocator.alloc(i32, generated_token_ids.len);
-        defer allocator.free(decoded_ids);
-        for (generated_token_ids, 0..) |token_id, idx| decoded_ids[idx] = @intCast(token_id);
-
-        const decoded_text = try self.tokenizer.decode(allocator, decoded_ids);
-        defer allocator.free(decoded_text);
-
-        const prefix_len = std.mem.indexOfDiff(u8, emitted_text.*, decoded_text) orelse @min(emitted_text.*.len, decoded_text.len);
-        const delta = decoded_text[prefix_len..];
-
-        allocator.free(emitted_text.*);
-        emitted_text.* = try allocator.dupe(u8, decoded_text);
-        if (delta.len == 0) return true;
-        return on_token_fn(on_token_ctx, delta);
+        return emitDecodedDeltaForTokenizer(
+            self.tokenizer,
+            self.allocator,
+            generated_token_ids,
+            state,
+            on_token_fn,
+            on_token_ctx,
+        );
     }
 
     fn tryReturnPrefillFirstToken(
@@ -3578,7 +3900,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
     ) !?DecodeResult {
         if (!shouldUsePrefillFirstTokenPath(self.cb.kind(), max_tokens, false, enableCudaPrefillFirstToken())) {
             debugFirstToken(
@@ -3719,7 +4041,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
     ) !DecodeResult {
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
@@ -3966,7 +4288,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
         tokens_generated: *usize,
         finish_reason: *[]const u8,
     ) !bool {
@@ -4087,7 +4409,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
     ) !?DecodeResult {
         _ = prompt_token_count;
         if (!enableCudaGreedyPendingTokenReadback()) return null;
@@ -7813,6 +8135,238 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
     try std.testing.expectEqual(@as(i32, 3), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[2]);
+}
+
+test "grammar prompt opens Gemma4 public final channel" {
+    const allocator = std.testing.allocator;
+    const thought_prompt =
+        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
+        gemma4_thought_channel_prompt_suffix ++ "\n";
+    const expected =
+        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
+        gemma4_final_channel_prompt_suffix ++ "\n";
+    const opened = try openGemma4FinalChannelForGrammar(allocator, thought_prompt);
+    defer allocator.free(opened);
+    try std.testing.expectEqualStrings(expected, opened);
+
+    const already_open = try openGemma4FinalChannelForGrammar(allocator, expected);
+    defer allocator.free(already_open);
+    try std.testing.expectEqualStrings(expected, already_open);
+
+    try std.testing.expectError(
+        error.GrammarRequiresGemma4ChannelPrompt,
+        openGemma4FinalChannelForGrammar(allocator, "<bos>raw prompt"),
+    );
+}
+
+test "final channel projection requires exact header and stops before trailing channels" {
+    const header = [_]i32{ 102, 103, 104, 101 };
+    const ids = [_]i64{ 7, 101, 9, 102, 103, 104, 101, 10, 106 };
+    try std.testing.expectEqual(@as(?usize, 7), finalChannelContentStart(&ids, 101));
+    try std.testing.expectEqualSlices(i64, &.{ 10, 106 }, finalChannelTokenSlice(&ids, 101));
+    try std.testing.expectEqualSlices(i64, &ids, finalChannelTokenSlice(&ids, null));
+    try std.testing.expectEqualSlices(i64, &ids, finalChannelTokenSlice(&ids, 999));
+    const range = completeFinalChannelRange(&ids, &header, 102, 106) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 7), range.start);
+    try std.testing.expectEqual(@as(usize, 8), range.end);
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{10},
+        finalResponseTokenSlice(&ids, true, 101, &header, 102, 106),
+    );
+
+    const malformed_trailing = [_]i64{
+        7,   101, 9,   102, 103, 104, 101, 10,
+        102, 103, 104, 101, 7,   106,
+    };
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{10},
+        finalResponseTokenSlice(&malformed_trailing, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 101, 10 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, null, &.{}, null, null),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        finalResponseTokenSlice(&.{ 7, 8 }, false, null, &.{}, null, null),
+    );
+}
+
+test "streaming final channel projection ignores intermediate boundaries and streams final text" {
+    const allocator = std.testing.allocator;
+    const tokenizer_json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "<unk>": 0,
+        \\      "reasoning": 7,
+        \\      "answer": 8,
+        \\      " follows": 9,
+        \\      "<channel|>": 101,
+        \\      "<turn|>": 106
+        \\    },
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 101, "content": "<channel|>", "special": true},
+        \\    {"id": 106, "content": "<turn|>", "special": true}
+        \\  ]
+        \\}
+    ;
+
+    var tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    defer tok.deinitSelf();
+    const tokenizer = tok.tokenizer();
+    try std.testing.expectEqual(@as(?i32, 101), try resolveTokenId(tokenizer, allocator, "<channel|>"));
+    try std.testing.expectEqual(@as(?i32, 106), try resolveTokenId(tokenizer, allocator, "<turn|>"));
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        text: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, delta: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.text.appendSlice(self.allocator, delta) catch return false;
+            return true;
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.text.deinit(allocator);
+    var state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = 106,
+    };
+    defer allocator.free(state.emitted_text);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{7},
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("", capture.text.items);
+    try std.testing.expect(!state.saw_final_channel);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("", capture.text.items);
+    try std.testing.expect(!state.saw_final_channel);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("", capture.text.items);
+    try std.testing.expect(!state.saw_final_channel);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103, 104, 101, 8 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("answer", capture.text.items);
+    try std.testing.expect(state.saw_final_channel);
+
+    // The normal autoregressive decoder consumes the turn token as EOS without
+    // appending it, while speculative paths may retain it. Neither path should
+    // delay or duplicate the final streamed text.
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103, 104, 101, 8, 9, 106 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("answer follows", capture.text.items);
+
+    // A malformed continuation after the final channel must fail closed before
+    // any subsequent channel name or private content reaches the callback.
+    var trailing_capture = Capture{ .allocator = allocator };
+    defer trailing_capture.text.deinit(allocator);
+    var trailing_state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = 106,
+    };
+    defer allocator.free(trailing_state.emitted_text);
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103, 104, 101, 8, 9, 102, 103, 104, 101, 7 },
+        &trailing_state,
+        Capture.callback,
+        &trailing_capture,
+    ));
+    try std.testing.expectEqualStrings("answer follows", trailing_capture.text.items);
+
+    // Tokenizer metadata is part of the security boundary. A channel-aware
+    // model with an incomplete protocol vocabulary must buffer indefinitely
+    // rather than falling back to raw reasoning text.
+    var incomplete_capture = Capture{ .allocator = allocator };
+    defer incomplete_capture.text.deinit(allocator);
+    var incomplete_state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = null,
+    };
+    defer allocator.free(incomplete_state.emitted_text);
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8 },
+        &incomplete_state,
+        Capture.callback,
+        &incomplete_capture,
+    ));
+    try std.testing.expectEqualStrings("", incomplete_capture.text.items);
 }
 
 test "shouldAddBosToken keeps bos when prompt lacks literal prefix" {

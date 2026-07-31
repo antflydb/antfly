@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -33,6 +34,115 @@ import (
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Config: `{"remote_content":{"default_s3":"primary","s3":{"primary":{"region":"us-west-2","access_key_id":"${secret:s3.access_key}","secret_access_key":"${secret:s3.secret_key}"}}}}`,
+		},
+	}
+
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	firstHash := first[generatedConfigHashAnnotation]
+	if firstHash == "" {
+		t.Fatal("expected generated config hash annotation")
+	}
+
+	// A value rotation behind either secret reference is not represented in the
+	// AntflyCluster and cannot affect this hash; changing config/routing does.
+	cluster.Spec.Config = `{"remote_content":{"default_s3":"archive","s3":{"archive":{"region":"us-east-1","access_key_id":"${secret:s3.access_key}","secret_access_key":"${secret:s3.secret_key}"}}}}`
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if second[generatedConfigHashAnnotation] == firstHash {
+		t.Fatal("expected remote-content config change to alter pod-template hash")
+	}
+}
+
+func TestReconcileConfigMapPublishesExactGenerationAndFullHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: scheme}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "publication", Namespace: "default", Generation: 9},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{"remote_content":{"default_s3":"primary"}}`},
+	}
+
+	if err := reconciler.reconcileConfigMap(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: "publication-config", Namespace: "default"}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	wantSum := sha256.Sum256([]byte(configMap.Data["config.json"]))
+	if cluster.Status.ConfigPublication == nil {
+		t.Fatal("expected config publication status")
+	}
+	if cluster.Status.ConfigPublication.ObservedGeneration != cluster.Generation {
+		t.Fatalf("published generation %d, want %d", cluster.Status.ConfigPublication.ObservedGeneration, cluster.Generation)
+	}
+	wantHash := fmt.Sprintf("%x", wantSum)
+	if cluster.Status.ConfigPublication.SHA256 != wantHash {
+		t.Fatalf("published hash %q, want %q", cluster.Status.ConfigPublication.SHA256, wantHash)
+	}
+	if configMap.Annotations[generatedConfigHashAnnotation] != wantHash[:16] {
+		t.Fatalf("pod-template hash %q does not match publication prefix", configMap.Annotations[generatedConfigHashAnnotation])
+	}
+}
+
+func TestSecretValueOnlyRotationDoesNotChangePodTemplateHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cloud-secrets-config", Namespace: "default"},
+		Data:       map[string][]byte{"secrets.json": []byte(`{"value":"first"}`)},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: secret.Namespace},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	envFrom := []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: secret.Name},
+	}}}
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+
+	secret.Data["secrets.json"] = []byte(`{"value":"other"}`)
+	if err := client.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+	if !maps.Equal(second, first) {
+		t.Fatalf("secret value rotation changed pod-template annotations: before=%v after=%v", first, second)
+	}
+}
+
+func TestCompatibilityRolloutGenerationPropagatesToPodTemplate(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example",
+			Annotations: map[string]string{
+				compatibilityRolloutGenerationAnnotation: "secret-sha256-0123456789abcdef",
+			},
+		},
+		Spec: antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	annotations := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if got := annotations[compatibilityRolloutGenerationAnnotation]; got != "secret-sha256-0123456789abcdef" {
+		t.Fatalf("compatibility rollout generation = %q", got)
+	}
+}
 
 func TestEffectiveTopologyModeFailsClosedForUnknownStoredMode(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterMode("RemovedMode")}}
@@ -9267,6 +9377,27 @@ var _ = Describe("AntflyCluster Controller", func() {
 				}, configMap)
 			}, timeout, interval).Should(Succeed())
 			Expect(configMap.Data).To(HaveKey("config.json"))
+			Expect(configMap.Annotations).To(HaveKey(generatedConfigHashAnnotation))
+			Expect(metadataSts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				generatedConfigHashAnnotation,
+				configMap.Annotations[generatedConfigHashAnnotation],
+			))
+			Expect(dataSts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				generatedConfigHashAnnotation,
+				configMap.Annotations[generatedConfigHashAnnotation],
+			))
+			configSum := sha256.Sum256([]byte(configMap.Data["config.json"]))
+			wantPublicationHash := fmt.Sprintf("%x", configSum)
+			Eventually(func() string {
+				observed := &antflyv1.AntflyCluster{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: namespace}, observed); err != nil {
+					return ""
+				}
+				if observed.Status.ConfigPublication == nil || observed.Status.ConfigPublication.ObservedGeneration != observed.Generation {
+					return ""
+				}
+				return observed.Status.ConfigPublication.SHA256
+			}, timeout, interval).Should(Equal(wantPublicationHash))
 
 			// Verify internal service is created
 			internalSvc := &corev1.Service{}

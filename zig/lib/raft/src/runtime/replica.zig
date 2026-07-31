@@ -130,6 +130,10 @@ pub const SnapshotBootstrap = struct {
 
 pub const ReplicaDescriptor = struct {
     group: group_mod.GroupConfig,
+    /// Authoritative voters for a brand-new local storage image. This is
+    /// intentionally distinct from raft_config.peers, which may include
+    /// relocation targets needed for transport before they become voters.
+    initial_voters: ?[]const core.types.NodeId = null,
     bootstrap: ReplicaBootstrap = .persisted,
 };
 

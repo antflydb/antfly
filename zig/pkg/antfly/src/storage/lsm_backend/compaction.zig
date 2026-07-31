@@ -22,6 +22,7 @@ const compaction_scheduler_mod = @import("compaction_scheduler.zig");
 const State = state_mod.State;
 const Run = repository_mod.Run;
 pub const max_remembered_compaction_run_ids = 64;
+pub const max_exact_l0_overlap_runs = 64;
 
 const CompactionWork = struct {
     score: u64,
@@ -916,13 +917,20 @@ fn selectCompactionPlanWithStats(
 ) ?CompactionPlan {
     if (runs.len < 2) return null;
     var best: ?ScoredCompactionPlan = null;
-    maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(
-        runs,
-        l0_overlap_compact_threshold_runs,
-        @max(l0_overlap_compact_threshold_runs, l0_limit),
-        max_input_bytes,
-        selection_stats,
-    ));
+    const l0_count = countLeadingL0Runs(runs);
+    // Exact hotspot selection is quadratic. Once L0 exceeds its ordinary
+    // pressure limit, a linear pressure compaction is already eligible and
+    // exact overlap ranking cannot affect correctness. Skipping it here keeps
+    // compaction planning from monopolizing the backend mutex during bursts.
+    if (l0_limit > 0 and l0_count <= @min(l0_limit, max_exact_l0_overlap_runs)) {
+        maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(
+            runs,
+            l0_overlap_compact_threshold_runs,
+            @max(l0_overlap_compact_threshold_runs, l0_limit),
+            max_input_bytes,
+            selection_stats,
+        ));
+    }
     maybeAdoptBest(&best, selectL0CompactionCandidateWithStats(runs, l0_limit, max_input_bytes, allow_oversized_single_job, selection_stats));
     maybeAdoptBest(&best, selectLowerLevelRepairCompactionCandidateWithStats(runs, max_input_bytes, allow_oversized_single_job, selection_stats));
     maybeAdoptBest(&best, selectLowerLevelPressureCompactionCandidateWithStats(
@@ -1412,50 +1420,196 @@ fn countRunEntries(runs: []const Run) usize {
     return total;
 }
 
-fn buildPlanForSourceRange(runs: []const Run, source_level: u32, source_start: usize, source_len: usize) ?CompactionPlan {
-    if (source_len == 0) return null;
-    var smallest_namespace_name = runs[source_start].smallest_namespace_name;
-    var smallest_key = runs[source_start].smallest_key;
-    var largest_namespace_name = runs[source_start].largest_namespace_name;
-    var largest_key = runs[source_start].largest_key;
+const CompactionBounds = struct {
+    smallest_namespace_name: ?[]const u8,
+    smallest_key: []const u8,
+    largest_namespace_name: ?[]const u8,
+    largest_key: []const u8,
 
-    for (runs[source_start + 1 .. source_start + source_len]) |run| {
-        if (compareRunBound(run.smallest_namespace_name, run.smallest_key, smallest_namespace_name, smallest_key) == .lt) {
-            smallest_namespace_name = run.smallest_namespace_name;
-            smallest_key = run.smallest_key;
+    fn include(self: *CompactionBounds, run: Run) void {
+        if (compareRunBound(
+            run.smallest_namespace_name,
+            run.smallest_key,
+            self.smallest_namespace_name,
+            self.smallest_key,
+        ) == .lt) {
+            self.smallest_namespace_name = run.smallest_namespace_name;
+            self.smallest_key = run.smallest_key;
         }
-        if (compareRunBound(run.largest_namespace_name, run.largest_key, largest_namespace_name, largest_key) == .gt) {
-            largest_namespace_name = run.largest_namespace_name;
-            largest_key = run.largest_key;
+        if (compareRunBound(
+            run.largest_namespace_name,
+            run.largest_key,
+            self.largest_namespace_name,
+            self.largest_key,
+        ) == .gt) {
+            self.largest_namespace_name = run.largest_namespace_name;
+            self.largest_key = run.largest_key;
         }
     }
 
-    const output_level = source_level + 1;
-    var target_start: ?usize = null;
-    var target_end: usize = 0;
-    for (runs, 0..) |run, i| {
-        if (run.level < output_level) continue;
-        if (run.level > output_level) break;
-        if (!rangesOverlap(
+    fn overlaps(self: CompactionBounds, run: Run) bool {
+        return rangesOverlap(
             run.smallest_namespace_name,
             run.smallest_key,
             run.largest_namespace_name,
             run.largest_key,
-            smallest_namespace_name,
-            smallest_key,
-            largest_namespace_name,
-            largest_key,
-        )) continue;
-        if (target_start == null) target_start = i;
-        target_end = i + 1;
+            self.smallest_namespace_name,
+            self.smallest_key,
+            self.largest_namespace_name,
+            self.largest_key,
+        );
+    }
+};
+
+const TargetLevelClosure = struct {
+    level_start: usize,
+    level_end: usize,
+    probe_start: usize,
+    selected_start: ?usize = null,
+    selected_end: usize = 0,
+
+    fn init(
+        runs: []const Run,
+        output_level: u32,
+        bounds: CompactionBounds,
+    ) ?TargetLevelClosure {
+        var level_start = runs.len;
+        var level_end = runs.len;
+        for (runs, 0..) |run, i| {
+            if (run.level < output_level) continue;
+            level_start = i;
+            level_end = i;
+            while (level_end < runs.len and runs[level_end].level == output_level) : (level_end += 1) {}
+            break;
+        }
+
+        var i = level_start;
+        while (i + 1 < level_end) : (i += 1) {
+            const current = runs[i];
+            const next = runs[i + 1];
+            if (compareRunBound(
+                current.smallest_namespace_name,
+                current.smallest_key,
+                next.smallest_namespace_name,
+                next.smallest_key,
+            ) == .gt) return null;
+            if (rangesOverlap(
+                current.smallest_namespace_name,
+                current.smallest_key,
+                current.largest_namespace_name,
+                current.largest_key,
+                next.smallest_namespace_name,
+                next.smallest_key,
+                next.largest_namespace_name,
+                next.largest_key,
+            )) return null;
+        }
+
+        var probe_start = level_start;
+        while (probe_start < level_end and compareRunBound(
+            runs[probe_start].largest_namespace_name,
+            runs[probe_start].largest_key,
+            bounds.smallest_namespace_name,
+            bounds.smallest_key,
+        ) == .lt) : (probe_start += 1) {}
+
+        return .{
+            .level_start = level_start,
+            .level_end = level_end,
+            .probe_start = probe_start,
+        };
+    }
+
+    fn expand(
+        self: *TargetLevelClosure,
+        runs: []const Run,
+        bounds: *CompactionBounds,
+    ) void {
+        if (self.level_start == self.level_end) return;
+
+        if (self.selected_start == null) {
+            while (self.probe_start > self.level_start) {
+                const previous = runs[self.probe_start - 1];
+                if (compareRunBound(
+                    previous.largest_namespace_name,
+                    previous.largest_key,
+                    bounds.smallest_namespace_name,
+                    bounds.smallest_key,
+                ) == .lt) break;
+                self.probe_start -= 1;
+            }
+            if (self.probe_start < self.level_end and bounds.overlaps(runs[self.probe_start])) {
+                self.selected_start = self.probe_start;
+                self.selected_end = self.probe_start + 1;
+                bounds.include(runs[self.probe_start]);
+            }
+        }
+
+        while (self.selected_start != null) {
+            const old_start = self.selected_start.?;
+            const old_end = self.selected_end;
+            while (self.selected_start.? > self.level_start and
+                bounds.overlaps(runs[self.selected_start.? - 1]))
+            {
+                self.selected_start.? -= 1;
+                bounds.include(runs[self.selected_start.?]);
+            }
+            while (self.selected_end < self.level_end and
+                bounds.overlaps(runs[self.selected_end]))
+            {
+                bounds.include(runs[self.selected_end]);
+                self.selected_end += 1;
+            }
+            if (self.selected_start.? == old_start and self.selected_end == old_end) break;
+        }
+    }
+};
+
+fn buildPlanForSourceRange(runs: []const Run, source_level: u32, source_start: usize, initial_source_len: usize) ?CompactionPlan {
+    if (initial_source_len == 0 or source_start >= runs.len or initial_source_len > runs.len - source_start) return null;
+    if (runs[source_start].level != source_level) return null;
+
+    var source_end = source_start + initial_source_len;
+    for (runs[source_start..source_end]) |run| {
+        if (run.level != source_level) return null;
+    }
+
+    var bounds = CompactionBounds{
+        .smallest_namespace_name = runs[source_start].smallest_namespace_name,
+        .smallest_key = runs[source_start].smallest_key,
+        .largest_namespace_name = runs[source_start].largest_namespace_name,
+        .largest_key = runs[source_start].largest_key,
+    };
+    for (runs[source_start + 1 .. source_end]) |run| bounds.include(run);
+
+    const output_level = source_level + 1;
+    var target_closure = TargetLevelClosure.init(runs, output_level, bounds) orelse return null;
+    target_closure.expand(runs, &bounds);
+
+    // L0 has newest-first precedence. If an older run overlaps the output
+    // closure, the contiguous prefix through that run is indivisible. Walking
+    // older L0 inputs once and expanding the sorted target window
+    // incrementally computes the fixed point in O(L0 + target-runs).
+    if (source_level == 0) {
+        const l0_count = countLeadingL0Runs(runs);
+        var i = source_end;
+        while (i < l0_count) : (i += 1) {
+            if (!bounds.overlaps(runs[i])) continue;
+            for (runs[source_end .. i + 1]) |run| bounds.include(run);
+            source_end = i + 1;
+            target_closure.expand(runs, &bounds);
+        }
     }
 
     return .{
         .source_level = source_level,
         .source_start = source_start,
-        .source_len = source_len,
-        .target_start = target_start orelse source_start + source_len,
-        .target_len = if (target_start == null) 0 else target_end - target_start.?,
+        .source_len = source_end - source_start,
+        .target_start = target_closure.selected_start orelse source_end,
+        .target_len = if (target_closure.selected_start) |start|
+            target_closure.selected_end - start
+        else
+            0,
         .output_level = output_level,
     };
 }
@@ -1656,6 +1810,37 @@ test "lsm compaction drains a hard L0 backlog in one byte-bounded window" {
     const bounded = selectL0Compaction(runs.items, 4, 20 * 1024 * 1024, false) orelse return error.TestUnexpectedResult;
     try std.testing.expect(bounded.source_len <= 6);
     try std.testing.expect(bounded.source_len > 0);
+}
+
+test "lsm L0 compaction closes over older inputs and expanded target ranges" {
+    const runs = [_]Run{
+        // A newer, disjoint run may remain in L0.
+        testRun(6, 0, "doc:z", "doc:zz", 10),
+        // The initial hotspot is these two runs.
+        testRun(5, 0, "doc:a", "doc:b", 10),
+        testRun(4, 0, "doc:b", "doc:c", 10),
+        // This older run does not overlap the hotspot directly. The first L1
+        // target expands the output range to it, so it must join the source.
+        testRun(3, 0, "doc:e", "doc:g", 10),
+        testRun(1, 1, "doc:a", "doc:f", 10),
+        // The older L0 inclusion then expands into this target too.
+        testRun(2, 1, "doc:g", "doc:k", 10),
+    };
+
+    const plan = buildPlanForSourceRange(&runs, 0, 1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 3), plan.source_len);
+    try std.testing.expectEqual(@as(usize, 4), plan.target_start);
+    try std.testing.expectEqual(@as(usize, 2), plan.target_len);
+
+    // Correctness closures are indivisible: a byte budget can defer the job,
+    // but it cannot compact the hotspot while leaving the stale older input.
+    try std.testing.expect(selectL0OverlapCompaction(&runs, 2, 49) == null);
+    const unbounded = selectL0OverlapCompaction(&runs, 2, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(plan.source_start, unbounded.source_start);
+    try std.testing.expectEqual(plan.source_len, unbounded.source_len);
+    try std.testing.expectEqual(plan.target_start, unbounded.target_start);
+    try std.testing.expectEqual(plan.target_len, unbounded.target_len);
 }
 
 test "lsm compaction plan selection chooses highest scored debt" {
@@ -2030,7 +2215,13 @@ const PersistedRunCursor = struct {
             window.physicalLen(),
         );
         defer self.allocator.free(payload);
-        self.loaded_bytes = try lsm_table_file.decodeBlockPayloadAlloc(self.allocator, window.compression, payload, window.len);
+        self.loaded_bytes = try lsm_table_file.decodeBlockPayloadAlloc(
+            self.allocator,
+            window.compression,
+            payload,
+            window.len,
+            window.checksum,
+        );
         self.loaded_window = window;
     }
 };

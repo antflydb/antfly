@@ -195,7 +195,19 @@ export async function pullHuggingFaceModel(
     } catch {
       // Missing file; download below.
     }
-    await downloadFile(fetchImpl, baseUrl, repoId, entry, destPath, completedBytes, totalBytes, blobsDone, selected.length, resumedBytes, options);
+    await downloadFile(
+      fetchImpl,
+      baseUrl,
+      repoId,
+      entry,
+      destPath,
+      completedBytes,
+      totalBytes,
+      blobsDone,
+      selected.length,
+      resumedBytes,
+      options
+    );
     const stat = await fs.stat(destPath);
     completedBytes += stat.size;
     blobsDone += 1;
@@ -226,7 +238,10 @@ export async function pullHuggingFaceModel(
       downloadedAt: new Date().toISOString(),
     },
   };
-  await fs.writeFile(path.join(targetDir, "model_manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  await fs.writeFile(
+    path.join(targetDir, "model_manifest.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`
+  );
   return targetDir;
 }
 
@@ -271,7 +286,11 @@ export function modelRefString(ref: ModelRef): string {
   return out;
 }
 
-function localModelFile(path: typeof import("node:path"), modelDir: string, remotePath: string): { name: string; destPath: string } {
+function localModelFile(
+  path: typeof import("node:path"),
+  modelDir: string,
+  remotePath: string
+): { name: string; destPath: string } {
   const name = safeLocalModelRelPath(remotePath);
   return { name, destPath: path.join(modelDir, ...name.split("/")) };
 }
@@ -294,14 +313,24 @@ async function listHuggingFaceFiles(
   repoId: string,
   token?: string
 ): Promise<HuggingFaceTreeEntry[]> {
-  const response = await fetchImpl(`${baseUrl}/api/models/${escapeRepoId(repoId)}/tree/main?recursive=1`, {
-    headers: authHeaders(token),
-  });
-  if (!response.ok) throw new Error(`listing HuggingFace files failed: ${response.status} ${await response.text()}`);
+  const response = await fetchImpl(
+    `${baseUrl}/api/models/${escapeRepoId(repoId)}/tree/main?recursive=1`,
+    {
+      headers: authHeaders(token),
+    }
+  );
+  if (!response.ok)
+    throw new Error(
+      `listing HuggingFace files failed: ${response.status} ${await response.text()}`
+    );
   return (await response.json()) as HuggingFaceTreeEntry[];
 }
 
-function selectModelFiles(entries: HuggingFaceTreeEntry[], format: string, variant: string): HuggingFaceTreeEntry[] {
+function selectModelFiles(
+  entries: HuggingFaceTreeEntry[],
+  format: string,
+  variant: string
+): HuggingFaceTreeEntry[] {
   const normalizedFormat = format.trim().toLowerCase();
   const normalizedVariant = normalizeVariant(variant);
   const support: HuggingFaceTreeEntry[] = [];
@@ -320,12 +349,18 @@ function selectModelFiles(entries: HuggingFaceTreeEntry[], format: string, varia
     }
     if (base.endsWith(".onnx")) {
       if (normalizedFormat === MODEL_FORMAT_GGUF) continue;
-      if (!normalizedVariant || normalizeVariant(base).includes(normalizedVariant) || !looksVariantFile(base)) artifacts.push(entry);
+      if (
+        !normalizedVariant ||
+        normalizeVariant(base).includes(normalizedVariant) ||
+        !looksVariantFile(base)
+      )
+        artifacts.push(entry);
       continue;
     }
     if (base.endsWith(".gguf")) {
       if (normalizedFormat && normalizedFormat !== MODEL_FORMAT_GGUF) continue;
-      if (!normalizedVariant || normalizeVariant(base).includes(normalizedVariant)) artifacts.push(entry);
+      if (!normalizedVariant || normalizeVariant(base).includes(normalizedVariant))
+        artifacts.push(entry);
     }
   }
   if (artifacts.length === 0) return [];
@@ -349,10 +384,16 @@ async function downloadFile(
   const path = await import("node:path");
   const { createWriteStream } = await import("node:fs");
   const { once } = await import("node:events");
-  const response = await fetchImpl(`${baseUrl}/${escapeRepoId(repoId)}/resolve/main/${escapeFilePath(entry.path)}`, {
-    headers: authHeaders(options.huggingFaceToken),
-  });
-  if (!response.ok) throw new Error(`downloading ${entry.path} failed: ${response.status} ${await response.text()}`);
+  const response = await fetchImpl(
+    `${baseUrl}/${escapeRepoId(repoId)}/resolve/main/${escapeFilePath(entry.path)}`,
+    {
+      headers: authHeaders(options.huggingFaceToken),
+    }
+  );
+  if (!response.ok)
+    throw new Error(
+      `downloading ${entry.path} failed: ${response.status} ${await response.text()}`
+    );
   if (!response.body) throw new Error(`downloading ${entry.path} failed: empty response body`);
 
   let downloaded = 0;
