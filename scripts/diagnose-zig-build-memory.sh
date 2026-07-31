@@ -15,6 +15,7 @@ Options:
   --prefix DIR           Zig install prefix. Default: /tmp/antfly-zig-build-memory-prefix
   --target TARGET        Zig target. Default: aarch64-linux-musl
   --optimize MODE        Zig optimize mode. Default: ReleaseFast
+  --strip true|false     Omit debug information. Default: false
   --install-step STEP    Build step. Default: install
   --jobs N               Zig build jobs. Default: 1
   --interval SEC         Sampling interval. Default: 1
@@ -40,6 +41,7 @@ out_dir="/tmp/antfly-zig-build-memory"
 prefix="/tmp/antfly-zig-build-memory-prefix"
 target="aarch64-linux-musl"
 optimize="ReleaseFast"
+strip="false"
 install_step="install"
 jobs="1"
 interval="1"
@@ -70,6 +72,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --optimize)
             optimize="$2"
+            shift 2
+            ;;
+        --strip)
+            strip="$2"
             shift 2
             ;;
         --install-step)
@@ -122,6 +128,14 @@ if [ ! -f "${zig_dir}/build.zig" ]; then
     exit 2
 fi
 
+case "${strip}" in
+    true|false) ;;
+    *)
+        echo "--strip must be true or false, got: ${strip}" >&2
+        exit 2
+        ;;
+esac
+
 mkdir -p "${out_dir}" "${prefix}"
 
 if [ -z "${label}" ]; then
@@ -141,11 +155,26 @@ rss_kb_for_pid() {
     ps -o rss= -p "$1" 2>/dev/null | awk '{print $1}'
 }
 
-find_build_exe_pids() {
-    ps -Ao pid=,comm=,args= | awk '
-        /zig build-exe/ {
-            pid=$1
-            print pid
+find_zig_compile_pids() {
+    local root_pid="$1"
+    ps -Ao pid=,ppid=,comm=,args= | awk -v root_pid="${root_pid}" '
+        {
+            parents[$1]=$2
+            if ($0 ~ /zig build-(exe|lib|obj)/) candidates[$1]=1
+        }
+        END {
+            for (pid in candidates) {
+                current=pid
+                delete seen
+                while (current in parents && !seen[current]) {
+                    if (current == root_pid) {
+                        print pid
+                        break
+                    }
+                    seen[current]=1
+                    current=parents[current]
+                }
+            }
         }
     '
 }
@@ -165,7 +194,7 @@ max_cmd=""
 
 (
     cd "${zig_dir}"
-    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "${install_step}" --prefix "${prefix}" "${extra_args[@]}"
+    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" "${extra_args[@]}"
 ) >"${build_log}" 2>&1 &
 build_pid="$!"
 
@@ -203,7 +232,7 @@ while kill -0 "${build_pid}" 2>/dev/null; do
                 sample "${pid}" "${sample_seconds}" -file "${sample_file}" >/dev/null 2>&1 || true
             fi
         fi
-    done < <(find_build_exe_pids)
+    done < <(find_zig_compile_pids "${build_pid}")
 
     sleep "${interval}"
 done
@@ -224,6 +253,7 @@ max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
     echo "zig_dir=${zig_dir}"
     echo "target=${target}"
     echo "optimize=${optimize}"
+    echo "strip=${strip}"
     echo "install_step=${install_step}"
     echo "jobs=${jobs}"
     echo "max_rss_kb=${max_rss_kb}"

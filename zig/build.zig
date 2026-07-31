@@ -465,6 +465,16 @@ fn addLocalHttpxModule(
     });
 }
 
+fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {
+    const result = visited.getOrPut(module) catch @panic("OOM");
+    if (result.found_existing) return;
+
+    module.strip = true;
+    for (module.import_table.values()) |imported_module| {
+        setStripRecursively(imported_module, visited);
+    }
+}
+
 const AntflyRootImports = struct {
     build_options: *std.Build.Step.Options,
     lmdb_engine: *std.Build.Module,
@@ -1148,6 +1158,7 @@ pub fn build(b: *std.Build) void {
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -8295,6 +8306,12 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+    if (strip) {
+        var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        defer visited.deinit();
+        setStripRecursively(antfly_main_mod, &visited);
+        setStripRecursively(lite_capi_mod, &visited);
+    }
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
         .test_runner = .{
