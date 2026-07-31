@@ -548,6 +548,7 @@ test "metadata control loop installs service median key lookup for automatic spl
                     .group_id = 4901,
                     .doc_count = 200,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_realtime_ms,
                     .local_leader = true,

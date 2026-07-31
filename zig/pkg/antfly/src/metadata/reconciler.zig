@@ -249,7 +249,7 @@ pub const Reconciler = struct {
         defer manager.freeTables(self.alloc, desired_tables);
         var evidence = try StoreEvidenceIndex.init(self.alloc, current);
         defer evidence.deinit();
-        try self.syncAutomaticShardIntents(
+        const automatic_shard_planning_conclusive = try self.syncAutomaticShardIntents(
             manager,
             current,
             &evidence,
@@ -716,13 +716,15 @@ pub const Reconciler = struct {
         plan.rebalance_placement_groups = rebalance_placement_groups;
         plan.forced_reallocation = current.reallocation_request != null;
         // Reallocation is a level-triggered replicated intent. Do not consume
-        // it unless this round was allowed to run forced placement planning
-        // with fully converged membership. Splits, merges, and unconverged
-        // groups defer the intent so a single unlucky reconcile round cannot
-        // permanently lose the operator's request.
+        // it unless this round completed both forced placement planning and
+        // the forced shard scan with fully converged evidence. Splits, merges,
+        // observation gaps, and unconverged groups defer the intent so a
+        // single unlucky reconcile round cannot permanently lose the
+        // operator's request.
         if (force_placement_reallocation and
             protected_placement_groups.len == 0 and
-            placement_candidate_info.len != 0)
+            placement_candidate_info.len != 0 and
+            automatic_shard_planning_conclusive)
         {
             plan.clear_reallocation_request = current.reallocation_request.?.request_id;
         }
@@ -736,7 +738,7 @@ pub const Reconciler = struct {
         evidence: *const StoreEvidenceIndex,
         now_monotonic_ms: u64,
         now_realtime_ms: u64,
-    ) !void {
+    ) !bool {
         var auto_transitions = try self.computeAutomaticShardTransitions(
             current,
             evidence,
@@ -744,11 +746,15 @@ pub const Reconciler = struct {
             now_realtime_ms,
         );
         defer auto_transitions.deinit(self.alloc);
+        var planning_conclusive = auto_transitions.planning_conclusive;
 
         var desired_split_ids = std.ArrayListUnmanaged(u64).empty;
         defer desired_split_ids.deinit(self.alloc);
         for (auto_transitions.splits) |intent| {
-            if (managerGroupBusy(manager, intent.source_group_id, intent.destination_group_id, intent.transition_id)) continue;
+            if (managerGroupBusy(manager, intent.source_group_id, intent.destination_group_id, intent.transition_id)) {
+                planning_conclusive = false;
+                continue;
+            }
             try manager.requestSplit(intent);
             try desired_split_ids.append(self.alloc, intent.transition_id);
         }
@@ -756,12 +762,16 @@ pub const Reconciler = struct {
         var desired_merge_ids = std.ArrayListUnmanaged(u64).empty;
         defer desired_merge_ids.deinit(self.alloc);
         for (auto_transitions.merges) |intent| {
-            if (managerGroupBusy(manager, intent.donor_group_id, intent.receiver_group_id, intent.transition_id)) continue;
+            if (managerGroupBusy(manager, intent.donor_group_id, intent.receiver_group_id, intent.transition_id)) {
+                planning_conclusive = false;
+                continue;
+            }
             try manager.requestMerge(intent);
             try desired_merge_ids.append(self.alloc, intent.transition_id);
         }
 
         try pruneAutomaticIntents(self.alloc, manager, current, desired_split_ids.items, desired_merge_ids.items);
+        return planning_conclusive;
     }
 
     fn computeAutomaticShardTransitions(
@@ -817,6 +827,8 @@ pub const Reconciler = struct {
             for (merge_intents.items) |intent| freeMergeIntentOwned(self.alloc, intent);
             merge_intents.deinit(self.alloc);
         }
+        const require_conclusive_scan = current.reallocation_request != null;
+        var planning_conclusive = true;
 
         for (current.tables) |table| {
             if (remaining_cluster_budget == 0) break;
@@ -827,8 +839,10 @@ pub const Reconciler = struct {
             table_budget -= active_table;
 
             const table_ranges = planning_index.rangesForTable(table.table_id);
-            var planned_shards = std.math.cast(u32, table_ranges.len) orelse
+            var planned_shards = std.math.cast(u32, table_ranges.len) orelse {
+                if (require_conclusive_scan) planning_conclusive = false;
                 continue;
+            };
 
             if (planned_shards > min_shards_per_table and table_budget > 0 and remaining_cluster_budget > 0) {
                 var i: usize = 0;
@@ -836,18 +850,44 @@ pub const Reconciler = struct {
                     const left = table_ranges[i];
                     const right = table_ranges[i + 1];
                     if (!rangesAdjacent(left, right)) continue;
-                    if (planning_index.groupBusy(left.group_id) or planning_index.groupBusy(right.group_id)) continue;
-                    if (self.isShardInCooldown(left.group_id, now_monotonic_ms) or self.isShardInCooldown(right.group_id, now_monotonic_ms)) continue;
-                    const left_status = evidence.mergedStatus(current, left.group_id) orelse continue;
-                    const right_status = evidence.mergedStatus(current, right.group_id) orelse continue;
+                    if (planning_index.groupBusy(left.group_id) or planning_index.groupBusy(right.group_id)) {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    }
+                    if (self.isShardInCooldown(left.group_id, now_monotonic_ms) or self.isShardInCooldown(right.group_id, now_monotonic_ms)) {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    }
+                    const left_status = evidence.mergedStatus(current, left.group_id) orelse {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    };
+                    const right_status = evidence.mergedStatus(current, right.group_id) orelse {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    };
                     if (!evidence.hasFullHealthyPlacement(left.group_id, left_status) or
                         !evidence.hasFullHealthyPlacement(right.group_id, right_status))
                     {
+                        if (require_conclusive_scan) planning_conclusive = false;
                         continue;
                     }
-                    if (!groupStatusFresh(self.config, left_status, now_realtime_ms) or !groupStatusFresh(self.config, right_status, now_realtime_ms)) continue;
-                    if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) continue;
-                    if (!self.groupOldEnoughForMerge(left_status, now_realtime_ms) or !self.groupOldEnoughForMerge(right_status, now_realtime_ms)) continue;
+                    if (!groupStatusFresh(self.config, left_status, now_realtime_ms) or !groupStatusFresh(self.config, right_status, now_realtime_ms)) {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    }
+                    if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    }
+                    if (!groupSizeObservationConclusive(left_status) or !groupSizeObservationConclusive(right_status)) {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    }
+                    if (!self.groupOldEnoughForMerge(left_status, now_realtime_ms) or !self.groupOldEnoughForMerge(right_status, now_realtime_ms)) {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    }
                     if (!docIdentityNamespacesCompatibleForAutomaticMerge(left_status, right_status)) continue;
 
                     const left_size = left_status.disk_bytes;
@@ -885,34 +925,77 @@ pub const Reconciler = struct {
 
             for (table_ranges) |range| {
                 if (planned_shards >= max_shards_per_table or table_budget == 0 or remaining_cluster_budget == 0) break;
-                if (planning_index.groupBusy(range.group_id)) continue;
-                if (self.isShardInCooldown(range.group_id, now_monotonic_ms)) continue;
-                const status = evidence.mergedStatus(current, range.group_id) orelse continue;
-                if (!evidence.hasFullHealthyPlacement(range.group_id, status)) continue;
-                if (!groupStatusFresh(self.config, status, now_realtime_ms)) continue;
-                if (!groupStatusReadyForAutomaticPlanning(status)) continue;
-                if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
+                if (planning_index.groupBusy(range.group_id)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (self.isShardInCooldown(range.group_id, now_monotonic_ms)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                const status = evidence.mergedStatus(current, range.group_id) orelse {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                };
+                if (!evidence.hasFullHealthyPlacement(range.group_id, status)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (!groupStatusFresh(self.config, status, now_realtime_ms)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (!groupStatusReadyForAutomaticPlanning(status)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (!groupSizeObservationConclusive(status)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (!docIdentityNamespaceReadyForAutomaticSplit(status)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
-                const lookup = self.config.median_key_lookup orelse continue;
+                const lookup = self.config.median_key_lookup orelse {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                };
                 const owned_split_key = (lookup.fetchMedianKey(
                     self.alloc,
                     range.group_id,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return err,
-                    else => continue,
-                }) orelse continue;
+                    else => {
+                        if (require_conclusive_scan) planning_conclusive = false;
+                        continue;
+                    },
+                }) orelse {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                };
                 var split_key_consumed = false;
                 defer if (!split_key_consumed) self.alloc.free(owned_split_key);
                 if (status.doc_count > 0 and status.doc_count < 2) continue;
-                if (owned_split_key.len == 0) continue;
-                if (!keyStrictlyInsideRange(owned_split_key, range.start_key, range.end_key)) continue;
+                if (owned_split_key.len == 0) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (!keyStrictlyInsideRange(owned_split_key, range.start_key, range.end_key)) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
 
                 const destination_group_id = deriveAutomaticSplitDestinationId(
                     &planning_index,
                     range.group_id,
                     owned_split_key,
                 );
-                if (destination_group_id == 0) continue;
+                if (destination_group_id == 0) {
+                    if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
                 const transition_id = deriveAutomaticTransitionId("split", range.group_id, destination_group_id, owned_split_key);
                 const intent: table_manager.SplitIntent = .{
                     .transition_id = transition_id,
@@ -936,6 +1019,7 @@ pub const Reconciler = struct {
         errdefer transitions.deinit(self.alloc);
         transitions.splits = try split_intents.toOwnedSlice(self.alloc);
         transitions.merges = try merge_intents.toOwnedSlice(self.alloc);
+        transitions.planning_conclusive = planning_conclusive;
         return transitions;
     }
 
@@ -1011,11 +1095,15 @@ pub const Reconciler = struct {
 const AutomaticTransitions = struct {
     splits: []table_manager.SplitIntent,
     merges: []table_manager.MergeIntent,
+    /// A forced, level-triggered scan may only be acknowledged after every
+    /// relevant range had enough stable evidence to reach a decision.
+    planning_conclusive: bool = true,
 
     fn empty() AutomaticTransitions {
         return .{
             .splits = &.{},
             .merges = &.{},
+            .planning_conclusive = true,
         };
     }
 
@@ -2927,6 +3015,14 @@ fn groupStatusReadyForAutomaticPlanning(status: MergedGroupStatus) bool {
         !status.cutover_ready and
         !status.reads_ready_after_cutover and
         !status.restore_pending;
+}
+
+fn groupSizeObservationConclusive(status: MergedGroupStatus) bool {
+    if (!status.disk_bytes_known) return false;
+    // A non-empty replica necessarily owns primary storage. A known zero
+    // paired with live documents is a transient status-publication boundary,
+    // not evidence that the shard is below its split threshold.
+    return status.doc_count == 0 or status.disk_bytes != 0;
 }
 
 fn managerGroupBusy(
@@ -6270,6 +6366,7 @@ test "metadata reconciler plans an automatic split from fresh group status" {
                     .group_id = 4001,
                     .doc_count = 200,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -6484,6 +6581,7 @@ test "metadata reconciler plans an automatic split from disk size when doc count
                     .group_id = 4101,
                     .doc_count = 0,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -7007,6 +7105,7 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
                     .group_id = 4101,
                     .doc_count = 10,
                     .disk_bytes = 20,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -7019,6 +7118,7 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
                     .group_id = 4102,
                     .doc_count = 8,
                     .disk_bytes = 15,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -8000,6 +8100,7 @@ test "metadata reconciler merges shards once they are older than the merge age t
                     .group_id = 41111,
                     .doc_count = 10,
                     .disk_bytes = 20,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .created_at_millis = now_realtime_ms - 2 * 60 * std.time.ms_per_s,
                     .updated_at_millis = now_realtime_ms,
@@ -8013,6 +8114,7 @@ test "metadata reconciler merges shards once they are older than the merge age t
                     .group_id = 41112,
                     .doc_count = 8,
                     .disk_bytes = 15,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .created_at_millis = now_realtime_ms - 2 * 60 * std.time.ms_per_s,
                     .updated_at_millis = now_realtime_ms,
@@ -8211,6 +8313,7 @@ test "metadata reconciler enforces per-table automatic transition budget" {
                     .group_id = 4131,
                     .doc_count = 200,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -8223,6 +8326,7 @@ test "metadata reconciler enforces per-table automatic transition budget" {
                     .group_id = 4132,
                     .doc_count = 220,
                     .disk_bytes = 220,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -8297,6 +8401,7 @@ test "metadata reconciler enforces cluster automatic transition budget" {
                     .group_id = 4141,
                     .doc_count = 200,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -8309,6 +8414,7 @@ test "metadata reconciler enforces cluster automatic transition budget" {
                     .group_id = 4151,
                     .doc_count = 210,
                     .disk_bytes = 210,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -8377,6 +8483,7 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
                     .group_id = 4201,
                     .doc_count = 200,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
@@ -8388,6 +8495,13 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
             })[0..]),
         },
     };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
+        .node_id = 1,
+        .store_id = 1,
+        .role = "data",
+        .failure_domain = "rack-a",
+        .retain_current = true,
+    }};
 
     var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
     var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
@@ -8408,7 +8522,33 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     try std.testing.expectEqual(@as(usize, 0), blocked_plan.split_upserts.len);
     try std.testing.expect(blocked_plan.clear_reallocation_request == null);
 
-    var forced_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+    const inconsistent_reports = [_]table_manager.GroupStatusReport{.{
+        .group_id = 4201,
+        .doc_count = 200,
+        .disk_bytes = 0,
+        .disk_bytes_known = true,
+        .empty = false,
+        .updated_at_millis = now_ms,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+        .voter_set_known = true,
+        .voter_set_fingerprint = voter_set_fingerprint,
+    }};
+    var inconsistent_stores = stores;
+    inconsistent_stores[0].group_statuses = @constCast(inconsistent_reports[0..]);
+    var inconclusive_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &placements,
+        .stores = &inconsistent_stores,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
+    });
+    defer inconclusive_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), inconclusive_plan.split_admissions.len);
+    try std.testing.expect(inconclusive_plan.clear_reallocation_request == null);
+
+    var forced_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
         .tables = tables,
         .ranges = ranges,
         .placement_intents = &placements,
@@ -8418,9 +8558,8 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     defer forced_plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), forced_plan.split_admissions.len);
     try std.testing.expect(forced_plan.forced_reallocation);
-    // The request admitted the split, but no placement candidates were
-    // available in this round. Keep it durable until a later round can run
-    // the complete forced-placement plan.
+    // The request admitted the split. Keep it durable until that transition
+    // completes, then a later round can conclusively scan the new topology.
     try std.testing.expect(forced_plan.clear_reallocation_request == null);
 }
 
@@ -8826,6 +8965,7 @@ test "metadata reconciler uses live median key lookup for split planning" {
                     .group_id = 4701,
                     .doc_count = 240,
                     .disk_bytes = 240,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms - 5,
                     .local_leader = true,
@@ -8848,6 +8988,7 @@ test "metadata reconciler uses live median key lookup for split planning" {
                     .group_id = 4701,
                     .doc_count = 240,
                     .disk_bytes = 240,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = false,
@@ -9066,6 +9207,7 @@ test "metadata reconciler prefers live median key lookup for automatic split" {
                     .group_id = 4811,
                     .doc_count = 200,
                     .disk_bytes = 200,
+                    .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
