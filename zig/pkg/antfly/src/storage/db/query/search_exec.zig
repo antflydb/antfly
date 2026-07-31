@@ -2768,6 +2768,27 @@ fn maybeLiveFilterResolvedDocSetAlloc(
         .doc_keys, .ordinals, .ordinal_bitmap => {},
         .all, .none => return set,
     }
+
+    // Prefer subtracting the usually tiny non-visible complement. A single
+    // tombstone used to make every broad structured filter probe every
+    // matching ordinal in the primary store, turning an indexed term filter
+    // into O(table size) work. Ordinal sets can reconcile visibility exactly
+    // with O(non-visible) bitmap/list subtraction; doc-key sets still require
+    // the general live-filter callback below.
+    switch (set.*) {
+        .ordinals, .ordinal_bitmap => if (executor.nonvisible_doc_set) |nonvisible| {
+            if (try nonvisible(executor.ctx, alloc, executor.identity_read_generation)) |resolved_nonvisible| {
+                var owned_nonvisible = resolved_nonvisible;
+                defer owned_nonvisible.deinit(alloc);
+                if (try doc_set.differenceAlloc(alloc, set, &owned_nonvisible)) |visible| {
+                    owned.* = visible;
+                    return &owned.*.?;
+                }
+            }
+        },
+        .all, .none, .doc_keys => {},
+    }
+
     const live_filter = executor.live_filter_doc_set orelse return set;
     owned.* = try live_filter(executor.ctx, alloc, set, executor.identity_read_generation);
     return &owned.*.?;
@@ -11435,6 +11456,7 @@ pub fn searchTextQuery(
             .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
             .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
             .live_filter_doc_set = executor.live_filter_doc_set,
+            .nonvisible_doc_set = executor.nonvisible_doc_set,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
         });
@@ -16374,32 +16396,53 @@ fn appendResolvedMultiMatchFields(
         try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
         return;
     }
-    const has_search_as_you_type = try fieldHasSearchAsYouTypeSubfields(alloc, text_analysis, runtime_schema, requested.field);
-    if (!has_search_as_you_type) {
+    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{requested.field});
+    const has_two_gram = fieldUsesAnalyzer(text_analysis, runtime_schema, two_gram, "search_as_you_type_2gram");
+    const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{requested.field});
+    const has_three_gram = fieldUsesAnalyzer(text_analysis, runtime_schema, three_gram, "search_as_you_type_3gram");
+    if (!has_two_gram and !has_three_gram) {
         try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
         return;
     }
 
-    // The root field can use a stemming or otherwise non-prefix-preserving
-    // analyzer, so its prefix clause must remain on the root dictionary. The
-    // generated shingle analyzers are byte-for-byte compatible with the
-    // shingles materialized in _index_prefix and can use exact lookups there.
-    try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
     const index_prefix = try std.fmt.allocPrint(alloc, "{s}._index_prefix", .{requested.field});
-    const compatible_index_prefix = fieldUsesAnalyzer(
+    const has_index_prefix = fieldUsesAnalyzer(
         text_analysis,
         runtime_schema,
         index_prefix,
         "search_as_you_type_index_prefix",
     );
-    const shingle_companion: ?[]const u8 = if (compatible_index_prefix) index_prefix else null;
-    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost, shingle_companion);
-    const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost, shingle_companion);
-    // Preserve the original BM25-scored trailing-shingle clause. The exact
-    // companion lookups above replace only constant-score prefix clauses.
-    try appendUniqueResolvedMultiMatchField(alloc, fields, index_prefix, requested.boost, null);
+    const root_prefix = try std.fmt.allocPrint(alloc, "{s}._root_prefix", .{requested.field});
+    const has_root_prefix = fieldUsesAnalyzer(
+        text_analysis,
+        runtime_schema,
+        root_prefix,
+        "search_as_you_type_root_prefix",
+    );
+    const root_uses_default_analyzer = fieldUsesAnalyzer(text_analysis, runtime_schema, requested.field, "standard") or
+        fieldUsesAnalyzer(text_analysis, runtime_schema, requested.field, "default");
+
+    // Every companion is analyzer-verified independently. PrefixFilter checks
+    // for the companion per segment and falls back to the source dictionary,
+    // so old and new segments remain correct during rolling upgrades.
+    try appendUniqueResolvedMultiMatchField(
+        alloc,
+        fields,
+        requested.field,
+        requested.boost,
+        if (has_root_prefix and root_uses_default_analyzer) root_prefix else null,
+    );
+    if (has_two_gram) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost, if (has_index_prefix) index_prefix else null);
+    }
+    if (has_three_gram) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost, if (has_index_prefix) index_prefix else null);
+    }
+    // Preserve the original BM25-scored trailing-shingle clause. Indexed
+    // companions replace only constant-score prefix clauses.
+    if (has_index_prefix) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, index_prefix, requested.boost, null);
+    }
 }
 
 fn appendUniqueResolvedMultiMatchField(
@@ -16421,26 +16464,23 @@ fn appendUniqueResolvedMultiMatchField(
     });
 }
 
-fn fieldHasSearchAsYouTypeSubfields(
-    alloc: Allocator,
-    text_analysis: introducer_mod.TextAnalysisConfig,
-    runtime_schema: ?runtime_schema_mod.TableSchema,
-    field: []const u8,
-) !bool {
-    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{field});
-    defer alloc.free(two_gram);
-    return fieldUsesAnalyzer(text_analysis, runtime_schema, two_gram, "search_as_you_type_2gram");
-}
-
 fn fieldUsesAnalyzer(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
     field: []const u8,
     expected_analyzer: []const u8,
 ) bool {
-    if (resolveConfiguredFieldAnalyzerName(text_analysis, field)) |analyzer| {
-        if (std.mem.eql(u8, analyzer, expected_analyzer)) return true;
+    var configured_count: usize = 0;
+    var configured_matches = true;
+    for (text_analysis.field_analyzers) |item| {
+        if (!std.mem.eql(u8, item.field_name, field)) continue;
+        configured_count += 1;
+        configured_matches = configured_matches and std.mem.eql(u8, item.analyzer_name, expected_analyzer);
     }
+    // Configured analyzer observations describe the actual persisted field and
+    // take precedence over a schema declaration. Any disagreement disables the
+    // optimization rather than risking false positives.
+    if (configured_count > 0) return configured_matches;
     if (runtime_schema) |schema| {
         if (resolveIndexedFieldAnalyzer(schema, field)) |analyzer| {
             if (std.mem.eql(u8, analyzer, expected_analyzer)) return true;
@@ -16491,13 +16531,10 @@ fn fieldBoolPrefixSearchQuery(
         if (final_token.len >= search_as_you_type_min_prefix_length and
             final_token.len <= search_as_you_type_max_prefix_length)
         {
-            const exact_prefix = try alloc.dupe(u8, final_token);
-            try should.append(alloc, .{ .term_range = .{
-                .field = index_prefix,
-                .min = exact_prefix,
-                .max = exact_prefix,
-                .inclusive_min = true,
-                .inclusive_max = true,
+            try should.append(alloc, .{ .prefix = .{
+                .field = field.field,
+                .prefix = try alloc.dupe(u8, final_token),
+                .indexed_field = index_prefix,
             } });
         } else {
             try should.append(alloc, .{ .prefix = .{
@@ -16529,7 +16566,8 @@ fn joinTokenTermsAlloc(alloc: Allocator, tokens: []const analysis_mod.Token) ![]
 }
 
 fn isSearchAsYouTypeGeneratedField(field: []const u8) bool {
-    return std.mem.endsWith(u8, field, "._2gram") or
+    return std.mem.endsWith(u8, field, "._root_prefix") or
+        std.mem.endsWith(u8, field, "._2gram") or
         std.mem.endsWith(u8, field, "._3gram") or
         std.mem.endsWith(u8, field, "._index_prefix");
 }
@@ -16854,6 +16892,7 @@ test "multi_match bool_prefix preserves root semantics and bounds shingle prefix
     const text_analysis: introducer_mod.TextAnalysisConfig = .{
         .field_analyzers = &.{
             .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "title._root_prefix", .analyzer_name = "search_as_you_type_root_prefix" },
             .{ .field_name = "title._2gram", .analyzer_name = "search_as_you_type_2gram" },
             .{ .field_name = "title._3gram", .analyzer_name = "search_as_you_type_3gram" },
             .{ .field_name = "title._index_prefix", .analyzer_name = "search_as_you_type_index_prefix" },
@@ -16873,6 +16912,7 @@ test "multi_match bool_prefix preserves root semantics and bounds shingle prefix
     try std.testing.expect(single.bool_query.should[0].bool_query.should[0] == .prefix);
     try std.testing.expectEqualStrings("title", single.bool_query.should[0].bool_query.should[0].prefix.field);
     try std.testing.expectEqualStrings("zul", single.bool_query.should[0].bool_query.should[0].prefix.prefix);
+    try std.testing.expectEqualStrings("title._root_prefix", single.bool_query.should[0].bool_query.should[0].prefix.indexed_field.?);
     try std.testing.expect(single.bool_query.should[1] == .term);
     try std.testing.expectEqualStrings("title._index_prefix", single.bool_query.should[1].term.field);
     try std.testing.expectEqualStrings("zul", single.bool_query.should[1].term.term);
@@ -16903,19 +16943,20 @@ test "multi_match bool_prefix preserves root semantics and bounds shingle prefix
     try std.testing.expect(multiple.bool_query.should[0].bool_query.should[2] == .prefix);
     try std.testing.expectEqualStrings("title", multiple.bool_query.should[0].bool_query.should[2].prefix.field);
     try std.testing.expectEqualStrings("099", multiple.bool_query.should[0].bool_query.should[2].prefix.prefix);
+    try std.testing.expectEqualStrings("title._root_prefix", multiple.bool_query.should[0].bool_query.should[2].prefix.indexed_field.?);
     try std.testing.expect(multiple.bool_query.should[1] == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), multiple.bool_query.should[1].bool_query.should.len);
     try std.testing.expect(multiple.bool_query.should[1].bool_query.should[0] == .term);
-    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[1] == .term_range);
-    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[1].bool_query.should[1].term_range.field);
-    try std.testing.expectEqualStrings("item 099", multiple.bool_query.should[1].bool_query.should[1].term_range.min.?);
-    try std.testing.expectEqualStrings("item 099", multiple.bool_query.should[1].bool_query.should[1].term_range.max.?);
-    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[1].term_range.inclusive_min);
-    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[1].term_range.inclusive_max);
+    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[1] == .prefix);
+    try std.testing.expectEqualStrings("title._2gram", multiple.bool_query.should[1].bool_query.should[1].prefix.field);
+    try std.testing.expectEqualStrings("item 099", multiple.bool_query.should[1].bool_query.should[1].prefix.prefix);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[1].bool_query.should[1].prefix.indexed_field.?);
     try std.testing.expect(multiple.bool_query.should[2] == .bool_query);
     try std.testing.expectEqual(@as(usize, 1), multiple.bool_query.should[2].bool_query.should.len);
-    try std.testing.expect(multiple.bool_query.should[2].bool_query.should[0] == .term_range);
-    try std.testing.expectEqualStrings("catalog item 099", multiple.bool_query.should[2].bool_query.should[0].term_range.min.?);
+    try std.testing.expect(multiple.bool_query.should[2].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("title._3gram", multiple.bool_query.should[2].bool_query.should[0].prefix.field);
+    try std.testing.expectEqualStrings("catalog item 099", multiple.bool_query.should[2].bool_query.should[0].prefix.prefix);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[2].bool_query.should[0].prefix.indexed_field.?);
     try std.testing.expect(multiple.bool_query.should[3] == .term);
     try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[3].term.field);
     try std.testing.expectEqualStrings("catalog item 099", multiple.bool_query.should[3].term.term);
@@ -16957,6 +16998,7 @@ test "multi_match bool_prefix preserves root semantics and bounds shingle prefix
     try std.testing.expect(stemmed.bool_query.should[0] == .bool_query);
     try std.testing.expect(stemmed.bool_query.should[0].bool_query.should[0] == .prefix);
     try std.testing.expectEqualStrings("happi", stemmed.bool_query.should[0].bool_query.should[0].prefix.prefix);
+    try std.testing.expectEqualStrings("title._root_prefix", stemmed.bool_query.should[0].bool_query.should[0].prefix.indexed_field.?);
     try std.testing.expect(stemmed.bool_query.should[1] == .term);
     try std.testing.expectEqualStrings("happy", stemmed.bool_query.should[1].term.term);
 
@@ -16979,6 +17021,25 @@ test "multi_match bool_prefix preserves root semantics and bounds shingle prefix
     try std.testing.expect(long.bool_query.should[0] == .bool_query);
     try std.testing.expect(long.bool_query.should[0].bool_query.should[0] == .prefix);
     try std.testing.expectEqualStrings("title", long.bool_query.should[0].bool_query.should[0].prefix.field);
+    try std.testing.expectEqual(@as(?[]const u8, null), long.bool_query.should[0].bool_query.should[0].prefix.indexed_field);
+
+    const incompatible_three_gram: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "title._root_prefix", .analyzer_name = "search_as_you_type_root_prefix" },
+            .{ .field_name = "title._2gram", .analyzer_name = "search_as_you_type_2gram" },
+            .{ .field_name = "title._3gram", .analyzer_name = "standard" },
+            .{ .field_name = "title._index_prefix", .analyzer_name = "search_as_you_type_index_prefix" },
+        },
+    };
+    const without_three_gram = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "catalog item 099",
+        .fields = &fields,
+    } }, incompatible_three_gram, null);
+    try std.testing.expectEqual(@as(usize, 3), without_three_gram.bool_query.should.len);
+    try std.testing.expect(without_three_gram.bool_query.should[0] == .bool_query);
+    try std.testing.expect(without_three_gram.bool_query.should[1] == .bool_query);
+    try std.testing.expect(without_three_gram.bool_query.should[2] == .term);
 }
 
 fn testDenseIndexCallback(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
@@ -26901,6 +26962,15 @@ fn testNonVisibleDocSetUnavailableCallback(
     return null;
 }
 
+fn testUnexpectedLiveFilterDocSetCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: *const doc_set.ResolvedDocSet,
+    _: ?u64,
+) anyerror!doc_set.ResolvedDocSet {
+    return error.TestUnexpectedResult;
+}
+
 test "broad live doc filter prefers small non-visible exclude set" {
     const alloc = std.testing.allocator;
     var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
@@ -26952,6 +27022,31 @@ test "broad live doc filter falls back to include set when complement unavailabl
 
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+}
+
+test "resolved ordinal filters subtract non-visible complement without live probes" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2, 3 }),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testUnexpectedLiveFilterDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(!containsDocNum(constraints.filter_doc_nums, 1));
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
 }

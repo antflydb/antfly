@@ -2681,16 +2681,22 @@ pub const TermIterator = struct {
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
     automaton: ?vellum.Automaton = null,
-    /// Number of dictionary entries decoded, including entries rejected by
-    /// range or automaton constraints. This is useful for query diagnostics
-    /// and for guarding the seek behavior of bounded iterators.
-    decoded_term_count: u64 = 0,
     // We must copy the key before advancing, because block parsing reuses section slices.
     current_key: std.ArrayListUnmanaged(u8) = .empty,
 
     pub const Entry = struct { term: []const u8, result: LookupResult };
 
     pub fn next(self: *TermIterator) !?Entry {
+        return self.nextInternal(false, null);
+    }
+
+    /// Diagnostic iterator path. The normal next() instantiation contains no
+    /// counter update or conditional branch in its term-decoding hot loop.
+    pub fn nextWithDecodedCount(self: *TermIterator, decoded_count: *u64) !?Entry {
+        return self.nextInternal(true, decoded_count);
+    }
+
+    fn nextInternal(self: *TermIterator, comptime track_decoded: bool, decoded_count: ?*u64) !?Entry {
         while (true) {
             if (self.current_block_remaining == 0) {
                 if (!try self.loadNextBlock()) return null;
@@ -2704,7 +2710,7 @@ pub const TermIterator = struct {
             self.current_block_cursor += leaf_len;
             const value = decodeTermDictBlockValueDelta(readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData, &self.current_block_last_postings_offset);
             self.current_block_remaining -= 1;
-            self.decoded_term_count += 1;
+            if (comptime track_decoded) decoded_count.?.* += 1;
 
             self.current_key.shrinkRetainingCapacity(self.current_block_prefix.len + shared_len);
             try self.current_key.appendSlice(self.alloc, leaf);
@@ -2729,10 +2735,6 @@ pub const TermIterator = struct {
 
             return .{ .term = self.current_key.items, .result = result };
         }
-    }
-
-    pub fn decodedTermCount(self: *const TermIterator) u64 {
-        return self.decoded_term_count;
     }
 
     fn loadNextBlock(self: *TermIterator) !bool {

@@ -353,6 +353,10 @@ pub const IndexSnapshot = struct {
     // instead of re-walking dictionaries/postings.
     term_doc_freq_cache_mu: std.atomic.Mutex,
     term_doc_freq_cache: TermDocFreqCache,
+    /// Advanced whenever an in-place deletion mutation changes live term
+    /// statistics. A generation check prevents a lookup that raced an
+    /// invalidation from repopulating the cache with the pre-delete value.
+    term_doc_freq_cache_generation: u64,
     term_doc_freq_cache_hits: u64,
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
@@ -759,57 +763,119 @@ pub const IndexSnapshot = struct {
         return false;
     }
 
+    fn invalidateTermDocFreqCache(self: *IndexSnapshot) void {
+        const cache_mu = &self.term_doc_freq_cache_mu;
+        while (!cache_mu.tryLock()) spinOrYield();
+        defer cache_mu.unlock();
+
+        self.term_doc_freq_cache_generation +%= 1;
+        var cache_it = self.term_doc_freq_cache.keyIterator();
+        while (cache_it.next()) |key| self.alloc.free(key.storage);
+        self.term_doc_freq_cache.clearRetainingCapacity();
+    }
+
+    /// Count live documents for one segment/term without turning a sparse
+    /// tombstone into a full postings scan. For sparse deletions, seek the
+    /// postings iterator to each deleted document; for dense deletions, scan
+    /// the smaller postings side once. Both paths preserve exact BM25 stats.
+    fn liveSegmentTermDocFreq(
+        alloc: Allocator,
+        lookup_result: inverted.LookupResult,
+        deleted: *const roaring.RoaringBitmap,
+    ) !u32 {
+        const raw_doc_freq = lookup_result.docFreq();
+        if (raw_doc_freq == 0 or deleted.isEmpty()) return raw_doc_freq;
+
+        var removed: u32 = 0;
+        var postings = try lookup_result.iterator(alloc);
+        defer postings.deinit();
+        postings.decode_positions = false;
+
+        if (deleted.cardinality() >= raw_doc_freq) {
+            while (try postings.nextScoring()) |hit| {
+                if (deleted.contains(hit.doc_id)) removed += 1;
+            }
+            return raw_doc_freq -| removed;
+        }
+
+        // advanceTo consumes the first posting at or after its target. Keep a
+        // one-item lookahead when that posting belongs to a later tombstone so
+        // it can still be reconciled without restarting the iterator.
+        var pending_doc: ?u32 = null;
+        var deleted_it = deleted.iterator();
+        while (deleted_it.next()) |deleted_doc| {
+            if (pending_doc) |pending| {
+                if (pending == deleted_doc) {
+                    removed += 1;
+                    pending_doc = null;
+                    continue;
+                }
+                if (pending > deleted_doc) continue;
+                pending_doc = null;
+            }
+
+            const hit = (try postings.advanceTo(deleted_doc)) orelse break;
+            if (hit.doc_id == deleted_doc) {
+                removed += 1;
+            } else {
+                pending_doc = hit.doc_id;
+            }
+        }
+        return raw_doc_freq -| removed;
+    }
+
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
         if (self.global_doc_count == 0) return 0;
         const mutable = @constCast(self);
         const adapted = TermDocFreqAdapted{ .field = field, .term = term };
         const adapted_ctx = TermDocFreqAdaptedCtx{};
 
-        const cache_mu = &mutable.term_doc_freq_cache_mu;
-        while (!cache_mu.tryLock()) {
-            spinOrYield();
-        }
-        if (mutable.term_doc_freq_cache.getAdapted(adapted, adapted_ctx)) |cached| {
-            mutable.term_doc_freq_cache_hits += 1;
+        while (true) {
+            const cache_mu = &mutable.term_doc_freq_cache_mu;
+            while (!cache_mu.tryLock()) spinOrYield();
+            if (mutable.term_doc_freq_cache.getAdapted(adapted, adapted_ctx)) |cached| {
+                mutable.term_doc_freq_cache_hits += 1;
+                cache_mu.unlock();
+                return cached;
+            }
+            const cache_generation = mutable.term_doc_freq_cache_generation;
+            mutable.term_doc_freq_cache_misses += 1;
             cache_mu.unlock();
-            return cached;
-        }
-        mutable.term_doc_freq_cache_misses += 1;
-        cache_mu.unlock();
 
-        var total: u32 = 0;
-        for (self.segments) |*seg| {
-            const inv_reader = (try seg.reader.invertedIndex(field)) orelse continue;
-            const lookup_result = inv_reader.lookup(term) orelse continue;
+            var total: u32 = 0;
+            for (self.segments) |*seg| {
+                const inv_reader = (try seg.reader.invertedIndex(field)) orelse continue;
+                const lookup_result = inv_reader.lookup(term) orelse continue;
+                total += if (seg.shared.deleted) |*deleted|
+                    try liveSegmentTermDocFreq(alloc, lookup_result, deleted)
+                else
+                    lookup_result.docFreq();
+            }
 
-            if (seg.shared.deleted == null) {
-                total += lookup_result.docFreq();
+            while (!cache_mu.tryLock()) spinOrYield();
+            if (mutable.term_doc_freq_cache_generation != cache_generation) {
+                cache_mu.unlock();
                 continue;
             }
+            defer cache_mu.unlock();
 
-            var iter = try lookup_result.iterator(alloc);
-            defer iter.deinit();
-            while (try iter.next()) |hit| {
-                if (!seg.shared.deleted.?.contains(hit.doc_id)) total += 1;
+            // Allocate before claiming a vacant hash slot. If allocation
+            // fails after getOrPut, the map would otherwise retain an
+            // uninitialized key/value entry.
+            const storage = try self.alloc.alloc(u8, field.len + term.len);
+            errdefer self.alloc.free(storage);
+            const gop = try mutable.term_doc_freq_cache.getOrPutAdapted(self.alloc, adapted, adapted_ctx);
+            if (gop.found_existing) {
+                // Another caller raced us to the insert.
+                self.alloc.free(storage);
+                return gop.value_ptr.*;
             }
+            @memcpy(storage[0..field.len], field);
+            @memcpy(storage[field.len..], term);
+            gop.key_ptr.* = .{ .storage = storage, .field_len = @intCast(field.len) };
+            gop.value_ptr.* = total;
+            return total;
         }
-
-        while (!cache_mu.tryLock()) {
-            spinOrYield();
-        }
-        defer cache_mu.unlock();
-        const gop = try mutable.term_doc_freq_cache.getOrPutAdapted(self.alloc, adapted, adapted_ctx);
-        if (gop.found_existing) {
-            // Another caller raced us to the insert.
-            return gop.value_ptr.*;
-        }
-        // Allocate the owning key only on the slow path.
-        const storage = try self.alloc.alloc(u8, field.len + term.len);
-        @memcpy(storage[0..field.len], field);
-        @memcpy(storage[field.len..], term);
-        gop.key_ptr.* = .{ .storage = storage, .field_len = @intCast(field.len) };
-        gop.value_ptr.* = total;
-        return total;
     }
 
     pub fn textAvgDocLen(self: *const IndexSnapshot, field: []const u8) f32 {
@@ -959,6 +1025,7 @@ pub const IndexWriter = struct {
             .global_total_field_len = .empty,
             .term_doc_freq_cache_mu = .unlocked,
             .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_generation = 0,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .bm25_bound_table_cache_mu = .unlocked,
@@ -1239,6 +1306,7 @@ pub const IndexWriter = struct {
             .global_total_field_len = global_field_lens,
             .term_doc_freq_cache_mu = .unlocked,
             .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_generation = 0,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .bm25_bound_table_cache_mu = .unlocked,
@@ -1379,6 +1447,7 @@ pub const IndexWriter = struct {
             .global_total_field_len = global_field_lens,
             .term_doc_freq_cache_mu = .unlocked,
             .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_generation = 0,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .bm25_bound_table_cache_mu = .unlocked,
@@ -1576,6 +1645,7 @@ pub const IndexWriter = struct {
                     total += s.liveDocCount();
                 }
                 snap.global_doc_count = total;
+                snap.invalidateTermDocFreqCache();
                 return;
             }
         }
@@ -1613,6 +1683,7 @@ pub const IndexWriter = struct {
 
     fn rollbackDeleteInfosLocked(self: *IndexWriter, delete_infos: []const DeleteInfo) void {
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        var changed = false;
         for (delete_infos) |delete_info| {
             for (snap.segments) |*seg| {
                 if (seg.id != delete_info.seg_id) continue;
@@ -1624,9 +1695,11 @@ pub const IndexWriter = struct {
                     }
                 }
                 snap.global_doc_count +|= @intCast(delete_info.applied_count);
+                changed = changed or delete_info.applied_count > 0;
                 break;
             }
         }
+        if (changed) snap.invalidateTermDocFreqCache();
     }
 
     /// Delete every live copy of a document and return one updated deletion
@@ -1693,6 +1766,7 @@ pub const IndexWriter = struct {
             }
             delete_infos.items[delete_infos.items.len - 1].bitmap_bytes = try seg.shared.deleted.?.toBytes(alloc);
         }
+        if (delete_infos.items.len > 0) snap.invalidateTermDocFreqCache();
         return try delete_infos.toOwnedSlice(alloc);
     }
 
@@ -2066,6 +2140,52 @@ test "deleteById removes document from search results" {
     // Double delete returns false
     const double_del = try writer.deleteById("doc-a");
     try std.testing.expect(!double_del);
+}
+
+test "term doc frequency invalidates on real deletes and reconciles sparse tombstones" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc-a", .terms = &.{.{ .term = "other", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc-b", .terms = &.{.{ .term = "common", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc-c", .terms = &.{.{ .term = "common", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc-d", .terms = &.{.{ .term = "common", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc-e", .terms = &.{.{ .term = "common", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    try std.testing.expectEqual(@as(u32, 4), try snap.termDocFreq(alloc, "body", "common"));
+    try std.testing.expectEqual(@as(u64, 1), snap.term_doc_freq_cache_misses);
+
+    // A phantom delete neither changes live statistics nor evicts the cache.
+    const generation_before_phantom = snap.term_doc_freq_cache_generation;
+    try std.testing.expect(!try writer.deleteById("doc-missing"));
+    try std.testing.expectEqual(generation_before_phantom, snap.term_doc_freq_cache_generation);
+    try std.testing.expectEqual(@as(u32, 4), try snap.termDocFreq(alloc, "body", "common"));
+    try std.testing.expectEqual(@as(u64, 1), snap.term_doc_freq_cache_hits);
+
+    // The first tombstone does not contain the term and the later one does.
+    // This exercises the sparse seek path's consumed-posting lookahead.
+    const tracked = try writer.deleteAllByIdsTracked(alloc, &.{ "doc-a", "doc-d" });
+    defer IndexWriter.freeDeleteInfos(alloc, tracked);
+    try std.testing.expectEqual(@as(usize, 1), tracked.len);
+    try std.testing.expectEqual(@as(u32, 3), try snap.termDocFreq(alloc, "body", "common"));
+    try std.testing.expect(snap.term_doc_freq_cache_generation > generation_before_phantom);
+
+    writer.rollbackDeleteInfos(tracked);
+    try std.testing.expectEqual(@as(u32, 4), try snap.termDocFreq(alloc, "body", "common"));
+
+    // A committed real delete invalidates the primed value and remains exact.
+    try std.testing.expect(try writer.deleteById("doc-d"));
+    try std.testing.expectEqual(@as(u32, 3), try snap.termDocFreq(alloc, "body", "common"));
+    const results = try snap.search(alloc, "body", &.{"common"}, 10);
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 3), results.hits.len);
 }
 
 test "deleteById across multiple segments" {

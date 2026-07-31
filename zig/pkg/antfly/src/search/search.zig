@@ -346,6 +346,10 @@ pub const PhraseQuery = struct {
 pub const PrefixQuery = struct {
     field: []const u8,
     prefix: []const u8,
+    /// Optional materialized prefix field. Execution uses an exact lookup when
+    /// the field exists in a segment and transparently falls back to the source
+    /// dictionary for older segments.
+    indexed_field: ?[]const u8 = null,
     boost: f32 = 1.0,
 };
 
@@ -1060,6 +1064,7 @@ fn executePrefix(
     return executeFilterQuery(alloc, snap, .{ .prefix = .{
         .field = pq.field,
         .prefix = pq.prefix,
+        .indexed_field = pq.indexed_field,
     } }, request, pq.boost);
 }
 
@@ -2462,7 +2467,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         },
         .phrase => |pq| (try buildPhraseFilter(alloc, pq.field, pq.text, pq.analyzer orelse &analysis_mod.default_analyzer, pq.max_edits, pq.auto_fuzzy)) orelse
             .{ .bool_filter = .{ .must = &.{}, .should = &.{}, .must_not = &.{} } },
-        .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix } },
+        .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
         .wildcard => |wq| .{ .wildcard = .{ .field = wq.field, .pattern = wq.pattern } },
         .regexp => |rq| .{ .regexp = .{ .field = rq.field, .pattern = rq.pattern } },
         .bool_query => |bq| blk: {
@@ -2674,7 +2679,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             };
         },
         .prefix => |pq| .{
-            .filter = .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix } },
+            .filter = .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },

@@ -536,6 +536,15 @@ fn deriveRuntimeFullTextLeaf(
     }
 
     if (has_search_as_you_type) {
+        // The root prefix companion is valid only for the default analyzer.
+        // Other/custom analyzers retain the dictionary-prefix fallback until a
+        // semantics-equivalent companion is available for that analyzer.
+        if (std.mem.eql(u8, primary_analyzer, "standard") or std.mem.eql(u8, primary_analyzer, "default")) {
+            const emitted_root_prefix = try std.fmt.allocPrint(alloc, "{s}._root_prefix", .{path});
+            defer alloc.free(emitted_root_prefix);
+            try appendFullTextField(alloc, fields, path, emitted_root_prefix, "search_as_you_type_root_prefix", false);
+        }
+
         const emitted_2gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{path});
         defer alloc.free(emitted_2gram);
         try appendFullTextField(alloc, fields, path, emitted_2gram, "search_as_you_type_2gram", false);
@@ -768,6 +777,7 @@ fn appendDynamicLeafRule(
     }
 
     if (has_search_as_you_type) {
+        try appendDynamicVariant(alloc, &variants, "._root_prefix", "search_as_you_type_root_prefix", false);
         try appendDynamicVariant(alloc, &variants, "._2gram", "search_as_you_type_2gram", false);
         try appendDynamicVariant(alloc, &variants, "._3gram", "search_as_you_type_3gram", false);
         try appendDynamicVariant(alloc, &variants, "._index_prefix", "search_as_you_type_index_prefix", false);
@@ -902,6 +912,28 @@ fn findFieldCapability(capabilities: []const storage_schema.FieldCapability, fie
         }
     }
     return null;
+}
+
+test "runtime schema materializes default-analyzed search-as-you-type root prefixes" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "properties": {
+        \\      "title": {"type":"string", "x-antfly-types":["text","search_as_you_type"]},
+        \\      "custom": {"type":"string", "x-antfly-types":["text","search_as_you_type"], "x-antfly-analyzer":"french"}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const fields = runtime.full_text_documents[0].fields;
+    const root_prefix = findFullTextField(fields, "title._root_prefix") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("search_as_you_type_root_prefix", root_prefix.analyzer);
+    try std.testing.expect(findFullTextField(fields, "custom._root_prefix") == null);
 }
 
 test "runtime schema derives internal doc values from sortable scalar mappings" {

@@ -41806,7 +41806,7 @@ test "db default dynamic schema vector term filters project through doc identity
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
 }
 
-test "db dense default dynamic one percent filters exact score top one hundred" {
+test "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -41838,7 +41838,10 @@ test "db dense default dynamic one percent filters exact score top one hundred" 
     });
 
     const doc_count: usize = 10_000;
-    const eligible_count: usize = 100;
+    // Reproduce the campaign's 0.2% selectivity cell. The public page still
+    // asks for top-100, while native planning must score only the 20 eligible
+    // vectors and return exact ordering instead of traversing filtered ANN.
+    const eligible_count: usize = 20;
     const writes = try alloc.alloc(types.BatchWrite, doc_count);
     defer {
         for (writes) |write| {
@@ -41863,17 +41866,17 @@ test "db dense default dynamic one percent filters exact score top one hundred" 
     });
 
     const filters = [_][]const u8{
-        "{\"numeric_range\":{\"field\":\"id\",\"min\":9900,\"inclusive_min\":true}}",
+        "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
         "{\"term\":{\"bucket\":\"selected\"}}",
     };
     for (filters) |filter_query_json| {
         var profiled = try db.searchDenseProfiled(alloc, .{
             .index_name = "dv_v1",
             .primary_text_index_name = "ft_v1",
-            .limit = eligible_count,
+            .limit = 100,
             .include_stored = false,
             .filter_query_json = filter_query_json,
-        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = eligible_count });
+        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });
         defer profiled.result.deinit();
 
         try std.testing.expectEqual(@as(u32, eligible_count), profiled.result.total_hits);
