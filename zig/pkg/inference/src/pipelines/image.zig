@@ -270,6 +270,38 @@ const red_png_2x2 = [_]u8{
     0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 };
 
+// A deliberately non-square, high-contrast RGB fixture. The asymmetric edge
+// bands make resize/crop regressions visible, while the center gradient catches
+// channel ordering and interpolation changes through the encoded-image path.
+const clip_contract_png_16x8 = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x7f, 0x14, 0xe8, 0xc0, 0x00, 0x00, 0x00,
+    0xfc, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x25, 0xcb, 0xb1, 0x69, 0x68,
+    0x21, 0x14, 0x00, 0xd0, 0x3b, 0x80, 0x65, 0xc0, 0xd2, 0x36, 0x95, 0x64,
+    0x80, 0x60, 0x27, 0xb6, 0x19, 0x40, 0xad, 0xfe, 0x06, 0x22, 0xa4, 0xb0,
+    0x0f, 0x88, 0x1b, 0x58, 0x89, 0x03, 0xa4, 0x95, 0xdb, 0x66, 0x00, 0xb1,
+    0xfa, 0xb8, 0x81, 0x90, 0xc6, 0x0d, 0xcc, 0x03, 0xe1, 0xb4, 0x07, 0x36,
+    0x90, 0x0b, 0xe0, 0x50, 0x58, 0x1c, 0x86, 0x04, 0xd4, 0x50, 0x1d, 0xa4,
+    0x08, 0xbe, 0x80, 0x6d, 0xa0, 0x3a, 0xbc, 0xbd, 0xec, 0x73, 0xc1, 0x7e,
+    0x21, 0x17, 0xb0, 0x43, 0xd9, 0xe2, 0x6c, 0x48, 0x86, 0x9a, 0x55, 0xc7,
+    0x52, 0x64, 0xbe, 0x30, 0xdb, 0x98, 0xea, 0xec, 0x09, 0xbf, 0x17, 0xec,
+    0x57, 0x72, 0x81, 0x38, 0x54, 0x2c, 0x2e, 0x86, 0x14, 0xa8, 0x45, 0x75,
+    0x22, 0x45, 0xe1, 0x8b, 0xb0, 0x4d, 0xa8, 0x2e, 0x9e, 0xf0, 0xff, 0x82,
+    0xfd, 0x4e, 0x2e, 0x30, 0x87, 0x9a, 0xc5, 0xcd, 0x90, 0x06, 0xb5, 0xa9,
+    0xce, 0xa4, 0x68, 0x7c, 0x31, 0xb6, 0x19, 0xd5, 0xcd, 0x13, 0x7e, 0x2e,
+    0xd8, 0x1f, 0xe4, 0x82, 0x70, 0x68, 0x58, 0x3c, 0x0c, 0x19, 0x50, 0x87,
+    0xea, 0x42, 0x8a, 0xc1, 0x97, 0x60, 0x5b, 0x50, 0x3d, 0x3c, 0xe1, 0xfb,
+    0x82, 0xfd, 0x8f, 0x5c, 0x90, 0x0f, 0xcd, 0x8b, 0xe7, 0x21, 0x33, 0xea,
+    0x5c, 0x5d, 0x4e, 0x31, 0xfb, 0x92, 0x6d, 0xcb, 0xaa, 0xe7, 0x27, 0xe4,
+    0x0b, 0xf6, 0x27, 0xb9, 0x00, 0x0f, 0xc5, 0xc5, 0x71, 0x48, 0x44, 0x8d,
+    0xd5, 0x61, 0x8a, 0xe8, 0x0b, 0xda, 0x86, 0xaa, 0xe3, 0x13, 0xbe, 0x2e,
+    0xd8, 0x89, 0x5c, 0x30, 0x0f, 0x9d, 0x8b, 0xcf, 0x21, 0x27, 0xea, 0x59,
+    0xdd, 0x4c, 0x71, 0xfa, 0x32, 0x6d, 0x9b, 0xaa, 0xcf, 0x27, 0xb8, 0xeb,
+    0x0f, 0x69, 0x25, 0xb9, 0x81, 0x25, 0x4d, 0x68, 0xb9, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+};
+
 const bmp_24_2x2 = [_]u8{
     'B',  'M',  70,   0,    0,    0,    0,    0,    0,    0,    54,   0,    0,    0,
     40,   0,    0,    0,    2,    0,    0,    0,    2,    0,    0,    0,    1,    0,
@@ -397,83 +429,31 @@ test "clip preprocessing resizes short edge before center crop" {
     try std.testing.expectApproxEqAbs(@as(f32, 40.0 / 255.0), out[3], 1e-6);
 }
 
-test "clip preprocessing contract matches non-square model fixture" {
+test "clip preprocessing encoded production path matches full tensor contract" {
     const alloc = std.testing.allocator;
-    const width: usize = 320;
-    const height: usize = 128;
     const target_size: usize = 224;
-    const plane_size = target_size * target_size;
-
-    const rgb = try alloc.alloc(u8, width * height * 3);
-    defer alloc.free(rgb);
-    for (0..height) |y| {
-        for (0..width) |x| {
-            const offset = (y * width + x) * 3;
-            if (x < 48) {
-                rgb[offset..][0..3].* = .{ 240, @intCast(y), 12 };
-            } else if (x >= 272) {
-                rgb[offset..][0..3].* = .{ 20, 240, @intCast(255 - y) };
-            } else {
-                const center_x = x - 48;
-                rgb[offset..][0..3].* = .{
-                    @intCast(center_x),
-                    @intCast((y * 2) % 256),
-                    @intCast(255 - center_x),
-                };
-            }
-        }
-    }
-
-    const output = try alloc.alloc(f32, 3 * plane_size);
-    defer alloc.free(output);
-    preprocessDecodedClip(
-        .{
-            .data = rgb,
-            .width = width,
-            .height = height,
-            .channels = 3,
-        },
-        output,
+    const output = try preprocessClipBatch(
+        alloc,
+        &.{&clip_contract_png_16x8},
         target_size,
         IMAGENET_MEAN,
         IMAGENET_STD,
     );
+    defer alloc.free(output);
 
-    // Whole-plane moments make this a contract over every output pixel, while
-    // the samples identify crop position and CHW channel ordering explicitly.
-    const expected_mean = [_]f64{
-        -0.16140965650510578,
-        0.1602639865346386,
-        0.5573124393451916,
-    };
-    const expected_square_mean = [_]f64{
-        0.3170190079155575,
-        1.2555142664438874,
-        0.586676112115291,
-    };
-    for (0..3) |channel| {
-        var sum: f64 = 0;
-        var square_sum: f64 = 0;
-        for (output[channel * plane_size ..][0..plane_size]) |value| {
-            const widened: f64 = value;
-            sum += widened;
-            square_sum += widened * widened;
-        }
-        try std.testing.expectApproxEqAbs(expected_mean[channel], sum / plane_size, 1e-6);
-        try std.testing.expectApproxEqAbs(expected_square_mean[channel], square_sum / plane_size, 1e-6);
-    }
+    try std.testing.expectEqual(@as(usize, 3 * target_size * target_size), output.len);
+    try std.testing.expectEqual(@as(u64, 13_952_212_876_790_254_949), clipTensorDigest(output));
+}
 
-    const sample_indices = [_]usize{ 0, target_size / 2, target_size - 1, plane_size / 2, plane_size - 1 };
-    const expected_samples = [_][5]f32{
-        .{ -1.0915378, -0.15723877, 0.76871884, -1.0915378, 0.76871884 },
-        .{ -1.7520971, -1.7520971, -1.7520971, 0.16889732, 2.059876 },
-        .{ 1.4633337, 0.5532498, -0.3487091, 1.4633337, -0.3487091 },
-    };
-    for (0..3) |channel| {
-        for (sample_indices, expected_samples[channel]) |index, expected| {
-            try std.testing.expectApproxEqAbs(expected, output[channel * plane_size + index], 1e-6);
-        }
+fn clipTensorDigest(values: []const f32) u64 {
+    var hash: u64 = 14_695_981_039_346_656_037;
+    for (values) |value| {
+        const quantized: i32 = @intFromFloat(@round(value * 10_000.0));
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(i32, &bytes, quantized, .little);
+        for (bytes) |byte| hash = (hash ^ byte) *% 1_099_511_628_211;
     }
+    return hash;
 }
 
 test "clip preprocessing uses resize source coordinates" {

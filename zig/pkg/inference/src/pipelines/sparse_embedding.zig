@@ -71,8 +71,8 @@ pub const SparseEmbeddingPipeline = struct {
     /// Caller owns the returned SparseVectors and must call deinit on each.
     pub fn embed(self: *SparseEmbeddingPipeline, texts: []const []const u8) ![]SparseVector {
         if (texts.len == 0) return try self.allocator.alloc(SparseVector, 0);
-        if (embedding_mod.textSessionRequiresSerialBatch(self.session, texts.len)) {
-            return self.embedSerial(texts);
+        if (embedding_mod.textSessionBatchPlan(self.session, texts.len)) |plan| {
+            return self.embedWithBatchPlan(texts, plan);
         }
         const alloc = self.allocator;
         const max_len = self.config.max_length;
@@ -173,7 +173,11 @@ pub const SparseEmbeddingPipeline = struct {
         };
     }
 
-    fn embedSerial(self: *SparseEmbeddingPipeline, texts: []const []const u8) anyerror![]SparseVector {
+    fn embedWithBatchPlan(
+        self: *SparseEmbeddingPipeline,
+        texts: []const []const u8,
+        plan: embedding_mod.TextSessionBatchPlan,
+    ) anyerror![]SparseVector {
         const alloc = self.allocator;
         const results = try alloc.alloc(SparseVector, texts.len);
         var initialized: usize = 0;
@@ -182,16 +186,38 @@ pub const SparseEmbeddingPipeline = struct {
             alloc.free(results);
         }
 
-        for (texts, 0..) |_, index| {
-            const one = try self.embed(texts[index .. index + 1]);
-            if (one.len != 1) {
-                for (one) |*result| result.deinit(alloc);
-                alloc.free(one);
+        const padded = if (plan.pad_final_batch and texts.len % plan.batch_size != 0)
+            try alloc.alloc([]const u8, plan.batch_size)
+        else
+            null;
+        defer if (padded) |items| alloc.free(items);
+
+        var offset: usize = 0;
+        while (offset < texts.len) {
+            const real_count = @min(plan.batch_size, texts.len - offset);
+            const batch_texts: []const []const u8 = if (real_count == plan.batch_size)
+                texts[offset .. offset + real_count]
+            else blk: {
+                const items = padded orelse return error.InvalidInputShape;
+                @memcpy(items[0..real_count], texts[offset .. offset + real_count]);
+                @memset(items[real_count..], texts[offset + real_count - 1]);
+                break :blk items;
+            };
+
+            const batch_results = try self.embed(batch_texts);
+            if (batch_results.len != plan.batch_size) {
+                for (batch_results) |*result| result.deinit(alloc);
+                alloc.free(batch_results);
                 return error.UnexpectedOutputShape;
             }
-            results[index] = one[0];
-            alloc.free(one);
-            initialized += 1;
+
+            for (batch_results[0..real_count], 0..) |result, index| {
+                results[offset + index] = result;
+            }
+            for (batch_results[real_count..]) |*result| result.deinit(alloc);
+            alloc.free(batch_results);
+            initialized += real_count;
+            offset += real_count;
         }
         return results;
     }
@@ -632,9 +658,9 @@ test "sparse ranking favors overlapping activated dimensions" {
     try std.testing.expect(unrelated_score == 0.0);
 }
 
-test "sparse embedding executes static-batch sessions serially" {
+test "sparse embedding chunks and pads fixed-batch sessions" {
     const alloc = std.testing.allocator;
-    var session_state = FakeStaticBatchSparseSession{};
+    var session_state = FakeStaticBatchSparseSession(2){};
     var tokenizer_state = FakeSparseTokenizer{};
     var pipeline = SparseEmbeddingPipeline{
         .allocator = alloc,
@@ -646,8 +672,8 @@ test "sparse embedding executes static-batch sessions serially" {
     const vectors = try pipeline.embed(&.{ "a", "b", "c" });
     defer freeSparseVectorSlice(alloc, vectors);
 
-    try std.testing.expectEqual(@as(usize, 3), session_state.run_count);
-    try std.testing.expectEqual(@as(usize, 1), session_state.max_batch_seen);
+    try std.testing.expectEqual(@as(usize, 2), session_state.run_count);
+    try std.testing.expectEqual(@as(usize, 2), session_state.max_batch_seen);
     try std.testing.expectEqual(@as(usize, 3), vectors.len);
     for (vectors, [_]u32{ 1, 2, 3 }) |vector, expected_index| {
         try std.testing.expectEqualSlices(u32, &.{expected_index}, vector.indices);
@@ -656,61 +682,76 @@ test "sparse embedding executes static-batch sessions serially" {
     }
 }
 
-const FakeStaticBatchSparseSession = struct {
-    run_count: usize = 0,
-    max_batch_seen: usize = 0,
+fn FakeStaticBatchSparseSession(comptime fixed_batch: usize) type {
+    if (fixed_batch == 0) @compileError("fixed batch must be positive");
+    return struct {
+        const Self = @This();
 
-    fn session(self: *FakeStaticBatchSparseSession) backends.Session {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .run = run,
-                .inputInfo = inputInfo,
-                .outputInfo = outputInfo,
-                .backend = backend,
-                .close = close,
-            },
-        };
-    }
+        run_count: usize = 0,
+        max_batch_seen: usize = 0,
 
-    fn run(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
-        const self: *FakeStaticBatchSparseSession = @ptrCast(@alignCast(raw));
-        if (inputs.len != 2) return error.TestUnexpectedResult;
-        const input_ids = &inputs[0];
-        if (input_ids.shape.len != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] != 4) {
-            return error.TestUnexpectedResult;
+        fn session(self: *Self) backends.Session {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .run = run,
+                    .inputInfo = inputInfo,
+                    .outputInfo = outputInfo,
+                    .backend = backend,
+                    .close = close,
+                },
+            };
         }
-        self.run_count += 1;
-        self.max_batch_seen = @max(self.max_batch_seen, @as(usize, @intCast(input_ids.shape[0])));
 
-        const token_id = input_ids.asInt64()[0];
-        if (token_id < 0) return error.TestUnexpectedResult;
-        var logits = [_]f32{ 0, 0, 0, 0 };
-        logits[@intCast(@mod(token_id, logits.len))] = @floatFromInt(token_id);
+        fn run(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            if (inputs.len != 2) return error.TestUnexpectedResult;
+            const input_ids = &inputs[0];
+            if (input_ids.shape.len != 2 or
+                input_ids.shape[0] != fixed_batch or
+                input_ids.shape[1] != 4)
+            {
+                return error.TestUnexpectedResult;
+            }
+            self.run_count += 1;
+            self.max_batch_seen = @max(self.max_batch_seen, @as(usize, @intCast(input_ids.shape[0])));
 
-        const outputs = try allocator.alloc(Tensor, 1);
-        errdefer allocator.free(outputs);
-        outputs[0] = try Tensor.initFloat32(allocator, "logits", &.{ 1, logits.len }, &logits);
-        return outputs;
-    }
+            var logits: [fixed_batch * 4]f32 = @splat(0);
+            for (0..fixed_batch) |row| {
+                const token_id = input_ids.asInt64()[row * 4];
+                if (token_id < 0) return error.TestUnexpectedResult;
+                logits[row * 4 + @as(usize, @intCast(@mod(token_id, 4)))] = @floatFromInt(token_id);
+            }
 
-    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
-        return &.{
-            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 4 } },
-            .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ 1, 4 } },
-        };
-    }
+            const outputs = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(outputs);
+            outputs[0] = try Tensor.initFloat32(
+                allocator,
+                "logits",
+                &.{ fixed_batch, 4 },
+                &logits,
+            );
+            return outputs;
+        }
 
-    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
-        return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 4 } }};
-    }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ fixed_batch, 4 } },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ fixed_batch, 4 } },
+            };
+        }
 
-    fn backend(_: *anyopaque) backends.BackendType {
-        return .native;
-    }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ fixed_batch, 4 } }};
+        }
 
-    fn close(_: *anyopaque) void {}
-};
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+
+        fn close(_: *anyopaque) void {}
+    };
+}
 
 const FakeSparseTokenizer = struct {
     fn tokenizer(self: *FakeSparseTokenizer) Tokenizer {

@@ -215,8 +215,8 @@ pub const EmbeddingPipeline = struct {
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
         const text_session = self.textEncodingSession();
-        if (textSessionRequiresSerialBatch(text_session, texts.len)) {
-            return try self.embedSerial(texts);
+        if (textSessionBatchPlan(text_session, texts.len)) |plan| {
+            return try self.embedWithBatchPlan(texts, plan);
         }
 
         const alloc = self.allocator;
@@ -361,7 +361,11 @@ pub const EmbeddingPipeline = struct {
         return self.session;
     }
 
-    fn embedSerial(self: *EmbeddingPipeline, texts: []const []const u8) anyerror![][]f32 {
+    fn embedWithBatchPlan(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        plan: TextSessionBatchPlan,
+    ) anyerror![][]f32 {
         const embeddings = try self.allocator.alloc([]f32, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -369,15 +373,37 @@ pub const EmbeddingPipeline = struct {
             self.allocator.free(embeddings);
         }
 
-        for (texts, 0..) |_, idx| {
-            const single = try self.embed(texts[idx .. idx + 1]);
-            if (single.len != 1) {
-                freeEmbeddingSlices(self.allocator, single);
+        const padded = if (plan.pad_final_batch and texts.len % plan.batch_size != 0)
+            try self.allocator.alloc([]const u8, plan.batch_size)
+        else
+            null;
+        defer if (padded) |items| self.allocator.free(items);
+
+        var offset: usize = 0;
+        while (offset < texts.len) {
+            const real_count = @min(plan.batch_size, texts.len - offset);
+            const batch_texts: []const []const u8 = if (real_count == plan.batch_size)
+                texts[offset .. offset + real_count]
+            else blk: {
+                const items = padded orelse return error.InvalidInputShape;
+                @memcpy(items[0..real_count], texts[offset .. offset + real_count]);
+                @memset(items[real_count..], texts[offset + real_count - 1]);
+                break :blk items;
+            };
+
+            const batch_embeddings = try self.embed(batch_texts);
+            if (batch_embeddings.len != plan.batch_size) {
+                freeEmbeddingSlices(self.allocator, batch_embeddings);
                 return error.UnexpectedOutputShape;
             }
-            embeddings[idx] = single[0];
-            self.allocator.free(single);
-            initialized += 1;
+
+            for (batch_embeddings[0..real_count], 0..) |embedding, index| {
+                embeddings[offset + index] = embedding;
+            }
+            for (batch_embeddings[real_count..]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(batch_embeddings);
+            initialized += real_count;
+            offset += real_count;
         }
 
         return embeddings;
@@ -1743,16 +1769,33 @@ test "embedding text length follows fixed input_ids sequence dimension" {
     try std.testing.expectEqual(@as(usize, 77), textSequenceLengthForInputs(&input_info, 512));
 }
 
-test "embedding text serializes batches that exceed declared input_ids batch" {
+test "embedding text plans backend and fixed-shape batches" {
     const dynamic = fakeTextSession(.native, &.{ -1, 77 });
-    try std.testing.expect(!textSessionRequiresSerialBatch(dynamic, 2));
+    try std.testing.expect(textSessionBatchPlan(dynamic, 2) == null);
 
     const fixed_one = fakeTextSession(.native, &.{ 1, 77 });
-    try std.testing.expect(!textSessionRequiresSerialBatch(fixed_one, 1));
-    try std.testing.expect(textSessionRequiresSerialBatch(fixed_one, 2));
+    try std.testing.expect(textSessionBatchPlan(fixed_one, 1) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_one, 2).?,
+    );
+
+    const fixed_two = fakeTextSession(.native, &.{ 2, 77 });
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 2, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_two, 1).?,
+    );
+    try std.testing.expect(textSessionBatchPlan(fixed_two, 2) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 2, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_two, 3).?,
+    );
 
     const external_onnx = fakeTextSession(.onnx, &.{ -1, 77 });
-    try std.testing.expect(textSessionRequiresSerialBatch(external_onnx, 2));
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
+        textSessionBatchPlan(external_onnx, 2).?,
+    );
 }
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
@@ -1762,17 +1805,35 @@ fn sessionHasInput(session: backends.Session, name: []const u8) bool {
     return false;
 }
 
-pub fn textSessionRequiresSerialBatch(session: backends.Session, requested_batch: usize) bool {
-    if (requested_batch <= 1) return false;
-    if (session.backend() == .onnx) return true;
-    if (backends.imported_onnx_session.sharedBackendContext(session) != null) return true;
+pub const TextSessionBatchPlan = struct {
+    batch_size: usize,
+    pad_final_batch: bool,
+};
+
+/// Return an execution plan only when the requested batch cannot be sent to
+/// the session directly. Fixed-shape models are processed at their declared
+/// batch size, padding only the final partial chunk. External ONNX sessions
+/// with dynamic shapes retain the conservative single-row execution path.
+pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?TextSessionBatchPlan {
+    if (requested_batch == 0) return null;
     for (session.inputInfo()) |info| {
         if (!std.mem.eql(u8, info.name, "input_ids")) continue;
-        if (info.shape.len == 0) return false;
+        if (info.shape.len == 0) break;
         const declared_batch = info.shape[0];
-        return declared_batch > 0 and @as(usize, @intCast(declared_batch)) < requested_batch;
+        if (declared_batch > 0) {
+            const batch_size: usize = @intCast(declared_batch);
+            if (batch_size == requested_batch) return null;
+            return .{ .batch_size = batch_size, .pad_final_batch = true };
+        }
+        break;
     }
-    return false;
+    if (requested_batch <= 1) return null;
+    if (session.backend() == .onnx or
+        backends.imported_onnx_session.sharedBackendContext(session) != null)
+    {
+        return .{ .batch_size = 1, .pad_final_batch = false };
+    }
+    return null;
 }
 
 fn shouldFallbackBatchedImageError(err: anyerror) bool {
