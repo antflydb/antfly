@@ -711,7 +711,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
-      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseFast
+      # Keep production optimization while preserving runtime-safety checks and
+      # std.debug.assert invariants exercised by the full E2E suite.
+      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
     steps:
       - uses: actions/checkout@v6
         with:

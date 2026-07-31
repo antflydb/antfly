@@ -29,7 +29,8 @@ const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const embedding_mod = @import("embedding.zig");
-const Tokenizer = @import("inference_tokenizer").Tokenizer;
+const tokenizer_mod = @import("inference_tokenizer");
+const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 
 pub const SparseVector = struct {
@@ -630,6 +631,149 @@ test "sparse ranking favors overlapping activated dimensions" {
     try std.testing.expect(related_score > unrelated_score);
     try std.testing.expect(unrelated_score == 0.0);
 }
+
+test "sparse embedding executes static-batch sessions serially" {
+    const alloc = std.testing.allocator;
+    var session_state = FakeStaticBatchSparseSession{};
+    var tokenizer_state = FakeSparseTokenizer{};
+    var pipeline = SparseEmbeddingPipeline{
+        .allocator = alloc,
+        .session = session_state.session(),
+        .tok = tokenizer_state.tokenizer(),
+        .config = .{ .max_length = 4, .top_k = 4 },
+    };
+
+    const vectors = try pipeline.embed(&.{ "a", "b", "c" });
+    defer freeSparseVectorSlice(alloc, vectors);
+
+    try std.testing.expectEqual(@as(usize, 3), session_state.run_count);
+    try std.testing.expectEqual(@as(usize, 1), session_state.max_batch_seen);
+    try std.testing.expectEqual(@as(usize, 3), vectors.len);
+    for (vectors, [_]u32{ 1, 2, 3 }) |vector, expected_index| {
+        try std.testing.expectEqualSlices(u32, &.{expected_index}, vector.indices);
+        try std.testing.expectEqual(@as(usize, 1), vector.values.len);
+        try std.testing.expect(vector.values[0] > 0);
+    }
+}
+
+const FakeStaticBatchSparseSession = struct {
+    run_count: usize = 0,
+    max_batch_seen: usize = 0,
+
+    fn session(self: *FakeStaticBatchSparseSession) backends.Session {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .run = run,
+                .inputInfo = inputInfo,
+                .outputInfo = outputInfo,
+                .backend = backend,
+                .close = close,
+            },
+        };
+    }
+
+    fn run(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
+        const self: *FakeStaticBatchSparseSession = @ptrCast(@alignCast(raw));
+        if (inputs.len != 2) return error.TestUnexpectedResult;
+        const input_ids = &inputs[0];
+        if (input_ids.shape.len != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] != 4) {
+            return error.TestUnexpectedResult;
+        }
+        self.run_count += 1;
+        self.max_batch_seen = @max(self.max_batch_seen, @as(usize, @intCast(input_ids.shape[0])));
+
+        const token_id = input_ids.asInt64()[0];
+        if (token_id < 0) return error.TestUnexpectedResult;
+        var logits = [_]f32{ 0, 0, 0, 0 };
+        logits[@intCast(@mod(token_id, logits.len))] = @floatFromInt(token_id);
+
+        const outputs = try allocator.alloc(Tensor, 1);
+        errdefer allocator.free(outputs);
+        outputs[0] = try Tensor.initFloat32(allocator, "logits", &.{ 1, logits.len }, &logits);
+        return outputs;
+    }
+
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 4 } },
+            .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ 1, 4 } },
+        };
+    }
+
+    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 4 } }};
+    }
+
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
+const FakeSparseTokenizer = struct {
+    fn tokenizer(self: *FakeSparseTokenizer) Tokenizer {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .encode = encode,
+                .encodeInto = encodeInto,
+                .encodeForModel = encodeForModel,
+                .encodeGeneration = encodeGeneration,
+                .decode = decode,
+                .specialTokens = specialTokens,
+                .vocabSize = vocabSize,
+                .deinit = deinit,
+            },
+        };
+    }
+
+    fn encode(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+        if (text.len == 0) return error.InvalidInput;
+        const ids = try allocator.alloc(i32, 1);
+        ids[0] = text[0];
+        return ids;
+    }
+
+    fn encodeInto(raw: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void {
+        const ids = try encode(raw, allocator, text);
+        defer allocator.free(ids);
+        try out.appendSlice(allocator, ids);
+    }
+
+    fn encodeForModel(raw: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!tokenizer_mod.EncodeResult {
+        if (max_length == 0) return error.InvalidInput;
+        const raw_ids = try encode(raw, allocator, text);
+        defer allocator.free(raw_ids);
+        const ids = try allocator.alloc(i32, max_length);
+        errdefer allocator.free(ids);
+        const mask = try allocator.alloc(i32, max_length);
+        ids[0] = raw_ids[0];
+        mask[0] = 1;
+        @memset(ids[1..], 0);
+        @memset(mask[1..], 0);
+        return .{ .ids = ids, .attention_mask = mask, .allocator = allocator };
+    }
+
+    fn encodeGeneration(raw: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, _: bool) anyerror!tokenizer_mod.EncodeResult {
+        return encodeForModel(raw, allocator, text, max_length);
+    }
+
+    fn decode(_: *anyopaque, allocator: std.mem.Allocator, _: []const i32) anyerror![]u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn specialTokens(_: *anyopaque) tokenizer_mod.SpecialTokens {
+        return .{};
+    }
+
+    fn vocabSize(_: *anyopaque) usize {
+        return 256;
+    }
+
+    fn deinit(_: *anyopaque) void {}
+};
 
 fn freeSparseVectorSlice(allocator: std.mem.Allocator, vectors: []SparseVector) void {
     for (vectors) |*v| v.deinit(allocator);

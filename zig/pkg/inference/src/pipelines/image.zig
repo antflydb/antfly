@@ -397,6 +397,85 @@ test "clip preprocessing resizes short edge before center crop" {
     try std.testing.expectApproxEqAbs(@as(f32, 40.0 / 255.0), out[3], 1e-6);
 }
 
+test "clip preprocessing contract matches non-square model fixture" {
+    const alloc = std.testing.allocator;
+    const width: usize = 320;
+    const height: usize = 128;
+    const target_size: usize = 224;
+    const plane_size = target_size * target_size;
+
+    const rgb = try alloc.alloc(u8, width * height * 3);
+    defer alloc.free(rgb);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const offset = (y * width + x) * 3;
+            if (x < 48) {
+                rgb[offset..][0..3].* = .{ 240, @intCast(y), 12 };
+            } else if (x >= 272) {
+                rgb[offset..][0..3].* = .{ 20, 240, @intCast(255 - y) };
+            } else {
+                const center_x = x - 48;
+                rgb[offset..][0..3].* = .{
+                    @intCast(center_x),
+                    @intCast((y * 2) % 256),
+                    @intCast(255 - center_x),
+                };
+            }
+        }
+    }
+
+    const output = try alloc.alloc(f32, 3 * plane_size);
+    defer alloc.free(output);
+    preprocessDecodedClip(
+        .{
+            .data = rgb,
+            .width = width,
+            .height = height,
+            .channels = 3,
+        },
+        output,
+        target_size,
+        IMAGENET_MEAN,
+        IMAGENET_STD,
+    );
+
+    // Whole-plane moments make this a contract over every output pixel, while
+    // the samples identify crop position and CHW channel ordering explicitly.
+    const expected_mean = [_]f64{
+        -0.16140965650510578,
+        0.1602639865346386,
+        0.5573124393451916,
+    };
+    const expected_square_mean = [_]f64{
+        0.3170190079155575,
+        1.2555142664438874,
+        0.586676112115291,
+    };
+    for (0..3) |channel| {
+        var sum: f64 = 0;
+        var square_sum: f64 = 0;
+        for (output[channel * plane_size ..][0..plane_size]) |value| {
+            const widened: f64 = value;
+            sum += widened;
+            square_sum += widened * widened;
+        }
+        try std.testing.expectApproxEqAbs(expected_mean[channel], sum / plane_size, 1e-6);
+        try std.testing.expectApproxEqAbs(expected_square_mean[channel], square_sum / plane_size, 1e-6);
+    }
+
+    const sample_indices = [_]usize{ 0, target_size / 2, target_size - 1, plane_size / 2, plane_size - 1 };
+    const expected_samples = [_][5]f32{
+        .{ -1.0915378, -0.15723877, 0.76871884, -1.0915378, 0.76871884 },
+        .{ -1.7520971, -1.7520971, -1.7520971, 0.16889732, 2.059876 },
+        .{ 1.4633337, 0.5532498, -0.3487091, 1.4633337, -0.3487091 },
+    };
+    for (0..3) |channel| {
+        for (sample_indices, expected_samples[channel]) |index, expected| {
+            try std.testing.expectApproxEqAbs(expected, output[channel * plane_size + index], 1e-6);
+        }
+    }
+}
+
 test "clip preprocessing uses resize source coordinates" {
     var rgb = [_]u8{
         0,   0, 0,
