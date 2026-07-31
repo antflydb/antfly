@@ -53,6 +53,20 @@ pub fn select(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             // Runtime-only controls do not participate in compile reachability.
+        } else if (std.mem.eql(u8, arg, "--dataset") or
+            std.mem.eql(u8, arg, "--dataset-dir"))
+        {
+            // The recall harness owns these arguments. They still appear in
+            // b.args while the build graph configures unrelated test steps, so
+            // consume their values without turning them into test filters.
+            i += 1;
+            if (i >= args.len or args[i].len == 0)
+                @panic("missing recall harness argument value");
+        } else if (std.mem.startsWith(u8, arg, "--dataset=") or
+            std.mem.startsWith(u8, arg, "--dataset-dir="))
+        {
+            if (std.mem.endsWith(u8, arg, "="))
+                @panic("missing recall harness argument value");
         } else if (std.mem.startsWith(u8, arg, "--")) {
             @panic("unsupported test runner argument");
         } else {
@@ -101,6 +115,17 @@ pub fn addRuntimeControls(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             run.addArg(arg);
+        } else if (std.mem.eql(u8, arg, "--dataset") or
+            std.mem.eql(u8, arg, "--dataset-dir"))
+        {
+            i += 1;
+            if (i >= args.len or args[i].len == 0)
+                @panic("missing recall harness argument value");
+        } else if (std.mem.startsWith(u8, arg, "--dataset=") or
+            std.mem.startsWith(u8, arg, "--dataset-dir="))
+        {
+            if (std.mem.endsWith(u8, arg, "="))
+                @panic("missing recall harness argument value");
         } else if (std.mem.startsWith(u8, arg, "--")) {
             @panic("unsupported test runner argument");
         }
@@ -141,6 +166,20 @@ test "select preserves defaults and concise bare filters" {
     try std.testing.expectEqual(@as(usize, 2), filters.len);
     try std.testing.expectEqualStrings("metadata service", filters[0]);
     try std.testing.expectEqualStrings("table manager", filters[1]);
+}
+
+test "select ignores recall harness arguments" {
+    const defaults = [_][]const u8{"default"};
+    const selected = select(
+        std.testing.allocator,
+        &.{
+            "--dataset-dir",
+            "testdata/vectorsets",
+            "--dataset=images-512d-10k.pbvec",
+        },
+        &defaults,
+    );
+    try std.testing.expectEqualStrings("default", selected[0]);
 }
 
 test "empty skip filters are rejected before compiling a zero-test selection" {

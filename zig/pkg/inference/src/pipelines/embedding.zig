@@ -1762,7 +1762,7 @@ fn sessionHasInput(session: backends.Session, name: []const u8) bool {
     return false;
 }
 
-fn textSessionRequiresSerialBatch(session: backends.Session, requested_batch: usize) bool {
+pub fn textSessionRequiresSerialBatch(session: backends.Session, requested_batch: usize) bool {
     if (requested_batch <= 1) return false;
     if (session.backend() == .onnx) return true;
     if (backends.imported_onnx_session.sharedBackendContext(session) != null) return true;

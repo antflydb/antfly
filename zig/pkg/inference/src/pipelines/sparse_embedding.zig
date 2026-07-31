@@ -28,6 +28,7 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const embedding_mod = @import("embedding.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Tensor = backends.Tensor;
 
@@ -69,6 +70,9 @@ pub const SparseEmbeddingPipeline = struct {
     /// Caller owns the returned SparseVectors and must call deinit on each.
     pub fn embed(self: *SparseEmbeddingPipeline, texts: []const []const u8) ![]SparseVector {
         if (texts.len == 0) return try self.allocator.alloc(SparseVector, 0);
+        if (embedding_mod.textSessionRequiresSerialBatch(self.session, texts.len)) {
+            return self.embedSerial(texts);
+        }
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = texts.len;
@@ -166,6 +170,29 @@ pub const SparseEmbeddingPipeline = struct {
             }),
             else => error.UnexpectedOutputShape,
         };
+    }
+
+    fn embedSerial(self: *SparseEmbeddingPipeline, texts: []const []const u8) anyerror![]SparseVector {
+        const alloc = self.allocator;
+        const results = try alloc.alloc(SparseVector, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(alloc);
+            alloc.free(results);
+        }
+
+        for (texts, 0..) |_, index| {
+            const one = try self.embed(texts[index .. index + 1]);
+            if (one.len != 1) {
+                for (one) |*result| result.deinit(alloc);
+                alloc.free(one);
+                return error.UnexpectedOutputShape;
+            }
+            results[index] = one[0];
+            alloc.free(one);
+            initialized += 1;
+        }
+        return results;
     }
 
     /// Max-pool over sequence dimension [batch, seq, vocab] → apply SPLADE activation → sparsify
