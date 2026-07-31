@@ -41865,11 +41865,23 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         .sync_level = .full_index,
     });
 
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
+    };
+    var vector_load_counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&vector_load_counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
     const filters = [_][]const u8{
         "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
         "{\"term\":{\"bucket\":\"selected\"}}",
     };
-    for (filters) |filter_query_json| {
+    for (filters, 0..) |filter_query_json, filter_index| {
         var profiled = try db.searchDenseProfiled(alloc, .{
             .index_name = "dv_v1",
             .primary_text_index_name = "ft_v1",
@@ -41882,14 +41894,17 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         try std.testing.expectEqual(@as(u32, eligible_count), profiled.result.total_hits);
         try std.testing.expectEqual(eligible_count, profiled.result.hits.len);
         try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.native_filter_candidate_count);
+        try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.hbc_exact_vectors_scored);
         try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
         try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
+        try std.testing.expectEqual(eligible_count * (filter_index + 1), vector_load_counter.count);
         for (profiled.result.hits, 0..) |hit, rank| {
             const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
             defer alloc.free(expected);
             try std.testing.expectEqualStrings(expected, hit.id);
         }
     }
+    try std.testing.expectEqual(eligible_count * filters.len, vector_load_counter.count);
 }
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
@@ -70762,8 +70777,13 @@ fn expectFilteredFullTextDeleteCliffProbe(
     const expected_page_len: usize = @intCast(@min(expected_total, 10));
     const expected_page_total: u32 = @intCast(expected_page_len);
     try std.testing.expectEqual(expected_page_len, bool_prefix.hits.len);
-    try std.testing.expect(bool_prefix.total_hits >= expected_page_total);
-    try std.testing.expect(bool_prefix.total_hits <= expected_total);
+    switch (bool_prefix.total_hits_relation) {
+        .exact => try std.testing.expectEqual(expected_total, bool_prefix.total_hits),
+        .gte => {
+            try std.testing.expect(bool_prefix.total_hits >= expected_page_total);
+            try std.testing.expect(bool_prefix.total_hits <= expected_total);
+        },
+    }
 
     var match = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
@@ -70773,8 +70793,13 @@ fn expectFilteredFullTextDeleteCliffProbe(
     });
     defer match.deinit();
     try std.testing.expectEqual(expected_page_len, match.hits.len);
-    try std.testing.expect(match.total_hits >= expected_page_total);
-    try std.testing.expect(match.total_hits <= expected_total);
+    switch (match.total_hits_relation) {
+        .exact => try std.testing.expectEqual(expected_total, match.total_hits),
+        .gte => {
+            try std.testing.expect(match.total_hits >= expected_page_total);
+            try std.testing.expect(match.total_hits <= expected_total);
+        },
+    }
 
     if (forbidden_id) |deleted_id| {
         for (bool_prefix.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
@@ -70817,7 +70842,10 @@ test "db one real delete keeps filtered full text on complement path across rest
         \\  }
         \\}
     ;
-    const initial_count: usize = 128;
+    // The reported release cliff starts between 5k and 10k documents. Keep
+    // this regression above the knee so a delete cannot silently switch large
+    // segments back to a full reconciliation/full-visibility scan.
+    const initial_count: usize = 10_000;
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -70885,8 +70913,8 @@ test "db one real delete keeps filtered full text on complement path across rest
         try std.testing.expect(visibility_after_repeat.cache_hits_total > visibility_after_delete.cache_hits_total);
     }
 
-    // The persisted deletion state reconstructs both the complement and live
-    // BM25 aggregates on reopen.
+    // The persisted deletion state reconstructs the complement on reopen;
+    // immutable segment BM25 statistics remain unchanged until merge.
     {
         var reopened = try DB.open(alloc, std.mem.span(path), .{});
         defer reopened.close();

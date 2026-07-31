@@ -6678,18 +6678,79 @@ pub const IndexManager = struct {
         var txn = try entry.index.beginReadTxn();
         defer txn.abort();
 
+        // Candidate IDs are sorted, so resolve metadata and vectors with the
+        // backend's ordered batch/cursor APIs. The old loop performed one
+        // metadata probe and could open one primary-store transaction per
+        // candidate, which dominated highly selective filtered searches.
+        const candidate_metadata = try self.alloc.alloc(?[]const u8, unique_candidate_ids.len);
+        defer self.alloc.free(candidate_metadata);
+        @memset(candidate_metadata, null);
+        try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+
+        const fallback_doc_keys = try self.alloc.alloc(?[]u8, unique_candidate_ids.len);
+        defer {
+            for (fallback_doc_keys) |maybe_doc_key| {
+                if (maybe_doc_key) |doc_key| self.alloc.free(doc_key);
+            }
+            self.alloc.free(fallback_doc_keys);
+        }
+        @memset(fallback_doc_keys, null);
+
+        var needs_primary_metadata = false;
+        for (candidate_metadata) |maybe_metadata| {
+            if (maybe_metadata == null) {
+                needs_primary_metadata = true;
+                break;
+            }
+        }
+        if (needs_primary_metadata) {
+            if (self.primary_store) |store| {
+                var legacy_vector_ordinals = std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal).empty;
+                defer legacy_vector_ordinals.deinit(self.alloc);
+                var needs_legacy_reverse = false;
+                for (unique_candidate_ids, candidate_metadata) |vector_id, maybe_metadata| {
+                    if (maybe_metadata == null and !entry.vector_ordinals.contains(vector_id)) {
+                        needs_legacy_reverse = true;
+                        break;
+                    }
+                }
+                if (needs_legacy_reverse) {
+                    try legacy_vector_ordinals.ensureTotalCapacity(self.alloc, entry.ordinal_vector_ids.count());
+                    var reverse_it = entry.ordinal_vector_ids.iterator();
+                    while (reverse_it.next()) |item| {
+                        legacy_vector_ordinals.putAssumeCapacity(item.value_ptr.*, item.key_ptr.*);
+                    }
+                }
+
+                var identity_txn = try store.beginProbeTxn();
+                defer identity_txn.abort();
+                for (unique_candidate_ids, candidate_metadata, 0..) |vector_id, maybe_metadata, i| {
+                    if (maybe_metadata != null) continue;
+                    const ordinal = entry.vector_ordinals.get(vector_id) orelse legacy_vector_ordinals.get(vector_id) orelse continue;
+                    fallback_doc_keys[i] = try doc_identity.lookupDocIdTxn(self.alloc, &identity_txn, ordinal);
+                }
+            }
+        }
+
+        var vector_cursor = entry.index.openNamespacedCursor(self.alloc, &txn, .vecs) catch |err| switch (err) {
+            error.Unsupported => null,
+            else => return err,
+        };
+        defer if (vector_cursor) |*cursor| cursor.close();
+
         const query_measure = vector_mod.norm(req.query);
         const vector_scratch = try self.alloc.alloc(f32, entry.dims);
         defer self.alloc.free(vector_scratch);
-        for (unique_candidate_ids) |vector_id| {
-            var owned_metadata = try self.resolveExactDenseDocKeyAlloc(entry, &txn, vector_id);
-            defer if (owned_metadata) |metadata| self.alloc.free(metadata);
-
-            const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+        for (unique_candidate_ids, candidate_metadata, fallback_doc_keys) |vector_id, maybe_metadata, fallback_doc_key| {
+            const doc_key = maybe_metadata orelse fallback_doc_key;
+            const vector = (if (vector_cursor) |*cursor|
+                entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
+            else
+                entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
                 error.NotFound => blk: {
                     const loader_ctx = entry.vector_loader_context orelse continue;
-                    const doc_key = owned_metadata orelse continue;
-                    break :blk try loadDenseVectorForHbcIntoScratch(loader_ctx, vector_id, doc_key, vector_scratch);
+                    const resolved_doc_key = doc_key orelse continue;
+                    break :blk try loadDenseVectorForHbcIntoScratch(loader_ctx, vector_id, resolved_doc_key, vector_scratch);
                 },
                 else => return err,
             };
@@ -6704,11 +6765,14 @@ pub const IndexManager = struct {
                 if (distance >= threshold) continue;
             }
             if (req.filter_prefix.len > 0) {
-                const doc_key = owned_metadata orelse continue;
-                if (!std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                const resolved_doc_key = doc_key orelse continue;
+                if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
             }
+            const owned_metadata = if (doc_key) |resolved_doc_key|
+                try self.alloc.dupe(u8, resolved_doc_key)
+            else
+                null;
             results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
-            owned_metadata = null;
         }
         results.sort();
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
@@ -6719,30 +6783,6 @@ pub const IndexManager = struct {
             });
         }
         return results;
-    }
-
-    fn resolveExactDenseDocKeyAlloc(
-        self: *IndexManager,
-        entry: *DenseIndex,
-        hbc_txn: anytype,
-        vector_id: u64,
-    ) !?[]u8 {
-        if (try entry.index.getMetadataInTxn(hbc_txn, vector_id)) |metadata| {
-            return try self.alloc.dupe(u8, metadata);
-        }
-        const store = self.primary_store orelse return null;
-        const ordinal = entry.vector_ordinals.get(vector_id) orelse ordinal: {
-            var it = entry.ordinal_vector_ids.iterator();
-            while (it.next()) |item| {
-                if (item.value_ptr.* == vector_id) break :ordinal item.key_ptr.*;
-            }
-            return null;
-        };
-        var runtime_store = try initRuntimeStore(self.alloc, store);
-        defer runtime_store.deinit();
-        var txn = try runtime_store.store.beginRead();
-        defer txn.abort();
-        return try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal);
     }
 
     pub fn textIndexesForChunk(
@@ -9973,12 +10013,13 @@ pub const IndexManager = struct {
         for (snap.segments, 0..) |seg, i| {
             if (self.text_merge_scheduler.segmentInFlight(entry.config.name, seg.id)) continue;
             if (self.text_merge_scheduler.segmentQuarantined(entry.config.name, seg.id, now_ns)) continue;
+            const deletion_summary = seg.deletionSummary();
             try infos.append(self.alloc, .{
                 .index = i,
                 .size = seg.data.bytes().len,
                 .doc_count = seg.reader.doc_count,
-                .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-                .has_deletions = seg.shared.deleted != null,
+                .deleted_count = deletion_summary.count,
+                .has_deletions = deletion_summary.has_deletions,
             });
         }
         if (infos.items.len < 2) return null;
@@ -10033,7 +10074,7 @@ pub const IndexManager = struct {
             const source_seg = &snap.segments[seg_idx];
             source[i] = .{
                 .id = source_seg.id,
-                .deleted = if (source_seg.shared.deleted) |*deleted| try deleted.clone(self.alloc) else null,
+                .deleted = try source_seg.cloneDeleted(self.alloc),
             };
             source_initialized += 1;
             merge_indices[i] = seg_idx;
@@ -10134,11 +10175,15 @@ pub const IndexManager = struct {
         defer snap.release();
         for (task.source) |source| {
             const seg = findSegmentById(snap, source.id) orelse return false;
-            if (source.deleted) |expected| {
-                const current_deleted = seg.shared.deleted orelse return false;
-                if (!current_deleted.eql(&expected)) return false;
-            } else if (seg.shared.deleted != null) {
-                return false;
+            {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                if (source.deleted) |expected| {
+                    const current_deleted = seg.shared.deleted orelse return false;
+                    if (!current_deleted.eql(&expected)) return false;
+                } else if (seg.shared.deleted != null) {
+                    return false;
+                }
             }
         }
         return true;

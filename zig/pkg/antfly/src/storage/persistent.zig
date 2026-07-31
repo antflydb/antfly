@@ -1955,11 +1955,23 @@ pub const PersistentIndex = struct {
 
         var inputs = try work_alloc.alloc(segment_mod.MergeInput, segment_indices.len);
         defer work_alloc.free(inputs);
+        const owned_deleted_docs = try work_alloc.alloc(
+            ?roaring.RoaringBitmap,
+            if (deleted_docs == null) segment_indices.len else 0,
+        );
+        defer {
+            for (owned_deleted_docs) |*maybe_deleted| {
+                if (maybe_deleted.*) |*deleted| deleted.deinit();
+            }
+            work_alloc.free(owned_deleted_docs);
+        }
+        if (owned_deleted_docs.len > 0) @memset(owned_deleted_docs, null);
         for (segment_indices, 0..) |seg_idx, i| {
             const seg = &snap.segments[seg_idx];
+            if (deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(work_alloc);
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = if (deleted_docs) |frozen| frozen[i] else seg.shared.deleted,
+                .deleted = if (deleted_docs) |frozen| frozen[i] else owned_deleted_docs[i],
             };
         }
         const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);

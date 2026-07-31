@@ -1647,8 +1647,12 @@ pub fn executeFilter(
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
-        // Remove deleted docs
-        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        // Remove deleted docs while pinning the shared bitmap containers.
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        }
 
         // Collect with offset
         var iter = bm.iterator();
@@ -1677,7 +1681,11 @@ pub fn executeFilterBitmap(
     for (snap.segments) |*seg| {
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
-        if (seg.shared.deleted) |d| local.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| local.andNotWith(&d);
+        }
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1709,7 +1717,11 @@ pub fn countFilterIntersection(
     for (snap.segments) |*seg| {
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
-        if (seg.shared.deleted) |d| local.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| local.andNotWith(&d);
+        }
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1739,7 +1751,11 @@ pub fn countFilter(
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
-        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        }
         total = std.math.add(usize, total, bm.cardinality()) catch return error.CountOverflow;
         doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;

@@ -67,9 +67,15 @@ var temp_path_nonce: u64 = 0;
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
 
-const TestGetVectorViewOrScratchHook = *const fn (?*anyopaque, *HBCIndex, u64) void;
+pub const TestGetVectorViewOrScratchHook = *const fn (?*anyopaque, *HBCIndex, u64) void;
 var test_get_vector_view_or_scratch_ctx: ?*anyopaque = null;
 var test_get_vector_view_or_scratch_hook: ?TestGetVectorViewOrScratchHook = null;
+
+pub fn setTestGetVectorViewOrScratchHook(ctx: ?*anyopaque, hook: ?TestGetVectorViewOrScratchHook) void {
+    if (!builtin.is_test) return;
+    test_get_vector_view_or_scratch_ctx = ctx;
+    test_get_vector_view_or_scratch_hook = hook;
+}
 
 // ============================================================================
 // Configuration
@@ -4712,6 +4718,9 @@ pub const HBCIndex = struct {
     }
 
     pub fn getVectorViewOrScratchWithCursor(self: *HBCIndex, cursor: *vectorindex_store.Cursor, vector_id: u64, scratch: []f32) ![]const f32 {
+        if (builtin.is_test) {
+            if (test_get_vector_view_or_scratch_hook) |hook| hook(test_get_vector_view_or_scratch_ctx, self, vector_id);
+        }
         return try vectorindex_hbc_index.getVectorViewOrScratchWithCursor(self, cursor, vector_id, scratch);
     }
 

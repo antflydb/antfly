@@ -7712,6 +7712,8 @@ fn sortedSegmentIteratorAdvance(iterator: *SortedSegmentIterator, reverse: bool)
 }
 
 fn sortedSegmentLocalDocDeleted(segment: *const index_mod.SegmentEntry, local_doc_id: u32) bool {
+    segment.shared.lockDeletionShared();
+    defer segment.shared.unlockDeletionShared();
     if (segment.shared.deleted) |deleted| return deleted.contains(local_doc_id);
     return false;
 }
@@ -11982,19 +11984,23 @@ fn textDocNumsForDocIdsAlloc(
     var doc_offset: u32 = 0;
     var scanned_count: u64 = 0;
     for (snapshot.segments) |*seg| {
-        for (0..seg.reader.doc_count) |local_doc_usize| {
-            scanned_count +|= 1;
-            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
-            const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            for (0..seg.reader.doc_count) |local_doc_usize| {
+                scanned_count +|= 1;
+                if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
+                const local_doc: u32 = @intCast(local_doc_usize);
+                if (seg.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const stored = (try seg.reader.storedDoc(local_doc)) orelse continue;
+                if (!doc_id_set.contains(stored.id)) continue;
+                const doc_num = doc_offset + local_doc;
+                const gop = try doc_num_set.getOrPut(alloc, doc_num);
+                if (gop.found_existing) continue;
+                try out.append(alloc, doc_num);
             }
-            const stored = (try seg.reader.storedDoc(local_doc)) orelse continue;
-            if (!doc_id_set.contains(stored.id)) continue;
-            const doc_num = doc_offset + local_doc;
-            const gop = try doc_num_set.getOrPut(alloc, doc_num);
-            if (gop.found_existing) continue;
-            try out.append(alloc, doc_num);
         }
         doc_offset += seg.reader.doc_count;
     }
@@ -12133,7 +12139,7 @@ pub fn collectExplicitTextStats(
         }
         out[i] = .{
             .field = try alloc.dupe(u8, request.field),
-            .global_doc_count = snapshot.liveDocCount(),
+            .global_doc_count = snapshot.scoringDocCount(),
             .global_total_field_len = snapshot.liveTotalFieldLen(request.field),
             .term_doc_freqs = term_doc_freqs,
         };
@@ -12169,16 +12175,20 @@ fn collectFilteredExplicitTextStats(
     defer selected_doc_keys.deinit(alloc);
     var doc_offset: u32 = 0;
     for (snapshot.segments) |*seg| {
-        for (0..seg.reader.doc_count) |local_doc_usize| {
-            const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            for (0..seg.reader.doc_count) |local_doc_usize| {
+                const local_doc: u32 = @intCast(local_doc_usize);
+                if (seg.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const doc_id = doc_offset + local_doc;
+                if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
+                global_doc_count += 1;
+                const stored = (try snapshot.storedDoc(doc_id)) orelse continue;
+                try selected_doc_keys.append(alloc, stored.id);
             }
-            const doc_id = doc_offset + local_doc;
-            if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
-            global_doc_count += 1;
-            const stored = (try snapshot.storedDoc(doc_id)) orelse continue;
-            try selected_doc_keys.append(alloc, stored.id);
         }
         doc_offset += seg.reader.doc_count;
     }
@@ -12216,13 +12226,17 @@ fn collectFilteredExplicitTextStats(
         for (snapshot.segments) |*seg| {
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
-            for (0..seg.reader.doc_count) |local_doc_usize| {
-                const local_doc: u32 = @intCast(local_doc_usize);
-                if (seg.shared.deleted) |deleted| {
-                    if (deleted.contains(local_doc)) continue;
-                }
-                if (try docAllowedByResolvedFilter(snapshot, doc_offset + local_doc, filter)) {
-                    try allowed_local_docs.add(local_doc);
+            {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                for (0..seg.reader.doc_count) |local_doc_usize| {
+                    const local_doc: u32 = @intCast(local_doc_usize);
+                    if (seg.shared.deleted) |deleted| {
+                        if (deleted.contains(local_doc)) continue;
+                    }
+                    if (try docAllowedByResolvedFilter(snapshot, doc_offset + local_doc, filter)) {
+                        try allowed_local_docs.add(local_doc);
+                    }
                 }
             }
             if (try seg.reader.invertedIndex(request.field)) |inv_reader| {
@@ -13205,24 +13219,50 @@ fn exactScoreNativeDenseFilter(
     entry: *index_manager_mod.IndexManager.DenseIndex,
     req: vectorindex_mod.SearchRequest,
 ) !vectorindex_mod.SearchResults {
+    var candidate_ids = std.ArrayListUnmanaged(u64).empty;
+    defer candidate_ids.deinit(alloc);
+    try candidate_ids.ensureTotalCapacity(alloc, req.filter_ids.len);
+    for (req.filter_ids) |vector_id| {
+        if (!containsVectorId(req.exclude_ids, vector_id)) candidate_ids.appendAssumeCapacity(vector_id);
+    }
+    std.mem.sort(u64, candidate_ids.items, {}, u64LessThan);
+    const unique_candidate_ids = candidate_ids.items[0..uniqueSortedU64(candidate_ids.items)];
+
     var results = try vectorindex_mod.SearchResults.initCapacity(
         alloc,
         req.k,
         req.k,
-        @min(req.k, req.filter_ids.len),
+        @min(req.k, unique_candidate_ids.len),
     );
     errdefer results.deinit();
 
     var txn = try entry.index.beginReadTxn();
     defer txn.abort();
+    var vector_cursor = entry.index.openNamespacedCursor(alloc, &txn, .vecs) catch |err| switch (err) {
+        error.Unsupported => null,
+        else => return err,
+    };
+    defer if (vector_cursor) |*cursor| cursor.close();
+
+    const candidate_metadata = try alloc.alloc(
+        ?[]const u8,
+        if (req.filter_prefix.len > 0) unique_candidate_ids.len else 0,
+    );
+    defer alloc.free(candidate_metadata);
+    if (candidate_metadata.len > 0) {
+        @memset(candidate_metadata, null);
+        try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+    }
 
     const vector_scratch = try alloc.alloc(f32, entry.dims);
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
 
-    for (req.filter_ids) |vector_id| {
-        if (containsVectorId(req.exclude_ids, vector_id)) continue;
-        const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+    for (unique_candidate_ids, 0..) |vector_id, i| {
+        const vector = (if (vector_cursor) |*cursor|
+            entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
+        else
+            entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
@@ -13237,7 +13277,7 @@ fn exactScoreNativeDenseFilter(
             if (distance >= threshold) continue;
         }
         if (req.filter_prefix.len > 0) {
-            const metadata = (try entry.index.getMetadataInTxn(&txn, vector_id)) orelse continue;
+            const metadata = candidate_metadata[i] orelse continue;
             if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
         }
         results.addResult(vector_id, distance, 0);
@@ -14830,14 +14870,18 @@ fn buildAllOrdinalTextDocIdMapAlloc(
     var doc_offset: u32 = 0;
     var saw_live_doc = false;
     for (snapshot.segments) |*segment| {
-        for (0..segment.reader.doc_count) |local_usize| {
-            const local_doc: u32 = @intCast(local_usize);
-            if (segment.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            segment.shared.lockDeletionShared();
+            defer segment.shared.unlockDeletionShared();
+            for (0..segment.reader.doc_count) |local_usize| {
+                const local_doc: u32 = @intCast(local_usize);
+                if (segment.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                saw_live_doc = true;
+                const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse return false;
+                try ordinal_to_text_doc_id.put(alloc, ordinal, doc_offset + local_doc);
             }
-            saw_live_doc = true;
-            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse return false;
-            try ordinal_to_text_doc_id.put(alloc, ordinal, doc_offset + local_doc);
         }
         doc_offset += segment.reader.doc_count;
     }
@@ -14859,26 +14903,30 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
     errdefer out.deinit(alloc);
     var scanned_count: u64 = 0;
     for (snapshot.segments) |*segment| {
-        for (0..segment.reader.doc_count) |local_usize| {
-            scanned_count +|= 1;
-            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
-            const local_doc: u32 = @intCast(local_usize);
-            if (segment.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            segment.shared.lockDeletionShared();
+            defer segment.shared.unlockDeletionShared();
+            for (0..segment.reader.doc_count) |local_usize| {
+                scanned_count +|= 1;
+                if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
+                const local_doc: u32 = @intCast(local_usize);
+                if (segment.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const stored = (try segment.reader.storedDoc(local_doc)) orelse continue;
+                if (!doc_id_set.contains(stored.id)) continue;
+                const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
+                    logNativeSortPlanRejection(
+                        "*",
+                        nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                        "doc_ordinal_projection_unavailable",
+                    );
+                    return error.UnsupportedQueryRequest;
+                };
+                const gop = try doc_num_set.getOrPut(alloc, ordinal);
+                if (gop.found_existing) continue;
+                try out.append(alloc, ordinal);
             }
-            const stored = (try segment.reader.storedDoc(local_doc)) orelse continue;
-            if (!doc_id_set.contains(stored.id)) continue;
-            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
-                logNativeSortPlanRejection(
-                    "*",
-                    nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
-                    "doc_ordinal_projection_unavailable",
-                );
-                return error.UnsupportedQueryRequest;
-            };
-            const gop = try doc_num_set.getOrPut(alloc, ordinal);
-            if (gop.found_existing) continue;
-            try out.append(alloc, ordinal);
         }
     }
     return try out.toOwnedSlice(alloc);
