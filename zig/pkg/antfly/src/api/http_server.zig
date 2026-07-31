@@ -8969,6 +8969,7 @@ pub const ApiHttpServer = struct {
         });
         defer params.deinit(alloc);
         params.execution_deadline_ns = request_deadline_ns;
+        params.cancellation = cancellation;
         try ensureRequestDeadline(request_deadline_ns);
 
         const source_config = try foreign_source.toSourceConfig(alloc);
@@ -8988,6 +8989,7 @@ pub const ApiHttpServer = struct {
             );
             defer aggregate_params.deinit(alloc);
             aggregate_params.execution_deadline_ns = request_deadline_ns;
+            aggregate_params.cancellation = cancellation;
             var aggregate_result = foreign_query_source.aggregate(alloc, aggregate_params) catch |err| switch (err) {
                 error.UnsupportedAggregate => return error.UnsupportedQueryRequest,
                 else => return err,

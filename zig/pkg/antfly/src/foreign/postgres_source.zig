@@ -835,6 +835,7 @@ fn cloneQueryParamsAlloc(alloc: Allocator, params: foreign_source.QueryParams) !
         .limit = params.limit,
         .offset = params.offset,
         .execution_deadline_ns = params.execution_deadline_ns,
+        .cancellation = params.cancellation,
     };
     errdefer out.deinit(alloc);
     out.fields = try cloneFieldsAlloc(alloc, params.fields);
@@ -848,6 +849,7 @@ fn cloneAggregateParamsAlloc(alloc: Allocator, params: foreign_source.AggregateP
     var out = foreign_source.AggregateParams{
         .table = try alloc.dupe(u8, params.table),
         .execution_deadline_ns = params.execution_deadline_ns,
+        .cancellation = params.cancellation,
     };
     errdefer out.deinit(alloc);
     out.filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null;

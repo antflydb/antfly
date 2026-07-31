@@ -2605,6 +2605,7 @@ pub fn executeForeignRightJoinQuery(
     });
     defer params.deinit(alloc);
     params.execution_deadline_ns = ctx.execution_deadline_ns;
+    params.cancellation = ctx.cancellation;
 
     const source_config = try foreign_source.toSourceConfig(alloc);
     var foreign_query_source = try registry.create(alloc, source_config);
