@@ -2274,12 +2274,12 @@ pub const ApiHttpServer = struct {
         _ = try self.source.removeJoinShuffleLease(job_id);
     }
 
-    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror!query_api.QueryResponse {
+    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, null);
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, cancellation);
     }
 
-    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror![]u8 {
+    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
@@ -2289,7 +2289,7 @@ pub const ApiHttpServer = struct {
             row_filter_json,
             null,
             execution_deadline_ns,
-            null,
+            cancellation,
         );
     }
 
@@ -8630,6 +8630,7 @@ pub const ApiHttpServer = struct {
         const start_ns = platform_time.monotonicNs();
         const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
         while (true) {
+            try ensureRequestActive(cancellation);
             if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
                 alloc,
@@ -8647,7 +8648,7 @@ pub const ApiHttpServer = struct {
                     if (retry_timeout_ns == 0) return err;
                     const sleep_ns = boundedRetrySleepNs(request_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
-                    sleepNs(sleep_ns);
+                    try sleepNsCancellable(sleep_ns, cancellation);
                     continue;
                 },
                 error.Timeout => {
@@ -8672,6 +8673,8 @@ pub const ApiHttpServer = struct {
         request_deadline_ns: ?u64,
         cancellation: ?*const std.atomic.Value(bool),
     ) ![]u8 {
+        try ensureRequestActive(cancellation);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
             var result = self.executePlainPublicTableQuery(
@@ -8708,6 +8711,7 @@ pub const ApiHttpServer = struct {
                 error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
                 error.Timeout => return error.Timeout,
+                error.Cancelled => return error.Cancelled,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -8720,8 +8724,10 @@ pub const ApiHttpServer = struct {
         var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_req.deinit();
 
+        try ensureRequestActive(cancellation);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns) catch |err| switch (err) {
+        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -8740,6 +8746,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
+            error.Cancelled => return error.Cancelled,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8755,6 +8762,8 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        try ensureRequestActive(cancellation);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (join_req) |owned_join| {
             var parsed_join = owned_join;
@@ -8762,7 +8771,7 @@ pub const ApiHttpServer = struct {
             if (authenticated_identity) |identity| {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
-            const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns);
+            const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
             return distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
         }
 
@@ -8800,6 +8809,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
+            error.Cancelled => return error.Cancelled,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8851,10 +8861,15 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) anyerror!?[]u8 {
+        try ensureRequestActive(cancellation);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         var parsed_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
+        try ensureRequestActive(cancellation);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         const request = &parsed_request.value;
         if (row_filter_json) |value| {
@@ -8866,6 +8881,8 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer foreign_sources.deinit(alloc);
+        try ensureRequestActive(cancellation);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
 
         const foreign_source = foreign_sources.get(table_name) orelse return null;
@@ -8887,10 +8904,11 @@ pub const ApiHttpServer = struct {
                 parsed_join.join,
                 parsed_join.foreign_sources,
                 request_deadline_ns,
+                cancellation,
             );
         }
 
-        return try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, request.*, foreign_source, request_deadline_ns);
+        return try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, request.*, foreign_source, request_deadline_ns, cancellation);
     }
 
     fn encodeForeignPublicTableQueryResponseAlloc(
@@ -8900,7 +8918,9 @@ pub const ApiHttpServer = struct {
         request: anytype,
         foreign_source: foreign_mod.PostgresConfig,
         request_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) ![]u8 {
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         const registry = try self.ensureForeignRegistry();
         const started_ns = platform_time.monotonicNs();
@@ -8967,6 +8987,7 @@ pub const ApiHttpServer = struct {
                 else => return err,
             };
             defer aggregate_result.deinit(alloc);
+            try ensureRequestActive(cancellation);
             try ensureRequestDeadline(request_deadline_ns);
             break :blk try foreign_sources_api.foreignAggregateResultsToSearchResultsAlloc(alloc, aggregation_requests, aggregate_result);
         } else @constCast(@as([]const db_mod.aggregations.SearchAggregationResult, &.{}));
@@ -8978,13 +8999,14 @@ pub const ApiHttpServer = struct {
         const result_hits = if (request.count == true)
             try alloc.alloc(db_mod.types.SearchHit, 0)
         else
-            try buildForeignSearchHitsAlloc(alloc, foreign_source, query_result.rows, request_deadline_ns);
+            try buildForeignSearchHitsAlloc(alloc, foreign_source, query_result.rows, request_deadline_ns, cancellation);
         var result: db_mod.types.SearchResult = .{
             .alloc = alloc,
             .hits = result_hits,
             .total_hits = @intCast(@min(query_result.total, std.math.maxInt(u32))),
         };
         defer result.deinit();
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
 
         const response_req: db_mod.types.SearchRequest = .{
@@ -9003,6 +9025,7 @@ pub const ApiHttpServer = struct {
             .aggregations_json = response_req.aggregations_json,
         }, response_meta, result);
         defer response.deinit(alloc);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         const response_json = try alloc.dupe(u8, response.json);
         errdefer alloc.free(response_json);
@@ -9021,10 +9044,13 @@ pub const ApiHttpServer = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
         request_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) anyerror![]u8 {
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         var contract_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_request.deinit();
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         const requested_left_fields = contract_request.value.fields orelse &.{};
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
@@ -9038,7 +9064,7 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
         }
-        const primary_json = try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, primary_request.value, foreign_source, request_deadline_ns);
+        const primary_json = try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, primary_request.value, foreign_source, request_deadline_ns, cancellation);
         defer alloc.free(primary_json);
 
         var owned_response = try parseOwnedJsonValueAlloc(alloc, primary_json);
@@ -9047,12 +9073,14 @@ pub const ApiHttpServer = struct {
         if (hits_ptr.items.len == 0) {
             const empty_response = try alloc.dupe(u8, primary_json);
             errdefer alloc.free(empty_response);
+            try ensureRequestActive(cancellation);
             try ensureRequestDeadline(request_deadline_ns);
             return empty_response;
         }
 
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        const ctx = self.joinContext().withExecutionDeadline(request_deadline_ns);
+        const ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
         const plan = try distributed_join.planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources);
         var right_result = try distributed_join.executeSupportedRightJoinQueryCoordinatorOnly(ctx, &self.join_job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources);
         defer right_result.deinit(alloc);
@@ -9067,9 +9095,11 @@ pub const ApiHttpServer = struct {
             appended_left_field,
         );
         try distributed_join.maybeAttachJoinProfile(alloc, &owned_response, stats, plan, right_result.strategy_used, right_result.distributed_execution, right_result.groups_queried);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         const response_json = try distributed_join.stringifyJsonValueAlloc(alloc, owned_response);
         errdefer alloc.free(response_json);
+        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         return response_json;
     }
@@ -9136,6 +9166,7 @@ pub const ApiHttpServer = struct {
         foreign_source: foreign_mod.PostgresConfig,
         rows: []const std.json.Value,
         execution_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) ![]db_mod.types.SearchHit {
         if (rows.len == 0) return &.{};
 
@@ -9151,6 +9182,7 @@ pub const ApiHttpServer = struct {
             rows_until_deadline_check -|= 1;
             if (rows_until_deadline_check == 0) {
                 rows_until_deadline_check = 64;
+                try ensureRequestActive(cancellation);
                 try ensureRequestDeadline(execution_deadline_ns);
             }
             if (row != .object) return error.InvalidQueryRequest;
@@ -9185,6 +9217,7 @@ pub const ApiHttpServer = struct {
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
         cancellation: ?*const std.atomic.Value(bool),
     ) !query_api.QueryResponse {
+        try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
         var query_req = query_api.parsePublicQueryRequestWithDeadline(
@@ -9284,6 +9317,7 @@ pub const ApiHttpServer = struct {
         const start_ns = platform_time.monotonicNs();
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
+            try ensureRequestActive(req.cancellation);
             if (retryDeadlineExpired(req.execution_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
                 // FileNotFound surfaces when a read-only replica open races
@@ -9302,10 +9336,10 @@ pub const ApiHttpServer = struct {
                     if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
                     const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
-                    sleepNs(sleep_ns);
+                    try sleepNsCancellable(sleep_ns, req.cancellation);
                     continue;
                 },
-                error.Timeout => return error.Timeout,
+                error.Timeout, error.Cancelled => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
                     return err;
@@ -10725,7 +10759,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
     ) !http_common.HttpResponse {
         if (isNdjsonContentType(content_type)) {
-            return try self.handlePublicTableMultiQuery(table_name, body, authenticated_identity);
+            return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
         }
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
     }
@@ -10776,6 +10810,9 @@ pub const ApiHttpServer = struct {
             error.EmbedTransientFailure => try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
             error.EmbedUpstreamFailure => try textResponse(self.alloc, 502, "query embedding provider failed"),
             error.Timeout => try textResponse(self.alloc, 504, "query timed out"),
+            // A peer disconnect is expected control flow. The listener will
+            // discard this response when the socket is already gone.
+            error.Cancelled => try textResponse(self.alloc, 499, "client closed request"),
             error.NotFound, error.TableNotFound => try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => try textResponse(self.alloc, 503, "doc identity unavailable"),
@@ -10828,6 +10865,16 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
+        return try self.handlePublicTableMultiQueryWithCancellation(route_table_name, body, authenticated_identity, null);
+    }
+
+    fn handlePublicTableMultiQueryWithCancellation(
+        self: *ApiHttpServer,
+        route_table_name: ?[]const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -10839,6 +10886,9 @@ pub const ApiHttpServer = struct {
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
+            if (cancellation) |value| {
+                if (value.isCancelled()) return error.Cancelled;
+            }
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
 
@@ -10865,7 +10915,7 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
-                null,
+                if (cancellation) |value| &value.cancelled else null,
             ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 
@@ -12643,6 +12693,25 @@ fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
 
 fn ensureRequestDeadline(deadline_ns: ?u64) !void {
     if (retryDeadlineExpired(deadline_ns, platform_time.monotonicNs())) return error.Timeout;
+}
+
+fn ensureRequestActive(cancellation: ?*const std.atomic.Value(bool)) !void {
+    if (cancellation) |value| {
+        if (value.load(.acquire)) return error.Cancelled;
+    }
+}
+
+fn sleepNsCancellable(duration_ns: u64, cancellation: ?*const std.atomic.Value(bool)) !void {
+    // Retry sleeps are deliberately broken into short slices so a vanished
+    // peer does not occupy an expensive query slot for the full backoff.
+    var remaining = duration_ns;
+    while (remaining > 0) {
+        try ensureRequestActive(cancellation);
+        const slice = @min(remaining, 5 * std.time.ns_per_ms);
+        sleepNs(slice);
+        remaining -= slice;
+    }
+    try ensureRequestActive(cancellation);
 }
 
 fn boundedRetrySleepNs(
@@ -17142,6 +17211,34 @@ test "api http transient read retry honors expired request deadline before sourc
         reads.source(),
         "docs",
         .{ .execution_deadline_ns = 0 },
+        .read_index,
+    ));
+    try std.testing.expectEqual(@as(u32, 0), reads.attempts);
+}
+
+test "api http transient read retry stops before source query when client cancellation is signaled" {
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse { return error.UnsupportedOperation; }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse { return error.UnsupportedOperation; }
+        fn query(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            return error.FileNotFound;
+        }
+    };
+
+    var reads = FakeReads{};
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        .{ .cancellation = &cancelled },
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
@@ -35791,11 +35888,11 @@ test "api http server executes direct foreign table query through registry" {
 
     try std.testing.expectError(
         error.Timeout,
-        server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, 0),
+        server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, 0, null),
     );
     try std.testing.expect(DummyForeign.last_dsn == null);
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -35884,7 +35981,7 @@ test "api http server executes direct foreign table aggregations through registr
         \\{"fields":["name"],"aggregations":{"version_stats":{"type":"stats","field":"version"},"name_terms":{"type":"terms","field":"name","size":5}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers","columns":[{"name":"version","type":"bigint"},{"name":"name","type":"text"}]}}}
     ;
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});

@@ -384,6 +384,13 @@ pub const StdHttpListener = struct {
         _ = self.active_requests.fetchSub(1, .acq_rel);
     }
 
+    fn requestConsumesExpensiveSlot(method: common.Method, uri: []const u8) bool {
+        // Query execution is bounded independently from connection handling.
+        // Health, recovery, and other public control routes retain capacity
+        // even while every expensive query slot is held.
+        return method == .POST and std.mem.indexOf(u8, uri, "/query") != null;
+    }
+
     fn acceptErrorBackoffInitialMs(self: *const StdHttpListener) u32 {
         return @max(@as(u32, 1), self.cfg.accept_error_backoff_initial_ms);
     }
@@ -605,7 +612,8 @@ pub const StdHttpListener = struct {
             .cancellation = &cancellation,
         };
 
-        if (!self.tryAcquireRequestSlot()) {
+        const consumes_expensive_slot = requestConsumesExpensiveSlot(method, uri);
+        if (consumes_expensive_slot and !self.tryAcquireRequestSlot()) {
             // Shed before application execution. Clients get a deterministic,
             // retryable response instead of leaving expensive work running
             // until their own timeout while the listener runs out of FDs.
@@ -616,7 +624,7 @@ pub const StdHttpListener = struct {
             });
             return;
         }
-        defer self.releaseRequestSlot();
+        defer if (consumes_expensive_slot) self.releaseRequestSlot();
 
         if (self.streaming_app) |streaming_app| {
             const body_buffer = try self.alloc.alloc(u8, self.cfg.send_buffer_bytes);
@@ -1419,7 +1427,7 @@ test "std http listener overload admission returns retryable 429 without invokin
         }
     };
 
-    var input_reader: std.Io.Reader = .fixed("GET /query HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    var input_reader: std.Io.Reader = .fixed("POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     var output_buffer: [512]u8 = undefined;
     var output_writer: std.Io.Writer = .fixed(&output_buffer);
     var server: std.http.Server = .init(&input_reader, &output_writer);
@@ -1440,6 +1448,38 @@ test "std http listener overload admission returns retryable 429 without invokin
     try std.testing.expect(std.mem.indexOf(u8, output, "HTTP/1.1 429 Too Many Requests\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "retry-after: 1\r\n") != null);
     try std.testing.expectEqual(@as(u32, 0), app.calls);
+}
+
+test "std http listener keeps control route capacity while query slots are full" {
+    const App = struct {
+        calls: u32 = 0,
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 200, .body = try alloc.dupe(u8, "ok") };
+        }
+    };
+
+    var input_reader: std.Io.Reader = .fixed("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    var output_buffer: [512]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buffer);
+    var server: std.http.Server = .init(&input_reader, &output_writer);
+    var request = try server.receiveHead();
+    var app = App{};
+    var listener: StdHttpListener = .{
+        .alloc = std.testing.allocator,
+        .cfg = .{ .max_active_requests = 32 },
+        .app = .{ .ptr = &app, .vtable = &.{ .execute = App.execute } },
+        .io_impl = undefined,
+        .io_owner = .shared,
+    };
+    for (0..32) |_| try std.testing.expect(listener.tryAcquireRequestSlot());
+    defer for (0..32) |_| listener.releaseRequestSlot();
+
+    try listener.handleRequest(null, &request);
+    try std.testing.expectEqual(@as(u32, 1), app.calls);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "HTTP/1.1 200 OK\r\n") != null);
 }
 
 test "std http listener propagates raw peer disconnect into in-flight executor cancellation" {

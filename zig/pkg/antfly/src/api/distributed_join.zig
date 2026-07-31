@@ -41,6 +41,7 @@ pub const JoinContext = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub const VTable = struct {
         admin_snapshot: *const fn (*anyopaque) anyerror!?metadata_api.AdminSnapshot,
@@ -53,8 +54,8 @@ pub const JoinContext = struct {
         get_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (*anyopaque, metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!void = null,
-        execute_plain_query: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64) anyerror!query_api.QueryResponse,
-        execute_query_dispatch: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64) anyerror![]u8,
+        execute_plain_query: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64, ?*const std.atomic.Value(bool)) anyerror!query_api.QueryResponse,
+        execute_query_dispatch: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64, ?*const std.atomic.Value(bool)) anyerror![]u8,
         build_owned_search_request: *const fn (*anyopaque, std.mem.Allocator, []const u8, std.json.Value, ?u64) anyerror!query_api.OwnedQueryRequest,
         ensure_foreign_registry: *const fn (*anyopaque) anyerror!*const foreign_mod.Registry,
     };
@@ -62,6 +63,12 @@ pub const JoinContext = struct {
     pub fn withExecutionDeadline(self: JoinContext, deadline_ns: ?u64) JoinContext {
         var out = self;
         out.execution_deadline_ns = deadline_ns;
+        return out;
+    }
+
+    pub fn withCancellation(self: JoinContext, cancellation: ?*const std.atomic.Value(bool)) JoinContext {
+        var out = self;
+        out.cancellation = cancellation;
         return out;
     }
 
@@ -91,6 +98,9 @@ pub const JoinContext = struct {
     }
 
     pub fn ensureExecutionDeadline(self: JoinContext) !void {
+        if (self.cancellation) |value| {
+            if (value.load(.acquire)) return error.Cancelled;
+        }
         const deadline_ns = self.execution_deadline_ns orelse return;
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
     }
@@ -138,6 +148,7 @@ pub const JoinContext = struct {
             body,
             row_filter_json,
             self.execution_deadline_ns,
+            self.cancellation,
         );
     }
 
@@ -150,6 +161,7 @@ pub const JoinContext = struct {
             body,
             row_filter_json,
             self.execution_deadline_ns,
+            self.cancellation,
         );
     }
 
@@ -1450,7 +1462,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     row_filter_json: ?[]const u8,
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
-) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout })![]u8 {
+) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout, Cancelled })![]u8 {
     try ctx.ensureExecutionDeadline();
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
     var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
