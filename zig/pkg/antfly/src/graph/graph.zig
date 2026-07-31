@@ -285,6 +285,7 @@ pub const GraphIndexOptions = struct {
     reverse_lsm_root_generation: u64 = 0,
     edge_type_configs: []const EdgeTypeConfig = &.{},
     rebuild_root_path: ?[]const u8 = null,
+    rebuild_owner_generation: u64 = 0,
     algebraic_semiring_traversal: bool = false,
 };
 
@@ -339,6 +340,8 @@ pub const GraphIndex = struct {
     reverse_owner: ReverseStoreOwner,
     edge_type_configs: []const EdgeTypeConfig,
     rebuild_root_path: ?[]u8,
+    rebuild_storage: ?lsm_backend.Storage,
+    rebuild_owner_generation: u64,
     algebraic_semiring_traversal: bool,
     edge_count: u64,
     node_count: u64,
@@ -719,6 +722,8 @@ pub const GraphIndex = struct {
             .reverse_owner = reverse_store.owner,
             .edge_type_configs = opts.edge_type_configs,
             .rebuild_root_path = if (opts.rebuild_root_path) |path| try alloc.dupe(u8, path) else null,
+            .rebuild_storage = opts.reverse_lsm_storage,
+            .rebuild_owner_generation = opts.rebuild_owner_generation,
             .algebraic_semiring_traversal = opts.algebraic_semiring_traversal,
             .edge_count = loaded_stats.edge_count,
             .node_count = loaded_stats.node_count,
@@ -1144,7 +1149,9 @@ pub const GraphIndex = struct {
     }
 
     pub fn rebuildReverseFromOwnedOutgoingEdges(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
-        return try self.rebuildReverseFromOwnedOutgoingEdgesResume(alloc, lower, upper, null);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(alloc, io_impl.io(), lower, upper, null);
     }
 
     pub fn copyOwnedOutgoingEdgesTo(self: *GraphIndex, dest: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
@@ -1180,6 +1187,19 @@ pub const GraphIndex = struct {
         upper: []const u8,
         resume_from: ?[]const u8,
     ) !usize {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(alloc, io_impl.io(), lower, upper, resume_from);
+    }
+
+    pub fn rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(
+        self: *GraphIndex,
+        alloc: Allocator,
+        io: std.Io,
+        lower: []const u8,
+        upper: []const u8,
+        resume_from: ?[]const u8,
+    ) !usize {
         const base_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
         defer if (base_lower_owned) |key| alloc.free(key);
         const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
@@ -1201,7 +1221,13 @@ pub const GraphIndex = struct {
         var txn = try self.beginWriteReverseTxn();
         var txn_active = true;
         errdefer if (txn_active) txn.abort();
-        const rebuild_state = if (self.rebuild_root_path) |path| backfill_state_mod.RebuildState.init(path) else null;
+        const rebuild_state = if (self.rebuild_root_path) |path|
+            if (self.rebuild_owner_generation != 0)
+                backfill_state_mod.RebuildState.initOwned(path, self.rebuild_storage, self.rebuild_owner_generation)
+            else
+                backfill_state_mod.RebuildState.initWithStorage(path, self.rebuild_storage)
+        else
+            null;
 
         for (pairs) |pair| {
             if (resume_from) |resume_key| {
@@ -1221,7 +1247,7 @@ pub const GraphIndex = struct {
             if (batch_count >= reverse_rebuild_batch_size) {
                 try txn.commit();
                 txn_active = false;
-                if (rebuild_state) |state| try state.update(pair.key);
+                if (rebuild_state) |state| try state.updateWithIo(io, pair.key);
                 flushed_batches += 1;
                 if (@import("builtin").is_test) {
                     if (test_abort_reverse_rebuild_after_batches) |limit| {
@@ -1236,7 +1262,7 @@ pub const GraphIndex = struct {
 
         try txn.commit();
         txn_active = false;
-        if (rebuild_state) |state| try state.clear();
+        if (rebuild_state) |state| try state.clearWithIo(io);
         try self.rebuildCounterMetadata();
         try self.checkpointLsmWalAfterDurableBoundary();
         return rebuilt;

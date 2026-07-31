@@ -720,8 +720,18 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var created_index = try client.createTableIndex(base_uri, "docs", "embed_idx", create_index_body);
     defer created_index.deinit(std.testing.allocator);
 
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
+    // Index creation is accepted before the writer-owned structural worker
+    // has published its durable generation. Wait on that owner's activity
+    // contract instead of assuming a fixed number of metadata rounds is
+    // enough on a loaded CI runner.
+    var structural_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer structural_wait_io.deinit();
+    var structural_wait_attempts: usize = 0;
+    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", 0)) : (structural_wait_attempts += 1) {
+        try svc.runRound();
+        structural_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", 0));
 
     // This fixture performs data-group writes directly instead of running a
     // second Raft host. Model the data owner's normal lifecycle explicitly:
@@ -7196,7 +7206,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         \\"doc:c":{"title":"left-2","body":"alpha"},
         \\"doc:d":{"title":"left-3","body":"alpha"},
         \\"doc:e":{"title":"left-4","body":"alpha"},
-        \\"doc:z":{"title":"right","body":"alpha rareright"}}}
+        \\"doc:z":{"title":"right","body":"alpha rareright"}},"sync_level":"full_text"}
     );
     defer std.testing.allocator.free(batch_body);
     var batch = try client.fetchBatch(base_uri, "docs", batch_body);

@@ -47,7 +47,17 @@ const McpToolSpec = struct {
     kind: McpToolKind,
     name: []const u8,
     description: []const u8,
+    permission: McpToolPermission,
+    table_argument: ?[]const u8 = null,
+    wildcard_table: bool = false,
     fields: []const McpToolFieldSpec = &.{},
+};
+
+const McpToolPermission = enum {
+    none,
+    read,
+    write,
+    admin,
 };
 
 const McpToolFieldType = enum {
@@ -89,6 +99,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .create_table,
         .name = "create_table",
         .description = "Create an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             // The runtime default is topology-aware: one for standalone and
@@ -102,19 +114,25 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .drop_table,
         .name = "drop_table",
         .description = "Drop an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
-    .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables", .permission = .read, .wildcard_table = true },
     .{
         .kind = .describe_table,
         .name = "describe_table",
         .description = "Describe an Antfly table, including schema, indexes, ranges, and storage status when available",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
         .kind = .create_index,
         .name = "create_index",
         .description = "Create an Antfly index",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
@@ -129,6 +147,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .drop_index,
         .name = "drop_index",
         .description = "Drop an Antfly index",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
@@ -138,18 +158,24 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .list_indexes,
         .name = "list_indexes",
         .description = "List indexes for an Antfly table",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
         .kind = .describe_indexes,
         .name = "describe_indexes",
         .description = "Describe indexes for an Antfly table",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
         .kind = .get_document,
         .name = "get_document",
         .description = "Get an Antfly document by key",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "key", .schema_type = .string, .required = true },
@@ -160,6 +186,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .sample_documents,
         .name = "sample_documents",
         .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
@@ -173,6 +201,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .query,
         .name = "query",
         .description = "Run an Antfly table query",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
@@ -191,16 +221,20 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .describe_query_request,
         .name = "describe_query_request",
         .description = "Return compact guidance for the raw Antfly QueryRequest accepted by query.queryRequest",
+        .permission = .none,
     },
     .{
         .kind = .describe_mcp_capabilities,
         .name = "describe_mcp_capabilities",
         .description = "Describe Antfly MCP capabilities, deterministic tools, and A2A query-builder handoff guidance",
+        .permission = .none,
     },
     .{
         .kind = .backup,
         .name = "backup",
         .description = "Backup an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
@@ -211,6 +245,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .restore,
         .name = "restore",
         .description = "Restore an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
@@ -221,6 +257,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .batch,
         .name = "batch",
         .description = "Insert and delete documents in an Antfly table",
+        .permission = .write,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "writes", .schema_type = .object },
@@ -289,7 +327,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         server: Server,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8,
-        kind: McpToolKind,
+        permissions: ?[]const usermgr.Permission,
+        spec: McpToolSpec,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -297,7 +336,10 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            return switch (ctx.kind) {
+            if (!mcpToolInvocationAllowed(ctx.spec, args, ctx.permissions)) {
+                return mcpError(alloc, "permission denied");
+            }
+            return switch (ctx.spec.kind) {
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
                 .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
@@ -507,6 +549,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         server: Server,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8,
+        permissions: ?[]const usermgr.Permission,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
 
@@ -516,6 +559,11 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            if (ctx.permissions) |permissions| {
+                if (!extensionMcpToolAllowedForPermissions(ctx.installed.*, ctx.tool.*, permissions)) {
+                    return mcpError(alloc, "permission denied");
+                }
+            }
             return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.installed, ctx.tool.*, args);
         }
     };
@@ -526,7 +574,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             .server = server_ptr,
             .authorization = req.authorization,
             .trusted_principal = req.header(trusted_principal_header),
-            .kind = spec.kind,
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
+            .spec = spec,
         };
     }
 
@@ -563,6 +612,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             .server = server_ptr,
             .authorization = req.authorization,
             .trusted_principal = req.header(trusted_principal_header),
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
         };
@@ -585,7 +635,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     defer protocol_server.deinit(server_ptr.alloc);
     if (extension_name_filter == null) {
         for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
-            if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
+            if (!mcpToolVisibleForIdentity(spec, authenticated_identity)) continue;
             try protocol_server.addTool(server_ptr.alloc, .{
                 .name = spec.name,
                 .description = spec.description,
@@ -630,31 +680,69 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     return try mcpBodyResponseWithStatus(server_ptr.alloc, transport);
 }
 
-fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype) bool {
+fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
-    return switch (kind) {
-        .describe_query_request, .describe_mcp_capabilities => true,
-        .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
-        .query, .describe_table, .describe_indexes, .get_document, .sample_documents, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
-        .batch => identityHasAnyPermission(identity.permissions, .table, .write),
-        .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
+    const required = permissionTypeForMcpTool(spec.permission) orelse return true;
+    if (spec.wildcard_table) {
+        return identityHasPermission(identity.permissions, .table, "*", required);
+    }
+    return identityHasAnyPermission(identity.permissions, .table, required);
+}
+
+/// Discovery filtering is useful UX, but it is not an authorization boundary:
+/// a client can retain an old tool schema or hand-craft tools/call. Enforce the
+/// effective table permission again immediately before dispatch so denied MCP
+/// calls cannot reach an extension, router, or metadata mutation path.
+fn mcpToolInvocationAllowed(
+    spec: McpToolSpec,
+    args: std.json.Value,
+    permissions: ?[]const usermgr.Permission,
+) bool {
+    const effective_permissions = permissions orelse return true;
+    const required = permissionTypeForMcpTool(spec.permission) orelse return true;
+    if (spec.wildcard_table) {
+        return identityHasPermission(effective_permissions, .table, "*", required);
+    }
+    const table_argument = spec.table_argument orelse return false;
+    // Malformed or missing resource identity must fail closed here. The tool
+    // handler will still return its normal validation error to callers that
+    // are permitted to invoke it, but an unscoped call must never cross the
+    // authorization boundary.
+    const table_name = jsonStringArg(args, table_argument) orelse return false;
+    return identityHasPermission(effective_permissions, .table, table_name, required);
+}
+
+fn permissionTypeForMcpTool(permission: McpToolPermission) ?usermgr.PermissionType {
+    return switch (permission) {
+        .none => null,
+        .read => .read,
+        .write => .write,
+        .admin => .admin,
     };
 }
 
 fn extensionMcpToolVisibleForIdentity(installed: *const extension_domain.InstalledExtension, tool: *const ExtensionMcpTool, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
+    return extensionMcpToolAllowedForPermissions(installed.*, tool.*, identity.permissions);
+}
+
+fn extensionMcpToolAllowedForPermissions(
+    installed: extension_domain.InstalledExtension,
+    tool: ExtensionMcpTool,
+    permissions: []const usermgr.Permission,
+) bool {
     if (tool.required_capabilities.len == 0) {
-        return extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+        return extensionScopeVisibleForIdentity(installed, tool.member.*, permissions);
     }
 
     var checked_table_permission = false;
     for (tool.required_capabilities) |capability| {
         const permission_type = permissionTypeForExtensionCapability(capability.name) orelse continue;
         checked_table_permission = true;
-        const table = tableResourceForExtensionCapability(installed.*, tool.member.*, capability);
-        if (!identityHasPermission(identity.permissions, .table, table, permission_type)) return false;
+        const table = tableResourceForExtensionCapability(installed, tool.member.*, capability);
+        if (!identityHasPermission(permissions, .table, table, permission_type)) return false;
     }
-    return checked_table_permission or extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+    return checked_table_permission or extensionScopeVisibleForIdentity(installed, tool.member.*, permissions);
 }
 
 fn extensionScopeVisibleForIdentity(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, permissions: []const usermgr.Permission) bool {

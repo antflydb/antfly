@@ -204,6 +204,7 @@ fn runtimeStatusEqual(
     for (lhs.indexes, rhs.indexes) |left, right| {
         if (!std.mem.eql(u8, left.name, right.name) or
             !std.mem.eql(u8, left.kind, right.kind) or
+            !optionalStringsEqual(left.load_error, right.load_error) or
             left.doc_count != right.doc_count or
             left.term_count != right.term_count or
             left.edge_count != right.edge_count or
@@ -226,6 +227,11 @@ fn runtimeStatusEqual(
         }
     }
     return true;
+}
+
+fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
 }
 
 fn runtimeEnrichmentStatusEqual(

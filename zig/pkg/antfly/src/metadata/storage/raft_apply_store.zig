@@ -3752,7 +3752,7 @@ fn replicationCutoverRetirementCleared(
 }
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 10;
+const runtime_status_record_version: u16 = 11;
 const group_status_record_version: u16 = 4;
 
 const TransitionTag = enum(u8) {
@@ -5032,6 +5032,7 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.replay_applied_sequence);
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
+    try appendOptionalString(alloc, out, record.load_error);
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -5075,9 +5076,12 @@ fn readRuntimeIndexStatusRecord(
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const replay_catch_up_required = encoded[pos.*] != 0;
     pos.* += 1;
+    const load_error = if (version >= 11) try readOptionalString(alloc, encoded, pos) else null;
+    errdefer if (load_error) |value| alloc.free(value);
     return .{
         .name = name,
         .kind = kind,
+        .load_error = load_error,
         .doc_count = doc_count,
         .term_count = term_count,
         .edge_count = edge_count,
@@ -5779,6 +5783,19 @@ fn appendRequiredString(
 ) !void {
     try appendInt(alloc, out, u32, @intCast(value.len));
     try out.appendSlice(alloc, value);
+}
+
+fn appendOptionalString(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: ?[]const u8,
+) !void {
+    const present = value orelse {
+        try out.append(alloc, 0);
+        return;
+    };
+    try out.append(alloc, 1);
+    try appendRequiredString(alloc, out, present);
 }
 
 fn appendRestoreIntentIdentity(
@@ -9887,6 +9904,7 @@ test "metadata raft apply store runtime status codec preserves document identity
         .indexes = @constCast((&[_]metadata.RuntimeIndexStatusReport{.{
             .name = "visual_idx",
             .kind = "dense_vector",
+            .load_error = "InvalidRebuildState",
             .coverage_produced_count = 31,
             .coverage_skipped_count = 7,
             .coverage_terminal_failed_count = 2,
@@ -9931,6 +9949,7 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 6), status.doc_set_planning.missing_ordinal_coverage_count);
     try std.testing.expectEqual(@as(u64, 5), status.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expectEqual(@as(usize, 1), status.indexes.len);
+    try std.testing.expectEqualStrings("InvalidRebuildState", status.indexes[0].load_error.?);
     try std.testing.expectEqual(@as(u64, 31), status.indexes[0].coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 7), status.indexes[0].coverage_skipped_count);
     try std.testing.expectEqual(@as(u64, 2), status.indexes[0].coverage_terminal_failed_count);
@@ -9938,6 +9957,38 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
     try std.testing.expect(status.indexes[0].coverage_identity_ready);
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
+}
+
+test "metadata runtime index status decoder accepts version ten records" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
+        .name = "legacy_idx",
+        .kind = "dense_vector",
+        .doc_count = 17,
+        .replay_applied_sequence = 9,
+        .replay_target_sequence = 11,
+        .replay_catch_up_required = true,
+    });
+
+    // Version 10 ended immediately after replay_catch_up_required. The final
+    // absent optional-string tag is the only field appended by version 11.
+    try std.testing.expectEqual(@as(u8, 0), encoded.items[encoded.items.len - 1]);
+    encoded.items.len -= 1;
+
+    var pos: usize = 0;
+    const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
+
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqualStrings("legacy_idx", decoded.name);
+    try std.testing.expectEqual(@as(u64, 17), decoded.doc_count);
+    try std.testing.expectEqual(@as(u64, 9), decoded.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 11), decoded.replay_target_sequence);
+    try std.testing.expect(decoded.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

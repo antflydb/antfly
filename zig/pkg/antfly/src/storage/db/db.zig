@@ -16024,7 +16024,11 @@ pub const DB = struct {
     };
 
     fn denseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ self.core.path, index_name });
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}/indexes/{s}",
+            .{ self.core.index_manager.base_path, index_name },
+        );
     }
 
     fn denseArtifactNameForEntry(entry: anytype) []const u8 {
@@ -16655,8 +16659,8 @@ pub const DB = struct {
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-            const persisted_resume = try rebuild_state.check(alloc);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
+            const persisted_resume = try rebuild_state.checkWithIo(alloc, self.core.index_manager.checkpointIo());
             errdefer if (persisted_resume) |buf| alloc.free(buf);
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
             const config_hash = types.indexConfigHash(entry.config);
@@ -16716,7 +16720,7 @@ pub const DB = struct {
             const entry = &self.core.index_manager.dense_indexes.items[dense_index_idx];
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
             const active_count = entry.index.stats().active_count;
             if (candidate.invalid_generation_error) |last_error| {
                 try generation_repairs.append(alloc, .{
@@ -16724,7 +16728,7 @@ pub const DB = struct {
                     .trigger = .projection_generation_invalid,
                     .last_error = last_error,
                 });
-                if (candidate.persisted_resume != null) try rebuild_state.clear();
+                if (candidate.persisted_resume != null) try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 continue;
             }
             if (candidate.artifact_counter_required and
@@ -16735,7 +16739,7 @@ pub const DB = struct {
                     .trigger = .artifact_counter_missing,
                     .last_error = "dense_artifact_counter_missing",
                 });
-                if (candidate.persisted_resume != null) try rebuild_state.clear();
+                if (candidate.persisted_resume != null) try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 continue;
             }
             const artifact_target_count = if (target_counts.authoritative_targets.contains(dense_index_idx))
@@ -16756,7 +16760,7 @@ pub const DB = struct {
                     .trigger = .artifact_coverage_mismatch,
                     .last_error = "dense_artifact_coverage_surplus",
                 });
-                if (candidate.persisted_resume != null) try rebuild_state.clear();
+                if (candidate.persisted_resume != null) try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 continue;
             }
             const already_repaired = denseCoverageMatchesTarget(active_count, artifact_target_count) and
@@ -16764,11 +16768,11 @@ pub const DB = struct {
 
             if (candidate.persisted_resume) |buf| {
                 if (artifact_target_count == 0) {
-                    try rebuild_state.clear();
+                    try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                     continue;
                 }
                 if (already_repaired) {
-                    try rebuild_state.clear();
+                    try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                     continue;
                 }
                 try targets.append(alloc, .{
@@ -16838,8 +16842,8 @@ pub const DB = struct {
             });
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(self.alloc, entry.config.name);
             defer self.alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-            try rebuild_state.update(target.resume_from orelse "");
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
+            try rebuild_state.updateWithIo(self.core.index_manager.checkpointIo(), target.resume_from orelse "");
         }
     }
 
@@ -16848,7 +16852,7 @@ pub const DB = struct {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
             const applied_sequence = try self.core.loadAppliedSequence(alloc, entry.config.name);
             const target_sequence = try self.probeDerivedReplayTargetSequence(
                 alloc,
@@ -16862,7 +16866,7 @@ pub const DB = struct {
             const repaired = denseCoverageMatchesTarget(entry.index.stats().active_count, target.artifact_target_count) and
                 applied_sequence >= target_sequence;
             if (repaired) {
-                try rebuild_state.clear();
+                try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = applied_sequence,
@@ -16915,8 +16919,8 @@ pub const DB = struct {
                 if (applied_sequence < target_sequence) try self.core.saveAppliedSequence(entry.config.name, target_sequence);
                 const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
-                const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-                try rebuild_state.clear();
+                const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
+                try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = target_sequence,
                     .status = .clean,
@@ -17216,8 +17220,8 @@ pub const DB = struct {
                     const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
                     const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
                     defer persist.alloc.free(rebuild_root_path);
-                    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-                    try rebuild_state.update(last_key);
+                    const rebuild_state = persist.db.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
+                    try rebuild_state.updateWithIo(persist.db.core.index_manager.checkpointIo(), last_key);
                     const owned_key = try persist.alloc.dupe(u8, last_key);
                     errdefer persist.alloc.free(owned_key);
                     if (target.resume_from) |resume_from| persist.alloc.free(resume_from);
@@ -18712,7 +18716,7 @@ pub const DB = struct {
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
                     if (self.core.textIndexEntry(cfg.name)) |entry| {
-                        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18734,7 +18738,7 @@ pub const DB = struct {
                         }
                         const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                         defer alloc.free(rebuild_root_path);
-                        const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
                         if (item.doc_count < visible_doc_count) {
                             if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                                 item.backfill_active = true;
@@ -18766,7 +18770,7 @@ pub const DB = struct {
                         else
                             sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
-                        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18788,7 +18792,7 @@ pub const DB = struct {
                         item.node_count = graph_stats.node_count;
                         item.doc_count = graph_stats.node_count;
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
-                        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.graph, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18849,6 +18853,46 @@ pub const DB = struct {
         };
     }
 
+    fn applyStatusOnlyRebuildStateStats(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        item: *types.DBIndexStats,
+    ) !void {
+        if (cfg.kind == .algebraic) return;
+        const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root_path);
+        const rebuild_state = self.core.index_manager.rebuildState(cfg.kind, rebuild_root_path, cfg);
+        var loaded = try rebuild_state.loadWithIo(
+            alloc,
+            self.core.index_manager.checkpointIo(),
+        );
+        defer loaded.deinit(alloc);
+        const key = switch (loaded) {
+            .absent => return,
+            .valid => |resume_key| resume_key,
+            .legacy => {
+                item.backfill_active = true;
+                item.backfill_progress = 0;
+                return;
+            },
+            .corrupt => {
+                item.load_error = try alloc.dupe(u8, @errorName(error.InvalidRebuildState));
+                item.repair_degraded = true;
+                item.backfill_active = false;
+                item.backfill_progress = 0;
+                return;
+            },
+        };
+        const byte_range = self.core.byteRange();
+        item.backfill_active = true;
+        item.backfill_progress = backfill_state_mod.estimateProgressForKey(
+            byte_range.start,
+            byte_range.end,
+            key,
+        );
+    }
+
     fn statusOnlyStats(self: *DB, alloc: Allocator) !types.DBStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
@@ -18888,6 +18932,7 @@ pub const DB = struct {
             };
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
+            try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             try applyDurableIndexRepairStats(
                 alloc,
@@ -18903,9 +18948,11 @@ pub const DB = struct {
                 item.backfill_active = item.backfill_active or applied_sequence < target_sequence;
             }
             if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                if (item.load_error) |previous| alloc.free(previous);
                 item.load_error = try alloc.dupe(u8, load_error);
                 applyTerminalLoadFailureStatus(&item);
             } else if (try self.loadPersistedIndexLoadFailure(alloc, cfg.name)) |load_error| {
+                if (item.load_error) |previous| alloc.free(previous);
                 item.load_error = load_error;
                 applyTerminalLoadFailureStatus(&item);
             }
@@ -42384,6 +42431,14 @@ test "db status_only open reads index catalog without loading index state" {
         const indexes = try status_db.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, indexes);
         try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        var full_text_generation: u64 = 0;
+        for (indexes) |config| {
+            if (std.mem.eql(u8, config.name, "ft_v1")) {
+                full_text_generation = config.coverage_generation;
+                break;
+            }
+        }
+        try std.testing.expect(full_text_generation != 0);
 
         const stats = try status_db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
@@ -42399,6 +42454,66 @@ test "db status_only open reads index catalog without loading index state" {
             try std.testing.expect(item.root_node > 0);
         }
         try std.testing.expect(saw_dense);
+
+        const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1", .{std.mem.span(path)});
+        defer alloc.free(rebuild_root);
+        const stale_generation = if (full_text_generation == 1) 2 else full_text_generation - 1;
+        const stale_state = backfill_state_mod.RebuildState.initOwned(rebuild_root, null, stale_generation);
+        defer stale_state.clear() catch {};
+        try stale_state.update("doc:stale");
+
+        const stale_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, stale_stats);
+        const stale_ft = blk: {
+            for (stale_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(!stale_ft.backfill_active);
+
+        const current_state = backfill_state_mod.RebuildState.initOwned(rebuild_root, null, full_text_generation);
+        defer current_state.clear() catch {};
+        try current_state.update("doc:a");
+        const rebuilding_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, rebuilding_stats);
+        const rebuilding_ft = blk: {
+            for (rebuilding_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(rebuilding_ft.backfill_active);
+
+        try current_state.clear();
+        const current_state_path = try current_state.pathAlloc(alloc);
+        defer alloc.free(current_state_path);
+        const legacy_state = backfill_state_mod.RebuildState.init(rebuild_root);
+        const legacy_state_path = try legacy_state.pathAlloc(alloc);
+        defer alloc.free(legacy_state_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = legacy_state_path,
+            .data = "doc:legacy",
+        });
+
+        const legacy_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, legacy_stats);
+        const legacy_ft = blk: {
+            for (legacy_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(legacy_ft.backfill_active);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, current_state_path, .{}));
+        const preserved_legacy = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            legacy_state_path,
+            alloc,
+            .limited(1024),
+        );
+        defer alloc.free(preserved_legacy);
+        try std.testing.expectEqualStrings("doc:legacy", preserved_legacy);
     }
 }
 
@@ -60191,6 +60306,8 @@ test "db full-text backfill resumes after interrupted reopen" {
     defer index_manager_mod.test_text_backfill_batch_size = null;
     index_manager_mod.test_abort_text_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+    var state_path: ?[]u8 = null;
+    defer if (state_path) |owned| alloc.free(owned);
     {
         // A per-index load failure no longer fails the whole open; the index
         // is quarantined with its error recorded and retried on next open.
@@ -60198,11 +60315,15 @@ test "db full-text backfill resumes after interrupted reopen" {
         defer interrupted.close();
         const recorded = interrupted.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+
+        const cfg = interrupted.core.index_manager.get("ft_v1") orelse return error.IndexNotFound;
+        const rebuild_root = try interrupted.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root);
+        const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
+        state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -60211,7 +60332,7 @@ test "db full-text backfill resumes after interrupted reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "ft_v1",
@@ -60281,7 +60402,7 @@ test "db full-text backfill retires segment fanout at durable batch boundaries" 
     try std.testing.expectEqual(@as(u32, 24), result.total_hits);
 }
 
-test "db sparse backfill resumes after interrupted reopen" {
+test "db sparse backfill restarts safely from a legacy cursor after interrupted reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -60320,6 +60441,12 @@ test "db sparse backfill resumes after interrupted reopen" {
     defer index_manager_mod.test_sparse_backfill_batch_size = null;
     index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
+    const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1", .{std.mem.span(path)});
+    defer alloc.free(rebuild_root);
+    var owned_state_path: ?[]u8 = null;
+    defer if (owned_state_path) |owned| alloc.free(owned);
+    var resume_key: ?[]u8 = null;
+    defer if (resume_key) |owned| alloc.free(owned);
     {
         // A per-index load failure no longer fails the whole open; the index
         // is quarantined with its error recorded and retried on next open.
@@ -60327,20 +60454,30 @@ test "db sparse backfill resumes after interrupted reopen" {
         defer interrupted.close();
         const recorded = interrupted.core.index_manager.loadFailure("sp_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+
+        const cfg = interrupted.core.index_manager.get("sp_v1") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
+        owned_state_path = try rebuild_state.pathAlloc(alloc);
+        resume_key = (try rebuild_state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+        try std.testing.expect(resume_key.?.len > 0);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
-    defer alloc.free(interrupted_state);
-    try std.testing.expect(interrupted_state.len > 0);
+    // Simulate an upgrade from the legacy raw-cursor format. It cannot be
+    // trusted, so reopen must restart from the beginning without inflating the
+    // persisted sparse document count for rows already indexed above.
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, owned_state_path.?);
+    const legacy_rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root);
+    const legacy_state_path = try legacy_rebuild_state.pathAlloc(alloc);
+    defer alloc.free(legacy_state_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = legacy_state_path, .data = resume_key.? });
 
     index_manager_mod.test_abort_sparse_backfill_after_batches = null;
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, owned_state_path.?, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_state_path, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "sp_v1",
@@ -66612,7 +66749,6 @@ test "db dense artifact rebuild resumes from persisted state" {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
-    const rebuild_state = backfill_state_mod.RebuildState.init(dense_index_path);
 
     {
         var interrupted = try DB.open(alloc, std.mem.span(path), .{
@@ -66622,6 +66758,8 @@ test "db dense artifact rebuild resumes from persisted state" {
         });
         defer interrupted.close();
 
+        const dense_entry = interrupted.core.index_manager.denseIndex("dense_idx") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const ResumeFailureCtx = struct {
             rebuild_state: backfill_state_mod.RebuildState,
             persisted_calls: usize = 0,
@@ -66675,6 +66813,8 @@ test "db dense artifact rebuild resumes from persisted state" {
         });
         defer resumed.close();
 
+        const dense_entry = resumed.core.index_manager.denseIndex("dense_idx") orelse return error.IndexNotFound;
+        const rebuild_state = resumed.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const rebuilt = try resumed.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
         try std.testing.expectEqual(@as(usize, 4), rebuilt);
 
@@ -66689,6 +66829,96 @@ test "db dense artifact rebuild resumes from persisted state" {
         }
         try std.testing.expectEqual(@as(?u64, doc_count), dense_doc_count);
     }
+}
+
+test "db dense artifact rebuild persists state through external index storage" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    const index_base_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/index-namespace", .{tmp.sub_path});
+    defer alloc.free(index_base_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "single-file-container",
+    });
+
+    var index_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer index_storage.deinit();
+    const external_storage = index_storage.storage();
+
+    var db = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .index_backends = .{
+            .dense_storage_backend = .lsm,
+            .dense_lsm_storage = external_storage,
+        },
+        .physical_root_mode = .external_backend,
+        .index_base_path = index_base_path,
+        .external_derived_checkpoints = false,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\"}",
+        }},
+        .sync_level = .write,
+    });
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+    const rebuild_root_path = try db.denseIndexRebuildStatePathAlloc(alloc, "dense_idx");
+    defer alloc.free(rebuild_root_path);
+    const rebuild_state = db.core.index_manager.rebuildState(
+        .dense_vector,
+        rebuild_root_path,
+        db.core.index_manager.denseIndex("dense_idx").?.config,
+    );
+    try rebuild_state.updateWithIo(db.core.index_manager.checkpointIo(), "");
+    const persisted_cursor = (try rebuild_state.checkWithIo(alloc, db.core.index_manager.checkpointIo())) orelse
+        return error.MissingExternalRebuildState;
+    defer alloc.free(persisted_cursor);
+    const rebuilding_stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, rebuilding_stats);
+    var saw_dense_index = false;
+    var saw_active_backfill = false;
+    for (rebuilding_stats.indexes) |index| {
+        if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+        saw_dense_index = true;
+        saw_active_backfill = index.backfill_active;
+        try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+    }
+    try std.testing.expect(saw_dense_index);
+    try std.testing.expect(saw_active_backfill);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc),
+    );
+    try std.testing.expect((try rebuild_state.checkWithIo(alloc, db.core.index_manager.checkpointIo())) == null);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
 test "db dense artifact rebuild resume keys are owned by plan allocator" {
@@ -66935,7 +67165,6 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
-    const rebuild_state = backfill_state_mod.RebuildState.init(dense_index_path);
 
     {
         var interrupted = try DB.open(alloc, std.mem.span(path), .{
@@ -66945,6 +67174,8 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
         });
         defer interrupted.close();
 
+        const dense_entry = interrupted.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const ResumeFailureCtx = struct {
             rebuild_state: backfill_state_mod.RebuildState,
             persisted_calls: usize = 0,
@@ -66990,6 +67221,8 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
         });
         defer resumed.close();
 
+        const dense_entry = resumed.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        const rebuild_state = resumed.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         try std.testing.expect(try resumed.hasPendingDenseArtifactRebuild(alloc));
 
         const Capture = struct {
@@ -68881,6 +69114,8 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
 
     graph_mod.test_abort_reverse_rebuild_after_batches = 1;
     defer graph_mod.test_abort_reverse_rebuild_after_batches = null;
+    var state_path: ?[]u8 = null;
+    defer if (state_path) |owned| alloc.free(owned);
     {
         // A per-index load failure no longer fails the whole open; the index
         // is quarantined with its error recorded and retried on next open.
@@ -68888,11 +69123,15 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
         defer interrupted.close();
         const recorded = interrupted.core.index_manager.loadFailure("gr_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+
+        const cfg = interrupted.core.index_manager.get("gr_v1") orelse return error.IndexNotFound;
+        const rebuild_root = try interrupted.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root);
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.graph, rebuild_root, cfg.*);
+        state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/gr_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -68901,7 +69140,7 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
 
     const incoming = try reopened.getEdges(alloc, "gr_v1", "doc:target", "links", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, incoming);

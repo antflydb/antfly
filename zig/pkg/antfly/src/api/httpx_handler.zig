@@ -558,6 +558,10 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer commit_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
@@ -676,7 +680,10 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = self.api_server.alloc;
-        const sessions = try self.api_server.txn_sessions.listStatuses(alloc);
+        const sessions = try self.api_server.txn_sessions.listStatusesForPrincipal(
+            alloc,
+            if (authenticated_identity) |identity| identity.username else null,
+        );
         defer alloc.free(sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -714,7 +721,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction begin request");
         };
-        const session = try self.api_server.txn_sessions.begin(alloc, begin_req, self.api_server.localSessionNodeId());
+        const session = try self.api_server.txn_sessions.beginForPrincipal(
+            alloc,
+            begin_req,
+            self.api_server.localSessionNodeId(),
+            if (authenticated_identity) |identity| identity.username else null,
+        );
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
@@ -738,6 +750,10 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const alloc = self.api_server.alloc;
         var details = (self.api_server.txn_sessions.getDetails(alloc, txn_id) catch |err| switch (err) {
@@ -775,6 +791,10 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
@@ -784,6 +804,10 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer stage_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
         const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -818,12 +842,22 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         const alloc = self.api_server.alloc;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid transaction read request");
         };
         defer read_req.deinit(alloc);
+        if (authenticated_identity) |identity| {
+            if (!http_server_mod.permissionsAllow(identity.permissions, .table, read_req.table_name, .read)) {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            }
+        }
 
         var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshot(alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
             error.SessionLeaseLost => {
@@ -852,6 +886,18 @@ pub const AntflyApiHandler = struct {
             if (fetched.document_json) |document_json| alloc.free(document_json);
         } else if (owned_snapshot.version == 0) {
             owned_snapshot.version = read_req.version;
+        }
+        if (!(try self.api_server.transactionReadSnapshotVisible(
+            authenticated_identity,
+            owned_snapshot.table_name,
+            owned_snapshot.key,
+            owned_snapshot.document_json,
+        ))) {
+            if (owned_snapshot.document_json) |document_json| {
+                alloc.free(document_json);
+                owned_snapshot.document_json = null;
+            }
+            owned_snapshot.version = 0;
         }
         if (owned_snapshot.version != read_req.version) {
             var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -914,6 +960,10 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         const alloc = self.api_server.alloc;
         var stage_req = switch (kind) {
             .write => transactions_api.parseStageWriteRequest(alloc, body_data) catch {
@@ -926,6 +976,10 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer stage_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
         const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -959,6 +1013,10 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, txn_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
@@ -1002,6 +1060,10 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -1040,6 +1102,10 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         const alloc = self.api_server.alloc;
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
             _ = ctx.status(404);
@@ -1076,6 +1142,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("transaction has no staged writes");
         };
         defer commit_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
@@ -1215,6 +1285,10 @@ pub const AntflyApiHandler = struct {
         if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
             _ = ctx.status(404);

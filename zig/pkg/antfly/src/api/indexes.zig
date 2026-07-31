@@ -1349,6 +1349,10 @@ fn aggregateIndexStatusIndexed(
         if (!runtime_present) continue;
         aggregate.reported_group_count += 1;
         aggregate.runtime_present = true;
+        // Integrity failures are current index-scoped facts even when the
+        // surrounding runtime snapshot is stale or failed. Capture them before
+        // gating materialization counters on freshness.
+        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
             aggregate.fresh_group_count += 1;
             aggregate.runtime_fresh = true;
@@ -1387,7 +1391,6 @@ fn aggregateIndexStatusIndexed(
             continue;
         }
         materialization_count += 1;
-        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
         if (publicIndexRepairState(item)) |state| {
             if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
                 aggregate.repair_state = state;
@@ -1911,6 +1914,47 @@ test "derived coverage aggregation rejects mixed config observations" {
     );
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"observation_incomplete_reasons\":[\"runtime_unavailable\",\"missing_group\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
+}
+
+test "rebuild quarantine remains an explicit failed public index status" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "search_idx",
+        .kind = .full_text,
+        .load_error = "InvalidRebuildState",
+    };
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .rebuild_state_quarantine, .freshness = .failed },
+        .stats = .{ .index_count = 1, .indexes = @constCast((&[_]db_mod.types.DBIndexStats{item})[0..]) },
+    }};
+    const aggregate = aggregateIndexStatus(&runtimes, "search_idx", &.{1}, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("InvalidRebuildState", aggregate.load_error.?);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .full_text,
+        item,
+        0,
+        .strict,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        runtimes[0].metadata,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"backfill_state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: InvalidRebuildState\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"runtime_source\":\"rebuild_state_quarantine\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"runtime_freshness\":\"failed\"") != null);
 }
 
 test "index status exposes compact repair state without internal diagnostics" {
@@ -2626,7 +2670,7 @@ fn appendSingleIndexRuntimeStatus(
     // operator-visible error. Once a repair intent exists, the compact repair
     // state is authoritative; exposing the quarantined root's raw load error
     // at the same time would incorrectly tell clients to drop/recreate.
-    const raw_load_error: ?[]const u8 = if (embeddings_materialization_current and @hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
     const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
     if (load_error != null) {
         backfill_active = false;
