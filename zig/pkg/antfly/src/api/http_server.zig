@@ -2276,7 +2276,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" });
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, null);
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror![]u8 {
@@ -2289,6 +2289,7 @@ pub const ApiHttpServer = struct {
             row_filter_json,
             null,
             execution_deadline_ns,
+            null,
         );
     }
 
@@ -6216,7 +6217,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableQuery(uri_parts.path)) |query_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, query_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicTableQueryWithContentType(table_name, req.body, req.content_type, authenticated_identity);
+                return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, req.body, req.content_type, authenticated_identity, req.cancellation);
             }
         }
         if (req.method == .POST) {
@@ -8567,7 +8568,7 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -8622,6 +8623,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const std.atomic.Value(bool),
     ) ![]u8 {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
@@ -8637,6 +8639,7 @@ pub const ApiHttpServer = struct {
                 row_filter_json,
                 authenticated_identity,
                 request_deadline_ns,
+                cancellation,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch, error.IdentityReadGenerationChanged => {
                     const now_ns = platform_time.monotonicNs();
@@ -8667,6 +8670,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) ![]u8 {
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
@@ -8679,6 +8683,7 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
                 request_deadline_ns,
                 queryEmbeddingSecurityScope(authenticated_identity),
+                cancellation,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.InvalidFilterQueryRequest,
@@ -8770,6 +8775,7 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             request_deadline_ns,
             queryEmbeddingSecurityScope(authenticated_identity),
+            cancellation,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest,
@@ -9177,6 +9183,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !query_api.QueryResponse {
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
@@ -9205,6 +9212,7 @@ pub const ApiHttpServer = struct {
             query_req.req.execution_deadline_ns = deadline;
             if (retryDeadlineExpired(deadline, platform_time.monotonicNs())) return error.Timeout;
         }
+        query_req.req.cancellation = cancellation;
         self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
@@ -10705,10 +10713,21 @@ pub const ApiHttpServer = struct {
         content_type: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
+        return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, content_type, authenticated_identity, null);
+    }
+
+    fn handlePublicTableQueryWithContentTypeCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQuery(table_name, body, authenticated_identity);
         }
-        return try self.handlePublicTableQuery(table_name, body, authenticated_identity);
+        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
     }
 
     pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
@@ -10771,6 +10790,16 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, null);
+    }
+
+    fn handlePublicTableQueryWithCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
@@ -10783,6 +10812,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
+            if (cancellation) |value| &value.cancelled else null,
         ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
         defer self.alloc.free(response_body);
 
@@ -10835,6 +10865,7 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
+                null,
             ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 

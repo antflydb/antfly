@@ -2771,6 +2771,42 @@ fn buildMultiDocSegment(alloc: Allocator, docs: []const struct { doc_id: []const
     return seg_writer.build();
 }
 
+fn buildHighFrequencyKeywordSegment(alloc: Allocator) ![]u8 {
+    const published_count = 4_237;
+    const total_count = 5_000;
+    var body_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
+    defer body_builder.deinit();
+    var state_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
+    defer state_builder.deinit();
+
+    for (0..total_count) |i| {
+        const doc_num: u32 = @intCast(i);
+        try body_builder.addDocument(doc_num, &.{.{ .term = "document", .freq = 1, .norm = 10 }});
+        try state_builder.addDocument(doc_num, &.{.{
+            .term = if (i < published_count) "published" else "draft",
+            .freq = 1,
+            .norm = 10,
+        }});
+    }
+    const body_data = try body_builder.build();
+    defer alloc.free(body_data);
+    const state_data = try state_builder.build();
+    defer alloc.free(state_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const body_field = try seg_writer.addField("body");
+    try seg_writer.addSection(body_field, .inverted_text, body_data);
+    const state_field = try seg_writer.addField("state");
+    try seg_writer.addSection(state_field, .inverted_text, state_data);
+    var doc_id_buf: [32]u8 = undefined;
+    for (0..total_count) |i| {
+        const doc_id = try std.fmt.bufPrint(&doc_id_buf, "doc:{d}", .{i});
+        try seg_writer.addStoredDoc(doc_id, "{}");
+    }
+    return seg_writer.build();
+}
+
 var persist_tmp_nonce: u64 = 0;
 
 fn persistTmpPath(buf: []u8) [*:0]const u8 {
@@ -2840,6 +2876,48 @@ test "persistent index reopen recovery" {
         const results = try snap.search(alloc, "body", &.{"hello"}, 10);
         defer alloc.free(results.hits);
         try std.testing.expect(results.hits.len >= 1);
+    }
+}
+
+test "persistent index keeps high-frequency keyword postings across two read-only restarts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    const segment = try buildHighFrequencyKeywordSegment(alloc);
+    defer alloc.free(segment);
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path, .main_backend = .lsm });
+        defer index.close();
+        try index.indexSegment(segment);
+        try index.syncMain(true);
+        const snapshot = index.snapshot();
+        const published = try snapshot.search(alloc, "state", &.{"published"}, 5_000);
+        defer alloc.free(published.hits);
+        try std.testing.expectEqual(@as(u32, 4_237), published.total_count);
+    }
+
+    // Neither recovery opens writes nor re-indexes the documents. Each cycle
+    // must rebuild the reader directly from the durable posting representation.
+    for (0..2) |_| {
+        var reopened = try PersistentIndex.open(alloc, .{
+            .path = path,
+            .main_backend = .lsm,
+            .read_only = true,
+        });
+        defer reopened.close();
+        const snapshot = reopened.snapshot();
+        const published = try snapshot.search(alloc, "state", &.{"published"}, 5_000);
+        defer alloc.free(published.hits);
+        try std.testing.expectEqual(@as(u32, 4_237), published.total_count);
+        const draft = try snapshot.search(alloc, "state", &.{"draft"}, 5_000);
+        defer alloc.free(draft.hits);
+        try std.testing.expectEqual(@as(u32, 763), draft.total_count);
+        const unfiltered = try snapshot.search(alloc, "body", &.{"document"}, 5_000);
+        defer alloc.free(unfiltered.hits);
+        try std.testing.expectEqual(@as(u32, 5_000), unfiltered.total_count);
+        try std.testing.expectEqual(@as(u32, 5_000), snapshot.global_doc_count);
     }
 }
 

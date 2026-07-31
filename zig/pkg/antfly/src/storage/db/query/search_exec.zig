@@ -2952,6 +2952,9 @@ fn logExactSortBudgetRejection(
 }
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
@@ -24994,6 +24997,21 @@ test "match_all rejects expired execution deadline" {
         .include_stored = false,
         .limit = 10,
         .execution_deadline_ns = platform_time.monotonicNs(),
+    }, testMatchAllExecutor(&ctx)));
+}
+
+test "match_all aborts the real search execution path when request cancellation is signaled" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    var cancellation = std.atomic.Value(bool).init(true);
+
+    try std.testing.expectError(error.Cancelled, searchMatchAll(alloc, .{
+        .include_stored = false,
+        .limit = 10,
+        .cancellation = &cancellation,
     }, testMatchAllExecutor(&ctx)));
 }
 

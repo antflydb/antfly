@@ -297,6 +297,10 @@ const metadata_bootstrap_retry_base_ms: u64 = 250;
 const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
 const metadata_bootstrap_retry_jitter_ms: u64 = 250;
 const public_api_max_connection_threads: u32 = 64;
+// Leave half of the public connection slots available to parse, reject, and
+// drain overload traffic. Health has its own listener; this bound prevents
+// expensive public queries from consuming every worker under client timeouts.
+const public_api_max_active_requests: u32 = 32;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -641,6 +645,7 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
         .max_request_bytes = antfly.public_api.http_server.public_api_max_request_body_bytes,
         .serve_in_connection_threads = true,
         .max_connection_threads = public_api_max_connection_threads,
+        .max_active_requests = public_api_max_active_requests,
     };
 }
 
@@ -649,6 +654,7 @@ test "data public API listener uses public API request body limit" {
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
     try std.testing.expect(cfg.serve_in_connection_threads);
     try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
+    try std.testing.expectEqual(public_api_max_active_requests, cfg.max_active_requests);
 }
 
 const DataDescriptorFactory = struct {
