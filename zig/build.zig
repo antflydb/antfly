@@ -3122,6 +3122,8 @@ pub fn build(b: *std.Build) void {
         "postgres libpq permit saturation preserves zero-connection pools",
         "postgres libpq async reader services input while flushing and between results",
         "postgres libpq async reader rejects and clears additional results",
+        "postgres libpq async reader observes cancellation after bounded wait before consuming input",
+        "postgres libpq async reader returns cancelled before waiting or consuming input",
         "postgres libpq created replication snapshot cloning is allocation-failure safe",
         "postgres libpq weighted FIFO preserves a queued two-permit cutover",
         "postgres libpq timed out weighted head hands released capacity to follower",
