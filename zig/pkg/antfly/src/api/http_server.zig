@@ -10896,7 +10896,13 @@ pub const ApiHttpServer = struct {
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
             if (cancellation) |value| {
-                if (value.isCancelled()) return error.Cancelled;
+                if (value.isCancelled()) {
+                    return try self.publicQueryDispatchErrorResponse(
+                        route_table_name orelse "",
+                        raw_line,
+                        error.Cancelled,
+                    );
+                }
             }
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
@@ -26042,6 +26048,39 @@ test "api http server preserves public query availability errors" {
         try std.testing.expectEqual(case.status, multi_resp.status);
         try std.testing.expectEqualStrings(case.body, multi_resp.body);
     }
+}
+
+test "api http server maps cancelled NDJSON multi-query to client closed response" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), null, null);
+    defer server.deinit();
+    var cancellation = http_common.RequestCancellation{};
+    cancellation.cancel();
+
+    var resp = try server.handlePublicTableQueryWithContentTypeCancellation(
+        "docs",
+        "{\"query\":{\"match_all\":{}}}\n",
+        "application/x-ndjson",
+        null,
+        &cancellation,
+    );
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 499), resp.status);
+    try std.testing.expectEqualStrings("client closed request", resp.body);
 }
 
 test "api http server retries transient query EndOfStream before returning 500" {
