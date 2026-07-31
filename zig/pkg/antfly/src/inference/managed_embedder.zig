@@ -890,8 +890,8 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequest
 }
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
-    const deadline = entry.deadline_ns orelse return;
     if (entry.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+    const deadline = entry.deadline_ns orelse return;
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
 
