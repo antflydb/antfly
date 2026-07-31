@@ -1646,6 +1646,18 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
     };
 }
 
+test "lsm compaction sizes bloom filters per bounded output run" {
+    var first = testRun(1, 0, "doc:a", "doc:m", 1000);
+    first.entry_count = 100;
+    var second = testRun(2, 0, "doc:n", "doc:z", 1000);
+    second.entry_count = 100;
+    const inputs = [_]*Run{ &first, &second };
+
+    try std.testing.expectEqual(@as(usize, 38), estimatedCompactionOutputEntries(&inputs, 500));
+    try std.testing.expectEqual(@as(usize, 3), estimatedCompactionOutputEntries(&inputs, 40));
+    try std.testing.expectEqual(@as(usize, 1), estimatedCompactionOutputEntries(&inputs, 1));
+}
+
 test "lsm compaction lower-level repair can exceed input target for minimum job" {
     const runs = [_]Run{
         testRun(1, 1, "doc:a", "doc:m", 100),
@@ -1907,7 +1919,7 @@ fn makeStateRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendTy
     return try makeRunsFromStateAtLevel(BackendType, backend, &merged, level);
 }
 
-fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32) !std.ArrayListUnmanaged(Run) {
+pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32) !std.ArrayListUnmanaged(Run) {
     const allocator = backend.allocator;
     const expected_entries = countRunPtrEntries(window_runs);
 
@@ -1930,6 +1942,7 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
     var output_active = false;
     defer if (output_active) output.deinit();
     const target_bytes = targetRunFileBytes(BackendType, backend);
+    const expected_entries_per_output = estimatedCompactionOutputEntries(window_runs, target_bytes);
     var consumed_entries: usize = 0;
     var emitted_entries: usize = 0;
 
@@ -1960,10 +1973,11 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
         }
 
         if (!output_active) {
+            const remaining_entries = expected_entries - consumed_entries;
             try output.initInPlace(
                 backend,
                 output_level,
-                @max(@as(usize, 1), expected_entries),
+                @max(@as(usize, 1), @min(remaining_entries, expected_entries_per_output)),
             );
             output_active = true;
         }
@@ -2348,6 +2362,30 @@ fn tableEntryLogicalBytes(entry: lsm_table_file.Entry) usize {
         entry.value.len;
 }
 
+const minimum_table_entry_logical_bytes = 1 + 3 * @sizeOf(u32);
+
+/// Size each output Bloom filter for one target-sized run, rather than for the
+/// entire compaction window. The physical input density gives a useful
+/// workload-specific estimate; the encoded minimum supplies a hard upper
+/// bound even for highly compressed inputs or incomplete legacy metadata.
+fn estimatedCompactionOutputEntries(window_runs: []const *Run, target_bytes: usize) usize {
+    var total_entries: u128 = 0;
+    var total_bytes: u128 = 0;
+    for (window_runs) |run| {
+        total_entries +|= run.entry_count;
+        total_bytes +|= run.size_bytes;
+    }
+    if (total_entries == 0) return 1;
+
+    const encoded_upper_bound = @max(@as(u128, 1), @as(u128, target_bytes) / minimum_table_entry_logical_bytes);
+    const proportional = if (total_bytes == 0)
+        encoded_upper_bound
+    else
+        (@as(u128, target_bytes) *| total_entries +| (total_bytes - 1)) / total_bytes;
+    const bounded = @max(@as(u128, 1), @min(total_entries, @min(proportional, encoded_upper_bound)));
+    return @intCast(@min(bounded, std.math.maxInt(usize)));
+}
+
 fn ensureRunStateForBackend(comptime BackendType: type, backend: *BackendType, run: *Run) !*const State {
     if (@hasField(BackendType, "storage")) {
         if (backend.storage) |storage| return try run.ensureStateWithStorage(backend.allocator, storage);
@@ -2407,7 +2445,7 @@ pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendTy
     return try makeRunsFromSortedTableEntriesAtLevel(BackendType, backend, entries, 0);
 }
 
-fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
+pub fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
     if (state.entries.items.len == 0) return error.EmptyRun;
     try validateSortedUniqueOwnedEntries(state.entries.items);
 
@@ -2571,14 +2609,16 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
     errdefer if (run.bloom_filter) |*filter| filter.deinit(backend.allocator);
 
     if (backend.root_dir != null) {
-        run.path = try repository_mod.persistRunFileWithStorageAccounted(
+        run.path = try repository_mod.persistRunFileWithStorageAccountedOptions(
             backend.storage.?,
             backend.allocator,
             backend.root_dir.?,
             &run,
+            backend.options.bloom,
             backend.options.table_block_compression,
             backend.options.table_prefix_extractor,
             backend.options.resource_manager,
+            physicalRunFileLimit(BackendType, backend),
         );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
         run.state = null;

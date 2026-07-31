@@ -2180,6 +2180,23 @@ const RuntimeStatusDiskUsageCacheEntry = struct {
     valid: bool = false,
 };
 
+const RuntimeStatusDiskUsageScanner = struct {
+    ptr: ?*anyopaque = null,
+    scan_fn: *const fn (ptr: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror!u64,
+
+    fn scan(self: @This(), alloc: std.mem.Allocator, path: []const u8) !u64 {
+        return try self.scan_fn(self.ptr, alloc, path);
+    }
+
+    fn directory() @This() {
+        return .{ .scan_fn = scanDirectory };
+    }
+
+    fn scanDirectory(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) !u64 {
+        return try directoryUsageBytes(alloc, path);
+    }
+};
+
 fn runtimeStatusDiskUsageCacheReusable(
     entry: RuntimeStatusDiskUsageCacheEntry,
     lsm_root_generation: u64,
@@ -2919,6 +2936,86 @@ test "runtime status disk usage cache is scoped to one root generation and group
     try std.testing.expect(!server.runtime_status_disk_usage_cache.get(7).?.valid);
     try std.testing.expect(server.runtime_status_disk_usage_cache.get(8).?.valid);
     try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
+}
+
+test "runtime status disk scan retries when maintenance invalidates its group" {
+    const ControlledScanner = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn interface(self: *@This()) RuntimeStatusDiskUsageScanner {
+            return .{ .ptr = self, .scan_fn = scan };
+        }
+
+        fn scan(ptr: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const call = self.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) {
+                self.entered.store(true, .release);
+                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+                return 111;
+            }
+            return 222;
+        }
+    };
+    const ScanThread = struct {
+        server: *DataServer,
+        scanner: RuntimeStatusDiskUsageScanner,
+        result: ?u64 = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.server.runtimeStatusDiskUsageBytesBestEffortWithScanner(
+                7,
+                "unused-by-controlled-scanner",
+                .{
+                    .group_id = 7,
+                    .metadata = .{ .lsm_root_generation = 3 },
+                    .stats = .{ .doc_count = 1 },
+                },
+                self.scanner,
+            );
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            ".",
+            catalog,
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    var controlled = ControlledScanner{};
+    var scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
+    const thread = try std.Thread.spawn(.{}, ScanThread.run, .{&scan_thread});
+    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    // This models a completed flush/compaction publishing a new storage view
+    // while the status scan still observes the old directory contents.
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+    controlled.release.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(@as(?u64, 222), scan_thread.result);
+    try std.testing.expectEqual(@as(u32, 2), controlled.calls.load(.acquire));
+    const cached = server.runtime_status_disk_usage_cache.get(7).?;
+    try std.testing.expect(cached.valid);
+    try std.testing.expectEqual(@as(u64, 222), cached.disk_bytes);
+    try std.testing.expectEqual(@as(u64, 3), cached.lsm_root_generation);
 }
 
 test "data runtime stamps one producer generation on every reported group" {
@@ -8655,6 +8752,16 @@ pub const DataServer = struct {
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
     ) ?u64 {
+        return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory());
+    }
+
+    fn runtimeStatusDiskUsageBytesBestEffortWithScanner(
+        self: *DataServer,
+        group_id: u64,
+        db_path: []const u8,
+        status: runtime_status.LocalTableRuntimeStatus,
+        scanner: RuntimeStatusDiskUsageScanner,
+    ) ?u64 {
         const active = runtimeStatusHasActiveBackgroundWork(status);
         const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
             status.metadata.lsm_root_generation
@@ -8685,7 +8792,7 @@ pub const DataServer = struct {
             self.runtime_status_disk_usage_cache_mutex.unlock();
 
             if (active and status.stats.doc_count == 0) return null;
-            const disk_bytes = directoryUsageBytes(self.alloc, db_path) catch return null;
+            const disk_bytes = scanner.scan(self.alloc, db_path) catch return null;
 
             lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
             const current = self.runtime_status_disk_usage_cache.getPtr(group_id) orelse {

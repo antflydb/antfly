@@ -202,7 +202,11 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
     }
     cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
-    if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
+        backend.noteRecoveredWriteMutationLocked();
+    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
         backend.noteWriteMutationLocked();

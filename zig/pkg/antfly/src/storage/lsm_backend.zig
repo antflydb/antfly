@@ -362,6 +362,11 @@ pub const Options = struct {
     wal_hard_limit_segments: u64 = 0,
     wal_soft_limit_bytes: u64 = 0,
     wal_hard_limit_bytes: u64 = 0,
+    // Adaptive soft checkpoint bound for overwrite-heavy small databases.
+    // When non-zero, retained WAL is compared with this multiple of the
+    // current run + mutable logical footprint, subject to the byte floor.
+    wal_checkpoint_live_bytes_multiplier: u32 = 0,
+    wal_checkpoint_live_bytes_floor: u64 = 0,
     // When background flush is unable to keep up, perform at most one
     // checkpoint-producing immutable flush per enforcement interval after the
     // soft WAL bound is crossed. This avoids accumulating to the hard bound
@@ -1993,6 +1998,27 @@ pub const Backend = struct {
         self.notePotentialMaintenanceDebtLocked();
     }
 
+    /// WAL replay proves this mutable state was already dirty before this
+    /// process started. Its original monotonic timestamp cannot be recovered,
+    /// so granting it a fresh maximum-age interval on every restart could
+    /// postpone checkpointing forever. Make recovered state immediately
+    /// eligible; the maintenance worker still performs the normal atomic
+    /// run/manifest/WAL checkpoint sequence.
+    pub fn noteRecoveredWriteMutationLocked(self: *Backend) void {
+        if (self.options.mutable_idle_flush_after_ns > 0 and
+            self.mutable.entries.items.len > 0 and
+            !self.options.backend.read_only)
+        {
+            const due_ns = @max(self.nowNs(), 1);
+            self.mutable_idle_flush_deadline_ns = due_ns;
+            self.mutable_idle_flush_max_deadline_ns = due_ns;
+        } else {
+            self.mutable_idle_flush_deadline_ns = 0;
+            self.mutable_idle_flush_max_deadline_ns = 0;
+        }
+        self.notePotentialMaintenanceDebtLocked();
+    }
+
     fn wakeMaintenanceWorker(self: *Backend) void {
         if (self.options.maintenance_waker) |waker| waker.wake();
     }
@@ -2884,7 +2910,10 @@ pub const Backend = struct {
             switch (classifyRun(run.*, split_key)) {
                 .left => {},
                 .right => {
-                    try dest.runs.append(self.allocator, try cloneRunForBackend(&dest, run.*));
+                    const source_runs = [_]*Run{run};
+                    var child_runs = try compaction_mod.makePersistedRunsFromSelectedRuns(Backend, &dest, &source_runs, run.level);
+                    defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
+                    try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
                     wrote_any = true;
                 },
                 .overlap => {
@@ -2892,8 +2921,9 @@ pub const Backend = struct {
                     var split = try run_state.splitAtKey(self.allocator, split_key);
                     defer split.deinit(self.allocator);
                     if (split.right.entries.items.len == 0) continue;
-                    try dest.runs.append(self.allocator, try dest.makeRun(split.right));
-                    split.right = .{};
+                    var child_runs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &dest, &split.right, run.level);
+                    defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
+                    try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
                     wrote_any = true;
                 },
             }
@@ -2916,12 +2946,15 @@ pub const Backend = struct {
         const allocator = self.allocator;
         var old_runs = self.runs;
         self.runs = .empty;
-        errdefer self.runs = old_runs;
+        var ownership_committed = false;
+        errdefer {
+            if (!ownership_committed) self.runs = old_runs;
+        }
 
         const RunAction = union(enum) {
             keep,
             drop,
-            replace: Run,
+            replace: std.ArrayListUnmanaged(Run),
         };
 
         var actions = try allocator.alloc(RunAction, old_runs.items.len);
@@ -2930,7 +2963,7 @@ pub const Backend = struct {
         errdefer {
             for (actions[0..actions_initialized]) |*action| {
                 switch (action.*) {
-                    .replace => |*run| run.deinit(allocator),
+                    .replace => |*runs| compaction_mod.discardOutputRuns(Backend, self, runs),
                     .keep, .drop => {},
                 }
             }
@@ -2951,8 +2984,7 @@ pub const Backend = struct {
                     if (split.left.entries.items.len == 0) {
                         actions[i] = .drop;
                     } else {
-                        actions[i] = .{ .replace = try self.makeRun(split.left) };
-                        split.left = .{};
+                        actions[i] = .{ .replace = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level) };
                     }
                     changed = true;
                 },
@@ -2970,13 +3002,39 @@ pub const Backend = struct {
             for (rewritten.items) |*run| run.deinit(allocator);
             rewritten.deinit(allocator);
         }
-        try rewritten.ensureTotalCapacity(allocator, old_runs.items.len);
+        var rewritten_run_count: usize = 0;
+        var obsolete_run_count: usize = 0;
+        for (actions[0..actions_initialized]) |action| switch (action) {
+            .keep => rewritten_run_count += 1,
+            .drop => obsolete_run_count += 1,
+            .replace => |replacements| {
+                rewritten_run_count += replacements.items.len;
+                obsolete_run_count += 1;
+            },
+        };
+        try rewritten.ensureTotalCapacity(allocator, rewritten_run_count);
 
         var obsolete_runs = std.ArrayListUnmanaged(Run).empty;
         errdefer {
             for (obsolete_runs.items) |*run| run.deinit(allocator);
             obsolete_runs.deinit(allocator);
         }
+        try obsolete_runs.ensureTotalCapacity(allocator, obsolete_run_count);
+
+        var obsolete_paths = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (obsolete_paths.items) |path| allocator.free(path);
+            obsolete_paths.deinit(allocator);
+        }
+        try obsolete_paths.ensureTotalCapacity(allocator, obsolete_run_count);
+        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+            .keep => {},
+            .drop, .replace => if (run.path) |path| {
+                obsolete_paths.appendAssumeCapacity(try allocator.dupe(u8, path));
+            },
+        };
+        try self.obsolete_paths.ensureUnusedCapacity(allocator, obsolete_paths.items.len);
+        try self.obsolete_runs.ensureUnusedCapacity(allocator, 1);
 
         for (old_runs.items, 0..) |*run, i| {
             switch (actions[i]) {
@@ -2985,24 +3043,49 @@ pub const Backend = struct {
                     run.* = undefined;
                 },
                 .drop => {
-                    if (run.path) |path| try self.queueObsoleteFilePath(try allocator.dupe(u8, path));
-                    try obsolete_runs.append(allocator, run.*);
+                    obsolete_runs.appendAssumeCapacity(run.*);
                     run.* = undefined;
                 },
-                .replace => |replacement| {
-                    rewritten.appendAssumeCapacity(replacement);
-                    if (run.path) |path| try self.queueObsoleteFilePath(try allocator.dupe(u8, path));
-                    try obsolete_runs.append(allocator, run.*);
+                .replace => |*replacements| {
+                    for (replacements.items) |*replacement| {
+                        rewritten.appendAssumeCapacity(replacement.*);
+                        replacement.* = undefined;
+                    }
+                    replacements.items.len = 0;
+                    replacements.deinit(allocator);
+                    replacements.* = .empty;
+                    obsolete_runs.appendAssumeCapacity(run.*);
                     run.* = undefined;
                 },
             }
         }
 
         old_runs.deinit(allocator);
+        old_runs = .empty;
         compaction_mod.sortRuns(rewritten.items);
         self.runs = rewritten;
-        try self.queueObsoleteRuns(obsolete_runs);
-        try self.persistManifest();
+        rewritten = .empty;
+        ownership_committed = true;
+        self.persistManifest() catch |err| {
+            // The in-memory rewrite remains valid, but the durable manifest
+            // still references the old files. Retire their metadata without
+            // making those paths deletion-eligible; a later successful
+            // manifest publish or reopen orphan scan reconciles the files.
+            for (obsolete_runs.items) |*run| self.releaseRunVersionRef(run);
+            self.obsolete_runs.appendAssumeCapacity(obsolete_runs);
+            obsolete_runs = .empty;
+            self.drainUnpinnedObsoleteRuns();
+            return err;
+        };
+        for (obsolete_paths.items) |*path| {
+            self.queueObsoleteFilePathAssumeCapacity(path.*);
+            path.* = &.{};
+        }
+        obsolete_paths.items.len = 0;
+        for (obsolete_runs.items) |*run| self.releaseRunVersionRef(run);
+        self.obsolete_runs.appendAssumeCapacity(obsolete_runs);
+        obsolete_runs = .empty;
+        self.drainUnpinnedObsoleteRuns();
         return true;
     }
 
@@ -4235,6 +4318,11 @@ pub const Backend = struct {
     }
 
     pub fn queueObsoleteFilePath(self: *Backend, path: []u8) !void {
+        try self.obsolete_paths.ensureUnusedCapacity(self.allocator, 1);
+        self.queueObsoleteFilePathAssumeCapacity(path);
+    }
+
+    fn queueObsoleteFilePathAssumeCapacity(self: *Backend, path: []u8) void {
         const delete_after_ns = self.nowNs() +| self.options.obsolete_retention_ns;
         for (self.obsolete_paths.items) |*obsolete| {
             if (!std.mem.eql(u8, obsolete.path, path)) continue;
@@ -4245,7 +4333,7 @@ pub const Backend = struct {
             return;
         }
 
-        try self.obsolete_paths.append(self.allocator, .{
+        self.obsolete_paths.appendAssumeCapacity(.{
             .path = path,
             .delete_after_ns = delete_after_ns,
         });
@@ -4607,7 +4695,8 @@ pub const Backend = struct {
         return self.options.wal_soft_limit_segments > 0 or
             self.options.wal_hard_limit_segments > 0 or
             self.options.wal_soft_limit_bytes > 0 or
-            self.options.wal_hard_limit_bytes > 0;
+            self.options.wal_hard_limit_bytes > 0 or
+            self.options.wal_checkpoint_live_bytes_multiplier > 0;
     }
 
     fn snapshotWalRetentionForPressureLocked(self: *Backend) !?wal_mod.RetentionStats {
@@ -4664,7 +4753,27 @@ pub const Backend = struct {
     fn walRetentionOverSoftLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
         if (self.options.wal_soft_limit_segments > 0 and retention.segments > self.options.wal_soft_limit_segments) return true;
         if (self.options.wal_soft_limit_bytes > 0 and retention.bytes > self.options.wal_soft_limit_bytes) return true;
+        if (self.walCheckpointLiveBytesLimit()) |limit| {
+            if (retention.bytes > limit) return true;
+        }
         return self.walRetentionOverHardLimit(retention);
+    }
+
+    fn walCheckpointLiveBytesLimit(self: *const Backend) ?u64 {
+        const multiplier = self.options.wal_checkpoint_live_bytes_multiplier;
+        if (multiplier == 0) return null;
+
+        // Run metadata carries exact physical bytes, while mutable generations
+        // maintain logical byte counters in O(1). The check is independent of
+        // corpus cardinality and write rate apart from the bounded run list.
+        var live_bytes: u64 = 0;
+        for (self.runs.items) |run| live_bytes +|= run.size_bytes;
+        live_bytes +|= estimateStateLogicalBytes(&self.mutable);
+        for (self.activeImmutableMemtables()) |immutable| {
+            live_bytes +|= estimateStateLogicalBytes(immutable);
+        }
+        const scaled = std.math.mul(u64, live_bytes, multiplier) catch std.math.maxInt(u64);
+        return @max(self.options.wal_checkpoint_live_bytes_floor, scaled);
     }
 
     fn walRetentionOverHardLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
@@ -4686,6 +4795,9 @@ pub const Backend = struct {
             score +|= (stats.bytes - self.options.wal_hard_limit_bytes) / 1024;
         } else if (self.options.wal_soft_limit_bytes > 0 and stats.bytes > self.options.wal_soft_limit_bytes) {
             score +|= (stats.bytes - self.options.wal_soft_limit_bytes) / (16 * 1024);
+        }
+        if (self.walCheckpointLiveBytesLimit()) |limit| {
+            if (stats.bytes > limit) score +|= (stats.bytes - limit) / (16 * 1024) +| 1;
         }
         return score;
     }
@@ -5784,54 +5896,6 @@ fn classifyRun(run: Run, split_key: []const u8) SplitSide {
     if (std.mem.order(u8, run.largest_key, split_key) == .lt) return .left;
     if (std.mem.order(u8, run.smallest_key, split_key) != .lt) return .right;
     return .overlap;
-}
-
-fn cloneRunForBackend(dest: *Backend, source: Run) !Run {
-    const run_id = dest.next_run_id;
-    dest.next_run_id += 1;
-
-    const smallest_namespace_name = if (source.smallest_namespace_name) |name| try dest.allocator.dupe(u8, name) else null;
-    errdefer if (smallest_namespace_name) |name| dest.allocator.free(name);
-    const smallest_key = try dest.allocator.dupe(u8, source.smallest_key);
-    errdefer dest.allocator.free(smallest_key);
-    const largest_namespace_name = if (source.largest_namespace_name) |name| try dest.allocator.dupe(u8, name) else null;
-    errdefer if (largest_namespace_name) |name| dest.allocator.free(name);
-    const largest_key = try dest.allocator.dupe(u8, source.largest_key);
-    errdefer dest.allocator.free(largest_key);
-
-    var run = Run{
-        .id = run_id,
-        .level = source.level,
-        .size_bytes = source.size_bytes,
-        .compression_stats = source.compression_stats,
-        .path = null,
-        .smallest_namespace_name = smallest_namespace_name,
-        .smallest_key = smallest_key,
-        .largest_namespace_name = largest_namespace_name,
-        .largest_key = largest_key,
-        .entry_count = source.entry_count,
-        .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(dest.allocator) else null,
-        .state = null,
-    };
-    errdefer run.deinit(dest.allocator);
-
-    if (dest.root_dir) |root_dir| {
-        const run_path = try repository_mod.runPath(dest.allocator, root_dir, run_id);
-        errdefer dest.allocator.free(run_path);
-        if (source.path) |src_path| {
-            _ = try repository_mod.copyFileAbsoluteWithStorage(dest.storage.?, dest.allocator, src_path, run_path);
-            run.path = run_path;
-        } else {
-            const source_state = source.state orelse return error.RunStateUnavailable;
-            run.state = try source_state.clone(dest.allocator);
-            run.path = try repository_mod.persistRunFileWithStorage(dest.storage.?, dest.allocator, root_dir, &run, dest.options.table_block_compression, dest.options.table_prefix_extractor);
-        }
-    } else {
-        const source_state = source.state orelse return error.RunStateUnavailable;
-        run.state = try source_state.clone(dest.allocator);
-    }
-
-    return run;
 }
 
 fn clearRunsAndFiles(backend: *Backend) !void {
@@ -7570,6 +7634,46 @@ test "lsm backend idle checkpoint accumulates small writes and bounds dirty age"
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
 }
 
+test "lsm backend recovered mutable state is immediately checkpoint eligible" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-recovered-idle-mutable-checkpoint";
+    const options = Options{
+        .flush_threshold_bytes = 1024 * 1024,
+        .mutable_idle_flush_after_ns = 100,
+        .mutable_idle_flush_min_bytes = 1024,
+        .mutable_idle_flush_max_age_ns = 1000,
+        .storage = storage.storage(),
+    };
+
+    storage.tick = 100;
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    const original_max_deadline = backend.mutable_idle_flush_max_deadline_ns;
+    try std.testing.expect(original_max_deadline > storage.tick);
+
+    // Model a crash: leave the WAL durable but suppress the graceful-close
+    // checkpoint. Recovery must not grant this state another full age window.
+    backend.options.backend.read_only = true;
+    backend.close();
+
+    storage.tick = 200;
+    backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+    try std.testing.expect(backend.write_stats.wal_replay_records > 0);
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
+}
+
 fn expectWalRetentionCacheMatchesStorage(backend: *Backend) !void {
     const cached_primary = try backend.cachedWalRetentionLocked();
     const fresh_primary = try wal_mod.snapshotRetention(backend.storage.?, backend.allocator, backend.root_dir.?);
@@ -8025,6 +8129,39 @@ test "lsm backend optional soft wal pressure checkpoints one bounded flush on co
     defer read.abort();
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend live-byte wal pressure bounds overwrite-heavy retention" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-live-byte-wal-pressure";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold_bytes = 1024 * 1024,
+        .storage = storage.storage(),
+        .wal_checkpoint_live_bytes_multiplier = 2,
+        .wal_checkpoint_live_bytes_floor = 256,
+        .foreground_soft_wal_checkpoint = true,
+        .compact_threshold_runs = 100,
+    });
+    defer backend.close();
+
+    var value: [512]u8 = undefined;
+    @memset(&value, 'v');
+    var writes: usize = 0;
+    while (writes < 16 and backend.write_stats.wal_pressure_flushes == 0) : (writes += 1) {
+        backend.last_wal_retention_enforce_ns = 0;
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", &value);
+        try txn.commit();
+    }
+
+    try std.testing.expect(writes < 16);
+    try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_flushes);
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqualSlices(u8, &value, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
 test "lsm backend repeated checkpointed reopen cycles do not accumulate retained wal" {
@@ -15936,6 +16073,71 @@ test "lsm backend fast split prepares child and rewrites left in place" {
         try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
         try std.testing.expectError(error.NotFound, txn.get("doc:z"));
     }
+}
+
+test "lsm backend shard rewrites preserve the configured physical run cap" {
+    var parent_buf: [256]u8 = undefined;
+    const parent_path = repository_mod.tmpPath(&parent_buf, "split-bounded-parent");
+    defer repository_mod.cleanupTmp(parent_path);
+
+    var child_buf: [256]u8 = undefined;
+    const child_path = repository_mod.tmpPath(&child_buf, "split-bounded-child");
+    defer repository_mod.cleanupTmp(child_path);
+
+    var backend = try Backend.open(std.testing.allocator, std.mem.span(parent_path), .{
+        .flush_threshold = 1,
+        .max_run_file_bytes = 16 * 1024,
+        .max_run_file_physical_bytes = 16 * 1024,
+    });
+    defer backend.close();
+
+    {
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        var value: [48]u8 = undefined;
+        @memset(&value, 'v');
+        for (0..80) |idx| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>3}", .{idx});
+            try txn.put(key, &value);
+        }
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+
+    const bounded_options = Options{
+        .backend = .{ .durability = .none },
+        .flush_threshold = 1,
+        .max_run_file_bytes = 512,
+        .max_run_file_physical_bytes = 512,
+    };
+    try std.testing.expect(try backend.prepareSplitRightToDir("doc:040", std.mem.span(child_path), bounded_options));
+
+    {
+        var child = try Backend.open(std.testing.allocator, std.mem.span(child_path), bounded_options);
+        defer child.close();
+        try std.testing.expect(child.runs.items.len > 1);
+        for (child.runs.items) |run| try std.testing.expect(run.size_bytes <= 512);
+        var runtime = try child.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:079"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:000"));
+    }
+
+    backend.options.max_run_file_bytes = 512;
+    backend.options.max_run_file_physical_bytes = 512;
+    try std.testing.expect(try backend.rewriteLeftInPlace("doc:040"));
+    try std.testing.expect(backend.runs.items.len > 1);
+    for (backend.runs.items) |run| try std.testing.expect(run.size_bytes <= 512);
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:000"));
+    try std.testing.expectError(error.NotFound, txn.get("doc:079"));
 }
 
 test "lsm backend ignores stray temp files on reopen" {

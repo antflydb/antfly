@@ -343,6 +343,30 @@ pub fn persistRunFileWithStorageAccounted(
     prefix_extractor: lsm_table_file.PrefixExtractor,
     resource_manager: ?*resource_manager_mod.ResourceManager,
 ) ![]u8 {
+    return try persistRunFileWithStorageAccountedOptions(
+        storage,
+        allocator,
+        root_dir,
+        run,
+        lsm_table_file.default_filter_config,
+        compression_policy,
+        prefix_extractor,
+        resource_manager,
+        max_run_file_read_bytes,
+    );
+}
+
+pub fn persistRunFileWithStorageAccountedOptions(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    root_dir: []const u8,
+    run: *Run,
+    bloom_config: bloom.Config,
+    compression_policy: lsm_table_file.CompressionPolicy,
+    prefix_extractor: lsm_table_file.PrefixExtractor,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    max_file_bytes: usize,
+) ![]u8 {
     const state = run.state orelse return error.RunStateUnavailable;
     var writer: StreamingRunFileWriter = undefined;
     try writer.initInPlace(
@@ -351,8 +375,8 @@ pub fn persistRunFileWithStorageAccounted(
         root_dir,
         run.id,
         state.entries.items.len,
-        max_run_file_read_bytes,
-        lsm_table_file.default_filter_config,
+        @min(max_file_bytes, max_run_file_read_bytes),
+        bloom_config,
         compression_policy,
         prefix_extractor,
         resource_manager,
