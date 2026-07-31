@@ -596,6 +596,42 @@ test "lsm backend simulation manifest sync fault recovers previous compaction vi
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 }
 
+test "lsm backend simulation split manifest fault preserves the complete parent view" {
+    const root_dir = "/lsm-modeled-split-manifest-fault";
+    const options = lsm_backend_mod.Options{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .compact_threshold_runs = 100,
+    };
+
+    var mem_backend = mem_backend_mod.Backend.init(std.testing.allocator, .{});
+    defer mem_backend.close();
+    var modeled_device = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer modeled_device.deinit();
+    var open_options = options;
+    open_options.storage = modeled_device.storage();
+    var lsm_backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, open_options);
+    defer lsm_backend.close();
+
+    try putBoth(&mem_backend, &lsm_backend, .{ .name = "docs" }, "doc:a", "alpha");
+    try putBoth(&mem_backend, &lsm_backend, .{ .name = "docs" }, "doc:z", "omega");
+    try lsm_backend.sync(true);
+    try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
+
+    try modeled_device.injectSyncFailureForPathContains("manifest.bin");
+    try std.testing.expectError(error.InjectedSyncFault, lsm_backend.rewriteLeftInPlace("doc:m"));
+    try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
+
+    try crashReopenLsm(&lsm_backend, &modeled_device, root_dir, open_options);
+    try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
+
+    try std.testing.expect(try lsm_backend.rewriteLeftInPlace("doc:m"));
+    var read = try lsm_backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, read.get(.{ .name = "docs" }, "doc:z"));
+}
+
 test "lsm backend simulation obsolete run cleanup fault recovers previous manifest" {
     const root_dir = "/lsm-modeled-compaction-cleanup-fault";
     const options = lsm_backend_mod.Options{

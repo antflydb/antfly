@@ -3719,6 +3719,7 @@ pub fn build(b: *std.Build) void {
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
+        "runtime status disk scan retries only when maintenance invalidates its group",
         "data runtime stamps one producer generation on every reported group",
         "data runtime live writer source follows raft apply ownership",
         "placement topology promotes cutover-ready learners to voters",

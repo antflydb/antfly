@@ -364,9 +364,10 @@ pub const Options = struct {
     wal_hard_limit_bytes: u64 = 0,
     // Adaptive soft checkpoint bound for overwrite-heavy small databases.
     // When non-zero, retained WAL is compared with this multiple of the
-    // current run + mutable logical footprint, subject to the byte floor.
-    wal_checkpoint_live_bytes_multiplier: u32 = 0,
-    wal_checkpoint_live_bytes_floor: u64 = 0,
+    // current uncheckpointed logical footprint, subject to the byte floor.
+    // Unlike total run bytes, this basis cannot grow with mutation history.
+    wal_checkpoint_dirty_bytes_multiplier: u32 = 0,
+    wal_checkpoint_dirty_bytes_floor: u64 = 0,
     // When background flush is unable to keep up, perform at most one
     // checkpoint-producing immutable flush per enforcement interval after the
     // soft WAL bound is crossed. This avoids accumulating to the hard bound
@@ -2997,6 +2998,27 @@ pub const Backend = struct {
             return false;
         }
 
+        // Publish the prospective run set before transferring any ownership out
+        // of the live version. A failed atomic manifest replacement must leave
+        // both readers and retries observing the original, complete shard.
+        var prospective_runs = std.ArrayListUnmanaged(Run).empty;
+        defer prospective_runs.deinit(allocator);
+        var prospective_run_count: usize = 0;
+        for (actions[0..actions_initialized]) |action| switch (action) {
+            .keep => prospective_run_count += 1,
+            .drop => {},
+            .replace => |replacements| prospective_run_count += replacements.items.len,
+        };
+        try prospective_runs.ensureTotalCapacity(allocator, prospective_run_count);
+        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+            .keep => prospective_runs.appendAssumeCapacity(run),
+            .drop => {},
+            .replace => |replacements| for (replacements.items) |replacement| {
+                prospective_runs.appendAssumeCapacity(replacement);
+            },
+        };
+        compaction_mod.sortRuns(prospective_runs.items);
+
         var rewritten = std.ArrayListUnmanaged(Run).empty;
         errdefer {
             for (rewritten.items) |*run| run.deinit(allocator);
@@ -3036,6 +3058,9 @@ pub const Backend = struct {
         try self.obsolete_paths.ensureUnusedCapacity(allocator, obsolete_paths.items.len);
         try self.obsolete_runs.ensureUnusedCapacity(allocator, 1);
 
+        const manifest_start_ns = self.writeStatsNowNs();
+        _ = try self.writeRunSetManifestSnapshotLocked(self.root_dir.?, prospective_runs.items, manifest_start_ns);
+
         for (old_runs.items, 0..) |*run, i| {
             switch (actions[i]) {
                 .keep => {
@@ -3066,17 +3091,8 @@ pub const Backend = struct {
         self.runs = rewritten;
         rewritten = .empty;
         ownership_committed = true;
-        self.persistManifest() catch |err| {
-            // The in-memory rewrite remains valid, but the durable manifest
-            // still references the old files. Retire their metadata without
-            // making those paths deletion-eligible; a later successful
-            // manifest publish or reopen orphan scan reconciles the files.
-            for (obsolete_runs.items) |*run| self.releaseRunVersionRef(run);
-            self.obsolete_runs.appendAssumeCapacity(obsolete_runs);
-            obsolete_runs = .empty;
-            self.drainUnpinnedObsoleteRuns();
-            return err;
-        };
+        self.manifest_dirty = false;
+        self.obsolete_manifest_dirty = false;
         for (obsolete_paths.items) |*path| {
             self.queueObsoleteFilePathAssumeCapacity(path.*);
             path.* = &.{};
@@ -3086,6 +3102,13 @@ pub const Backend = struct {
         self.obsolete_runs.appendAssumeCapacity(obsolete_runs);
         obsolete_runs = .empty;
         self.drainUnpinnedObsoleteRuns();
+        // The run-set manifest is already durable. WAL retirement is cleanup,
+        // not part of the split commit decision; retry it through maintenance
+        // rather than reporting a failed split after the live version changed.
+        self.maybeCheckpointWalAfterManifestPublish() catch |err| {
+            std.log.warn("lsm split-left manifest published but wal checkpoint deferred root={?s} err={}", .{ self.root_dir, err });
+            self.notePotentialMaintenanceDebtLocked();
+        };
         return true;
     }
 
@@ -3631,22 +3654,27 @@ pub const Backend = struct {
     }
 
     fn writeManifestSnapshotLocked(self: *Backend, root_dir: []const u8, start_ns: u64) !void {
-        try validateRunLayoutForManifest(self.runs.items);
+        _ = try self.writeRunSetManifestSnapshotLocked(root_dir, self.runs.items, start_ns);
+        try self.maybeCheckpointWalAfterManifestPublish();
+        self.manifest_dirty = false;
+        self.obsolete_manifest_dirty = false;
+    }
+
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !usize {
+        try validateRunLayoutForManifest(runs);
         const bytes = try repository_mod.persistManifestWithStorageCount(
             self.storage.?,
             self.allocator,
             root_dir,
             self.next_run_id,
-            self.runs.items,
+            runs,
             self.obsolete_paths.items,
         );
         self.write_stats.manifest_writes += 1;
         self.write_stats.manifest_bytes += bytes;
         self.write_stats.manifest_ns += self.writeStatsElapsedNs(start_ns);
         self.current_manifest_bytes = bytes;
-        try self.maybeCheckpointWalAfterManifestPublish();
-        self.manifest_dirty = false;
-        self.obsolete_manifest_dirty = false;
+        return bytes;
     }
 
     pub fn appendWalForState(self: *Backend, state: *const State) !void {
@@ -4696,7 +4724,7 @@ pub const Backend = struct {
             self.options.wal_hard_limit_segments > 0 or
             self.options.wal_soft_limit_bytes > 0 or
             self.options.wal_hard_limit_bytes > 0 or
-            self.options.wal_checkpoint_live_bytes_multiplier > 0;
+            self.options.wal_checkpoint_dirty_bytes_multiplier > 0;
     }
 
     fn snapshotWalRetentionForPressureLocked(self: *Backend) !?wal_mod.RetentionStats {
@@ -4753,27 +4781,24 @@ pub const Backend = struct {
     fn walRetentionOverSoftLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
         if (self.options.wal_soft_limit_segments > 0 and retention.segments > self.options.wal_soft_limit_segments) return true;
         if (self.options.wal_soft_limit_bytes > 0 and retention.bytes > self.options.wal_soft_limit_bytes) return true;
-        if (self.walCheckpointLiveBytesLimit()) |limit| {
+        if (self.walCheckpointDirtyBytesLimit()) |limit| {
             if (retention.bytes > limit) return true;
         }
         return self.walRetentionOverHardLimit(retention);
     }
 
-    fn walCheckpointLiveBytesLimit(self: *const Backend) ?u64 {
-        const multiplier = self.options.wal_checkpoint_live_bytes_multiplier;
+    fn walCheckpointDirtyBytesLimit(self: *const Backend) ?u64 {
+        const multiplier = self.options.wal_checkpoint_dirty_bytes_multiplier;
         if (multiplier == 0) return null;
 
-        // Run metadata carries exact physical bytes, while mutable generations
-        // maintain logical byte counters in O(1). The check is independent of
-        // corpus cardinality and write rate apart from the bounded run list.
-        var live_bytes: u64 = 0;
-        for (self.runs.items) |run| live_bytes +|= run.size_bytes;
-        live_bytes +|= estimateStateLogicalBytes(&self.mutable);
+        // Mutable generations are the complete set of logical changes not yet
+        // covered by a published manifest. Reading their counters is O(1).
+        var dirty_bytes = estimateStateLogicalBytes(&self.mutable);
         for (self.activeImmutableMemtables()) |immutable| {
-            live_bytes +|= estimateStateLogicalBytes(immutable);
+            dirty_bytes +|= estimateStateLogicalBytes(immutable);
         }
-        const scaled = std.math.mul(u64, live_bytes, multiplier) catch std.math.maxInt(u64);
-        return @max(self.options.wal_checkpoint_live_bytes_floor, scaled);
+        const scaled = std.math.mul(u64, dirty_bytes, multiplier) catch std.math.maxInt(u64);
+        return @max(self.options.wal_checkpoint_dirty_bytes_floor, scaled);
     }
 
     fn walRetentionOverHardLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
@@ -4796,7 +4821,7 @@ pub const Backend = struct {
         } else if (self.options.wal_soft_limit_bytes > 0 and stats.bytes > self.options.wal_soft_limit_bytes) {
             score +|= (stats.bytes - self.options.wal_soft_limit_bytes) / (16 * 1024);
         }
-        if (self.walCheckpointLiveBytesLimit()) |limit| {
+        if (self.walCheckpointDirtyBytesLimit()) |limit| {
             if (stats.bytes > limit) score +|= (stats.bytes - limit) / (16 * 1024) +| 1;
         }
         return score;
@@ -4899,7 +4924,6 @@ pub const Backend = struct {
     }
 
     fn enforceWalRetentionHardPressureGuarded(self: *Backend) anyerror!void {
-        if (self.bulkIngestActive()) return;
         if (self.write_pressure_enforcing) return;
         self.write_pressure_enforcing = true;
         defer self.write_pressure_enforcing = false;
@@ -4908,7 +4932,7 @@ pub const Backend = struct {
 
     fn enforceWalRetentionSoftPressureGuarded(self: *Backend) anyerror!void {
         if (!self.options.foreground_soft_wal_checkpoint) return;
-        if (self.bulkIngestActive() or self.write_pressure_enforcing) return;
+        if (self.write_pressure_enforcing) return;
         if (!self.walRetentionEnforceDue()) return;
         const retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
         if (!self.walRetentionOverSoftLimit(retention)) return;
@@ -4930,6 +4954,7 @@ pub const Backend = struct {
             flushes = 1;
         }
         if (flushes > 0) {
+            if (self.bulkIngestActive() and self.manifest_dirty) try self.persistManifest();
             self.write_stats.wal_pressure_flushes += flushes;
             self.write_stats.wal_pressure_ns += self.writeStatsElapsedNs(start_ns);
         }
@@ -4962,7 +4987,16 @@ pub const Backend = struct {
             retention = try self.snapshotWalRetentionForPressureLocked() orelse break;
         }
 
-        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len == 0 and self.walRetentionOverHardLimit(retention)) {
+        // Bulk ingest defers ordinary manifest traffic, but a WAL bound is a
+        // durability and resource invariant. Publish a partial durable boundary
+        // before retiring WAL; compaction remains deferred until bulk exit.
+        if (self.bulkIngestActive() and self.manifest_dirty) {
+            try self.persistManifest();
+            self.invalidatePrimaryWalRetentionCacheLocked();
+            retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
+        }
+
+        if (!self.manifest_dirty and self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len == 0 and self.walRetentionOverHardLimit(retention)) {
             try self.resetWalAfterManifestCheckpoint();
             retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
         }
@@ -8131,7 +8165,7 @@ test "lsm backend optional soft wal pressure checkpoints one bounded flush on co
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
 }
 
-test "lsm backend live-byte wal pressure bounds overwrite-heavy retention" {
+test "lsm backend dirty-byte wal pressure bounds overwrite-heavy retention" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
 
@@ -8139,8 +8173,8 @@ test "lsm backend live-byte wal pressure bounds overwrite-heavy retention" {
     var backend = try Backend.open(std.testing.allocator, root_dir, .{
         .flush_threshold_bytes = 1024 * 1024,
         .storage = storage.storage(),
-        .wal_checkpoint_live_bytes_multiplier = 2,
-        .wal_checkpoint_live_bytes_floor = 256,
+        .wal_checkpoint_dirty_bytes_multiplier = 2,
+        .wal_checkpoint_dirty_bytes_floor = 256,
         .foreground_soft_wal_checkpoint = true,
         .compact_threshold_runs = 100,
     });
@@ -8162,6 +8196,46 @@ test "lsm backend live-byte wal pressure bounds overwrite-heavy retention" {
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqualSlices(u8, &value, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+}
+
+test "lsm backend checkpoints wal pressure during a sustained bulk ingest session" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-bulk-wal-pressure";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold_bytes = 1024 * 1024,
+        .storage = storage.storage(),
+        .wal_checkpoint_dirty_bytes_multiplier = 2,
+        .wal_checkpoint_dirty_bytes_floor = 256,
+        .foreground_soft_wal_checkpoint = true,
+        .compact_threshold_runs = 100,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    errdefer if (backend.bulkIngestActive()) backend.abortBulkIngestSession();
+
+    var value: [512]u8 = undefined;
+    @memset(&value, 'v');
+    var writes: usize = 0;
+    while (writes < 16 and backend.write_stats.wal_pressure_flushes == 0) : (writes += 1) {
+        backend.last_wal_retention_enforce_ns = 0;
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", &value);
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.bulkIngestActive());
+    try std.testing.expect(writes < 16);
+    try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_flushes);
+    try std.testing.expect(backend.write_stats.manifest_writes > 0);
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
+    try std.testing.expectEqualSlices(u8, &value, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    try std.testing.expect(!backend.bulkIngestActive());
 }
 
 test "lsm backend repeated checkpointed reopen cycles do not accumulate retained wal" {
@@ -15052,6 +15126,42 @@ test "lsm backend reloads persisted manifest and run files" {
         try std.testing.expectError(error.NotFound, txn.get(.{ .name = "docs" }, "doc:b"));
         try std.testing.expectEqualStrings("7", try txn.get(.{}, "meta:lsn"));
     }
+}
+
+test "lsm backend rejects oversized manifest runs before reporting open" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-oversized-manifest-run";
+    var run = Run{
+        .id = 1,
+        .level = 0,
+        .size_bytes = repository_mod.maxRunFileReadBytes() + 1,
+        .path = try allocator.dupe(u8, "/lsm-oversized-manifest-run/runs/1.tbl"),
+        .smallest_namespace_name = try allocator.dupe(u8, "docs"),
+        .smallest_key = try allocator.dupe(u8, "doc:a"),
+        .largest_namespace_name = try allocator.dupe(u8, "docs"),
+        .largest_key = try allocator.dupe(u8, "doc:z"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = null,
+    };
+    defer run.deinit(allocator);
+
+    const runs = [_]Run{run};
+    _ = try repository_mod.persistManifestWithStorageCount(
+        storage.storage(),
+        allocator,
+        root_dir,
+        2,
+        &runs,
+        &.{},
+    );
+
+    try std.testing.expectError(error.FileTooBig, Backend.open(allocator, root_dir, .{
+        .storage = storage.storage(),
+    }));
 }
 
 test "lsm backend reloads persisted manifest and run files over memory storage" {

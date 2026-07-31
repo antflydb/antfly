@@ -138,6 +138,18 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         );
     };
     recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
+    if (loaded_manifest) {
+        for (backend.runs.items) |run| {
+            const path = run.path orelse return error.RunStateUnavailable;
+            repository_mod.validateManifestRunSize(run.size_bytes) catch |err| {
+                std.log.err(
+                    "lsm backend open rejected invalid manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+        }
+    }
     if (debug_open) {
         std.log.info(
             "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",

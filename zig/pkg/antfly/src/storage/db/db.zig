@@ -4515,6 +4515,21 @@ pub const DB = struct {
         return write_stats;
     }
 
+    fn storageChangeTokenLocked(self: *DB) u64 {
+        const write_stats = self.snapshotLsmWriteStatsLocked();
+        var hasher = std.hash.Wyhash.init(0x6c736d5f73746f72);
+        // Directory scans are intentionally coarser than write accounting.
+        // Bucket WAL growth so a sustained stream cannot force one recursive
+        // scan per status refresh while keeping reported bytes within 1 MiB.
+        const wal_growth_bucket = write_stats.wal_append_bytes / (1024 * 1024);
+        hasher.update(std.mem.asBytes(&wal_growth_bucket));
+        hasher.update(std.mem.asBytes(&write_stats.wal_resets));
+        hasher.update(std.mem.asBytes(&write_stats.table_file_bytes));
+        hasher.update(std.mem.asBytes(&write_stats.manifest_writes));
+        hasher.update(std.mem.asBytes(&write_stats.manifest_bytes));
+        return hasher.final();
+    }
+
     pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
@@ -18605,6 +18620,7 @@ pub const DB = struct {
         }
 
         return .{
+            .storage_change_token = self.storageChangeTokenLocked(),
             .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),

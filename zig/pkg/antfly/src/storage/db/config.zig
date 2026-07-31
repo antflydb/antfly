@@ -86,8 +86,8 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = primary_wal_hard_limit_bytes,
-    .wal_checkpoint_live_bytes_multiplier = 2,
-    .wal_checkpoint_live_bytes_floor = mib,
+    .wal_checkpoint_dirty_bytes_multiplier = 2,
+    .wal_checkpoint_dirty_bytes_floor = mib,
     .foreground_soft_wal_checkpoint = true,
     .max_deferred_immutable_bytes = 256 * mib,
     .table_prefix_extractor = .first_separator,
@@ -111,8 +111,9 @@ pub const text_main_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
-    .wal_checkpoint_live_bytes_multiplier = 4,
-    .wal_checkpoint_live_bytes_floor = 4 * mib,
+    .wal_checkpoint_dirty_bytes_multiplier = 4,
+    .wal_checkpoint_dirty_bytes_floor = 4 * mib,
+    .foreground_soft_wal_checkpoint = true,
     .max_deferred_immutable_bytes = 128 * mib,
     .table_prefix_extractor = .first_separator,
 };
@@ -135,8 +136,9 @@ pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
-    .wal_checkpoint_live_bytes_multiplier = 4,
-    .wal_checkpoint_live_bytes_floor = 4 * mib,
+    .wal_checkpoint_dirty_bytes_multiplier = 4,
+    .wal_checkpoint_dirty_bytes_floor = 4 * mib,
+    .foreground_soft_wal_checkpoint = true,
     .max_deferred_immutable_bytes = 128 * mib,
     .table_prefix_extractor = .first_separator,
 };
@@ -164,8 +166,9 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
-    .wal_checkpoint_live_bytes_multiplier = 4,
-    .wal_checkpoint_live_bytes_floor = 16 * mib,
+    .wal_checkpoint_dirty_bytes_multiplier = 4,
+    .wal_checkpoint_dirty_bytes_floor = 16 * mib,
+    .foreground_soft_wal_checkpoint = true,
     .max_deferred_immutable_bytes = 512 * mib,
     .table_prefix_extractor = .none,
     // HBC mutation streams rewrite nodes/ranges/quantized payloads. Direct
@@ -194,8 +197,9 @@ pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
-    .wal_checkpoint_live_bytes_multiplier = 4,
-    .wal_checkpoint_live_bytes_floor = 4 * mib,
+    .wal_checkpoint_dirty_bytes_multiplier = 4,
+    .wal_checkpoint_dirty_bytes_floor = 4 * mib,
+    .foreground_soft_wal_checkpoint = true,
     .max_deferred_immutable_bytes = 128 * mib,
     .table_prefix_extractor = .first_separator,
 };
@@ -477,14 +481,16 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.text_main_lsm_options.wal_hard_limit_segments);
     try std.testing.expectEqual(index_wal_soft_limit_bytes, opts.text_main_lsm_options.wal_soft_limit_bytes);
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.text_main_lsm_options.wal_hard_limit_bytes);
-    try std.testing.expectEqual(@as(u32, 4), opts.text_main_lsm_options.wal_checkpoint_live_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, 4 * mib), opts.text_main_lsm_options.wal_checkpoint_live_bytes_floor);
+    try std.testing.expectEqual(@as(u32, 4), opts.text_main_lsm_options.wal_checkpoint_dirty_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 4 * mib), opts.text_main_lsm_options.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expect(opts.text_main_lsm_options.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(u64, 128 * mib), opts.text_main_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.text_main_lsm_options.table_prefix_extractor), .first_separator), opts.text_main_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.text_wal_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.text_wal_lsm_options.wal_hard_limit_segments);
-    try std.testing.expectEqual(@as(u32, 4), opts.text_wal_lsm_options.wal_checkpoint_live_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, 4 * mib), opts.text_wal_lsm_options.wal_checkpoint_live_bytes_floor);
+    try std.testing.expectEqual(@as(u32, 4), opts.text_wal_lsm_options.wal_checkpoint_dirty_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 4 * mib), opts.text_wal_lsm_options.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expect(opts.text_wal_lsm_options.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(u64, 128 * mib), opts.text_wal_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.text_wal_lsm_options.table_prefix_extractor), .first_separator), opts.text_wal_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(@as(usize, 8), opts.dense_lsm_options.flush_threshold);
@@ -506,8 +512,9 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.dense_lsm_options.wal_hard_limit_segments);
     try std.testing.expectEqual(index_wal_soft_limit_bytes, opts.dense_lsm_options.wal_soft_limit_bytes);
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.dense_lsm_options.wal_hard_limit_bytes);
-    try std.testing.expectEqual(@as(u32, 4), opts.dense_lsm_options.wal_checkpoint_live_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, 16 * mib), opts.dense_lsm_options.wal_checkpoint_live_bytes_floor);
+    try std.testing.expectEqual(@as(u32, 4), opts.dense_lsm_options.wal_checkpoint_dirty_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 16 * mib), opts.dense_lsm_options.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expect(opts.dense_lsm_options.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(u64, 512 * mib), opts.dense_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.dense_lsm_options.table_prefix_extractor), .none), opts.dense_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(false, opts.dense_lsm_options.direct_bulk_ingest);
@@ -522,8 +529,9 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 10), opts.sparse_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.sparse_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.sparse_lsm_options.wal_hard_limit_segments);
-    try std.testing.expectEqual(@as(u32, 4), opts.sparse_lsm_options.wal_checkpoint_live_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, 4 * mib), opts.sparse_lsm_options.wal_checkpoint_live_bytes_floor);
+    try std.testing.expectEqual(@as(u32, 4), opts.sparse_lsm_options.wal_checkpoint_dirty_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 4 * mib), opts.sparse_lsm_options.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expect(opts.sparse_lsm_options.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(u64, 128 * mib), opts.sparse_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.sparse_lsm_options.table_prefix_extractor), .first_separator), opts.sparse_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.graph_reverse_lsm_options.flush_threshold_bytes);
@@ -535,8 +543,9 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 10), opts.graph_reverse_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.graph_reverse_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.graph_reverse_lsm_options.wal_hard_limit_segments);
-    try std.testing.expectEqual(@as(u32, 4), opts.graph_reverse_lsm_options.wal_checkpoint_live_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, 4 * mib), opts.graph_reverse_lsm_options.wal_checkpoint_live_bytes_floor);
+    try std.testing.expectEqual(@as(u32, 4), opts.graph_reverse_lsm_options.wal_checkpoint_dirty_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 4 * mib), opts.graph_reverse_lsm_options.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expect(opts.graph_reverse_lsm_options.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(u64, 128 * mib), opts.graph_reverse_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.graph_reverse_lsm_options.table_prefix_extractor), .first_separator), opts.graph_reverse_lsm_options.table_prefix_extractor);
     const primary_opts = primary_lsm_options_default;
@@ -554,8 +563,8 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(primary_wal_hard_limit_segments, primary_opts.wal_hard_limit_segments);
     try std.testing.expectEqual(primary_wal_soft_limit_bytes, primary_opts.wal_soft_limit_bytes);
     try std.testing.expectEqual(primary_wal_hard_limit_bytes, primary_opts.wal_hard_limit_bytes);
-    try std.testing.expectEqual(@as(u32, 2), primary_opts.wal_checkpoint_live_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, mib), primary_opts.wal_checkpoint_live_bytes_floor);
+    try std.testing.expectEqual(@as(u32, 2), primary_opts.wal_checkpoint_dirty_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, mib), primary_opts.wal_checkpoint_dirty_bytes_floor);
     try std.testing.expectEqual(@as(u64, 256 * mib), primary_opts.max_deferred_immutable_bytes);
     try std.testing.expect(primary_opts.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(@TypeOf(primary_opts.table_prefix_extractor), .first_separator), primary_opts.table_prefix_extractor);

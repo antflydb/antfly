@@ -2176,6 +2176,7 @@ const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
     checked_at_ns: u64 = 0,
     lsm_root_generation: u64 = 0,
+    storage_change_token: u64 = 0,
     invalidation_generation: u64 = 0,
     valid: bool = false,
 };
@@ -2203,21 +2204,20 @@ fn runtimeStatusDiskUsageCacheReusable(
     now_ns: u64,
     active: bool,
     doc_count: u64,
+    storage_change_token: u64,
 ) bool {
     if (!entry.valid) return false;
     if (entry.lsm_root_generation != lsm_root_generation) return false;
     if (entry.disk_bytes == 0 and doc_count > 0) return false;
+    if (storage_change_token != 0 and entry.storage_change_token != storage_change_token) return false;
     return active or now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
 }
 
 fn runtimeStatusDiskUsageScanCanPublish(
     entry: RuntimeStatusDiskUsageCacheEntry,
     captured_group_generation: u64,
-    current_global_generation: u64,
-    captured_global_generation: u64,
 ) bool {
-    return entry.invalidation_generation == captured_group_generation and
-        current_global_generation == captured_global_generation;
+    return entry.invalidation_generation == captured_group_generation;
 }
 
 const OwnedLocalGroupStatusRefresh = struct {
@@ -2882,29 +2882,37 @@ test "idle cached runtime status stays fresh only for the published root generat
 }
 
 test "runtime status disk usage cache is scoped to one root generation" {
+    const cloned_stats = try runtime_status.cloneDBStats(std.testing.allocator, .{ .storage_change_token = 42 });
+    defer antfly.db.types.freeDBStats(std.testing.allocator, cloned_stats);
+    try std.testing.expectEqual(@as(u64, 42), cloned_stats.storage_change_token);
+
     const entry = RuntimeStatusDiskUsageCacheEntry{
         .disk_bytes = 4096,
         .checked_at_ns = 100,
         .lsm_root_generation = 7,
         .valid = true,
     };
-    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, 101, false, 1));
-    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, std.math.maxInt(u64), true, 1));
-    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(entry, 8, 101, true, 1));
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, 101, false, 1, 0));
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, std.math.maxInt(u64), true, 1, 0));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(entry, 8, 101, true, 1, 0));
 
     var zero_entry = entry;
     zero_entry.disk_bytes = 0;
-    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(zero_entry, 7, 101, false, 1));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(zero_entry, 7, 101, false, 1, 0));
 
     var invalidated_entry = entry;
     invalidated_entry.valid = false;
-    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(invalidated_entry, 7, 101, false, 1));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(invalidated_entry, 7, 101, false, 1, 0));
 
-    try std.testing.expect(runtimeStatusDiskUsageScanCanPublish(entry, 0, 4, 4));
+    var changed_storage_entry = entry;
+    changed_storage_entry.storage_change_token = 11;
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(changed_storage_entry, 7, 101, false, 1, 11));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(changed_storage_entry, 7, 101, false, 1, 12));
+
+    try std.testing.expect(runtimeStatusDiskUsageScanCanPublish(entry, 0));
     var group_invalidated = entry;
     group_invalidated.invalidation_generation = 5;
-    try std.testing.expect(!runtimeStatusDiskUsageScanCanPublish(group_invalidated, 0, 5, 4));
-    try std.testing.expect(!runtimeStatusDiskUsageScanCanPublish(entry, 0, 5, 4));
+    try std.testing.expect(!runtimeStatusDiskUsageScanCanPublish(group_invalidated, 0));
 }
 
 test "runtime status disk usage cache is scoped to one root generation and group invalidation is scoped" {
@@ -2938,7 +2946,7 @@ test "runtime status disk usage cache is scoped to one root generation and group
     try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
 }
 
-test "runtime status disk scan retries when maintenance invalidates its group" {
+test "runtime status disk scan retries only when maintenance invalidates its group" {
     const ControlledScanner = struct {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
@@ -3016,6 +3024,21 @@ test "runtime status disk scan retries when maintenance invalidates its group" {
     try std.testing.expect(cached.valid);
     try std.testing.expectEqual(@as(u64, 222), cached.disk_bytes);
     try std.testing.expectEqual(@as(u64, 3), cached.lsm_root_generation);
+
+    // A different group's publication must not fence or duplicate this scan.
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+    controlled.entered.store(false, .release);
+    controlled.release.store(false, .release);
+    controlled.calls.store(0, .release);
+    var unrelated_scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
+    const unrelated_thread = try std.Thread.spawn(.{}, ScanThread.run, .{&unrelated_scan_thread});
+    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(8);
+    controlled.release.store(true, .release);
+    unrelated_thread.join();
+
+    try std.testing.expectEqual(@as(?u64, 111), unrelated_scan_thread.result);
+    try std.testing.expectEqual(@as(u32, 1), controlled.calls.load(.acquire));
 }
 
 test "data runtime stamps one producer generation on every reported group" {
@@ -8770,7 +8793,6 @@ pub const DataServer = struct {
         var attempt: usize = 0;
         while (attempt < 2) : (attempt += 1) {
             const now_ns = platform_time.monotonicNs();
-            const scan_generation = self.runtime_status_disk_usage_invalidation_generation.load(.acquire);
             lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
             const state = self.runtime_status_disk_usage_cache.getOrPut(self.alloc, group_id) catch {
                 self.runtime_status_disk_usage_cache_mutex.unlock();
@@ -8784,6 +8806,7 @@ pub const DataServer = struct {
                 now_ns,
                 active,
                 status.stats.doc_count,
+                status.stats.storage_change_token,
             )) {
                 const disk_bytes = state.value_ptr.disk_bytes;
                 self.runtime_status_disk_usage_cache_mutex.unlock();
@@ -8802,8 +8825,6 @@ pub const DataServer = struct {
             if (!runtimeStatusDiskUsageScanCanPublish(
                 current.*,
                 group_generation,
-                self.runtime_status_disk_usage_invalidation_generation.load(.acquire),
-                scan_generation,
             )) {
                 self.runtime_status_disk_usage_cache_mutex.unlock();
                 continue;
@@ -8812,6 +8833,7 @@ pub const DataServer = struct {
                 .disk_bytes = disk_bytes,
                 .checked_at_ns = now_ns,
                 .lsm_root_generation = lsm_root_generation,
+                .storage_change_token = status.stats.storage_change_token,
                 .invalidation_generation = group_generation,
                 .valid = true,
             };

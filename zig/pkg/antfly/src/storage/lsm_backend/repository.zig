@@ -661,6 +661,13 @@ fn loadRunFooterWithStorage(
     return footer;
 }
 
+/// Validate the checksummed manifest's exact physical run size during mount.
+/// This preserves lazy table I/O while ensuring an oversized run is rejected
+/// before the backend can report ready.
+pub fn validateManifestRunSize(manifest_size: u64) !void {
+    if (manifest_size > max_run_file_read_bytes) return error.FileTooBig;
+}
+
 pub fn deleteFileAbsolute(path: []const u8) !void {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
