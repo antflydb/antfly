@@ -200,11 +200,11 @@ def test_read_with_prompt(api):
 
 
 @pytest.mark.multimodal
-def test_read_trocr_model_answers_text(api):
-    """TrOCR-style readers should load explicitly and return text."""
-    model = os.environ.get("ANTFLY_INFERENCE_TROCR_MODEL") or _find_reader_model(api, "trocr")
+def test_read_florence_model_answers_text(api):
+    """Florence readers should load explicitly and return text."""
+    model = os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL") or _find_reader_model(api, "florence")
     if not model:
-        pytest.skip("No TrOCR reader model is available")
+        pytest.skip("No Florence reader model is available")
 
     test_image = make_text_png_uri(
         [

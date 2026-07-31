@@ -18,12 +18,36 @@ fn validateSkipTestFilter(value: []const u8) error{EmptySkipTestFilter}!void {
     if (value.len == 0) return error.EmptySkipTestFilter;
 }
 
+fn isTestControl(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--test-filter") or
+        std.mem.startsWith(u8, arg, "--test-filter=") or
+        std.mem.eql(u8, arg, "--skip-test-filter") or
+        std.mem.startsWith(u8, arg, "--skip-test-filter=") or
+        std.mem.startsWith(u8, arg, "--seed=") or
+        std.mem.startsWith(u8, arg, "--cache-dir=") or
+        std.mem.eql(u8, arg, "--listen=-");
+}
+
+/// Build arguments are global, even when they belong to a non-test run step.
+/// If an executable owns any long option, leave the complete argument vector
+/// out of compile-time test selection instead of interpreting its positional
+/// values as test filters. Runtime test steps still receive the vector: they
+/// do not execute for an unrelated top-level step, and strict test runners must
+/// reject it if a test and another argument-owning step are selected together.
+fn hasForeignLongOption(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--") and !isTestControl(arg))
+            return true;
+    }
+    return false;
+}
+
 pub fn select(
     alloc: std.mem.Allocator,
     args: []const []const u8,
     default_filters: []const []const u8,
 ) []const []const u8 {
-    if (args.len == 0) return default_filters;
+    if (args.len == 0 or hasForeignLongOption(args)) return default_filters;
 
     var filters = std.ArrayListUnmanaged([]const u8).empty;
     filters.ensureTotalCapacity(alloc, args.len) catch @panic("OOM");
@@ -53,8 +77,6 @@ pub fn select(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             // Runtime-only controls do not participate in compile reachability.
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            @panic("unsupported test runner argument");
         } else {
             // Preserve the concise `zig build step -- "filter"` form.
             filters.appendAssumeCapacity(arg);
@@ -76,6 +98,11 @@ pub fn addRuntimeControls(
     run: *std.Build.Step.Run,
     args: []const []const u8,
 ) void {
+    if (hasForeignLongOption(args)) {
+        run.addArgs(args);
+        return;
+    }
+
     var i: usize = 0;
     while (i < args.len) {
         const arg = args[i];
@@ -101,8 +128,6 @@ pub fn addRuntimeControls(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             run.addArg(arg);
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            @panic("unsupported test runner argument");
         }
         i += 1;
     }
@@ -141,6 +166,49 @@ test "select preserves defaults and concise bare filters" {
     try std.testing.expectEqual(@as(usize, 2), filters.len);
     try std.testing.expectEqualStrings("metadata service", filters[0]);
     try std.testing.expectEqualStrings("table manager", filters[1]);
+}
+
+test "select leaves foreign executable arguments untouched" {
+    const defaults = [_][]const u8{"default"};
+    const selected = select(
+        std.testing.allocator,
+        &.{
+            "--dataset-dir",
+            "testdata/vectorsets",
+            "--dataset",
+            "images-512d-10k.pbvec",
+            "--suite",
+            "hbc",
+            "--bulk-build",
+            "--centroid-only-routing",
+            "--dump-query-index",
+            "4",
+            "--dump-metric",
+            "inner_product",
+            "--dump-limit",
+            "20",
+            "--dump-randomize",
+            "false",
+            "--per-query-metric",
+            "cosine",
+            "--per-query-only",
+        },
+        &defaults,
+    );
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqualStrings("default", selected[0]);
+}
+
+test "foreign option detection is generic and preserves test-only arguments" {
+    try std.testing.expect(hasForeignLongOption(&.{ "--benchmark-mode", "fast" }));
+    try std.testing.expect(!hasForeignLongOption(&.{
+        "--test-filter=metadata",
+        "--skip-test-filter",
+        "slow",
+        "--seed=1234",
+        "--cache-dir=/tmp/cache",
+        "--listen=-",
+    }));
 }
 
 test "empty skip filters are rejected before compiling a zero-test selection" {

@@ -18,8 +18,11 @@ Matches Go antfly's embedders_test.go and clip_test.go patterns.
 """
 
 import base64
+import hashlib
 import json
+import math
 import subprocess
+from pathlib import Path
 
 import pytest
 from .helpers import (
@@ -137,6 +140,9 @@ def test_invalid_json_returns_error(api):
 
 
 CLIPCLAP_MODEL = "antflydb/clipclap"
+CLIPCLAP_IMAGE_GOLDEN = (
+    Path(__file__).with_name("testdata") / "clipclap_q4k_image_embedding.json"
+)
 
 
 def _media_wav_part(duration: float = 0.1, sample_rate: int = 48000):
@@ -164,10 +170,6 @@ def _assert_distinct_rows(*embs):
             assert delta > 1e-5
 
 
-def _weighted_embedding_sum(emb):
-    return sum((i + 1) * value for i, value in enumerate(emb))
-
-
 @pytest.mark.multimodal
 def test_image_embedding(api):
     """Image embedding via image_url content part."""
@@ -181,7 +183,7 @@ def test_image_embedding(api):
 @pytest.mark.multimodal
 @pytest.mark.verification
 def test_clipclap_image_embedding_golden_contract(tmp_path):
-    """ClipClap image embeddings should keep the CLIP preprocessing contract stable."""
+    """ClipClap image embeddings should match the pinned Q4_K model contract."""
     if not local_model_exists(CLIPCLAP_MODEL, "embedders") and not inference_download_enabled():
         pytest.skip(f"{CLIPCLAP_MODEL} is not available")
 
@@ -189,47 +191,63 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
     if model_dir is None:
         pytest.skip(f"{CLIPCLAP_MODEL} is not available")
 
+    golden = json.loads(CLIPCLAP_IMAGE_GOLDEN.read_text())
+    assert golden["model"] == CLIPCLAP_MODEL
+    assert golden["variant"] == "Q4_K"
+
     image_uri = make_clip_contract_png_uri()
+    image_bytes = base64.b64decode(image_uri.split(",", 1)[1])
+    assert hashlib.sha256(image_bytes).hexdigest() == golden["input"]["sha256"]
     image_path = tmp_path / "clip-contract.png"
-    image_path.write_bytes(base64.b64decode(image_uri.split(",", 1)[1]))
+    image_path.write_bytes(image_bytes)
 
-    result = subprocess.run(
-        [
-            *inference_command(),
-            "embed",
-            str(model_dir),
-            "--backend",
-            "native",
-            "--image",
-            str(image_path),
-        ],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    artifact = golden["vision_artifact"]
+    manifest = json.loads((model_dir / "model_manifest.json").read_text())
+    manifest_file = next(item for item in manifest["files"] if item["name"] == artifact["name"])
+    assert manifest_file["digest"] == f"sha256:{artifact['sha256']}"
+    model_path = model_dir / artifact["name"]
+    assert model_path.stat().st_size == manifest_file["size"]
+    with model_path.open("rb") as model_file:
+        assert hashlib.file_digest(model_file, "sha256").hexdigest() == artifact["sha256"]
+
+    def run_embedding():
+        result = subprocess.run(
+            [
+                *inference_command(),
+                "embed",
+                str(model_dir),
+                "--backend",
+                "native",
+                "--image",
+                str(image_path),
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        combined = [*result.stdout.splitlines(), *result.stderr.splitlines()]
+        response_line = next(line for line in reversed(combined) if line.startswith("{") and "\"embeddings\"" in line)
+        return json.loads(response_line)["embeddings"][0]
+
+    first = run_embedding()
+    second = run_embedding()
+
+    assert len(first) == 512
+    assert len(second) == 512
+    assert all(math.isfinite(value) for value in first)
+    assert all(math.isfinite(value) for value in second)
+    assert abs(l2_norm(first) - 1.0) < 1e-4
+    assert abs(l2_norm(second) - 1.0) < 1e-4
+    assert max(abs(a - b) for a, b in zip(first, second)) < 1e-5
+
+    reference = golden["embedding"]
+    assert len(reference) == 512
+    similarity = cosine_similarity(first, reference)
+    assert similarity >= 0.995, (
+        f"ClipClap Q4_K image embedding cosine {similarity:.8f} is below the "
+        "cross-kernel golden threshold 0.995"
     )
-    combined = [*result.stdout.splitlines(), *result.stderr.splitlines()]
-    response_line = next(line for line in reversed(combined) if line.startswith("{") and "\"embeddings\"" in line)
-    emb = json.loads(response_line)["embeddings"][0]
-
-    assert len(emb) == 512
-    assert abs(l2_norm(emb) - 1.0) < 1e-4
-
-    expected_weighted_sum = -107.44091905420602
-    expected_prefix = [
-        0.041707344,
-        0.03681396,
-        -0.034344856,
-        0.024631007,
-        0.019223439,
-        0.03514648,
-        0.0022730897,
-        0.094304845,
-    ]
-
-    assert abs(_weighted_embedding_sum(emb) - expected_weighted_sum) < 1e-4
-    for i, expected in enumerate(expected_prefix):
-        assert abs(emb[i] - expected) < 1e-4
 
 
 @pytest.mark.multimodal
