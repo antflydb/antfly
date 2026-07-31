@@ -1,4 +1,8 @@
 {
+  "decision_scope": {
+    "ours_sha": "0c8435faf04d676cfb0802cf6ede9d70d43555b1",
+    "incoming_sha": "0c64d0b3907a6363bbeb919905c559b010ff1152"
+  },
   "moved_paths": {
     "zig/pkg/antfly/src/api/tables.zig": [
       "zig/pkg/antfly/src/metadata/catalog/table_ddl.zig"

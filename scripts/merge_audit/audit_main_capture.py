@@ -21,89 +21,19 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_POLICY_PATH = ROOT / "scripts/merge_audit/policy.json"
 
-MOVED_PATHS = {
-    "zig/pkg/antfly/src/api/tables.zig": [
-        "zig/pkg/antfly/src/metadata/catalog/table_ddl.zig",
-    ],
-    "zig/pkg/antfly/src/api/table_reads.zig": [
-        "zig/pkg/antfly/src/api/table_reads.zig",
-        "zig/pkg/antfly/src/api/table_reads/core.zig",
-        "zig/pkg/antfly/src/api/table_reads/document_sql.zig",
-        "zig/pkg/antfly/src/api/table_reads/remote_wire.zig",
-        "zig/pkg/antfly/src/api/table_reads/sources.zig",
-    ],
-    "zig/pkg/antfly/src/api/table_writes.zig": [
-        "zig/pkg/antfly/src/api/table_writes.zig",
-        "zig/pkg/antfly/src/api/table_writes/bulk_ingest.zig",
-        "zig/pkg/antfly/src/api/table_writes/cache.zig",
-        "zig/pkg/antfly/src/api/table_writes/core.zig",
-        "zig/pkg/antfly/src/api/table_writes/integrity.zig",
-        "zig/pkg/antfly/src/api/table_writes/managed_db.zig",
-        "zig/pkg/antfly/src/api/table_writes/sources.zig",
-    ],
-    "zig/pkg/antfly/src/storage/db/db.zig": [
-        "zig/pkg/antfly/src/storage/db/db.zig",
-        "zig/pkg/antfly/src/storage/db/artifact_repair.zig",
-        "zig/pkg/antfly/src/storage/db/artifact_replay.zig",
-        "zig/pkg/antfly/src/storage/db/catalog/index_manager.zig",
-        "zig/pkg/antfly/src/storage/db/core.zig",
-        "zig/pkg/antfly/src/storage/db/derived_async.zig",
-        "zig/pkg/antfly/src/storage/db/document_mapper.zig",
-        "zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig",
-        "zig/pkg/antfly/src/storage/db/graph_runtime.zig",
-        "zig/pkg/antfly/src/storage/db/internal.zig",
-        "zig/pkg/antfly/src/storage/db/lifecycle.zig",
-        "zig/pkg/antfly/src/storage/db/query/graph_exec.zig",
-        "zig/pkg/antfly/src/storage/db/query/search_exec.zig",
-        "zig/pkg/antfly/src/storage/db/search_runtime.zig",
-        "zig/pkg/antfly/src/storage/db/split_restore.zig",
-        "zig/pkg/antfly/src/storage/db/types.zig",
-        "zig/pkg/antfly/src/storage/db/write_path.zig",
-    ],
-}
-
-EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS = {
-    "docs/guides/document-engine.mdx": "trivial EOF blank-line normalization; content is otherwise identical to incoming main.",
-    "py/packages/sdk/src/antfly/client_generated/models/algebraic_index_stats.py": "regenerated from merged specs; adds planner_last_unsupported_reason from current schema.",
-    "py/packages/sdk/src/antfly/client_generated/models/embeddings_index_stats.py": "regenerated from merged specs; adds embeddings coverage from merged indexes schema.",
-    "zig/pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig": "test root wiring for merged table repair cancel callback coverage.",
-    "zig/pkg/antfly/src/api/distributed_candidate_source.zig": "merged scan-row identity contract: incoming candidate-source behavior adapted from legacy key field to branch `_id` scan rows via table_reads.appendScanLine.",
-    "zig/ENRICHMENTS.md": "incoming enrichment sync docs adjusted to branch public sync-level naming: query/full_index instead of stale full_text/embeddings aliases.",
-    "zig/pkg/antfly/src/public_test_helpers.zig": "generated OpenAPI total relation became an enum; helper must compare enum value.",
-    "zig/pkg/inference/src/native_generate.zig": "merged inference OpenAPI generation made request fields enums; client source converts CLI strings to generated enum values.",
-    "zig/pkg/antfly/src/inference/managed_embedder.zig": "incoming managed embedder changes are integrated with branch embedding_name alias lookup, collision validation, and owned slice transfer cleanup.",
-    "zig/pkg/inference/src/server/server.zig": "merged inference OpenAPI generation made request/response literals enums; server source converts generated enum values.",
-}
-
-EXPECTED_OURS_ONLY_RESOLUTIONS = {
-    "docs/architecture.mdx": "branch sync-level naming uses query while still retaining main's aknn removal via full_index.",
-    "examples/epstein/main.go": "branch sync-level naming uses query/full_index and rejects stale full_text/embeddings aliases.",
-    "examples/epstein/main_test.go": "branch sync-level naming regression test rejects stale full_text/embeddings/aknn aliases.",
-    "go/e2e/backup_restore_test.go": "branch sync-level naming uses SyncLevelQuery for query visibility; main's SyncLevelAknn removal is already represented by SyncLevelFullIndex where needed.",
-    "py/packages/sdk/src/antfly/client_generated/models/batch_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
-    "py/packages/sdk/src/antfly/client_generated/models/linear_merge_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
-    "py/packages/sdk/src/antfly/client_generated/models/multi_batch_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
-    "py/packages/sdk/src/antfly/client_generated/models/sync_level.py": "generated enum intentionally keeps query naming and omits aknn.",
-    "py/packages/sdk/src/antfly/client_generated/models/transaction_begin_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
-    "py/packages/sdk/src/antfly/client_generated/models/transaction_commit_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
-    "zig/DOCID.md": "branch DOCID evidence text keeps query sync-level naming and has no aknn sync-level residue.",
-    "zig/pkg/antfly/src/api/tables.zig": "tables.zig is intentionally removed without a shim; split-aware table contract/schema symbol audits cover incoming changes.",
-    "zig/pkg/antfly/src/api/table_writes.zig": "split facade is authoritative on this branch; split-aware public symbol and vtable audits cover incoming monolith changes.",
-    "zig/pkg/antfly/src/api_table_reads_test_root.zig": "split test root stays decomposed on this branch; table_router is compiled through api/mod and api_rows roots.",
-    "zig/pkg/antfly/src/cmd/cli/data.zig": "CLI parser intentionally keeps branch query sync-level naming and rejects aknn.",
-}
-
-EXPECTED_MAIN_ONLY_RESOLUTIONS = {
-    "go/pkg/antfly/src/metadata/api_document_artifacts.go": "main-only stub ordering is acceptable; all artifact enrichment handlers are present.",
-    "scripts/bench_gemma4_mtp.sh": "incoming bench helper is accepted exactly from main.",
-}
+MOVED_PATHS: dict[str, list[str]] = {}
+EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS: dict[str, str] = {}
+EXPECTED_OURS_ONLY_RESOLUTIONS: dict[str, str] = {}
+EXPECTED_MAIN_ONLY_RESOLUTIONS: dict[str, str] = {}
 
 MANUAL_REVIEW_REQUIRED_PATHS: dict[str, str] = {}
 MANUAL_REVIEW_ACKNOWLEDGEMENTS: dict[str, str] = {}
 GENERATED_FILE_PROVENANCE: dict[str, list[str]] = {}
 GENERATED_PROVENANCE_ALLOWLIST: dict[str, str] = {}
+DECISION_SCOPE: dict[str, str] = {}
 
 MANIFEST_SCHEMA: dict[str, str] = {
+    "decision_scope": "map_string",
     "moved_paths": "map_list",
     "expected_incoming_only_integration_diffs": "map_string",
     "expected_ours_only_resolutions": "map_string",
@@ -159,6 +89,26 @@ def ensure_manifest_shape(data: object, path: pathlib.Path) -> dict[str, Any]:
         else:
             errors.append(f"{key}: internal schema error for {expected!r}")
 
+    decision_fields = (
+        "expected_incoming_only_integration_diffs",
+        "expected_ours_only_resolutions",
+        "expected_main_only_resolutions",
+        "expected_generated_without_spec_changes",
+        "manual_review_acknowledgements",
+    )
+    if any(data.get(key) for key in decision_fields):
+        scope = data.get("decision_scope", {})
+        if set(scope) != {"ours_sha", "incoming_sha"}:
+            errors.append(
+                "decision_scope: per-merge decisions require exactly ours_sha and incoming_sha"
+            )
+        else:
+            for key, value in scope.items():
+                if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+                    errors.append(
+                        f"decision_scope.{key}: expected full lowercase 40-character commit SHA"
+                    )
+
     if errors:
         joined = "\n  - ".join(errors)
         raise ValueError(f"{path}: invalid manifest\n  - {joined}")
@@ -169,6 +119,7 @@ def load_policy(path: pathlib.Path) -> None:
     if not path.exists():
         return
     data = ensure_manifest_shape(json.loads(path.read_text()), path)
+    DECISION_SCOPE.update(data.get("decision_scope", {}))
     MOVED_PATHS.update({key: list(value) for key, value in data.get("moved_paths", {}).items()})
     EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS.update(data.get("expected_incoming_only_integration_diffs", {}))
     EXPECTED_OURS_ONLY_RESOLUTIONS.update(data.get("expected_ours_only_resolutions", {}))
@@ -378,6 +329,17 @@ def audit_merge(
         mode = "previous-main-baseline" if previous_main_merge else "active-merge"
 
     head = audited_ref(ours_ref)
+    decision_scope_active = (
+        DECISION_SCOPE.get("ours_sha") == head
+        and DECISION_SCOPE.get("incoming_sha") == merge_head
+    )
+    expected_incoming_only_integration_diffs = (
+        EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS if decision_scope_active else {}
+    )
+    expected_ours_only_resolutions = EXPECTED_OURS_ONLY_RESOLUTIONS if decision_scope_active else {}
+    expected_main_only_resolutions = EXPECTED_MAIN_ONLY_RESOLUTIONS if decision_scope_active else {}
+    manual_review_acknowledgements = MANUAL_REVIEW_ACKNOWLEDGEMENTS if decision_scope_active else {}
+    generated_provenance_allowlist = GENERATED_PROVENANCE_ALLOWLIST if decision_scope_active else {}
     staged_paths = set(lines(["diff", "--cached", "--name-only"]))
     result_changed_paths = set(incoming_paths) | staged_paths
     both_changed: list[str] = []
@@ -418,7 +380,7 @@ def audit_merge(
             if result_captured_moved_path(path):
                 moved_paths.append(path)
                 continue
-            if path in EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS:
+            if path in expected_incoming_only_integration_diffs:
                 expected_integration_diffs.append(path)
             elif result_blob is None:
                 result_missing.append(path)
@@ -441,7 +403,7 @@ def audit_merge(
         review_reason = matching_policy(path, MANUAL_REVIEW_REQUIRED_PATHS)
         if review_reason:
             manual_review_required[path] = review_reason
-            if not matching_policy(path, MANUAL_REVIEW_ACKNOWLEDGEMENTS):
+            if not matching_policy(path, manual_review_acknowledgements):
                 manual_review_missing[path] = review_reason
 
         provenance = matching_provenance(path)
@@ -452,7 +414,7 @@ def audit_merge(
             any(matches_pattern(changed_path, spec_pattern) for changed_path in result_changed_paths)
             for spec_pattern in spec_patterns
         )
-        if not relevant_spec_changed and not matching_policy(path, GENERATED_PROVENANCE_ALLOWLIST):
+        if not relevant_spec_changed and not matching_policy(path, generated_provenance_allowlist):
             generated_without_spec_changes[path] = generated_pattern
 
     failures: dict[str, list[str]] = {}
@@ -464,11 +426,11 @@ def audit_merge(
         failures["incoming-only deletion not reflected"] = incoming_deleted_not_deleted
     unexpected_ours_only = [
         path for path in ours_only_resolutions
-        if path not in EXPECTED_OURS_ONLY_RESOLUTIONS
+        if path not in expected_ours_only_resolutions
     ]
     unexpected_main_only = [
         path for path in main_only_resolutions
-        if path not in EXPECTED_MAIN_ONLY_RESOLUTIONS
+        if path not in expected_main_only_resolutions
     ]
     if unexpected_ours_only:
         failures["unexpected both-changed result identical to ours"] = unexpected_ours_only
@@ -490,6 +452,10 @@ def audit_merge(
         "incoming_sha": merge_head,
         "previous_main_merge_input": previous_baseline_input,
         "previous_main_baseline_resolved": base if previous_baseline_input else None,
+        "decision_scope": {
+            "configured": dict(DECISION_SCOPE),
+            "active": decision_scope_active,
+        },
         "incoming_changed_files": len(incoming_paths),
         "incoming_only_exact_or_deleted_ok": incoming_only_ok,
         "incoming_only_moved_ok": len(moved_paths),
@@ -498,7 +464,7 @@ def audit_merge(
         "both_changed_categories": dict(sorted(both_counts.items())),
         "moved_paths": moved_paths,
         "expected_integration_diffs": {
-            path: EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS[path]
+            path: expected_incoming_only_integration_diffs[path]
             for path in expected_integration_diffs
         },
         "both_changed_paths": both_changed,
@@ -506,11 +472,11 @@ def audit_merge(
             "integrated_other": integrated_resolutions,
             "same_as_both": same_as_both_resolutions,
             "ours_only": {
-                path: EXPECTED_OURS_ONLY_RESOLUTIONS.get(path, "UNEXPECTED")
+                path: expected_ours_only_resolutions.get(path, "UNEXPECTED")
                 for path in ours_only_resolutions
             },
             "main_only": {
-                path: EXPECTED_MAIN_ONLY_RESOLUTIONS.get(path, "UNEXPECTED")
+                path: expected_main_only_resolutions.get(path, "UNEXPECTED")
                 for path in main_only_resolutions
             },
         },
@@ -518,14 +484,14 @@ def audit_merge(
             "required": manual_review_required,
             "acknowledged": {
                 path: reason
-                for path, reason in MANUAL_REVIEW_ACKNOWLEDGEMENTS.items()
+                for path, reason in manual_review_acknowledgements.items()
                 if any(matches_pattern(changed_path, path) for changed_path in result_changed_paths)
             },
             "missing": manual_review_missing,
         },
         "generated_provenance": {
             "rules": GENERATED_FILE_PROVENANCE,
-            "allowlist": GENERATED_PROVENANCE_ALLOWLIST,
+            "allowlist": generated_provenance_allowlist,
             "changed_without_matching_spec": generated_without_spec_changes,
         },
         "failures": failures,
@@ -545,6 +511,7 @@ def render_text(result: dict[str, Any], summary_only: bool) -> str:
         f"ours_ref={result['ours_ref']}",
         f"head={result['head']}",
         f"incoming_sha={result['incoming_sha']}",
+        f"decision_scope_active={str(result['decision_scope']['active']).lower()}",
         f"incoming_changed_files={result['incoming_changed_files']}",
         f"incoming_only_exact_or_deleted_ok={result['incoming_only_exact_or_deleted_ok']}",
         f"incoming_only_moved_ok={result['incoming_only_moved_ok']}",

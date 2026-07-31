@@ -88,6 +88,14 @@ python3 scripts/merge_audit/audit_zig_split_merge.py \
 side choices, renamed helpers/tests, high-risk paths requiring explicit review,
 and generated-file provenance. Keep policy changes specific and documented.
 
+Reusable structural policy (`moved_paths`, aliases, review requirements, and
+generated-file provenance) applies across merges. Resolution decisions and
+review acknowledgements are merge-specific: when any are present, the manifest
+must include `decision_scope.ours_sha` and `decision_scope.incoming_sha` as full
+commit SHAs. The audit ignores those decisions unless both SHAs match the merge
+being audited. Update the scope only after re-reviewing every carried decision;
+never advance it mechanically.
+
 ## Make Variables
 
 Override these when the default refs or output paths are not what you want:
