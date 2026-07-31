@@ -16328,9 +16328,12 @@ fn textQuerySliceToSearchQuerySlice(
 const ResolvedMultiMatchField = struct {
     field: []const u8,
     boost: f32,
+    index_prefix_companion: ?[]const u8 = null,
 };
 
 const search_as_you_type_max_shingle_size: usize = 3;
+const search_as_you_type_min_prefix_length: usize = 2;
+const search_as_you_type_max_prefix_length: usize = 20;
 
 fn multiMatchBoolPrefixToSearchQuery(
     alloc: Allocator,
@@ -16353,6 +16356,11 @@ fn multiMatchBoolPrefixToSearchQuery(
     }
 
     if (should.items.len == 0) return .{ .match_none = {} };
+    if (should.items.len == 1 and multi_match.boost == 1.0) {
+        const query = should.items[0];
+        should.deinit(alloc);
+        return query;
+    }
     return .{ .bool_query = .{
         .should = try should.toOwnedSlice(alloc),
         .min_should = 1,
@@ -16367,16 +16375,22 @@ fn appendResolvedMultiMatchFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !void {
-    try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost);
-    if (isSearchAsYouTypeGeneratedField(requested.field)) return;
-    if (!try fieldHasSearchAsYouTypeSubfields(alloc, text_analysis, runtime_schema, requested.field)) return;
+    if (isSearchAsYouTypeGeneratedField(requested.field)) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
+        return;
+    }
+    const has_search_as_you_type = try fieldHasSearchAsYouTypeSubfields(alloc, text_analysis, runtime_schema, requested.field);
+    if (!has_search_as_you_type) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
+        return;
+    }
 
-    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost);
-    const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost);
     const index_prefix = try std.fmt.allocPrint(alloc, "{s}._index_prefix", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, index_prefix, requested.boost);
+    try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, index_prefix);
+    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{requested.field});
+    try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost, index_prefix);
+    const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{requested.field});
+    try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost, index_prefix);
 }
 
 fn appendUniqueResolvedMultiMatchField(
@@ -16384,11 +16398,18 @@ fn appendUniqueResolvedMultiMatchField(
     fields: *std.ArrayListUnmanaged(ResolvedMultiMatchField),
     field: []const u8,
     boost: f32,
+    index_prefix_companion: ?[]const u8,
 ) !void {
-    for (fields.items) |item| {
-        if (std.mem.eql(u8, item.field, field)) return;
+    for (fields.items) |*item| {
+        if (!std.mem.eql(u8, item.field, field)) continue;
+        if (item.index_prefix_companion == null) item.index_prefix_companion = index_prefix_companion;
+        return;
     }
-    try fields.append(alloc, .{ .field = field, .boost = boost });
+    try fields.append(alloc, .{
+        .field = field,
+        .boost = boost,
+        .index_prefix_companion = index_prefix_companion,
+    });
 }
 
 fn fieldHasSearchAsYouTypeSubfields(
@@ -16447,10 +16468,32 @@ fn fieldBoolPrefixSearchQuery(
             } });
         }
     }
-    try should.append(alloc, .{ .prefix = .{
-        .field = field.field,
-        .prefix = try alloc.dupe(u8, tokens[tokens.len - 1].term),
-    } });
+    const final_token = tokens[tokens.len - 1].term;
+    if (field.index_prefix_companion) |index_prefix| {
+        if (final_token.len >= search_as_you_type_min_prefix_length and
+            final_token.len <= search_as_you_type_max_prefix_length)
+        {
+            try should.append(alloc, .{ .term = .{
+                .field = index_prefix,
+                .term = try alloc.dupe(u8, final_token),
+            } });
+        } else {
+            try should.append(alloc, .{ .prefix = .{
+                .field = field.field,
+                .prefix = try alloc.dupe(u8, final_token),
+            } });
+        }
+    } else {
+        try should.append(alloc, .{ .prefix = .{
+            .field = field.field,
+            .prefix = try alloc.dupe(u8, final_token),
+        } });
+    }
+    if (should.items.len == 1 and field.boost == 1.0) {
+        const query = should.items[0];
+        should.deinit(alloc);
+        return query;
+    }
     return .{ .bool_query = .{
         .should = try should.toOwnedSlice(alloc),
         .min_should = 1,
@@ -16779,11 +16822,84 @@ test "multi_match bool_prefix index prefix uses trailing shingle window" {
         .fields = &fields,
     } }, .{}, null);
 
-    try std.testing.expect(query == .bool_query);
-    try std.testing.expectEqual(@as(usize, 1), query.bool_query.should.len);
-    try std.testing.expect(query.bool_query.should[0] == .term);
-    try std.testing.expectEqualStrings("name._index_prefix", query.bool_query.should[0].term.field);
-    try std.testing.expectEqualStrings("smartphone apple ip", query.bool_query.should[0].term.term);
+    try std.testing.expect(query == .term);
+    try std.testing.expectEqualStrings("name._index_prefix", query.term.field);
+    try std.testing.expectEqualStrings("smartphone apple ip", query.term.term);
+}
+
+test "multi_match bool_prefix rewrites generated field prefixes to indexed terms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const text_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "title._2gram", .analyzer_name = "search_as_you_type_2gram" },
+            .{ .field_name = "title._3gram", .analyzer_name = "search_as_you_type_3gram" },
+            .{ .field_name = "title._index_prefix", .analyzer_name = "search_as_you_type_index_prefix" },
+            .{ .field_name = "body", .analyzer_name = "standard" },
+        },
+    };
+    const fields = [_]types.TextMultiMatchField{.{ .field = "title" }};
+
+    const single = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "zul",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(single == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", single.term.field);
+    try std.testing.expectEqualStrings("zul", single.term.term);
+
+    const mixed_fields = [_]types.TextMultiMatchField{ .{ .field = "title" }, .{ .field = "body" } };
+    const mixed = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "zul",
+        .fields = &mixed_fields,
+    } }, text_analysis, null);
+    try std.testing.expect(mixed == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), mixed.bool_query.should.len);
+    try std.testing.expect(mixed.bool_query.should[0] == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", mixed.bool_query.should[0].term.field);
+    try std.testing.expect(mixed.bool_query.should[1] == .prefix);
+    try std.testing.expectEqualStrings("body", mixed.bool_query.should[1].prefix.field);
+
+    const multiple = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "catalog item 099",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(multiple == .bool_query);
+    try std.testing.expectEqual(@as(usize, 3), multiple.bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[0] == .bool_query);
+    try std.testing.expectEqual(@as(usize, 3), multiple.bool_query.should[0].bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[0].bool_query.should[0] == .term);
+    try std.testing.expect(multiple.bool_query.should[0].bool_query.should[1] == .term);
+    try std.testing.expect(multiple.bool_query.should[0].bool_query.should[2] == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[0].bool_query.should[2].term.field);
+    try std.testing.expectEqualStrings("099", multiple.bool_query.should[0].bool_query.should[2].term.term);
+    try std.testing.expect(multiple.bool_query.should[1] == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), multiple.bool_query.should[1].bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[0] == .term);
+    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[1] == .term);
+    try std.testing.expectEqualStrings("item 099", multiple.bool_query.should[1].bool_query.should[1].term.term);
+    try std.testing.expect(multiple.bool_query.should[2] == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[2].term.field);
+    try std.testing.expectEqualStrings("catalog item 099", multiple.bool_query.should[2].term.term);
+
+    // Prefixes outside the configured edge-ngram range keep the dictionary
+    // prefix clause so one-character and long-prefix behavior is unchanged.
+    const short = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "z",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(short == .prefix);
+    try std.testing.expectEqualStrings("title", short.prefix.field);
+
+    const long = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "abcdefghijklmnopqrstuvwxyz",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(long == .prefix);
+    try std.testing.expectEqualStrings("title", long.prefix.field);
 }
 
 fn testDenseIndexCallback(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {

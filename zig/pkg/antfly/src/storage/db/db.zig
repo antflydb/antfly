@@ -70618,6 +70618,10 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
         \\          "description": {
         \\            "type": "string",
         \\            "x-antfly-types": ["text"]
+        \\          },
+        \\          "state": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["keyword"]
         \\          }
         \\        }
         \\      }
@@ -70640,10 +70644,10 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:1", .value = "{\"name\":\"Smartphone Apple iPhone\",\"description\":\"Latest iPhone model\"}" },
-            .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\"}" },
-            .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\"}" },
-            .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\"}" },
+            .{ .key = "doc:1", .value = "{\"name\":\"Smartphone Apple iPhone\",\"description\":\"Latest iPhone model\",\"state\":\"published\"}" },
+            .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\",\"state\":\"draft\"}" },
+            .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\",\"state\":\"published\"}" },
+            .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\",\"state\":\"published\"}" },
         },
         .sync_level = .full_index,
     });
@@ -70695,6 +70699,19 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     defer bool_prefix_results.deinit();
     try std.testing.expectEqual(@as(u32, 1), bool_prefix_results.total_hits);
     try std.testing.expectEqualStrings("doc:1", bool_prefix_results.hits[0].id);
+
+    var filtered_bool_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "sm",
+            .fields = &multi_match_fields,
+        } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer filtered_bool_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 2), filtered_bool_prefix_results.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), filtered_bool_prefix_results.hits.len);
 }
 
 test "db versioned full text indexes reload matching schema mappings after reopen" {

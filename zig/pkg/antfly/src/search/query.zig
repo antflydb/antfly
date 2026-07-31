@@ -310,8 +310,11 @@ pub const PrefixFilter = struct {
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Use the term iterator to find all terms with the given prefix
-        var term_iter = try inv_reader.termIterator();
+        // Seek to the first dictionary block that can contain the prefix.
+        // Starting from termIterator() makes every prefix query decode all
+        // lexicographically earlier terms, which turns type-ahead queries into
+        // a full term-dictionary scan as the corpus vocabulary grows.
+        var term_iter = try inv_reader.rangeTermIterator(self.prefix, null);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -2009,6 +2012,41 @@ test "prefix filter" {
     try testing.expect(bm.contains(0));
     try testing.expect(bm.contains(1));
     try testing.expect(!bm.contains(2));
+}
+
+test "prefix filter seeks late range in large term dictionary" {
+    const alloc = testing.allocator;
+
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    defer hits.deinit(alloc);
+    var owned_terms = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_terms.items) |term| alloc.free(term);
+        owned_terms.deinit(alloc);
+    }
+    for (0..4_096) |i| {
+        const term = try std.fmt.allocPrint(alloc, "catalog-{d:0>5}", .{i});
+        owned_terms.append(alloc, term) catch |err| {
+            alloc.free(term);
+            return err;
+        };
+        try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
+    }
+    try hits.append(alloc, .{ .term = "zz-target", .freq = 1, .norm = 10 });
+
+    const seg_bytes = try buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const seg = &writer.snapshot().segments[0];
+    const filter = Filter{ .prefix = .{ .field = "body", .prefix = "zz-" } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(bm.contains(0));
 }
 
 test "multi-segment filter execution" {
