@@ -88,7 +88,15 @@ pub fn addRuntimeControls(
     run: *std.Build.Step.Run,
     args: []const []const u8,
 ) void {
-    if (hasForeignLongOption(args)) return;
+    // Build arguments are shared by every configured run artifact. Preserve a
+    // foreign executable's complete vector without letting it affect compile-
+    // time test reachability. If this test step is actually selected, the
+    // strict runtime test runner will reject the foreign option instead of
+    // silently running the default suite.
+    if (hasForeignLongOption(args)) {
+        run.addArgs(args);
+        return;
+    }
 
     var i: usize = 0;
     while (i < args.len) {

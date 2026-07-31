@@ -30,8 +30,10 @@ fn isTestControl(arg: []const u8) bool {
 
 /// Build arguments are global, even when they belong to a non-test run step.
 /// If an executable owns any long option, leave the complete argument vector
-/// to that executable instead of interpreting its positional values as test
-/// filters or forwarding test-runner controls to unrelated test steps.
+/// out of compile-time test selection instead of interpreting its positional
+/// values as test filters. Runtime test steps still receive the vector: they
+/// do not execute for an unrelated top-level step, and strict test runners must
+/// reject it if a test and another argument-owning step are selected together.
 fn hasForeignLongOption(args: []const []const u8) bool {
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--") and !isTestControl(arg))
@@ -96,7 +98,10 @@ pub fn addRuntimeControls(
     run: *std.Build.Step.Run,
     args: []const []const u8,
 ) void {
-    if (hasForeignLongOption(args)) return;
+    if (hasForeignLongOption(args)) {
+        run.addArgs(args);
+        return;
+    }
 
     var i: usize = 0;
     while (i < args.len) {
