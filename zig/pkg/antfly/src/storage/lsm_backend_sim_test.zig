@@ -514,9 +514,14 @@ test "lsm backend simulation compaction run write fault is retryable" {
     defer std.testing.allocator.free(compacted_run_needle);
     try modeled_device.injectWriteFailureForPathContains(compacted_run_needle);
     try std.testing.expectError(error.InjectedWriteFault, lsm_backend.finishBulkIngestSession());
+    try std.testing.expect(lsm_backend.bulkIngestActive());
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
-    try lsm_backend.sync(true);
+    // A failed finalization keeps ownership of the bulk-ingest session so the
+    // caller can retry the same lifecycle transition (or abort it) without a
+    // concurrent maintenance job publishing the intermediate run set.
+    try lsm_backend.finishBulkIngestSession();
+    try std.testing.expect(!lsm_backend.bulkIngestActive());
     try std.testing.expect(lsm_backend.compaction_stats.compactions > 0);
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 

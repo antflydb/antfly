@@ -4886,6 +4886,7 @@ pub const Backend = struct {
                 _ = self.refreshCachedMaintenanceHintLocked();
             }
             self.active_bulk_ingest_batches -= 1;
+            errdefer self.active_bulk_ingest_batches += 1;
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             }
@@ -4893,6 +4894,7 @@ pub const Backend = struct {
             return;
         }
         self.active_bulk_ingest_batches -= 1;
+        errdefer self.active_bulk_ingest_batches += 1;
         if (self.active_bulk_ingest_batches == 0) {
             if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
                 if (!try self.directIngestMutableAtBulkFinishIfPossible()) {
@@ -15004,6 +15006,48 @@ test "lsm backend manifest layout validation keeps WAL and bulk session when run
     try std.testing.expect(!backend.bulkIngestActive());
     const after_repair = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), after_repair.wal_retained_bytes);
+}
+
+test "lsm backend failed final bulk manifest publish leaves the session abortable" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/final-bulk-manifest-failure";
+    var backend = try Backend.open(alloc, root_dir, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .obsolete_retention_ns = 0,
+        .storage = memory_storage.storage(),
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+
+    const original_entry_count = backend.runs.items[0].entry_count;
+    backend.runs.items[0].entry_count = 0;
+    try backend.obsolete_paths.append(alloc, .{
+        .path = try repository_mod.runPath(alloc, root_dir, 999),
+        .delete_after_ns = 0,
+    });
+    backend.manifest_dirty = false;
+    backend.obsolete_manifest_dirty = false;
+
+    try std.testing.expectError(error.InvalidTableFile, backend.finishBulkIngestSessionWithOptions(.{
+        .compact = false,
+        .flush = false,
+    }));
+    try std.testing.expect(backend.bulkIngestActive());
+
+    backend.runs.items[0].entry_count = original_entry_count;
+    backend.abortBulkIngestSession();
+    try std.testing.expect(!backend.bulkIngestActive());
 }
 
 test "lsm backend deferred byte-threshold WAL flush preserves DB-style artifacts across reopen" {
