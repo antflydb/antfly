@@ -8459,19 +8459,28 @@ pub const ProvisionedTableWriteSource = struct {
         result.retry_at_ms = entry.value_ptr.retry_at_ms;
     }
 
+    pub const LsmMaintenanceRoundResult = struct {
+        progressed: bool = false,
+        group_id: ?u64 = null,
+    };
+
     pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
+        return (try self.runLsmMaintenanceRoundDetailed()).progressed;
+    }
+
+    pub fn runLsmMaintenanceRoundDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
         var primary_only = false;
         var leased = blk: {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
+            const cache = self.write_cache orelse return .{};
             if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
             if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
                 primary_only = true;
                 break :blk lease;
             }
-            if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
-            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return false;
+            if (cache.maxLsmMaintenanceScoreLocked() == 0) return .{};
+            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -8489,15 +8498,22 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
         }
-        return progressed;
+        return .{
+            .progressed = progressed,
+            .group_id = if (leased.entry) |entry| entry.group_id else null,
+        };
     }
 
     pub fn runLsmMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !bool {
-        if (!self.local_db_mutex.tryLock()) return false;
+        return (try self.runLsmMaintenanceRoundBestEffortDetailed()).progressed;
+    }
+
+    pub fn runLsmMaintenanceRoundBestEffortDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        if (!self.local_db_mutex.tryLock()) return .{};
         var primary_only = false;
         var leased = blk: {
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
+            const cache = self.write_cache orelse return .{};
             if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
             if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
                 primary_only = true;
@@ -8506,9 +8522,9 @@ pub const ProvisionedTableWriteSource = struct {
             if (cache.maxLsmMaintenanceScoreLocked() != 0) {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
             }
-            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
+            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return .{};
             primary_only = true;
-            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;
+            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -8526,7 +8542,10 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
         }
-        return progressed;
+        return .{
+            .progressed = progressed,
+            .group_id = if (leased.entry) |entry| entry.group_id else null,
+        };
     }
 
     pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {

@@ -1948,7 +1948,8 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
                 backend.options.run_partition_prefix_bytes,
             );
             if (partition_changed or
-                (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes))
+                (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes) or
+                (output.entry_count > 0 and !output.canAppendEntry(winner)))
             {
                 try runs.ensureUnusedCapacity(allocator, 1);
                 const run = try output.finish();
@@ -1966,6 +1967,7 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
             );
             output_active = true;
         }
+        if (!output.canAppendEntry(winner)) return error.TableFileTooLarge;
         try output.appendEntry(winner, entry_bytes);
         emitted_entries += 1;
         consumed_entries += try heap.advanceTopSourcesAtKey(winner);
@@ -2025,7 +2027,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 backend.root_dir.?,
                 run_id,
                 expected_entries,
-                repository_mod.maxRunFileReadBytes(),
+                physicalRunFileLimit(BackendType, backend),
                 backend.options.bloom,
                 backend.options.table_block_compression,
                 backend.options.table_prefix_extractor,
@@ -2081,6 +2083,10 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             new_largest_key = &.{};
             self.entry_count += 1;
             self.logical_bytes += entry_bytes;
+        }
+
+        fn canAppendEntry(self: *const Self, entry: lsm_table_file.Entry) bool {
+            return self.writer.canAppendEntry(entry);
         }
 
         fn finish(self: *Self) !Run {
@@ -2411,16 +2417,22 @@ fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend
     const target_bytes = targetRunFileBytes(BackendType, backend);
     var start: usize = 0;
     while (start < state.entries.items.len) {
-        const end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        const preferred_end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes);
         try runs.ensureUnusedCapacity(backend.allocator, 1);
 
         var output: PersistedOutputRunBuilder(BackendType) = undefined;
-        try output.initInPlace(backend, level, end - start);
+        try output.initInPlace(backend, level, preferred_end - start);
         var output_active = true;
         errdefer if (output_active) output.deinit();
 
-        for (state.entries.items[start..end]) |entry| {
+        var end = start;
+        while (end < preferred_end) : (end += 1) {
+            const entry = state.entries.items[end];
             const table_entry = tableEntryFromOwnedEntry(entry);
+            if (!output.canAppendEntry(table_entry)) {
+                if (end == start) return error.TableFileTooLarge;
+                break;
+            }
             try output.appendEntry(table_entry, estimateOwnedEntryBytes(entry));
         }
 
@@ -2440,6 +2452,13 @@ pub fn makeRunsFromSortedTableEntries(comptime BackendType: type, backend: *Back
 
 fn makeRunsFromStateAtLevel(comptime BackendType: type, backend: *BackendType, state: *State, level: u32) !std.ArrayListUnmanaged(Run) {
     if (state.entries.items.len == 0) return error.EmptyRun;
+
+    if (backend.root_dir != null) {
+        const runs = try makePersistedRunsFromStateBorrowedAtLevel(BackendType, backend, state, level);
+        state.deinit(backend.allocator);
+        state.* = .{};
+        return runs;
+    }
 
     var source_entries = state.entries;
     state.entries = .empty;
@@ -2487,8 +2506,31 @@ fn makeRunsFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *B
     var start: usize = 0;
     while (start < entries.len) {
         try runs.ensureUnusedCapacity(backend.allocator, 1);
-        const end = splitTableEntriesEnd(entries, start, target_bytes, backend.options.run_partition_prefix_bytes);
-        const run = try makeRunFromSortedTableEntriesAtLevel(BackendType, backend, entries[start..end], level);
+        const preferred_end = splitTableEntriesEnd(entries, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        if (backend.root_dir == null) {
+            const run = try makeRunFromSortedTableEntriesAtLevel(BackendType, backend, entries[start..preferred_end], level);
+            runs.appendAssumeCapacity(run);
+            start = preferred_end;
+            continue;
+        }
+
+        var output: PersistedOutputRunBuilder(BackendType) = undefined;
+        try output.initInPlace(backend, level, preferred_end - start);
+        var output_active = true;
+        errdefer if (output_active) output.deinit();
+
+        var end = start;
+        while (end < preferred_end) : (end += 1) {
+            const entry = entries[end];
+            if (!output.canAppendEntry(entry)) {
+                if (end == start) return error.TableFileTooLarge;
+                break;
+            }
+            try output.appendEntry(entry, estimateTableEntryBytes(entry));
+        }
+        const run = try output.finish();
+        output.deinit();
+        output_active = false;
         runs.appendAssumeCapacity(run);
         start = end;
     }
@@ -2584,7 +2626,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         backend.root_dir.?,
         run_id,
         entries.len,
-        repository_mod.maxRunFileReadBytes(),
+        physicalRunFileLimit(BackendType, backend),
         backend.options.bloom,
         backend.options.table_block_compression,
         backend.options.table_prefix_extractor,
@@ -2700,7 +2742,14 @@ fn targetRunFileBytes(comptime BackendType: type, backend: *BackendType) usize {
     return @max(@as(usize, 1), @min(
         backend.options.max_run_file_bytes,
         lsm_table_file.max_entry_data_len,
-        repository_mod.maxRunFileWritePayloadBytes(),
+        physicalRunFileLimit(BackendType, backend),
+    ));
+}
+
+fn physicalRunFileLimit(comptime BackendType: type, backend: *BackendType) usize {
+    return @max(@as(usize, 1), @min(
+        backend.options.max_run_file_physical_bytes,
+        repository_mod.maxRunFileReadBytes(),
     ));
 }
 

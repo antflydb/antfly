@@ -2176,6 +2176,8 @@ const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
     checked_at_ns: u64 = 0,
     lsm_root_generation: u64 = 0,
+    invalidation_generation: u64 = 0,
+    valid: bool = false,
 };
 
 fn runtimeStatusDiskUsageCacheReusable(
@@ -2185,9 +2187,20 @@ fn runtimeStatusDiskUsageCacheReusable(
     active: bool,
     doc_count: u64,
 ) bool {
+    if (!entry.valid) return false;
     if (entry.lsm_root_generation != lsm_root_generation) return false;
     if (entry.disk_bytes == 0 and doc_count > 0) return false;
     return active or now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
+}
+
+fn runtimeStatusDiskUsageScanCanPublish(
+    entry: RuntimeStatusDiskUsageCacheEntry,
+    captured_group_generation: u64,
+    current_global_generation: u64,
+    captured_global_generation: u64,
+) bool {
+    return entry.invalidation_generation == captured_group_generation and
+        current_global_generation == captured_global_generation;
 }
 
 const OwnedLocalGroupStatusRefresh = struct {
@@ -2856,6 +2869,7 @@ test "runtime status disk usage cache is scoped to one root generation" {
         .disk_bytes = 4096,
         .checked_at_ns = 100,
         .lsm_root_generation = 7,
+        .valid = true,
     };
     try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, 101, false, 1));
     try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, std.math.maxInt(u64), true, 1));
@@ -2864,6 +2878,47 @@ test "runtime status disk usage cache is scoped to one root generation" {
     var zero_entry = entry;
     zero_entry.disk_bytes = 0;
     try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(zero_entry, 7, 101, false, 1));
+
+    var invalidated_entry = entry;
+    invalidated_entry.valid = false;
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(invalidated_entry, 7, 101, false, 1));
+
+    try std.testing.expect(runtimeStatusDiskUsageScanCanPublish(entry, 0, 4, 4));
+    var group_invalidated = entry;
+    group_invalidated.invalidation_generation = 5;
+    try std.testing.expect(!runtimeStatusDiskUsageScanCanPublish(group_invalidated, 0, 5, 4));
+    try std.testing.expect(!runtimeStatusDiskUsageScanCanPublish(entry, 0, 5, 4));
+}
+
+test "runtime status disk usage cache is scoped to one root generation and group invalidation is scoped" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            ".",
+            catalog,
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    try server.runtime_status_disk_usage_cache.put(alloc, 7, .{ .disk_bytes = 700, .valid = true });
+    try server.runtime_status_disk_usage_cache.put(alloc, 8, .{ .disk_bytes = 800, .valid = true });
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+
+    try std.testing.expect(!server.runtime_status_disk_usage_cache.get(7).?.valid);
+    try std.testing.expect(server.runtime_status_disk_usage_cache.get(8).?.valid);
+    try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
 }
 
 test "data runtime stamps one producer generation on every reported group" {
@@ -3471,6 +3526,9 @@ pub const DataServer = struct {
     runtime_status_last_refresh_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_disk_usage_cache_mutex: std.atomic.Mutex = .unlocked,
     runtime_status_disk_usage_cache: std.AutoHashMapUnmanaged(u64, RuntimeStatusDiskUsageCacheEntry) = .empty,
+    // Detect an invalidation racing a directory scan before it can publish a
+    // stale result. Per-group cache entries remain independently reusable.
+    runtime_status_disk_usage_invalidation_generation: std.atomic.Value(u64) = .init(1),
     store_status_cache_mutex: std.atomic.Mutex = .unlocked,
     store_status_heartbeat_cache: StoreStatusHeartbeatCache = .{},
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
@@ -4867,7 +4925,7 @@ pub const DataServer = struct {
     fn deferLsmObsoleteReclaim(self: *DataServer, now_ns: u64, delay_ns: u64) void {
         const due_ns = now_ns +| delay_ns;
         const current = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
-        if (current == 0 or due_ns < current) {
+        if (current == 0 or current <= now_ns or due_ns < current) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(due_ns, .release);
         }
     }
@@ -4908,9 +4966,12 @@ pub const DataServer = struct {
             const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
             var maintenance_progressed = false;
+            var maintenance_progressed_groups: [lsm_maintenance_worker_max_steps_per_wake]u64 = undefined;
+            var maintenance_progressed_group_count: usize = 0;
+            var maintenance_progressed_unscoped = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const did_work = live_write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
+                const maintenance = live_write_source.runLsmMaintenanceRoundBestEffortDetailed() catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -4922,7 +4983,7 @@ pub const DataServer = struct {
                     _ = self.lsm_maintenance_failed.fetchAdd(1, .monotonic);
                     break;
                 };
-                if (!did_work) {
+                if (!maintenance.progressed) {
                     if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
@@ -4933,6 +4994,21 @@ pub const DataServer = struct {
                     break;
                 }
                 maintenance_progressed = true;
+                if (maintenance.group_id) |group_id| {
+                    var already_recorded = false;
+                    for (maintenance_progressed_groups[0..maintenance_progressed_group_count]) |recorded| {
+                        if (recorded == group_id) {
+                            already_recorded = true;
+                            break;
+                        }
+                    }
+                    if (!already_recorded) {
+                        maintenance_progressed_groups[maintenance_progressed_group_count] = group_id;
+                        maintenance_progressed_group_count += 1;
+                    }
+                } else {
+                    maintenance_progressed_unscoped = true;
+                }
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
                 if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
@@ -4946,7 +5022,13 @@ pub const DataServer = struct {
             // checkpoint, compaction, or obsolete-file reclaim invalidates
             // those bytes even when no request mutates the logical table.
             if (maintenance_progressed) {
-                self.invalidateRuntimeStatusDiskUsageCache();
+                if (maintenance_progressed_unscoped) {
+                    self.invalidateAllRuntimeStatusDiskUsageCacheEntries();
+                } else {
+                    for (maintenance_progressed_groups[0..maintenance_progressed_group_count]) |group_id| {
+                        self.invalidateRuntimeStatusDiskUsageCacheForGroup(group_id);
+                    }
+                }
                 self.runtime_status_dirty.store(true, .release);
                 self.markStoreStatusDirtyImmediate();
             }
@@ -8573,44 +8655,84 @@ pub const DataServer = struct {
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
     ) ?u64 {
-        const now_ns = platform_time.monotonicNs();
         const active = runtimeStatusHasActiveBackgroundWork(status);
         const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
             status.metadata.lsm_root_generation
         else
             self.provisioned_storage.visibleRootGenerationForGroup(group_id);
-        lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
-        if (self.runtime_status_disk_usage_cache.get(group_id)) |entry| {
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const now_ns = platform_time.monotonicNs();
+            const scan_generation = self.runtime_status_disk_usage_invalidation_generation.load(.acquire);
+            lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+            const state = self.runtime_status_disk_usage_cache.getOrPut(self.alloc, group_id) catch {
+                self.runtime_status_disk_usage_cache_mutex.unlock();
+                return null;
+            };
+            if (!state.found_existing) state.value_ptr.* = .{};
+            const group_generation = state.value_ptr.invalidation_generation;
             if (runtimeStatusDiskUsageCacheReusable(
-                entry,
+                state.value_ptr.*,
                 lsm_root_generation,
                 now_ns,
                 active,
                 status.stats.doc_count,
             )) {
+                const disk_bytes = state.value_ptr.disk_bytes;
                 self.runtime_status_disk_usage_cache_mutex.unlock();
-                return entry.disk_bytes;
+                return disk_bytes;
             }
+            self.runtime_status_disk_usage_cache_mutex.unlock();
+
+            if (active and status.stats.doc_count == 0) return null;
+            const disk_bytes = directoryUsageBytes(self.alloc, db_path) catch return null;
+
+            lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+            const current = self.runtime_status_disk_usage_cache.getPtr(group_id) orelse {
+                self.runtime_status_disk_usage_cache_mutex.unlock();
+                continue;
+            };
+            if (!runtimeStatusDiskUsageScanCanPublish(
+                current.*,
+                group_generation,
+                self.runtime_status_disk_usage_invalidation_generation.load(.acquire),
+                scan_generation,
+            )) {
+                self.runtime_status_disk_usage_cache_mutex.unlock();
+                continue;
+            }
+            current.* = .{
+                .disk_bytes = disk_bytes,
+                .checked_at_ns = now_ns,
+                .lsm_root_generation = lsm_root_generation,
+                .invalidation_generation = group_generation,
+                .valid = true,
+            };
+            self.runtime_status_disk_usage_cache_mutex.unlock();
+            return disk_bytes;
         }
-        self.runtime_status_disk_usage_cache_mutex.unlock();
-
-        if (active and status.stats.doc_count == 0) return null;
-        const disk_bytes = directoryUsageBytes(self.alloc, db_path) catch return null;
-
-        lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
-        defer self.runtime_status_disk_usage_cache_mutex.unlock();
-        self.runtime_status_disk_usage_cache.put(self.alloc, group_id, .{
-            .disk_bytes = disk_bytes,
-            .checked_at_ns = now_ns,
-            .lsm_root_generation = lsm_root_generation,
-        }) catch {};
-        return disk_bytes;
+        return null;
     }
 
-    fn invalidateRuntimeStatusDiskUsageCache(self: *DataServer) void {
+    fn invalidateRuntimeStatusDiskUsageCacheForGroup(self: *DataServer, group_id: u64) void {
+        const generation = self.runtime_status_disk_usage_invalidation_generation.fetchAdd(1, .acq_rel) +| 1;
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
         defer self.runtime_status_disk_usage_cache_mutex.unlock();
-        self.runtime_status_disk_usage_cache.clearRetainingCapacity();
+        const state = self.runtime_status_disk_usage_cache.getOrPut(self.alloc, group_id) catch return;
+        if (!state.found_existing) state.value_ptr.* = .{};
+        state.value_ptr.invalidation_generation = generation;
+        state.value_ptr.valid = false;
+    }
+
+    fn invalidateAllRuntimeStatusDiskUsageCacheEntries(self: *DataServer) void {
+        const generation = self.runtime_status_disk_usage_invalidation_generation.fetchAdd(1, .acq_rel) +| 1;
+        lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+        defer self.runtime_status_disk_usage_cache_mutex.unlock();
+        var it = self.runtime_status_disk_usage_cache.valueIterator();
+        while (it.next()) |entry| {
+            entry.invalidation_generation = generation;
+            entry.valid = false;
+        }
     }
 
     fn joinLocalGroupStatusRefreshThread(self: *DataServer) void {

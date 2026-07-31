@@ -290,9 +290,17 @@ pub const Options = struct {
     flush_threshold: usize = 8,
     flush_threshold_bytes: u64 = 0,
     // Rotate and flush a non-empty mutable table after this much write-idle
-    // time. Zero disables idle flushing. The deadline is renewed by each
-    // mutation, so sustained write throughput still uses the size threshold.
+    // time once it reaches mutable_idle_flush_min_bytes. Zero disables idle
+    // flushing. The deadline is renewed by each mutation, so sustained write
+    // throughput still uses the normal size threshold.
     mutable_idle_flush_after_ns: u64 = 0,
+    // Avoid turning low-rate writes into one tiny L0 run per idle interval.
+    // Zero makes every non-empty mutable table eligible for the idle deadline.
+    mutable_idle_flush_min_bytes: u64 = 0,
+    // Upper bound on how long any non-empty mutable table remains WAL-only,
+    // even when it never reaches mutable_idle_flush_min_bytes. Zero leaves the
+    // maximum age unbounded.
+    mutable_idle_flush_max_age_ns: u64 = 0,
     recovery_replay_flush_threshold: usize = 64 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
@@ -320,7 +328,12 @@ pub const Options = struct {
     level_target_bytes_multiplier: usize = 8,
     max_compaction_input_bytes: u64 = 0,
     max_compaction_input_allow_oversized_single_job: bool = true,
+    // Preferred logical payload target used to shape runs.
     max_run_file_bytes: usize = 512 * 1024 * 1024,
+    // Hard physical publication bound. Keep this no larger than the reader
+    // allocation cap; tests and embedded users may lower it independently of
+    // the logical target to exercise encoded-size admission.
+    max_run_file_physical_bytes: usize = 512 * 1024 * 1024,
     /// Finish a run when the namespace or the first N key bytes change. This
     /// only controls run layout; the persisted table-file format is unchanged.
     run_partition_prefix_bytes: usize = 0,
@@ -1384,6 +1397,7 @@ pub const Backend = struct {
     active_bulk_ingest_batches: usize = 0,
     mutable: ActiveMemTable = .{},
     mutable_idle_flush_deadline_ns: u64 = 0,
+    mutable_idle_flush_max_deadline_ns: u64 = 0,
     mutable_wal_range: WalSegmentRange = .{},
     empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
@@ -1953,9 +1967,28 @@ pub const Backend = struct {
             self.mutable.entries.items.len > 0 and
             !self.options.backend.read_only)
         {
-            self.mutable_idle_flush_deadline_ns = self.nowNs() +| self.options.mutable_idle_flush_after_ns;
+            const now_ns = self.nowNs();
+            if (self.mutable_idle_flush_max_deadline_ns == 0 and
+                self.options.mutable_idle_flush_max_age_ns > 0)
+            {
+                self.mutable_idle_flush_max_deadline_ns = now_ns +| self.options.mutable_idle_flush_max_age_ns;
+            }
+
+            const idle_eligible = self.options.mutable_idle_flush_min_bytes == 0 or
+                self.mutable.estimatedLogicalBytes() >= self.options.mutable_idle_flush_min_bytes;
+            const idle_deadline = if (idle_eligible)
+                now_ns +| self.options.mutable_idle_flush_after_ns
+            else
+                std.math.maxInt(u64);
+            self.mutable_idle_flush_deadline_ns = if (self.mutable_idle_flush_max_deadline_ns > 0)
+                @min(idle_deadline, self.mutable_idle_flush_max_deadline_ns)
+            else if (idle_eligible)
+                idle_deadline
+            else
+                0;
         } else {
             self.mutable_idle_flush_deadline_ns = 0;
+            self.mutable_idle_flush_max_deadline_ns = 0;
         }
         self.notePotentialMaintenanceDebtLocked();
     }
@@ -3020,6 +3053,7 @@ pub const Backend = struct {
         self.immutable_wal_ranges.appendAssumeCapacity(self.mutable_wal_range);
         self.mutable_wal_range = .{};
         self.mutable_idle_flush_deadline_ns = 0;
+        self.mutable_idle_flush_max_deadline_ns = 0;
         self.write_stats.immutable_rotations += 1;
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
@@ -7455,6 +7489,85 @@ test "lsm backend idle mutable deadline checkpoints retained wal" {
 
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+}
+
+test "lsm backend idle checkpoint accumulates small writes and bounds dirty age" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-adaptive-idle-mutable-checkpoint";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold_bytes = 1024 * 1024,
+        .mutable_idle_flush_after_ns = 100,
+        .mutable_idle_flush_min_bytes = 1024,
+        .mutable_idle_flush_max_age_ns = 1000,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+    const max_deadline = backend.mutable_idle_flush_max_deadline_ns;
+    try std.testing.expect(max_deadline > 0);
+    try std.testing.expectEqual(max_deadline, backend.mutable_idle_flush_deadline_ns);
+
+    // A second low-rate write below the byte floor does not renew the maximum
+    // age or create an early tiny-run deadline.
+    storage.tick = 200;
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "bravo");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(max_deadline, backend.mutable_idle_flush_deadline_ns);
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+
+    // Crossing the byte floor activates the short idle deadline, which is
+    // renewed by another write but never beyond the original maximum age.
+    var large_value: [2048]u8 = undefined;
+    @memset(&large_value, 'v');
+    storage.tick = 300;
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:c", &large_value);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 400), backend.mutable_idle_flush_deadline_ns);
+    storage.tick = 350;
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:d", "delta");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 450), backend.mutable_idle_flush_deadline_ns);
+    storage.tick = 450;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_deadline_ns);
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_max_deadline_ns);
+
+    // A later tiny write still checkpoints at its maximum dirty age.
+    storage.tick = 500;
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:e", "echo");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 1500), backend.mutable_idle_flush_deadline_ns);
+    storage.tick = 1499;
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    storage.tick = 1500;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
 }
 
 fn expectWalRetentionCacheMatchesStorage(backend: *Backend) !void {
@@ -14917,6 +15030,41 @@ test "lsm backend splits oversized flushes into persisted run segments" {
     }
 }
 
+test "lsm backend physically bounds metadata-heavy flush runs" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/physical-size-bounded-flush";
+    const count = 64;
+    var backend = try Backend.open(alloc, root_dir, .{
+        .flush_threshold = count,
+        .compact_threshold_runs = 100,
+        .max_run_file_bytes = 1024 * 1024,
+        .max_run_file_physical_bytes = 1024,
+        .storage = memory_storage.storage(),
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var txn = try runtime.beginWrite();
+    var key_buf: [32]u8 = undefined;
+    for (0..count) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "tenant:{d:0>4}", .{i});
+        try txn.put(key, "v");
+    }
+    try txn.commit();
+
+    try std.testing.expect(backend.runs.items.len > 1);
+    var total_entries: usize = 0;
+    for (backend.runs.items) |run| {
+        try std.testing.expect(run.size_bytes <= 1024);
+        total_entries += run.entry_count;
+    }
+    try std.testing.expectEqual(@as(usize, count), total_entries);
+}
+
 test "lsm backend partitions persisted runs at configured key family boundaries" {
     const alloc = std.testing.allocator;
     var memory_storage = storage_io.MemoryStorage.init(alloc);
@@ -15017,6 +15165,7 @@ test "lsm backend splits oversized compaction output into persisted run segments
             .level_target_runs_base = 100,
             .level_target_bytes_base = 0,
             .max_run_file_bytes = 120,
+            .max_run_file_physical_bytes = 512,
             .storage = memory_storage.storage(),
         });
         defer backend.close();
@@ -15035,6 +15184,7 @@ test "lsm backend splits oversized compaction output into persisted run segments
         var level_one_runs: usize = 0;
         for (backend.runs.items) |run| {
             if (run.level == 1) level_one_runs += 1;
+            try std.testing.expect(run.size_bytes <= 512);
             try std.testing.expect(run.state == null);
         }
         try std.testing.expect(level_one_runs >= 2);
@@ -15047,6 +15197,7 @@ test "lsm backend splits oversized compaction output into persisted run segments
             .level_target_runs_base = 100,
             .level_target_bytes_base = 0,
             .max_run_file_bytes = 120,
+            .max_run_file_physical_bytes = 512,
             .storage = memory_storage.storage(),
         });
         defer reopened.close();

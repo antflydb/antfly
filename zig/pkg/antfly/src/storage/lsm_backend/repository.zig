@@ -23,21 +23,12 @@ const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
 
 const max_run_file_read_bytes = 512 * 1024 * 1024;
-// Run splitting is based on logical entry bytes, while the reader limit covers
-// the complete encoded table (entry blocks, offsets, Bloom filters, block
-// bounds, checksums, and the footer). Reserve enough space for that metadata;
-// the writer also rejects any finished file that exceeds the hard reader cap.
-const max_run_file_write_payload_bytes = max_run_file_read_bytes * 7 / 8;
 const max_manifest_read_bytes = 128 * 1024 * 1024;
 const table_write_buffer_size = 256 * 1024;
 const table_builder_accounting_step_bytes: u64 = 64 * 1024;
 
 pub fn maxRunFileReadBytes() usize {
     return max_run_file_read_bytes;
-}
-
-pub fn maxRunFileWritePayloadBytes() usize {
-    return max_run_file_write_payload_bytes;
 }
 
 pub fn maxManifestReadBytes() usize {
@@ -748,6 +739,10 @@ fn writeTableFileAtomically(
         .block_compression = compression_policy,
         .compression_stats = &compression_stats,
     });
+    // The legacy whole-table path is not used by normal flush or compaction,
+    // but it must obey the same reader contract: never publish a run that the
+    // repository's own bounded reader will reject.
+    if (size_bytes > max_run_file_read_bytes) return error.TableFileTooLarge;
     try adapter.flush();
 
     active = false;
@@ -994,6 +989,10 @@ pub const StreamingRunFileWriter = struct {
         self.observeBuilderWorkingSet(false);
     }
 
+    pub fn canAppendEntry(self: *const StreamingRunFileWriter, entry: lsm_table_file.Entry) bool {
+        return (self.encoder.encodedSizeUpperBoundAfterEntry(entry) catch return false) <= self.max_file_bytes;
+    }
+
     pub fn finish(self: *StreamingRunFileWriter) !PersistedStreamingRunFile {
         self.observeBuilderWorkingSet(true);
         var encoded = try self.encoder.finish();
@@ -1109,8 +1108,6 @@ test "repository refuses to publish a streaming run above the reader cap" {
     var storage = storage_io.MemoryStorage.init(allocator);
     defer storage.deinit();
 
-    try std.testing.expect(maxRunFileWritePayloadBytes() < maxRunFileReadBytes());
-
     const root_dir = "/repository-streaming-run-reader-cap";
     var writer: StreamingRunFileWriter = undefined;
     try writer.initInPlace(
@@ -1128,11 +1125,13 @@ test "repository refuses to publish a streaming run above the reader cap" {
     var writer_active = true;
     defer if (writer_active) writer.deinit();
 
-    try writer.appendEntry(.{
+    const entry = lsm_table_file.Entry{
         .namespace_name = "docs",
         .key = "doc:a",
         .value = "alpha",
-    });
+    };
+    try std.testing.expect(!writer.canAppendEntry(entry));
+    try writer.appendEntry(entry);
     try std.testing.expectError(error.TableFileTooLarge, writer.finish());
     writer.deinit();
     writer_active = false;
@@ -1140,6 +1139,98 @@ test "repository refuses to publish a streaming run above the reader cap" {
     const path = try runPath(allocator, root_dir, 1);
     defer allocator.free(path);
     try std.testing.expectError(error.FileNotFound, storage.storage().readFileAlloc(allocator, path, 1024));
+}
+
+test "repository streaming size admission bounds metadata-heavy runs" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const max_file_bytes = 1024;
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage.storage(),
+        allocator,
+        "/repository-streaming-run-size-admission",
+        1,
+        128,
+        max_file_bytes,
+        .{},
+        .none,
+        .first_separator,
+        null,
+    );
+    var writer_active = true;
+    defer if (writer_active) writer.deinit();
+
+    var admitted: usize = 0;
+    var key_buf: [32]u8 = undefined;
+    for (0..128) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "tenant:{d:0>4}", .{i});
+        const entry = lsm_table_file.Entry{ .namespace_name = "docs", .key = key, .value = "v" };
+        if (!writer.canAppendEntry(entry)) break;
+        try writer.appendEntry(entry);
+        admitted += 1;
+    }
+    try std.testing.expect(admitted > 0);
+    try std.testing.expect(admitted < 128);
+
+    var persisted = try writer.finish();
+    writer_active = false;
+    defer {
+        allocator.free(persisted.path);
+        persisted.filter.deinit(allocator);
+    }
+    try std.testing.expect(persisted.size_bytes <= max_file_bytes);
+    var index = try loadRunTableIndexAllocWithStorage(storage.storage(), allocator, persisted.path);
+    defer index.deinit(allocator);
+    try std.testing.expectEqual(admitted, index.entryCount());
+}
+
+test "repository streaming size admission remains exact across completed blocks" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const max_file_bytes = 96 * 1024;
+    const entry_count = 20;
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage.storage(),
+        allocator,
+        "/repository-streaming-run-multi-block-admission",
+        1,
+        entry_count,
+        max_file_bytes,
+        .{},
+        .none,
+        .none,
+        null,
+    );
+    var writer_active = true;
+    defer if (writer_active) writer.deinit();
+
+    var value: [4096]u8 = undefined;
+    @memset(&value, 'v');
+    var key_buf: [32]u8 = undefined;
+    for (0..entry_count) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>4}", .{i});
+        const entry = lsm_table_file.Entry{ .namespace_name = "docs", .key = key, .value = &value };
+        try std.testing.expect(writer.canAppendEntry(entry));
+        try writer.appendEntry(entry);
+    }
+
+    var persisted = try writer.finish();
+    writer_active = false;
+    defer {
+        allocator.free(persisted.path);
+        persisted.filter.deinit(allocator);
+    }
+    try std.testing.expect(persisted.size_bytes <= max_file_bytes);
+    var index = try loadRunTableIndexAllocWithStorage(storage.storage(), allocator, persisted.path);
+    defer index.deinit(allocator);
+    try std.testing.expect(index.blocks.len > 1);
+    try std.testing.expectEqual(@as(usize, entry_count), index.entryCount());
 }
 
 test "repository rejects forged run metadata length before allocating" {

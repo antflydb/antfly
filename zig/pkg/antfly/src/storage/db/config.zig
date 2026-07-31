@@ -60,10 +60,13 @@ pub const PrimaryBackend = union(enum) {
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
-    // Keep the throughput-oriented size threshold above, but checkpoint a
-    // quiescent primary table so small and medium corpora do not retain their
-    // entire write history in the WAL indefinitely.
-    .mutable_idle_flush_after_ns = std.time.ns_per_s,
+    // Preserve throughput batching while bounding retained WAL for every
+    // workload shape. Meaningful bursts checkpoint promptly; low-rate tables
+    // accumulate instead of producing one run per write and checkpoint at the
+    // maximum dirty age if they remain small.
+    .mutable_idle_flush_after_ns = 5 * std.time.ns_per_s,
+    .mutable_idle_flush_min_bytes = 1024 * 1024,
+    .mutable_idle_flush_max_age_ns = 5 * 60 * std.time.ns_per_s,
     .bulk_ingest_flush_threshold_bytes_multiplier = 2,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
@@ -484,7 +487,9 @@ test "index lsm profiles preserve current flush profiles" {
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
-    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
+    try std.testing.expectEqual(@as(u64, mib), primary_opts.mutable_idle_flush_min_bytes);
+    try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), primary_opts.mutable_idle_flush_max_age_ns);
     try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_flush_threshold_bytes_multiplier);
     try std.testing.expectEqual(@as(usize, 32), primary_opts.l0_soft_limit_runs);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), primary_opts.level_target_bytes_base);
