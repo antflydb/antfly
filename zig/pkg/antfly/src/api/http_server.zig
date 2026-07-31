@@ -35741,12 +35741,17 @@ test "api http server executes foreign right join query through registry" {
     const alloc = std.testing.allocator;
 
     const DummyForeign = struct {
+        var saw_no_deadline = false;
+        var saw_cancellation = false;
+
         fn destroy(ptr: *anyopaque, inner_alloc: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             inner_alloc.destroy(self);
         }
 
-        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, _: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+            saw_no_deadline = params.execution_deadline_ns == null;
+            saw_cancellation = params.cancellation != null;
             const rows = try inner_alloc.alloc(std.json.Value, 2);
             rows[0] = try parseOwnedJsonValueAlloc(inner_alloc, "{\"id\":\"cust:a\",\"name\":\"Alice\"}");
             rows[1] = try parseOwnedJsonValueAlloc(inner_alloc, "{\"id\":\"cust:b\",\"name\":\"Bob\"}");
@@ -35817,12 +35822,24 @@ test "api http server executes foreign right join query through registry" {
         .ptr = undefined,
         .vtable = undefined,
     };
-    var right = try server.executeForeignRightJoinQuery(alloc, dummy_source, foreign_config, join, parsed_hits.values, .{});
+    var cancellation = std.atomic.Value(bool).init(false);
+    var right = try distributed_join.executeForeignRightJoinQuery(
+        server.joinContext().withCancellation(&cancellation),
+        &server.join_job_store,
+        alloc,
+        dummy_source,
+        foreign_config,
+        join,
+        parsed_hits.values,
+        .{},
+    );
     defer right.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), right.hits.len);
     try std.testing.expectEqualStrings("cust:a", right.hits[0].object.get("_id").?.string);
     try std.testing.expectEqualStrings("Alice", testOwnedHitSourcePathValue(right.hits[0], "name").?.string);
+    try std.testing.expect(DummyForeign.saw_no_deadline);
+    try std.testing.expect(DummyForeign.saw_cancellation);
 }
 
 test "api http server executes direct foreign table query through registry" {
@@ -35833,13 +35850,22 @@ test "api http server executes direct foreign table query through registry" {
 
     const DummyForeign = struct {
         var last_dsn: ?[]u8 = null;
+        var saw_no_deadline = false;
+        var saw_cancellation = false;
+        var cancel_when_observed = false;
 
         fn destroy(ptr: *anyopaque, inner_alloc: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             inner_alloc.destroy(self);
         }
 
-        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, _: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+            saw_no_deadline = params.execution_deadline_ns == null;
+            saw_cancellation = params.cancellation != null;
+            if (cancel_when_observed) {
+                _ = params.cancellation orelse return error.ForeignQueryFailed;
+                return error.Cancelled;
+            }
             const rows = try inner_alloc.alloc(std.json.Value, 2);
             rows[0] = try parseOwnedJsonValueAlloc(inner_alloc, "{\"id\":\"cust:a\",\"name\":\"Alice\"}");
             rows[1] = try parseOwnedJsonValueAlloc(inner_alloc, "{\"id\":\"cust:b\",\"name\":\"Bob\"}");
@@ -35901,7 +35927,8 @@ test "api http server executes direct foreign table query through registry" {
     );
     try std.testing.expect(DummyForeign.last_dsn == null);
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, null)).?;
+    var cancellation = std.atomic.Value(bool).init(false);
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -35913,26 +35940,54 @@ test "api http server executes direct foreign table query through registry" {
     try std.testing.expectEqualStrings("cust:a", response.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("Alice", testQueryHitSourcePathValue(response.hits.?.hits.?[0], "name").?.string);
     try std.testing.expectEqualStrings("postgres://resolved", DummyForeign.last_dsn.?);
+    try std.testing.expect(DummyForeign.saw_no_deadline);
+    try std.testing.expect(DummyForeign.saw_cancellation);
+
+    DummyForeign.cancel_when_observed = true;
+    defer DummyForeign.cancel_when_observed = false;
+    cancellation.store(false, .release);
+    try std.testing.expectError(
+        error.Cancelled,
+        server.executeForeignPublicTableQueryIfAny(
+            alloc,
+            dummy_source,
+            "pg_customers",
+            body,
+            null,
+            null,
+            null,
+            &cancellation,
+        ),
+    );
 }
 
 test "api http server executes direct foreign table aggregations through registry" {
     const alloc = std.testing.allocator;
 
     const DummyForeign = struct {
+        var query_saw_no_deadline = false;
+        var query_saw_cancellation = false;
+        var aggregate_saw_no_deadline = false;
+        var aggregate_saw_cancellation = false;
+
         fn destroy(ptr: *anyopaque, inner_alloc: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             inner_alloc.destroy(self);
         }
 
-        fn query(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: std.mem.Allocator, params: foreign_mod.QueryParams) !foreign_mod.QueryResult {
             _ = ptr;
+            query_saw_no_deadline = params.execution_deadline_ns == null;
+            query_saw_cancellation = params.cancellation != null;
             const rows = try inner_alloc.alloc(std.json.Value, 1);
             rows[0] = try parseOwnedJsonValueAlloc(inner_alloc, "{\"id\":\"cust:a\",\"name\":\"Alice\",\"version\":1}");
             return .{ .rows = rows, .total = 1 };
         }
 
-        fn aggregate(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: foreign_mod.AggregateParams) !foreign_mod.AggregateResult {
+        fn aggregate(ptr: *anyopaque, inner_alloc: std.mem.Allocator, params: foreign_mod.AggregateParams) !foreign_mod.AggregateResult {
             _ = ptr;
+            aggregate_saw_no_deadline = params.execution_deadline_ns == null;
+            aggregate_saw_cancellation = params.cancellation != null;
             const results = try inner_alloc.alloc(foreign_mod.NamedValue, 2);
             results[0] = .{
                 .name = try inner_alloc.dupe(u8, "version_stats"),
@@ -35990,7 +36045,8 @@ test "api http server executes direct foreign table aggregations through registr
         \\{"fields":["name"],"aggregations":{"version_stats":{"type":"stats","field":"version"},"name_terms":{"type":"terms","field":"name","size":5}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers","columns":[{"name":"version","type":"bigint"},{"name":"name","type":"text"}]}}}
     ;
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, null)).?;
+    var cancellation = std.atomic.Value(bool).init(false);
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -36008,4 +36064,8 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expectEqual(@as(usize, 2), name_terms.buckets.?.len);
     try std.testing.expectEqualStrings("Alice", name_terms.buckets.?[0].key);
     try std.testing.expectEqual(@as(i64, 1), name_terms.buckets.?[0].doc_count);
+    try std.testing.expect(DummyForeign.query_saw_no_deadline);
+    try std.testing.expect(DummyForeign.query_saw_cancellation);
+    try std.testing.expect(DummyForeign.aggregate_saw_no_deadline);
+    try std.testing.expect(DummyForeign.aggregate_saw_cancellation);
 }
