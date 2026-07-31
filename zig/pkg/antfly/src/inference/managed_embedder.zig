@@ -60,8 +60,10 @@ pub const ProviderKind = enum {
 pub const EmbeddingRequestContext = struct {
     io: std.Io,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {
+        if (self.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
         const deadline = self.deadline_ns orelse return;
         if (monotonicNowNs() >= deadline) return error.Timeout;
     }
@@ -157,6 +159,7 @@ pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -372,6 +375,7 @@ pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     provider: ProviderKind,
@@ -882,11 +886,12 @@ fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
 }
 
 fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequestContext {
-    return .{ .io = embeddingIo(entry), .deadline_ns = entry.deadline_ns };
+    return .{ .io = embeddingIo(entry), .deadline_ns = entry.deadline_ns, .cancellation = entry.cancellation };
 }
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
     const deadline = entry.deadline_ns orelse return;
+    if (entry.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
 
@@ -1358,6 +1363,7 @@ fn buildManagedEmbeddingEntry(
         .alloc = alloc,
         .io = options.io,
         .deadline_ns = options.deadline_ns,
+        .cancellation = options.cancellation,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .provider = provider,

@@ -691,6 +691,7 @@ pub const SemanticStatusResolver = struct {
             .query_embedding_security_domain = self.query_embedding_security_domain,
             .query_embedding_security_scope = self.query_embedding_security_scope,
             .query_embedding_deadline_ns = self.query_embedding_deadline_ns,
+            .query_cancellation = self.query_cancellation,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
         try ensureRequestActive(self.query_cancellation);
         return planned;
