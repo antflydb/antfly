@@ -56,6 +56,7 @@ type StoreAPI struct {
 
 	startMu        sync.Mutex
 	startingShards map[types.ID]struct{}
+	queryAdmission *queryAdmission
 }
 
 func (store *Store) NewHttpAPI() http.Handler {
@@ -64,6 +65,7 @@ func (store *Store) NewHttpAPI() http.Handler {
 		store:          store,
 		antflyConfig:   store.antflyConfig,
 		startingShards: make(map[types.ID]struct{}),
+		queryAdmission: newQueryAdmission(concurrentQueriesFromEnv(os.Getenv("ANTFLY_MAX_CONCURRENT_QUERIES"))),
 	}
 	return api.setupRoutes()
 }
@@ -2051,6 +2053,11 @@ func (h *StoreAPI) handleGetEdges(w http.ResponseWriter, r *http.Request) {
 
 // setupRoutes sets up the HTTP routes for the API
 func (h *StoreAPI) setupRoutes() *http.ServeMux {
+	// Keep direct StoreAPI construction in tests and small in-process users
+	// protected as well as the production constructor.
+	if h.queryAdmission == nil {
+		h.queryAdmission = newQueryAdmission(defaultConcurrentQueries)
+	}
 	mux := http.NewServeMux()
 	// Special command endpoints
 	mux.HandleFunc("POST /shard", h.handleStartShard)
@@ -2072,7 +2079,7 @@ func (h *StoreAPI) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /shard/isremoved/{id}", h.handleIsIDRemoved)
 	mux.HandleFunc("GET /shard/mediankey", h.handleGetMedianKey)
 	mux.HandleFunc("GET /status", h.handleGetStoreStatus)
-	mux.HandleFunc("POST /search", h.handleSearch)
+	mux.Handle("POST /search", h.queryAdmission.wrap(http.HandlerFunc(h.handleSearch)))
 	mux.HandleFunc("POST /batch", h.handleBatchWrite)
 	mux.HandleFunc("POST /shard/merge-chunk", h.handleApplyMergeChunk)
 	mux.HandleFunc("POST /scan", h.handleScan)

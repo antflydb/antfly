@@ -249,9 +249,12 @@ func RunAsStore(
 			defer func() { _ = server.Close() }()
 		} else {
 			server := &http.Server{
-				Addr:        url.Host,
-				Handler:     runtime.HTTPHandler(),
-				ReadTimeout: time.Minute,
+				Addr:              url.Host,
+				Handler:           runtime.HTTPHandler(),
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       time.Minute,
+				IdleTimeout:       time.Minute,
+				MaxHeaderBytes:    1 << 20,
 			}
 			eg.Go(func() error {
 				wg.Done()

@@ -362,6 +362,58 @@ func TestBleveIndexV2_Search(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestKeywordPostingRecallSurvivesRepeatedRestart exercises the large-posting
+// representation used by keyword fields.  A previous index dependency could
+// reopen the document store and general full-text data while omitting this
+// high-frequency posting list; keep this fixture at the observed cardinality.
+func TestKeywordPostingRecallSurvivesRepeatedRestart(t *testing.T) {
+	const published = 4237
+	const total = 5000
+	path := filepath.Join(t.TempDir(), "keyword-restart")
+
+	mapping := bleve.NewIndexMapping()
+	docMapping := bleve.NewDocumentMapping()
+	docMapping.AddFieldMappingsAt("state", bleve.NewKeywordFieldMapping())
+	mapping.DefaultMapping = docMapping
+
+	idx, err := bleve.New(path, mapping)
+	require.NoError(t, err)
+	batch := idx.NewBatch()
+	for i := range total {
+		state := "draft"
+		if i < published {
+			state = "published"
+		}
+		batch.Index(fmt.Sprintf("doc-%04d", i), map[string]string{
+			"state": state,
+			"body":  "restart fixture",
+		})
+	}
+	require.NoError(t, idx.Batch(batch))
+	require.NoError(t, idx.Close())
+
+	for restart := range 2 {
+		idx, err = bleve.Open(path)
+		require.NoError(t, err)
+		assertKeywordCount := func(value string, expected uint64) {
+			term := query.NewTermQuery(value)
+			term.SetField("state")
+			result, searchErr := idx.Search(bleve.NewSearchRequest(term))
+			require.NoError(t, searchErr)
+			require.Equal(t, expected, result.Total, "restart %d, state=%s", restart, value)
+		}
+		assertKeywordCount("published", published)
+		assertKeywordCount("draft", total-published)
+
+		all, searchErr := idx.Search(bleve.NewSearchRequest(bleve.NewMatchAllQuery()))
+		require.NoError(t, searchErr)
+		require.Equal(t, uint64(total), all.Total)
+		_, err = idx.Document("doc-0000")
+		require.NoError(t, err)
+		require.NoError(t, idx.Close())
+	}
+}
+
 func TestSerializationErr(t *testing.T) {
 	testData := `{"url":"https://en.wikipedia.org/wiki?curid=12559133","title":"184th Ordnance Battalion (EOD)","body":"\n184th Ordnance Battalion (EOD)\n\nThe 184th Ordnance Battalion (EOD) accomplish the explosive ordnance disposal (EOD) support activity. The EOD battalion operates under United States Army Forces Command (52nd Ordnance Group (EOD)) command and control with several companies (EOD) strategically located within each control area. Installations and MACOMs do not have a direct area support EOD responsibility.\nOrganization.\nSeven Ordnance Companies (EOD).\nFort Campbell, Kentucky\n-49th OD CO (EOD)\n-717th OD CO (EOD)\n-723rd OD CO (EOD)\n-744th OD CO (EOD)\n-788th OD CO (EOD)\nFort Knox, Kentucky\n-703rd OD CO (EOD)\nFort Benning, Georgia\n-789th OD CO (EOD)\n\n"}`
 	v := map[string]any{}
