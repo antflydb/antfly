@@ -70742,6 +70742,158 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     try std.testing.expectEqual(@as(u32, 2), stemmed_prefix_results.total_hits);
 }
 
+fn expectFilteredFullTextDeleteCliffProbe(
+    db: *DB,
+    alloc: Allocator,
+    expected_total: u32,
+    forbidden_id: ?[]const u8,
+) !void {
+    const fields = [_]types.TextMultiMatchField{.{ .field = "title" }};
+    var bool_prefix = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "catalog item",
+            .fields = &fields,
+        } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer bool_prefix.deinit();
+    const expected_page_len: usize = @intCast(@min(expected_total, 10));
+    const expected_page_total: u32 = @intCast(expected_page_len);
+    try std.testing.expectEqual(expected_page_len, bool_prefix.hits.len);
+    try std.testing.expect(bool_prefix.total_hits >= expected_page_total);
+    try std.testing.expect(bool_prefix.total_hits <= expected_total);
+
+    var match = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer match.deinit();
+    try std.testing.expectEqual(expected_page_len, match.hits.len);
+    try std.testing.expect(match.total_hits >= expected_page_total);
+    try std.testing.expect(match.total_hits <= expected_total);
+
+    if (forbidden_id) |deleted_id| {
+        for (bool_prefix.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
+        for (match.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
+
+        var deleted_term = try db.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .query = .{ .term = .{ .field = "title", .term = "00000" } },
+            .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+            .limit = 10,
+        });
+        defer deleted_term.deinit();
+        try std.testing.expectEqual(@as(u32, 0), deleted_term.total_hits);
+        try std.testing.expectEqual(@as(usize, 0), deleted_term.hits.len);
+    }
+}
+
+test "db one real delete keeps filtered full text on complement path across restart" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{
+        \\  "default_type": "product",
+        \\  "document_schemas": {
+        \\    "product": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": true,
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text","search_as_you_type"]},
+        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const initial_count: usize = 128;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const writes = try alloc.alloc(types.BatchWrite, initial_count);
+        defer {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i}),
+                .value = try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"title\":\"Catalog item {d:0>5}\",\"state\":\"published\"}}",
+                    .{i},
+                ),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .full_index });
+
+        // Zero-mutation and phantom-delete controls retain identical results.
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, null);
+        try db.batch(.{ .deletes = &.{"doc:missing"}, .sync_level = .full_index });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, null);
+
+        // An insertion-only upsert changes the corpus without creating a text
+        // tombstone and must remain on the same fast query path.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:new",
+                .value = "{\"title\":\"Catalog item new\",\"state\":\"published\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count + 1, null);
+
+        const visibility_before_delete = db.snapshotVisibilityStats();
+        try db.batch(.{ .deletes = &.{"doc:00000"}, .sync_level = .full_index });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, "doc:00000");
+        const visibility_after_delete = db.snapshotVisibilityStats();
+        try std.testing.expect(visibility_after_delete.mask_builds_total > visibility_before_delete.mask_builds_total);
+        try std.testing.expectEqual(visibility_before_delete.full_scan_fallbacks_total, visibility_after_delete.full_scan_fallbacks_total);
+        try std.testing.expectEqual(@as(u64, 1), visibility_after_delete.cache_entries);
+
+        // Repeated filtered queries reuse the small complement rather than
+        // probing every matching ordinal in the primary store.
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, "doc:00000");
+        const visibility_after_repeat = db.snapshotVisibilityStats();
+        try std.testing.expect(visibility_after_repeat.cache_hits_total > visibility_after_delete.cache_hits_total);
+    }
+
+    // The persisted deletion state reconstructs both the complement and live
+    // BM25 aggregates on reopen.
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        try expectFilteredFullTextDeleteCliffProbe(&reopened, alloc, initial_count, "doc:00000");
+    }
+}
+
 test "db versioned full text indexes reload matching schema mappings after reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");

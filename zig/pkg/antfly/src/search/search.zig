@@ -468,7 +468,7 @@ pub const ScoredHit = struct {
 fn effectiveK(request: SearchRequest, snap: *const index_mod.IndexSnapshot) u32 {
     if (request.search_after != null) {
         // Retrieve all matching results so cursor filtering works correctly
-        return snap.global_doc_count;
+        return snap.liveDocCount();
     }
     return request.k + request.offset;
 }
@@ -841,11 +841,12 @@ fn executeScoredPhraseFilter(
         return executeFilterQuery(alloc, snap, .{ .phrase = phrase_filter }, request, boost);
     }
 
+    const live_doc_count = snap.liveDocCount();
     var phrase_idf_sum: f32 = 0;
     for (phrase_filter.terms) |term| {
         const df = try snap.termDocFreq(alloc, phrase_filter.field, term);
         if (df == 0) return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
-        phrase_idf_sum += inverted.bm25Idf(snap.global_doc_count, df);
+        phrase_idf_sum += inverted.bm25Idf(live_doc_count, df);
     }
 
     var collector = FastTopK{
@@ -1319,7 +1320,7 @@ fn executeQueryAllScored(
 ) ![]scorer_mod.ScoredHit {
     var sub_request = request;
     sub_request.query = query;
-    sub_request.k = snap.global_doc_count;
+    sub_request.k = snap.liveDocCount();
     sub_request.offset = 0;
     sub_request.include_stored = false;
     sub_request.aggregations = &.{};
@@ -1675,6 +1676,7 @@ fn initFastTermStates(
         for (states.items) |*state| state.deinit();
         states.deinit(alloc);
     };
+    const live_doc_count = snap.liveDocCount();
 
     for (terms) |term| {
         const lookup_result = inv_reader.lookup(term.term) orelse {
@@ -1694,7 +1696,7 @@ fn initFastTermStates(
         var state = FastTermState{
             .iter = iter,
             .doc_freq = df,
-            .idf = inverted.bm25Idf(snap.global_doc_count, df),
+            .idf = inverted.bm25Idf(live_doc_count, df),
             .boost = term.boost,
             .block_max = switch (lookup_result) {
                 .postings => |postings| postings.block_max,
@@ -2136,7 +2138,8 @@ fn executeSimpleTextBool(
     if (should_terms.items.len > 0) field = simpleTermsField(should_terms.items, field) orelse return null;
     if (must_not_terms.items.len > 0) field = simpleTermsField(must_not_terms.items, field) orelse return null;
     const text_field = field orelse return null;
-    if (snap.global_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+    const live_doc_count = snap.liveDocCount();
+    if (live_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
 
     const effective_min_should: u32 = if (should_terms.items.len > 0 and
         bq.min_should == 0 and
@@ -2231,9 +2234,9 @@ fn executeSimpleTextBool(
             }
 
             if (must_terms.items.len > 0) {
-                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
+                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, live_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
             } else if (should_states.len > 0) {
-                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost);
+                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, live_doc_count, avg_dl, request.bm25_config, bq.boost);
             }
         }
     }
@@ -3760,7 +3763,7 @@ test "search match query can use distributed text stats for shard-consistent bm2
 
     const distributed_stats = [_]distributed_stats_mod.TextFieldStats{.{
         .field = "title",
-        .global_doc_count = combined_snap.global_doc_count,
+        .global_doc_count = combined_snap.liveDocCount(),
         .global_total_field_len = combined_snap.global_total_field_len.get("title") orelse 0,
         .term_doc_freqs = &.{
             .{ .term = "alpha", .doc_freq = try combined_snap.termDocFreq(alloc, "title", "alpha") },
@@ -3962,7 +3965,7 @@ test "streaming boolean scorer matches all-hit reference on randomized corpus" {
         };
         const request = SearchRequest{
             .query = .{ .bool_query = bool_query },
-            .k = snap.global_doc_count,
+            .k = snap.liveDocCount(),
             .include_stored = false,
         };
         var streaming = (try executeSimpleTextBool(alloc, snap, bool_query, request)) orelse return error.TestExpectedEqual;

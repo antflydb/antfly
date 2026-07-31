@@ -2224,6 +2224,14 @@ pub const InvertedIndexReader = struct {
         return decodeNormValue(self.norms_data, doc_id);
     }
 
+    /// Decoded BM25 field length for one document. The value uses the same
+    /// norm representation as scoring, so deletion-adjusted aggregate stats
+    /// remain consistent with the lengths consumed by the scorer.
+    pub fn docLength(self: *const InvertedIndexReader, doc_id: u32) u32 {
+        if (doc_id >= self.doc_count) return 0;
+        return self.normForDoc(doc_id);
+    }
+
     /// Average document length for BM25.
     pub fn avgDocLen(self: *const InvertedIndexReader) f32 {
         if (self.doc_count == 0) return 0;

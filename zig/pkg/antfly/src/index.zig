@@ -145,6 +145,16 @@ pub const SegmentShared = struct {
     /// copy-by-value field, whose stale copies aliased bitmap memory that
     /// setDeletionBitmap freed on replacement.
     deleted: ?roaring.RoaringBitmap = null,
+    /// Monotonic epoch for in-place deletion changes. Every snapshot that
+    /// references this segment observes the same epoch, so snapshot-local
+    /// caches cannot retain pre-delete values after a newer snapshot mutates
+    /// the shared tombstone bitmap.
+    deletion_generation: std.atomic.Value(u64) = .init(0),
+    /// Deleted BM25 field length by SegmentReader.fields index. This fixed-size
+    /// vector is allocated with the segment and updated without allocation on
+    /// delete/rollback. It keeps average field length proportional to live
+    /// documents without rescanning term dictionaries at query time.
+    deleted_field_lens: []std.atomic.Value(u64) = &.{},
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
     retired_cleanup: ?RetiredSegmentCleanup = null,
@@ -162,13 +172,30 @@ pub const SegmentEntry = struct {
     layout_stats: segment_mod.SegmentLayoutStats = .{},
     shared: *SegmentShared,
 
-    fn initShared(shared: *SegmentShared, data: SegmentData) void {
-        shared.* = .{ .ref_count = 1 };
+    fn initShared(alloc: Allocator, shared: *SegmentShared, data: SegmentData, reader: *const segment_mod.SegmentReader) !void {
+        const deleted_field_lens = try alloc.alloc(std.atomic.Value(u64), reader.fields.len);
+        for (deleted_field_lens) |*field_len| field_len.* = .init(0);
+        shared.* = .{
+            .ref_count = 1,
+            .deleted_field_lens = deleted_field_lens,
+        };
         if (data.isFileBacked()) {
             // Opening a segment reads headers and dictionaries. Count the
             // whole mapping conservatively until the owner advises it cold.
             shared.mapped_residency_state.store(mapped_residency_resident, .release);
         }
+    }
+
+    fn createShared(alloc: Allocator, data: SegmentData, reader: *const segment_mod.SegmentReader) !*SegmentShared {
+        const shared = try alloc.create(SegmentShared);
+        errdefer alloc.destroy(shared);
+        try initShared(alloc, shared, data, reader);
+        return shared;
+    }
+
+    fn deinitSharedMetadata(self: *SegmentShared, alloc: Allocator) void {
+        if (self.deleted_field_lens.len > 0) alloc.free(self.deleted_field_lens);
+        self.deleted_field_lens = &.{};
     }
 
     pub fn noteAccess(self: *const SegmentEntry) void {
@@ -204,6 +231,7 @@ pub const SegmentEntry = struct {
             var del = d.*;
             del.deinit();
         }
+        deinitSharedMetadata(self.shared, alloc);
         self.data.deinit(alloc);
         alloc.destroy(self.shared);
         if (cleanup) |c| c.run(seg_id);
@@ -318,9 +346,14 @@ const TermDocFreqAdaptedCtx = struct {
     }
 };
 
+const TermDocFreqCacheValue = struct {
+    deletion_generation: u64,
+    doc_freq: u32,
+};
+
 const TermDocFreqCache = std.HashMapUnmanaged(
     TermDocFreqKey,
-    u32,
+    TermDocFreqCacheValue,
     TermDocFreqStoredCtx,
     std.hash_map.default_max_load_percentage,
 );
@@ -353,10 +386,6 @@ pub const IndexSnapshot = struct {
     // instead of re-walking dictionaries/postings.
     term_doc_freq_cache_mu: std.atomic.Mutex,
     term_doc_freq_cache: TermDocFreqCache,
-    /// Advanced whenever an in-place deletion mutation changes live term
-    /// statistics. A generation check prevents a lookup that raced an
-    /// invalidation from repopulating the cache with the pre-delete value.
-    term_doc_freq_cache_generation: u64,
     term_doc_freq_cache_hits: u64,
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
@@ -502,9 +531,10 @@ pub const IndexSnapshot = struct {
         bm25_config: inverted.BM25Config,
         diagnostics: ?*scorer_mod.SearchDiagnostics,
     ) !scorer_mod.SearchResults {
-        if (self.global_doc_count == 0 or terms.len == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
+        const live_doc_count = self.liveDocCount();
+        if (live_doc_count == 0 or terms.len == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
 
-        const global_doc_count = if (override) |stats| stats.global_doc_count else self.global_doc_count;
+        const global_doc_count = if (override) |stats| stats.global_doc_count else live_doc_count;
         if (global_doc_count == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
         const avg_dl = if (override) |stats| stats.avgDocLen() else self.avgDocLen(field);
         const bound_table = try self.bm25BoundTable(avg_dl, bm25_config);
@@ -763,15 +793,25 @@ pub const IndexSnapshot = struct {
         return false;
     }
 
-    fn invalidateTermDocFreqCache(self: *IndexSnapshot) void {
-        const cache_mu = &self.term_doc_freq_cache_mu;
-        while (!cache_mu.tryLock()) spinOrYield();
-        defer cache_mu.unlock();
+    /// Aggregate the monotonic deletion epochs of exactly the segments visible
+    /// to this snapshot. Epochs live in SegmentShared, so a retained older
+    /// snapshot observes mutations to carried segments without being
+    /// invalidated by changes to segments it does not contain.
+    fn deletionGeneration(self: *const IndexSnapshot) u64 {
+        var generation: u64 = 0;
+        for (self.segments) |*seg| {
+            generation +%= seg.shared.deletion_generation.load(.acquire);
+        }
+        return generation;
+    }
 
-        self.term_doc_freq_cache_generation +%= 1;
-        var cache_it = self.term_doc_freq_cache.keyIterator();
-        while (cache_it.next()) |key| self.alloc.free(key.storage);
-        self.term_doc_freq_cache.clearRetainingCapacity();
+    /// Current live count rather than the publish-time count. Segment deletion
+    /// state is shared across retained snapshots, so scoring must derive the
+    /// denominator from the same state used to mask hits.
+    pub fn liveDocCount(self: *const IndexSnapshot) u32 {
+        var total: u32 = 0;
+        for (self.segments) |*seg| total +|= seg.liveDocCount();
+        return total;
     }
 
     /// Count live documents for one segment/term without turning a sparse
@@ -825,20 +865,22 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
-        if (self.global_doc_count == 0) return 0;
+        if (self.liveDocCount() == 0) return 0;
         const mutable = @constCast(self);
         const adapted = TermDocFreqAdapted{ .field = field, .term = term };
         const adapted_ctx = TermDocFreqAdaptedCtx{};
 
         while (true) {
+            const deletion_generation = self.deletionGeneration();
             const cache_mu = &mutable.term_doc_freq_cache_mu;
             while (!cache_mu.tryLock()) spinOrYield();
             if (mutable.term_doc_freq_cache.getAdapted(adapted, adapted_ctx)) |cached| {
-                mutable.term_doc_freq_cache_hits += 1;
-                cache_mu.unlock();
-                return cached;
+                if (cached.deletion_generation == deletion_generation) {
+                    mutable.term_doc_freq_cache_hits += 1;
+                    cache_mu.unlock();
+                    return cached.doc_freq;
+                }
             }
-            const cache_generation = mutable.term_doc_freq_cache_generation;
             mutable.term_doc_freq_cache_misses += 1;
             cache_mu.unlock();
 
@@ -852,8 +894,12 @@ pub const IndexSnapshot = struct {
                     lookup_result.docFreq();
             }
 
+            // A shared segment changed while postings were reconciled. Retry
+            // instead of publishing a mixed-generation statistic.
+            if (self.deletionGeneration() != deletion_generation) continue;
+
             while (!cache_mu.tryLock()) spinOrYield();
-            if (mutable.term_doc_freq_cache_generation != cache_generation) {
+            if (self.deletionGeneration() != deletion_generation) {
                 cache_mu.unlock();
                 continue;
             }
@@ -866,14 +912,19 @@ pub const IndexSnapshot = struct {
             errdefer self.alloc.free(storage);
             const gop = try mutable.term_doc_freq_cache.getOrPutAdapted(self.alloc, adapted, adapted_ctx);
             if (gop.found_existing) {
-                // Another caller raced us to the insert.
                 self.alloc.free(storage);
-                return gop.value_ptr.*;
+                // Another caller may have populated this generation while we
+                // computed. Prefer its identical exact result; otherwise
+                // replace the stale generation in place without growing or
+                // clearing the cache.
+                if (gop.value_ptr.deletion_generation == deletion_generation) return gop.value_ptr.doc_freq;
+                gop.value_ptr.* = .{ .deletion_generation = deletion_generation, .doc_freq = total };
+                return total;
             }
             @memcpy(storage[0..field.len], field);
             @memcpy(storage[field.len..], term);
             gop.key_ptr.* = .{ .storage = storage, .field_len = @intCast(field.len) };
-            gop.value_ptr.* = total;
+            gop.value_ptr.* = .{ .deletion_generation = deletion_generation, .doc_freq = total };
             return total;
         }
     }
@@ -904,10 +955,11 @@ pub const IndexSnapshot = struct {
         const hit = (try postings.advanceTo(resolved.local_id)) orelse return null;
         if (hit.doc_id != resolved.local_id) return null;
 
-        const total_field_len = self.global_total_field_len.get(field) orelse 0;
+        const global_doc_count = self.liveDocCount();
+        const total_field_len = self.liveTotalFieldLen(field);
         const document_frequency = try self.termDocFreq(alloc, field, term);
         return .{
-            .global_doc_count = self.global_doc_count,
+            .global_doc_count = global_doc_count,
             .total_field_len = total_field_len,
             .average_doc_length = self.avgDocLen(field),
             .document_frequency = document_frequency,
@@ -916,7 +968,7 @@ pub const IndexSnapshot = struct {
             .score = inverted.bm25Score(
                 hit.freq,
                 hit.norm,
-                self.global_doc_count,
+                global_doc_count,
                 document_frequency,
                 self.avgDocLen(field),
                 .{},
@@ -925,9 +977,25 @@ pub const IndexSnapshot = struct {
     }
 
     fn avgDocLen(self: *const IndexSnapshot, field: []const u8) f32 {
-        if (self.global_doc_count == 0) return 0;
+        const live_doc_count = self.liveDocCount();
+        if (live_doc_count == 0) return 0;
+        return @as(f32, @floatFromInt(self.liveTotalFieldLen(field))) /
+            @as(f32, @floatFromInt(live_doc_count));
+    }
+
+    pub fn liveTotalFieldLen(self: *const IndexSnapshot, field: []const u8) u64 {
+        var deleted_total: u64 = 0;
+        for (self.segments) |*seg| {
+            for (seg.reader.fields, 0..) |*field_info, field_idx| {
+                if (!std.mem.eql(u8, field_info.name, field)) continue;
+                if (field_idx < seg.shared.deleted_field_lens.len) {
+                    deleted_total +|= seg.shared.deleted_field_lens[field_idx].load(.acquire);
+                }
+                break;
+            }
+        }
         const total = self.global_total_field_len.get(field) orelse 0;
-        return @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(self.global_doc_count));
+        return total -| deleted_total;
     }
 };
 
@@ -1025,7 +1093,6 @@ pub const IndexWriter = struct {
             .global_total_field_len = .empty,
             .term_doc_freq_cache_mu = .unlocked,
             .term_doc_freq_cache = .empty,
-            .term_doc_freq_cache_generation = 0,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .bm25_bound_table_cache_mu = .unlocked,
@@ -1249,9 +1316,11 @@ pub const IndexWriter = struct {
         const new_segments = try self.alloc.alloc(SegmentEntry, old.segments.len + 1);
         errdefer self.alloc.free(new_segments);
         @memcpy(new_segments[0..old.segments.len], old.segments);
-        const shared = try self.alloc.create(SegmentShared);
-        SegmentEntry.initShared(shared, data);
-        errdefer self.alloc.destroy(shared);
+        const shared = try SegmentEntry.createShared(self.alloc, data, &reader);
+        errdefer {
+            SegmentEntry.deinitSharedMetadata(shared, self.alloc);
+            self.alloc.destroy(shared);
+        }
         new_segments[old.segments.len] = .{
             .id = seg_id,
             .data = data,
@@ -1306,7 +1375,6 @@ pub const IndexWriter = struct {
             .global_total_field_len = global_field_lens,
             .term_doc_freq_cache_mu = .unlocked,
             .term_doc_freq_cache = .empty,
-            .term_doc_freq_cache_generation = 0,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .bm25_bound_table_cache_mu = .unlocked,
@@ -1419,9 +1487,11 @@ pub const IndexWriter = struct {
         const new_segments = try self.alloc.alloc(SegmentEntry, old.segments.len + 1);
         errdefer self.alloc.free(new_segments);
         @memcpy(new_segments[0..old.segments.len], old.segments);
-        const shared = try self.alloc.create(SegmentShared);
-        SegmentEntry.initShared(shared, owned.?);
-        errdefer self.alloc.destroy(shared);
+        const shared = try SegmentEntry.createShared(self.alloc, owned.?, &reader);
+        errdefer {
+            SegmentEntry.deinitSharedMetadata(shared, self.alloc);
+            self.alloc.destroy(shared);
+        }
         new_segments[old.segments.len] = .{
             .id = seg_id,
             .data = owned.?,
@@ -1447,7 +1517,6 @@ pub const IndexWriter = struct {
             .global_total_field_len = global_field_lens,
             .term_doc_freq_cache_mu = .unlocked,
             .term_doc_freq_cache = .empty,
-            .term_doc_freq_cache_generation = 0,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .bm25_bound_table_cache_mu = .unlocked,
@@ -1554,10 +1623,12 @@ pub const IndexWriter = struct {
         }
 
         var cells_created: usize = 0;
-        errdefer for (new_segments[keep_count .. keep_count + cells_created]) |*seg| self.alloc.destroy(seg.shared);
+        errdefer for (new_segments[keep_count .. keep_count + cells_created]) |*seg| {
+            SegmentEntry.deinitSharedMetadata(seg.shared, self.alloc);
+            self.alloc.destroy(seg.shared);
+        };
         for (replacements, 0..) |replacement, i| {
-            const shared = try self.alloc.create(SegmentShared);
-            SegmentEntry.initShared(shared, replacement.data);
+            const shared = try SegmentEntry.createShared(self.alloc, replacement.data, &replacement_readers[i]);
             new_segments[idx] = .{
                 .id = replacement.id,
                 .data = replacement.data,
@@ -1626,29 +1697,66 @@ pub const IndexWriter = struct {
         try self.rebuildSnapshot(new_segments, keep_count, retired);
     }
 
+    fn computeDeletedFieldLensForBitmap(seg: *const SegmentEntry, deleted: *const roaring.RoaringBitmap, out: []std.atomic.Value(u64)) void {
+        for (out) |*field_len| field_len.store(0, .release);
+        for (seg.reader.fields, 0..) |*field_info, field_idx| {
+            if (field_idx >= out.len) break;
+            const inv_reader = (seg.reader.invertedIndex(field_info.name) catch continue) orelse continue;
+            var total: u64 = 0;
+            var deleted_it = deleted.iterator();
+            while (deleted_it.next()) |local_id| {
+                total +|= inv_reader.docLength(local_id);
+            }
+            out[field_idx].store(total, .release);
+        }
+    }
+
+    fn adjustDeletedFieldLensForDocs(seg: *SegmentEntry, local_ids: []const u32, add: bool) void {
+        for (seg.reader.fields, 0..) |*field_info, field_idx| {
+            if (field_idx >= seg.shared.deleted_field_lens.len) break;
+            const inv_reader = (seg.reader.invertedIndex(field_info.name) catch continue) orelse continue;
+            var delta: u64 = 0;
+            for (local_ids) |local_id| delta +|= inv_reader.docLength(local_id);
+            if (add) {
+                _ = seg.shared.deleted_field_lens[field_idx].fetchAdd(delta, .release);
+            } else {
+                _ = seg.shared.deleted_field_lens[field_idx].fetchSub(delta, .release);
+            }
+        }
+    }
+
+    fn markDeletionMutation(seg: *SegmentEntry) void {
+        _ = seg.shared.deletion_generation.fetchAdd(1, .release);
+    }
+
     /// Set deletion bitmap for a segment by ID (for recovery).
     pub fn setDeletionBitmap(self: *IndexWriter, seg_id: u64, bitmap: roaring.RoaringBitmap) void {
         self.lockMutex();
         defer self.mu.unlock();
 
+        var owned_bitmap = bitmap;
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         for (snap.segments) |*seg| {
             if (seg.id == seg_id) {
+                computeDeletedFieldLensForBitmap(seg, &owned_bitmap, seg.shared.deleted_field_lens);
                 if (seg.shared.deleted) |*d| {
                     var old_del = d.*;
                     old_del.deinit();
                 }
-                seg.shared.deleted = bitmap;
+                seg.shared.deleted = owned_bitmap;
                 // Recompute global doc count
                 var total: u32 = 0;
                 for (snap.segments) |*s| {
                     total += s.liveDocCount();
                 }
                 snap.global_doc_count = total;
-                snap.invalidateTermDocFreqCache();
+                markDeletionMutation(seg);
                 return;
             }
         }
+        // Ownership is transferred to this API even when recovery references
+        // a segment that is no longer active.
+        owned_bitmap.deinit();
     }
 
     /// Delete a document by its external ID.
@@ -1665,6 +1773,7 @@ pub const IndexWriter = struct {
         local_ids: []u32,
         applied_count: usize,
         created_bitmap: bool,
+        field_lengths_applied: bool,
     };
 
     pub fn freeDeleteInfos(alloc: Allocator, delete_infos: []DeleteInfo) void {
@@ -1683,7 +1792,6 @@ pub const IndexWriter = struct {
 
     fn rollbackDeleteInfosLocked(self: *IndexWriter, delete_infos: []const DeleteInfo) void {
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
-        var changed = false;
         for (delete_infos) |delete_info| {
             for (snap.segments) |*seg| {
                 if (seg.id != delete_info.seg_id) continue;
@@ -1694,12 +1802,14 @@ pub const IndexWriter = struct {
                         seg.shared.deleted = null;
                     }
                 }
+                if (delete_info.field_lengths_applied) {
+                    adjustDeletedFieldLensForDocs(seg, delete_info.local_ids[0..delete_info.applied_count], false);
+                }
                 snap.global_doc_count +|= @intCast(delete_info.applied_count);
-                changed = changed or delete_info.applied_count > 0;
+                if (delete_info.applied_count > 0) markDeletionMutation(seg);
                 break;
             }
         }
-        if (changed) snap.invalidateTermDocFreqCache();
     }
 
     /// Delete every live copy of a document and return one updated deletion
@@ -1756,6 +1866,7 @@ pub const IndexWriter = struct {
                 .local_ids = owned_local_ids,
                 .applied_count = 0,
                 .created_bitmap = created_bitmap,
+                .field_lengths_applied = false,
             });
             local_ids_transferred = true;
             if (created_bitmap) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
@@ -1765,8 +1876,17 @@ pub const IndexWriter = struct {
                 snap.global_doc_count -|= 1;
             }
             delete_infos.items[delete_infos.items.len - 1].bitmap_bytes = try seg.shared.deleted.?.toBytes(alloc);
+            adjustDeletedFieldLensForDocs(seg, owned_local_ids, true);
+            delete_infos.items[delete_infos.items.len - 1].field_lengths_applied = true;
         }
-        if (delete_infos.items.len > 0) snap.invalidateTermDocFreqCache();
+        for (delete_infos.items) |delete_info| {
+            if (delete_info.applied_count == 0) continue;
+            for (snap.segments) |*seg| {
+                if (seg.id != delete_info.seg_id) continue;
+                markDeletionMutation(seg);
+                break;
+            }
+        }
         return try delete_infos.toOwnedSlice(alloc);
     }
 
@@ -2163,9 +2283,9 @@ test "term doc frequency invalidates on real deletes and reconciles sparse tombs
     try std.testing.expectEqual(@as(u64, 1), snap.term_doc_freq_cache_misses);
 
     // A phantom delete neither changes live statistics nor evicts the cache.
-    const generation_before_phantom = snap.term_doc_freq_cache_generation;
+    const generation_before_phantom = snap.deletionGeneration();
     try std.testing.expect(!try writer.deleteById("doc-missing"));
-    try std.testing.expectEqual(generation_before_phantom, snap.term_doc_freq_cache_generation);
+    try std.testing.expectEqual(generation_before_phantom, snap.deletionGeneration());
     try std.testing.expectEqual(@as(u32, 4), try snap.termDocFreq(alloc, "body", "common"));
     try std.testing.expectEqual(@as(u64, 1), snap.term_doc_freq_cache_hits);
 
@@ -2175,7 +2295,7 @@ test "term doc frequency invalidates on real deletes and reconciles sparse tombs
     defer IndexWriter.freeDeleteInfos(alloc, tracked);
     try std.testing.expectEqual(@as(usize, 1), tracked.len);
     try std.testing.expectEqual(@as(u32, 3), try snap.termDocFreq(alloc, "body", "common"));
-    try std.testing.expect(snap.term_doc_freq_cache_generation > generation_before_phantom);
+    try std.testing.expect(snap.deletionGeneration() > generation_before_phantom);
 
     writer.rollbackDeleteInfos(tracked);
     try std.testing.expectEqual(@as(u32, 4), try snap.termDocFreq(alloc, "body", "common"));
@@ -2186,6 +2306,43 @@ test "term doc frequency invalidates on real deletes and reconciles sparse tombs
     const results = try snap.search(alloc, "body", &.{"common"}, 10);
     defer alloc.free(results.hits);
     try std.testing.expectEqual(@as(usize, 3), results.hits.len);
+}
+
+test "retained snapshots observe shared deletion epochs and live BM25 aggregates" {
+    const alloc = std.testing.allocator;
+
+    const first_segment = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc-a", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+        .{ .id = "doc-b", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+    });
+    defer alloc.free(first_segment);
+    const second_segment = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc-c", .terms = &.{.{ .term = "other", .freq = 1, .norm = 1 }} },
+    });
+    defer alloc.free(second_segment);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(first_segment);
+
+    const retained = writer.acquireSnapshot();
+    defer retained.release();
+    try std.testing.expectEqual(@as(u32, 2), try retained.termDocFreq(alloc, "body", "common"));
+    try std.testing.expectEqual(@as(u32, 2), retained.liveDocCount());
+    try std.testing.expectApproxEqAbs(@as(f32, 1), retained.textAvgDocLen("body"), 0.00001);
+
+    // Publishing a newer snapshot leaves `retained` alive with its own term
+    // cache, while the carried segment deletion state remains shared.
+    try writer.addSegment(second_segment);
+    try std.testing.expect(try writer.deleteById("doc-a"));
+
+    try std.testing.expectEqual(@as(u32, 1), try retained.termDocFreq(alloc, "body", "common"));
+    try std.testing.expectEqual(@as(u32, 1), retained.liveDocCount());
+    try std.testing.expectApproxEqAbs(@as(f32, 1), retained.textAvgDocLen("body"), 0.00001);
+    const results = try retained.search(alloc, "body", &.{"common"}, 10);
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), results.hits[0].doc_id);
 }
 
 test "deleteById across multiple segments" {

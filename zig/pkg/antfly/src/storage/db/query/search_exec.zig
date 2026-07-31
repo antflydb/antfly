@@ -12133,8 +12133,8 @@ pub fn collectExplicitTextStats(
         }
         out[i] = .{
             .field = try alloc.dupe(u8, request.field),
-            .global_doc_count = snapshot.global_doc_count,
-            .global_total_field_len = snapshot.global_total_field_len.get(request.field) orelse 0,
+            .global_doc_count = snapshot.liveDocCount(),
+            .global_total_field_len = snapshot.liveTotalFieldLen(request.field),
             .term_doc_freqs = term_doc_freqs,
         };
         initialized += 1;
