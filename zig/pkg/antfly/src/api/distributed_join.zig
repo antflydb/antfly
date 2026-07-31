@@ -1488,6 +1488,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.TableNotFound => return error.NotFound,
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
+        error.Cancelled => return error.Cancelled,
         else => return error.InternalFailure,
     };
     defer primary_result.deinit(alloc);
@@ -1506,6 +1507,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
+        error.Cancelled => return error.Cancelled,
         else => return error.InternalFailure,
     };
 
@@ -1515,6 +1517,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.Timeout => return error.Timeout,
+            error.Cancelled => return error.Cancelled,
             else => {
                 std.log.err("distributed shuffle join failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -1538,6 +1541,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.TableNotFound => return error.NotFound,
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
+        error.Cancelled => return error.Cancelled,
         else => return error.InternalFailure,
     };
     defer right_result.deinit(alloc);
@@ -5702,6 +5706,7 @@ test "distributed join context forwards one absolute deadline to every query cal
             _: []const u8,
             _: ?[]const u8,
             deadline_ns: ?u64,
+            _: ?*const std.atomic.Value(bool),
         ) !query_api.QueryResponse {
             try std.testing.expectEqual(@as(?u64, expected_deadline_ns), deadline_ns);
             return error.TestDeadlineForwarded;
@@ -5715,6 +5720,7 @@ test "distributed join context forwards one absolute deadline to every query cal
             _: []const u8,
             _: ?[]const u8,
             deadline_ns: ?u64,
+            _: ?*const std.atomic.Value(bool),
         ) ![]u8 {
             try std.testing.expectEqual(@as(?u64, expected_deadline_ns), deadline_ns);
             return error.TestDeadlineForwarded;
@@ -6745,10 +6751,10 @@ test "distributed join unmatched worker returns only unmatched synthetic hits" {
         }
         fn upsertJoinShuffleLease(_: *anyopaque, _: metadata_table_manager.ShuffleJoinLeaseRecord) !void {}
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
         fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {

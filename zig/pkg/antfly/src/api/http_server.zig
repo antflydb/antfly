@@ -654,6 +654,7 @@ pub const SemanticStatusResolver = struct {
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
+    query_cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -674,7 +675,8 @@ pub const SemanticStatusResolver = struct {
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
-        return try http_internal_group_read_routes.planSemanticQuery(.{
+        try ensureRequestActive(self.query_cancellation);
+        const planned = try http_internal_group_read_routes.planSemanticQuery(.{
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
@@ -690,6 +692,8 @@ pub const SemanticStatusResolver = struct {
             .query_embedding_security_scope = self.query_embedding_security_scope,
             .query_embedding_deadline_ns = self.query_embedding_deadline_ns,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        try ensureRequestActive(self.query_cancellation);
+        return planned;
     }
 };
 
@@ -8612,6 +8616,7 @@ pub const ApiHttpServer = struct {
             row_filter_json,
             null,
             execution_deadline_ns,
+            null,
         );
     }
 
@@ -9220,6 +9225,7 @@ pub const ApiHttpServer = struct {
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
+        semantic_resolver.query_cancellation = cancellation;
         var query_req = query_api.parsePublicQueryRequestWithDeadline(
             alloc,
             semantic_resolver.iface(),
