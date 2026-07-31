@@ -227,6 +227,12 @@ fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     }
 }
 
+fn finishCommittedWalAppend(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "finishCommittedWalAppend")) {
+        backend.finishCommittedWalAppend();
+    }
+}
+
 fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
@@ -3292,8 +3298,11 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.closed = true;
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
-            if (!try self.tryCommitDirectBulkIngest()) {
+            var committed_write = direct_ingested_bulk_appends;
+            const direct_ingested_bulk_state = try self.tryCommitDirectBulkIngest();
+            if (!direct_ingested_bulk_state) {
                 const mutated = self.mutable.entries.items.len > 0;
+                committed_write = committed_write or mutated;
                 if (mutated) {
                     try enforceMutableWriteAdmission(self.backend, &self.mutable);
                     try prepareMutableForWrite(self.backend);
@@ -3319,8 +3328,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 }
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             } else {
+                committed_write = true;
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             }
+            if (committed_write) finishCommittedWalAppend(self.backend);
             self.backend.finishBatchMode(self.batch_options);
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
@@ -6014,8 +6025,11 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.closed = true;
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
-            if (!try self.tryCommitDirectBulkIngest()) {
+            var committed_write = direct_ingested_bulk_appends;
+            const direct_ingested_bulk_state = try self.tryCommitDirectBulkIngest();
+            if (!direct_ingested_bulk_state) {
                 const mutated = self.mutable.entries.items.len > 0;
+                committed_write = committed_write or mutated;
                 if (mutated) {
                     try enforceMutableWriteAdmission(self.backend, &self.mutable);
                     try prepareMutableForWrite(self.backend);
@@ -6041,8 +6055,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 }
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             } else {
+                committed_write = true;
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             }
+            if (committed_write) finishCommittedWalAppend(self.backend);
             self.backend.finishBatchMode(self.batch_options);
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;

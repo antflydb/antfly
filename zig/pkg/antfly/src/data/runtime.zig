@@ -1391,6 +1391,12 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_covered_through_segment", "gauge", "Last cached write LSM WAL segment durably covered by the checkpoint", stats.wal_checkpoint_covered_through_segment);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_current_segment", "gauge", "Current cached write LSM WAL segment", stats.wal_checkpoint_current_segment);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_lag_segments", "gauge", "Sealed cached write LSM WAL segments retained before the active segment", stats.wal_checkpoint_lag_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_soft_limit_segments", "gauge", "Configured cached write LSM soft WAL retention limit in segments", stats.wal_soft_limit_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_hard_limit_segments", "gauge", "Configured cached write LSM hard WAL retention limit in segments", stats.wal_hard_limit_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_soft_limit_bytes", "gauge", "Configured cached write LSM soft WAL retention limit in bytes", stats.wal_soft_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_hard_limit_bytes", "gauge", "Configured cached write LSM hard WAL retention limit in bytes", stats.wal_hard_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_pending", "gauge", "Whether cached write LSM WAL checkpoint maintenance is pending", if (stats.wal_checkpoint_pending) 1 else 0);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_blocked", "gauge", "Whether cached write LSM WAL hard-limit admission is blocked", if (stats.wal_pressure_blocked) 1 else 0);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_segments", "gauge", "Cached write LSM dedicated replay WAL segments still retained", stats.wal_replay_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_bytes", "gauge", "Cached write LSM dedicated replay WAL bytes still retained", stats.wal_replay_retained_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_current_segment", "gauge", "Current cached write LSM dedicated replay WAL segment", stats.wal_replay_current_segment);
@@ -1453,6 +1459,10 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_rejections_total", "counter", "Cached write LSM writes rejected after write-pressure overload", stats.write_pressure_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground write-pressure compactions", stats.write_pressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_flushes_total", "counter", "Cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_manifest_publishes_total", "counter", "Cached write LSM manifests published to advance WAL checkpoints", stats.wal_pressure_manifest_publishes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_admission_checkpoints_total", "counter", "Cached write LSM checkpoints completed before hard-limit WAL admission", stats.wal_pressure_admission_checkpoints);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_failures_total", "counter", "Cached write LSM WAL-pressure checkpoint failures", stats.wal_pressure_failures);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_rejections_total", "counter", "Cached write LSM WAL appends rejected before mutation", stats.wal_pressure_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_records_total", "counter", "Cached write LSM WAL records appended", stats.wal_append_records);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_entries_total", "counter", "Cached write LSM WAL entries appended", stats.wal_append_entries);
@@ -21234,6 +21244,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .obsolete_paths_reclaimable = 5,
         .obsolete_delete_failures = 6,
         .obsolete_delete_retries = 7,
+        .wal_soft_limit_segments = 8,
+        .wal_hard_limit_segments = 32,
+        .wal_soft_limit_bytes = 32768,
+        .wal_hard_limit_bytes = 65536,
+        .wal_checkpoint_pending = true,
+        .wal_pressure_blocked = true,
         .active_readers = 6,
         .active_readers_by_kind = blk: {
             var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
@@ -21281,6 +21297,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_reclaimable 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_failures_total 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_retries_total 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_soft_limit_segments 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_hard_limit_segments 32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_soft_limit_bytes 32768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_hard_limit_bytes 65536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_pending 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_pressure_blocked 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers_by_kind{kind=\"compaction\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_reader_kind{kind=\"compaction\"} 3") != null);
@@ -21314,6 +21336,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .write_pressure_overloads = 23,
         .write_pressure_rejections = 24,
         .wal_pressure_flushes = 7,
+        .wal_pressure_manifest_publishes = 29,
+        .wal_pressure_admission_checkpoints = 30,
+        .wal_pressure_failures = 31,
+        .wal_pressure_rejections = 32,
         .wal_append_records = 8,
         .wal_append_entries = 9,
         .wal_append_bytes = 10,
@@ -21341,6 +21367,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_overload_l0_byte_debt_total 28") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_rejections_total 24") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_flushes_total 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_manifest_publishes_total 29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_admission_checkpoints_total 30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_failures_total 31") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_rejections_total 32") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_append_records_total 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_sync_records_total 12") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_sync_ns_total 13") != null);
