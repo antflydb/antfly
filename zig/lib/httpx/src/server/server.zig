@@ -146,6 +146,12 @@ pub const Context = struct {
 
     // H1 streaming field (set by the server, null for HTTP/2).
     h1_sock: ?*Socket = null,
+    /// True when this HTTP/1.1 request was parsed with bytes for a following
+    /// request already held in the connection loop's private buffer. Handlers
+    /// that observe the peer socket must not mistake its EOF for cancellation
+    /// of the current request: the peer may have half-closed after pipelining
+    /// its next request.
+    h1_has_buffered_input: bool = false,
     /// Set to true when a streaming response has been sent via `streamResponse()`.
     /// When true, the connection loop skips the normal response serialization.
     h1_stream_sent: bool = false,
@@ -1210,6 +1216,7 @@ pub const Server = struct {
             var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
             ctx.h1_sock = &sock;
+            ctx.h1_has_buffered_input = leftover > 0;
             defer ctx.deinit();
 
             for (self.pre_route_hooks.items) |hook| {
@@ -2945,6 +2952,77 @@ test "cross-thread graceful shutdown is listener-owned" {
     try std.testing.expect(!server.running);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expect(elapsed < std.time.ns_per_s);
+}
+
+test "H1 context preserves buffered pipeline input across client SHUT_WR" {
+    if (builtin.os.tag == .windows) return;
+
+    const State = struct {
+        var first_saw_buffered_input = std.atomic.Value(bool).init(false);
+        var second_handled = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            if (mem.eql(u8, ctx.request.uri.path, "/a")) {
+                first_saw_buffered_input.store(ctx.h1_has_buffered_input, .release);
+                return ctx.text("A");
+            }
+            second_handled.store(true, .release);
+            return ctx.text("B");
+        }
+    };
+    State.first_saw_buffered_input.store(false, .release);
+    State.second_handled.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.get("/a", State.handler);
+    try server.get("/b", State.handler);
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("pipeline listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(address, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    // A and B deliberately share one write. The client half-closes only after
+    // both complete requests are in flight, so EOF must not cancel A while B
+    // is already held by the server's connection buffer.
+    try client.sendAll(
+        "GET /a HTTP/1.1\r\nHost: test\r\n\r\n" ++
+            "GET /b HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    );
+    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
+
+    var response: [1024]u8 = undefined;
+    var response_len: usize = 0;
+    while (true) {
+        const n = try client.recv(response[response_len..]);
+        if (n == 0) break;
+        response_len += n;
+        if (response_len == response.len) return error.TestUnexpectedResult;
+    }
+
+    try std.testing.expect(State.first_saw_buffered_input.load(.acquire));
+    try std.testing.expect(State.second_handled.load(.acquire));
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nA") != null);
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
 }
 
 test "connection interruption preserves the fiber-owned descriptor" {

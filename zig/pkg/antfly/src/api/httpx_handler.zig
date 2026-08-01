@@ -122,6 +122,10 @@ pub const QueryAdmission = struct {
 const PeerCancellationWatcher = struct {
     socket: *httpx.Socket,
     cancellation: *http_common.RequestCancellation,
+    /// The server parsed a following H1 request into its private connection
+    /// buffer before entering this handler. A peer FIN after that pipeline is
+    /// not cancellation of the current request.
+    has_buffered_input: bool,
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
@@ -146,11 +150,21 @@ const PeerCancellationWatcher = struct {
             const ready = std.posix.poll(&fds, 25) catch return;
             if (ready == 0) continue;
             const events = fds[0].revents;
-            if (events & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+            // POLLNVAL means the descriptor is no longer usable. POLLERR
+            // reports a pending socket error (including a peer reset), which
+            // is distinct from a normal half-close and cancels immediately.
+            if (events & std.posix.POLL.NVAL != 0) {
                 self.cancellation.cancel();
                 return;
             }
-            if (events & std.posix.POLL.IN == 0) continue;
+            if (events & std.posix.POLL.ERR != 0) {
+                self.cancellation.cancel();
+                return;
+            }
+            // Darwin can surface a FIN as POLLIN, POLLHUP, or both. Always
+            // PEEK first; HUP alone is not enough to distinguish EOF from
+            // unread request bytes.
+            if (events & (std.posix.POLL.IN | std.posix.POLL.HUP) == 0) continue;
 
             var byte: [1]u8 = undefined;
             // The request body was fully read before this watcher starts, so
@@ -163,7 +177,12 @@ const PeerCancellationWatcher = struct {
                 @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT),
             );
             if (n == 0) {
-                self.cancellation.cancel();
+                // A following request may already be buffered by
+                // Server.handleConnection, leaving the kernel socket at EOF
+                // after a valid client SHUT_WR. Preserve the current request
+                // in that case; the connection loop will process the buffered
+                // request after this handler completes.
+                if (!self.has_buffered_input) self.cancellation.cancel();
                 return;
             }
             if (n > 0) {
@@ -171,10 +190,67 @@ const PeerCancellationWatcher = struct {
                 // to avoid repeatedly polling the same unread bytes.
                 return;
             }
-            // EAGAIN (or a transient error after poll) is not a disconnect.
+            // EAGAIN/INTR after poll is transient. A reset may be reported by
+            // recv rather than POLLERR, and is a real cancellation.
+            switch (std.posix.errno(n)) {
+                .AGAIN, .INTR => continue,
+                .CONNRESET => {
+                    self.cancellation.cancel();
+                    return;
+                },
+                else => {
+                    self.cancellation.cancel();
+                    return;
+                },
+            }
         }
     }
 };
+
+test "PeerCancellationWatcher cancels a bare H1 FIN but preserves buffered pipeline work" {
+    if (comptime builtin.os.tag == .windows) return;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listener = try httpx.TcpListener.init(.{
+        .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 },
+    }, io);
+    defer listener.deinit();
+
+    var first_client = try httpx.Socket.connect(listener.getLocalAddress(), io);
+    defer first_client.close();
+    var first_accepted = try listener.accept();
+    defer first_accepted.socket.close();
+    var first_cancellation = http_common.RequestCancellation{};
+    var first_watcher = PeerCancellationWatcher{
+        .socket = &first_accepted.socket,
+        .cancellation = &first_cancellation,
+        .has_buffered_input = false,
+    };
+    try first_watcher.start();
+    defer first_watcher.deinit();
+    try io.vtable.netShutdown(io.userdata, first_client.handle, .send);
+    for (0..40) |_| {
+        if (first_cancellation.isCancelled()) break;
+        io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(first_cancellation.isCancelled());
+
+    var second_client = try httpx.Socket.connect(listener.getLocalAddress(), io);
+    defer second_client.close();
+    var second_accepted = try listener.accept();
+    defer second_accepted.socket.close();
+    var second_cancellation = http_common.RequestCancellation{};
+    var second_watcher = PeerCancellationWatcher{
+        .socket = &second_accepted.socket,
+        .cancellation = &second_cancellation,
+        .has_buffered_input = true,
+    };
+    try second_watcher.start();
+    defer second_watcher.deinit();
+    try io.vtable.netShutdown(io.userdata, second_client.handle, .send);
+    io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    try std.testing.expect(!second_cancellation.isCancelled());
+}
 
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
@@ -430,7 +506,11 @@ pub const AntflyApiHandler = struct {
 
     fn startPeerCancellationWatcher(ctx: *httpx.Context, cancellation: *http_common.RequestCancellation, watcher: *?PeerCancellationWatcher) void {
         const socket = ctx.h1_sock orelse return;
-        watcher.* = .{ .socket = socket, .cancellation = cancellation };
+        watcher.* = .{
+            .socket = socket,
+            .cancellation = cancellation,
+            .has_buffered_input = ctx.h1_has_buffered_input,
+        };
         if (watcher.*) |*value| value.start() catch {
             // Failure to start observation must not fail a valid query. The
             // listener still owns normal request lifetime and response I/O.
