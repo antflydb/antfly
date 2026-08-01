@@ -1763,7 +1763,11 @@ pub const Client = struct {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
-                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                if (req.body) |body| {
+                    h2.write_mutex.lockUncancelable(self.io);
+                    defer h2.write_mutex.unlock(self.io);
+                    try h2.writeData(w, stream_id, body, true);
+                }
                 h2.awaitStreamComplete(r, w, stream_id) catch |err| {
                     if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
                     return err;
@@ -1771,7 +1775,11 @@ pub const Client = struct {
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
-                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                if (req.body) |body| {
+                    h2.write_mutex.lockUncancelable(self.io);
+                    defer h2.write_mutex.unlock(self.io);
+                    try h2.writeData(&entry.socket, stream_id, body, true);
+                }
                 h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id) catch |err| {
                     if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
                     return err;
