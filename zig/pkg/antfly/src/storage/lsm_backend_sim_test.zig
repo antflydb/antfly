@@ -693,6 +693,7 @@ test "lsm backend simulation hard wal admission fault rejects before append" {
 
     // The bulk-only maintenance lane retries the failed admission checkpoint
     // without enabling compaction or requiring another client write.
+    lsm_backend.makeWalCheckpointRetryDueForTest();
     try std.testing.expect(try lsm_backend.runMaintenanceStep());
     const repaired = lsm_backend.snapshotMaintenanceStats();
     try std.testing.expect(!repaired.wal_checkpoint_pending);
@@ -732,7 +733,30 @@ test "lsm backend simulation split manifest fault preserves the complete parent 
     try crashReopenLsm(&lsm_backend, &modeled_device, root_dir, open_options);
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
+    // Once the replacement manifest is durable, WAL retirement is cleanup:
+    // its failure must preserve the committed split and enter the autonomous
+    // checkpoint retry state rather than returning a false split failure.
+    try modeled_device.injectSyncFailureForPathContains("/wal/index");
     try std.testing.expect(try lsm_backend.rewriteLeftInPlace("doc:m"));
+    const deferred = lsm_backend.snapshotMaintenanceStats();
+    try std.testing.expect(deferred.wal_checkpoint_pending);
+    try std.testing.expect(!deferred.wal_pressure_blocked);
+    try std.testing.expectEqual(
+        lsm_backend_mod.WalCheckpointRetryReason.checkpoint_failure,
+        deferred.wal_checkpoint_retry_reason,
+    );
+    try modeled_device.injectSyncFailureForPathContains("/wal/index");
+    lsm_backend.makeWalCheckpointRetryDueForTest();
+    try std.testing.expectError(error.InjectedSyncFault, lsm_backend.runMaintenanceStep());
+    const retried_failure = lsm_backend.snapshotMaintenanceStats();
+    try std.testing.expect(retried_failure.wal_checkpoint_pending);
+    try std.testing.expect(!retried_failure.wal_pressure_blocked);
+    try std.testing.expectEqual(@as(u32, 2), retried_failure.wal_checkpoint_retry_attempts);
+    lsm_backend.makeWalCheckpointRetryDueForTest();
+    try std.testing.expect(try lsm_backend.runMaintenanceStep());
+    const repaired = lsm_backend.snapshotMaintenanceStats();
+    try std.testing.expect(!repaired.wal_checkpoint_pending);
+    try std.testing.expect(!repaired.wal_pressure_blocked);
     var read = try lsm_backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));

@@ -51,6 +51,16 @@ const CounterU64 = platform.atomic.Value(u64);
 // mutable memory can be higher because arenas retain overwritten values and
 // hash tables reserve capacity, so enforce a separate bounded safety limit.
 const mutable_memory_guard_multiplier: u64 = 2;
+const wal_retention_enforce_interval_ns: u64 = 250 * std.time.ns_per_ms;
+const wal_checkpoint_retry_initial_ns: u64 = 250 * std.time.ns_per_ms;
+const wal_checkpoint_retry_max_ns: u64 = 30 * std.time.ns_per_s;
+
+pub const WalCheckpointRetryReason = enum(u8) {
+    none,
+    soft_pressure,
+    hard_pressure,
+    checkpoint_failure,
+};
 
 const supports_waitable_immutable_flush = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -783,6 +793,12 @@ pub const Backend = struct {
         wal_hard_limit_bytes: u64 = 0,
         wal_checkpoint_pending: bool = false,
         wal_pressure_blocked: bool = false,
+        wal_checkpoint_retry_reason: WalCheckpointRetryReason = .none,
+        wal_checkpoint_retry_attempts: u32 = 0,
+        wal_checkpoint_retry_delay_ns: u64 = 0,
+        active_immutable_logical_bytes: u64 = 0,
+        unpublished_wal_logical_bytes: u64 = 0,
+        unpublished_wal_max_batch_logical_bytes: u64 = 0,
         wal_replay_retained_segments: u64 = 0,
         wal_replay_retained_bytes: u64 = 0,
         wal_replay_current_segment: u64 = 0,
@@ -891,6 +907,19 @@ pub const Backend = struct {
         dst.wal_hard_limit_bytes +|= src.wal_hard_limit_bytes;
         dst.wal_checkpoint_pending = dst.wal_checkpoint_pending or src.wal_checkpoint_pending;
         dst.wal_pressure_blocked = dst.wal_pressure_blocked or src.wal_pressure_blocked;
+        if (@intFromEnum(src.wal_checkpoint_retry_reason) > @intFromEnum(dst.wal_checkpoint_retry_reason)) {
+            dst.wal_checkpoint_retry_reason = src.wal_checkpoint_retry_reason;
+        }
+        dst.wal_checkpoint_retry_attempts = @max(dst.wal_checkpoint_retry_attempts, src.wal_checkpoint_retry_attempts);
+        dst.wal_checkpoint_retry_delay_ns = if (dst.wal_checkpoint_retry_delay_ns == 0)
+            src.wal_checkpoint_retry_delay_ns
+        else if (src.wal_checkpoint_retry_delay_ns == 0)
+            dst.wal_checkpoint_retry_delay_ns
+        else
+            @min(dst.wal_checkpoint_retry_delay_ns, src.wal_checkpoint_retry_delay_ns);
+        dst.active_immutable_logical_bytes +|= src.active_immutable_logical_bytes;
+        dst.unpublished_wal_logical_bytes +|= src.unpublished_wal_logical_bytes;
+        dst.unpublished_wal_max_batch_logical_bytes = @max(dst.unpublished_wal_max_batch_logical_bytes, src.unpublished_wal_max_batch_logical_bytes);
         dst.wal_replay_retained_segments +|= src.wal_replay_retained_segments;
         dst.wal_replay_retained_bytes +|= src.wal_replay_retained_bytes;
         dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
@@ -1400,6 +1429,12 @@ pub const Backend = struct {
     last_wal_retention_enforce_ns: u64 = 0,
     wal_checkpoint_pending: bool = false,
     wal_pressure_blocked: bool = false,
+    wal_checkpoint_retry_reason: WalCheckpointRetryReason = .none,
+    wal_checkpoint_retry_attempts: u32 = 0,
+    wal_checkpoint_retry_deadline_ns: u64 = 0,
+    active_immutable_logical_bytes: u64 = 0,
+    unpublished_wal_logical_bytes: u64 = 0,
+    unpublished_wal_max_batch_logical_bytes: u64 = 0,
     wal_retention: WalRetentionState = .{},
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     open_stats: OpenStats = .{},
@@ -1834,6 +1869,12 @@ pub const Backend = struct {
             .wal_hard_limit_bytes = self.options.wal_hard_limit_bytes,
             .wal_checkpoint_pending = self.wal_checkpoint_pending,
             .wal_pressure_blocked = self.wal_pressure_blocked,
+            .wal_checkpoint_retry_reason = self.wal_checkpoint_retry_reason,
+            .wal_checkpoint_retry_attempts = self.wal_checkpoint_retry_attempts,
+            .wal_checkpoint_retry_delay_ns = self.walCheckpointRetryRemainingNsLocked(),
+            .active_immutable_logical_bytes = self.active_immutable_logical_bytes,
+            .unpublished_wal_logical_bytes = self.unpublished_wal_logical_bytes,
+            .unpublished_wal_max_batch_logical_bytes = self.unpublished_wal_max_batch_logical_bytes,
             .manifest_dirty = self.manifest_dirty,
             .obsolete_manifest_dirty = self.obsolete_manifest_dirty,
             .obsolete_delete_failures = self.obsolete_delete_failures,
@@ -1941,8 +1982,13 @@ pub const Backend = struct {
             stats.wal_checkpoint_oldest_retained_segment = wal_retention.oldest_retained_segment;
             stats.wal_checkpoint_covered_through_segment = wal_retention.checkpoint_covered_through_segment;
             stats.wal_checkpoint_current_segment = wal_retention.current_segment;
-            stats.wal_checkpoint_pending = stats.wal_checkpoint_pending or self.walRetentionOverSoftLimit(wal_retention);
-            stats.wal_pressure_blocked = stats.wal_pressure_blocked or self.walRetentionOverHardLimit(wal_retention);
+            const over_soft = self.walRetentionOverSoftLimit(wal_retention);
+            const over_hard = self.walRetentionOverHardLimit(wal_retention);
+            stats.wal_checkpoint_pending = stats.wal_checkpoint_pending or over_soft;
+            stats.wal_pressure_blocked = stats.wal_pressure_blocked or over_hard;
+            if (stats.wal_checkpoint_pending and stats.wal_checkpoint_retry_reason == .none) {
+                stats.wal_checkpoint_retry_reason = if (over_hard) .hard_pressure else .soft_pressure;
+            }
             if (wal_retention.current_segment > wal_retention.oldest_retained_segment) {
                 stats.wal_checkpoint_lag_segments = wal_retention.current_segment - wal_retention.oldest_retained_segment;
             }
@@ -2290,12 +2336,23 @@ pub const Backend = struct {
         return try self.runMaintenanceStepLocked();
     }
 
+    pub fn makeWalCheckpointRetryDueForTest(self: *Backend) void {
+        if (!builtin.is_test) return;
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        self.wal_checkpoint_retry_deadline_ns = 0;
+        self.last_wal_retention_enforce_ns = 0;
+    }
+
     fn runMaintenanceStepLocked(self: *Backend) !bool {
         if (self.options.backend.read_only) return false;
+        if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
+            if (try self.runWalPressureMaintenanceStepLocked()) return true;
+        }
         // Bulk ingest suppresses compaction, not durability/resource bounds.
         // This lane can only flush unpublished memtables and publish a
         // checkpoint manifest; it deliberately cannot compact runs.
-        if (self.bulkIngestActive()) return try self.runBulkWalPressureMaintenanceStepLocked();
+        if (self.bulkIngestActive()) return false;
         self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
             self.options.background_io_budget_bytes
         else
@@ -2347,43 +2404,57 @@ pub const Backend = struct {
             self.obsolete_paths.items.len != before_obsolete_paths;
     }
 
-    fn runBulkWalPressureMaintenanceStepLocked(self: *Backend) !bool {
-        if (!self.walRetentionPressureEnabled() or !self.wal_checkpoint_pending) return false;
+    fn runWalPressureMaintenanceStepLocked(self: *Backend) !bool {
+        if (!self.wal_checkpoint_pending) return false;
+        const retrying_failed_checkpoint = self.wal_checkpoint_retry_reason == .checkpoint_failure;
+        if (!retrying_failed_checkpoint and !self.walRetentionPressureEnabled()) return false;
+        if (!self.walCheckpointRetryDueLocked()) return false;
         const before_flushes = self.write_stats.immutable_flushes;
         const before_manifest_writes = self.write_stats.manifest_writes;
         const before_wal_resets = self.write_stats.wal_resets;
 
-        if (self.wal_pressure_blocked) {
-            // A failed pre-append checkpoint leaves the current committed
-            // generation below the limit but blocks the projected append.
-            // Retry that exact durable boundary without waiting for another
-            // client write to discover it again.
+        if (self.wal_pressure_blocked or retrying_failed_checkpoint) {
+            // Retry the exact durable boundary after either pre-append
+            // admission or post-publication cleanup failed. The recorded hard
+            // pressure bit remains level-triggered; a cleanup-only failure
+            // must not falsely advertise blocked write admission.
             self.checkpointCommittedStateForWalAdmissionLocked() catch |err| {
                 self.write_stats.wal_pressure_failures +|= 1;
-                self.wal_checkpoint_pending = true;
-                self.wal_pressure_blocked = true;
+                self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
                 return err;
             };
         } else {
             // A retry is not foreground commit latency, so soft work honors
             // the normal checkpoint cadence. Hard pressure is unconditional.
-            self.enforceWalRetentionSoftPressureGuarded() catch |err| {
+            self.enforceWalRetentionSoftPressureGuarded(true) catch |err| {
                 self.write_stats.wal_pressure_failures +|= 1;
-                self.wal_checkpoint_pending = true;
+                self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
                 return err;
             };
             self.enforceWalRetentionHardPressure(false) catch |err| {
                 self.write_stats.wal_pressure_failures +|= 1;
-                self.wal_checkpoint_pending = true;
                 self.wal_pressure_blocked = true;
+                self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
                 return err;
             };
         }
 
         self.invalidatePrimaryWalRetentionCacheLocked();
-        const retention = try self.snapshotWalRetentionForPressureLocked() orelse return false;
+        const retention = try self.snapshotWalRetentionForPressureLocked() orelse {
+            self.wal_pressure_blocked = false;
+            self.clearWalCheckpointRetryLocked();
+            _ = self.refreshCachedMaintenanceHintLocked();
+            return self.write_stats.immutable_flushes != before_flushes or
+                self.write_stats.manifest_writes != before_manifest_writes or
+                self.write_stats.wal_resets != before_wal_resets;
+        };
         self.wal_checkpoint_pending = self.walRetentionOverSoftLimit(retention);
         self.wal_pressure_blocked = self.walRetentionOverHardLimit(retention);
+        if (self.wal_checkpoint_pending) {
+            self.scheduleWalCheckpointRetryLocked(if (self.wal_pressure_blocked) .hard_pressure else .soft_pressure, false);
+        } else {
+            self.clearWalCheckpointRetryLocked();
+        }
         _ = self.refreshCachedMaintenanceHintLocked();
 
         return self.write_stats.immutable_flushes != before_flushes or
@@ -2796,6 +2867,20 @@ pub const Backend = struct {
         return bytes +| bytes;
     }
 
+    fn noteImmutablePublishedForWal(self: *Backend, state: *const State) void {
+        // Run construction already walks every entry, so computing this once
+        // at publication does not change flush complexity. Commits thereafter
+        // consume only the maintained aggregate.
+        const logical_bytes = estimateStateLogicalBytes(state);
+        std.debug.assert(logical_bytes <= self.active_immutable_logical_bytes);
+        self.active_immutable_logical_bytes -|= logical_bytes;
+        self.unpublished_wal_logical_bytes +|= logical_bytes;
+        self.unpublished_wal_max_batch_logical_bytes = @max(
+            self.unpublished_wal_max_batch_logical_bytes,
+            logical_bytes,
+        );
+    }
+
     fn maintenanceLevelRunTarget(level: u32, base: usize, multiplier: usize) usize {
         if (level == 0) return 0;
         var target = @max(@as(usize, 1), base);
@@ -3186,7 +3271,8 @@ pub const Backend = struct {
         // rather than reporting a failed split after the live version changed.
         self.maybeCheckpointWalAfterManifestPublish() catch |err| {
             std.log.warn("lsm split-left manifest published but wal checkpoint deferred root={?s} err={}", .{ self.root_dir, err });
-            self.notePotentialMaintenanceDebtLocked();
+            self.write_stats.wal_pressure_failures +|= 1;
+            self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
         };
         return true;
     }
@@ -3229,12 +3315,14 @@ pub const Backend = struct {
     fn rotateMutableToImmutable(self: *Backend) !void {
         if (self.mutable.entries.items.len == 0) return;
         self.invalidateMutableReadSnapshot();
+        const rotated_logical_bytes = self.mutable.logical_bytes;
         const rotated = try self.allocator.create(State);
         errdefer self.allocator.destroy(rotated);
         try self.immutable_memtables.ensureUnusedCapacity(self.allocator, 1);
         try self.immutable_wal_ranges.ensureUnusedCapacity(self.allocator, 1);
         rotated.* = try self.mutable.toStateMove(self.allocator);
         self.immutable_memtables.appendAssumeCapacity(rotated);
+        self.active_immutable_logical_bytes +|= rotated_logical_bytes;
         self.immutable_wal_ranges.appendAssumeCapacity(self.mutable_wal_range);
         self.mutable_wal_range = .{};
         self.mutable_idle_flush_deadline_ns = 0;
@@ -3352,6 +3440,7 @@ pub const Backend = struct {
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
         try self.retireImmutableMemtable(state);
         self.compactImmutableMemtableQueue();
@@ -3426,6 +3515,7 @@ pub const Backend = struct {
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &build_result);
+        self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
         try self.retireImmutableMemtable(state);
         self.compactImmutableMemtableQueue();
@@ -3610,6 +3700,7 @@ pub const Backend = struct {
             try self.flushMutable();
         }
 
+        const input_logical_bytes = estimateStateLogicalBytes(state);
         const start_ns = self.writeStatsNowNs();
         var new_runs = try compaction_mod.makeRunsFromStateBorrowed(Backend, self, state);
         errdefer {
@@ -3619,6 +3710,11 @@ pub const Backend = struct {
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        self.unpublished_wal_logical_bytes +|= input_logical_bytes;
+        self.unpublished_wal_max_batch_logical_bytes = @max(
+            self.unpublished_wal_max_batch_logical_bytes,
+            input_logical_bytes,
+        );
 
         compaction_mod.sortRuns(self.runs.items);
         if (self.root_dir != null) {
@@ -3740,6 +3836,8 @@ pub const Backend = struct {
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = false;
         self.obsolete_manifest_dirty = false;
+        self.unpublished_wal_logical_bytes = 0;
+        self.unpublished_wal_max_batch_logical_bytes = 0;
     }
 
     fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !usize {
@@ -4856,11 +4954,74 @@ pub const Backend = struct {
     // maintenance step. Once per interval is plenty for an approximate
     // limit.
     fn walRetentionEnforceDue(self: *Backend) bool {
-        const interval_ns: u64 = 250 * std.time.ns_per_ms;
         const now_ns = self.writeStatsNowNs();
-        if (now_ns -| self.last_wal_retention_enforce_ns < interval_ns) return false;
+        if (now_ns -| self.last_wal_retention_enforce_ns < wal_retention_enforce_interval_ns) return false;
         self.last_wal_retention_enforce_ns = now_ns;
         return true;
+    }
+
+    fn walCheckpointRetryBackoffNs(attempts: u32) u64 {
+        if (attempts == 0) return wal_checkpoint_retry_initial_ns;
+        const shift: u6 = @intCast(@min(attempts - 1, 7));
+        return @min(wal_checkpoint_retry_initial_ns << shift, wal_checkpoint_retry_max_ns);
+    }
+
+    fn scheduleWalCheckpointRetryLocked(
+        self: *Backend,
+        reason: WalCheckpointRetryReason,
+        checkpoint_failed: bool,
+    ) void {
+        const now_ns = self.writeStatsNowNs();
+        self.wal_checkpoint_pending = true;
+        if (checkpoint_failed) {
+            self.wal_checkpoint_retry_attempts +|= 1;
+            self.wal_checkpoint_retry_reason = .checkpoint_failure;
+            self.wal_checkpoint_retry_deadline_ns = now_ns +|
+                walCheckpointRetryBackoffNs(self.wal_checkpoint_retry_attempts);
+        } else if (self.wal_checkpoint_retry_deadline_ns == 0 or
+            self.wal_checkpoint_retry_deadline_ns <= now_ns or
+            self.wal_checkpoint_retry_reason != .checkpoint_failure)
+        {
+            self.wal_checkpoint_retry_attempts = 0;
+            self.wal_checkpoint_retry_reason = reason;
+            self.wal_checkpoint_retry_deadline_ns = switch (reason) {
+                .hard_pressure => now_ns,
+                .soft_pressure => @max(now_ns, self.last_wal_retention_enforce_ns +| wal_retention_enforce_interval_ns),
+                .checkpoint_failure => now_ns +| wal_checkpoint_retry_initial_ns,
+                .none => now_ns,
+            };
+        }
+        self.notePotentialMaintenanceDebtLocked();
+    }
+
+    fn clearWalCheckpointRetryLocked(self: *Backend) void {
+        self.wal_checkpoint_pending = false;
+        self.wal_checkpoint_retry_reason = .none;
+        self.wal_checkpoint_retry_attempts = 0;
+        self.wal_checkpoint_retry_deadline_ns = 0;
+    }
+
+    fn walCheckpointRetryDueLocked(self: *Backend) bool {
+        return self.wal_checkpoint_pending and
+            (self.wal_checkpoint_retry_deadline_ns == 0 or
+                self.writeStatsNowNs() >= self.wal_checkpoint_retry_deadline_ns);
+    }
+
+    fn nextWalCheckpointRetryDelayNsLocked(self: *Backend) ?u64 {
+        if (!self.wal_checkpoint_pending) return null;
+        if (self.wal_checkpoint_retry_reason != .checkpoint_failure and
+            !self.walRetentionPressureEnabled()) return null;
+        const delay_ns = self.walCheckpointRetryRemainingNsLocked();
+        if (delay_ns == 0) self.cached_maintenance_hint.store(1, .release);
+        return delay_ns;
+    }
+
+    fn walCheckpointRetryRemainingNsLocked(self: *Backend) u64 {
+        const now_ns = self.writeStatsNowNs();
+        return if (self.wal_checkpoint_retry_deadline_ns <= now_ns)
+            0
+        else
+            self.wal_checkpoint_retry_deadline_ns - now_ns;
     }
 
     fn walRetentionOverSoftLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
@@ -4876,19 +5037,19 @@ pub const Backend = struct {
         const multiplier = self.options.wal_checkpoint_dirty_bytes_multiplier;
         if (multiplier == 0) return null;
 
-        // Mutable generations are the complete set of logical changes not yet
-        // covered by a published manifest. Reading their counters is O(1).
-        var dirty_bytes = estimateStateLogicalBytes(&self.mutable);
-        for (self.activeImmutableMemtables()) |immutable| {
-            dirty_bytes +|= estimateStateLogicalBytes(immutable);
-        }
-        // A dirty manifest with no mutable generations is direct/flush run
-        // publication debt, not an overwrite-heavy live set. Applying only
-        // the adaptive floor here would force a manifest fsync for every large
-        // direct-ingest batch. Let the configured absolute byte/segment bounds
-        // batch those already-durable run files, while mutable overwrite
-        // history remains adaptive.
-        if (dirty_bytes == 0 and self.manifest_dirty) return null;
+        // Mutable, immutable, and already-written-but-unpublished run debt are
+        // maintained at their transition points. This keeps foreground commit
+        // admission O(1) even while a large immutable generation is flushing,
+        // and gives direct ingest the same workload-relative WAL bound as the
+        // ordinary mutable path.
+        // Unpublished direct runs are already durable data. Growing the target
+        // with their cumulative bytes would let WAL and target grow in
+        // lockstep forever, so size the publication window from the largest
+        // unpublished batch. Small batches coalesce behind the floor; large
+        // batches receive a proportional window without abandoning the bound.
+        const dirty_bytes = self.mutable.logical_bytes +|
+            self.active_immutable_logical_bytes +|
+            self.unpublished_wal_max_batch_logical_bytes;
         const scaled = std.math.mul(u64, dirty_bytes, multiplier) catch std.math.maxInt(u64);
         return @max(self.options.wal_checkpoint_dirty_bytes_floor, scaled);
     }
@@ -4966,16 +5127,15 @@ pub const Backend = struct {
 
         self.checkpointCommittedStateForWalAdmissionLocked() catch |err| {
             self.write_stats.wal_pressure_failures +|= 1;
-            self.wal_checkpoint_pending = true;
             self.wal_pressure_blocked = true;
-            self.notePotentialMaintenanceDebtLocked();
+            self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
             return err;
         };
         retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
         if (self.walRetentionWouldExceedHardAfterAppend(retention, incoming_bytes)) {
             self.write_stats.wal_pressure_rejections +|= 1;
-            self.wal_checkpoint_pending = true;
             self.wal_pressure_blocked = true;
+            self.scheduleWalCheckpointRetryLocked(.hard_pressure, false);
             return error.WalRetentionLimitExceeded;
         }
         self.wal_pressure_blocked = false;
@@ -4991,13 +5151,19 @@ pub const Backend = struct {
             return;
         } orelse return;
         if (!self.walRetentionOverSoftLimit(retention)) {
-            self.wal_checkpoint_pending = false;
+            // A retry created by failed post-publication cleanup is durable
+            // maintenance debt, not merely a reflection of the current
+            // retention level. Only a successful checkpoint may discharge it;
+            // otherwise an unrelated small commit could strand retained WAL.
+            if (self.wal_checkpoint_retry_reason != .checkpoint_failure) {
+                self.clearWalCheckpointRetryLocked();
+            }
             self.wal_pressure_blocked = false;
             return;
         }
 
-        self.wal_checkpoint_pending = true;
-        self.enforceWalRetentionSoftPressureGuarded() catch |err| {
+        self.scheduleWalCheckpointRetryLocked(if (self.walRetentionOverHardLimit(retention)) .hard_pressure else .soft_pressure, false);
+        self.enforceWalRetentionSoftPressureGuarded(false) catch |err| {
             self.recordCommittedWalPressureFailure(err);
             return;
         };
@@ -5012,16 +5178,19 @@ pub const Backend = struct {
         } orelse return;
         self.wal_checkpoint_pending = self.walRetentionOverSoftLimit(after);
         self.wal_pressure_blocked = self.walRetentionOverHardLimit(after);
-        if (self.wal_checkpoint_pending) self.notePotentialMaintenanceDebtLocked();
+        if (self.wal_checkpoint_pending) {
+            self.scheduleWalCheckpointRetryLocked(if (self.wal_pressure_blocked) .hard_pressure else .soft_pressure, false);
+        } else {
+            self.clearWalCheckpointRetryLocked();
+        }
     }
 
     fn recordCommittedWalPressureFailure(self: *Backend, err: anyerror) void {
         self.write_stats.wal_pressure_failures +|= 1;
-        self.wal_checkpoint_pending = true;
         const retention = self.snapshotWalRetentionForPressureLocked() catch null;
         self.wal_pressure_blocked = if (retention) |stats| self.walRetentionOverHardLimit(stats) else true;
         std.log.warn("lsm committed write checkpoint deferred root={?s} err={}", .{ self.root_dir, err });
-        self.notePotentialMaintenanceDebtLocked();
+        self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
     }
 
     fn walRetentionPressureScoreLocked(self: *Backend) u64 {
@@ -5147,8 +5316,11 @@ pub const Backend = struct {
         try self.enforceWalRetentionHardPressure(false);
     }
 
-    fn enforceWalRetentionSoftPressureGuarded(self: *Backend) anyerror!void {
-        if (!self.options.foreground_soft_wal_checkpoint) return;
+    fn enforceWalRetentionSoftPressureGuarded(self: *Backend, background_retry: bool) anyerror!void {
+        // The option controls foreground commit latency only. Once pressure
+        // has scheduled background debt, the maintenance worker must service
+        // it even when foreground checkpoints are disabled.
+        if (!background_retry and !self.options.foreground_soft_wal_checkpoint) return;
         if (self.write_pressure_enforcing) return;
         if (!self.walRetentionEnforceDue()) return;
         const retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
@@ -5607,8 +5779,17 @@ pub const Backend = struct {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
 
+        // Keep the advertised deadline consistent with runMaintenanceStepLocked:
+        // an open bulk session exposes only resource/durability checkpoints.
+        // In particular, a due routine task must not keep an external worker
+        // spinning while bulk mode intentionally suppresses that task.
+        if (self.bulkIngestActive()) return self.nextWalCheckpointRetryDelayNsLocked();
+
         var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
         if (self.nextMutableIdleFlushDelayNsLocked()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        if (self.nextWalCheckpointRetryDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         return delay_ns;
@@ -5867,7 +6048,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         while (steps < 64) : (steps += 1) {
             const progressed = self.backend.runMaintenanceStep() catch |err| {
                 self.recordError(err);
-                return null;
+                return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             };
             if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
@@ -6175,6 +6356,9 @@ fn clearRunsAndFiles(backend: *Backend) !void {
     backend.immutable_memtables.clearRetainingCapacity();
     backend.immutable_wal_ranges.clearRetainingCapacity();
     backend.immutable_head = 0;
+    backend.active_immutable_logical_bytes = 0;
+    backend.unpublished_wal_logical_bytes = 0;
+    backend.unpublished_wal_max_batch_logical_bytes = 0;
     backend.drainRetiredImmutableMemtables();
     backend.drainRetiredMutableSnapshots();
     backend.next_run_id = 1;
@@ -8550,7 +8734,7 @@ test "lsm backend deferred direct bulk commits publish bounded wal checkpoints" 
     try std.testing.expectEqualSlices(u8, &expected, try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
-test "lsm backend direct bulk runs use absolute wal batching instead of adaptive floor" {
+test "lsm backend direct bulk runs checkpoint at adaptive publication window" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
 
@@ -8570,21 +8754,107 @@ test "lsm backend direct bulk runs use absolute wal batching instead of adaptive
 
     var value: [512]u8 = undefined;
     @memset(&value, 'v');
-    backend.last_wal_retention_enforce_ns = 0;
-    var txn = try backend.beginBatchWithOptions(.{
-        .mode = .bulk_ingest,
-        .defer_commit_flush = true,
-    });
-    try txn.appendPut(.{ .name = "docs" }, "doc:a", &value);
-    try txn.commit();
+    var write_count: usize = 0;
+    while (write_count < 16 and backend.write_stats.wal_pressure_manifest_publishes == 0) : (write_count += 1) {
+        backend.last_wal_retention_enforce_ns = 0;
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{write_count});
+        var txn = try backend.beginBatchWithOptions(.{
+            .mode = .bulk_ingest,
+            .defer_commit_flush = true,
+        });
+        try txn.appendPut(.{ .name = "docs" }, key, &value);
+        try txn.commit();
+    }
 
     const writes = backend.snapshotWriteStats();
-    try std.testing.expectEqual(@as(u64, 1), writes.bulk_append_direct_successes);
-    try std.testing.expectEqual(@as(u64, 0), writes.wal_pressure_manifest_publishes);
+    try std.testing.expect(writes.bulk_append_direct_successes > 1);
+    try std.testing.expect(writes.bulk_append_direct_successes < 16);
+    try std.testing.expect(writes.wal_pressure_manifest_publishes > 0);
     const maintenance = backend.snapshotMaintenanceStats();
-    try std.testing.expect(maintenance.wal_retained_bytes > 0);
-    try std.testing.expect(maintenance.wal_retained_bytes < maintenance.wal_soft_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.unpublished_wal_logical_bytes);
     try std.testing.expect(!maintenance.wal_checkpoint_pending);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
+test "lsm backend wal retry deadline is scheduled with bounded backoff" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-wal-retry-deadline", .{
+        .storage = storage.storage(),
+        .wal_soft_limit_bytes = 128,
+    });
+    defer backend.close();
+
+    backend.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
+    const first_deadline = backend.wal_checkpoint_retry_deadline_ns;
+    try std.testing.expect(backend.wal_checkpoint_pending);
+    try std.testing.expectEqual(WalCheckpointRetryReason.checkpoint_failure, backend.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u32, 1), backend.wal_checkpoint_retry_attempts);
+    try std.testing.expect(first_deadline > backend.writeStatsNowNs());
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+
+    // A later low-pressure commit cannot discharge failed checkpoint work.
+    backend.finishCommittedWalAppend();
+    try std.testing.expect(backend.wal_checkpoint_pending);
+    try std.testing.expectEqual(WalCheckpointRetryReason.checkpoint_failure, backend.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u32, 1), backend.wal_checkpoint_retry_attempts);
+
+    backend.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
+    try std.testing.expectEqual(@as(u32, 2), backend.wal_checkpoint_retry_attempts);
+    try std.testing.expect(backend.wal_checkpoint_retry_deadline_ns > first_deadline);
+
+    backend.wal_checkpoint_retry_deadline_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+}
+
+test "lsm backend due wal maintenance publishes during open bulk session" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-bulk-due-wal-retry", .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .storage = storage.storage(),
+        .wal_checkpoint_dirty_bytes_multiplier = 1,
+        .wal_checkpoint_dirty_bytes_floor = 128,
+        .wal_soft_limit_bytes = 4096,
+        .foreground_soft_wal_checkpoint = false,
+        .compact_threshold_runs = 100,
+    });
+    defer backend.close();
+    try backend.beginBulkIngestSession();
+    errdefer if (backend.bulkIngestActive()) backend.abortBulkIngestSession();
+
+    var value: [512]u8 = undefined;
+    @memset(&value, 'v');
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        // Keep foreground work inside the cadence window. The worker owns the
+        // eventual pressure publication in this regression.
+        backend.last_wal_retention_enforce_ns = backend.writeStatsNowNs();
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginBatchWithOptions(.{
+            .mode = .bulk_ingest,
+            .defer_commit_flush = true,
+        });
+        try txn.appendPut(.{ .name = "docs" }, key, &value);
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.wal_checkpoint_pending);
+    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_pressure_manifest_publishes);
+    backend.last_wal_retention_enforce_ns = 0;
+    backend.wal_checkpoint_retry_deadline_ns = 0;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(backend.bulkIngestActive());
+    try std.testing.expect(backend.write_stats.wal_pressure_manifest_publishes > 0);
+    try std.testing.expect(!backend.wal_checkpoint_pending);
+    try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
 
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
 }

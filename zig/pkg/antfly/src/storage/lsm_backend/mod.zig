@@ -33,6 +33,7 @@ pub const Storage = impl.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const MemoryStorage = storage_io.MemoryStorage;
 pub const NativeStorageStats = impl.NativeStorageStats;
+pub const WalCheckpointRetryReason = impl.WalCheckpointRetryReason;
 pub const Cache = impl.Cache;
 pub const DefaultCacheSizeBytes = impl.DefaultCacheSizeBytes;
 pub const TableEntry = impl.TableEntry;
