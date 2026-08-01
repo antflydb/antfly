@@ -41881,6 +41881,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     const cases = [_]struct {
         filter_query_json: []const u8,
         exclusion_query_json: []const u8 = "",
+        filter_prefix: []const u8 = "",
         expected_candidates: usize = eligible_count,
         expected_scored: usize = eligible_count,
         expected_route: []const u8 = "exact_native_filter",
@@ -41888,6 +41889,13 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     }{
         .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
         .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
+        // Prefix metadata is resolved before vector IO. Only the ten matching
+        // candidates should incur a distance evaluation.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .filter_prefix = "doc:0999",
+            .expected_scored = 10,
+        },
         // Exercise a highly selective positive filter together with a large,
         // disjoint native exclusion set. Exact scoring must subtract the two
         // ordered sets linearly instead of probing every exclusion for every
@@ -41930,6 +41938,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
             .primary_text_index_name = "ft_v1",
             .limit = 100,
             .include_stored = false,
+            .filter_prefix = case.filter_prefix,
             .filter_query_json = case.filter_query_json,
             .exclusion_query_json = case.exclusion_query_json,
         }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });

@@ -116,7 +116,22 @@ pub fn differenceCandidateUpperBound(
     include_ids: []const u64,
     exclude_ids: []const u64,
 ) ?usize {
+    // The overwhelmingly common positive-filter query has no exclusions.
+    // Its input length is already a conservative unique-candidate bound, so
+    // avoid walking a potentially large include list merely to rediscover it.
+    if (include_ids.len == 0 or exclude_ids.len == 0) return include_ids.len;
     if (!isSortedUniqueU64(exclude_ids)) return null;
+    return differenceCandidateUpperBoundNormalizedExclusions(include_ids, exclude_ids);
+}
+
+/// Same bound as `differenceCandidateUpperBound`, for callers that already
+/// own a sorted, unique exclusion set. This avoids validating large native
+/// exclusion lists a second time after their merge/normalization step.
+pub fn differenceCandidateUpperBoundNormalizedExclusions(
+    include_ids: []const u64,
+    exclude_ids: []const u64,
+) usize {
+    if (include_ids.len == 0 or exclude_ids.len == 0) return include_ids.len;
     if (isSortedUniqueU64(include_ids)) {
         return sortedUniqueDifferenceCountAssumeNormalized(include_ids, exclude_ids);
     }
@@ -210,4 +225,9 @@ test "sorted unique vector id subtraction handles sparse and dense exclusions" {
     // Duplicate survivors deliberately overestimate the unique difference.
     try std.testing.expectEqual(@as(?usize, 2), differenceCandidateUpperBound(&.{ 7, 7 }, &.{ 1, 2 }));
     try std.testing.expectEqual(@as(?usize, null), differenceCandidateUpperBound(&.{ 1, 2 }, &.{ 2, 1 }));
+    try std.testing.expectEqual(@as(?usize, 3), differenceCandidateUpperBound(&.{ 3, 1, 3 }, &.{}));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        differenceCandidateUpperBoundNormalizedExclusions(&.{ 9, 2, 7, 2 }, &.{ 1, 2, 3 }),
+    );
 }

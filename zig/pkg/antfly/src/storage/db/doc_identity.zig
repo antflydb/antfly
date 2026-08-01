@@ -3345,12 +3345,29 @@ test "non-visible doc set complements visibility per generation" {
     try std.testing.expect(!excluded_live.containsOrdinal(3));
 
     // A pinned read at the latest generation has the same current-state
-    // complement and can use the compact deleted side index.
+    // complement. Remove the authoritative visibility chunk first so this
+    // assertion proves the compact deleted side index served the request.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const chunk_key = internal_keys.identityVisibilityChunkKey(0);
+        try txn.delete(chunk_key[0..]);
+        try txn.commit();
+    }
     var excluded_at_latest = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 13, 16)) orelse return error.TestUnexpectedResult;
     defer excluded_at_latest.deinit(alloc);
     try std.testing.expectEqual(@as(?usize, 1), excluded_at_latest.estimatedCardinality());
     try std.testing.expect(excluded_at_latest.containsOrdinal(2));
     try std.testing.expect(!excluded_at_latest.containsOrdinal(3));
+
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var chunk = try rebuildVisibilityChunkFromIdentityStatesAlloc(alloc, &store, &txn, 0);
+        defer chunk.deinit(alloc);
+        try writeVisibilityChunkTxn(alloc, &txn, 0, &chunk);
+        try txn.commit();
+    }
 
     // The current-read side index is required for validation. Query-time falls
     // back to the authoritative chunk when the summary says the side index is

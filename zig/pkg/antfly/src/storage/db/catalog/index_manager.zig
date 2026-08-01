@@ -6739,6 +6739,10 @@ pub const IndexManager = struct {
         var vectors_scored: u64 = 0;
         for (unique_candidate_ids, candidate_metadata, fallback_doc_keys) |vector_id, maybe_metadata, fallback_doc_key| {
             const doc_key = maybe_metadata orelse fallback_doc_key;
+            if (req.filter_prefix.len > 0) {
+                const resolved_doc_key = doc_key orelse continue;
+                if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
+            }
             const vector = (if (vector_cursor) |*cursor|
                 entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
             else
@@ -6760,10 +6764,6 @@ pub const IndexManager = struct {
             }
             if (req.distance_under) |threshold| {
                 if (distance >= threshold) continue;
-            }
-            if (req.filter_prefix.len > 0) {
-                const resolved_doc_key = doc_key orelse continue;
-                if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
             }
             const owned_metadata = if (doc_key) |resolved_doc_key|
                 try self.alloc.dupe(u8, resolved_doc_key)

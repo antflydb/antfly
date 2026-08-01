@@ -12818,7 +12818,10 @@ fn searchDenseInternal(
     profile.native_filter_candidate_count = @intCast(effective_filter_ids.len);
     const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
     const effective_native_filter_candidate_count = if (native_constraints.positive_filter)
-        dense_exact.differenceCandidateUpperBound(effective_filter_ids, effective_exclude_ids) orelse effective_filter_ids.len
+        if (native_constraints.exclude_ids_owned)
+            dense_exact.differenceCandidateUpperBoundNormalizedExclusions(effective_filter_ids, effective_exclude_ids)
+        else
+            dense_exact.differenceCandidateUpperBound(effective_filter_ids, effective_exclude_ids) orelse effective_filter_ids.len
     else
         effective_filter_ids.len;
     if (native_constraints.positive_filter and effective_native_filter_candidate_count == 0) {
@@ -13260,6 +13263,10 @@ fn exactScoreNativeDenseFilter(
     var vectors_scored: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
+        if (req.filter_prefix.len > 0) {
+            const metadata = candidate_metadata[i] orelse continue;
+            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
+        }
         const vector = (if (vector_cursor) |*cursor|
             entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
         else
@@ -13277,10 +13284,6 @@ fn exactScoreNativeDenseFilter(
         }
         if (req.distance_under) |threshold| {
             if (distance >= threshold) continue;
-        }
-        if (req.filter_prefix.len > 0) {
-            const metadata = candidate_metadata[i] orelse continue;
-            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
         }
         results.addResult(vector_id, distance, 0);
     }
