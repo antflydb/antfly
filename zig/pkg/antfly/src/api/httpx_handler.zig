@@ -55,6 +55,7 @@ const usermgr = @import("../usermgr/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const casbin = @import("antfly_casbin");
+const builtin = @import("builtin");
 
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -85,8 +86,73 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
+/// Bounded admission for expensive public query execution.  This lives at the
+/// httpx adapter boundary so status, auth, and other control routes retain a
+/// path even when query workers are saturated.
+pub const QueryAdmission = struct {
+    capacity: usize = 64,
+    in_flight: std.atomic.Value(usize) = .init(0),
+
+    pub fn init(capacity: usize) QueryAdmission {
+        return .{ .capacity = capacity };
+    }
+
+    pub fn tryAcquire(self: *QueryAdmission) bool {
+        var observed = self.in_flight.load(.acquire);
+        while (observed < self.capacity) {
+            if (self.in_flight.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire) == null) return true;
+            observed = self.in_flight.load(.acquire);
+        }
+        return false;
+    }
+
+    pub fn release(self: *QueryAdmission) void {
+        _ = self.in_flight.fetchSub(1, .acq_rel);
+    }
+};
+
+/// Watches only for a terminal peer socket event while a query is executing.
+/// It deliberately does not read the socket: HTTP/1 pipelined bytes remain
+/// owned by httpx's connection loop. HTTP/2 stream reset support remains in
+/// httpx's stream layer; this adapter therefore treats an unavailable watcher
+/// as no cancellation signal rather than guessing from readable bytes.
+const PeerCancellationWatcher = struct {
+    socket: *httpx.Socket,
+    cancellation: *http_common.RequestCancellation,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *@This()) !void {
+        if (comptime builtin.os.tag == .windows) return;
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        self.done.store(true, .release);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn run(self: *@This()) void {
+        if (comptime builtin.os.tag == .windows) return;
+        while (!self.done.load(.acquire)) {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.socket.handle,
+                .events = 0,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&fds, 25) catch return;
+            if (ready == 0) continue;
+            if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+                self.cancellation.cancel();
+                return;
+            }
+        }
+    }
+};
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
+    query_admission: QueryAdmission = .{},
 
     // ---------------------------------------------------------------
     // Response conversion: http_common.HttpResponse -> httpx.Response
@@ -329,6 +395,21 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "text/plain");
         _ = ctx.response.body(body);
         return ctx.response.build();
+    }
+
+    fn queryOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return textResponse(ctx, 429, "query capacity exhausted");
+    }
+
+    fn startPeerCancellationWatcher(ctx: *httpx.Context, cancellation: *http_common.RequestCancellation, watcher: *?PeerCancellationWatcher) void {
+        const socket = ctx.h1_sock orelse return;
+        watcher.* = .{ .socket = socket, .cancellation = cancellation };
+        if (watcher.*) |*value| value.start() catch {
+            // Failure to start observation must not fail a valid query. The
+            // listener still owns normal request lifetime and response I/O.
+            watcher.* = null;
+        };
     }
 
     fn unauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
@@ -1394,14 +1475,21 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
+        defer self.query_admission.release();
+        var cancellation = http_common.RequestCancellation{};
+        var watcher: ?PeerCancellationWatcher = null;
+        startPeerCancellationWatcher(ctx, &cancellation, &watcher);
+        defer if (watcher) |*value| value.deinit();
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
         if (isNdjsonContentType(ctx.header("content-type"))) {
-            var resp = try self.api_server.handlePublicGlobalMultiQuery(
+            var resp = try self.api_server.handlePublicGlobalMultiQueryWithCancellation(
                 body_data,
                 authenticated_identity,
+                &cancellation,
             );
             return respondWithAllocator(ctx, &resp, self.api_server.alloc);
         }
@@ -1410,10 +1498,12 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var resp = try self.api_server.handlePublicTableQuery(
+        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             parsed_table.table_name,
             body_data,
+            ctx.header("content-type"),
             authenticated_identity,
+            &cancellation,
         );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
@@ -1982,17 +2072,24 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
+        defer self.query_admission.release();
+        var cancellation = http_common.RequestCancellation{};
+        var watcher: ?PeerCancellationWatcher = null;
+        startPeerCancellationWatcher(ctx, &cancellation, &watcher);
+        defer if (watcher) |*value| value.deinit();
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        var resp = try self.api_server.handlePublicTableQueryWithContentType(
+        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
+            &cancellation,
         );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
@@ -3579,6 +3676,48 @@ test "httpx internal request conversion preserves protocol headers" {
     try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
     try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
     try std.testing.expectEqualStrings("{}", converted.value.body);
+}
+
+test "httpx query admission rejects saturated queries without blocking control routes" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var handler = AntflyApiHandler{
+        .api_server = &api_server,
+        .query_admission = QueryAdmission.init(1),
+    };
+
+    try std.testing.expect(handler.query_admission.tryAcquire());
+    defer handler.query_admission.release();
+
+    var query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer query_request.deinit();
+    query_request.body = "{}";
+    var query_ctx = httpx.Context.init(alloc, undefined, &query_request);
+    defer query_ctx.deinit();
+    var rejected = try handler.queryTable(&query_ctx, "docs");
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+    try std.testing.expectEqualStrings("1", rejected.headers.get("Retry-After").?);
+
+    var control_request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/status");
+    defer control_request.deinit();
+    var control_ctx = httpx.Context.init(alloc, undefined, &control_request);
+    defer control_ctx.deinit();
+    var control = try handler.getStatus(&control_ctx);
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status.code);
+}
+
+test "httpx query admission releases a cancelled query slot" {
+    var admission = QueryAdmission.init(1);
+    try std.testing.expect(admission.tryAcquire());
+    var cancellation = http_common.RequestCancellation{};
+    cancellation.cancel();
+    try std.testing.expect(cancellation.isCancelled());
+    admission.release();
+    try std.testing.expect(admission.tryAcquire());
+    admission.release();
 }
 
 test "httpx antfly routes require auth and enforce admin middleware" {

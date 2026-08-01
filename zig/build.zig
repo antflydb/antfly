@@ -4471,6 +4471,8 @@ pub fn build(b: *std.Build) void {
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
         "httpx antfly scan honors optional body and documented bad requests",
+        "httpx query admission rejects saturated queries without blocking control routes",
+        "httpx query admission releases a cancelled query slot",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
         "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",

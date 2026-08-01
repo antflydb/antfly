@@ -10759,7 +10759,7 @@ pub const ApiHttpServer = struct {
         return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, content_type, authenticated_identity, null);
     }
 
-    fn handlePublicTableQueryWithContentTypeCancellation(
+    pub fn handlePublicTableQueryWithContentTypeCancellation(
         self: *ApiHttpServer,
         table_name: []const u8,
         body: []const u8,
@@ -10774,7 +10774,19 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        return try self.handlePublicTableMultiQuery(null, body, authenticated_identity);
+        return try self.handlePublicGlobalMultiQueryWithCancellation(body, authenticated_identity, null);
+    }
+
+    /// httpx owns the inbound socket and supplies this request-scoped signal.
+    /// Keep the cancellation-aware variant public so alternate listeners do
+    /// not silently lose the public query cancellation contract.
+    pub fn handlePublicGlobalMultiQueryWithCancellation(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
+        return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation);
     }
 
     fn publicQueryDispatchErrorResponse(
@@ -17238,8 +17250,12 @@ test "api http transient read retry stops before source query when client cancel
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
         }
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse { return error.UnsupportedOperation; }
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse { return error.UnsupportedOperation; }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
         fn query(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.attempts += 1;
