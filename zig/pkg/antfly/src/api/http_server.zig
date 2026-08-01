@@ -2306,6 +2306,7 @@ pub const ApiHttpServer = struct {
             table_name,
             query_value,
             execution_deadline_ns,
+            cancellation,
         );
     }
 
@@ -9380,11 +9381,14 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         query_value: std.json.Value,
         execution_deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !query_api.OwnedQueryRequest {
+        try ensureRequestActive(cancellation);
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
         var semantic_resolver = self.semanticStatusResolver(.internal, "");
         semantic_resolver.query_embedding_deadline_ns = execution_deadline_ns;
+        semantic_resolver.query_cancellation = cancellation;
         var owned = try query_api.parsePublicQueryRequestWithDeadline(
             alloc,
             semantic_resolver.iface(),
@@ -9393,6 +9397,8 @@ pub const ApiHttpServer = struct {
             execution_deadline_ns,
         );
         errdefer owned.deinit(alloc);
+        owned.req.cancellation = cancellation;
+        try ensureRequestActive(cancellation);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
         try self.validatePublicQuerySortCapabilities(table_name, owned.req);
         return owned;
@@ -35791,6 +35797,35 @@ test "api http server join parser accepts foreign source maps" {
 
     try std.testing.expectEqualStrings("customers", parsed.join.right_table);
     try std.testing.expect(parsed.foreign_sources.contains("pg_customers"));
+}
+
+test "api http server join context carries cancellation into owned right request" {
+    const alloc = std.testing.allocator;
+    const DummyStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = DummyStatus.status },
+    }, null, null);
+    defer server.deinit();
+
+    var query_value = try parseOwnedJsonValueAlloc(alloc, "{}");
+    defer ApiHttpServer.deinitJsonValue(alloc, &query_value);
+    var cancellation = std.atomic.Value(bool).init(false);
+    var owned = try server.joinContext().withCancellation(&cancellation).buildOwnedSearchRequest(
+        alloc,
+        "right",
+        query_value,
+    );
+    defer owned.deinit(alloc);
+
+    try std.testing.expect(owned.req.cancellation.? == &cancellation);
+    cancellation.store(true, .release);
+    try std.testing.expectError(error.Cancelled, ensureRequestActive(owned.req.cancellation));
 }
 
 test "api http server executes foreign right join query through registry" {
