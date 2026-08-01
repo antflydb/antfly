@@ -627,9 +627,6 @@ pub const StdHttpListener = struct {
             null;
         defer if (content_type) |value| self.alloc.free(value);
 
-        const body = (try self.readRequestBody(stream, request)) orelse return;
-        defer self.alloc.free(body);
-
         const consumes_expensive_slot = requestConsumesExpensiveSlot(method, uri);
         if (consumes_expensive_slot and !self.tryAcquireRequestSlot()) {
             // Shed before application execution. Clients get a deterministic,
@@ -643,6 +640,12 @@ pub const StdHttpListener = struct {
             return;
         }
         defer if (consumes_expensive_slot) self.releaseRequestSlot();
+
+        // Reserve query capacity before a slow request body can occupy every
+        // public connection worker. Control routes retain the unreserved
+        // connection budget while rejected query uploads receive 429 early.
+        const body = (try self.readRequestBody(stream, request)) orelse return;
+        defer self.alloc.free(body);
 
         var cancellation = common.RequestCancellation{};
         var peer_registration: PeerObserver.Registration = .{};

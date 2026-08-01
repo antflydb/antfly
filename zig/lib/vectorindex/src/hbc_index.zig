@@ -1658,6 +1658,7 @@ pub fn searchProfiledRequest(
 ) !search_types.ProfiledSearchResults {
     var profile = search_types.SearchProfile{};
     const total_start = now_fn_u64();
+    try search_types.checkCancelled(req);
     hbc_runtime.beginSearchEpoch(self);
     defer hbc_runtime.endSearchEpoch(self);
     const Index = comptime childType(@TypeOf(self));
@@ -1740,7 +1741,8 @@ pub fn searchProfiledRequest(
         );
 
         var flat_leaves_scored: usize = 0;
-        for (probes[0..probe_count]) |probe| {
+        for (probes[0..probe_count], 0..) |probe, i| {
+            if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
             var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
             var leaf_handle_active = true;
@@ -1845,6 +1847,7 @@ pub fn searchProfiledRequest(
 
     var beam_state = search_mod.BeamSearchState{};
     while (true) {
+        try search_types.checkCancelled(req);
         const candidate = candidates.pop() orelse break;
         if (search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
         profile.nodes_visited += 1;
@@ -2089,9 +2092,13 @@ fn scoreLeafMemberIds(
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
             if (!has_extra_filters) {
-                for (member_ids, 0..) |member_id, i| results.addApproxResult(member_id, distances[i], error_bounds[i]);
+                for (member_ids, 0..) |member_id, i| {
+                    if (i % 256 == 0) try search_types.checkCancelled(req);
+                    results.addApproxResult(member_id, distances[i], error_bounds[i]);
+                }
             } else {
                 for (member_ids, 0..) |member_id, i| {
+                    if (i % 256 == 0) try search_types.checkCancelled(req);
                     if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], req, filter_state, true)) continue;
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
@@ -4011,7 +4018,6 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
             try recomputeInternalCentroid(self, txn, &node);
             try self.saveNode(txn, &node);
         }
-
     }
     return report;
 }

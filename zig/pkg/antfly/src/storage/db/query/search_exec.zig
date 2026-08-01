@@ -12891,6 +12891,7 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
+            .cancellation = req.cancellation,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
@@ -13771,6 +13772,7 @@ pub fn searchSparse(
     executor: SparseSearchExecutor,
 ) !types.SearchResult {
     resetLastSortRejectionDiagnostic();
+    try checkSearchRequestDeadline(req);
     try rejectApproximateSortPageOptions(req);
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or req.profile;
@@ -13839,7 +13841,9 @@ pub fn searchSparse(
         .exclude_doc_ids = native_constraints.exclude_doc_ids,
         .filter_doc_nums = native_constraints.filter_doc_nums,
         .exclude_doc_nums = native_constraints.exclude_doc_nums,
+        .cancellation = req.cancellation,
     });
+    try checkSearchRequestDeadline(req);
     if (bench_query_profile) index_search_ns = platform_time.monotonicNs() - index_search_start_ns;
     defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
 
