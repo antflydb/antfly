@@ -729,6 +729,18 @@ pub const H2Connection = struct {
 
     /// Encodes headers via HPACK and sends as HEADERS frame(s).
     pub fn sendHeaders(self: *Self, writer: anytype, stream_id: u31, h2_headers: []const hpack.HeaderEntry, end_stream: bool) !void {
+        const stream = self.stream_manager.getStream(stream_id);
+        // Do this before HPACK encoding so an application handler awakened by
+        // a peer RST_STREAM cannot emit response bytes (or mutate the shared
+        // encoder state) after that stream has been reset.
+        if (stream) |value| {
+            if (value.stream_error) |err| return err;
+            // Some existing in-memory callers write an initial HEADERS frame
+            // without first registering a stream. A peer reset is always
+            // registered and marks cancellation, so guard that closed state
+            // without changing those established encoder-only call paths.
+            if (value.state == .closed and value.cancellation.load(.acquire)) return error.StreamReset;
+        }
         const encoded = try hpack.encodeHeaders(&self.stream_manager.hpack_encode_ctx, h2_headers, self.allocator);
         defer self.allocator.free(encoded);
         try self.writeHeaders(writer, stream_id, encoded, end_stream);
@@ -2945,6 +2957,30 @@ test "RST_STREAM signals the stream cancellation before waking its handler" {
     try std.testing.expect(stream.cancellation.load(.acquire));
     try std.testing.expect(stream.completed);
     try std.testing.expectEqual(error.StreamReset, stream.stream_error.?);
+}
+
+test "sendHeaders emits no response bytes after peer RST_STREAM" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const rst_payload = stream_mod.buildRstStreamPayload(.cancel);
+    var rst = Frame{
+        .header = .{ .length = 4, .frame_type = .rst_stream, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&rst_payload),
+    };
+    try server.deliverToMailbox(&rst);
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+    try std.testing.expectError(
+        error.StreamReset,
+        server.sendHeaders(writer, 1, &.{.{ .name = ":status", .value = "200" }}, true),
+    );
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
 }
 
 test "connection EOF signals cancellation on every active stream" {
