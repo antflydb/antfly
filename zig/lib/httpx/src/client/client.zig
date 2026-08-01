@@ -1671,7 +1671,11 @@ pub const Client = struct {
         self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
         defer interrupt.clearH2(entry, stream_id, self.io);
-        errdefer h2.stream_manager.removeStream(stream_id);
+        errdefer {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            h2.stream_manager.removeStream(stream_id);
+        }
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -1800,7 +1804,11 @@ pub const Client = struct {
 
         // Extract response from mailbox.
         const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
-        defer h2.stream_manager.removeStream(stream_id);
+        defer {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            h2.stream_manager.removeStream(stream_id);
+        }
         if (s.stream_error) |err| return err;
 
         // Headers were decoded in deliverToMailbox (receive loop) to avoid
