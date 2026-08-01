@@ -5071,6 +5071,7 @@ test "postgres libpq live deadline cancels slow query and pool remains reusable"
             dsn,
             slow_query,
             platform_time.monotonicNs() + 25 * std.time.ns_per_ms,
+            null,
         ),
     );
 
@@ -5082,6 +5083,7 @@ test "postgres libpq live deadline cancels slow query and pool remains reusable"
         dsn,
         reuse_query,
         platform_time.monotonicNs() + std.time.ns_per_s,
+        null,
     );
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
