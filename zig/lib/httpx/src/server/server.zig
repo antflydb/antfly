@@ -1866,7 +1866,10 @@ pub const Server = struct {
             self.allocator.destroy(data_event);
         }
 
-        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+        // The receive loop mutates StreamManager while holding write_mutex.
+        // Snapshot the separately allocated Stream pointer under that lock,
+        // then release it before parsing or routing so DATA delivery can run.
+        const stream = getH2Stream(h2, stream_id) orelse return;
 
         // Headers were decoded in the receive loop's deliverToMailbox to
         // avoid concurrent HPACK decode races on the shared hpack_ctx.
@@ -2050,7 +2053,7 @@ pub const Server = struct {
         ctx.h2_sock = sock;
         ctx.h2_body_reader = body_reader;
         ctx.h2_stream_id = stream_id;
-        if (h2.stream_manager.getStream(stream_id)) |stream| {
+        if (getH2Stream(h2, stream_id)) |stream| {
             ctx.cancellation = &stream.cancellation;
         }
         defer ctx.deinit();
@@ -2178,6 +2181,16 @@ pub const Server = struct {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
         try self.sendH2Error(h2, writer, stream_id, code);
+    }
+
+    /// StreamManager stores Stream allocations separately from its hash map.
+    /// Synchronize the lookup with frame-pump map mutations; the returned
+    /// pointer remains stable until handler cleanup removes it under the same
+    /// mutex.
+    fn getH2Stream(h2: *H2Connection, stream_id: u31) ?*Stream {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+        return h2.stream_manager.getStream(stream_id);
     }
 
     /// Sends an error response.
@@ -2993,6 +3006,28 @@ test "handleH2Stream cleanup skips RST_STREAM on already-closed stream" {
     stream3.end_stream_sent = false;
     const should_rst_open = !stream3.end_stream_sent and stream3.state != .idle and stream3.state != .closed;
     try std.testing.expect(should_rst_open);
+}
+
+test "H2 handler stream lookups share the receive mutex" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, std.testing.io);
+    defer server.deinit();
+    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    defer h2.deinit();
+
+    h2.write_mutex.lockUncancelable(std.testing.io);
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    h2.write_mutex.unlock(std.testing.io);
+
+    // The handler snapshot shares the receive loop's map mutex and retains
+    // the stable Stream allocation rather than any map storage.
+    const handler_stream = Server.getH2Stream(&h2, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(handler_stream == stream);
+
+    h2.write_mutex.lockUncancelable(std.testing.io);
+    h2.stream_manager.removeStream(1);
+    h2.write_mutex.unlock(std.testing.io);
+    try std.testing.expect(Server.getH2Stream(&h2, 1) == null);
 }
 
 test "isH2ForbiddenHeader rejects connection-specific headers" {
