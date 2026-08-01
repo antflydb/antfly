@@ -152,6 +152,14 @@ pub const LsmStorageStatus = struct {
     read_snapshot_mutable_rotation_count: u64 = 0,
     read_snapshot_mutable_rotation_bytes: u64 = 0,
     wal_retained_bytes: u64 = 0,
+    wal_checkpoint_pending: bool = false,
+    wal_pressure_blocked: bool = false,
+    wal_checkpoint_retry_reason: []const u8 = "none",
+    wal_checkpoint_retry_attempts: u64 = 0,
+    wal_checkpoint_retry_delay_ns: u64 = 0,
+    active_immutable_logical_bytes: u64 = 0,
+    unpublished_wal_logical_bytes: u64 = 0,
+    unpublished_wal_max_batch_logical_bytes: u64 = 0,
     compaction_backlog_bytes: u64 = 0,
     active_readers: u64 = 0,
     active_readers_bound_read_txn: u64 = 0,
@@ -266,6 +274,14 @@ pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageS
         .read_snapshot_mutable_rotation_count = maintenance.read_snapshot_mutable_rotations,
         .read_snapshot_mutable_rotation_bytes = maintenance.read_snapshot_mutable_rotation_bytes_total,
         .wal_retained_bytes = maintenance.wal_retained_bytes,
+        .wal_checkpoint_pending = maintenance.wal_checkpoint_pending,
+        .wal_pressure_blocked = maintenance.wal_pressure_blocked,
+        .wal_checkpoint_retry_reason = @tagName(maintenance.wal_checkpoint_retry_reason),
+        .wal_checkpoint_retry_attempts = maintenance.wal_checkpoint_retry_attempts,
+        .wal_checkpoint_retry_delay_ns = maintenance.wal_checkpoint_retry_delay_ns,
+        .active_immutable_logical_bytes = maintenance.active_immutable_logical_bytes,
+        .unpublished_wal_logical_bytes = maintenance.unpublished_wal_logical_bytes,
+        .unpublished_wal_max_batch_logical_bytes = maintenance.unpublished_wal_max_batch_logical_bytes,
         .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
         .active_readers = maintenance.active_readers,
         .active_readers_bound_read_txn = readerPinCount(maintenance.active_readers_by_kind, .bound_read_txn),
@@ -323,6 +339,27 @@ pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.Mai
     return lsmStorageStatusFromStats(.{ .maintenance = maintenance, .write = .{} });
 }
 
+test "metadata.table lsm status exposes wal retry and publication debt" {
+    const status = lsmStorageStatusFromMaintenanceStats(.{
+        .wal_checkpoint_pending = true,
+        .wal_pressure_blocked = true,
+        .wal_checkpoint_retry_reason = .checkpoint_failure,
+        .wal_checkpoint_retry_attempts = 4,
+        .wal_checkpoint_retry_delay_ns = 500,
+        .active_immutable_logical_bytes = 600,
+        .unpublished_wal_logical_bytes = 700,
+        .unpublished_wal_max_batch_logical_bytes = 350,
+    });
+    try std.testing.expect(status.wal_checkpoint_pending);
+    try std.testing.expect(status.wal_pressure_blocked);
+    try std.testing.expectEqualStrings("checkpoint_failure", status.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u64, 4), status.wal_checkpoint_retry_attempts);
+    try std.testing.expectEqual(@as(u64, 500), status.wal_checkpoint_retry_delay_ns);
+    try std.testing.expectEqual(@as(u64, 600), status.active_immutable_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 700), status.unpublished_wal_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 350), status.unpublished_wal_max_batch_logical_bytes);
+}
+
 fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
     return .{
         .run_count = u64ToI64(status.run_count),
@@ -361,6 +398,14 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .read_snapshot_mutable_rotation_count = u64ToI64(status.read_snapshot_mutable_rotation_count),
         .read_snapshot_mutable_rotation_bytes = u64ToI64(status.read_snapshot_mutable_rotation_bytes),
         .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
+        .wal_checkpoint_pending = status.wal_checkpoint_pending,
+        .wal_pressure_blocked = status.wal_pressure_blocked,
+        .wal_checkpoint_retry_reason = status.wal_checkpoint_retry_reason,
+        .wal_checkpoint_retry_attempts = u64ToI64(status.wal_checkpoint_retry_attempts),
+        .wal_checkpoint_retry_delay_ns = u64ToI64(status.wal_checkpoint_retry_delay_ns),
+        .active_immutable_logical_bytes = u64ToI64(status.active_immutable_logical_bytes),
+        .unpublished_wal_logical_bytes = u64ToI64(status.unpublished_wal_logical_bytes),
+        .unpublished_wal_max_batch_logical_bytes = u64ToI64(status.unpublished_wal_max_batch_logical_bytes),
         .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
         .active_readers = u64ToI64(status.active_readers),
         .active_readers_bound_read_txn = u64ToI64(status.active_readers_bound_read_txn),
@@ -2999,6 +3044,14 @@ test "metadata.table status encoder honors storage status overrides" {
             .read_snapshot_mutable_rotation_count = 25,
             .read_snapshot_mutable_rotation_bytes = 26,
             .wal_retained_bytes = 55,
+            .wal_checkpoint_pending = true,
+            .wal_pressure_blocked = true,
+            .wal_checkpoint_retry_reason = "checkpoint_failure",
+            .wal_checkpoint_retry_attempts = 3,
+            .wal_checkpoint_retry_delay_ns = 250,
+            .active_immutable_logical_bytes = 56,
+            .unpublished_wal_logical_bytes = 57,
+            .unpublished_wal_max_batch_logical_bytes = 58,
             .compaction_backlog_bytes = 10,
             .active_readers = 2,
             .active_bulk_ingest_batches = 1,
@@ -3065,6 +3118,14 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_snapshot_clone_count\":22") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"read_snapshot_mutable_rotation_count\":25") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_pending\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_pressure_blocked\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_retry_reason\":\"checkpoint_failure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_retry_attempts\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_retry_delay_ns\":250") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_immutable_logical_bytes\":56") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"unpublished_wal_logical_bytes\":57") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"unpublished_wal_max_batch_logical_bytes\":58") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_bulk_ingest_batches\":1") != null);

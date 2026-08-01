@@ -142,7 +142,12 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         for (backend.runs.items) |run| {
             const path = run.path orelse return error.RunStateUnavailable;
             repository_mod.validateManifestRunSize(run.size_bytes) catch |err| {
-                std.log.err(
+                // The caller receives the concrete open error. Keep the
+                // structured rejection diagnostic at warning level so an
+                // expected corruption/size-admission test does not violate the
+                // project's invariant that error logs represent unhandled
+                // failures rather than successfully rejected input.
+                std.log.warn(
                     "lsm backend open rejected invalid manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
                     .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
                 );

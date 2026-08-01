@@ -905,18 +905,26 @@ pub const Backend = struct {
         dst.wal_hard_limit_segments +|= src.wal_hard_limit_segments;
         dst.wal_soft_limit_bytes +|= src.wal_soft_limit_bytes;
         dst.wal_hard_limit_bytes +|= src.wal_hard_limit_bytes;
-        dst.wal_checkpoint_pending = dst.wal_checkpoint_pending or src.wal_checkpoint_pending;
+        const dst_wal_checkpoint_pending = dst.wal_checkpoint_pending;
+        dst.wal_checkpoint_pending = dst_wal_checkpoint_pending or src.wal_checkpoint_pending;
         dst.wal_pressure_blocked = dst.wal_pressure_blocked or src.wal_pressure_blocked;
-        if (@intFromEnum(src.wal_checkpoint_retry_reason) > @intFromEnum(dst.wal_checkpoint_retry_reason)) {
+        // The retry fields form one status tuple. Select the backend with the
+        // earliest deadline (including zero, which means due now), then break
+        // ties by severity and attempt count. Aggregating the fields
+        // independently can report a reason, attempt, and deadline that never
+        // coexisted on any backend.
+        const src_retry_precedes = src.wal_checkpoint_pending and
+            (!dst_wal_checkpoint_pending or
+                src.wal_checkpoint_retry_delay_ns < dst.wal_checkpoint_retry_delay_ns or
+                (src.wal_checkpoint_retry_delay_ns == dst.wal_checkpoint_retry_delay_ns and
+                    (@intFromEnum(src.wal_checkpoint_retry_reason) > @intFromEnum(dst.wal_checkpoint_retry_reason) or
+                        (src.wal_checkpoint_retry_reason == dst.wal_checkpoint_retry_reason and
+                            src.wal_checkpoint_retry_attempts > dst.wal_checkpoint_retry_attempts))));
+        if (src_retry_precedes) {
             dst.wal_checkpoint_retry_reason = src.wal_checkpoint_retry_reason;
+            dst.wal_checkpoint_retry_attempts = src.wal_checkpoint_retry_attempts;
+            dst.wal_checkpoint_retry_delay_ns = src.wal_checkpoint_retry_delay_ns;
         }
-        dst.wal_checkpoint_retry_attempts = @max(dst.wal_checkpoint_retry_attempts, src.wal_checkpoint_retry_attempts);
-        dst.wal_checkpoint_retry_delay_ns = if (dst.wal_checkpoint_retry_delay_ns == 0)
-            src.wal_checkpoint_retry_delay_ns
-        else if (src.wal_checkpoint_retry_delay_ns == 0)
-            dst.wal_checkpoint_retry_delay_ns
-        else
-            @min(dst.wal_checkpoint_retry_delay_ns, src.wal_checkpoint_retry_delay_ns);
         dst.active_immutable_logical_bytes +|= src.active_immutable_logical_bytes;
         dst.unpublished_wal_logical_bytes +|= src.unpublished_wal_logical_bytes;
         dst.unpublished_wal_max_batch_logical_bytes = @max(dst.unpublished_wal_max_batch_logical_bytes, src.unpublished_wal_max_batch_logical_bytes);
@@ -2440,7 +2448,15 @@ pub const Backend = struct {
         }
 
         self.invalidatePrimaryWalRetentionCacheLocked();
-        const retention = try self.snapshotWalRetentionForPressureLocked() orelse {
+        const retention = self.snapshotWalRetentionForPressureLocked() catch |err| {
+            // Observation is part of the retry attempt: without a fresh
+            // retention snapshot we cannot safely discharge pending/blocked
+            // state. Advance the same capped backoff used by checkpoint I/O so
+            // a persistent metadata read failure cannot hot-loop workers.
+            self.write_stats.wal_pressure_failures +|= 1;
+            self.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
+            return err;
+        } orelse {
             self.wal_pressure_blocked = false;
             self.clearWalCheckpointRetryLocked();
             _ = self.refreshCachedMaintenanceHintLocked();
@@ -3836,8 +3852,6 @@ pub const Backend = struct {
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = false;
         self.obsolete_manifest_dirty = false;
-        self.unpublished_wal_logical_bytes = 0;
-        self.unpublished_wal_max_batch_logical_bytes = 0;
     }
 
     fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !usize {
@@ -3854,6 +3868,11 @@ pub const Backend = struct {
         self.write_stats.manifest_bytes += bytes;
         self.write_stats.manifest_ns += self.writeStatsElapsedNs(start_ns);
         self.current_manifest_bytes = bytes;
+        // A successfully published run-set manifest is the durable boundary
+        // for every flushed/direct-ingested batch represented by this backend.
+        // WAL retirement is subsequent cleanup and must not keep already
+        // published bytes in the adaptive dirty-window accounting.
+        self.clearPublishedWalLogicalDebtLocked();
         return bytes;
     }
 
@@ -4049,6 +4068,10 @@ pub const Backend = struct {
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
+        // This operation is only valid after the corresponding state is
+        // durably manifested. Keep cleanup-only retry paths and future callers
+        // from retaining stale publication debt after a successful reset.
+        self.clearPublishedWalLogicalDebtLocked();
     }
 
     pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
@@ -4978,20 +5001,39 @@ pub const Backend = struct {
             self.wal_checkpoint_retry_reason = .checkpoint_failure;
             self.wal_checkpoint_retry_deadline_ns = now_ns +|
                 walCheckpointRetryBackoffNs(self.wal_checkpoint_retry_attempts);
-        } else if (self.wal_checkpoint_retry_deadline_ns == 0 or
-            self.wal_checkpoint_retry_deadline_ns <= now_ns or
-            self.wal_checkpoint_retry_reason != .checkpoint_failure)
-        {
-            self.wal_checkpoint_retry_attempts = 0;
-            self.wal_checkpoint_retry_reason = reason;
-            self.wal_checkpoint_retry_deadline_ns = switch (reason) {
+        } else if (self.wal_checkpoint_retry_reason != .checkpoint_failure) {
+            const candidate_deadline_ns = switch (reason) {
                 .hard_pressure => now_ns,
                 .soft_pressure => @max(now_ns, self.last_wal_retention_enforce_ns +| wal_retention_enforce_interval_ns),
                 .checkpoint_failure => now_ns +| wal_checkpoint_retry_initial_ns,
                 .none => now_ns,
             };
+            if (self.wal_checkpoint_retry_reason == .none) {
+                self.wal_checkpoint_retry_reason = reason;
+                self.wal_checkpoint_retry_deadline_ns = candidate_deadline_ns;
+            } else {
+                // Pressure is level-triggered. Preserve the earliest work
+                // deadline and only escalate its reason; foreground traffic
+                // must never renew a due deadline or downgrade hard pressure.
+                self.wal_checkpoint_retry_deadline_ns = @min(
+                    self.wal_checkpoint_retry_deadline_ns,
+                    candidate_deadline_ns,
+                );
+                if (@intFromEnum(reason) > @intFromEnum(self.wal_checkpoint_retry_reason)) {
+                    self.wal_checkpoint_retry_reason = reason;
+                }
+            }
+            self.wal_checkpoint_retry_attempts = 0;
         }
+        // checkpoint_failure is sticky until a successful maintenance attempt
+        // explicitly clears it. This remains true even once its deadline is
+        // due, so sustained commits cannot reset exponential backoff.
         self.notePotentialMaintenanceDebtLocked();
+    }
+
+    fn clearPublishedWalLogicalDebtLocked(self: *Backend) void {
+        self.unpublished_wal_logical_bytes = 0;
+        self.unpublished_wal_max_batch_logical_bytes = 0;
     }
 
     fn clearWalCheckpointRetryLocked(self: *Backend) void {
@@ -5163,6 +5205,17 @@ pub const Backend = struct {
         }
 
         self.scheduleWalCheckpointRetryLocked(if (self.walRetentionOverHardLimit(retention)) .hard_pressure else .soft_pressure, false);
+        if (self.wal_checkpoint_retry_reason == .checkpoint_failure and
+            !self.walCheckpointRetryDueLocked())
+        {
+            // Foreground soft-pressure checks share the failure backoff with
+            // background maintenance. Otherwise sustained commits can retry
+            // every enforcement interval even while the recorded deadline is
+            // still in the future. Hard admission remains enforced before the
+            // next WAL append by prepareWalAppendForPressureLocked.
+            self.wal_pressure_blocked = self.walRetentionOverHardLimit(retention);
+            return;
+        }
         self.enforceWalRetentionSoftPressureGuarded(false) catch |err| {
             self.recordCommittedWalPressureFailure(err);
             return;
@@ -8803,12 +8856,88 @@ test "lsm backend wal retry deadline is scheduled with bounded backoff" {
     try std.testing.expectEqual(WalCheckpointRetryReason.checkpoint_failure, backend.wal_checkpoint_retry_reason);
     try std.testing.expectEqual(@as(u32, 1), backend.wal_checkpoint_retry_attempts);
 
+    // Once due, foreground pressure still cannot replace the failed attempt
+    // or renew its deadline. Only executing the retry may advance backoff.
+    backend.wal_checkpoint_retry_deadline_ns = 0;
+    backend.scheduleWalCheckpointRetryLocked(.soft_pressure, false);
+    try std.testing.expectEqual(WalCheckpointRetryReason.checkpoint_failure, backend.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u32, 1), backend.wal_checkpoint_retry_attempts);
+    try std.testing.expectEqual(@as(u64, 0), backend.wal_checkpoint_retry_deadline_ns);
+
     backend.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
     try std.testing.expectEqual(@as(u32, 2), backend.wal_checkpoint_retry_attempts);
     try std.testing.expect(backend.wal_checkpoint_retry_deadline_ns > first_deadline);
 
     backend.wal_checkpoint_retry_deadline_ns = 0;
     try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+}
+
+test "lsm backend foreground soft pressure honors checkpoint failure backoff" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-wal-foreground-retry-backoff", .{
+        .storage = storage.storage(),
+        .wal_soft_limit_bytes = 1,
+        .foreground_soft_wal_checkpoint = false,
+    });
+    defer backend.close();
+
+    var txn = try backend.beginWrite();
+    defer txn.abort();
+    try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+    try txn.commit();
+    try std.testing.expect(backend.snapshotMaintenanceStats().wal_retained_bytes > 1);
+
+    backend.scheduleWalCheckpointRetryLocked(.checkpoint_failure, true);
+    backend.options.foreground_soft_wal_checkpoint = true;
+    backend.last_wal_retention_enforce_ns = 0;
+    const resets_before = backend.write_stats.wal_resets;
+    backend.finishCommittedWalAppend();
+
+    try std.testing.expectEqual(WalCheckpointRetryReason.checkpoint_failure, backend.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u32, 1), backend.wal_checkpoint_retry_attempts);
+    try std.testing.expectEqual(resets_before, backend.write_stats.wal_resets);
+    try std.testing.expect(backend.snapshotMaintenanceStats().wal_retained_bytes > 1);
+}
+
+test "lsm maintenance aggregation preserves the earliest coherent wal retry tuple" {
+    var aggregate = Backend.MaintenanceStats{};
+    Backend.accumulateMaintenanceStats(&aggregate, .{
+        .wal_checkpoint_pending = true,
+        .wal_checkpoint_retry_reason = .checkpoint_failure,
+        .wal_checkpoint_retry_attempts = 7,
+        .wal_checkpoint_retry_delay_ns = 500,
+    });
+    Backend.accumulateMaintenanceStats(&aggregate, .{
+        .wal_checkpoint_pending = true,
+        .wal_checkpoint_retry_reason = .soft_pressure,
+        .wal_checkpoint_retry_attempts = 0,
+        .wal_checkpoint_retry_delay_ns = 0,
+    });
+
+    try std.testing.expect(aggregate.wal_checkpoint_pending);
+    try std.testing.expectEqual(WalCheckpointRetryReason.soft_pressure, aggregate.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u32, 0), aggregate.wal_checkpoint_retry_attempts);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.wal_checkpoint_retry_delay_ns);
+
+    // Accumulation order cannot change the representative backend.
+    aggregate = .{};
+    Backend.accumulateMaintenanceStats(&aggregate, .{
+        .wal_checkpoint_pending = true,
+        .wal_checkpoint_retry_reason = .soft_pressure,
+        .wal_checkpoint_retry_attempts = 0,
+        .wal_checkpoint_retry_delay_ns = 0,
+    });
+    Backend.accumulateMaintenanceStats(&aggregate, .{
+        .wal_checkpoint_pending = true,
+        .wal_checkpoint_retry_reason = .checkpoint_failure,
+        .wal_checkpoint_retry_attempts = 7,
+        .wal_checkpoint_retry_delay_ns = 500,
+    });
+    try std.testing.expectEqual(WalCheckpointRetryReason.soft_pressure, aggregate.wal_checkpoint_retry_reason);
+    try std.testing.expectEqual(@as(u32, 0), aggregate.wal_checkpoint_retry_attempts);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.wal_checkpoint_retry_delay_ns);
 }
 
 test "lsm backend due wal maintenance publishes during open bulk session" {

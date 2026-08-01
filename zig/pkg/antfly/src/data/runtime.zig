@@ -1397,6 +1397,21 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_hard_limit_bytes", "gauge", "Configured cached write LSM hard WAL retention limit in bytes", stats.wal_hard_limit_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_pending", "gauge", "Whether cached write LSM WAL checkpoint maintenance is pending", if (stats.wal_checkpoint_pending) 1 else 0);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_blocked", "gauge", "Whether cached write LSM WAL hard-limit admission is blocked", if (stats.wal_pressure_blocked) 1 else 0);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_wal_checkpoint_retry_reason", "gauge", "Current cached write LSM WAL checkpoint retry reason");
+    inline for (std.meta.tags(lsm_backend_mod.WalCheckpointRetryReason)) |reason| {
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = @tagName(reason) }};
+        try health_metrics.appendPromSampleLabeled(
+            writer,
+            "antfly_lsm_wal_checkpoint_retry_reason",
+            &labels,
+            if (stats.wal_checkpoint_retry_reason == reason) 1 else 0,
+        );
+    }
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_retry_attempts", "gauge", "Consecutive cached write LSM WAL checkpoint retry failures", stats.wal_checkpoint_retry_attempts);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_retry_delay_ns", "gauge", "Nanoseconds until the next cached write LSM WAL checkpoint retry; zero means due now", stats.wal_checkpoint_retry_delay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_active_immutable_logical_bytes", "gauge", "Logical bytes in cached write LSM immutable memtables awaiting run publication", stats.active_immutable_logical_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_unpublished_wal_logical_bytes", "gauge", "Logical bytes in cached write LSM runs awaiting durable manifest publication", stats.unpublished_wal_logical_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_unpublished_wal_max_batch_logical_bytes", "gauge", "Largest cached write LSM logical batch awaiting durable manifest publication", stats.unpublished_wal_max_batch_logical_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_segments", "gauge", "Cached write LSM dedicated replay WAL segments still retained", stats.wal_replay_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_bytes", "gauge", "Cached write LSM dedicated replay WAL bytes still retained", stats.wal_replay_retained_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_current_segment", "gauge", "Current cached write LSM dedicated replay WAL segment", stats.wal_replay_current_segment);
@@ -21250,6 +21265,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .wal_hard_limit_bytes = 65536,
         .wal_checkpoint_pending = true,
         .wal_pressure_blocked = true,
+        .wal_checkpoint_retry_reason = .checkpoint_failure,
+        .wal_checkpoint_retry_attempts = 3,
+        .wal_checkpoint_retry_delay_ns = 250,
+        .active_immutable_logical_bytes = 1025,
+        .unpublished_wal_logical_bytes = 2049,
+        .unpublished_wal_max_batch_logical_bytes = 1537,
         .active_readers = 6,
         .active_readers_by_kind = blk: {
             var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
@@ -21303,6 +21324,13 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_hard_limit_bytes 65536") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_pending 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_pressure_blocked 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_reason{reason=\"checkpoint_failure\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_reason{reason=\"soft_pressure\"} 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_attempts 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_delay_ns 250") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_immutable_logical_bytes 1025") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_unpublished_wal_logical_bytes 2049") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_unpublished_wal_max_batch_logical_bytes 1537") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers_by_kind{kind=\"compaction\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_reader_kind{kind=\"compaction\"} 3") != null);

@@ -741,6 +741,8 @@ test "lsm backend simulation split manifest fault preserves the complete parent 
     const deferred = lsm_backend.snapshotMaintenanceStats();
     try std.testing.expect(deferred.wal_checkpoint_pending);
     try std.testing.expect(!deferred.wal_pressure_blocked);
+    try std.testing.expectEqual(@as(u64, 0), deferred.unpublished_wal_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 0), deferred.unpublished_wal_max_batch_logical_bytes);
     try std.testing.expectEqual(
         lsm_backend_mod.WalCheckpointRetryReason.checkpoint_failure,
         deferred.wal_checkpoint_retry_reason,
@@ -757,6 +759,8 @@ test "lsm backend simulation split manifest fault preserves the complete parent 
     const repaired = lsm_backend.snapshotMaintenanceStats();
     try std.testing.expect(!repaired.wal_checkpoint_pending);
     try std.testing.expect(!repaired.wal_pressure_blocked);
+    try std.testing.expectEqual(@as(u64, 0), repaired.unpublished_wal_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 0), repaired.unpublished_wal_max_batch_logical_bytes);
     var read = try lsm_backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
