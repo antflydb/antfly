@@ -139,9 +139,76 @@ const PeerCancellationWatcher = struct {
         if (self.thread) |thread| thread.join();
     }
 
+    /// Once MSG_PEEK has found a following request byte, another peek can no
+    /// longer observe a FIN behind it: it will keep returning that byte.  Ask
+    /// the kernel for the read-side close state instead, without consuming the
+    /// byte the H1 connection loop still owns.
+    fn peerClosedBehindUnreadInput(self: *@This()) bool {
+        if (comptime builtin.os.tag == .linux) {
+            const epoll_fd = std.c.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+            if (epoll_fd < 0) return false;
+            defer _ = std.c.close(epoll_fd);
+
+            var registration = std.c.epoll_event{
+                .events = std.os.linux.EPOLL.RDHUP | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP,
+                .data = .{ .u64 = 0 },
+            };
+            if (std.c.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_ADD, self.socket.handle, &registration) != 0) return false;
+
+            var events: [1]std.c.epoll_event = undefined;
+            const ready = std.c.epoll_wait(epoll_fd, &events, events.len, 25);
+            if (ready <= 0) return false;
+            return events[0].events & (std.os.linux.EPOLL.RDHUP | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP) != 0;
+        }
+
+        if (comptime builtin.os.tag == .macos) {
+            const kq = std.posix.system.kqueue();
+            if (std.posix.errno(kq) != .SUCCESS) return false;
+            defer _ = std.posix.system.close(@intCast(kq));
+
+            var changes = [_]std.posix.Kevent{.{
+                .ident = @intCast(self.socket.handle),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            var events: [1]std.posix.Kevent = undefined;
+            const timeout = std.posix.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+            const ready = std.posix.system.kevent(kq, &changes, changes.len, &events, events.len, &timeout);
+            if (std.posix.errno(ready) != .SUCCESS or ready == 0) return false;
+            return events[0].flags & (std.c.EV.EOF | std.c.EV.ERROR) != 0;
+        }
+
+        // POLLHUP/POLLERR are reported even when they were not requested.
+        // This is the best non-consuming fallback on POSIX targets without a
+        // read-side-close primitive equivalent to EPOLLRDHUP/EV_EOF.
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.socket.handle,
+            .events = std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&fds, 25) catch return false;
+        return fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0;
+    }
+
     fn run(self: *@This()) void {
         if (comptime builtin.os.tag == .windows) return;
+        var has_unread_input = false;
         while (!self.done.load(.acquire)) {
+            if (has_unread_input) {
+                if (self.peerClosedBehindUnreadInput()) {
+                    self.cancellation.cancel();
+                    return;
+                }
+                // kqueue reports the already-readable byte immediately until
+                // EOF arrives. Bound that path so it cannot spin while the
+                // long-running request still owns the connection.
+                var req = std.posix.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+                _ = std.posix.system.nanosleep(&req, &req);
+                continue;
+            }
             var fds = [_]std.posix.pollfd{.{
                 .fd = self.socket.handle,
                 .events = std.posix.POLL.IN | std.posix.POLL.ERR,
@@ -186,9 +253,17 @@ const PeerCancellationWatcher = struct {
                 return;
             }
             if (n > 0) {
-                // A pipelined request is not a cancellation. Stop observing
-                // to avoid repeatedly polling the same unread bytes.
-                return;
+                // A complete following request is already held in the H1
+                // parser's private buffer. Its eventual response must not be
+                // invalidated by bytes belonging to a later request or by the
+                // peer half-closing after that buffered pipeline.
+                if (self.has_buffered_input) return;
+                // Preserve the byte for Server.handleConnection, but keep
+                // observing the transport close notification. A peer can
+                // send a partial follow-up request and then disconnect while
+                // this expensive request is still executing.
+                has_unread_input = true;
+                continue;
             }
             // EAGAIN/INTR after poll is transient. A reset may be reported by
             // recv rather than POLLERR, and is a real cancellation.
@@ -207,7 +282,7 @@ const PeerCancellationWatcher = struct {
     }
 };
 
-test "PeerCancellationWatcher cancels a bare H1 FIN but preserves buffered pipeline work" {
+test "PeerCancellationWatcher cancels a FIN behind unread H1 bytes without consuming them" {
     if (comptime builtin.os.tag == .windows) return;
 
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -250,6 +325,55 @@ test "PeerCancellationWatcher cancels a bare H1 FIN but preserves buffered pipel
     try io.vtable.netShutdown(io.userdata, second_client.handle, .send);
     io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
     try std.testing.expect(!second_cancellation.isCancelled());
+
+    var third_client = try httpx.Socket.connect(listener.getLocalAddress(), io);
+    defer third_client.close();
+    var third_accepted = try listener.accept();
+    defer third_accepted.socket.close();
+    var third_cancellation = http_common.RequestCancellation{};
+    const Query = struct {
+        cancellation: *const http_common.RequestCancellation,
+        started: std.atomic.Value(bool) = .init(false),
+        observed_cancel: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            for (0..2_000) |_| {
+                if (self.cancellation.isCancelled()) {
+                    self.observed_cancel.store(true, .release);
+                    return;
+                }
+                var req = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = std.posix.system.nanosleep(&req, &req);
+            }
+        }
+    };
+    var third_query = Query{ .cancellation = &third_cancellation };
+    var third_watcher = PeerCancellationWatcher{
+        .socket = &third_accepted.socket,
+        .cancellation = &third_cancellation,
+        .has_buffered_input = false,
+    };
+    try third_watcher.start();
+    defer third_watcher.deinit();
+    const query_thread = try std.Thread.spawn(.{}, Query.run, .{&third_query});
+    defer query_thread.join();
+    for (0..400) |_| {
+        if (third_query.started.load(.acquire)) break;
+        io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(third_query.started.load(.acquire));
+    try third_client.sendAll("B");
+    try io.vtable.netShutdown(io.userdata, third_client.handle, .send);
+    for (0..400) |_| {
+        if (third_query.observed_cancel.load(.acquire)) break;
+        io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(third_cancellation.isCancelled());
+    try std.testing.expect(third_query.observed_cancel.load(.acquire));
+    var queued: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try third_accepted.socket.recv(&queued));
+    try std.testing.expectEqualStrings("B", &queued);
 }
 
 pub const AntflyApiHandler = struct {
