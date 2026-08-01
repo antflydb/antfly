@@ -155,22 +155,20 @@ const RequestInterrupt = struct {
 
     fn cancelH2Locked(_: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
         const h2 = &entry.h2;
-        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+        h2.write_mutex.lockUncancelable(io);
+        const stream = h2.stream_manager.getStream(stream_id) orelse {
+            h2.write_mutex.unlock(io);
+            return;
+        };
         // A finished or removed stream is no longer ours to reset. In
         // particular, never append RST_STREAM after a completed response.
-        if (stream.completed) return;
+        if (stream.completed) {
+            h2.write_mutex.unlock(io);
+            return;
+        }
         stream.stream_error = error.Cancelled;
         stream.completed = true;
         stream.reset();
-        if (stream.completion_sem) |sem| sem.post(io);
-        if (stream.data_event) |event| event.set(io);
-        // A request body can be blocked waiting for flow-control credit. Wake
-        // it before waiting for the write mutex so it observes stream_error,
-        // releases the mutex, and lets this RST_STREAM through promptly.
-        h2.send_window_event.set(io);
-        if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
-        h2.write_mutex.lockUncancelable(io);
-        defer h2.write_mutex.unlock(io);
         if (entry.is_tls) {
             if (entry.session.getWriter()) |writer|
                 h2.sendRstStream(writer, stream_id, .cancel) catch {}
@@ -178,6 +176,14 @@ const RequestInterrupt = struct {
         } else {
             h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
         }
+        h2.write_mutex.unlock(io);
+
+        // Wake waiters only after publishing the reset under the connection
+        // lock; a body blocked on flow control can now observe stream_error.
+        if (stream.completion_sem) |sem| sem.post(io);
+        if (stream.data_event) |event| event.set(io);
+        h2.send_window_event.set(io);
+        if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
     }
 
     fn cancel(self: *RequestInterrupt, io: Io) void {
