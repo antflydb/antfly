@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
@@ -223,6 +224,7 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public queries rejected because peer observation could not be scheduled", handler.cancellation_watcher_start_failures_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public query peer disconnects propagated to cancellation", handler.peer_disconnect_cancellations_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public queries cancelled after peer observation failed", handler.peer_observer_failures_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public query sockets currently watched for disconnect", handler.active_peer_observers);
 
         if (self.unified_lifecycle.runtimeStats()) |http| {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_limit", "gauge", "Maximum concurrent public HTTP connections", http.max_connections);
@@ -1621,6 +1623,8 @@ pub fn runFromIterator(
     // ---------------------------------------------------------------
 
     var handler = AntflyApiHandler{ .api_server = api_server };
+    try handler.initRuntime(alloc);
+    defer handler.deinitRuntime();
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
@@ -2427,6 +2431,23 @@ fn serveUnifiedInner(
     try server.listen();
 }
 
+const public_http_connection_ceiling: u32 = 256;
+
+fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
+    // Public inbound sockets may use at most one quarter of the process FD
+    // budget. Storage files, Raft, metadata, outbound providers, logs, and an
+    // operator shell retain the rest even when the deployment lowers RLIMIT.
+    const proportional_limit = @max(@as(u64, 1), fd_soft_limit / 4);
+    return @intCast(@min(proportional_limit, public_http_connection_ceiling));
+}
+
+fn configuredPublicHttpConnectionLimit() u32 {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return public_http_connection_ceiling;
+    const limit = std.posix.getrlimit(.NOFILE) catch return public_http_connection_ceiling;
+    if (limit.cur == std.math.maxInt(@TypeOf(limit.cur))) return public_http_connection_ceiling;
+    return publicHttpConnectionLimitForFdSoftLimit(@intCast(limit.cur));
+}
+
 fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
     return .{
         .host = bind_host,
@@ -2436,7 +2457,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // Keep a large process-wide FD reserve for storage, Raft, outbound
         // clients, and diagnostics. This prevents the historical 1,000-socket
         // cliff under the common 1,024 descriptor soft limit.
-        .max_connections = 256,
+        .max_connections = configuredPublicHttpConnectionLimit(),
         .accept_error_backoff_initial_ms = 5,
         .accept_error_backoff_max_ms = 1_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
@@ -5315,9 +5336,14 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
-    try std.testing.expectEqual(@as(u32, 256), cfg.max_connections);
+    try std.testing.expect(cfg.max_connections >= 1);
+    try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
     try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
     try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);
+    try std.testing.expectEqual(@as(u32, 256), publicHttpConnectionLimitForFdSoftLimit(1024));
+    try std.testing.expectEqual(@as(u32, 128), publicHttpConnectionLimitForFdSoftLimit(512));
+    try std.testing.expectEqual(@as(u32, 32), publicHttpConnectionLimitForFdSoftLimit(128));
+    try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
 }
 
 test "standalone Lite transaction sessions survive file reopen" {

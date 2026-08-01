@@ -22,6 +22,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const http_common = @import("../raft/transport/http_common.zig");
+const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
 const http_server_mod = @import("http_server.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
@@ -140,312 +141,10 @@ pub const QueryAdmission = struct {
     }
 };
 
-/// Watches for a peer disconnect while a fully received HTTP/1 query executes.
-///
-/// Darwin reports a normal FIN as POLL.IN, but HTTP/1 keep-alive may also make
-/// a pipelined next request readable. After `ctx.body()` has drained this
-/// request, the server has no concurrent reader; a non-consuming peek can
-/// therefore distinguish EOF (cancel) from queued request bytes (leave the
-/// connection to the server loop). HTTP/2 stream reset support remains in
-/// httpx's stream layer.
-const PeerCancellationWatcher = struct {
-    socket: *httpx.Socket,
-    cancellation: *http_common.RequestCancellation,
-    /// The server parsed a following H1 request into its private connection
-    /// buffer before entering this handler. A peer FIN after that pipeline is
-    /// not cancellation of the current request.
-    has_buffered_input: bool,
-    done: std.atomic.Value(bool) = .init(false),
-    task_group: std.Io.Group = std.Io.Group.init,
-    task_started: bool = false,
-    close_observer_fd: ?std.posix.fd_t = null,
-    peer_disconnects_total: ?*std.atomic.Value(u64) = null,
-    observer_failures_total: ?*std.atomic.Value(u64) = null,
-
-    fn start(self: *@This()) !void {
-        if (comptime builtin.os.tag == .windows) return;
-        try self.task_group.concurrent(self.socket.io, run, .{self});
-        self.task_started = true;
-    }
-
-    fn deinit(self: *@This()) void {
-        self.done.store(true, .release);
-        if (self.task_started) self.task_group.await(self.socket.io) catch {};
-        if (self.close_observer_fd) |fd| _ = std.posix.system.close(fd);
-        self.task_started = false;
-        self.close_observer_fd = null;
-    }
-
-    const PeerCloseState = enum { open, closed, unavailable };
-
-    fn cancelForPeerDisconnect(self: *@This()) void {
-        if (self.peer_disconnects_total) |counter| _ = counter.fetchAdd(1, .monotonic);
-        self.cancellation.cancel();
-    }
-
-    fn cancelForObserverFailure(self: *@This()) void {
-        if (self.observer_failures_total) |counter| _ = counter.fetchAdd(1, .monotonic);
-        self.cancellation.cancel();
-    }
-
-    /// Once MSG_PEEK has found a following request byte, another peek can no
-    /// longer observe a FIN behind it: it will keep returning that byte.  Ask
-    /// the kernel for the read-side close state instead, without consuming the
-    /// byte the H1 connection loop still owns.
-    fn peerCloseStateBehindUnreadInput(self: *@This()) PeerCloseState {
-        if (comptime builtin.os.tag == .linux) {
-            // POLLRDHUP observes a FIN behind unread bytes without allocating
-            // an epoll descriptor. This remains reliable when the process is
-            // at its FD ceiling, which is precisely when cancellation matters.
-            var fds = [_]std.posix.pollfd{.{
-                .fd = self.socket.handle,
-                .events = std.c.POLL.RDHUP | std.c.POLL.ERR,
-                .revents = 0,
-            }};
-            const ready = std.posix.poll(&fds, 25) catch return .unavailable;
-            if (ready == 0) return .open;
-            return if (fds[0].revents & (std.c.POLL.RDHUP | std.c.POLL.HUP | std.c.POLL.ERR | std.c.POLL.NVAL) != 0)
-                .closed
-            else
-                .open;
-        }
-
-        if (comptime builtin.os.tag == .macos) {
-            const kq = self.close_observer_fd orelse blk: {
-                const created = std.posix.system.kqueue();
-                if (std.posix.errno(created) != .SUCCESS) return .unavailable;
-                self.close_observer_fd = @intCast(created);
-                break :blk @as(std.posix.fd_t, @intCast(created));
-            };
-
-            var changes = [_]std.posix.Kevent{.{
-                .ident = @intCast(self.socket.handle),
-                .filter = std.c.EVFILT.READ,
-                .flags = std.c.EV.ADD,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            }};
-            var events: [1]std.posix.Kevent = undefined;
-            const timeout = std.posix.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
-            const ready = std.posix.system.kevent(kq, &changes, changes.len, &events, events.len, &timeout);
-            if (std.posix.errno(ready) != .SUCCESS) return .unavailable;
-            if (ready == 0) return .open;
-            return if (events[0].flags & (std.c.EV.EOF | std.c.EV.ERROR) != 0) .closed else .open;
-        }
-
-        // POLLHUP/POLLERR are reported even when they were not requested.
-        // This is the best non-consuming fallback on POSIX targets without a
-        // read-side-close primitive equivalent to EPOLLRDHUP/EV_EOF.
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.socket.handle,
-            .events = std.posix.POLL.ERR,
-            .revents = 0,
-        }};
-        _ = std.posix.poll(&fds, 25) catch return .unavailable;
-        return if (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) .closed else .open;
-    }
-
-    fn run(self: *@This()) std.Io.Cancelable!void {
-        if (comptime builtin.os.tag == .windows) return;
-        var has_unread_input = false;
-        while (!self.done.load(.acquire)) {
-            if (has_unread_input) {
-                switch (self.peerCloseStateBehindUnreadInput()) {
-                    .open => {},
-                    .closed => {
-                        self.cancelForPeerDisconnect();
-                        return;
-                    },
-                    .unavailable => {
-                        // Fail closed if the platform cannot maintain the
-                        // observer: never continue expensive work after losing
-                        // the only peer-lifetime signal.
-                        self.cancelForObserverFailure();
-                        return;
-                    },
-                }
-                // kqueue reports the already-readable byte immediately until
-                // EOF arrives. Bound that path so it cannot spin while the
-                // long-running request still owns the connection.
-                try self.socket.io.sleep(std.Io.Duration.fromMilliseconds(25), .awake);
-                continue;
-            }
-            var fds = [_]std.posix.pollfd{.{
-                .fd = self.socket.handle,
-                .events = std.posix.POLL.IN | std.posix.POLL.ERR,
-                .revents = 0,
-            }};
-            const ready = std.posix.poll(&fds, 25) catch {
-                self.cancelForObserverFailure();
-                return;
-            };
-            if (ready == 0) continue;
-            const events = fds[0].revents;
-            // POLLNVAL means the descriptor is no longer usable. POLLERR
-            // reports a pending socket error (including a peer reset), which
-            // is distinct from a normal half-close and cancels immediately.
-            if (events & std.posix.POLL.NVAL != 0) {
-                self.cancelForObserverFailure();
-                return;
-            }
-            if (events & std.posix.POLL.ERR != 0) {
-                self.cancelForPeerDisconnect();
-                return;
-            }
-            // Darwin can surface a FIN as POLLIN, POLLHUP, or both. Always
-            // PEEK first; HUP alone is not enough to distinguish EOF from
-            // unread request bytes.
-            if (events & (std.posix.POLL.IN | std.posix.POLL.HUP) == 0) continue;
-
-            var byte: [1]u8 = undefined;
-            // The request body was fully read before this watcher starts, so
-            // the server connection loop cannot race this peek. PEEK retains
-            // any queued bytes for that loop to parse after the handler ends.
-            const n = std.c.recv(
-                self.socket.handle,
-                &byte,
-                byte.len,
-                @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT),
-            );
-            if (n == 0) {
-                // A following request may already be buffered by
-                // Server.handleConnection, leaving the kernel socket at EOF
-                // after a valid client SHUT_WR. Preserve the current request
-                // in that case; the connection loop will process the buffered
-                // request after this handler completes.
-                if (!self.has_buffered_input) self.cancelForPeerDisconnect();
-                return;
-            }
-            if (n > 0) {
-                // A complete following request is already held in the H1
-                // parser's private buffer. Its eventual response must not be
-                // invalidated by bytes belonging to a later request or by the
-                // peer half-closing after that buffered pipeline.
-                if (self.has_buffered_input) return;
-                // Preserve the byte for Server.handleConnection, but keep
-                // observing the transport close notification. A peer can
-                // send a partial follow-up request and then disconnect while
-                // this expensive request is still executing.
-                has_unread_input = true;
-                continue;
-            }
-            // EAGAIN/INTR after poll is transient. A reset may be reported by
-            // recv rather than POLLERR, and is a real cancellation.
-            switch (std.posix.errno(n)) {
-                .AGAIN, .INTR => continue,
-                .CONNRESET => {
-                    self.cancelForPeerDisconnect();
-                    return;
-                },
-                else => {
-                    self.cancelForObserverFailure();
-                    return;
-                },
-            }
-        }
-    }
-};
-
-test "PeerCancellationWatcher cancels a FIN behind unread H1 bytes without consuming them" {
-    if (comptime builtin.os.tag == .windows) return;
-
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    var listener = try httpx.TcpListener.init(.{
-        .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 },
-    }, io);
-    defer listener.deinit();
-
-    var first_client = try httpx.Socket.connect(listener.getLocalAddress(), io);
-    defer first_client.close();
-    var first_accepted = try listener.accept();
-    defer first_accepted.socket.close();
-    var first_cancellation = http_common.RequestCancellation{};
-    var first_watcher = PeerCancellationWatcher{
-        .socket = &first_accepted.socket,
-        .cancellation = &first_cancellation,
-        .has_buffered_input = false,
-    };
-    try first_watcher.start();
-    defer first_watcher.deinit();
-    try io.vtable.netShutdown(io.userdata, first_client.handle, .send);
-    for (0..40) |_| {
-        if (first_cancellation.isCancelled()) break;
-        io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-    }
-    try std.testing.expect(first_cancellation.isCancelled());
-
-    var second_client = try httpx.Socket.connect(listener.getLocalAddress(), io);
-    defer second_client.close();
-    var second_accepted = try listener.accept();
-    defer second_accepted.socket.close();
-    var second_cancellation = http_common.RequestCancellation{};
-    var second_watcher = PeerCancellationWatcher{
-        .socket = &second_accepted.socket,
-        .cancellation = &second_cancellation,
-        .has_buffered_input = true,
-    };
-    try second_watcher.start();
-    defer second_watcher.deinit();
-    try io.vtable.netShutdown(io.userdata, second_client.handle, .send);
-    io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
-    try std.testing.expect(!second_cancellation.isCancelled());
-
-    var third_client = try httpx.Socket.connect(listener.getLocalAddress(), io);
-    defer third_client.close();
-    var third_accepted = try listener.accept();
-    defer third_accepted.socket.close();
-    var third_cancellation = http_common.RequestCancellation{};
-    const Query = struct {
-        cancellation: *const http_common.RequestCancellation,
-        started: std.atomic.Value(bool) = .init(false),
-        observed_cancel: std.atomic.Value(bool) = .init(false),
-
-        fn run(self: *@This()) void {
-            self.started.store(true, .release);
-            for (0..2_000) |_| {
-                if (self.cancellation.isCancelled()) {
-                    self.observed_cancel.store(true, .release);
-                    return;
-                }
-                var req = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = std.posix.system.nanosleep(&req, &req);
-            }
-        }
-    };
-    var third_query = Query{ .cancellation = &third_cancellation };
-    var third_watcher = PeerCancellationWatcher{
-        .socket = &third_accepted.socket,
-        .cancellation = &third_cancellation,
-        .has_buffered_input = false,
-    };
-    try third_watcher.start();
-    defer third_watcher.deinit();
-    const query_thread = try std.Thread.spawn(.{}, Query.run, .{&third_query});
-    defer query_thread.join();
-    for (0..400) |_| {
-        if (third_query.started.load(.acquire)) break;
-        io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-    }
-    try std.testing.expect(third_query.started.load(.acquire));
-    try third_client.sendAll("B");
-    try io.vtable.netShutdown(io.userdata, third_client.handle, .send);
-    for (0..400) |_| {
-        if (third_query.observed_cancel.load(.acquire)) break;
-        io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-    }
-    try std.testing.expect(third_cancellation.isCancelled());
-    try std.testing.expect(third_query.observed_cancel.load(.acquire));
-    var queued: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try third_accepted.socket.recv(&queued));
-    try std.testing.expectEqualStrings("B", &queued);
-}
-
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
     query_admission: QueryAdmission = .{},
+    peer_observer: ?PeerObserver = null,
     cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
     peer_disconnect_cancellations_total: std.atomic.Value(u64) = .init(0),
     peer_observer_failures_total: std.atomic.Value(u64) = .init(0),
@@ -454,6 +153,7 @@ pub const AntflyApiHandler = struct {
         cancellation_watcher_start_failures_total: u64,
         peer_disconnect_cancellations_total: u64,
         peer_observer_failures_total: u64,
+        active_peer_observers: usize,
     };
 
     pub fn runtimeStats(self: *const AntflyApiHandler) RuntimeStats {
@@ -461,7 +161,26 @@ pub const AntflyApiHandler = struct {
             .cancellation_watcher_start_failures_total = self.cancellation_watcher_start_failures_total.load(.acquire),
             .peer_disconnect_cancellations_total = self.peer_disconnect_cancellations_total.load(.acquire),
             .peer_observer_failures_total = self.peer_observer_failures_total.load(.acquire),
+            .active_peer_observers = if (self.peer_observer) |*observer| observer.activeCount() else 0,
         };
+    }
+
+    /// Starts the one-thread, multiplexed H1 cancellation observer after the
+    /// handler has reached its stable address. Query handlers fail closed if
+    /// this runtime is unavailable.
+    pub fn initRuntime(self: *AntflyApiHandler, alloc: std.mem.Allocator) !void {
+        if (self.peer_observer != null) return error.AlreadyStarted;
+        self.peer_observer = PeerObserver.init(alloc, self.query_admission.capacity);
+        self.peer_observer.?.start() catch |err| {
+            self.peer_observer.?.deinit();
+            self.peer_observer = null;
+            return err;
+        };
+    }
+
+    pub fn deinitRuntime(self: *AntflyApiHandler) void {
+        if (self.peer_observer) |*observer| observer.deinit();
+        self.peer_observer = null;
     }
 
     // ---------------------------------------------------------------
@@ -717,17 +436,19 @@ pub const AntflyApiHandler = struct {
         return textResponse(ctx, 503, "query cancellation capacity unavailable");
     }
 
-    fn startPeerCancellationWatcher(self: *AntflyApiHandler, ctx: *httpx.Context, cancellation: *http_common.RequestCancellation, watcher: *?PeerCancellationWatcher) !void {
+    fn startPeerCancellationWatcher(self: *AntflyApiHandler, ctx: *httpx.Context, cancellation: *http_common.RequestCancellation, registration: *PeerObserver.Registration) !void {
         const socket = ctx.h1_sock orelse return;
-        watcher.* = .{
-            .socket = socket,
-            .cancellation = cancellation,
-            .has_buffered_input = ctx.h1_has_buffered_input,
-            .peer_disconnects_total = &self.peer_disconnect_cancellations_total,
-            .observer_failures_total = &self.peer_observer_failures_total,
-        };
-        if (watcher.*) |*value| value.start() catch |err| {
-            watcher.* = null;
+        // A complete next request already lives in the server parser buffer.
+        // A subsequent FIN belongs to the pipelined connection lifetime, not
+        // necessarily to this request, and must not cancel valid current work.
+        if (ctx.h1_has_buffered_input) return;
+        const observer = if (self.peer_observer) |*value| value else return error.ObserverUnavailable;
+        registration.* = observer.register(
+            socket.handle,
+            cancellation,
+            &self.peer_disconnect_cancellations_total,
+            &self.peer_observer_failures_total,
+        ) catch |err| {
             _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
             return err;
         };
@@ -1803,10 +1524,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("missing body");
         };
         var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
-        var watcher: ?PeerCancellationWatcher = null;
-        self.startPeerCancellationWatcher(ctx, &cancellation, &watcher) catch
+        var peer_registration: PeerObserver.Registration = .{};
+        self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
             return queryCancellationUnavailableResponse(ctx);
-        defer if (watcher) |*value| value.deinit();
+        defer peer_registration.deinit();
         if (isNdjsonContentType(ctx.header("content-type"))) {
             var resp = try self.api_server.handlePublicGlobalMultiQueryWithCancellation(
                 body_data,
@@ -2403,10 +2124,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("missing body");
         };
         var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
-        var watcher: ?PeerCancellationWatcher = null;
-        self.startPeerCancellationWatcher(ctx, &cancellation, &watcher) catch
+        var peer_registration: PeerObserver.Registration = .{};
+        self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
             return queryCancellationUnavailableResponse(ctx);
-        defer if (watcher) |*value| value.deinit();
+        defer peer_registration.deinit();
         var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
             body_data,

@@ -1064,6 +1064,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public request peer disconnects propagated to cancellation", http.peer_disconnects_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets currently watched for disconnect", http.active_peer_observers);
         }
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);

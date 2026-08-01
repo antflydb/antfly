@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const common = @import("http_common.zig");
+const PeerObserver = @import("peer_disconnect_observer.zig").Observer;
 
 pub const default_max_request_bytes: usize = 32 * 1024 * 1024;
 pub const default_request_stack_size: usize = 8 * 1024 * 1024;
@@ -71,50 +72,6 @@ fn sleepMs(ms: u64) void {
     };
 }
 
-const PeerDisconnectWatcher = struct {
-    fd: std.posix.fd_t,
-    cancellation: *common.RequestCancellation,
-    observed_disconnects: *std.atomic.Value(u64),
-    done: std.atomic.Value(bool) = .init(false),
-    group: std.Io.Group = std.Io.Group.init,
-    started: bool = false,
-
-    fn start(self: *PeerDisconnectWatcher, io: std.Io) !void {
-        try self.group.concurrent(io, run, .{self});
-        self.started = true;
-    }
-
-    fn stop(self: *PeerDisconnectWatcher, io: std.Io) void {
-        self.done.store(true, .release);
-        if (self.started) self.group.await(io) catch {};
-        self.started = false;
-    }
-
-    fn run(self: *PeerDisconnectWatcher) std.Io.Cancelable!void {
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = self.fd,
-            // After the request body is fully consumed this listener never
-            // accepts a pipelined follow-up (responses are keep-alive=false),
-            // so readability means EOF/reset or unusable extra input. Polling
-            // IN is required on Darwin, which does not reliably surface a
-            // peer FIN as HUP without a read interest.
-            .events = std.posix.POLL.IN | std.posix.POLL.ERR,
-            .revents = 0,
-        }};
-        while (!self.done.load(.acquire)) {
-            poll_fds[0].revents = 0;
-            const result = std.posix.poll(&poll_fds, 25) catch continue;
-            if (result == 0) continue;
-            const events = poll_fds[0].revents;
-            if (events & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
-                _ = self.observed_disconnects.fetchAdd(1, .monotonic);
-                self.cancellation.cancel();
-                return;
-            }
-        }
-    }
-};
-
 pub const StdHttpListenerConfig = struct {
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
@@ -148,6 +105,7 @@ pub const StdHttpListener = struct {
         accept_errors_total: u64,
         cancellation_watcher_start_failures_total: u64,
         peer_disconnects_total: u64,
+        active_peer_observers: usize,
     };
 
     const IoOwner = enum {
@@ -172,6 +130,7 @@ pub const StdHttpListener = struct {
     accept_errors_total: std.atomic.Value(u64) = .init(0),
     cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
     peer_disconnects_total: std.atomic.Value(u64) = .init(0),
+    peer_observer: ?PeerObserver = null,
     active_streams_lock: std.atomic.Mutex = .unlocked,
     active_streams: std.ArrayListUnmanaged(*const std.Io.net.Stream) = .empty,
 
@@ -218,6 +177,23 @@ pub const StdHttpListener = struct {
     pub fn start(self: *StdHttpListener) !void {
         if (self.server != null) return error.AlreadyListening;
         self.stopping.store(false, .release);
+
+        const observer_capacity = if (self.cfg.max_connection_threads > 0)
+            self.cfg.max_connection_threads
+        else if (self.cfg.max_active_requests > 0)
+            self.cfg.max_active_requests
+        else
+            64;
+        self.peer_observer = PeerObserver.init(self.alloc, observer_capacity);
+        self.peer_observer.?.start() catch |err| {
+            self.peer_observer.?.deinit();
+            self.peer_observer = null;
+            return err;
+        };
+        errdefer {
+            self.peer_observer.?.deinit();
+            self.peer_observer = null;
+        }
 
         const listen_addr = try std.Io.net.IpAddress.parse(self.cfg.bind_host, self.cfg.bind_port);
         const TestBindFailure = struct {
@@ -282,6 +258,8 @@ pub const StdHttpListener = struct {
             self.shutdownActiveStreams(io);
             sleepMs(1);
         }
+        if (self.peer_observer) |*observer| observer.deinit();
+        self.peer_observer = null;
         if (self.server) |*server| {
             server.deinit(io);
             self.server = null;
@@ -323,6 +301,7 @@ pub const StdHttpListener = struct {
             .accept_errors_total = self.accept_errors_total.load(.acquire),
             .cancellation_watcher_start_failures_total = self.cancellation_watcher_start_failures_total.load(.acquire),
             .peer_disconnects_total = self.peer_disconnects_total.load(.acquire),
+            .active_peer_observers = if (self.peer_observer) |*observer| observer.activeCount() else 0,
         };
     }
 
@@ -444,7 +423,9 @@ pub const StdHttpListener = struct {
         // Query execution is bounded independently from connection handling.
         // Health, recovery, and other public control routes retain capacity
         // even while every expensive query slot is held.
-        return method == .POST and std.mem.indexOf(u8, uri, "/query") != null;
+        if (method != .POST) return false;
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query_index| uri[0..query_index] else uri;
+        return std.mem.eql(u8, path, "/query") or std.mem.endsWith(u8, path, "/query");
     }
 
     fn acceptErrorBackoffInitialMs(self: *const StdHttpListener) u32 {
@@ -664,16 +645,28 @@ pub const StdHttpListener = struct {
         defer if (consumes_expensive_slot) self.releaseRequestSlot();
 
         var cancellation = common.RequestCancellation{};
-        var peer_watcher: PeerDisconnectWatcher = undefined;
-        var peer_watch_started = false;
-        const request_io = self.io_impl.io();
+        var peer_registration: PeerObserver.Registration = .{};
         if (stream) |active_stream| {
-            peer_watcher = .{
-                .fd = active_stream.socket.handle,
-                .cancellation = &cancellation,
-                .observed_disconnects = &self.peer_disconnects_total,
-            };
-            peer_watcher.start(request_io) catch {
+            if (self.peer_observer) |*observer| {
+                peer_registration = observer.register(
+                    active_stream.socket.handle,
+                    &cancellation,
+                    &self.peer_disconnects_total,
+                    null,
+                ) catch blk: {
+                    _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
+                    if (consumes_expensive_slot) {
+                        try request.respond("query cancellation capacity unavailable", .{
+                            .status = @enumFromInt(503),
+                            .keep_alive = false,
+                            .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
+                        });
+                        return;
+                    }
+                    cancellation.cancel();
+                    break :blk .{};
+                };
+            } else {
                 _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
                 if (consumes_expensive_slot) {
                     try request.respond("query cancellation capacity unavailable", .{
@@ -684,10 +677,9 @@ pub const StdHttpListener = struct {
                     return;
                 }
                 cancellation.cancel();
-            };
-            peer_watch_started = peer_watcher.started;
+            }
         }
-        defer if (peer_watch_started) peer_watcher.stop(request_io);
+        defer peer_registration.deinit();
         const http_req: common.HttpRequest = .{
             .method = method,
             .uri = uri,
@@ -1492,6 +1484,14 @@ test "std http listener bounds 128 admitted requests and keeps a retryable reser
     listener.releaseRequestSlot();
 }
 
+test "std http listener query admission matches paths without query-string false positives" {
+    try std.testing.expect(StdHttpListener.requestConsumesExpensiveSlot(.POST, "/query"));
+    try std.testing.expect(StdHttpListener.requestConsumesExpensiveSlot(.POST, "/db/v1/tables/products/query?limit=10"));
+    try std.testing.expect(!StdHttpListener.requestConsumesExpensiveSlot(.GET, "/db/v1/tables/products/query"));
+    try std.testing.expect(!StdHttpListener.requestConsumesExpensiveSlot(.POST, "/db/v1/tables/products/query-preflight"));
+    try std.testing.expect(!StdHttpListener.requestConsumesExpensiveSlot(.POST, "/control?next=/query"));
+}
+
 test "std http listener recovers after 128 real clients abandon saturated queries" {
     const std_http_executor = @import("std_http_executor.zig");
 
@@ -1560,6 +1560,7 @@ test "std http listener recovers after 128 real clients abandon saturated querie
     try std.testing.expectEqual(@as(u64, 120), saturated.rejected_requests_total);
     try std.testing.expect(saturated.peak_active_requests <= saturated.max_active_requests);
     try std.testing.expect(saturated.peak_connection_threads <= saturated.max_connection_threads);
+    try std.testing.expectEqual(@as(usize, 8), saturated.active_peer_observers);
 
     // At least one real overload client must receive the retryable wire
     // response; the counter alone is not sufficient evidence of shedding.
@@ -1605,12 +1606,13 @@ test "std http listener recovers after 128 real clients abandon saturated querie
     var recovered = listener.runtimeStats();
     for (0..10_000) |_| {
         recovered = listener.runtimeStats();
-        if (recovered.active_requests == 0 and app.cancelled_queries.load(.acquire) == 8) break;
+        if (recovered.active_requests == 0 and recovered.active_peer_observers == 0 and app.cancelled_queries.load(.acquire) == 8) break;
         sleepMs(1);
     }
     try std.testing.expectEqual(@as(u32, 0), recovered.active_requests);
     try std.testing.expectEqual(@as(u32, 8), app.cancelled_queries.load(.acquire));
     try std.testing.expect(recovered.peer_disconnects_total >= 8);
+    try std.testing.expectEqual(@as(usize, 0), recovered.active_peer_observers);
 
     app.release_queries.store(true, .release);
     const query_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/query", .{base_uri});
