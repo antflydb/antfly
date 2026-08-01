@@ -3128,6 +3128,7 @@ pub fn build(b: *std.Build) void {
         "postgres libpq global permit wait observes cancellation without a deadline",
         "postgres libpq pool wait observes cancellation without a deadline",
         "postgres libpq cancellation during connect polling closes the fresh connection",
+        "managed embedder cancels an in-flight remote embedding request",
         "postgres libpq created replication snapshot cloning is allocation-failure safe",
         "postgres libpq weighted FIFO preserves a queued two-permit cutover",
         "postgres libpq timed out weighted head hands released capacity to follower",

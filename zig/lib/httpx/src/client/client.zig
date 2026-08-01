@@ -96,7 +96,12 @@ pub const RequestOptions = struct {
     /// Per-request response ceiling. This may lower, but never raise, the
     /// client-wide maximum.
     max_response_size: ?usize = null,
+    /// Borrowed cancellation signal. It must remain valid until the request
+    /// method returns.
+    cancellation: ?*const std.atomic.Value(bool) = null,
 };
+
+const cancellation_poll_interval_ms: u64 = 25;
 
 pub const WriterProgress = struct {
     bytes_written: u64,
@@ -396,7 +401,7 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts.timeout_ms);
+        var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
         errdefer response.deinit();
 
         try self.storeCookies(&response);
@@ -490,7 +495,7 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx);
+        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
         errdefer response.deinit();
 
         try self.storeCookies(&response);
@@ -526,7 +531,8 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
+    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?*const std.atomic.Value(bool)) !Response {
+        if (cancellation) |signal| return self.executeRequestCancellable(req, timeout_override_ms, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms);
@@ -584,6 +590,111 @@ pub const Client = struct {
         }
     }
 
+    fn executeRequestCancellable(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        cancellation: *const std.atomic.Value(bool),
+    ) !Response {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
+        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        const RequestResult = anyerror!Response;
+        const CancelResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            cancellation: CancelResult,
+            timeout: anyerror!void,
+        };
+        const Task = struct {
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64) RequestResult {
+                return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms);
+            }
+
+            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
+                while (!signal.load(.acquire)) {
+                    try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
+                }
+                return error.Cancelled;
+            }
+
+            fn timeoutTask(io: Io, timeout: Io.Timeout) anyerror!void {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .request => |request_result| if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {},
+                    .cancellation, .timeout => {},
+                }
+            }
+        };
+
+        if (timeout_ms == 0) {
+            var select_buffer: [2]SelectResult = undefined;
+            var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+            try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms });
+            select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+            const first = try select.await();
+            switch (first) {
+                .request => |request_result| {
+                    select.cancelDiscard();
+                    if (cancellation.load(.acquire)) {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit();
+                        } else |_| {}
+                        return error.Cancelled;
+                    }
+                    return try request_result;
+                },
+                .cancellation => |cancel_result| {
+                    while (select.cancel()) |late| Task.drainLateResult(late);
+                    cancel_result catch |err| return err;
+                    return error.Cancelled;
+                },
+                .timeout => unreachable,
+            }
+        }
+
+        var select_buffer: [3]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms });
+        select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+        select.async(.timeout, Task.timeoutTask, .{ self.io, Io.Timeout{ .duration = .{
+            .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+            .clock = .awake,
+        } } });
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                if (cancellation.load(.acquire)) {
+                    if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {}
+                    return error.Cancelled;
+                }
+                return try request_result;
+            },
+            .cancellation => |cancel_result| {
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                cancel_result catch |err| return err;
+                return error.Cancelled;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                if (cancellation.load(.acquire)) return error.Cancelled;
+                return error.Timeout;
+            },
+        }
+    }
+
     fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
@@ -632,7 +743,9 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !Response {
+        if (cancellation) |signal| return self.executeRequestToWriterCancellable(req, timeout_override_ms, writer, progress_cb, progress_ctx, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx);
@@ -694,6 +807,115 @@ pub const Client = struct {
             .timeout => |timeout_result| {
                 try timeout_result;
                 while (select.cancel()) |late| Task.drainLateResult(late);
+                return error.Timeout;
+            },
+        }
+    }
+
+    fn executeRequestToWriterCancellable(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        cancellation: *const std.atomic.Value(bool),
+    ) !Response {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
+        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        const Writer = @TypeOf(writer);
+        const RequestResult = anyerror!Response;
+        const CancelResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            cancellation: CancelResult,
+            timeout: anyerror!void,
+        };
+        const Task = struct {
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, output: Writer, callback: ?WriterProgressCallback, callback_context: ?*anyopaque) RequestResult {
+                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context);
+            }
+
+            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
+                while (!signal.load(.acquire)) {
+                    try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
+                }
+                return error.Cancelled;
+            }
+
+            fn timeoutTask(io: Io, timeout: Io.Timeout) anyerror!void {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .request => |request_result| if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {},
+                    .cancellation, .timeout => {},
+                }
+            }
+        };
+
+        if (timeout_ms == 0) {
+            var select_buffer: [2]SelectResult = undefined;
+            var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+            try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx });
+            select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+            const first = try select.await();
+            switch (first) {
+                .request => |request_result| {
+                    select.cancelDiscard();
+                    if (cancellation.load(.acquire)) {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit();
+                        } else |_| {}
+                        return error.Cancelled;
+                    }
+                    return try request_result;
+                },
+                .cancellation => |cancel_result| {
+                    while (select.cancel()) |late| Task.drainLateResult(late);
+                    cancel_result catch |err| return err;
+                    return error.Cancelled;
+                },
+                .timeout => unreachable,
+            }
+        }
+
+        var select_buffer: [3]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx });
+        select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+        select.async(.timeout, Task.timeoutTask, .{ self.io, Io.Timeout{ .duration = .{
+            .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+            .clock = .awake,
+        } } });
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                if (cancellation.load(.acquire)) {
+                    if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {}
+                    return error.Cancelled;
+                }
+                return try request_result;
+            },
+            .cancellation => |cancel_result| {
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                cancel_result catch |err| return err;
+                return error.Cancelled;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                if (cancellation.load(.acquire)) return error.Cancelled;
                 return error.Timeout;
             },
         }
@@ -2413,6 +2635,16 @@ test "Client initialization" {
     defer client.deinit();
 
     try std.testing.expectEqualStrings(meta.default_user_agent, client.config.user_agent);
+}
+
+test "Client rejects an already cancelled request" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    var cancellation = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{ .cancellation = &cancellation }),
+    );
 }
 
 test "Client with config" {

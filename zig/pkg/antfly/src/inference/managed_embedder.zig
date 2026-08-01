@@ -1901,6 +1901,7 @@ fn embedWithEntryParts(
             .input_type = entry.input_type,
             .truncate = entry.truncate,
             .dimension = dims,
+            .cancellation = entry.cancellation,
         }, &@constCast(entry).bedrock_credentials);
         defer provider.deinit();
 
@@ -1994,6 +1995,7 @@ fn embedSparseBatchWithEntry(
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
             defer provider.deinit();
+            provider.setRequestCancellation(entry.cancellation);
             if (entry.api_key) |*api_key_ref| {
                 if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                     defer alloc.free(auth_header);
@@ -2207,6 +2209,7 @@ fn embedBatchWithEntry(
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
             defer provider.deinit();
+            provider.setRequestCancellation(entry.cancellation);
             if (entry.api_key) |*api_key_ref| {
                 if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
                     defer alloc.free(auth_header);
@@ -2263,6 +2266,7 @@ fn embedBatchWithBedrockRequest(
         .input_type = entry.input_type,
         .truncate = entry.truncate,
         .dimension = dims,
+        .cancellation = entry.cancellation,
     }, &@constCast(entry).bedrock_credentials);
     defer provider.deinit();
     var result = try provider.embedText(alloc, entry.model, texts);
@@ -2344,6 +2348,7 @@ fn embedBatchWithOpenAiCompatible(
     var response = try client.post(url, .{
         .json = json_body,
         .headers = headers_buf[0..header_count],
+        .cancellation = entry.cancellation,
     });
     defer response.deinit();
     if (!response.ok()) return mapEmbedStatus(response.status.code);
@@ -2890,6 +2895,80 @@ test "managed embedder calls openai compatible embeddings endpoint" {
     try std.testing.expectEqual(@as(usize, 3), vector.len);
     try std.testing.expectEqual(@as(f32, 0.125), vector[0]);
     try std.testing.expectEqual(@as(f32, 0.5), vector[2]);
+}
+
+pub fn testRemoteEmbeddingCancellation() !void {
+    const alloc = std.testing.allocator;
+    const DelayedApp = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            return .{
+                .status = 200,
+                .content_type = try response_alloc.dupe(u8, "application/json"),
+                .body = try response_alloc.dupe(u8,
+                    \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.125,0.25,0.5]}]}
+                ),
+            };
+        }
+    };
+
+    var app = DelayedApp{};
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, app.executor());
+    defer {
+        app.release.store(true, .release);
+        listener.deinit();
+    }
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(indexes_json);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var cancellation = std.atomic.Value(bool).init(false);
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
+        .io = io_impl.io(),
+        .cancellation = &cancellation,
+    });
+    defer managed.deinit();
+
+    const Worker = struct {
+        fn run(target: *ManagedEmbedder, err_out: *?anyerror) void {
+            const vector = target.embedQuery(alloc, "semantic_idx", "alpha concept") catch |err| {
+                err_out.* = err;
+                return;
+            };
+            alloc.free(vector);
+            err_out.* = error.TestUnexpectedResult;
+        }
+    };
+    var err_out: ?anyerror = null;
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{ &managed, &err_out });
+    while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    const started_ns = monotonicNowNs();
+    cancellation.store(true, .release);
+    worker.join();
+    const elapsed_ns = monotonicNowNs() - started_ns;
+    app.release.store(true, .release);
+
+    try std.testing.expectEqual(error.Cancelled, err_out.?);
+    try std.testing.expect(elapsed_ns < 250 * std.time.ns_per_ms);
 }
 
 pub fn testFileBackedApiKeyRotation() !void {
