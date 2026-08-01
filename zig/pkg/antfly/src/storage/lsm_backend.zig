@@ -2721,12 +2721,20 @@ pub const Backend = struct {
         self.allocator.destroy(state);
     }
 
-    fn retireImmutableMemtable(self: *Backend, state: *State) !void {
+    fn reserveImmutableMemtableRetirement(self: *Backend, state: *const State) !void {
+        if (!self.immutableMemtableIsPinned(state)) return;
+        try self.retired_immutable_memtables.ensureUnusedCapacity(self.allocator, 1);
+    }
+
+    fn retireImmutableMemtable(self: *Backend, state: *State) void {
         if (!self.immutableMemtableIsPinned(state)) {
             self.destroyImmutableMemtable(state);
             return;
         }
-        try self.retired_immutable_memtables.append(self.allocator, state);
+        // Publication reserves this slot before the replacement runs become
+        // visible. The ownership transition after publication must not fail:
+        // readers may still hold pointers into this immutable generation.
+        self.retired_immutable_memtables.appendAssumeCapacity(state);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
@@ -3455,10 +3463,11 @@ pub const Backend = struct {
         self.write_stats.immutable_flushes += 1;
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
+        try self.reserveImmutableMemtableRetirement(state);
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
-        try self.retireImmutableMemtable(state);
+        self.retireImmutableMemtable(state);
         self.compactImmutableMemtableQueue();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
 
@@ -3530,10 +3539,15 @@ pub const Backend = struct {
         self.write_stats.immutable_flushes += 1;
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
+        // The build ran without the backend lock, so reserve only after the
+        // generation identity has been revalidated. From this point through
+        // retirement, publication is allocation-free except for installing
+        // the new run pointers themselves.
+        try self.reserveImmutableMemtableRetirement(state);
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &build_result);
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
-        try self.retireImmutableMemtable(state);
+        self.retireImmutableMemtable(state);
         self.compactImmutableMemtableQueue();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
 
@@ -4556,7 +4570,12 @@ pub const Backend = struct {
         self.queueObsoleteFilePathAssumeCapacity(path);
     }
 
-    fn queueObsoleteFilePathAssumeCapacity(self: *Backend, path: []u8) void {
+    pub fn reserveObsoletePublication(self: *Backend, path_count: usize, run_list_count: usize) !void {
+        try self.obsolete_paths.ensureUnusedCapacity(self.allocator, path_count);
+        try self.obsolete_runs.ensureUnusedCapacity(self.allocator, run_list_count);
+    }
+
+    pub fn queueObsoleteFilePathAssumeCapacity(self: *Backend, path: []u8) void {
         const delete_after_ns = self.nowNs() +| self.options.obsolete_retention_ns;
         for (self.obsolete_paths.items) |*obsolete| {
             if (!std.mem.eql(u8, obsolete.path, path)) continue;
@@ -4576,6 +4595,11 @@ pub const Backend = struct {
     }
 
     pub fn queueObsoleteRuns(self: *Backend, runs: std.ArrayListUnmanaged(Run)) !void {
+        try self.obsolete_runs.ensureUnusedCapacity(self.allocator, @intFromBool(runs.items.len > 0));
+        self.queueObsoleteRunsAssumeCapacity(runs);
+    }
+
+    pub fn queueObsoleteRunsAssumeCapacity(self: *Backend, runs: std.ArrayListUnmanaged(Run)) void {
         if (runs.items.len == 0) {
             var empty = runs;
             empty.deinit(self.allocator);
@@ -4585,7 +4609,7 @@ pub const Backend = struct {
         // The backend's active-version ownership ends at compaction publish.
         // Snapshot readers now carry their own per-run pins.
         for (retired.items) |*run| self.releaseRunVersionRef(run);
-        try self.obsolete_runs.append(self.allocator, retired);
+        self.obsolete_runs.appendAssumeCapacity(retired);
         self.drainUnpinnedObsoleteRuns();
     }
 
@@ -9782,6 +9806,47 @@ test "lsm backend reclaims a retired immutable when its exact reader exits" {
     );
     try std.testing.expectEqualStrings(value_a[0..], try newer_reader.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings(value_b[0..], try newer_reader.get(.{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend pinned immutable retirement is allocation free after reservation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    {
+        var backend = Backend.init(alloc, .{
+            .flush_threshold = 1000,
+            .wal_enabled = false,
+        });
+        defer backend.close();
+
+        {
+            var txn = try backend.beginWrite();
+            try txn.put(.{ .name = "docs" }, "doc:a", "A");
+            try txn.commit();
+        }
+        try backend.rotateMutableToImmutable();
+        try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+        const snapshot = try backend.snapshotImmutableMemtables();
+        const state = backend.immutable_memtables.items[backend.immutable_head];
+        try std.testing.expect(snapshot[0] == state);
+
+        // Flush publication performs this reservation before installing the new
+        // runs. Once installed, advancing the generation and transferring its
+        // ownership to the retired queue must remain safe under allocator failure.
+        try backend.reserveImmutableMemtableRetirement(state);
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+        backend.immutable_head += 1;
+        backend.retireImmutableMemtable(state);
+        backend.compactImmutableMemtableQueue();
+        try std.testing.expectEqual(@as(usize, 1), backend.retired_immutable_memtables.items.len);
+
+        backend.releaseImmutableMemtableSnapshot(snapshot);
+        try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+    }
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "lsm backend probe owns active mutable point values across later writes" {
@@ -17326,5 +17391,42 @@ test "lsm backend mutable read snapshot retirement allocation failure keeps snap
     read_a_active = false;
     try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
     backend.close();
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "lsm backend obsolete publication is allocation free after reservation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    {
+        var backend = Backend.init(alloc, .{ .wal_enabled = false });
+        defer backend.close();
+
+        const obsolete_path = try alloc.dupe(u8, "/runs/1.tbl");
+        var obsolete_runs = std.ArrayListUnmanaged(Run).empty;
+        try obsolete_runs.ensureTotalCapacity(alloc, 1);
+        obsolete_runs.appendAssumeCapacity(.{
+            .id = 1,
+            .level = 0,
+            .size_bytes = 1,
+            .path = try alloc.dupe(u8, "/runs/1.tbl"),
+            .smallest_namespace_name = null,
+            .smallest_key = try alloc.dupe(u8, "a"),
+            .largest_namespace_name = null,
+            .largest_key = try alloc.dupe(u8, "z"),
+            .entry_count = 1,
+            .bloom_filter = null,
+            .state = null,
+        });
+
+        try backend.reserveObsoletePublication(1, 1);
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+        backend.queueObsoleteFilePathAssumeCapacity(obsolete_path);
+        backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
+        try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.items.len);
+        try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+    }
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }

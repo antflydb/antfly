@@ -556,6 +556,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
         for (obsolete_runs.items) |*run| run.deinit(backend.allocator);
         obsolete_runs.deinit(backend.allocator);
     }
+    try obsolete_runs.ensureTotalCapacity(backend.allocator, selected_len);
 
     var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
     defer backend.allocator.free(remove);
@@ -563,10 +564,24 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     for (plan.source_start..plan.source_start + plan.source_len) |i| remove[i] = true;
     for (plan.target_start..plan.target_start + plan.target_len) |i| remove[i] = true;
 
+    // Prepare every allocation before transferring ownership from the active
+    // version. A failed compaction publication must leave both the live run
+    // set and its obsolete-file bookkeeping untouched.
+    var obsolete_paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (obsolete_paths.items) |path| backend.allocator.free(path);
+        obsolete_paths.deinit(backend.allocator);
+    }
+    try obsolete_paths.ensureTotalCapacity(backend.allocator, selected_len);
+    for (backend.runs.items, remove) |run, removed| {
+        if (!removed) continue;
+        if (run.path) |path| obsolete_paths.appendAssumeCapacity(try backend.allocator.dupe(u8, path));
+    }
+    try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
+
     for (backend.runs.items, 0..) |*run, i| {
         if (remove[i]) {
-            if (run.path) |path| try queueObsoleteFilePath(BackendType, backend, try backend.allocator.dupe(u8, path));
-            try obsolete_runs.append(backend.allocator, run.*);
+            obsolete_runs.appendAssumeCapacity(run.*);
             run.* = undefined;
             continue;
         }
@@ -596,7 +611,13 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
-    try backend.queueObsoleteRuns(obsolete_runs);
+    for (obsolete_paths.items) |*path| {
+        backend.queueObsoleteFilePathAssumeCapacity(path.*);
+        path.* = &.{};
+    }
+    obsolete_paths.items.len = 0;
+    backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
+    obsolete_runs = .empty;
 }
 
 fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
@@ -819,6 +840,7 @@ fn installCompactedRuns(
         for (obsolete_runs.items) |*run| run.deinit(backend.allocator);
         obsolete_runs.deinit(backend.allocator);
     }
+    try obsolete_runs.ensureTotalCapacity(backend.allocator, selected_len);
 
     var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
     defer backend.allocator.free(remove);
@@ -826,10 +848,24 @@ fn installCompactedRuns(
     for (plan.source_start..plan.source_start + plan.source_len) |i| remove[i] = true;
     for (plan.target_start..plan.target_start + plan.target_len) |i| remove[i] = true;
 
+    // The build ran without the backend lock. After revalidation, stage every
+    // remaining allocation before changing the live version so OOM leaves the
+    // old run set fully intact and the new files safely discardable.
+    var obsolete_paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (obsolete_paths.items) |path| backend.allocator.free(path);
+        obsolete_paths.deinit(backend.allocator);
+    }
+    try obsolete_paths.ensureTotalCapacity(backend.allocator, selected_len);
+    for (backend.runs.items, remove) |run, removed| {
+        if (!removed) continue;
+        if (run.path) |path| obsolete_paths.appendAssumeCapacity(try backend.allocator.dupe(u8, path));
+    }
+    try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
+
     for (backend.runs.items, 0..) |*run, i| {
         if (remove[i]) {
-            if (run.path) |path| try queueObsoleteFilePath(BackendType, backend, try backend.allocator.dupe(u8, path));
-            try obsolete_runs.append(backend.allocator, run.*);
+            obsolete_runs.appendAssumeCapacity(run.*);
             run.* = undefined;
             continue;
         }
@@ -859,7 +895,13 @@ fn installCompactedRuns(
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
-    try backend.queueObsoleteRuns(obsolete_runs);
+    for (obsolete_paths.items) |*path| {
+        backend.queueObsoleteFilePathAssumeCapacity(path.*);
+        path.* = &.{};
+    }
+    obsolete_paths.items.len = 0;
+    backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
+    obsolete_runs = .empty;
 }
 
 pub fn discardOutputRuns(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
@@ -2399,15 +2441,6 @@ fn compareTableEntry(lhs: lsm_table_file.Entry, rhs: lsm_table_file.Entry) std.m
     return std.mem.order(u8, lhs.key, rhs.key);
 }
 
-fn queueObsoleteFilePath(comptime BackendType: type, backend: *BackendType, path: []u8) !void {
-    if (@hasDecl(BackendType, "queueObsoleteFilePath")) {
-        try backend.queueObsoleteFilePath(path);
-    } else {
-        repository_mod.deleteFileAbsoluteWithStorage(backend.storage.?, path) catch {};
-        backend.allocator.free(path);
-    }
-}
-
 pub fn makeRun(comptime BackendType: type, backend: *BackendType, state: State) !Run {
     return try makeRunAtLevel(BackendType, backend, state, 0);
 }
@@ -2928,4 +2961,104 @@ test "unlocked compaction snapshots retain source file references until build cl
     releaseCompactionSnapshots(FakeBackend, &backend, &snapshots);
     try std.testing.expectEqual(@as(usize, 1), backend.released);
     try std.testing.expectEqual(@as(usize, 0), snapshots.items.len);
+}
+
+test "compaction publication OOM leaves the active run version intact" {
+    const FakeBackend = struct {
+        allocator: std.mem.Allocator,
+        runs: std.ArrayListUnmanaged(Run) = .empty,
+        obsolete_paths: std.ArrayListUnmanaged([]u8) = .empty,
+        obsolete_runs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Run)) = .empty,
+
+        fn reserveObsoletePublication(self: *@This(), path_count: usize, run_list_count: usize) !void {
+            try self.obsolete_paths.ensureUnusedCapacity(self.allocator, path_count);
+            try self.obsolete_runs.ensureUnusedCapacity(self.allocator, run_list_count);
+        }
+
+        fn queueObsoleteFilePathAssumeCapacity(self: *@This(), path: []u8) void {
+            self.obsolete_paths.appendAssumeCapacity(path);
+        }
+
+        fn queueObsoleteRunsAssumeCapacity(self: *@This(), runs: std.ArrayListUnmanaged(Run)) void {
+            self.obsolete_runs.appendAssumeCapacity(runs);
+        }
+
+        fn deinit(self: *@This()) void {
+            deinitRunList(self.allocator, &self.runs);
+            for (self.obsolete_paths.items) |path| self.allocator.free(path);
+            self.obsolete_paths.deinit(self.allocator);
+            for (self.obsolete_runs.items) |*runs| deinitRunList(self.allocator, runs);
+            self.obsolete_runs.deinit(self.allocator);
+        }
+    };
+
+    const makeTestRun = struct {
+        fn make(allocator: std.mem.Allocator, id: u64, level: u32) !Run {
+            const path = try std.fmt.allocPrint(allocator, "/runs/{}.tbl", .{id});
+            errdefer allocator.free(path);
+            const smallest_key = try allocator.dupe(u8, "a");
+            errdefer allocator.free(smallest_key);
+            const largest_key = try allocator.dupe(u8, "z");
+            return .{
+                .id = id,
+                .level = level,
+                .size_bytes = 1,
+                .path = path,
+                .smallest_namespace_name = null,
+                .smallest_key = smallest_key,
+                .largest_namespace_name = null,
+                .largest_key = largest_key,
+                .entry_count = 1,
+                .bloom_filter = null,
+                .state = null,
+            };
+        }
+    }.make;
+
+    var observed_preflight_failure = false;
+    for (0..12) |failure_offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const allocator = failing.allocator();
+        var backend = FakeBackend{ .allocator = allocator };
+        defer backend.deinit();
+        try backend.runs.append(allocator, try makeTestRun(allocator, 1, 0));
+        try backend.runs.append(allocator, try makeTestRun(allocator, 2, 0));
+
+        var compacted_runs = std.ArrayListUnmanaged(Run).empty;
+        defer discardOutputRuns(FakeBackend, &backend, &compacted_runs);
+        try compacted_runs.append(allocator, try makeTestRun(allocator, 3, 1));
+
+        failing.fail_index = failing.alloc_index + failure_offset;
+        failing.resize_fail_index = failing.resize_index + failure_offset;
+        const result = installCompactedRuns(
+            FakeBackend,
+            &backend,
+            .{
+                .source_level = 0,
+                .source_start = 0,
+                .source_len = 2,
+                .target_start = 2,
+                .target_len = 0,
+                .output_level = 1,
+            },
+            2,
+            2,
+            0,
+            &compacted_runs,
+        );
+        if (result) |_| {
+            try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+            try std.testing.expectEqual(@as(u64, 3), backend.runs.items[0].id);
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            observed_preflight_failure = true;
+            try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+            try std.testing.expectEqual(@as(u64, 1), backend.runs.items[0].id);
+            try std.testing.expectEqual(@as(u64, 2), backend.runs.items[1].id);
+            try std.testing.expectEqual(@as(usize, 1), compacted_runs.items.len);
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+        }
+    }
+    try std.testing.expect(observed_preflight_failure);
 }
