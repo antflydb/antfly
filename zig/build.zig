@@ -4816,6 +4816,7 @@ pub fn build(b: *std.Build) void {
             "enrichment worker chunk cache keys preserve embedded separators",
             "search request text stats keys preserve embedded separators",
             "merge distributed background text stats keys preserve embedded separators",
+            "significant_terms local background stats use postings without stored index source",
             "graph edge local read rejects stale identity namespace",
             "dense metadata keys preserve embedded index separators",
             "dense metadata lookups read legacy textual rows",
@@ -6374,6 +6375,30 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
+    // Release-blocker regressions must run in the PR/base unit gate. Keep this
+    // as a focused artifact so CI does not need to run the entire DB suite.
+    const release_blocker_regression_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+            "db one real delete keeps filtered full text on complement path across restart",
+            "non-visible doc set complements visibility per generation",
+            "built-in exact dense scorer filters metadata before vector reads",
+            "sorted unique vector id subtraction handles sparse and dense exclusions",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_release_blocker_regression_tests = addFilteredTestRunArtifact(b, release_blocker_regression_tests);
+    const release_blocker_regression_step = b.step(
+        "release-blocker-regression-test",
+        "Run selective ANN and post-delete full-text release-blocker regressions",
+    );
+    release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
+    unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
+
     const db_restore_identity_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{"db restore snapshot repeatedly validates run-backed doc identity metadata"},
@@ -7267,6 +7292,15 @@ pub fn build(b: *std.Build) void {
             "streaming phrase scorer matches randomized positional reference",
             "phrase filter exact adjacency",
             "phrase filter with slop",
+            "prefix filter seeks late range in large term dictionary",
+            "prefix filter uses a materialized companion with old-segment fallback",
+            "exact inclusive term range preserves prefix constant scores",
+            "multi_match bool_prefix preserves root semantics and bounds shingle prefixes",
+            "segment term statistics stay immutable while tombstones mask hits",
+            "retained snapshots share tombstones and immutable BM25 statistics",
+            "concurrent searches safely observe in-place deletion publication",
+            "resolved ordinal filters subtract non-visible complement without live probes",
+            "db one real delete keeps filtered full text on complement path across restart",
             "PostingsIterator positional seek decodes only selected records",
             "PostingsIterator deferred positional seek decodes only accepted candidates",
             "PostingsIterator streams deferred grouped positions without scratch arrays",
@@ -7306,7 +7340,6 @@ pub fn build(b: *std.Build) void {
             "bool fallback applies native doc number constraints",
             "db text kernel search matches projected search without stored bodies",
             "split preserves postings when text segments omit source bodies",
-            "background text stats use postings when segment source is omitted",
             "text score query exposes score top k sort profile",
         },
         .test_runner = .{

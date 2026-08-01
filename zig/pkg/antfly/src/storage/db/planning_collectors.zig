@@ -33,7 +33,7 @@ pub fn resolveTextIndexEstimate(
     const entry = core.textIndexEntry(index_name) orelse return null;
     const chunk_backed = entry.chunk_name != null;
     const persistent = core.textIndex(entry.config.name) orelse return error.IndexNotFound;
-    const indexed_doc_count = persistent.snapshot().global_doc_count;
+    const indexed_doc_count = persistent.snapshot().liveDocCount();
     return .{
         .name = try alloc.dupe(u8, entry.config.name),
         .doc_count = if (indexed_doc_count > 0) indexed_doc_count else try scanPrimaryDocCount(core),

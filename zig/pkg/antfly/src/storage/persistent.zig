@@ -1955,11 +1955,23 @@ pub const PersistentIndex = struct {
 
         var inputs = try work_alloc.alloc(segment_mod.MergeInput, segment_indices.len);
         defer work_alloc.free(inputs);
+        const owned_deleted_docs = try work_alloc.alloc(
+            ?roaring.RoaringBitmap,
+            if (deleted_docs == null) segment_indices.len else 0,
+        );
+        defer {
+            for (owned_deleted_docs) |*maybe_deleted| {
+                if (maybe_deleted.*) |*deleted| deleted.deinit();
+            }
+            work_alloc.free(owned_deleted_docs);
+        }
+        if (owned_deleted_docs.len > 0) @memset(owned_deleted_docs, null);
         for (segment_indices, 0..) |seg_idx, i| {
             const seg = &snap.segments[seg_idx];
+            if (deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(work_alloc);
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = if (deleted_docs) |frozen| frozen[i] else seg.shared.deleted,
+                .deleted = if (deleted_docs) |frozen| frozen[i] else owned_deleted_docs[i],
             };
         }
         const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);
@@ -2802,7 +2814,7 @@ test "persistent index write and read" {
         try pi.indexSegment(seg);
 
         const snap = pi.snapshot();
-        try std.testing.expectEqual(@as(u32, 1), snap.global_doc_count);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
     }
 }
 
@@ -2825,7 +2837,7 @@ test "persistent index reopen recovery" {
         defer alloc.free(seg2);
         try pi.indexSegment(seg2);
 
-        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().global_doc_count);
+        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().liveDocCount());
     }
 
     // Reopen and verify data survived
@@ -2833,7 +2845,7 @@ test "persistent index reopen recovery" {
         var pi = try PersistentIndex.open(alloc, .{ .path = path });
         defer pi.close();
 
-        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().global_doc_count);
+        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().liveDocCount());
 
         // Verify search works
         const snap = pi.snapshot();
@@ -3200,7 +3212,7 @@ test "persistent index hands off right-only segments to child index" {
     try std.testing.expectEqualStrings("doc:z", ranges[0].max_doc_key);
 
     const snap = dest.snapshot();
-    try std.testing.expectEqual(@as(u32, 1), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 
     const middle_results = try snap.search(alloc, "body", &.{"middle"}, 10);
     defer alloc.free(middle_results.hits);
@@ -3348,7 +3360,7 @@ test "persistent index reopens with durable lsm main backend" {
         defer idx.close();
 
         const snap = idx.snapshot();
-        try std.testing.expectEqual(@as(u32, 1), snap.global_doc_count);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
         const results = try snap.search(alloc, "body", &.{"alpha"}, 10);
         defer alloc.free(results.hits);
         try std.testing.expectEqual(@as(u32, 1), results.total_count);
@@ -3536,7 +3548,7 @@ fn persistentSimSummaryFromIndex(alloc: Allocator, pi: *PersistentIndex) !Persis
 
     const snap = pi.snapshot();
     return .{
-        .doc_count = snap.global_doc_count,
+        .doc_count = snap.liveDocCount(),
         .segment_count = ranges.len,
         .alpha_hits = try persistentSearchHitCount(alloc, snap, "alpha"),
         .beta_hits = try persistentSearchHitCount(alloc, snap, "beta"),
@@ -4380,7 +4392,7 @@ fn expectPersistentTextCompactionView(
     }
 
     const snap = pi.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), snap.liveDocCount());
     try std.testing.expectEqual(expected_segments, ranges.len);
     try std.testing.expectEqual(stale_hits, try persistentSearchHitCount(alloc, snap, "stale"));
     try std.testing.expectEqual(fresh_hits, try persistentSearchHitCount(alloc, snap, "fresh"));

@@ -2580,7 +2580,7 @@ test "introducer builds and indexes a batch" {
     } });
 
     const snap = writer.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), snap.liveDocCount());
 
     const results = try snap.search(alloc, "title", &.{"hello"}, 10);
     defer alloc.free(results.hits);
@@ -2617,7 +2617,7 @@ test "multiple batches create multiple segments" {
     } });
 
     try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
-    try std.testing.expectEqual(@as(u32, 2), writer.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
 }
 
 test "buildSegmentFromText analyzes and indexes text" {
@@ -2648,7 +2648,7 @@ test "buildSegmentFromText analyzes and indexes text" {
     try writer.addSegment(seg_bytes);
 
     const snap = writer.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), snap.liveDocCount());
 
     // Check what terms the default analyzer produces for "Running"
     const check_tokens = try analysis_mod.default_analyzer.analyze(alloc, "Running");
