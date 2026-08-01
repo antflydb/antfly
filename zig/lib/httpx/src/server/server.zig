@@ -133,6 +133,21 @@ fn routeErrorBody(code: u16) []const u8 {
     };
 }
 
+/// Reports whether `input` begins with a complete HTTP/1 request under the
+/// same parser limits as this server. `input` is the connection loop's
+/// unconsumed suffix after dispatching the current request, so non-empty data
+/// alone is not enough: it may be a partial or malformed next request.
+fn hasCompleteBufferedH1Request(allocator: Allocator, input: []const u8, config: ServerConfig) bool {
+    if (input.len == 0) return false;
+
+    var probe = Parser.init(allocator);
+    defer probe.deinit();
+    probe.max_body_size = config.max_body_size;
+    probe.max_headers = config.max_headers;
+    _ = probe.feed(input) catch return false;
+    return probe.isComplete();
+}
+
 /// Request context passed to handlers.
 pub const Context = struct {
     allocator: Allocator,
@@ -1216,7 +1231,11 @@ pub const Server = struct {
             var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
             ctx.h1_sock = &sock;
-            ctx.h1_has_buffered_input = leftover > 0;
+            // A non-empty suffix is not necessarily a pipelined request: it
+            // can be a partial or malformed request line. Only suppress a
+            // peer-FIN cancellation when a fresh parser can complete the
+            // following request without changing the live parser or buffer.
+            ctx.h1_has_buffered_input = hasCompleteBufferedH1Request(self.allocator, buffer[0..leftover], self.config);
             defer ctx.deinit();
 
             for (self.pre_route_hooks.items) |hook| {
@@ -3023,6 +3042,58 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try std.testing.expect(State.second_handled.load(.acquire));
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nA") != null);
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
+}
+
+test "H1 context does not treat a partial pipeline suffix as buffered input" {
+    if (builtin.os.tag == .windows) return;
+
+    const State = struct {
+        var first_saw_buffered_input = std.atomic.Value(bool).init(true);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            first_saw_buffered_input.store(ctx.h1_has_buffered_input, .release);
+            return ctx.text("A");
+        }
+    };
+    State.first_saw_buffered_input.store(true, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.get("/a", State.handler);
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("partial-pipeline listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(address, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    // The trailing G starts a second request but cannot complete one. A FIN
+    // after it must remain observable as cancellation of A, rather than being
+    // suppressed as though a valid pipelined request were buffered.
+    try client.sendAll("GET /a HTTP/1.1\r\nHost: test\r\n\r\nG");
+    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
+
+    var response: [1024]u8 = undefined;
+    while (try client.recv(&response) != 0) {}
+
+    try std.testing.expect(!State.first_saw_buffered_input.load(.acquire));
 }
 
 test "connection interruption preserves the fiber-owned descriptor" {
