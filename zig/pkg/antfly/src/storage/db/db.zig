@@ -4515,6 +4515,21 @@ pub const DB = struct {
         return write_stats;
     }
 
+    fn storageChangeTokenLocked(self: *DB) u64 {
+        const write_stats = self.snapshotLsmWriteStatsLocked();
+        var hasher = std.hash.Wyhash.init(0x6c736d5f73746f72);
+        // Directory scans are intentionally coarser than write accounting.
+        // Bucket WAL growth so a sustained stream cannot force one recursive
+        // scan per status refresh while keeping reported bytes within 1 MiB.
+        const wal_growth_bucket = write_stats.wal_append_bytes / (1024 * 1024);
+        hasher.update(std.mem.asBytes(&wal_growth_bucket));
+        hasher.update(std.mem.asBytes(&write_stats.wal_resets));
+        hasher.update(std.mem.asBytes(&write_stats.table_file_bytes));
+        hasher.update(std.mem.asBytes(&write_stats.manifest_writes));
+        hasher.update(std.mem.asBytes(&write_stats.manifest_bytes));
+        return hasher.final();
+    }
+
     pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
@@ -18605,6 +18620,7 @@ pub const DB = struct {
         }
 
         return .{
+            .storage_change_token = self.storageChangeTokenLocked(),
             .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
@@ -36467,6 +36483,14 @@ fn clearSplitMetadataFromStore(alloc: Allocator, dest_store: *docstore_mod.DocSt
 
 fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docstore_mod.DocStore) !void {
     try deleteKeysWithPrefixFromStore(alloc, dest_store, "\x00\x00__metadata__:");
+    // Split destinations register and populate their index generations
+    // synchronously below. A physical LSM split also carries replay-namespace
+    // control rows, including a tombstone-shadowed admission marker from the
+    // source's history. Never let source-generation admission state quarantine
+    // an independently constructed destination generation.
+    const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+    defer alloc.free(admission_prefix);
+    try deleteKeysWithPrefixFromStore(alloc, dest_store, admission_prefix);
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -75294,6 +75318,10 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    const copied_admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, "ft_v1");
+    defer alloc.free(copied_admission_key);
+    try std.testing.expectError(error.NotFound, split_db.core.store.get(alloc, copied_admission_key));
+    try std.testing.expect(!split_db.core.index_manager.repairUnavailable("ft_v1"));
     {
         const split_stats = try split_db.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, split_stats);

@@ -556,6 +556,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
         for (obsolete_runs.items) |*run| run.deinit(backend.allocator);
         obsolete_runs.deinit(backend.allocator);
     }
+    try obsolete_runs.ensureTotalCapacity(backend.allocator, selected_len);
 
     var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
     defer backend.allocator.free(remove);
@@ -563,10 +564,24 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     for (plan.source_start..plan.source_start + plan.source_len) |i| remove[i] = true;
     for (plan.target_start..plan.target_start + plan.target_len) |i| remove[i] = true;
 
+    // Prepare every allocation before transferring ownership from the active
+    // version. A failed compaction publication must leave both the live run
+    // set and its obsolete-file bookkeeping untouched.
+    var obsolete_paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (obsolete_paths.items) |path| backend.allocator.free(path);
+        obsolete_paths.deinit(backend.allocator);
+    }
+    try obsolete_paths.ensureTotalCapacity(backend.allocator, selected_len);
+    for (backend.runs.items, remove) |run, removed| {
+        if (!removed) continue;
+        if (run.path) |path| obsolete_paths.appendAssumeCapacity(try backend.allocator.dupe(u8, path));
+    }
+    try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
+
     for (backend.runs.items, 0..) |*run, i| {
         if (remove[i]) {
-            if (run.path) |path| try queueObsoleteFilePath(BackendType, backend, try backend.allocator.dupe(u8, path));
-            try obsolete_runs.append(backend.allocator, run.*);
+            obsolete_runs.appendAssumeCapacity(run.*);
             run.* = undefined;
             continue;
         }
@@ -596,7 +611,13 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
-    try backend.queueObsoleteRuns(obsolete_runs);
+    for (obsolete_paths.items) |*path| {
+        backend.queueObsoleteFilePathAssumeCapacity(path.*);
+        path.* = &.{};
+    }
+    obsolete_paths.items.len = 0;
+    backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
+    obsolete_runs = .empty;
 }
 
 fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
@@ -819,6 +840,7 @@ fn installCompactedRuns(
         for (obsolete_runs.items) |*run| run.deinit(backend.allocator);
         obsolete_runs.deinit(backend.allocator);
     }
+    try obsolete_runs.ensureTotalCapacity(backend.allocator, selected_len);
 
     var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
     defer backend.allocator.free(remove);
@@ -826,10 +848,24 @@ fn installCompactedRuns(
     for (plan.source_start..plan.source_start + plan.source_len) |i| remove[i] = true;
     for (plan.target_start..plan.target_start + plan.target_len) |i| remove[i] = true;
 
+    // The build ran without the backend lock. After revalidation, stage every
+    // remaining allocation before changing the live version so OOM leaves the
+    // old run set fully intact and the new files safely discardable.
+    var obsolete_paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (obsolete_paths.items) |path| backend.allocator.free(path);
+        obsolete_paths.deinit(backend.allocator);
+    }
+    try obsolete_paths.ensureTotalCapacity(backend.allocator, selected_len);
+    for (backend.runs.items, remove) |run, removed| {
+        if (!removed) continue;
+        if (run.path) |path| obsolete_paths.appendAssumeCapacity(try backend.allocator.dupe(u8, path));
+    }
+    try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
+
     for (backend.runs.items, 0..) |*run, i| {
         if (remove[i]) {
-            if (run.path) |path| try queueObsoleteFilePath(BackendType, backend, try backend.allocator.dupe(u8, path));
-            try obsolete_runs.append(backend.allocator, run.*);
+            obsolete_runs.appendAssumeCapacity(run.*);
             run.* = undefined;
             continue;
         }
@@ -859,7 +895,13 @@ fn installCompactedRuns(
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
-    try backend.queueObsoleteRuns(obsolete_runs);
+    for (obsolete_paths.items) |*path| {
+        backend.queueObsoleteFilePathAssumeCapacity(path.*);
+        path.* = &.{};
+    }
+    obsolete_paths.items.len = 0;
+    backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
+    obsolete_runs = .empty;
 }
 
 pub fn discardOutputRuns(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
@@ -1646,6 +1688,18 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
     };
 }
 
+test "lsm compaction sizes bloom filters per bounded output run" {
+    var first = testRun(1, 0, "doc:a", "doc:m", 1000);
+    first.entry_count = 100;
+    var second = testRun(2, 0, "doc:n", "doc:z", 1000);
+    second.entry_count = 100;
+    const inputs = [_]*Run{ &first, &second };
+
+    try std.testing.expectEqual(@as(usize, 38), estimatedCompactionOutputEntries(&inputs, 500));
+    try std.testing.expectEqual(@as(usize, 3), estimatedCompactionOutputEntries(&inputs, 40));
+    try std.testing.expectEqual(@as(usize, 1), estimatedCompactionOutputEntries(&inputs, 1));
+}
+
 test "lsm compaction lower-level repair can exceed input target for minimum job" {
     const runs = [_]Run{
         testRun(1, 1, "doc:a", "doc:m", 100),
@@ -1907,7 +1961,7 @@ fn makeStateRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendTy
     return try makeRunsFromStateAtLevel(BackendType, backend, &merged, level);
 }
 
-fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32) !std.ArrayListUnmanaged(Run) {
+pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32) !std.ArrayListUnmanaged(Run) {
     const allocator = backend.allocator;
     const expected_entries = countRunPtrEntries(window_runs);
 
@@ -1930,6 +1984,7 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
     var output_active = false;
     defer if (output_active) output.deinit();
     const target_bytes = targetRunFileBytes(BackendType, backend);
+    const expected_entries_per_output = estimatedCompactionOutputEntries(window_runs, target_bytes);
     var consumed_entries: usize = 0;
     var emitted_entries: usize = 0;
 
@@ -1948,7 +2003,8 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
                 backend.options.run_partition_prefix_bytes,
             );
             if (partition_changed or
-                (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes))
+                (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes) or
+                (output.entry_count > 0 and !output.canAppendEntry(winner)))
             {
                 try runs.ensureUnusedCapacity(allocator, 1);
                 const run = try output.finish();
@@ -1959,13 +2015,15 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
         }
 
         if (!output_active) {
+            const remaining_entries = expected_entries - consumed_entries;
             try output.initInPlace(
                 backend,
                 output_level,
-                @max(@as(usize, 1), expected_entries),
+                @max(@as(usize, 1), @min(remaining_entries, expected_entries_per_output)),
             );
             output_active = true;
         }
+        if (!output.canAppendEntry(winner)) return error.TableFileTooLarge;
         try output.appendEntry(winner, entry_bytes);
         emitted_entries += 1;
         consumed_entries += try heap.advanceTopSourcesAtKey(winner);
@@ -2025,6 +2083,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 backend.root_dir.?,
                 run_id,
                 expected_entries,
+                physicalRunFileLimit(BackendType, backend),
                 backend.options.bloom,
                 backend.options.table_block_compression,
                 backend.options.table_prefix_extractor,
@@ -2080,6 +2139,10 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             new_largest_key = &.{};
             self.entry_count += 1;
             self.logical_bytes += entry_bytes;
+        }
+
+        fn canAppendEntry(self: *const Self, entry: lsm_table_file.Entry) bool {
+            return self.writer.canAppendEntry(entry);
         }
 
         fn finish(self: *Self) !Run {
@@ -2341,6 +2404,30 @@ fn tableEntryLogicalBytes(entry: lsm_table_file.Entry) usize {
         entry.value.len;
 }
 
+const minimum_table_entry_logical_bytes = 1 + 3 * @sizeOf(u32);
+
+/// Size each output Bloom filter for one target-sized run, rather than for the
+/// entire compaction window. The physical input density gives a useful
+/// workload-specific estimate; the encoded minimum supplies a hard upper
+/// bound even for highly compressed inputs or incomplete legacy metadata.
+fn estimatedCompactionOutputEntries(window_runs: []const *Run, target_bytes: usize) usize {
+    var total_entries: u128 = 0;
+    var total_bytes: u128 = 0;
+    for (window_runs) |run| {
+        total_entries +|= run.entry_count;
+        total_bytes +|= run.size_bytes;
+    }
+    if (total_entries == 0) return 1;
+
+    const encoded_upper_bound = @max(@as(u128, 1), @as(u128, target_bytes) / minimum_table_entry_logical_bytes);
+    const proportional = if (total_bytes == 0)
+        encoded_upper_bound
+    else
+        (@as(u128, target_bytes) *| total_entries +| (total_bytes - 1)) / total_bytes;
+    const bounded = @max(@as(u128, 1), @min(total_entries, @min(proportional, encoded_upper_bound)));
+    return @intCast(@min(bounded, std.math.maxInt(usize)));
+}
+
 fn ensureRunStateForBackend(comptime BackendType: type, backend: *BackendType, run: *Run) !*const State {
     if (@hasField(BackendType, "storage")) {
         if (backend.storage) |storage| return try run.ensureStateWithStorage(backend.allocator, storage);
@@ -2352,15 +2439,6 @@ fn compareTableEntry(lhs: lsm_table_file.Entry, rhs: lsm_table_file.Entry) std.m
     const namespace_order = state_mod.compareNamespace(.{ .name = lhs.namespace_name }, .{ .name = rhs.namespace_name });
     if (namespace_order != .eq) return namespace_order;
     return std.mem.order(u8, lhs.key, rhs.key);
-}
-
-fn queueObsoleteFilePath(comptime BackendType: type, backend: *BackendType, path: []u8) !void {
-    if (@hasDecl(BackendType, "queueObsoleteFilePath")) {
-        try backend.queueObsoleteFilePath(path);
-    } else {
-        repository_mod.deleteFileAbsoluteWithStorage(backend.storage.?, path) catch {};
-        backend.allocator.free(path);
-    }
 }
 
 pub fn makeRun(comptime BackendType: type, backend: *BackendType, state: State) !Run {
@@ -2400,7 +2478,7 @@ pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendTy
     return try makeRunsFromSortedTableEntriesAtLevel(BackendType, backend, entries, 0);
 }
 
-fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
+pub fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
     if (state.entries.items.len == 0) return error.EmptyRun;
     try validateSortedUniqueOwnedEntries(state.entries.items);
 
@@ -2410,16 +2488,22 @@ fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend
     const target_bytes = targetRunFileBytes(BackendType, backend);
     var start: usize = 0;
     while (start < state.entries.items.len) {
-        const end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        const preferred_end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes);
         try runs.ensureUnusedCapacity(backend.allocator, 1);
 
         var output: PersistedOutputRunBuilder(BackendType) = undefined;
-        try output.initInPlace(backend, level, end - start);
+        try output.initInPlace(backend, level, preferred_end - start);
         var output_active = true;
         errdefer if (output_active) output.deinit();
 
-        for (state.entries.items[start..end]) |entry| {
+        var end = start;
+        while (end < preferred_end) : (end += 1) {
+            const entry = state.entries.items[end];
             const table_entry = tableEntryFromOwnedEntry(entry);
+            if (!output.canAppendEntry(table_entry)) {
+                if (end == start) return error.TableFileTooLarge;
+                break;
+            }
             try output.appendEntry(table_entry, estimateOwnedEntryBytes(entry));
         }
 
@@ -2439,6 +2523,13 @@ pub fn makeRunsFromSortedTableEntries(comptime BackendType: type, backend: *Back
 
 fn makeRunsFromStateAtLevel(comptime BackendType: type, backend: *BackendType, state: *State, level: u32) !std.ArrayListUnmanaged(Run) {
     if (state.entries.items.len == 0) return error.EmptyRun;
+
+    if (backend.root_dir != null) {
+        const runs = try makePersistedRunsFromStateBorrowedAtLevel(BackendType, backend, state, level);
+        state.deinit(backend.allocator);
+        state.* = .{};
+        return runs;
+    }
 
     var source_entries = state.entries;
     state.entries = .empty;
@@ -2486,8 +2577,31 @@ fn makeRunsFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *B
     var start: usize = 0;
     while (start < entries.len) {
         try runs.ensureUnusedCapacity(backend.allocator, 1);
-        const end = splitTableEntriesEnd(entries, start, target_bytes, backend.options.run_partition_prefix_bytes);
-        const run = try makeRunFromSortedTableEntriesAtLevel(BackendType, backend, entries[start..end], level);
+        const preferred_end = splitTableEntriesEnd(entries, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        if (backend.root_dir == null) {
+            const run = try makeRunFromSortedTableEntriesAtLevel(BackendType, backend, entries[start..preferred_end], level);
+            runs.appendAssumeCapacity(run);
+            start = preferred_end;
+            continue;
+        }
+
+        var output: PersistedOutputRunBuilder(BackendType) = undefined;
+        try output.initInPlace(backend, level, preferred_end - start);
+        var output_active = true;
+        errdefer if (output_active) output.deinit();
+
+        var end = start;
+        while (end < preferred_end) : (end += 1) {
+            const entry = entries[end];
+            if (!output.canAppendEntry(entry)) {
+                if (end == start) return error.TableFileTooLarge;
+                break;
+            }
+            try output.appendEntry(entry, estimateTableEntryBytes(entry));
+        }
+        const run = try output.finish();
+        output.deinit();
+        output_active = false;
         runs.appendAssumeCapacity(run);
         start = end;
     }
@@ -2528,14 +2642,16 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
     errdefer if (run.bloom_filter) |*filter| filter.deinit(backend.allocator);
 
     if (backend.root_dir != null) {
-        run.path = try repository_mod.persistRunFileWithStorageAccounted(
+        run.path = try repository_mod.persistRunFileWithStorageAccountedOptions(
             backend.storage.?,
             backend.allocator,
             backend.root_dir.?,
             &run,
+            backend.options.bloom,
             backend.options.table_block_compression,
             backend.options.table_prefix_extractor,
             backend.options.resource_manager,
+            physicalRunFileLimit(BackendType, backend),
         );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
         run.state = null;
@@ -2583,6 +2699,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         backend.root_dir.?,
         run_id,
         entries.len,
+        physicalRunFileLimit(BackendType, backend),
         backend.options.bloom,
         backend.options.table_block_compression,
         backend.options.table_prefix_extractor,
@@ -2695,7 +2812,18 @@ fn disarmRun(run: *Run) void {
 }
 
 fn targetRunFileBytes(comptime BackendType: type, backend: *BackendType) usize {
-    return @max(@as(usize, 1), @min(backend.options.max_run_file_bytes, lsm_table_file.max_entry_data_len));
+    return @max(@as(usize, 1), @min(
+        backend.options.max_run_file_bytes,
+        lsm_table_file.max_entry_data_len,
+        physicalRunFileLimit(BackendType, backend),
+    ));
+}
+
+fn physicalRunFileLimit(comptime BackendType: type, backend: *BackendType) usize {
+    return @max(@as(usize, 1), @min(
+        backend.options.max_run_file_physical_bytes,
+        repository_mod.maxRunFileReadBytes(),
+    ));
 }
 
 fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, target_bytes: usize, partition_prefix_bytes: usize) usize {
@@ -2833,4 +2961,104 @@ test "unlocked compaction snapshots retain source file references until build cl
     releaseCompactionSnapshots(FakeBackend, &backend, &snapshots);
     try std.testing.expectEqual(@as(usize, 1), backend.released);
     try std.testing.expectEqual(@as(usize, 0), snapshots.items.len);
+}
+
+test "compaction publication OOM leaves the active run version intact" {
+    const FakeBackend = struct {
+        allocator: std.mem.Allocator,
+        runs: std.ArrayListUnmanaged(Run) = .empty,
+        obsolete_paths: std.ArrayListUnmanaged([]u8) = .empty,
+        obsolete_runs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Run)) = .empty,
+
+        fn reserveObsoletePublication(self: *@This(), path_count: usize, run_list_count: usize) !void {
+            try self.obsolete_paths.ensureUnusedCapacity(self.allocator, path_count);
+            try self.obsolete_runs.ensureUnusedCapacity(self.allocator, run_list_count);
+        }
+
+        fn queueObsoleteFilePathAssumeCapacity(self: *@This(), path: []u8) void {
+            self.obsolete_paths.appendAssumeCapacity(path);
+        }
+
+        fn queueObsoleteRunsAssumeCapacity(self: *@This(), runs: std.ArrayListUnmanaged(Run)) void {
+            self.obsolete_runs.appendAssumeCapacity(runs);
+        }
+
+        fn deinit(self: *@This()) void {
+            deinitRunList(self.allocator, &self.runs);
+            for (self.obsolete_paths.items) |path| self.allocator.free(path);
+            self.obsolete_paths.deinit(self.allocator);
+            for (self.obsolete_runs.items) |*runs| deinitRunList(self.allocator, runs);
+            self.obsolete_runs.deinit(self.allocator);
+        }
+    };
+
+    const makeTestRun = struct {
+        fn make(allocator: std.mem.Allocator, id: u64, level: u32) !Run {
+            const path = try std.fmt.allocPrint(allocator, "/runs/{}.tbl", .{id});
+            errdefer allocator.free(path);
+            const smallest_key = try allocator.dupe(u8, "a");
+            errdefer allocator.free(smallest_key);
+            const largest_key = try allocator.dupe(u8, "z");
+            return .{
+                .id = id,
+                .level = level,
+                .size_bytes = 1,
+                .path = path,
+                .smallest_namespace_name = null,
+                .smallest_key = smallest_key,
+                .largest_namespace_name = null,
+                .largest_key = largest_key,
+                .entry_count = 1,
+                .bloom_filter = null,
+                .state = null,
+            };
+        }
+    }.make;
+
+    var observed_preflight_failure = false;
+    for (0..12) |failure_offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const allocator = failing.allocator();
+        var backend = FakeBackend{ .allocator = allocator };
+        defer backend.deinit();
+        try backend.runs.append(allocator, try makeTestRun(allocator, 1, 0));
+        try backend.runs.append(allocator, try makeTestRun(allocator, 2, 0));
+
+        var compacted_runs = std.ArrayListUnmanaged(Run).empty;
+        defer discardOutputRuns(FakeBackend, &backend, &compacted_runs);
+        try compacted_runs.append(allocator, try makeTestRun(allocator, 3, 1));
+
+        failing.fail_index = failing.alloc_index + failure_offset;
+        failing.resize_fail_index = failing.resize_index + failure_offset;
+        const result = installCompactedRuns(
+            FakeBackend,
+            &backend,
+            .{
+                .source_level = 0,
+                .source_start = 0,
+                .source_len = 2,
+                .target_start = 2,
+                .target_len = 0,
+                .output_level = 1,
+            },
+            2,
+            2,
+            0,
+            &compacted_runs,
+        );
+        if (result) |_| {
+            try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+            try std.testing.expectEqual(@as(u64, 3), backend.runs.items[0].id);
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            observed_preflight_failure = true;
+            try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+            try std.testing.expectEqual(@as(u64, 1), backend.runs.items[0].id);
+            try std.testing.expectEqual(@as(u64, 2), backend.runs.items[1].id);
+            try std.testing.expectEqual(@as(usize, 1), compacted_runs.items.len);
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+        }
+    }
+    try std.testing.expect(observed_preflight_failure);
 }

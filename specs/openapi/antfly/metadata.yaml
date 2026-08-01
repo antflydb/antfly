@@ -3773,6 +3773,35 @@ components:
         wal_retained_bytes:
           type: integer
           format: uint64
+        wal_checkpoint_pending:
+          type: boolean
+          description: Whether WAL checkpoint maintenance is pending.
+        wal_pressure_blocked:
+          type: boolean
+          description: Whether WAL hard-limit admission is currently blocked.
+        wal_checkpoint_retry_reason:
+          type: string
+          description: Representative reason for the earliest pending WAL checkpoint retry.
+        wal_checkpoint_retry_attempts:
+          type: integer
+          format: uint64
+          description: Consecutive failures for the representative WAL checkpoint retry.
+        wal_checkpoint_retry_delay_ns:
+          type: integer
+          format: uint64
+          description: Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+        active_immutable_logical_bytes:
+          type: integer
+          format: uint64
+          description: Logical bytes in immutable memtables awaiting run publication.
+        unpublished_wal_logical_bytes:
+          type: integer
+          format: uint64
+          description: Logical bytes in runs awaiting durable manifest publication.
+        unpublished_wal_max_batch_logical_bytes:
+          type: integer
+          format: uint64
+          description: Largest logical batch awaiting durable manifest publication.
         compaction_backlog_bytes:
           type: integer
           format: uint64
