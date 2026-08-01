@@ -65,6 +65,9 @@ pub const Parser = struct {
     status_code: ?u16 = null,
     headers: Headers,
     body_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    /// Whether parsed body bytes should be retained in `body_buffer`.
+    /// Disable this for callers which only need message framing/completeness.
+    store_body: bool = true,
     content_length: ?u64 = null,
     chunked: bool = false,
     current_chunk_size: usize = 0,
@@ -431,7 +434,9 @@ pub const Parser = struct {
             if (len > 0) {
                 // Pre-allocate the body buffer to avoid repeated reallocs
                 // during incremental parsing of fixed-length bodies.
-                self.body_buffer.ensureTotalCapacity(self.allocator, @intCast(len)) catch {};
+                if (self.store_body) {
+                    self.body_buffer.ensureTotalCapacity(self.allocator, @intCast(len)) catch {};
+                }
                 self.state = .body;
             } else {
                 self.state = .complete;
@@ -451,7 +456,9 @@ pub const Parser = struct {
             }
             const remaining = len - self.bytes_read;
             const to_read = @min(data.len, @as(usize, @intCast(remaining)));
-            try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+            if (self.store_body) {
+                try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+            }
             self.bytes_read += to_read;
 
             if (self.bytes_read >= len) {
@@ -466,7 +473,9 @@ pub const Parser = struct {
             self.error_reason = .body_too_large;
             return error.BodyTooLarge;
         }
-        try self.body_buffer.appendSlice(self.allocator, data);
+        if (self.store_body) {
+            try self.body_buffer.appendSlice(self.allocator, data);
+        }
         return data.len;
     }
 
@@ -515,7 +524,9 @@ pub const Parser = struct {
             return error.BodyTooLarge;
         }
 
-        try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+        if (self.store_body) {
+            try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+        }
         self.bytes_read += to_read;
 
         if (self.bytes_read >= self.current_chunk_size) {
@@ -685,6 +696,22 @@ test "multi-feed parsing" {
     try std.testing.expectEqualStrings("/index.html", parser.path.?);
     try std.testing.expectEqualStrings("localhost", parser.headers.get("Host").?);
     try std.testing.expectEqualStrings("abc", parser.getBody());
+}
+
+test "Parser frames a partial large body without storing it" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    parser.store_body = false;
+
+    _ = try parser.feed(
+        "POST /upload HTTP/1.1\r\nContent-Length: 10485760\r\n\r\n" ++
+            "partial",
+    );
+
+    try std.testing.expect(!parser.isComplete());
+    try std.testing.expectEqual(@as(usize, 0), parser.body_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parser.body_buffer.capacity);
 }
 
 test "header size limit returns HeaderTooLarge" {

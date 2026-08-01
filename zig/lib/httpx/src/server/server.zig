@@ -142,10 +142,44 @@ fn hasCompleteBufferedH1Request(allocator: Allocator, input: []const u8, config:
 
     var probe = Parser.init(allocator);
     defer probe.deinit();
+    // This parser is only a framing probe for the next pipelined request.
+    // In particular, do not reserve the declared Content-Length before the
+    // complete body is known to be buffered.
+    probe.store_body = false;
     probe.max_body_size = config.max_body_size;
     probe.max_headers = config.max_headers;
     _ = probe.feed(input) catch return false;
     return probe.isComplete();
+}
+
+test "buffered H1 probe frames bodies without retaining them" {
+    const allocator = std.testing.allocator;
+    const config = ServerConfig{};
+
+    // A complete header block alone is not a complete fixed-length request.
+    try std.testing.expect(!hasCompleteBufferedH1Request(
+        allocator,
+        "POST /upload HTTP/1.1\r\nContent-Length: 10485760\r\n\r\n",
+        config,
+    ));
+    try std.testing.expect(hasCompleteBufferedH1Request(
+        allocator,
+        "POST /upload HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc",
+        config,
+    ));
+
+    // Chunk framing must remain incremental: an unfinished terminal chunk is
+    // not a pipelined request, while its completed form is.
+    try std.testing.expect(!hasCompleteBufferedH1Request(
+        allocator,
+        "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n",
+        config,
+    ));
+    try std.testing.expect(hasCompleteBufferedH1Request(
+        allocator,
+        "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        config,
+    ));
 }
 
 /// Request context passed to handlers.
