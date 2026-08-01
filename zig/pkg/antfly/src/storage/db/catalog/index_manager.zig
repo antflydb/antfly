@@ -48,6 +48,7 @@ const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
+const dense_exact = @import("../dense_exact.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
@@ -6639,7 +6640,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
-    ) !hbc_mod.SearchResults {
+    ) !dense_exact.SearchOutcome {
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -6657,25 +6658,9 @@ pub const IndexManager = struct {
             active_dense_vector_load_session = &vector_load_session.?;
         }
 
-        const candidate_storage = try self.alloc.dupe(u64, req.filter_ids);
-        defer self.alloc.free(candidate_storage);
-        std.mem.sort(u64, candidate_storage, {}, std.sort.asc(u64));
-        const sorted_unique_candidates = candidate_storage[0..uniqueSortedU64(candidate_storage)];
-
-        var owned_exclude_storage: ?[]u64 = null;
-        defer if (owned_exclude_storage) |storage| self.alloc.free(storage);
-        const sorted_unique_excludes: []const u64 = if (isSortedUniqueU64(req.exclude_ids))
-            req.exclude_ids
-        else blk: {
-            const storage = try self.alloc.dupe(u64, req.exclude_ids);
-            owned_exclude_storage = storage;
-            std.mem.sort(u64, storage, {}, std.sort.asc(u64));
-            break :blk storage[0..uniqueSortedU64(storage)];
-        };
-        const unique_candidate_ids = sorted_unique_candidates[0..subtractSortedUniqueU64InPlace(
-            sorted_unique_candidates,
-            sorted_unique_excludes,
-        )];
+        var candidates = try dense_exact.CandidateDifference.init(self.alloc, req.filter_ids, req.exclude_ids);
+        defer candidates.deinit();
+        const unique_candidate_ids = candidates.values;
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -6751,6 +6736,7 @@ pub const IndexManager = struct {
         const query_measure = vector_mod.norm(req.query);
         const vector_scratch = try self.alloc.alloc(f32, entry.dims);
         defer self.alloc.free(vector_scratch);
+        var vectors_scored: u64 = 0;
         for (unique_candidate_ids, candidate_metadata, fallback_doc_keys) |vector_id, maybe_metadata, fallback_doc_key| {
             const doc_key = maybe_metadata orelse fallback_doc_key;
             const vector = (if (vector_cursor) |*cursor|
@@ -6766,6 +6752,7 @@ pub const IndexManager = struct {
             };
             if (vector.len != req.query.len) return error.DimensionMismatch;
 
+            vectors_scored += 1;
             const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
             if (!std.math.isFinite(distance)) continue;
             if (req.distance_over) |threshold| {
@@ -6792,7 +6779,10 @@ pub const IndexManager = struct {
                 results.getHits().len,
             });
         }
-        return results;
+        return .{
+            .results = results,
+            .vectors_scored = vectors_scored,
+        };
     }
 
     pub fn textIndexesForChunk(
@@ -17187,28 +17177,6 @@ fn uniqueSortedU64(items: []u64) usize {
     return write;
 }
 
-fn isSortedUniqueU64(items: []const u64) bool {
-    if (items.len < 2) return true;
-    for (items[1..], items[0 .. items.len - 1]) |item, previous| {
-        if (item <= previous) return false;
-    }
-    return true;
-}
-
-fn subtractSortedUniqueU64InPlace(values: []u64, excluded: []const u64) usize {
-    var out: usize = 0;
-    var excluded_index: usize = 0;
-    for (values) |value| {
-        while (excluded_index < excluded.len and excluded[excluded_index] < value) {
-            excluded_index += 1;
-        }
-        if (excluded_index < excluded.len and excluded[excluded_index] == value) continue;
-        values[out] = value;
-        out += 1;
-    }
-    return out;
-}
-
 fn containsU64(items: []const u64, id: u64) bool {
     for (items) |item| {
         if (item == id) return true;
@@ -22670,8 +22638,17 @@ test "text delete clears handed-off stale docs outside current range" {
     const snapshot = manager.textIndex("ft_v1").?.snapshot();
     try std.testing.expectEqual(@as(u64, 1), snapshot.liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "title", "alpha"));
+    // Lucene/Tantivy-style collection statistics remain segment-immutable
+    // until merge. The in-range segment was merged, while the handed-off
+    // segment retains its statistic; both tombstones are masked from hits now.
     try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "title", "middle"));
-    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "title", "zeta"));
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "title", "zeta"));
+    const middle = try snapshot.search(alloc, "title", &.{"middle"}, 10);
+    defer alloc.free(middle.hits);
+    try std.testing.expectEqual(@as(usize, 0), middle.hits.len);
+    const zeta = try snapshot.search(alloc, "title", &.{"zeta"}, 10);
+    defer alloc.free(zeta.hits);
+    try std.testing.expectEqual(@as(usize, 0), zeta.hits.len);
 }
 
 test "text merge failure quarantines source segments" {

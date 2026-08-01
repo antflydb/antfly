@@ -23,6 +23,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
+const dense_exact = @import("../dense_exact.zig");
 const graph_exec = @import("graph_exec.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
@@ -417,7 +418,7 @@ pub const DenseSearchExecutor = struct {
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
-    ) anyerror!vectorindex_mod.SearchResults = null,
+    ) anyerror!dense_exact.SearchOutcome = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2578,6 +2579,7 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
             // would strip the very ordinals it exists to exclude.
             var already_filtered_executor = executor;
             already_filtered_executor.live_filter_doc_set = null;
+            already_filtered_executor.nonvisible_doc_set = null;
 
             // Preserve the provenance of the broad-live exclusion before it is
             // unioned with request exclusions. Dense search can use only this
@@ -2617,6 +2619,7 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     // filter over it would redo one visibility probe per document.
     var already_filtered_executor = executor;
     already_filtered_executor.live_filter_doc_set = null;
+    already_filtered_executor.nonvisible_doc_set = null;
 
     const resolved_stored_filters_before_live_filter = out.resolved_stored_filters;
     try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
@@ -10962,40 +10965,6 @@ fn uniqueSortedU64(values: []u64) usize {
     return out;
 }
 
-fn isSortedUniqueU64(values: []const u64) bool {
-    if (values.len < 2) return true;
-    for (values[1..], values[0 .. values.len - 1]) |value, previous| {
-        if (value <= previous) return false;
-    }
-    return true;
-}
-
-/// Remove a sorted, unique exclusion set from a sorted, unique value set in
-/// place. Both cursors advance monotonically, keeping selective ANN planning
-/// O(filters log filters + exclusions log exclusions) rather than O(F * E).
-fn subtractSortedUniqueU64InPlace(values: []u64, excluded: []const u64) usize {
-    var out: usize = 0;
-    var excluded_index: usize = 0;
-    for (values) |value| {
-        while (excluded_index < excluded.len and excluded[excluded_index] < value) {
-            excluded_index += 1;
-        }
-        if (excluded_index < excluded.len and excluded[excluded_index] == value) continue;
-        values[out] = value;
-        out += 1;
-    }
-    return out;
-}
-
-test "sorted unique vector id subtraction handles sparse and dense exclusions" {
-    var values = [_]u64{ 1, 2, 4, 7, 9, 12 };
-    const len = subtractSortedUniqueU64InPlace(&values, &.{ 0, 2, 3, 4, 8, 12, 14 });
-    try std.testing.expectEqualSlices(u64, &.{ 1, 7, 9 }, values[0..len]);
-    try std.testing.expect(isSortedUniqueU64(values[0..len]));
-    try std.testing.expect(!isSortedUniqueU64(&.{ 1, 1, 2 }));
-    try std.testing.expect(!isSortedUniqueU64(&.{ 2, 1 }));
-}
-
 fn containsSortedU64(values: []const u64, expected: u64) bool {
     return std.sort.binarySearch(u64, values, expected, compareU64) != null;
 }
@@ -12925,9 +12894,9 @@ fn searchDenseInternal(
                 try exact_search(executor.ctx, entry, hbc_req)
             else
                 try exactScoreNativeDenseFilter(alloc, entry, hbc_req);
-            profile.hbc_exact_vectors_scored = @intCast(native_constraints.filter_ids.len);
+            profile.hbc_exact_vectors_scored = exact.vectors_scored;
             score_exactness = .exact;
-            break :blk exact;
+            break :blk exact.results;
         } else if (collect_hbc_profile) blk: {
             const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
                 error.NotFound => {
@@ -13252,26 +13221,10 @@ fn exactScoreNativeDenseFilter(
     alloc: Allocator,
     entry: *index_manager_mod.IndexManager.DenseIndex,
     req: vectorindex_mod.SearchRequest,
-) !vectorindex_mod.SearchResults {
-    const candidate_storage = try alloc.dupe(u64, req.filter_ids);
-    defer alloc.free(candidate_storage);
-    std.mem.sort(u64, candidate_storage, {}, u64LessThan);
-    const sorted_unique_candidates = candidate_storage[0..uniqueSortedU64(candidate_storage)];
-
-    var owned_exclude_storage: ?[]u64 = null;
-    defer if (owned_exclude_storage) |storage| alloc.free(storage);
-    const sorted_unique_excludes: []const u64 = if (isSortedUniqueU64(req.exclude_ids))
-        req.exclude_ids
-    else blk: {
-        const storage = try alloc.dupe(u64, req.exclude_ids);
-        owned_exclude_storage = storage;
-        std.mem.sort(u64, storage, {}, u64LessThan);
-        break :blk storage[0..uniqueSortedU64(storage)];
-    };
-    const unique_candidate_ids = sorted_unique_candidates[0..subtractSortedUniqueU64InPlace(
-        sorted_unique_candidates,
-        sorted_unique_excludes,
-    )];
+) !dense_exact.SearchOutcome {
+    var candidates = try dense_exact.CandidateDifference.init(alloc, req.filter_ids, req.exclude_ids);
+    defer candidates.deinit();
+    const unique_candidate_ids = candidates.values;
 
     var results = try vectorindex_mod.SearchResults.initCapacity(
         alloc,
@@ -13302,6 +13255,7 @@ fn exactScoreNativeDenseFilter(
     const vector_scratch = try alloc.alloc(f32, entry.dims);
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
+    var vectors_scored: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
         const vector = (if (vector_cursor) |*cursor|
@@ -13313,6 +13267,7 @@ fn exactScoreNativeDenseFilter(
         };
         if (vector.len != req.query.len) return error.DimensionMismatch;
 
+        vectors_scored += 1;
         const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
         if (!std.math.isFinite(distance)) continue;
         if (req.distance_over) |threshold| {
@@ -13328,7 +13283,10 @@ fn exactScoreNativeDenseFilter(
         results.addResult(vector_id, distance, 0);
     }
     results.sort();
-    return results;
+    return .{
+        .results = results,
+        .vectors_scored = vectors_scored,
+    };
 }
 
 fn countActiveDenseVectorIdsAlloc(

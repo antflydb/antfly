@@ -133,6 +133,7 @@ const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
+const dense_exact = @import("dense_exact.zig");
 const search_mod = @import("../../search/search.zig");
 const index_mod = @import("../../index.zig");
 const introducer_mod = @import("../../introducer.zig");
@@ -20180,7 +20181,7 @@ pub const DB = struct {
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
-    ) anyerror!vectorindex_mod.SearchResults {
+    ) anyerror!dense_exact.SearchOutcome {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, req);
     }
@@ -41880,6 +41881,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     const cases = [_]struct {
         filter_query_json: []const u8,
         exclusion_query_json: []const u8 = "",
+        expected_scored: usize = eligible_count,
     }{
         .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
         .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
@@ -41891,8 +41893,17 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
             .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
             .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
         },
+        // Overlap half of the positive set while retaining the same large
+        // exclusion range. Telemetry must report actual distance evaluations,
+        // not the pre-exclusion planner cardinality.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9989,\"inclusive_max\":true}}",
+            .expected_scored = 10,
+        },
     };
-    for (cases, 0..) |case, case_index| {
+    var expected_vector_loads: usize = 0;
+    for (cases) |case| {
         var profiled = try db.searchDenseProfiled(alloc, .{
             .index_name = "dv_v1",
             .primary_text_index_name = "ft_v1",
@@ -41903,20 +41914,21 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });
         defer profiled.result.deinit();
 
-        try std.testing.expectEqual(@as(u32, eligible_count), profiled.result.total_hits);
-        try std.testing.expectEqual(eligible_count, profiled.result.hits.len);
+        expected_vector_loads += case.expected_scored;
+        try std.testing.expectEqual(@as(u32, @intCast(case.expected_scored)), profiled.result.total_hits);
+        try std.testing.expectEqual(case.expected_scored, profiled.result.hits.len);
         try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.native_filter_candidate_count);
-        try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.hbc_exact_vectors_scored);
+        try std.testing.expectEqual(@as(u64, @intCast(case.expected_scored)), profiled.profile.hbc_exact_vectors_scored);
         try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
         try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
-        try std.testing.expectEqual(eligible_count * (case_index + 1), vector_load_counter.count);
+        try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
         for (profiled.result.hits, 0..) |hit, rank| {
             const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
             defer alloc.free(expected);
             try std.testing.expectEqualStrings(expected, hit.id);
         }
     }
-    try std.testing.expectEqual(eligible_count * cases.len, vector_load_counter.count);
+    try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
 }
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
@@ -42364,6 +42376,7 @@ test "db non chunked search paths apply broad live doc filter" {
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var dense_live = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -52993,6 +53006,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var stale_sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -55946,6 +55960,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
