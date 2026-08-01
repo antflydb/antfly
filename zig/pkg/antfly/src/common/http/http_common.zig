@@ -41,6 +41,12 @@ pub const RequestCancellation = struct {
         return self.cancelled.load(.acquire) or
             (self.borrowed != null and self.borrowed.?.load(.acquire));
     }
+
+    /// The listener installs at most one cancellation source per transport:
+    /// H2 borrows the stream signal, while H1 uses the local socket watcher.
+    pub fn signal(self: *const RequestCancellation) *const std.atomic.Value(bool) {
+        return self.borrowed orelse &self.cancelled;
+    }
 };
 
 test "RequestCancellation observes a borrowed listener signal" {

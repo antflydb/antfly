@@ -10870,7 +10870,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
-            if (cancellation) |value| &value.cancelled else null,
+            if (cancellation) |value| value.signal() else null,
         ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
         defer self.alloc.free(response_body);
 
@@ -10942,7 +10942,7 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
-                if (cancellation) |value| &value.cancelled else null,
+                if (cancellation) |value| value.signal() else null,
             ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 

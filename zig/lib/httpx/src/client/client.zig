@@ -133,7 +133,11 @@ const RequestInterrupt = struct {
         defer self.mutex.unlock(io);
         self.h2_entry = entry;
         self.h2_stream_id = stream_id;
-        if (self.cancelled.load(.acquire)) self.cancelH2Locked(entry, stream_id, io);
+        if (self.cancelled.load(.acquire)) {
+            self.h2_entry = null;
+            self.h2_stream_id = null;
+            self.cancelH2Locked(entry, stream_id, io);
+        }
     }
 
     fn clearH2(self: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
@@ -143,17 +147,28 @@ const RequestInterrupt = struct {
             self.h2_entry = null;
             self.h2_stream_id = null;
         }
+        // Inline H2 fallback uses a short socket timeout solely to wake a
+        // silent read after cancellation; restore normal blocking I/O before
+        // this shared connection can serve another request.
+        if (!entry.recv_running) entry.socket.setRecvTimeout(0) catch {};
     }
 
     fn cancelH2Locked(_: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
         const h2 = &entry.h2;
-        if (h2.stream_manager.getStream(stream_id)) |stream| {
-            stream.stream_error = error.Cancelled;
-            stream.completed = true;
-            stream.reset();
-            if (stream.completion_sem) |sem| sem.post(io);
-            if (stream.data_event) |event| event.set(io);
-        }
+        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+        // A finished or removed stream is no longer ours to reset. In
+        // particular, never append RST_STREAM after a completed response.
+        if (stream.completed) return;
+        stream.stream_error = error.Cancelled;
+        stream.completed = true;
+        stream.reset();
+        if (stream.completion_sem) |sem| sem.post(io);
+        if (stream.data_event) |event| event.set(io);
+        // A request body can be blocked waiting for flow-control credit. Wake
+        // it before waiting for the write mutex so it observes stream_error,
+        // releases the mutex, and lets this RST_STREAM through promptly.
+        h2.send_window_event.set(io);
+        if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
         h2.write_mutex.lockUncancelable(io);
         defer h2.write_mutex.unlock(io);
         if (entry.is_tls) {
@@ -170,7 +185,12 @@ const RequestInterrupt = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.socket) |socket| socket.shutdown();
-        if (self.h2_entry) |entry| self.cancelH2Locked(entry, self.h2_stream_id.?, io);
+        if (self.h2_entry) |entry| {
+            const stream_id = self.h2_stream_id.?;
+            self.h2_entry = null;
+            self.h2_stream_id = null;
+            self.cancelH2Locked(entry, stream_id, io);
+        }
     }
 };
 
@@ -1712,16 +1732,26 @@ pub const Client = struct {
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                    if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
                 } else {
                     try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                    if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
                 }
             }
 
-            // The completion semaphore is installed before publication, so a
-            // cancellation racing immediately after HEADERS can wake us.
+            // The completion semaphore is installed before publication. Do
+            // this immediately after HEADERS, before potentially blocking on
+            // request-body flow control, so cancellation owns a live stream.
             interrupt.publishH2(entry, stream_id, self.io);
+
+            if (req.body) |body| {
+                h2.write_mutex.lockUncancelable(self.io);
+                defer h2.write_mutex.unlock(self.io);
+                if (entry.is_tls) {
+                    const w = try entry.session.getWriter();
+                    try h2.writeDataBlocking(w, stream_id, body, true);
+                } else {
+                    try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
+                }
+            }
 
             // Wait for the receive loop to deliver the response.
             sem.waitUncancelable(self.io);
@@ -1732,14 +1762,20 @@ pub const Client = struct {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
                 interrupt.publishH2(entry, stream_id, self.io);
-                try h2.awaitStreamComplete(r, w, stream_id);
+                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                h2.awaitStreamComplete(r, w, stream_id) catch |err| {
+                    if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                    return err;
+                };
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
                 interrupt.publishH2(entry, stream_id, self.io);
-                try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
+                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id) catch |err| {
+                    if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                    return err;
+                };
             }
         }
 
