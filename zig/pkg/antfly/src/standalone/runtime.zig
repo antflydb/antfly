@@ -2466,6 +2466,10 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // execution. Four maximum-sized public requests may complete while
         // excess uploads are shed before allocator pressure becomes systemic.
         .h2_body_buffer_budget_bytes = 256 * 1024 * 1024,
+        // Query execution admits 32 requests. Apply the same bound while H1
+        // bodies are still streaming so the remaining public connections can
+        // service health, control, and recovery traffic.
+        .max_h1_inflight_bodies = 32,
         .request_timeout_ms = 300_000,
         // Keep a large process-wide FD reserve for storage, Raft, outbound
         // clients, and diagnostics. This prevents the historical 1,000-socket

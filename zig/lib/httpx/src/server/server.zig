@@ -83,6 +83,10 @@ pub const ServerConfig = struct {
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
+    /// Maximum H1 requests allowed to wait for a body after headers have been
+    /// parsed. 0 inherits max_connections. This preserves connection capacity
+    /// for control/recovery traffic during slow uploads.
+    max_h1_inflight_bodies: u32 = 0,
     /// Exponential accept-error backoff. Resource exhaustion otherwise turns
     /// EMFILE/ENFILE into a CPU-burning, unbounded log loop.
     accept_error_backoff_initial_ms: u32 = 5,
@@ -801,6 +805,7 @@ pub const Server = struct {
     connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
+    h1_body_budget: SharedDataBudget,
     waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
     h2_body_budget: SharedDataBudget,
 
@@ -855,6 +860,7 @@ pub const Server = struct {
             .config = cfg,
             .router = Router.init(allocator),
             .conn_semaphore = .{ .permits = cfg.max_connections },
+            .h1_body_budget = SharedDataBudget.init(if (cfg.max_h1_inflight_bodies == 0) cfg.max_connections else cfg.max_h1_inflight_bodies),
             .h2_body_budget = SharedDataBudget.init(cfg.h2_body_buffer_budget_bytes),
         };
     }
@@ -1202,6 +1208,8 @@ pub const Server = struct {
         var leftover: usize = 0;
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             parser.reset();
+            var h1_body_reserved = false;
+            defer if (h1_body_reserved) self.h1_body_budget.release(1);
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
             // trickles bytes just fast enough to avoid per-recv timeouts.
@@ -1232,6 +1240,10 @@ pub const Server = struct {
                 leftover -= consumed;
                 if (parser.isError()) {
                     try self.sendError(&sock, 400);
+                    return;
+                }
+                if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
+                    try self.sendError(&sock, 429);
                     return;
                 }
             }
@@ -1273,6 +1285,15 @@ pub const Server = struct {
                     try self.sendError(&sock, 400);
                     return;
                 }
+                if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
+                    try self.sendError(&sock, 429);
+                    return;
+                }
+            }
+
+            if (h1_body_reserved) {
+                self.h1_body_budget.release(1);
+                h1_body_reserved = false;
             }
 
             self.startRequest();
@@ -1483,6 +1504,15 @@ pub const Server = struct {
             }
             self.io.sleep(Io.Duration.zero, .awake) catch {};
         }
+    }
+
+    /// Admit an HTTP/1 request body as soon as headers identify it, rather
+    /// than after the parser has waited for an attacker-controlled upload.
+    fn reserveH1BodyAfterHeaders(self: *Self, parser: *const Parser, reserved: *bool) bool {
+        if (reserved.* or !parser.hasCompleteHeaders() or parser.isComplete()) return true;
+        if (!self.h1_body_budget.tryReserve(1)) return false;
+        reserved.* = true;
+        return true;
     }
 
     /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).

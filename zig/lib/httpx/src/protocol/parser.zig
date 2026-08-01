@@ -155,6 +155,16 @@ pub const Parser = struct {
         return self.state == .complete;
     }
 
+    /// True once request routing metadata is available, before a body is
+    /// necessarily complete. Servers use this to apply bounded body admission
+    /// without allowing slow uploads to consume every connection worker.
+    pub fn hasCompleteHeaders(self: *const Self) bool {
+        return switch (self.state) {
+            .body, .chunk_size, .chunk_data, .chunk_crlf, .chunk_trailer, .complete => true,
+            else => false,
+        };
+    }
+
     /// Returns true if parsing encountered an error.
     pub fn isError(self: *const Self) bool {
         return self.state == .err;
