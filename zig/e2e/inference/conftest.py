@@ -256,35 +256,27 @@ def api(base_url):
             multi_label = bool(kwargs.pop("multi_label", False))
             body = {
                 "model": model or "cross-encoder/nli-distilroberta-base",
-                "inputs": [{"content": value} for value in text],
-                "schema": {
-                    "classifications": [{
-                        "name": "classification",
-                        "labels": labels,
-                        "multi_label": multi_label,
-                    }],
-                },
+                "texts": text,
+                "labels": labels,
+                "multi_label": multi_label,
                 **kwargs,
             }
-            r = self.post("/extract", json=body)
+            r = self.post("/classify", json=body)
             _check(r)
             return r.json()
 
         def recognize(self, text: list[str], model: str = "", labels: list[str] | None = None, **kwargs):
             relation_labels = kwargs.pop("relation_labels", None)
-            schema: dict = {}
-            schema["entities"] = labels if labels is not None else ["PER", "ORG", "LOC", "MISC"]
-            if relation_labels is not None:
-                schema["relations"] = [{"type": label} for label in relation_labels]
-            if "resolver" in kwargs:
-                kwargs.pop("resolver")
             body: dict = {
                 "model": model or "fastino/gliner2-base-v1",
-                "inputs": [{"content": value} for value in text],
-                "schema": schema,
+                "texts": text,
                 **kwargs,
             }
-            r = self.post("/extract", json=body)
+            if labels is not None:
+                body["labels"] = labels
+            if relation_labels is not None:
+                body["relation_labels"] = relation_labels
+            r = self.post("/recognize", json=body)
             _check(r)
             return r.json()
 
@@ -294,7 +286,7 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def read(self, images: list[str], model: str = "", prompt: str = "", **kwargs):
+        def read(self, images: list[str], model: str = "antflydb/florence-2-base", prompt: str = "", **kwargs):
             # Convert plain URL strings to ImageURL objects {url: "..."}
             image_objs = [{"url": img} if isinstance(img, str) else img for img in images]
             body = {"model": model, "images": image_objs, "prompt": prompt, **kwargs}
@@ -309,41 +301,15 @@ def api(base_url):
             return r.json()
 
         def extract(self, texts: list[str] | None = None, images: list[str] | None = None, schema: dict | None = None, model: str = "", **kwargs):
-            def structure_schema(raw: dict | None) -> dict:
-                structures: dict = {}
-                for name, fields in (raw or {}).items():
-                    field_map: dict = {}
-                    for field in fields:
-                        if isinstance(field, str):
-                            parts = field.split("::")
-                            field_map[parts[0]] = "list" if "list" in parts[1:] else "str"
-                        elif isinstance(field, dict):
-                            field_name = field.get("name")
-                            if field_name:
-                                field_map[field_name] = field.get("type", "str")
-                    structures[name] = {"fields": field_map}
-                return {"structures": structures}
-
-            options = {}
-            for key in ("threshold", "flat_ner", "include_confidence", "include_spans"):
-                if key in kwargs:
-                    options[key] = kwargs.pop(key)
-
             body = {
                 "model": model,
-                "inputs": [],
-                "schema": structure_schema(schema),
+                "schema": schema or {},
                 **kwargs,
             }
-            if options:
-                body["options"] = options
             if texts is not None:
-                body["inputs"].extend({"content": value} for value in texts)
+                body["texts"] = texts
             if images is not None:
-                body["inputs"].extend(
-                    {"content": {"type": "image_url", "image_url": {"url": img}} if isinstance(img, str) else img}
-                    for img in images
-                )
+                body["images"] = [{"url": image} if isinstance(image, str) else image for image in images]
             r = self.post("/extract", json=body)
             _check(r)
             return r.json()

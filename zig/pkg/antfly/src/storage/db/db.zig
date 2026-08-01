@@ -133,6 +133,7 @@ const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
+const dense_exact = @import("dense_exact.zig");
 const search_mod = @import("../../search/search.zig");
 const index_mod = @import("../../index.zig");
 const introducer_mod = @import("../../introducer.zig");
@@ -4513,6 +4514,21 @@ pub const DB = struct {
         }
         lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, self.core.index_manager.snapshotLsmWriteStats());
         return write_stats;
+    }
+
+    fn storageChangeTokenLocked(self: *DB) u64 {
+        const write_stats = self.snapshotLsmWriteStatsLocked();
+        var hasher = std.hash.Wyhash.init(0x6c736d5f73746f72);
+        // Directory scans are intentionally coarser than write accounting.
+        // Bucket WAL growth so a sustained stream cannot force one recursive
+        // scan per status refresh while keeping reported bytes within 1 MiB.
+        const wal_growth_bucket = write_stats.wal_append_bytes / (1024 * 1024);
+        hasher.update(std.mem.asBytes(&wal_growth_bucket));
+        hasher.update(std.mem.asBytes(&write_stats.wal_resets));
+        hasher.update(std.mem.asBytes(&write_stats.table_file_bytes));
+        hasher.update(std.mem.asBytes(&write_stats.manifest_writes));
+        hasher.update(std.mem.asBytes(&write_stats.manifest_bytes));
+        return hasher.final();
     }
 
     pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
@@ -14806,7 +14822,7 @@ pub const DB = struct {
             };
         }
         return .{
-            .global_doc_count = text_snapshot.global_doc_count,
+            .global_doc_count = text_snapshot.liveDocCount(),
             .total_bytes = total_bytes,
             .segments = segments,
             .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
@@ -17818,7 +17834,7 @@ pub const DB = struct {
             defer text_snapshot.release();
             return .{
                 .kind = .full_text,
-                .doc_count = text_snapshot.global_doc_count,
+                .doc_count = text_snapshot.liveDocCount(),
                 .updated_at_ns = platform_time.monotonicNs(),
             };
         }
@@ -18190,7 +18206,7 @@ pub const DB = struct {
                     if (self.core.textIndex(item.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
-                        item.doc_count = text_snapshot.global_doc_count;
+                        item.doc_count = text_snapshot.liveDocCount();
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
@@ -18537,7 +18553,7 @@ pub const DB = struct {
                     if (self.core.textIndex(cfg.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
-                        item.doc_count = text_snapshot.global_doc_count;
+                        item.doc_count = text_snapshot.liveDocCount();
                         item.term_count = textIndexTermCount(entry);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
@@ -18605,6 +18621,7 @@ pub const DB = struct {
         }
 
         return .{
+            .storage_change_token = self.storageChangeTokenLocked(),
             .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
@@ -18651,7 +18668,7 @@ pub const DB = struct {
         for (configs) |cfg| {
             if (cfg.kind != .full_text) continue;
             if (self.core.textIndex(cfg.name)) |entry| {
-                indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().global_doc_count);
+                indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().liveDocCount());
             }
         }
         const visible_doc_count = indexed_doc_count orelse try self.scanPrimaryDocCount(byte_range);
@@ -18711,7 +18728,7 @@ pub const DB = struct {
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        item.doc_count = entry.snapshot().global_doc_count;
+                        item.doc_count = entry.snapshot().liveDocCount();
                         indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
@@ -20180,7 +20197,7 @@ pub const DB = struct {
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
-    ) anyerror!vectorindex_mod.SearchResults {
+    ) anyerror!dense_exact.SearchOutcome {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, req);
     }
@@ -36467,6 +36484,14 @@ fn clearSplitMetadataFromStore(alloc: Allocator, dest_store: *docstore_mod.DocSt
 
 fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docstore_mod.DocStore) !void {
     try deleteKeysWithPrefixFromStore(alloc, dest_store, "\x00\x00__metadata__:");
+    // Split destinations register and populate their index generations
+    // synchronously below. A physical LSM split also carries replay-namespace
+    // control rows, including a tombstone-shadowed admission marker from the
+    // source's history. Never let source-generation admission state quarantine
+    // an independently constructed destination generation.
+    const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+    defer alloc.free(admission_prefix);
+    try deleteKeysWithPrefixFromStore(alloc, dest_store, admission_prefix);
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -38599,8 +38624,8 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
         null;
 
     return .{
-        .source_doc_count = source_snapshot.global_doc_count,
-        .dest_doc_count = if (dest_snapshot) |snapshot| snapshot.global_doc_count else 0,
+        .source_doc_count = source_snapshot.liveDocCount(),
+        .dest_doc_count = if (dest_snapshot) |snapshot| snapshot.liveDocCount() else 0,
         .source_alpha_hits = try source_snapshot.termDocFreq(alloc, "title", "alpha"),
         .source_beta_hits = try source_snapshot.termDocFreq(alloc, "title", "beta"),
         .source_gamma_hits = try source_snapshot.termDocFreq(alloc, "title", "gamma"),
@@ -41806,7 +41831,7 @@ test "db default dynamic schema vector term filters project through doc identity
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
 }
 
-test "db dense default dynamic one percent filters exact score top one hundred" {
+test "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -41838,7 +41863,10 @@ test "db dense default dynamic one percent filters exact score top one hundred" 
     });
 
     const doc_count: usize = 10_000;
-    const eligible_count: usize = 100;
+    // Reproduce the campaign's 0.2% selectivity cell. The public page still
+    // asks for top-100, while native planning must score only the 20 eligible
+    // vectors and return exact ordering instead of traversing filtered ANN.
+    const eligible_count: usize = 20;
     const writes = try alloc.alloc(types.BatchWrite, doc_count);
     defer {
         for (writes) |write| {
@@ -41862,31 +41890,99 @@ test "db dense default dynamic one percent filters exact score top one hundred" 
         .sync_level = .full_index,
     });
 
-    const filters = [_][]const u8{
-        "{\"numeric_range\":{\"field\":\"id\",\"min\":9900,\"inclusive_min\":true}}",
-        "{\"term\":{\"bucket\":\"selected\"}}",
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
     };
-    for (filters) |filter_query_json| {
+    var vector_load_counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&vector_load_counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    const cases = [_]struct {
+        filter_query_json: []const u8,
+        exclusion_query_json: []const u8 = "",
+        filter_prefix: []const u8 = "",
+        expected_candidates: usize = eligible_count,
+        expected_scored: usize = eligible_count,
+        expected_route: []const u8 = "exact_native_filter",
+        expected_route_reason: []const u8 = "candidate_count_within_budget",
+    }{
+        .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
+        .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
+        // Prefix metadata is resolved before vector IO. Only the ten matching
+        // candidates should incur a distance evaluation.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .filter_prefix = "doc:0999",
+            .expected_scored = 10,
+        },
+        // Exercise a highly selective positive filter together with a large,
+        // disjoint native exclusion set. Exact scoring must subtract the two
+        // ordered sets linearly instead of probing every exclusion for every
+        // candidate.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
+        },
+        // Overlap half of the positive set while retaining the same large
+        // exclusion range. Telemetry must report actual distance evaluations,
+        // not the pre-exclusion planner cardinality.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9989,\"inclusive_max\":true}}",
+            .expected_scored = 10,
+        },
+        // A completely excluded native filter is authoritative and should
+        // return immediately without entering either exact scoring or ANN.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .expected_scored = 0,
+            .expected_route = "empty_result",
+            .expected_route_reason = "empty_native_filter",
+        },
+        // The positive set alone exceeds the exact-scoring budget, but the
+        // ordered exclusion leaves only 20 effective candidates. Route on the
+        // allocation-free set-difference cardinality instead of falling back
+        // to filtered ANN for this highly selective result.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":6000,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
+            .expected_candidates = 4000,
+        },
+    };
+    var expected_vector_loads: usize = 0;
+    for (cases) |case| {
         var profiled = try db.searchDenseProfiled(alloc, .{
             .index_name = "dv_v1",
             .primary_text_index_name = "ft_v1",
-            .limit = eligible_count,
+            .limit = 100,
             .include_stored = false,
-            .filter_query_json = filter_query_json,
-        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = eligible_count });
+            .filter_prefix = case.filter_prefix,
+            .filter_query_json = case.filter_query_json,
+            .exclusion_query_json = case.exclusion_query_json,
+        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });
         defer profiled.result.deinit();
 
-        try std.testing.expectEqual(@as(u32, eligible_count), profiled.result.total_hits);
-        try std.testing.expectEqual(eligible_count, profiled.result.hits.len);
-        try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.native_filter_candidate_count);
-        try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
-        try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
+        expected_vector_loads += case.expected_scored;
+        try std.testing.expectEqual(@as(u32, @intCast(case.expected_scored)), profiled.result.total_hits);
+        try std.testing.expectEqual(case.expected_scored, profiled.result.hits.len);
+        try std.testing.expectEqual(@as(u64, @intCast(case.expected_candidates)), profiled.profile.native_filter_candidate_count);
+        try std.testing.expectEqual(@as(u64, @intCast(case.expected_scored)), profiled.profile.hbc_exact_vectors_scored);
+        try std.testing.expectEqualStrings(case.expected_route, profiled.profile.search_route);
+        try std.testing.expectEqualStrings(case.expected_route_reason, profiled.profile.route_reason);
+        try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
         for (profiled.result.hits, 0..) |hit, rank| {
             const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
             defer alloc.free(expected);
             try std.testing.expectEqualStrings(expected, hit.id);
         }
     }
+    try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
 }
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
@@ -42334,6 +42430,7 @@ test "db non chunked search paths apply broad live doc filter" {
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var dense_live = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -52963,6 +53060,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var stale_sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -55053,7 +55151,7 @@ test "db asset enrichment full_text_index feeds default full text index after fu
     const asset_value = try db.core.store.get(alloc, asset_key);
     defer alloc.free(asset_value);
     try std.testing.expect(std.mem.indexOf(u8, asset_value, "crimson sunset harbor") != null);
-    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().global_doc_count > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().liveDocCount() > 0);
 
     var results = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
@@ -55440,7 +55538,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
     try std.testing.expect(chunk_records.len > 0);
-    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().global_doc_count > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().liveDocCount() > 0);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",
@@ -55916,6 +56014,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -70618,6 +70717,10 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
         \\          "description": {
         \\            "type": "string",
         \\            "x-antfly-types": ["text"]
+        \\          },
+        \\          "state": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["keyword"]
         \\          }
         \\        }
         \\      }
@@ -70640,10 +70743,12 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:1", .value = "{\"name\":\"Smartphone Apple iPhone\",\"description\":\"Latest iPhone model\"}" },
-            .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\"}" },
-            .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\"}" },
-            .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\"}" },
+            .{ .key = "doc:1", .value = "{\"name\":\"Smartphone Apple iPhone\",\"description\":\"Latest iPhone model\",\"state\":\"published\"}" },
+            .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\",\"state\":\"draft\"}" },
+            .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\",\"state\":\"published\"}" },
+            .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\",\"state\":\"published\"}" },
+            .{ .key = "doc:5", .value = "{\"name\":\"The Happy Catalog\",\"description\":\"Stop-word prefix coverage\",\"state\":\"published\"}" },
+            .{ .key = "doc:6", .value = "{\"name\":\"Happiness Catalog\",\"description\":\"Stemmed root coverage\",\"state\":\"published\"}" },
         },
         .sync_level = .full_index,
     });
@@ -70695,6 +70800,207 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     defer bool_prefix_results.deinit();
     try std.testing.expectEqual(@as(u32, 1), bool_prefix_results.total_hits);
     try std.testing.expectEqualStrings("doc:1", bool_prefix_results.hits[0].id);
+
+    var filtered_bool_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "sm",
+            .fields = &multi_match_fields,
+        } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer filtered_bool_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 2), filtered_bool_prefix_results.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), filtered_bool_prefix_results.hits.len);
+
+    var stop_word_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "the",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer stop_word_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), stop_word_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:5", stop_word_prefix_results.hits[0].id);
+
+    var stemmed_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "happy",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer stemmed_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 2), stemmed_prefix_results.total_hits);
+}
+
+fn expectFilteredFullTextDeleteCliffProbe(
+    db: *DB,
+    alloc: Allocator,
+    expected_total: u32,
+    forbidden_id: ?[]const u8,
+) !void {
+    const fields = [_]types.TextMultiMatchField{.{ .field = "title" }};
+    var bool_prefix = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "catalog item",
+            .fields = &fields,
+        } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer bool_prefix.deinit();
+    const expected_page_len: usize = @intCast(@min(expected_total, 10));
+    const expected_page_total: u32 = @intCast(expected_page_len);
+    try std.testing.expectEqual(expected_page_len, bool_prefix.hits.len);
+    switch (bool_prefix.total_hits_relation) {
+        .exact => try std.testing.expectEqual(expected_total, bool_prefix.total_hits),
+        .gte => {
+            try std.testing.expect(bool_prefix.total_hits >= expected_page_total);
+            try std.testing.expect(bool_prefix.total_hits <= expected_total);
+        },
+    }
+
+    var match = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer match.deinit();
+    try std.testing.expectEqual(expected_page_len, match.hits.len);
+    switch (match.total_hits_relation) {
+        .exact => try std.testing.expectEqual(expected_total, match.total_hits),
+        .gte => {
+            try std.testing.expect(match.total_hits >= expected_page_total);
+            try std.testing.expect(match.total_hits <= expected_total);
+        },
+    }
+
+    if (forbidden_id) |deleted_id| {
+        for (bool_prefix.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
+        for (match.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
+
+        var deleted_term = try db.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .query = .{ .term = .{ .field = "title", .term = "00000" } },
+            .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+            .limit = 10,
+        });
+        defer deleted_term.deinit();
+        try std.testing.expectEqual(@as(u32, 0), deleted_term.total_hits);
+        try std.testing.expectEqual(@as(usize, 0), deleted_term.hits.len);
+    }
+}
+
+test "db one real delete keeps filtered full text on complement path across restart" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{
+        \\  "default_type": "product",
+        \\  "document_schemas": {
+        \\    "product": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": true,
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text","search_as_you_type"]},
+        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    // The reported release cliff starts between 5k and 10k documents. Keep
+    // this regression above the knee so a delete cannot silently switch large
+    // segments back to a full reconciliation/full-visibility scan.
+    const initial_count: usize = 10_000;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const writes = try alloc.alloc(types.BatchWrite, initial_count);
+        defer {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i}),
+                .value = try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"title\":\"Catalog item {d:0>5}\",\"state\":\"published\"}}",
+                    .{i},
+                ),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .full_index });
+
+        // Zero-mutation and phantom-delete controls retain identical results.
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, null);
+        try db.batch(.{ .deletes = &.{"doc:missing"}, .sync_level = .full_index });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, null);
+
+        // An insertion-only upsert changes the corpus without creating a text
+        // tombstone and must remain on the same fast query path.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:new",
+                .value = "{\"title\":\"Catalog item new\",\"state\":\"published\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count + 1, null);
+
+        const visibility_before_delete = db.snapshotVisibilityStats();
+        try db.batch(.{ .deletes = &.{"doc:00000"}, .sync_level = .full_index });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, "doc:00000");
+        const visibility_after_delete = db.snapshotVisibilityStats();
+        try std.testing.expect(visibility_after_delete.mask_builds_total > visibility_before_delete.mask_builds_total);
+        try std.testing.expectEqual(visibility_before_delete.full_scan_fallbacks_total, visibility_after_delete.full_scan_fallbacks_total);
+        try std.testing.expectEqual(@as(u64, 1), visibility_after_delete.cache_entries);
+
+        // Repeated filtered queries reuse the small complement rather than
+        // probing every matching ordinal in the primary store.
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, "doc:00000");
+        const visibility_after_repeat = db.snapshotVisibilityStats();
+        try std.testing.expect(visibility_after_repeat.cache_hits_total > visibility_after_delete.cache_hits_total);
+    }
+
+    // The persisted deletion state reconstructs the complement on reopen;
+    // immutable segment BM25 statistics remain unchanged until merge.
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        try expectFilteredFullTextDeleteCliffProbe(&reopened, alloc, initial_count, "doc:00000");
+    }
 }
 
 test "db versioned full text indexes reload matching schema mappings after reopen" {
@@ -75052,7 +75358,7 @@ test "db shadow index manager backfills split-off range and ignores parent-range
     try db.createShadowIndexManager("doc:m", "");
     try std.testing.expect(db.shadow != null);
     try std.testing.expect(db.getShadowIndexDir().len > 0);
-    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.core.shard_manager.prepareSplit("doc:m");
     try db.core.shard_manager.split(0, "doc:m");
@@ -75063,7 +75369,7 @@ test "db shadow index manager backfills split-off range and ignores parent-range
         .sync_level = .full_index,
     });
 
-    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.closeShadowIndexManager();
     try std.testing.expectEqualStrings("", db.getShadowIndexDir());
@@ -75294,6 +75600,10 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    const copied_admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, "ft_v1");
+    defer alloc.free(copied_admission_key);
+    try std.testing.expectError(error.NotFound, split_db.core.store.get(alloc, copied_admission_key));
+    try std.testing.expect(!split_db.core.index_manager.repairUnavailable("ft_v1"));
     {
         const split_stats = try split_db.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, split_stats);
@@ -78563,7 +78873,7 @@ test "db updateRange constrains index backfill" {
     });
 
     const text_index = db.core.index_manager.textIndex("ft_range").?;
-    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().liveDocCount());
 }
 
 test "db range cardinality remains exact across mutations and reopen" {

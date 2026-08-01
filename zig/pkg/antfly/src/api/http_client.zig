@@ -2153,6 +2153,7 @@ pub const ApiHttpClient = struct {
             200 => return try self.alloc.dupe(u8, resp.body),
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }

@@ -8,7 +8,7 @@
 
 import json
 
-from .models import _looks_like_model_dir
+from .models import _env_model_specs, _looks_like_model_dir
 
 
 def test_partial_model_directory_is_not_available(tmp_path):
@@ -100,3 +100,12 @@ def test_managed_completion_receipt_rejects_boolean_numeric_fields(tmp_path):
     (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
 
     assert not _looks_like_model_dir(model_dir)
+
+
+def test_reader_environment_override_preserves_curated_variant(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_FLORENCE_MODEL", "antflydb/florence-2-base")
+
+    specs = _env_model_specs()
+    florence = next(spec for spec in specs if spec.repo == "antflydb/florence-2-base")
+
+    assert florence.pull_ref == "hf:antflydb/florence-2-base:gguf:Q4_K"

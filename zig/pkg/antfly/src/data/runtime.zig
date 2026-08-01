@@ -1397,6 +1397,27 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_covered_through_segment", "gauge", "Last cached write LSM WAL segment durably covered by the checkpoint", stats.wal_checkpoint_covered_through_segment);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_current_segment", "gauge", "Current cached write LSM WAL segment", stats.wal_checkpoint_current_segment);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_lag_segments", "gauge", "Sealed cached write LSM WAL segments retained before the active segment", stats.wal_checkpoint_lag_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_soft_limit_segments", "gauge", "Configured cached write LSM soft WAL retention limit in segments", stats.wal_soft_limit_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_hard_limit_segments", "gauge", "Configured cached write LSM hard WAL retention limit in segments", stats.wal_hard_limit_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_soft_limit_bytes", "gauge", "Configured cached write LSM soft WAL retention limit in bytes", stats.wal_soft_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_hard_limit_bytes", "gauge", "Configured cached write LSM hard WAL retention limit in bytes", stats.wal_hard_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_pending", "gauge", "Whether cached write LSM WAL checkpoint maintenance is pending", if (stats.wal_checkpoint_pending) 1 else 0);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_blocked", "gauge", "Whether cached write LSM WAL hard-limit admission is blocked", if (stats.wal_pressure_blocked) 1 else 0);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_wal_checkpoint_retry_reason", "gauge", "Current cached write LSM WAL checkpoint retry reason");
+    inline for (std.meta.tags(lsm_backend_mod.WalCheckpointRetryReason)) |reason| {
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = @tagName(reason) }};
+        try health_metrics.appendPromSampleLabeled(
+            writer,
+            "antfly_lsm_wal_checkpoint_retry_reason",
+            &labels,
+            if (stats.wal_checkpoint_retry_reason == reason) 1 else 0,
+        );
+    }
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_retry_attempts", "gauge", "Consecutive cached write LSM WAL checkpoint retry failures", stats.wal_checkpoint_retry_attempts);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_retry_delay_ns", "gauge", "Nanoseconds until the next cached write LSM WAL checkpoint retry; zero means due now", stats.wal_checkpoint_retry_delay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_active_immutable_logical_bytes", "gauge", "Logical bytes in cached write LSM immutable memtables awaiting run publication", stats.active_immutable_logical_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_unpublished_wal_logical_bytes", "gauge", "Logical bytes in cached write LSM runs awaiting durable manifest publication", stats.unpublished_wal_logical_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_unpublished_wal_max_batch_logical_bytes", "gauge", "Largest cached write LSM logical batch awaiting durable manifest publication", stats.unpublished_wal_max_batch_logical_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_segments", "gauge", "Cached write LSM dedicated replay WAL segments still retained", stats.wal_replay_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_bytes", "gauge", "Cached write LSM dedicated replay WAL bytes still retained", stats.wal_replay_retained_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_current_segment", "gauge", "Current cached write LSM dedicated replay WAL segment", stats.wal_replay_current_segment);
@@ -1459,6 +1480,10 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_rejections_total", "counter", "Cached write LSM writes rejected after write-pressure overload", stats.write_pressure_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground write-pressure compactions", stats.write_pressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_flushes_total", "counter", "Cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_manifest_publishes_total", "counter", "Cached write LSM manifests published to advance WAL checkpoints", stats.wal_pressure_manifest_publishes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_admission_checkpoints_total", "counter", "Cached write LSM checkpoints completed before hard-limit WAL admission", stats.wal_pressure_admission_checkpoints);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_failures_total", "counter", "Cached write LSM WAL-pressure checkpoint failures", stats.wal_pressure_failures);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_rejections_total", "counter", "Cached write LSM WAL appends rejected before mutation", stats.wal_pressure_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_records_total", "counter", "Cached write LSM WAL records appended", stats.wal_append_records);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_entries_total", "counter", "Cached write LSM WAL entries appended", stats.wal_append_entries);
@@ -2182,6 +2207,26 @@ const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
     checked_at_ns: u64 = 0,
     lsm_root_generation: u64 = 0,
+    storage_change_token: u64 = 0,
+    invalidation_generation: u64 = 0,
+    valid: bool = false,
+};
+
+const RuntimeStatusDiskUsageScanner = struct {
+    ptr: ?*anyopaque = null,
+    scan_fn: *const fn (ptr: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror!u64,
+
+    fn scan(self: @This(), alloc: std.mem.Allocator, path: []const u8) !u64 {
+        return try self.scan_fn(self.ptr, alloc, path);
+    }
+
+    fn directory() @This() {
+        return .{ .scan_fn = scanDirectory };
+    }
+
+    fn scanDirectory(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) !u64 {
+        return try directoryUsageBytes(alloc, path);
+    }
 };
 
 fn runtimeStatusDiskUsageCacheReusable(
@@ -2190,10 +2235,20 @@ fn runtimeStatusDiskUsageCacheReusable(
     now_ns: u64,
     active: bool,
     doc_count: u64,
+    storage_change_token: u64,
 ) bool {
+    if (!entry.valid) return false;
     if (entry.lsm_root_generation != lsm_root_generation) return false;
     if (entry.disk_bytes == 0 and doc_count > 0) return false;
+    if (storage_change_token != 0 and entry.storage_change_token != storage_change_token) return false;
     return active or now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
+}
+
+fn runtimeStatusDiskUsageScanCanPublish(
+    entry: RuntimeStatusDiskUsageCacheEntry,
+    captured_group_generation: u64,
+) bool {
+    return entry.invalidation_generation == captured_group_generation;
 }
 
 const OwnedLocalGroupStatusRefresh = struct {
@@ -2858,18 +2913,163 @@ test "idle cached runtime status stays fresh only for the published root generat
 }
 
 test "runtime status disk usage cache is scoped to one root generation" {
+    const cloned_stats = try runtime_status.cloneDBStats(std.testing.allocator, .{ .storage_change_token = 42 });
+    defer antfly.db.types.freeDBStats(std.testing.allocator, cloned_stats);
+    try std.testing.expectEqual(@as(u64, 42), cloned_stats.storage_change_token);
+
     const entry = RuntimeStatusDiskUsageCacheEntry{
         .disk_bytes = 4096,
         .checked_at_ns = 100,
         .lsm_root_generation = 7,
+        .valid = true,
     };
-    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, 101, false, 1));
-    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, std.math.maxInt(u64), true, 1));
-    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(entry, 8, 101, true, 1));
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, 101, false, 1, 0));
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, std.math.maxInt(u64), true, 1, 0));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(entry, 8, 101, true, 1, 0));
 
     var zero_entry = entry;
     zero_entry.disk_bytes = 0;
-    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(zero_entry, 7, 101, false, 1));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(zero_entry, 7, 101, false, 1, 0));
+
+    var invalidated_entry = entry;
+    invalidated_entry.valid = false;
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(invalidated_entry, 7, 101, false, 1, 0));
+
+    var changed_storage_entry = entry;
+    changed_storage_entry.storage_change_token = 11;
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(changed_storage_entry, 7, 101, false, 1, 11));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(changed_storage_entry, 7, 101, false, 1, 12));
+
+    try std.testing.expect(runtimeStatusDiskUsageScanCanPublish(entry, 0));
+    var group_invalidated = entry;
+    group_invalidated.invalidation_generation = 5;
+    try std.testing.expect(!runtimeStatusDiskUsageScanCanPublish(group_invalidated, 0));
+}
+
+test "runtime status disk usage cache is scoped to one root generation and group invalidation is scoped" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            ".",
+            catalog,
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    try server.runtime_status_disk_usage_cache.put(alloc, 7, .{ .disk_bytes = 700, .valid = true });
+    try server.runtime_status_disk_usage_cache.put(alloc, 8, .{ .disk_bytes = 800, .valid = true });
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+
+    try std.testing.expect(!server.runtime_status_disk_usage_cache.get(7).?.valid);
+    try std.testing.expect(server.runtime_status_disk_usage_cache.get(8).?.valid);
+    try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
+}
+
+test "runtime status disk scan retries only when maintenance invalidates its group" {
+    const ControlledScanner = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn interface(self: *@This()) RuntimeStatusDiskUsageScanner {
+            return .{ .ptr = self, .scan_fn = scan };
+        }
+
+        fn scan(ptr: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const call = self.calls.fetchAdd(1, .acq_rel);
+            if (call == 0) {
+                self.entered.store(true, .release);
+                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+                return 111;
+            }
+            return 222;
+        }
+    };
+    const ScanThread = struct {
+        server: *DataServer,
+        scanner: RuntimeStatusDiskUsageScanner,
+        result: ?u64 = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.server.runtimeStatusDiskUsageBytesBestEffortWithScanner(
+                7,
+                "unused-by-controlled-scanner",
+                .{
+                    .group_id = 7,
+                    .metadata = .{ .lsm_root_generation = 3 },
+                    .stats = .{ .doc_count = 1 },
+                },
+                self.scanner,
+            );
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            ".",
+            catalog,
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    var controlled = ControlledScanner{};
+    var scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
+    const thread = try std.Thread.spawn(.{}, ScanThread.run, .{&scan_thread});
+    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    // This models a completed flush/compaction publishing a new storage view
+    // while the status scan still observes the old directory contents.
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+    controlled.release.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(@as(?u64, 222), scan_thread.result);
+    try std.testing.expectEqual(@as(u32, 2), controlled.calls.load(.acquire));
+    const cached = server.runtime_status_disk_usage_cache.get(7).?;
+    try std.testing.expect(cached.valid);
+    try std.testing.expectEqual(@as(u64, 222), cached.disk_bytes);
+    try std.testing.expectEqual(@as(u64, 3), cached.lsm_root_generation);
+
+    // A different group's publication must not fence or duplicate this scan.
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+    controlled.entered.store(false, .release);
+    controlled.release.store(false, .release);
+    controlled.calls.store(0, .release);
+    var unrelated_scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
+    const unrelated_thread = try std.Thread.spawn(.{}, ScanThread.run, .{&unrelated_scan_thread});
+    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+    server.invalidateRuntimeStatusDiskUsageCacheForGroup(8);
+    controlled.release.store(true, .release);
+    unrelated_thread.join();
+
+    try std.testing.expectEqual(@as(?u64, 111), unrelated_scan_thread.result);
+    try std.testing.expectEqual(@as(u32, 1), controlled.calls.load(.acquire));
 }
 
 test "data runtime stamps one producer generation on every reported group" {
@@ -3477,6 +3677,9 @@ pub const DataServer = struct {
     runtime_status_last_refresh_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_disk_usage_cache_mutex: std.atomic.Mutex = .unlocked,
     runtime_status_disk_usage_cache: std.AutoHashMapUnmanaged(u64, RuntimeStatusDiskUsageCacheEntry) = .empty,
+    // Detect an invalidation racing a directory scan before it can publish a
+    // stale result. Per-group cache entries remain independently reusable.
+    runtime_status_disk_usage_invalidation_generation: std.atomic.Value(u64) = .init(1),
     store_status_cache_mutex: std.atomic.Mutex = .unlocked,
     store_status_heartbeat_cache: StoreStatusHeartbeatCache = .{},
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
@@ -4873,7 +5076,7 @@ pub const DataServer = struct {
     fn deferLsmObsoleteReclaim(self: *DataServer, now_ns: u64, delay_ns: u64) void {
         const due_ns = now_ns +| delay_ns;
         const current = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
-        if (current == 0 or due_ns < current) {
+        if (current == 0 or current <= now_ns or due_ns < current) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(due_ns, .release);
         }
     }
@@ -4913,9 +5116,13 @@ pub const DataServer = struct {
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
             const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
+            var maintenance_progressed = false;
+            var maintenance_progressed_groups: [lsm_maintenance_worker_max_steps_per_wake]u64 = undefined;
+            var maintenance_progressed_group_count: usize = 0;
+            var maintenance_progressed_unscoped = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const did_work = live_write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
+                const maintenance = live_write_source.runLsmMaintenanceRoundBestEffortDetailed() catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -4927,7 +5134,7 @@ pub const DataServer = struct {
                     _ = self.lsm_maintenance_failed.fetchAdd(1, .monotonic);
                     break;
                 };
-                if (!did_work) {
+                if (!maintenance.progressed) {
                     if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
@@ -4936,6 +5143,22 @@ pub const DataServer = struct {
                     }
                     completed = true;
                     break;
+                }
+                maintenance_progressed = true;
+                if (maintenance.group_id) |group_id| {
+                    var already_recorded = false;
+                    for (maintenance_progressed_groups[0..maintenance_progressed_group_count]) |recorded| {
+                        if (recorded == group_id) {
+                            already_recorded = true;
+                            break;
+                        }
+                    }
+                    if (!already_recorded) {
+                        maintenance_progressed_groups[maintenance_progressed_group_count] = group_id;
+                        maintenance_progressed_group_count += 1;
+                    }
+                } else {
+                    maintenance_progressed_unscoped = true;
                 }
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
@@ -4946,6 +5169,20 @@ pub const DataServer = struct {
                 }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
+            // Runtime table status caches include physical LSM state. A flush,
+            // checkpoint, compaction, or obsolete-file reclaim invalidates
+            // those bytes even when no request mutates the logical table.
+            if (maintenance_progressed) {
+                if (maintenance_progressed_unscoped) {
+                    self.invalidateAllRuntimeStatusDiskUsageCacheEntries();
+                } else {
+                    for (maintenance_progressed_groups[0..maintenance_progressed_group_count]) |group_id| {
+                        self.invalidateRuntimeStatusDiskUsageCacheForGroup(group_id);
+                    }
+                }
+                self.runtime_status_dirty.store(true, .release);
+                self.markStoreStatusDirtyImmediate();
+            }
             // Bulk loads can leave leaf postings with stale quantized payloads
             // (deferred splits), which forces exact member scoring on every
             // query that visits them. Drain a bounded amount of that repair
@@ -8569,38 +8806,93 @@ pub const DataServer = struct {
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
     ) ?u64 {
-        const now_ns = platform_time.monotonicNs();
+        return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory());
+    }
+
+    fn runtimeStatusDiskUsageBytesBestEffortWithScanner(
+        self: *DataServer,
+        group_id: u64,
+        db_path: []const u8,
+        status: runtime_status.LocalTableRuntimeStatus,
+        scanner: RuntimeStatusDiskUsageScanner,
+    ) ?u64 {
         const active = runtimeStatusHasActiveBackgroundWork(status);
         const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
             status.metadata.lsm_root_generation
         else
             self.provisioned_storage.visibleRootGenerationForGroup(group_id);
-        lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
-        if (self.runtime_status_disk_usage_cache.get(group_id)) |entry| {
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const now_ns = platform_time.monotonicNs();
+            lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+            const state = self.runtime_status_disk_usage_cache.getOrPut(self.alloc, group_id) catch {
+                self.runtime_status_disk_usage_cache_mutex.unlock();
+                return null;
+            };
+            if (!state.found_existing) state.value_ptr.* = .{};
+            const group_generation = state.value_ptr.invalidation_generation;
             if (runtimeStatusDiskUsageCacheReusable(
-                entry,
+                state.value_ptr.*,
                 lsm_root_generation,
                 now_ns,
                 active,
                 status.stats.doc_count,
+                status.stats.storage_change_token,
+            )) {
+                const disk_bytes = state.value_ptr.disk_bytes;
+                self.runtime_status_disk_usage_cache_mutex.unlock();
+                return disk_bytes;
+            }
+            self.runtime_status_disk_usage_cache_mutex.unlock();
+
+            if (active and status.stats.doc_count == 0) return null;
+            const disk_bytes = scanner.scan(self.alloc, db_path) catch return null;
+
+            lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+            const current = self.runtime_status_disk_usage_cache.getPtr(group_id) orelse {
+                self.runtime_status_disk_usage_cache_mutex.unlock();
+                continue;
+            };
+            if (!runtimeStatusDiskUsageScanCanPublish(
+                current.*,
+                group_generation,
             )) {
                 self.runtime_status_disk_usage_cache_mutex.unlock();
-                return entry.disk_bytes;
+                continue;
             }
+            current.* = .{
+                .disk_bytes = disk_bytes,
+                .checked_at_ns = now_ns,
+                .lsm_root_generation = lsm_root_generation,
+                .storage_change_token = status.stats.storage_change_token,
+                .invalidation_generation = group_generation,
+                .valid = true,
+            };
+            self.runtime_status_disk_usage_cache_mutex.unlock();
+            return disk_bytes;
         }
-        self.runtime_status_disk_usage_cache_mutex.unlock();
+        return null;
+    }
 
-        if (active and status.stats.doc_count == 0) return null;
-        const disk_bytes = directoryUsageBytes(self.alloc, db_path) catch return null;
-
+    fn invalidateRuntimeStatusDiskUsageCacheForGroup(self: *DataServer, group_id: u64) void {
+        const generation = self.runtime_status_disk_usage_invalidation_generation.fetchAdd(1, .acq_rel) +| 1;
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
         defer self.runtime_status_disk_usage_cache_mutex.unlock();
-        self.runtime_status_disk_usage_cache.put(self.alloc, group_id, .{
-            .disk_bytes = disk_bytes,
-            .checked_at_ns = now_ns,
-            .lsm_root_generation = lsm_root_generation,
-        }) catch {};
-        return disk_bytes;
+        const state = self.runtime_status_disk_usage_cache.getOrPut(self.alloc, group_id) catch return;
+        if (!state.found_existing) state.value_ptr.* = .{};
+        state.value_ptr.invalidation_generation = generation;
+        state.value_ptr.valid = false;
+    }
+
+    fn invalidateAllRuntimeStatusDiskUsageCacheEntries(self: *DataServer) void {
+        const generation = self.runtime_status_disk_usage_invalidation_generation.fetchAdd(1, .acq_rel) +| 1;
+        lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
+        defer self.runtime_status_disk_usage_cache_mutex.unlock();
+        var it = self.runtime_status_disk_usage_cache.valueIterator();
+        while (it.next()) |entry| {
+            entry.invalidation_generation = generation;
+            entry.valid = false;
+        }
     }
 
     fn joinLocalGroupStatusRefreshThread(self: *DataServer) void {
@@ -20973,6 +21265,18 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .obsolete_paths_reclaimable = 5,
         .obsolete_delete_failures = 6,
         .obsolete_delete_retries = 7,
+        .wal_soft_limit_segments = 8,
+        .wal_hard_limit_segments = 32,
+        .wal_soft_limit_bytes = 32768,
+        .wal_hard_limit_bytes = 65536,
+        .wal_checkpoint_pending = true,
+        .wal_pressure_blocked = true,
+        .wal_checkpoint_retry_reason = .checkpoint_failure,
+        .wal_checkpoint_retry_attempts = 3,
+        .wal_checkpoint_retry_delay_ns = 250,
+        .active_immutable_logical_bytes = 1025,
+        .unpublished_wal_logical_bytes = 2049,
+        .unpublished_wal_max_batch_logical_bytes = 1537,
         .active_readers = 6,
         .active_readers_by_kind = blk: {
             var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
@@ -21020,6 +21324,19 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_reclaimable 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_failures_total 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_retries_total 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_soft_limit_segments 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_hard_limit_segments 32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_soft_limit_bytes 32768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_hard_limit_bytes 65536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_pending 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_pressure_blocked 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_reason{reason=\"checkpoint_failure\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_reason{reason=\"soft_pressure\"} 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_attempts 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_wal_checkpoint_retry_delay_ns 250") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_immutable_logical_bytes 1025") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_unpublished_wal_logical_bytes 2049") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_unpublished_wal_max_batch_logical_bytes 1537") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers_by_kind{kind=\"compaction\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_reader_kind{kind=\"compaction\"} 3") != null);
@@ -21053,6 +21370,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .write_pressure_overloads = 23,
         .write_pressure_rejections = 24,
         .wal_pressure_flushes = 7,
+        .wal_pressure_manifest_publishes = 29,
+        .wal_pressure_admission_checkpoints = 30,
+        .wal_pressure_failures = 31,
+        .wal_pressure_rejections = 32,
         .wal_append_records = 8,
         .wal_append_entries = 9,
         .wal_append_bytes = 10,
@@ -21080,6 +21401,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_overload_l0_byte_debt_total 28") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_rejections_total 24") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_flushes_total 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_manifest_publishes_total 29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_admission_checkpoints_total 30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_failures_total 31") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_rejections_total 32") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_append_records_total 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_sync_records_total 12") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_sync_ns_total 13") != null);

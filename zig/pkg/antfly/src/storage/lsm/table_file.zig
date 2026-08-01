@@ -1125,6 +1125,9 @@ pub const StreamingEncoder = struct {
     encoded_filter_bytes: std.ArrayListUnmanaged(u8) = .empty,
     block_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
     block_prefix_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
+    /// Exact encoded metadata contribution of completed blocks. Maintaining it
+    /// at flush time keeps physical-size admission O(1) per appended entry.
+    completed_blocks_metadata_bytes: usize = 0,
     /// Heap owned by completed block metadata. Keep this incrementally so
     /// resource accounting remains O(1) as a streaming table grows.
     blocks_owned_heap_bytes: u64 = 0,
@@ -1207,6 +1210,84 @@ pub const StreamingEncoder = struct {
         if (self.block_largest_namespace_name) |name| bytes +|= name.len;
         bytes +|= self.block_largest_key.len;
         return bytes;
+    }
+
+    /// Returns a conservative upper bound for the complete encoded table if
+    /// `entry` is appended and the encoder is finished immediately afterward.
+    /// Block compression is deliberately ignored because every adaptive codec
+    /// falls back to the raw payload when compression would grow the block.
+    /// This lets streaming compaction split before an append without buffering
+    /// or rolling back an arbitrarily large entry.
+    pub fn encodedSizeUpperBoundAfterEntry(self: *const StreamingEncoder, entry: Entry) !usize {
+        if (self.finished or self.entry_count >= max_entry_count) return error.TableFileTooLarge;
+        const entry_len = try tableEntryEncodedLen(entry);
+        if (self.logical_entry_data_len > max_entry_data_len or
+            entry_len > max_entry_data_len - self.logical_entry_data_len)
+        {
+            return error.TableFileTooLarge;
+        }
+
+        const split_pending_block = self.block_entry_count > 0 and
+            self.block_bytes.items.len +| entry_len > default_block_size;
+        const projected_entry_count = try checkedAddUsize(self.entry_count, 1);
+
+        var total = self.sink.len();
+        total = try checkedAddUsize(total, self.block_bytes.items.len);
+        total = try checkedAddUsize(total, entry_len);
+
+        // Metadata section headers and the packed local entry offsets.
+        total = try checkedAddUsize(total, packed_offsets_magic.len);
+        total = try checkedAddUsize(
+            total,
+            std.math.mul(usize, projected_entry_count, @sizeOf(u16)) catch return error.TableFileTooLarge,
+        );
+        total = try checkedAddUsize(total, @sizeOf(u32));
+        total = try checkedAddUsize(total, bloomEncodedLenForBytes(self.filter_builder.bytes.len));
+        // Six block-index sections, each prefixed by a u32 block count.
+        total = try checkedAddUsize(total, 6 * @sizeOf(u32));
+        total = try checkedAddUsize(total, self.completed_blocks_metadata_bytes);
+
+        if (split_pending_block) {
+            total = try checkedAddUsize(total, try encodedBlockMetadataLen(
+                self.block_smallest_namespace_name,
+                self.block_smallest_key,
+                self.block_largest_namespace_name,
+                self.block_largest_key,
+                try bloomEncodedLenForKeyCount(self.block_hashes.items.len, block_filter_config),
+                try bloomEncodedLenForKeyCount(self.block_prefix_hashes.items.len, block_filter_config),
+            ));
+            total = try checkedAddUsize(total, try encodedBlockMetadataLen(
+                entry.namespace_name,
+                entry.key,
+                entry.namespace_name,
+                entry.key,
+                try bloomEncodedLenForKeyCount(1, block_filter_config),
+                try bloomEncodedLenForKeyCount(if (entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key) != null) 1 else 0, block_filter_config),
+            ));
+        } else {
+            const smallest_namespace_name = if (self.block_entry_count == 0) entry.namespace_name else self.block_smallest_namespace_name;
+            const smallest_key = if (self.block_entry_count == 0) entry.key else self.block_smallest_key;
+            const candidate_prefix = entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key);
+            const block_prefix_count = self.block_prefix_hashes.items.len + @intFromBool(candidate_prefix != null and
+                (self.block_prefix_hashes.items.len == 0 or !std.meta.eql(self.block_prefix_hashes.items[self.block_prefix_hashes.items.len - 1], candidate_prefix.?)));
+            total = try checkedAddUsize(total, try encodedBlockMetadataLen(
+                smallest_namespace_name,
+                smallest_key,
+                entry.namespace_name,
+                entry.key,
+                try bloomEncodedLenForKeyCount(self.block_hashes.items.len + 1, block_filter_config),
+                try bloomEncodedLenForKeyCount(block_prefix_count, block_filter_config),
+            ));
+        }
+
+        // Prefix extractor, run-level prefix Bloom filter, and footer.
+        const candidate_prefix = entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key);
+        const prefix_count = self.prefix_hashes.items.len + @intFromBool(candidate_prefix != null and
+            (self.prefix_hashes.items.len == 0 or !std.meta.eql(self.prefix_hashes.items[self.prefix_hashes.items.len - 1], candidate_prefix.?)));
+        total = try checkedAddUsize(total, 2 * @sizeOf(u32));
+        total = try checkedAddUsize(total, try bloomEncodedLenForKeyCount(prefix_count, self.bloom_config));
+        total = try checkedAddUsize(total, footer_len);
+        return total;
     }
 
     pub fn appendEntry(self: *StreamingEncoder, entry: Entry) !void {
@@ -1406,6 +1487,18 @@ pub const StreamingEncoder = struct {
             self.allocator.free(largest_key);
         }
 
+        const next_completed_blocks_metadata_bytes = try checkedAddUsize(
+            self.completed_blocks_metadata_bytes,
+            try encodedBlockMetadataLen(
+                smallest_namespace_name,
+                smallest_key,
+                largest_namespace_name,
+                largest_key,
+                bloomEncodedLenForBytes(block_filter.bytes.len),
+                bloomEncodedLenForBytes(block_prefix_filter.bytes.len),
+            ),
+        );
+
         try self.blocks.append(self.allocator, .{
             .relative_offset = self.block_start.?,
             .len = try checkedU32(self.block_bytes.items.len),
@@ -1423,6 +1516,7 @@ pub const StreamingEncoder = struct {
             .prefix_filter = block_prefix_filter,
             .hash_slots = hash_slots,
         });
+        self.completed_blocks_metadata_bytes = next_completed_blocks_metadata_bytes;
         self.blocks_owned_heap_bytes +|= ownedEncodedBlockMetaHeapBytes(self.blocks.items[self.blocks.items.len - 1]);
 
         self.block_bytes.clearRetainingCapacity();
@@ -1432,6 +1526,43 @@ pub const StreamingEncoder = struct {
         self.block_entry_count = 0;
     }
 };
+
+const bloom_encoded_header_len = bloom.magic.len + @sizeOf(u32) * 3 + @sizeOf(u8);
+
+fn bloomEncodedLenForBytes(byte_len: usize) usize {
+    return bloom_encoded_header_len +| byte_len;
+}
+
+fn bloomEncodedLenForKeyCount(key_count: usize, config: bloom.Config) !usize {
+    if (key_count == 0) return bloomEncodedLenForBytes(0);
+    const requested_bits = std.math.mul(usize, key_count, config.bits_per_key) catch return error.TableFileTooLarge;
+    const raw_bits = @max(config.min_bits, requested_bits);
+    const bit_count = std.math.ceilPowerOfTwo(usize, raw_bits) catch raw_bits;
+    if (bit_count > std.math.maxInt(u32)) return error.TableFileTooLarge;
+    const byte_len = try checkedAddUsize(bit_count, 7) / 8;
+    return try checkedAddUsize(bloom_encoded_header_len, byte_len);
+}
+
+fn encodedBlockMetadataLen(
+    smallest_namespace_name: ?[]const u8,
+    smallest_key: []const u8,
+    largest_namespace_name: ?[]const u8,
+    largest_key: []const u8,
+    encoded_filter_len: usize,
+    encoded_prefix_filter_len: usize,
+) !usize {
+    // Largest bound: six u32 fields. Bloom and prefix Bloom: a u32 length
+    // each. Empty hash slots: one u32 length. Physical block metadata: four
+    // u32 fields. Smallest bound: two u32 fields.
+    var total: usize = 15 * @sizeOf(u32);
+    if (smallest_namespace_name) |name| total = try checkedAddUsize(total, name.len);
+    total = try checkedAddUsize(total, smallest_key.len);
+    if (largest_namespace_name) |name| total = try checkedAddUsize(total, name.len);
+    total = try checkedAddUsize(total, largest_key.len);
+    total = try checkedAddUsize(total, encoded_filter_len);
+    total = try checkedAddUsize(total, encoded_prefix_filter_len);
+    return total;
+}
 
 fn capacityBytes(comptime T: type, capacity: usize) u64 {
     return @as(u64, @intCast(capacity)) *| @as(u64, @intCast(@sizeOf(T)));

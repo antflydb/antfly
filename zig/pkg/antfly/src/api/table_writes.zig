@@ -2553,10 +2553,8 @@ pub const ProvisionedTableWriteCache = struct {
         return if (stats.obsolete_paths_pinned_by_versions != 0) 1 else 0;
     }
 
-    fn leaseLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+    fn leaseLsmMaintenanceDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
             if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) return self.leaseEntryLocked(entry);
             }
@@ -2564,9 +2562,8 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
-    fn leasePrimaryLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+    fn leasePrimaryLsmMaintenanceDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
             if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) return self.leaseEntryLocked(entry);
             }
@@ -2612,8 +2609,6 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn nextLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
         var delay_ns: ?u64 = null;
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
             if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
                 delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
             }
@@ -2624,7 +2619,6 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn nextPrimaryLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
         var delay_ns: ?u64 = null;
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
             if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
                 delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
             }
@@ -8459,19 +8453,28 @@ pub const ProvisionedTableWriteSource = struct {
         result.retry_at_ms = entry.value_ptr.retry_at_ms;
     }
 
+    pub const LsmMaintenanceRoundResult = struct {
+        progressed: bool = false,
+        group_id: ?u64 = null,
+    };
+
     pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
+        return (try self.runLsmMaintenanceRoundDetailed()).progressed;
+    }
+
+    pub fn runLsmMaintenanceRoundDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
         var primary_only = false;
         var leased = blk: {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
-            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
+            const cache = self.write_cache orelse return .{};
+            if (cache.leaseLsmMaintenanceDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmMaintenanceDueLocked()) |lease| {
                 primary_only = true;
                 break :blk lease;
             }
-            if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
-            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return false;
+            if (cache.maxLsmMaintenanceScoreLocked() == 0) return .{};
+            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -8489,26 +8492,33 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
         }
-        return progressed;
+        return .{
+            .progressed = progressed,
+            .group_id = if (leased.entry) |entry| entry.group_id else null,
+        };
     }
 
     pub fn runLsmMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !bool {
-        if (!self.local_db_mutex.tryLock()) return false;
+        return (try self.runLsmMaintenanceRoundBestEffortDetailed()).progressed;
+    }
+
+    pub fn runLsmMaintenanceRoundBestEffortDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        if (!self.local_db_mutex.tryLock()) return .{};
         var primary_only = false;
         var leased = blk: {
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
-            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
+            const cache = self.write_cache orelse return .{};
+            if (cache.leaseLsmMaintenanceDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmMaintenanceDueLocked()) |lease| {
                 primary_only = true;
                 break :blk lease;
             }
             if (cache.maxLsmMaintenanceScoreLocked() != 0) {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
             }
-            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
+            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return .{};
             primary_only = true;
-            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;
+            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -8526,7 +8536,10 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
         }
-        return progressed;
+        return .{
+            .progressed = progressed,
+            .group_id = if (leased.entry) |entry| entry.group_id else null,
+        };
     }
 
     pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
@@ -21344,6 +21357,7 @@ test "bound table write source backs up and restores a local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///bound-native-test",
     });
 
@@ -21417,6 +21431,7 @@ test "bound table write source backs up and restores a portable local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///bound-portable-test",
     });
 
@@ -21517,6 +21532,7 @@ test "provisioned table write source backs up and restores a local table" {
     try std.testing.expectError(error.GenerationDurabilityUncertain, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///stable-backup-location",
     }));
 
@@ -21525,12 +21541,14 @@ test "provisioned table write source backs up and restores a local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///stable-backup-location",
         .reconcile_only = true,
     });
     try std.testing.expectError(error.RestoreIdentityMismatch, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///different-backup-location",
         .reconcile_only = true,
     }));
@@ -21570,6 +21588,7 @@ test "provisioned table restore rejects multi-range manifests before opening sto
     try std.testing.expectError(error.UnsupportedMultiRangeTable, source.source().restoreTable(std.testing.allocator, "docs", .{
         .backup_root = "/tmp/unused-antfly-multi-range-backup",
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///tmp/unused-antfly-multi-range-backup",
     }));
 }
@@ -21675,6 +21694,7 @@ test "provisioned table restore retry skips exact incomplete restore state with 
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = location,
     });
     source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
@@ -21700,6 +21720,7 @@ test "provisioned table restore retry skips exact incomplete restore state with 
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = location,
     });
 }
@@ -21941,6 +21962,7 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
         .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, "snap1", 7001),
     };
     defer freeBackupShards(alloc, shards);
+    try backups_api.populateShardArtifactIntegrity(alloc, null, .native, dest_root, &shards[0]);
 
     var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,
@@ -22000,6 +22022,7 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
     try std.testing.expectError(error.IdentityNamespaceMismatch, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///provisioned-identity-mismatch-test",
     }));
 }
@@ -22103,6 +22126,7 @@ test "provisioned table write source backs up and restores full_text writes from
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///provisioned-write-cache-test",
     });
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -25829,6 +25853,8 @@ test "provisioned managed replay tails converge and publish without later traffi
     var write_cache_live = true;
     defer if (write_cache_live) write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    var source_live = true;
+    defer if (source_live) source.deinit();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
@@ -25915,6 +25941,8 @@ test "provisioned managed replay tails converge and publish without later traffi
     }
 
     write_cache.entries.items[0].db.setQueryVisibilityHook(null);
+    source.deinit();
+    source_live = false;
     write_cache.deinit();
     write_cache_live = false;
     snapshot_cache.deinit();
@@ -25923,9 +25951,10 @@ test "provisioned managed replay tails converge and publish without later traffi
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
 
-    // Leave one real dense replay record beyond the persisted applied
+    // Leave one real dense replay effect beyond the persisted applied
     // watermark while all workers are stopped. This models a process exiting
-    // after the commit became durable but before derived replay completed.
+    // after the primary commit and generated effect became durable but before
+    // derived replay completed.
     var restart_tail_sequence: u64 = 0;
     {
         var seeded = try db_mod.DB.open(alloc, group_path, .{
@@ -25940,12 +25969,17 @@ test "provisioned managed replay tails converge and publish without later traffi
         });
         defer seeded.close();
 
-        const stored_key = try db_mod.internal_keys.documentKeyAlloc(alloc, "restart-tail");
-        defer alloc.free(stored_key);
-        try seeded.core.store.putBatch(&.{.{
-            .key = stored_key,
-            .value = "{\"content\":\"restart payload\",\"semantic_content\":\"restart semantic payload\"}",
-        }}, &.{});
+        // Commit through the real batch machinery while all optional runtimes
+        // and index workers are stopped. This leaves an ordinary durable
+        // document/enrichment replay tail without fabricating only one half of
+        // the journal contract.
+        try seeded.batch(.{
+            .writes = &.{.{
+                .key = "restart-tail",
+                .value = "{\"content\":\"restart payload\",\"semantic_content\":\"restart semantic payload\"}",
+            }},
+            .sync_level = .write,
+        });
 
         var dense_embeddings = try alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
         var derived_batch = db_mod.derived_types.DerivedBatch{
@@ -25981,6 +26015,7 @@ test "provisioned managed replay tails converge and publish without later traffi
     var restarted_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer restarted_write_cache.deinit();
     var restarted_source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    defer restarted_source.deinit();
     restarted_source.write_cache = &restarted_write_cache;
     restarted_source.runtime_status_cache = &restarted_snapshot_cache;
 
@@ -35723,6 +35758,7 @@ test "provisioned table write source restore table does not hold local db mutex 
             _ = self.source.source().restoreTable(std.heap.page_allocator, "docs", .{
                 .backup_root = backup_root,
                 .manifest = self.manifest,
+                .artifact_backup_id = self.manifest.backup_id,
                 .source_location = "file:///provisioned-restore-preparation-test",
             }) catch |err| {
                 self.err = err;
