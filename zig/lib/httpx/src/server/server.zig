@@ -1125,7 +1125,19 @@ pub const Server = struct {
 
     fn logConnectionError(err: anyerror) void {
         switch (err) {
-            error.Timeout, error.Canceled => {},
+            // Normal peer-abandonment and shutdown races are accounted for by
+            // admission/cancellation metrics. Logging one line per abandoned
+            // socket recreates the overload log storm this server is meant to
+            // contain and obscures actionable listener failures.
+            error.Timeout,
+            error.Canceled,
+            error.EndOfStream,
+            error.ConnectionResetByPeer,
+            error.BrokenPipe,
+            error.RecvFailed,
+            error.SendFailed,
+            error.InvalidSocketOption,
+            => {},
             else => std.debug.print("Connection error: {}\n", .{err}),
         }
     }
@@ -1396,9 +1408,14 @@ pub const Server = struct {
             }
 
             const request_wants_keep_alive = req.headers.isKeepAlive(req.version);
+            // Handlers may deliberately shed an overloaded request and ask the
+            // peer to reconnect later. Honor a response-side Connection: close
+            // instead of advertising closure while retaining the socket and its
+            // connection-admission permit until the keep-alive timeout.
+            const response_wants_keep_alive = response.headers.isKeepAlive(req.version);
             const reaches_request_limit = self.config.max_requests_per_connection > 0 and
                 request_count + 1 >= self.config.max_requests_per_connection;
-            const keep_alive = self.config.keep_alive and request_wants_keep_alive and
+            const keep_alive = self.config.keep_alive and request_wants_keep_alive and response_wants_keep_alive and
                 !reaches_request_limit and self.shutdown_mode.load(.acquire) == 0;
             if (!keep_alive) {
                 try response.headers.set(HeaderName.CONNECTION, "close");

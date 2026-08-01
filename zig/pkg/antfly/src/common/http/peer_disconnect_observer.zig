@@ -10,6 +10,10 @@ const platform_sync = @import("antfly_platform").sync;
 const http_common = @import("http_common.zig");
 
 const observation_interval_ms: u64 = 25;
+// Linux exposes POLLRDHUP under its GNU poll ABI, but Zig 0.16's
+// std.os.linux.POLL omits the name. The kernel ABI value is stable and shared
+// with EPOLLRDHUP; keep it explicitly typed for pollfd.events/revents.
+const linux_poll_rdhup: i16 = 0x2000;
 
 fn sleepMs(ms: u64) void {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
@@ -175,9 +179,12 @@ pub const Observer = struct {
                 continue;
             }
             for (self.entries.items) |entry| {
-                var events = std.posix.POLL.ERR;
+                // POLL constants are comptime integers. Give the mutable mask
+                // the ABI type used by pollfd.events so Linux can add RDHUP at
+                // runtime without leaving `events` inferred as comptime_int.
+                var events: i16 = std.posix.POLL.ERR;
                 if (!entry.unread_input) events |= std.posix.POLL.IN;
-                if (comptime builtin.os.tag == .linux) events |= std.c.POLL.RDHUP;
+                if (comptime builtin.os.tag == .linux) events |= linux_poll_rdhup;
                 fds.appendAssumeCapacity(.{ .fd = entry.fd, .events = events, .revents = 0 });
                 ids.appendAssumeCapacity(entry.id);
             }
@@ -206,9 +213,11 @@ pub const Observer = struct {
                 self.cancelEntryLocked(index, false);
                 continue;
             }
-            if (events & std.posix.POLL.ERR != 0 or
-                (comptime builtin.os.tag == .linux and events & std.c.POLL.RDHUP != 0))
-            {
+            const peer_closed = if (comptime builtin.os.tag == .linux)
+                events & linux_poll_rdhup != 0
+            else
+                false;
+            if (events & std.posix.POLL.ERR != 0 or peer_closed) {
                 self.cancelEntryLocked(index, true);
                 continue;
             }

@@ -59,6 +59,8 @@ const casbin = @import("antfly_casbin");
 const builtin = @import("builtin");
 
 const db_mod = @import("../storage/db/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
+const table_schema_api = @import("../schema/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 
@@ -428,11 +430,13 @@ pub const AntflyApiHandler = struct {
 
     fn queryOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
+        try ctx.setHeader("Connection", "close");
         return textResponse(ctx, 429, "query capacity exhausted");
     }
 
     fn queryCancellationUnavailableResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
+        try ctx.setHeader("Connection", "close");
         return textResponse(ctx, 503, "query cancellation capacity unavailable");
     }
 
@@ -3428,19 +3432,36 @@ const HttpxE2eServer = struct {
     thread: ?std.Thread = null,
 
     fn init(self: *HttpxE2eServer, allocator: std.mem.Allocator, api_server: *ApiHttpServer) !void {
+        return self.initWithLimits(allocator, api_server, 32, 1_000);
+    }
+
+    fn initWithLimits(
+        self: *HttpxE2eServer,
+        allocator: std.mem.Allocator,
+        api_server: *ApiHttpServer,
+        query_capacity: usize,
+        max_connections: u32,
+    ) !void {
         self.* = .{
             .allocator = allocator,
             .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
             .server = undefined,
-            .handler = .{ .api_server = api_server },
+            .handler = .{
+                .api_server = api_server,
+                .query_admission = QueryAdmission.init(query_capacity),
+            },
             .thread = null,
         };
         errdefer self.io_impl.deinit();
+
+        try self.handler.initRuntime(allocator);
+        errdefer self.handler.deinitRuntime();
 
         self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), .{
             .host = "127.0.0.1",
             .port = 0,
             .request_timeout_ms = 30_000,
+            .max_connections = max_connections,
         });
         errdefer self.server.deinit();
 
@@ -3460,6 +3481,7 @@ const HttpxE2eServer = struct {
             self.server.stop();
             thread.join();
         }
+        self.handler.deinitRuntime();
         self.server.deinit();
         self.io_impl.deinit();
         self.* = undefined;
@@ -3516,6 +3538,70 @@ fn requestWithRetry(
         };
     }
     unreachable;
+}
+
+fn queryTotalWithRetry(
+    alloc: std.mem.Allocator,
+    client: *httpx.Client,
+    io: std.Io,
+    url: []const u8,
+    body: []const u8,
+) !u64 {
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var response = try requestWithRetry(client, io, .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    const responses = parsed.value.object.get("responses") orelse return error.InvalidResponse;
+    if (responses.array.items.len != 1) return error.InvalidResponse;
+    const hits = responses.array.items[0].object.get("hits") orelse return error.InvalidResponse;
+    const total = hits.object.get("total") orelse return error.InvalidResponse;
+    const value = total.object.get("value") orelse return error.InvalidResponse;
+    return @intCast(value.integer);
+}
+
+fn expectHighFrequencyRecallViaHttpx(alloc: std.mem.Allocator, db_path: []const u8) !void {
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var status_source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), table_source.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});
+    defer alloc.free(query_url);
+
+    try std.testing.expectEqual(@as(u64, 4_237), try queryTotalWithRetry(
+        alloc,
+        &client,
+        client_io.io(),
+        query_url,
+        "{\"full_text_search\":{\"match\":\"catalog\",\"field\":\"title\"},\"filter_query\":{\"term\":\"published\",\"field\":\"state\"},\"limit\":1}",
+    ));
+    try std.testing.expectEqual(@as(u64, 763), try queryTotalWithRetry(
+        alloc,
+        &client,
+        client_io.io(),
+        query_url,
+        "{\"full_text_search\":{\"match\":\"catalog\",\"field\":\"title\"},\"filter_query\":{\"term\":\"draft\",\"field\":\"state\"},\"limit\":1}",
+    ));
+    try std.testing.expectEqual(@as(u64, 5_000), try queryTotalWithRetry(
+        alloc,
+        &client,
+        client_io.io(),
+        query_url,
+        "{\"full_text_search\":{\"match\":\"catalog\",\"field\":\"title\"},\"limit\":1}",
+    ));
 }
 
 const AuthStatusSource = struct {
@@ -3766,6 +3852,224 @@ test "httpx query admission releases a cancelled query slot" {
     admission.release();
     try std.testing.expect(admission.tryAcquire());
     admission.release();
+}
+
+test "httpx production path sheds 128 abandoned queries and preserves control recovery" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const BlockingReads = struct {
+        started: std.atomic.Value(u32) = .init(0),
+        cancelled: std.atomic.Value(u32) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable = table_reads.TableReadSource.VTable{
+            .lookup = lookup,
+            .scan = scan,
+            .query = query,
+        };
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs")) return null;
+            _ = self.started.fetchAdd(1, .monotonic);
+            while (!self.release.load(.acquire)) {
+                if (req.cancellation) |signal| {
+                    if (signal.load(.acquire)) {
+                        _ = self.cancelled.fetchAdd(1, .monotonic);
+                        return error.Cancelled;
+                    }
+                }
+                var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = std.posix.system.nanosleep(&delay, &delay);
+            }
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var reads = BlockingReads{};
+    defer reads.release.store(true, .release);
+    var status_source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.initWithLimits(alloc, &api_server, 8, 32) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var clients = [_]?httpx.Socket{null} ** 128;
+    defer for (&clients) |*slot| {
+        if (slot.*) |*client| client.close();
+        slot.* = null;
+    };
+
+    const request =
+        "POST /db/v1/tables/docs/query HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Content-Length: 11\r\n\r\n" ++
+        "{\"limit\":1}";
+    for (&clients) |*slot| {
+        var client = try httpx.Socket.connect(address, client_io);
+        errdefer client.close();
+        try client.sendAll(request);
+        slot.* = client;
+    }
+
+    for (0..10_000) |_| {
+        const admission = e2e_server.handler.query_admission.stats();
+        if (admission.in_flight == 8 and admission.rejected_total == 120) break;
+        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&delay, &delay);
+    }
+    const saturated = e2e_server.handler.query_admission.stats();
+    try std.testing.expectEqual(@as(usize, 8), saturated.in_flight);
+    try std.testing.expectEqual(@as(u64, 120), saturated.rejected_total);
+    try std.testing.expectEqual(@as(u32, 8), reads.started.load(.acquire));
+    try std.testing.expect(e2e_server.server.runtimeStats().active_connections <= 32);
+    try std.testing.expectEqual(@as(usize, 8), e2e_server.handler.runtimeStats().active_peer_observers);
+
+    // Rejected keep-alive clients must not retain all connection permits. The
+    // real status route remains reachable while every expensive slot is held.
+    var control_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer control_io.deinit();
+    var control_client = httpx.Client.initWithConfig(alloc, control_io.io(), .{ .keep_alive = false });
+    defer control_client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base_url});
+    defer alloc.free(status_url);
+    var status = try getWithRetry(&control_client, control_io.io(), status_url, null, 20);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), status.status.code);
+
+    // Simulate all timed-out callers abandoning their sockets. The observer
+    // must terminate the eight admitted queries and release every slot.
+    for (&clients) |*slot| {
+        if (slot.*) |*client| client.close();
+        slot.* = null;
+    }
+    for (0..10_000) |_| {
+        const admission = e2e_server.handler.query_admission.stats();
+        const runtime = e2e_server.handler.runtimeStats();
+        if (admission.in_flight == 0 and runtime.active_peer_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
+        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&delay, &delay);
+    }
+    try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.runtimeStats().active_peer_observers);
+    try std.testing.expectEqual(@as(u32, 8), reads.cancelled.load(.acquire));
+
+    reads.release.store(true, .release);
+    const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});
+    defer alloc.free(query_url);
+    var recovered = try requestWithRetry(&control_client, control_io.io(), .POST, query_url, "{\"limit\":1}", null, 20);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u16, 200), recovered.status.code);
+}
+
+test "httpx production query preserves high-frequency keyword recall across clean restarts" {
+    const alloc = std.testing.allocator;
+    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-keyword-restart-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(db_path);
+    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer fs_io.deinit();
+    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+
+    const schema_json =
+        \\{
+        \\  "default_type": "product",
+        \\  "document_schemas": {
+        \\    "product": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": true,
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text"]},
+        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer storage_schema.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const writes = try alloc.alloc(db_mod.types.BatchWrite, 5_000);
+        defer {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            const state = if (i < 4_237) "published" else "draft";
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"Catalog document {d}\",\"state\":\"{s}\"}}", .{ i, state }),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .full_index });
+    }
+
+    // Each helper invocation starts the real httpx adapter on a fresh DB open,
+    // issues the public query contract, and shuts the service down cleanly.
+    // Repeating it catches one-shot reload state that a DB-only snapshot test
+    // cannot observe.
+    try expectHighFrequencyRecallViaHttpx(alloc, db_path);
+    try expectHighFrequencyRecallViaHttpx(alloc, db_path);
 }
 
 test "httpx antfly routes require auth and enforce admin middleware" {
