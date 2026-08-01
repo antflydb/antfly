@@ -12275,7 +12275,9 @@ test "lsm backend no-cache point reads reuse local index and block cache" {
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
     try std.testing.expectEqual(@as(usize, 2), ctx.run_range_reads);
     try std.testing.expectEqual(@as(usize, 1), ctx.run_trailer_reads);
-    try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
+    // Mount performs one metadata-only size validation; repeated point reads
+    // must not add any more file-size probes.
+    try std.testing.expectEqual(@as(usize, 1), ctx.run_file_size_reads);
 }
 
 test "lsm backend multi-block point read skips directly to one candidate block" {
@@ -12456,7 +12458,9 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
     try std.testing.expectEqual(@as(usize, 2), ctx.run_range_reads);
     try std.testing.expectEqual(@as(usize, 1), ctx.run_trailer_reads);
-    try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
+    // Mount performs one metadata-only size validation; the point lookup does
+    // not need a second stat.
+    try std.testing.expectEqual(@as(usize, 1), ctx.run_file_size_reads);
 }
 
 test "lsm backend cached cursor scan avoids whole-run table reads" {
@@ -12803,7 +12807,9 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
     try std.testing.expect(ctx.run_range_reads <= 18);
     try std.testing.expect(ctx.run_trailer_reads <= 8);
-    try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
+    // Each of the five backend mounts validates the immutable file once;
+    // cursor, batch, and probe reads do not add further size probes.
+    try std.testing.expectEqual(@as(usize, 5), ctx.run_file_size_reads);
 }
 
 test "lsm backend prefix bloom skips bounded scan blocks" {
@@ -13174,7 +13180,9 @@ test "lsm backend block filter avoids candidate block read on run-bloom false po
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
     try std.testing.expectEqual(@as(usize, 1), ctx.run_range_reads);
     try std.testing.expectEqual(@as(usize, 1), ctx.run_trailer_reads);
-    try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
+    // Mount validates the physical file once; the Bloom-negative lookup does
+    // not touch file metadata again.
+    try std.testing.expectEqual(@as(usize, 1), ctx.run_file_size_reads);
 }
 
 test "lsm backend persists next run id across reopen" {
@@ -16018,6 +16026,49 @@ test "lsm backend rejects oversized manifest runs before reporting open" {
     try std.testing.expectError(error.FileTooBig, Backend.open(allocator, root_dir, .{
         .storage = storage.storage(),
     }));
+}
+
+test "lsm backend rejects physical run size mismatch before reporting open" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-mismatched-physical-run";
+    const run_path = "/lsm-mismatched-physical-run/runs/1.tbl";
+    try storage.storage().writeFileAbsolute(run_path, "physical-bytes");
+
+    var run = Run{
+        .id = 1,
+        .level = 0,
+        .size_bytes = "physical-bytes".len - 1,
+        .path = try allocator.dupe(u8, run_path),
+        .smallest_namespace_name = try allocator.dupe(u8, "docs"),
+        .smallest_key = try allocator.dupe(u8, "doc:a"),
+        .largest_namespace_name = try allocator.dupe(u8, "docs"),
+        .largest_key = try allocator.dupe(u8, "doc:z"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = null,
+    };
+    defer run.deinit(allocator);
+
+    const runs = [_]Run{run};
+    _ = try repository_mod.persistManifestWithStorageCount(
+        storage.storage(),
+        allocator,
+        root_dir,
+        2,
+        &runs,
+        &.{},
+    );
+
+    try std.testing.expectError(error.InvalidTableFile, Backend.open(allocator, root_dir, .{
+        .storage = storage.storage(),
+    }));
+    try std.testing.expectError(
+        error.FileTooBig,
+        repository_mod.validateManifestRunPhysicalSize(1, repository_mod.maxRunFileReadBytes() + 1),
+    );
 }
 
 test "lsm backend reloads persisted manifest and run files over memory storage" {

@@ -141,6 +141,9 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     if (loaded_manifest) {
         for (backend.runs.items) |run| {
             const path = run.path orelse return error.RunStateUnavailable;
+            // Check the manifest bound first so old oversized manifests retain
+            // their precise FileTooBig diagnosis even when the referenced file
+            // has already been removed by an operator.
             repository_mod.validateManifestRunSize(run.size_bytes) catch |err| {
                 // The caller receives the concrete open error. Keep the
                 // structured rejection diagnostic at warning level so an
@@ -150,6 +153,20 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
                 std.log.warn(
                     "lsm backend open rejected invalid manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
                     .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+            const physical_size = backend.storage.?.fileSize(path) catch |err| {
+                std.log.warn(
+                    "lsm backend open rejected unavailable manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+            repository_mod.validateManifestRunPhysicalSize(run.size_bytes, physical_size) catch |err| {
+                std.log.warn(
+                    "lsm backend open rejected mismatched manifest run root={s} run_id={} path={s} manifest_bytes={} physical_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, physical_size, err },
                 );
                 return err;
             };

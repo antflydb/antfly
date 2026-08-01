@@ -668,6 +668,17 @@ pub fn validateManifestRunSize(manifest_size: u64) !void {
     if (manifest_size > max_run_file_read_bytes) return error.FileTooBig;
 }
 
+/// Validate the immutable file against the checksummed manifest without
+/// decoding or allocating the table. Run files are atomically published and
+/// never modified in place, so a size mismatch means the manifest and file do
+/// not describe the same durable object. Reject it during mount instead of
+/// letting the backend report ready and fail on the first query.
+pub fn validateManifestRunPhysicalSize(manifest_size: u64, physical_size: u64) !void {
+    try validateManifestRunSize(manifest_size);
+    if (physical_size > max_run_file_read_bytes) return error.FileTooBig;
+    if (physical_size != manifest_size) return error.InvalidTableFile;
+}
+
 pub fn deleteFileAbsolute(path: []const u8) !void {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
