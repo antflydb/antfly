@@ -2135,9 +2135,9 @@ pub const Client = struct {
             }
         }
 
-        lease_transferred = true;
+        const code = try transferStreamLeaseAfterStatus(&lease_transferred, status_code);
         return .{
-            .status_code = status_code orelse return error.InvalidResponse,
+            .status_code = code,
             .headers = response_headers,
             .reader = .{
                 .stream = stream,
@@ -2149,6 +2149,15 @@ pub const Client = struct {
                 .lease = lease,
             },
         };
+    }
+
+    /// Validates the required H2 status before the returned stream reader owns
+    /// its pool-entry lease. This keeps requestStream's error defer in charge
+    /// of releasing leases for malformed response headers.
+    fn transferStreamLeaseAfterStatus(lease_transferred: *bool, status_code: ?u16) !u16 {
+        const code = status_code orelse return error.InvalidResponse;
+        lease_transferred.* = true;
+        return code;
     }
 
     /// Unified response reader parameterized on the read source.
@@ -3286,6 +3295,36 @@ test "H2 entry lease defers retired teardown while another request is in flight"
     // until the final old request releases its lease.
     try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
     try std.testing.expect(entry.retired);
+}
+
+test "H2 stream response without status releases its retired lease" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+
+    var entry = H2PoolEntry{
+        .socket = undefined,
+        .session = undefined,
+        .h2 = H2Connection.initClient(std.testing.allocator, std.testing.io),
+        .is_tls = false,
+        .retired = true,
+        // Keep one synthetic in-flight request so release avoids socket
+        // teardown; that lets this regression assert the lease accounting.
+        .active_requests = 2,
+    };
+    defer entry.h2.deinit();
+
+    {
+        var lease = Client.H2Lease{ .client = &client, .entry = &entry };
+        var lease_transferred = false;
+        defer if (!lease_transferred) lease.release();
+
+        try std.testing.expectError(
+            error.InvalidResponse,
+            Client.transferStreamLeaseAfterStatus(&lease_transferred, null),
+        );
+        try std.testing.expect(!lease_transferred);
+    }
+    try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
 }
 
 test "H2 stream cleanup detaches receiver before resetting a published stream" {

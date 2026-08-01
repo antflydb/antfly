@@ -111,12 +111,14 @@ pub const QueryAdmission = struct {
     }
 };
 
-/// Watches only for a terminal peer socket event while a query is executing.
-/// It deliberately does not read the socket. This endpoint does not support
-/// HTTP/1 keep-alive or pipelining, so a readable peer socket is terminal
-/// (including Darwin's normal-FIN readiness) rather than request bytes owned
-/// by httpx's connection loop. HTTP/2 stream reset support remains in httpx's
-/// stream layer.
+/// Watches for a peer disconnect while a fully received HTTP/1 query executes.
+///
+/// Darwin reports a normal FIN as POLL.IN, but HTTP/1 keep-alive may also make
+/// a pipelined next request readable. After `ctx.body()` has drained this
+/// request, the server has no concurrent reader; a non-consuming peek can
+/// therefore distinguish EOF (cancel) from queued request bytes (leave the
+/// connection to the server loop). HTTP/2 stream reset support remains in
+/// httpx's stream layer.
 const PeerCancellationWatcher = struct {
     socket: *httpx.Socket,
     cancellation: *http_common.RequestCancellation,
@@ -143,10 +145,33 @@ const PeerCancellationWatcher = struct {
             }};
             const ready = std.posix.poll(&fds, 25) catch return;
             if (ready == 0) continue;
-            if (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+            const events = fds[0].revents;
+            if (events & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
                 self.cancellation.cancel();
                 return;
             }
+            if (events & std.posix.POLL.IN == 0) continue;
+
+            var byte: [1]u8 = undefined;
+            // The request body was fully read before this watcher starts, so
+            // the server connection loop cannot race this peek. PEEK retains
+            // any queued bytes for that loop to parse after the handler ends.
+            const n = std.c.recv(
+                self.socket.handle,
+                &byte,
+                byte.len,
+                @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT),
+            );
+            if (n == 0) {
+                self.cancellation.cancel();
+                return;
+            }
+            if (n > 0) {
+                // A pipelined request is not a cancellation. Stop observing
+                // to avoid repeatedly polling the same unread bytes.
+                return;
+            }
+            // EAGAIN (or a transient error after poll) is not a disconnect.
         }
     }
 };
@@ -1478,14 +1503,14 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
-        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
-        var watcher: ?PeerCancellationWatcher = null;
-        startPeerCancellationWatcher(ctx, &cancellation, &watcher);
-        defer if (watcher) |*value| value.deinit();
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
+        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
+        var watcher: ?PeerCancellationWatcher = null;
+        startPeerCancellationWatcher(ctx, &cancellation, &watcher);
+        defer if (watcher) |*value| value.deinit();
         if (isNdjsonContentType(ctx.header("content-type"))) {
             var resp = try self.api_server.handlePublicGlobalMultiQueryWithCancellation(
                 body_data,
@@ -2075,16 +2100,16 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
-        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
-        var watcher: ?PeerCancellationWatcher = null;
-        startPeerCancellationWatcher(ctx, &cancellation, &watcher);
-        defer if (watcher) |*value| value.deinit();
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
+        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
+        var watcher: ?PeerCancellationWatcher = null;
+        startPeerCancellationWatcher(ctx, &cancellation, &watcher);
+        defer if (watcher) |*value| value.deinit();
         var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
             body_data,
