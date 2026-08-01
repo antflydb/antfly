@@ -82,6 +82,10 @@ pub const ServerConfig = struct {
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
+    /// Exponential accept-error backoff. Resource exhaustion otherwise turns
+    /// EMFILE/ENFILE into a CPU-burning, unbounded log loop.
+    accept_error_backoff_initial_ms: u32 = 5,
+    accept_error_backoff_max_ms: u32 = 1_000,
     /// Permit rebinding an address that has recently been used. Disable for
     /// exclusive production listeners where two live servers must never share
     /// an address (notably macOS SO_REUSEADDR semantics).
@@ -751,6 +755,13 @@ pub const Handler = *const fn (*Context) anyerror!Response;
 
 /// HTTP Server.
 pub const Server = struct {
+    pub const RuntimeStats = struct {
+        max_connections: u32,
+        active_connections: usize,
+        active_requests: usize,
+        accept_errors_total: u64,
+    };
+
     allocator: Allocator,
     io: Io,
     config: ServerConfig,
@@ -773,6 +784,7 @@ pub const Server = struct {
     wake_port: std.atomic.Value(u16) = .init(0),
     active_connections: std.atomic.Value(usize) = .init(0),
     active_requests: std.atomic.Value(usize) = .init(0),
+    accept_errors_total: std.atomic.Value(u64) = .init(0),
     connection_controls_mutex: std.atomic.Mutex = .unlocked,
     connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
     connections: Io.Group = Io.Group.init,
@@ -820,6 +832,8 @@ pub const Server = struct {
         if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
         if (cfg.keep_alive_timeout_ms == 0) cfg.keep_alive_timeout_ms = 60_000;
         if (cfg.h2_max_concurrent_streams == 0) cfg.h2_max_concurrent_streams = 100;
+        cfg.accept_error_backoff_initial_ms = @max(cfg.accept_error_backoff_initial_ms, 1);
+        cfg.accept_error_backoff_max_ms = @max(cfg.accept_error_backoff_max_ms, cfg.accept_error_backoff_initial_ms);
 
         return .{
             .allocator = allocator,
@@ -827,6 +841,18 @@ pub const Server = struct {
             .config = cfg,
             .router = Router.init(allocator),
             .conn_semaphore = .{ .permits = cfg.max_connections },
+        };
+    }
+
+    /// Lock-free snapshot suitable for health and metrics endpoints. The
+    /// configured limit is immutable after initialization and the remaining
+    /// fields are atomically maintained by the accept/request paths.
+    pub fn runtimeStats(self: *const Self) RuntimeStats {
+        return .{
+            .max_connections = self.config.max_connections,
+            .active_connections = self.active_connections.load(.acquire),
+            .active_requests = self.active_requests.load(.acquire),
+            .accept_errors_total = self.accept_errors_total.load(.acquire),
         };
     }
 
@@ -947,6 +973,7 @@ pub const Server = struct {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
+        var accept_error_backoff_ms = self.config.accept_error_backoff_initial_ms;
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
@@ -973,9 +1000,13 @@ pub const Server = struct {
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.io);
                 if (!self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
-                std.debug.print("Accept error: {}\n", .{err});
+                _ = self.accept_errors_total.fetchAdd(1, .monotonic);
+                std.log.warn("httpx accept failed; backing off delay_ms={d} err={s}", .{ accept_error_backoff_ms, @errorName(err) });
+                self.io.sleep(Io.Duration.fromMilliseconds(accept_error_backoff_ms), .awake) catch {};
+                accept_error_backoff_ms = @min(self.config.accept_error_backoff_max_ms, accept_error_backoff_ms *| 2);
                 continue;
             };
+            accept_error_backoff_ms = self.config.accept_error_backoff_initial_ms;
             if (self.shutdown_mode.load(.acquire) != 0) {
                 var wake_socket = conn.socket;
                 wake_socket.close();
@@ -2955,6 +2986,29 @@ test "repeated stop requests do not inflate connection admission permits" {
     server.requestStop();
     server.requestStop();
     try std.testing.expectEqual(@as(usize, 3), server.conn_semaphore.permits);
+}
+
+test "accept backoff is normalized and bounded" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .accept_error_backoff_initial_ms = 0,
+        .accept_error_backoff_max_ms = 0,
+    });
+    defer server.deinit();
+    try std.testing.expectEqual(@as(u32, 1), server.config.accept_error_backoff_initial_ms);
+    try std.testing.expectEqual(@as(u32, 1), server.config.accept_error_backoff_max_ms);
+
+    var delay = server.config.accept_error_backoff_initial_ms;
+    for (0..64) |_| delay = @min(server.config.accept_error_backoff_max_ms, delay *| 2);
+    try std.testing.expectEqual(server.config.accept_error_backoff_max_ms, delay);
+
+    server.active_connections.store(3, .release);
+    server.active_requests.store(2, .release);
+    server.accept_errors_total.store(7, .release);
+    const stats = server.runtimeStats();
+    try std.testing.expectEqual(@as(u32, 1000), stats.max_connections);
+    try std.testing.expectEqual(@as(usize, 3), stats.active_connections);
+    try std.testing.expectEqual(@as(usize, 2), stats.active_requests);
+    try std.testing.expectEqual(@as(u64, 7), stats.accept_errors_total);
 }
 
 test "cross-thread stop wakes an ephemeral listener" {

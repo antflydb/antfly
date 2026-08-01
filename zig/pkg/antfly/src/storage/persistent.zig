@@ -2929,7 +2929,7 @@ test "persistent index keeps high-frequency keyword postings across two read-onl
         const unfiltered = try snapshot.search(alloc, "body", &.{"document"}, 5_000);
         defer alloc.free(unfiltered.hits);
         try std.testing.expectEqual(@as(u32, 5_000), unfiltered.total_count);
-        try std.testing.expectEqual(@as(u32, 5_000), snapshot.global_doc_count);
+        try std.testing.expectEqual(@as(u32, 5_000), snapshot.liveDocCount());
     }
 }
 

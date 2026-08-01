@@ -74,20 +74,23 @@ fn sleepMs(ms: u64) void {
 const PeerDisconnectWatcher = struct {
     fd: std.posix.fd_t,
     cancellation: *common.RequestCancellation,
+    observed_disconnects: *std.atomic.Value(u64),
     done: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    group: std.Io.Group = std.Io.Group.init,
+    started: bool = false,
 
-    fn start(self: *PeerDisconnectWatcher) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    fn start(self: *PeerDisconnectWatcher, io: std.Io) !void {
+        try self.group.concurrent(io, run, .{self});
+        self.started = true;
     }
 
-    fn stop(self: *PeerDisconnectWatcher) void {
+    fn stop(self: *PeerDisconnectWatcher, io: std.Io) void {
         self.done.store(true, .release);
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
+        if (self.started) self.group.await(io) catch {};
+        self.started = false;
     }
 
-    fn run(self: *PeerDisconnectWatcher) void {
+    fn run(self: *PeerDisconnectWatcher) std.Io.Cancelable!void {
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = self.fd,
             // After the request body is fully consumed this listener never
@@ -104,6 +107,7 @@ const PeerDisconnectWatcher = struct {
             if (result == 0) continue;
             const events = poll_fds[0].revents;
             if (events & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
+                _ = self.observed_disconnects.fetchAdd(1, .monotonic);
                 self.cancellation.cancel();
                 return;
             }
@@ -133,6 +137,19 @@ pub const StdHttpListenerConfig = struct {
 };
 
 pub const StdHttpListener = struct {
+    pub const RuntimeStats = struct {
+        max_connection_threads: u32,
+        active_connection_threads: u32,
+        peak_connection_threads: u32,
+        max_active_requests: u32,
+        active_requests: u32,
+        peak_active_requests: u32,
+        rejected_requests_total: u64,
+        accept_errors_total: u64,
+        cancellation_watcher_start_failures_total: u64,
+        peer_disconnects_total: u64,
+    };
+
     const IoOwner = enum {
         process_shared,
         shared,
@@ -148,7 +165,13 @@ pub const StdHttpListener = struct {
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     active_connection_threads: std.atomic.Value(u32) = .init(0),
+    peak_connection_threads: std.atomic.Value(u32) = .init(0),
     active_requests: std.atomic.Value(u32) = .init(0),
+    peak_active_requests: std.atomic.Value(u32) = .init(0),
+    rejected_requests_total: std.atomic.Value(u64) = .init(0),
+    accept_errors_total: std.atomic.Value(u64) = .init(0),
+    cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
+    peer_disconnects_total: std.atomic.Value(u64) = .init(0),
     active_streams_lock: std.atomic.Mutex = .unlocked,
     active_streams: std.ArrayListUnmanaged(*const std.Io.net.Stream) = .empty,
 
@@ -288,6 +311,21 @@ pub const StdHttpListener = struct {
         return try std.fmt.allocPrint(alloc, "http://{f}", .{addr});
     }
 
+    pub fn runtimeStats(self: *const StdHttpListener) RuntimeStats {
+        return .{
+            .max_connection_threads = self.cfg.max_connection_threads,
+            .active_connection_threads = self.active_connection_threads.load(.acquire),
+            .peak_connection_threads = self.peak_connection_threads.load(.acquire),
+            .max_active_requests = self.cfg.max_active_requests,
+            .active_requests = self.active_requests.load(.acquire),
+            .peak_active_requests = self.peak_active_requests.load(.acquire),
+            .rejected_requests_total = self.rejected_requests_total.load(.acquire),
+            .accept_errors_total = self.accept_errors_total.load(.acquire),
+            .cancellation_watcher_start_failures_total = self.cancellation_watcher_start_failures_total.load(.acquire),
+            .peer_disconnects_total = self.peer_disconnects_total.load(.acquire),
+        };
+    }
+
     fn serve(self: *StdHttpListener) void {
         const io = self.io_impl.io();
         defer if (self.stopping.load(.acquire)) self.shutdownActiveStreams(io);
@@ -315,6 +353,7 @@ pub const StdHttpListener = struct {
                     error.Canceled => return,
                     else => {
                         if (self.stopping.load(.acquire)) return;
+                        _ = self.accept_errors_total.fetchAdd(1, .monotonic);
                         std.log.warn("std http listener accept failed; backing off delay_ms={d} err={s}", .{ accept_error_backoff_ms, @errorName(err) });
                         sleepMs(accept_error_backoff_ms);
                         accept_error_backoff_ms = @min(self.acceptErrorBackoffMaxMs(), accept_error_backoff_ms *| 2);
@@ -367,7 +406,10 @@ pub const StdHttpListener = struct {
         while (true) {
             const active = self.active_connection_threads.load(.acquire);
             if (max_threads > 0 and active >= max_threads) return false;
-            if (self.active_connection_threads.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return true;
+            if (self.active_connection_threads.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) {
+                atomicMaxU32(&self.peak_connection_threads, active + 1);
+                return true;
+            }
         }
     }
 
@@ -375,13 +417,27 @@ pub const StdHttpListener = struct {
         const max_requests = self.cfg.max_active_requests;
         while (true) {
             const active = self.active_requests.load(.acquire);
-            if (max_requests > 0 and active >= max_requests) return false;
-            if (self.active_requests.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return true;
+            if (max_requests > 0 and active >= max_requests) {
+                _ = self.rejected_requests_total.fetchAdd(1, .monotonic);
+                return false;
+            }
+            if (self.active_requests.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) {
+                atomicMaxU32(&self.peak_active_requests, active + 1);
+                return true;
+            }
         }
     }
 
     fn releaseRequestSlot(self: *StdHttpListener) void {
         _ = self.active_requests.fetchSub(1, .acq_rel);
+    }
+
+    fn atomicMaxU32(value: *std.atomic.Value(u32), candidate: u32) void {
+        var observed = value.load(.acquire);
+        while (observed < candidate) {
+            if (value.cmpxchgWeak(observed, candidate, .acq_rel, .acquire) == null) return;
+            observed = value.load(.acquire);
+        }
     }
 
     fn requestConsumesExpensiveSlot(method: common.Method, uri: []const u8) bool {
@@ -593,25 +649,6 @@ pub const StdHttpListener = struct {
         const body = (try self.readRequestBody(stream, request)) orelse return;
         defer self.alloc.free(body);
 
-        var cancellation = common.RequestCancellation{};
-        var peer_watcher: PeerDisconnectWatcher = undefined;
-        var peer_watch_started = false;
-        if (stream) |active_stream| {
-            peer_watcher = .{ .fd = active_stream.socket.handle, .cancellation = &cancellation };
-            peer_watcher.start() catch {};
-            peer_watch_started = peer_watcher.thread != null;
-        }
-        defer if (peer_watch_started) peer_watcher.stop();
-        const http_req: common.HttpRequest = .{
-            .method = method,
-            .uri = uri,
-            .headers = headers.items,
-            .authorization = authorization,
-            .content_type = content_type,
-            .body = body,
-            .cancellation = &cancellation,
-        };
-
         const consumes_expensive_slot = requestConsumesExpensiveSlot(method, uri);
         if (consumes_expensive_slot and !self.tryAcquireRequestSlot()) {
             // Shed before application execution. Clients get a deterministic,
@@ -625,6 +662,41 @@ pub const StdHttpListener = struct {
             return;
         }
         defer if (consumes_expensive_slot) self.releaseRequestSlot();
+
+        var cancellation = common.RequestCancellation{};
+        var peer_watcher: PeerDisconnectWatcher = undefined;
+        var peer_watch_started = false;
+        const request_io = self.io_impl.io();
+        if (stream) |active_stream| {
+            peer_watcher = .{
+                .fd = active_stream.socket.handle,
+                .cancellation = &cancellation,
+                .observed_disconnects = &self.peer_disconnects_total,
+            };
+            peer_watcher.start(request_io) catch {
+                _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
+                if (consumes_expensive_slot) {
+                    try request.respond("query cancellation capacity unavailable", .{
+                        .status = @enumFromInt(503),
+                        .keep_alive = false,
+                        .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
+                    });
+                    return;
+                }
+                cancellation.cancel();
+            };
+            peer_watch_started = peer_watcher.started;
+        }
+        defer if (peer_watch_started) peer_watcher.stop(request_io);
+        const http_req: common.HttpRequest = .{
+            .method = method,
+            .uri = uri,
+            .headers = headers.items,
+            .authorization = authorization,
+            .content_type = content_type,
+            .body = body,
+            .cancellation = &cancellation,
+        };
 
         if (self.streaming_app) |streaming_app| {
             const body_buffer = try self.alloc.alloc(u8, self.cfg.send_buffer_bytes);
@@ -1409,11 +1481,147 @@ test "std http listener bounds 128 admitted requests and keeps a retryable reser
     // attempts are rejected before they can enter the expensive executor.
     for (0..96) |_| try std.testing.expect(!listener.tryAcquireRequestSlot());
     try std.testing.expectEqual(@as(u32, 32), listener.active_requests.load(.acquire));
+    const saturated = listener.runtimeStats();
+    try std.testing.expectEqual(@as(u32, 32), saturated.max_active_requests);
+    try std.testing.expectEqual(@as(u32, 32), saturated.active_requests);
+    try std.testing.expectEqual(@as(u64, 96), saturated.rejected_requests_total);
 
     for (0..32) |_| listener.releaseRequestSlot();
     try std.testing.expectEqual(@as(u32, 0), listener.active_requests.load(.acquire));
     try std.testing.expect(listener.tryAcquireRequestSlot());
     listener.releaseRequestSlot();
+}
+
+test "std http listener recovers after 128 real clients abandon saturated queries" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        release_queries: std.atomic.Value(bool) = .init(false),
+        cancelled_queries: std.atomic.Value(u32) = .init(0),
+
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.indexOf(u8, req.uri, "/query") != null) {
+                const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
+                while (!self.release_queries.load(.acquire)) {
+                    if (cancellation.isCancelled()) {
+                        _ = self.cancelled_queries.fetchAdd(1, .monotonic);
+                        return .{ .status = 499, .body = try alloc.dupe(u8, "client closed") };
+                    }
+                    sleepMs(1);
+                }
+            }
+            return .{ .status = 200, .body = try alloc.dupe(u8, "ok") };
+        }
+    };
+
+    var app = App{};
+    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+        .serve_in_connection_threads = true,
+        // These are deliberately tighter than production. They turn the test
+        // into a deterministic connection/worker resource constraint while
+        // retaining ample capacity to parse 429s and serve control traffic.
+        .max_connection_threads = 32,
+        .max_active_requests = 8,
+        .kernel_backlog = 256,
+    }, app.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const bound_addr = listener.boundAddress() orelse return error.TestUnexpectedResult;
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var clients = [_]?std.Io.net.Stream{null} ** 128;
+    defer for (&clients) |*slot| {
+        if (slot.*) |*client| client.close(client_io);
+        slot.* = null;
+    };
+
+    for (&clients) |*slot| {
+        var client = try bound_addr.connect(client_io, .{ .mode = .stream });
+        errdefer client.close(client_io);
+        var write_buffer: [256]u8 = undefined;
+        var writer = client.writer(client_io, &write_buffer);
+        try writer.interface.writeAll("POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        try writer.interface.flush();
+        slot.* = client;
+    }
+
+    var saturated = listener.runtimeStats();
+    for (0..10_000) |_| {
+        saturated = listener.runtimeStats();
+        if (saturated.active_requests == 8 and saturated.rejected_requests_total == 120) break;
+        sleepMs(1);
+    }
+    try std.testing.expectEqual(@as(u32, 8), saturated.active_requests);
+    try std.testing.expectEqual(@as(u64, 120), saturated.rejected_requests_total);
+    try std.testing.expect(saturated.peak_active_requests <= saturated.max_active_requests);
+    try std.testing.expect(saturated.peak_connection_threads <= saturated.max_connection_threads);
+
+    // At least one real overload client must receive the retryable wire
+    // response; the counter alone is not sufficient evidence of shedding.
+    var saw_429 = false;
+    var response_buffer: [512]u8 = undefined;
+    for (clients[8..]) |maybe_client| {
+        const client = maybe_client orelse continue;
+        const received = std.c.recv(
+            client.socket.handle,
+            &response_buffer,
+            response_buffer.len,
+            @intCast(std.posix.MSG.DONTWAIT),
+        );
+        if (received > 0 and std.mem.indexOf(u8, response_buffer[0..@intCast(received)], "429 Too Many Requests") != null) {
+            saw_429 = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_429);
+
+    // A control request remains usable while every expensive slot is held and
+    // 120 abandoned/rejected client sockets are still retained by the test.
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    defer executor.deinit();
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const control_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/control", .{base_uri});
+    defer std.testing.allocator.free(control_uri);
+    var control = try executor.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = control_uri,
+        .timeout_ms = 2_000,
+    });
+    defer control.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), control.status);
+
+    // Abandon every client. The eight admitted executions must observe the
+    // disconnect and release their slots without requiring a server restart.
+    for (&clients) |*slot| {
+        if (slot.*) |*client| client.close(client_io);
+        slot.* = null;
+    }
+    var recovered = listener.runtimeStats();
+    for (0..10_000) |_| {
+        recovered = listener.runtimeStats();
+        if (recovered.active_requests == 0 and app.cancelled_queries.load(.acquire) == 8) break;
+        sleepMs(1);
+    }
+    try std.testing.expectEqual(@as(u32, 0), recovered.active_requests);
+    try std.testing.expectEqual(@as(u32, 8), app.cancelled_queries.load(.acquire));
+    try std.testing.expect(recovered.peer_disconnects_total >= 8);
+
+    app.release_queries.store(true, .release);
+    const query_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/query", .{base_uri});
+    defer std.testing.allocator.free(query_uri);
+    var post_load = try executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = query_uri,
+        .timeout_ms = 2_000,
+    });
+    defer post_load.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), post_load.status);
 }
 
 test "std http listener overload admission returns retryable 429 without invoking executor" {

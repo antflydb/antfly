@@ -1132,6 +1132,19 @@ pub const Client = struct {
         stream.max_data_size = self.responseSizeLimit(req);
     }
 
+    /// Allocates and publishes a locally initiated stream while holding the
+    /// same mutex used by the receive loop and stream teardown. A pooled H2
+    /// connection is intentionally shared by concurrent callers, so both the
+    /// next-stream-id counter and the unmanaged stream map require this lock.
+    fn createH2ResponseStream(self: *const Self, h2: *H2Connection, req: *const Request) !*Stream {
+        h2.write_mutex.lockUncancelable(self.io);
+        defer h2.write_mutex.unlock(self.io);
+        if (h2.goaway_received) return error.ConnectionClosed;
+        const stream = try h2.stream_manager.createStream();
+        self.configureH2ResponseStream(stream, req);
+        return stream;
+    }
+
     fn mayRetryConnectionError(err: anyerror) bool {
         // Local response-policy failures are deterministic. Retrying them
         // wastes bandwidth and, for writer requests, could duplicate output.
@@ -1704,12 +1717,10 @@ pub const Client = struct {
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
     fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt) !Response {
         const h2 = &entry.h2;
-        if (h2.goaway_received) {
-            entry.broken = true;
-            return error.ConnectionClosed;
-        }
-        const stream = try h2.stream_manager.createStream();
-        self.configureH2ResponseStream(stream, req);
+        const stream = self.createH2ResponseStream(h2, req) catch |err| {
+            if (err == error.ConnectionClosed) entry.broken = true;
+            return err;
+        };
         const stream_id = stream.id;
         defer interrupt.clearH2(entry, stream_id, self.io);
         errdefer {
@@ -1843,28 +1854,41 @@ pub const Client = struct {
             }
         }
 
-        // Extract response from mailbox.
-        const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
+        // Extract an owned response snapshot while holding the mailbox lock.
+        // Cancellation may race the request task after the completion wake,
+        // and trailing frames can otherwise invalidate header/body slices.
         defer {
             h2.write_mutex.lockUncancelable(self.io);
             defer h2.write_mutex.unlock(self.io);
             h2.stream_manager.removeStream(stream_id);
         }
-        if (s.stream_error) |err| return err;
-
-        // Headers were decoded in deliverToMailbox (receive loop) to avoid
-        // concurrent HPACK decode races on the shared hpack_ctx.
-        const decoded_headers = s.request_headers orelse return error.InvalidResponse;
 
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
+        var response_body: ?[]u8 = null;
+        errdefer if (response_body) |body| self.allocator.free(body);
 
-        for (decoded_headers) |h| {
-            if (mem.eql(u8, h.name, ":status")) {
-                status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
-            } else if (h.name.len > 0 and h.name[0] != ':') {
-                try response_headers.append(h.name, h.value);
+        {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
+            if (s.stream_error) |err| return err;
+
+            // Headers were decoded in deliverToMailbox (receive loop) to
+            // avoid concurrent HPACK decode races on the shared hpack_ctx.
+            const decoded_headers = s.request_headers orelse return error.InvalidResponse;
+            for (decoded_headers) |h| {
+                if (mem.eql(u8, h.name, ":status")) {
+                    status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
+                } else if (h.name.len > 0 and h.name[0] != ':') {
+                    try response_headers.append(h.name, h.value);
+                }
+            }
+
+            if (s.data_buf.items.len > 0) {
+                if (s.data_buf.items.len > self.responseSizeLimit(req)) return error.ResponseTooLarge;
+                response_body = try self.allocator.dupe(u8, s.data_buf.items);
             }
         }
 
@@ -1874,10 +1898,10 @@ pub const Client = struct {
         res.headers.deinit();
         res.headers = response_headers;
 
-        if (s.data_buf.items.len > 0) {
-            if (s.data_buf.items.len > self.responseSizeLimit(req)) return error.ResponseTooLarge;
-            res.body = try self.allocator.dupe(u8, s.data_buf.items);
+        if (response_body) |body| {
+            res.body = body;
             res.body_owned = true;
+            response_body = null;
         }
 
         return res;
@@ -1900,6 +1924,7 @@ pub const Client = struct {
         /// within the configured read_timeout.
         pub fn read(self: *H2StreamReader, buf: []u8) !usize {
             while (true) {
+                self.h2.write_mutex.lockUncancelable(self.io);
                 const avail = self.stream.data_buf.items.len - self.stream.read_offset;
                 if (avail > 0) {
                     const n = @min(avail, buf.len);
@@ -1909,18 +1934,35 @@ pub const Client = struct {
                     if (self.stream.read_offset >= Stream.compact_threshold) {
                         self.stream.compactDataBuf();
                     }
+                    self.h2.write_mutex.unlock(self.io);
                     return n;
                 }
-                if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
-                if (self.stream.completed) return 0;
+                if (self.stream.stream_error) |err| {
+                    self.h2.write_mutex.unlock(self.io);
+                    return normalizeH2ResponseError(err);
+                }
+                if (self.stream.completed) {
+                    self.h2.write_mutex.unlock(self.io);
+                    return 0;
+                }
 
                 // Reset event, re-check buffer (handles race with receive loop),
-                // then wait with timeout.
+                // then release the mailbox lock before waiting.
                 self.data_event.reset();
                 const avail2 = self.stream.data_buf.items.len - self.stream.read_offset;
-                if (avail2 > 0) continue;
-                if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
-                if (self.stream.completed) return 0;
+                if (avail2 > 0) {
+                    self.h2.write_mutex.unlock(self.io);
+                    continue;
+                }
+                if (self.stream.stream_error) |err| {
+                    self.h2.write_mutex.unlock(self.io);
+                    return normalizeH2ResponseError(err);
+                }
+                if (self.stream.completed) {
+                    self.h2.write_mutex.unlock(self.io);
+                    return 0;
+                }
+                self.h2.write_mutex.unlock(self.io);
 
                 self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
                     error.Timeout => return error.Timeout,
@@ -2029,12 +2071,10 @@ pub const Client = struct {
         if (!entry.recv_running) return error.MultiplexingRequired;
 
         const h2 = &entry.h2;
-        if (h2.goaway_received) {
-            entry.broken = true;
-            return error.ConnectionClosed;
-        }
-        const stream = try h2.stream_manager.createStream();
-        self.configureH2ResponseStream(stream, req);
+        const stream = self.createH2ResponseStream(h2, req) catch |err| {
+            if (err == error.ConnectionClosed) entry.broken = true;
+            return err;
+        };
         const stream_id = stream.id;
         var data_event: ?*Io.Event = null;
         var headers_sent = false;
@@ -2108,30 +2148,42 @@ pub const Client = struct {
             } }
         else
             .none;
-        while (!stream.got_headers and !stream.completed) {
+        while (true) {
+            h2.write_mutex.lockUncancelable(self.io);
+            if (stream.got_headers or stream.completed) {
+                h2.write_mutex.unlock(self.io);
+                break;
+            }
             data_event.?.reset();
-            if (stream.got_headers or stream.completed) break;
+            if (stream.got_headers or stream.completed) {
+                h2.write_mutex.unlock(self.io);
+                break;
+            }
+            h2.write_mutex.unlock(self.io);
             data_event.?.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 error.Canceled => return error.Canceled,
             };
         }
-        if (stream.stream_error) |err| return normalizeH2ResponseError(err);
-
-        // Headers were decoded in deliverToMailbox (receive loop) to avoid
-        // concurrent HPACK decode races on the shared hpack_ctx.
-        const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
-
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (decoded_headers) |h| {
-            if (mem.eql(u8, h.name, ":status")) {
-                status_code = std.fmt.parseInt(u16, h.value, 10) catch
-                    return error.InvalidResponse;
-            } else if (h.name.len > 0 and h.name[0] != ':') {
-                try response_headers.append(h.name, h.value);
+        {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            if (stream.stream_error) |err| return normalizeH2ResponseError(err);
+
+            // Copy decoded headers while the receive loop cannot replace or
+            // extend the stream mailbox with trailing header blocks.
+            const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
+            for (decoded_headers) |h| {
+                if (mem.eql(u8, h.name, ":status")) {
+                    status_code = std.fmt.parseInt(u16, h.value, 10) catch
+                        return error.InvalidResponse;
+                } else if (h.name.len > 0 and h.name[0] != ':') {
+                    try response_headers.append(h.name, h.value);
+                }
             }
         }
 
@@ -3295,6 +3347,44 @@ test "H2 entry lease defers retired teardown while another request is in flight"
     // until the final old request releases its lease.
     try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
     try std.testing.expect(entry.retired);
+}
+
+test "pooled H2 stream creation serializes ids and map publication" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+    var h2 = H2Connection.initClient(alloc, io);
+    defer h2.deinit();
+    var request = try Request.init(alloc, .GET, "http://example.com/");
+    defer request.deinit();
+
+    const stream_count = 64;
+    var ids: [stream_count]u31 = undefined;
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(c: *Client, conn: *H2Connection, req: *Request, out: *u31, did_fail: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            const stream = c.createH2ResponseStream(conn, req) catch {
+                did_fail.store(true, .release);
+                return;
+            };
+            out.* = stream.id;
+        }
+    };
+
+    var group = std.Io.Group.init;
+    for (&ids) |*id| try group.concurrent(io, Worker.run, .{ &client, &h2, &request, id, &failed });
+    try group.await(io);
+    try std.testing.expect(!failed.load(.acquire));
+
+    std.mem.sort(u31, &ids, {}, std.sort.asc(u31));
+    for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u31, @intCast(i * 2 + 1)), id);
+    h2.write_mutex.lockUncancelable(io);
+    defer h2.write_mutex.unlock(io);
+    try std.testing.expectEqual(@as(u32, stream_count), h2.stream_manager.activeStreamCount());
 }
 
 test "H2 stream response without status releases its retired lease" {
