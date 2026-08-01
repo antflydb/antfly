@@ -4975,9 +4975,9 @@ fn mergeJoinedRightHitsAllocWithDeadline(
             if (EqualityJoinIndex.supports(left_value))
                 if (index.lookupIndex(left_value)) |match_index| right_hits[match_index] else null
             else
-                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, null)
+                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, cancellation)
         else
-            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, null);
+            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, cancellation);
         const effective_matched_right = matched_right orelse {
             stats.rows_unmatched_left += 1;
             if (join.join_type == .left) {
@@ -6528,6 +6528,51 @@ test "distributed join merge rejects an expired deadline before scanning" {
             &.{left_hit},
             join,
             &.{},
+            &.{},
+            false,
+        ),
+    );
+}
+
+test "distributed join apply context cancels a linear non-equality merge" {
+    const alloc = std.testing.allocator;
+
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .join_type = .inner,
+        .operator = .neq,
+        .left_field = try alloc.dupe(u8, "id"),
+        .right_field = try alloc.dupe(u8, "id"),
+    };
+    defer join.deinit(alloc);
+    var left_hit = try testJoinHitAlloc(alloc, "left", 1, "shared");
+    defer deinitJsonValue(alloc, &left_hit);
+    var right_hit = try testJoinHitAlloc(alloc, "right", 1, "shared");
+    defer deinitJsonValue(alloc, &right_hit);
+    var response = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"responses\":[{\"hits\":{\"hits\":[]}}]}",
+        .{},
+    );
+    defer response.deinit();
+    var cancellation = std.atomic.Value(bool).init(true);
+    var state: u8 = 0;
+    const ctx = JoinContext{
+        .ptr = &state,
+        .vtable = undefined,
+        .cancellation = &cancellation,
+    };
+
+    try std.testing.expectError(
+        error.Cancelled,
+        applyJoinedRightHitsToResponseWithContext(
+            ctx,
+            alloc,
+            &response.value,
+            &.{left_hit},
+            join,
+            &.{right_hit},
             &.{},
             false,
         ),
