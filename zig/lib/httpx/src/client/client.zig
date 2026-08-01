@@ -169,6 +169,11 @@ const RequestInterrupt = struct {
         stream.stream_error = error.Cancelled;
         stream.completed = true;
         stream.reset();
+        // Stream removal can run as soon as we wake its owner. Keep only the
+        // waiter pointers after unlock; never dereference the map-owned Stream
+        // outside the connection mutex.
+        const completion_sem = stream.completion_sem;
+        const data_event = stream.data_event;
         if (entry.is_tls) {
             if (entry.session.getWriter()) |writer|
                 h2.sendRstStream(writer, stream_id, .cancel) catch {}
@@ -180,8 +185,8 @@ const RequestInterrupt = struct {
 
         // Wake waiters only after publishing the reset under the connection
         // lock; a body blocked on flow control can now observe stream_error.
-        if (stream.completion_sem) |sem| sem.post(io);
-        if (stream.data_event) |event| event.set(io);
+        if (completion_sem) |sem| sem.post(io);
+        if (data_event) |event| event.set(io);
         h2.send_window_event.set(io);
         if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
     }

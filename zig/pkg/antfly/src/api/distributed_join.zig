@@ -2621,11 +2621,11 @@ pub fn executeForeignRightJoinQuery(
     }
 
     var left_equality_index: ?EqualityJoinIndex = if (join.join_type != .right and join.operator == .eq and left_hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.execution_deadline_ns)
+        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.execution_deadline_ns, ctx.cancellation)
     else
         null;
     defer if (left_equality_index) |*index| index.deinit(alloc);
-    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns };
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns, .cancellation = ctx.cancellation };
     for (result.rows) |row| {
         try deadline_poller.poll();
         if (row != .object) return error.UnsupportedQueryRequest;
@@ -4060,11 +4060,11 @@ fn applyNestedJoinToRightHits(
     defer nested_result.deinit(alloc);
 
     var equality_index: ?EqualityJoinIndex = if (nested_join.operator == .eq and nested_result.hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.execution_deadline_ns)
+        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.execution_deadline_ns, ctx.cancellation)
     else
         null;
     defer if (equality_index) |*index| index.deinit(alloc);
-    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns };
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns, .cancellation = ctx.cancellation };
     for (right_hits) |*hit| {
         try deadline_poller.poll();
         const left_value = extractJoinValueFromHit(hit.*, nested_join.left_field) orelse continue;
@@ -4072,9 +4072,9 @@ fn applyNestedJoinToRightHits(
             if (EqualityJoinIndex.supports(left_value))
                 if (index.lookupIndex(left_value)) |match_index| nested_result.hits[match_index] else null
             else
-                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns)
+                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns, ctx.cancellation)
         else
-            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns);
+            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns, ctx.cancellation);
         const effective_matched_right = matched_right orelse continue;
         const source_value = hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
         if (source_value.* != .object) return error.InvalidQueryRequest;
@@ -4708,12 +4708,16 @@ pub fn extractJsonPathValue(value: std.json.Value, path: []const u8) ?std.json.V
 
 const JoinDeadlinePoller = struct {
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     work_until_check: u8 = 1,
 
     fn poll(self: *@This()) !void {
         self.work_until_check -|= 1;
         if (self.work_until_check != 0) return;
         self.work_until_check = 64;
+        if (self.cancellation) |value| {
+            if (value.load(.acquire)) return error.Cancelled;
+        }
         const deadline_ns = self.deadline_ns orelse return;
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
     }
@@ -4734,10 +4738,11 @@ const EqualityJoinIndex = struct {
         hits: []const std.json.Value,
         field_name: []const u8,
         deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !EqualityJoinIndex {
         var out: EqualityJoinIndex = .{};
         errdefer out.deinit(alloc);
-        var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+        var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
         for (hits, 0..) |hit, index| {
             try poller.poll();
             const value = extractJoinValueFromHit(hit, field_name) orelse continue;
@@ -4933,7 +4938,7 @@ fn mergeJoinedRightHitsAllocWithDeadline(
     }
 
     var equality_index: ?EqualityJoinIndex = if (join.operator == .eq and right_hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns)
+        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns, null)
     else
         null;
     defer if (equality_index) |*index| index.deinit(alloc);
@@ -4960,9 +4965,9 @@ fn mergeJoinedRightHitsAllocWithDeadline(
             if (EqualityJoinIndex.supports(left_value))
                 if (index.lookupIndex(left_value)) |match_index| right_hits[match_index] else null
             else
-                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns)
+                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, null)
         else
-            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns);
+            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, null);
         const effective_matched_right = matched_right orelse {
             stats.rows_unmatched_left += 1;
             if (join.join_type == .left) {
@@ -5613,8 +5618,9 @@ fn findFirstMatchingRightHitWithDeadline(
     left_value: std.json.Value,
     right_hits: []const std.json.Value,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !?std.json.Value {
-    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     for (right_hits) |hit_value| {
         try poller.poll();
         const right_value = extractJoinValueFromHit(hit_value, join.right_field) orelse continue;
