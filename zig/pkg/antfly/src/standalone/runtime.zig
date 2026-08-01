@@ -216,11 +216,16 @@ const StandaloneHealthSource = struct {
         try data_health.metricsWriter().writeMetrics(writer);
 
         const query = self.handler.query_admission.stats();
+        const query_body = self.handler.query_body_admission.stats();
         const handler = self.handler.runtimeStats();
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", query.capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", query.in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", query.peak_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", query.rejected_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", query_body.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", query_body.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", query_body.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", query_body.rejected_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public queries rejected because peer observation could not be scheduled", handler.cancellation_watcher_start_failures_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public query peer disconnects propagated to cancellation", handler.peer_disconnect_cancellations_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public queries cancelled after peer observation failed", handler.peer_observer_failures_total);
@@ -231,6 +236,10 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP/2 request-body mailbox capacity", http.h2_body_buffer_capacity_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_in_use_bytes", "gauge", "HTTP/2 request-body bytes retained in stream mailboxes", http.h2_body_buffer_in_use_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_peak_bytes", "gauge", "Peak HTTP/2 request-body mailbox bytes since process start", http.h2_body_buffer_peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_rejected_total", "counter", "HTTP/2 DATA frames rejected by aggregate body budget", http.h2_body_buffer_rejected_total);
         }
     }
 };
@@ -2453,6 +2462,10 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        // Bound aggregate H2 request-body buffering independently from query
+        // execution. Four maximum-sized public requests may complete while
+        // excess uploads are shed before allocator pressure becomes systemic.
+        .h2_body_buffer_budget_bytes = 256 * 1024 * 1024,
         .request_timeout_ms = 300_000,
         // Keep a large process-wide FD reserve for storage, Raft, outbound
         // clients, and diagnostics. This prevents the historical 1,000-socket

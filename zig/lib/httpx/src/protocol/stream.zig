@@ -53,6 +53,68 @@ pub const StreamPriority = struct {
     exclusive: bool = false,
 };
 
+/// Process-wide byte budget for request DATA retained by HTTP/2 stream
+/// mailboxes. HTTP/2 flow control limits bytes per connection, but does not
+/// bound the aggregate memory retained across many connections. Servers share
+/// one of these budgets across every H2 connection and fail new DATA closed
+/// when the process-wide ceiling is reached.
+pub const SharedDataBudget = struct {
+    capacity: usize,
+    in_use: std.atomic.Value(usize) = .init(0),
+    peak_in_use: std.atomic.Value(usize) = .init(0),
+    rejected_total: std.atomic.Value(u64) = .init(0),
+
+    pub fn init(capacity: usize) SharedDataBudget {
+        return .{ .capacity = capacity };
+    }
+
+    pub fn tryReserve(self: *@This(), amount: usize) bool {
+        if (amount == 0) return true;
+        var observed = self.in_use.load(.acquire);
+        while (true) {
+            const next = std.math.add(usize, observed, amount) catch {
+                _ = self.rejected_total.fetchAdd(1, .monotonic);
+                return false;
+            };
+            if (next > self.capacity) {
+                _ = self.rejected_total.fetchAdd(1, .monotonic);
+                return false;
+            }
+            if (self.in_use.cmpxchgWeak(observed, next, .acq_rel, .acquire) == null) {
+                var peak = self.peak_in_use.load(.acquire);
+                while (peak < next) {
+                    if (self.peak_in_use.cmpxchgWeak(peak, next, .acq_rel, .acquire) == null) break;
+                    peak = self.peak_in_use.load(.acquire);
+                }
+                return true;
+            }
+            observed = self.in_use.load(.acquire);
+        }
+    }
+
+    pub fn release(self: *@This(), amount: usize) void {
+        if (amount == 0) return;
+        const previous = self.in_use.fetchSub(amount, .acq_rel);
+        std.debug.assert(previous >= amount);
+    }
+
+    pub const Stats = struct {
+        capacity: usize,
+        in_use: usize,
+        peak_in_use: usize,
+        rejected_total: u64,
+    };
+
+    pub fn stats(self: *const @This()) Stats {
+        return .{
+            .capacity = self.capacity,
+            .in_use = self.in_use.load(.acquire),
+            .peak_in_use = self.peak_in_use.load(.acquire),
+            .rejected_total = self.rejected_total.load(.acquire),
+        };
+    }
+};
+
 /// Represents an HTTP/2 stream.
 pub const Stream = struct {
     id: u31,
@@ -113,6 +175,11 @@ pub const Stream = struct {
     /// Per-stream body ceiling. Null inherits the connection-wide ceiling.
     max_data_size: ?usize = null,
 
+    /// Bytes charged to the server's aggregate H2 mailbox budget. The stream
+    /// owns this reservation until removal, including error paths.
+    data_budget: ?*SharedDataBudget = null,
+    data_budget_reserved: usize = 0,
+
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_window_update: u32 = 0,
 
@@ -127,6 +194,9 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
+        if (self.data_budget) |budget| budget.release(self.data_budget_reserved);
+        self.data_budget = null;
+        self.data_budget_reserved = 0;
         self.data_buf.deinit(allocator);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);

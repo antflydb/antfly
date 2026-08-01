@@ -29,6 +29,7 @@ const Http2Settings = types.Http2Settings;
 const StreamManager = stream_mod.StreamManager;
 const Stream = stream_mod.Stream;
 const StreamPriority = stream_mod.StreamPriority;
+const SharedDataBudget = stream_mod.SharedDataBudget;
 
 /// A received HTTP/2 frame (header + payload).
 pub const Frame = struct {
@@ -72,6 +73,10 @@ pub const H2Connection = struct {
     /// Maximum bytes of DATA payload allowed per stream. 0 = unlimited.
     /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
     max_stream_data_size: usize = 0,
+
+    /// Optional aggregate budget shared by all server-side H2 connections.
+    /// Each stream reservation is released by Stream.deinit().
+    recv_data_budget: ?*SharedDataBudget = null,
 
     /// Timeout for writeDataBlocking to wait for flow-control window space.
     /// Prevents indefinite blocking when a peer stops sending WINDOW_UPDATE.
@@ -952,8 +957,25 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
+                const budget = self.recv_data_budget;
+                if (budget) |shared| {
+                    if (!shared.tryReserve(data_payload.len)) {
+                        stream.stream_error = error.BodyCapacityExceeded;
+                        stream.completed = true;
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        return;
+                    }
+                }
+                stream.data_buf.appendSlice(self.allocator, data_payload) catch |err| {
+                    if (budget) |shared| shared.release(data_payload.len);
+                    return err;
+                };
+                if (budget) |shared| {
+                    stream.data_budget = shared;
+                    stream.data_budget_reserved += data_payload.len;
+                }
                 stream.total_data_received = new_size;
-                try stream.data_buf.appendSlice(self.allocator, data_payload);
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     // RFC 7540 §8.1.2.6: If content-length was provided,
@@ -1026,7 +1048,18 @@ pub const H2Connection = struct {
             if (sf.header.frame_type == .data) {
                 if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
                     if (stream.stream_error != null) {
-                        self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
+                        // A server handler already waiting on this body can
+                        // translate aggregate ingress exhaustion into a 429
+                        // response, then reset the still-open remote half.
+                        const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                        if (!(is_body_capacity and stream.data_event != null)) {
+                            const code: Http2ErrorCode = if (is_body_capacity)
+                                .enhance_your_calm
+                            else
+                                .stream_closed;
+                            self.sendRstStream(writer, sf.header.stream_id, code) catch {};
+                            stream.reset();
+                        }
                     }
                 }
             }
@@ -1081,7 +1114,15 @@ pub const H2Connection = struct {
                 if (sf.header.frame_type == .data) {
                     if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
                         if (stream.stream_error != null) {
-                            self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
+                            const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                            if (!(is_body_capacity and stream.data_event != null)) {
+                                const code: Http2ErrorCode = if (is_body_capacity)
+                                    .enhance_your_calm
+                                else
+                                    .stream_closed;
+                                self.sendRstStream(writer, sf.header.stream_id, code) catch {};
+                                stream.reset();
+                            }
                         }
                     }
                 }
@@ -2300,6 +2341,47 @@ test "deliverToMailbox fails closed when cumulative DATA accounting overflows" {
     try std.testing.expect(stream.completed);
     try std.testing.expectEqual(error.StreamDataOverflow, stream.stream_error.?);
     try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
+}
+
+test "deliverToMailbox enforces and releases shared DATA budget across streams" {
+    const allocator = std.testing.allocator;
+    var budget = stream_mod.SharedDataBudget.init(5);
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    server.recv_data_budget = &budget;
+
+    const first = try server.stream_manager.getOrCreateStream(1);
+    try first.open();
+    var first_payload = [_]u8{ 1, 2, 3, 4 };
+    try server.deliverToMailbox(&.{
+        .header = .{ .length = first_payload.len, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = &first_payload,
+    });
+    try std.testing.expectEqual(@as(usize, 4), budget.stats().in_use);
+
+    const second = try server.stream_manager.getOrCreateStream(3);
+    try second.open();
+    var second_payload = [_]u8{ 5, 6 };
+    try server.deliverToMailbox(&.{
+        .header = .{ .length = second_payload.len, .frame_type = .data, .flags = 0, .stream_id = 3 },
+        .payload = &second_payload,
+    });
+    try std.testing.expectEqual(error.BodyCapacityExceeded, second.stream_error.?);
+    try std.testing.expectEqual(@as(usize, 4), budget.stats().in_use);
+    try std.testing.expectEqual(@as(u64, 1), budget.stats().rejected_total);
+
+    server.stream_manager.removeStream(1);
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+
+    const third = try server.stream_manager.getOrCreateStream(5);
+    try third.open();
+    try server.deliverToMailbox(&.{
+        .header = .{ .length = second_payload.len, .frame_type = .data, .flags = H2Connection.FLAG_END_STREAM, .stream_id = 5 },
+        .payload = &second_payload,
+    });
+    try std.testing.expectEqual(@as(usize, 2), budget.stats().in_use);
+    server.stream_manager.removeStream(5);
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
 }
 
 test "CONTINUATION reassembly rejects oversized header block" {

@@ -71075,22 +71075,31 @@ test "db production ingest preserves high-frequency keyword recall across clean 
             .config_json = "{}",
         });
 
-        const writes = try alloc.alloc(types.BatchWrite, 5_000);
-        defer {
-            for (writes) |write| {
-                alloc.free(@constCast(write.key));
-                alloc.free(@constCast(write.value));
+        // Production fixture loading reaches the table in many API-sized
+        // batches, not as one already-materialized segment. Exercise segment
+        // publication/merge state throughout the high-frequency transition.
+        const batch_size = 100;
+        var batch_start: usize = 0;
+        while (batch_start < 5_000) : (batch_start += batch_size) {
+            const batch_len = @min(batch_size, 5_000 - batch_start);
+            const writes = try alloc.alloc(types.BatchWrite, batch_len);
+            defer {
+                for (writes) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                alloc.free(writes);
             }
-            alloc.free(writes);
+            for (writes, 0..) |*write, offset| {
+                const i = batch_start + offset;
+                const state = if (i < 4_237) "published" else "draft";
+                write.* = .{
+                    .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                    .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"Catalog document {d}\",\"state\":\"{s}\"}}", .{ i, state }),
+                };
+            }
+            try db.batch(.{ .writes = writes, .sync_level = .full_index });
         }
-        for (writes, 0..) |*write, i| {
-            const state = if (i < 4_237) "published" else "draft";
-            write.* = .{
-                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"Catalog document {d}\",\"state\":\"{s}\"}}", .{ i, state }),
-            };
-        }
-        try db.batch(.{ .writes = writes, .sync_level = .full_index });
         try expectHighFrequencyKeywordRecall(&db, alloc);
     }
 

@@ -57,6 +57,7 @@ const H2Connection = h2_mod.H2Connection;
 const hpack = @import("../protocol/hpack.zig");
 const stream_mod = @import("../protocol/stream.zig");
 const Stream = stream_mod.Stream;
+const SharedDataBudget = stream_mod.SharedDataBudget;
 
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;
@@ -106,6 +107,11 @@ pub const ServerConfig = struct {
     /// HTTP/2 max concurrent streams advertised in SETTINGS. Controls how many
     /// in-flight requests a client can have on one connection. 0 = use default (100).
     h2_max_concurrent_streams: u32 = 100,
+    /// Aggregate bytes retained in HTTP/2 request-body mailboxes across all
+    /// connections. This complements per-stream flow control with a process-
+    /// wide memory bound. Values below max_body_size are raised to it so one
+    /// valid request can always complete; 0 selects that minimum.
+    h2_body_buffer_budget_bytes: usize = 64 * 1024 * 1024,
     /// Reserved for future server-side TLS support. Zig 0.16 only provides
     /// `std.crypto.tls.Client`; there is no server TLS implementation yet.
     /// Use a TLS-terminating reverse proxy in the meantime.
@@ -116,6 +122,7 @@ pub const ServerConfig = struct {
 fn routeErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        error.BodyCapacityExceeded => 429,
         error.SyntaxError,
         error.UnexpectedToken,
         error.MissingField,
@@ -132,6 +139,7 @@ fn routeErrorBody(code: u16) []const u8 {
         404 => "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
         408 => "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
         413 => "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        429 => "{\"error\":\"TOO_MANY_REQUESTS\",\"message\":\"request body capacity exhausted\"}",
         431 => "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
         else => "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
     };
@@ -483,15 +491,15 @@ pub const Context = struct {
                     }
                     return n;
                 }
-                if (self.h2_stream.completed) return 0;
                 if (self.h2_stream.stream_error) |err| return err;
+                if (self.h2_stream.completed) return 0;
 
                 // Reset event, re-check (race guard), then wait with timeout.
                 self.data_event.reset();
                 const avail2 = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
                 if (avail2 > 0) continue;
-                if (self.h2_stream.completed) return 0;
                 if (self.h2_stream.stream_error) |err| return err;
+                if (self.h2_stream.completed) return 0;
 
                 self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
                     error.Timeout => return error.Timeout,
@@ -760,6 +768,10 @@ pub const Server = struct {
         active_connections: usize,
         active_requests: usize,
         accept_errors_total: u64,
+        h2_body_buffer_capacity_bytes: usize,
+        h2_body_buffer_in_use_bytes: usize,
+        h2_body_buffer_peak_bytes: usize,
+        h2_body_buffer_rejected_total: u64,
     };
 
     allocator: Allocator,
@@ -790,6 +802,7 @@ pub const Server = struct {
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
     waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
+    h2_body_budget: SharedDataBudget,
 
     const Self = @This();
 
@@ -832,6 +845,7 @@ pub const Server = struct {
         if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
         if (cfg.keep_alive_timeout_ms == 0) cfg.keep_alive_timeout_ms = 60_000;
         if (cfg.h2_max_concurrent_streams == 0) cfg.h2_max_concurrent_streams = 100;
+        cfg.h2_body_buffer_budget_bytes = @max(cfg.h2_body_buffer_budget_bytes, cfg.max_body_size);
         cfg.accept_error_backoff_initial_ms = @max(cfg.accept_error_backoff_initial_ms, 1);
         cfg.accept_error_backoff_max_ms = @max(cfg.accept_error_backoff_max_ms, cfg.accept_error_backoff_initial_ms);
 
@@ -841,6 +855,7 @@ pub const Server = struct {
             .config = cfg,
             .router = Router.init(allocator),
             .conn_semaphore = .{ .permits = cfg.max_connections },
+            .h2_body_budget = SharedDataBudget.init(cfg.h2_body_buffer_budget_bytes),
         };
     }
 
@@ -848,11 +863,16 @@ pub const Server = struct {
     /// configured limit is immutable after initialization and the remaining
     /// fields are atomically maintained by the accept/request paths.
     pub fn runtimeStats(self: *const Self) RuntimeStats {
+        const h2_body = self.h2_body_budget.stats();
         return .{
             .max_connections = self.config.max_connections,
             .active_connections = self.active_connections.load(.acquire),
             .active_requests = self.active_requests.load(.acquire),
             .accept_errors_total = self.accept_errors_total.load(.acquire),
+            .h2_body_buffer_capacity_bytes = h2_body.capacity,
+            .h2_body_buffer_in_use_bytes = h2_body.in_use,
+            .h2_body_buffer_peak_bytes = h2_body.peak_in_use,
+            .h2_body_buffer_rejected_total = h2_body.rejected_total,
         };
     }
 
@@ -1485,6 +1505,7 @@ pub const Server = struct {
         self.setH2Control(control, &h2);
         defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
+        h2.recv_data_budget = &self.h2_body_budget;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
         try h2.applyPeerSettings(settings_payload);
@@ -1646,6 +1667,7 @@ pub const Server = struct {
         self.setH2Control(control, &h2);
         defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
+        h2.recv_data_budget = &self.h2_body_budget;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
 
@@ -1825,10 +1847,17 @@ pub const Server = struct {
                 h2.write_mutex.lockUncancelable(h2.io);
                 defer h2.write_mutex.unlock(h2.io);
                 if (h2.stream_manager.getStream(stream_id)) |s| {
-                    // If HEADERS was sent but END_STREAM was not, the peer has a
-                    // half-open stream. Send RST_STREAM so it doesn't wait forever.
-                    if (!s.end_stream_sent and s.state != .idle and s.state != .closed) {
-                        h2.sendRstStream(sock, stream_id, .internal_error) catch {};
+                    // A response can end locally while the peer is still
+                    // uploading (for example a 429 from body admission). Reset
+                    // every stream whose remote side remains open so rejected
+                    // bodies stop consuming socket and flow-control capacity.
+                    if (s.state != .idle and s.state != .closed and !s.end_stream_received) {
+                        const is_body_capacity = if (s.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                        const code: http.Http2ErrorCode = if (is_body_capacity)
+                            .enhance_your_calm
+                        else
+                            .cancel;
+                        h2.sendRstStream(sock, stream_id, code) catch {};
                     }
                     s.data_event = null;
                 }
@@ -2510,6 +2539,7 @@ test "Server any() registers all methods" {
 test "ServerConfig defaults" {
     const config = ServerConfig{};
     try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.max_body_size);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), config.h2_body_buffer_budget_bytes);
     try std.testing.expectEqual(@as(usize, 100), config.max_headers);
     try std.testing.expectEqual(@as(usize, 100 * 1024 * 1024), config.max_file_size);
 }
@@ -2520,6 +2550,7 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.ValueTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.BodyTooLarge));
+    try std.testing.expectEqual(@as(u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
     try std.testing.expectEqual(@as(u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
     try std.testing.expectEqualStrings(
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
@@ -2722,6 +2753,23 @@ test "H2StreamReader.readAll buffers entire body" {
     const body_data = try reader.readAll(allocator);
     defer allocator.free(body_data);
     try std.testing.expectEqualStrings("part1part2", body_data);
+}
+
+test "H2StreamReader reports terminal stream errors instead of truncated EOF" {
+    const allocator = std.testing.allocator;
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+    s.completed = true;
+    s.stream_error = error.BodyCapacityExceeded;
+
+    var event = Io.Event.unset;
+    var reader = Context.H2StreamReader{
+        .h2_stream = &s,
+        .io = std.testing.io,
+        .data_event = &event,
+    };
+    var buf: [1]u8 = undefined;
+    try std.testing.expectError(error.BodyCapacityExceeded, reader.read(&buf));
 }
 
 test "Context.body() returns request.body for HTTP/1.1" {

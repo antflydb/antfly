@@ -146,6 +146,9 @@ pub const QueryAdmission = struct {
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
     query_admission: QueryAdmission = .{},
+    /// Separate phase admission for H2 query bodies. Slow uploads must not
+    /// consume execution permits, but still need a global waiter bound.
+    query_body_admission: QueryAdmission = .{},
     peer_observer: ?PeerObserver = null,
     cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
     peer_disconnect_cancellations_total: std.atomic.Value(u64) = .init(0),
@@ -435,6 +438,11 @@ pub const AntflyApiHandler = struct {
         // they do not retain connection-admission permits.
         if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
         return textResponse(ctx, 429, "query capacity exhausted");
+    }
+
+    fn queryBodyOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return textResponse(ctx, 429, "query body capacity exhausted");
     }
 
     fn queryCancellationUnavailableResponse(ctx: *httpx.Context) !httpx.Response {
@@ -1529,13 +1537,18 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
+        const body_data = body: {
+            const needs_h2_body_slot = ctx.h2_body_reader != null;
+            if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
+                return queryBodyOverloadedResponse(ctx);
+            defer if (needs_h2_body_slot) self.query_body_admission.release();
+            break :body (try ctx.body()) orelse {
+                _ = ctx.status(400);
+                return ctx.text("missing body");
+            };
         };
-        // H2 handlers are dispatched as soon as HEADERS arrive. Do not let an
-        // incomplete streaming body consume the expensive-execution budget;
-        // the transport's independent stream/body limits bound that phase.
+        // Body admission is released before expensive execution starts so
+        // slow ingress and query compute cannot starve one another.
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
         var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
@@ -2132,9 +2145,15 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
+        const body_data = body: {
+            const needs_h2_body_slot = ctx.h2_body_reader != null;
+            if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
+                return queryBodyOverloadedResponse(ctx);
+            defer if (needs_h2_body_slot) self.query_body_admission.release();
+            break :body (try ctx.body()) orelse {
+                _ = ctx.status(400);
+                return ctx.text("missing body");
+            };
         };
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
@@ -3460,6 +3479,7 @@ const HttpxE2eServer = struct {
             .handler = .{
                 .api_server = api_server,
                 .query_admission = QueryAdmission.init(query_capacity),
+                .query_body_admission = QueryAdmission.init(query_capacity),
             },
             .thread = null,
         };
@@ -3826,6 +3846,7 @@ test "httpx query admission rejects saturated queries without blocking control r
     var handler = AntflyApiHandler{
         .api_server = &api_server,
         .query_admission = QueryAdmission.init(1),
+        .query_body_admission = QueryAdmission.init(1),
     };
 
     try std.testing.expect(handler.query_admission.tryAcquire());
@@ -3857,6 +3878,24 @@ test "httpx query admission rejects saturated queries without blocking control r
     defer h1_rejected.deinit();
     try std.testing.expectEqual(@as(u16, 429), h1_rejected.status.code);
     try std.testing.expectEqualStrings("close", h1_rejected.headers.get("Connection").?);
+
+    // Slow H2 upload admission is independent from query execution. Reject
+    // before reading the streaming body and leave the execution count intact.
+    try std.testing.expect(handler.query_body_admission.tryAcquire());
+    defer handler.query_body_admission.release();
+    var h2_query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer h2_query_request.deinit();
+    var h2_query_ctx = httpx.Context.init(alloc, std.testing.io, &h2_query_request);
+    defer h2_query_ctx.deinit();
+    var unused_body_reader: httpx.Context.H2StreamReader = undefined;
+    h2_query_ctx.h2_body_reader = &unused_body_reader;
+    var h2_rejected = try handler.queryTable(&h2_query_ctx, "docs");
+    defer h2_rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), h2_rejected.status.code);
+    try std.testing.expectEqualStrings("query body capacity exhausted", h2_rejected.body orelse "");
+    try std.testing.expectEqual(@as(usize, 1), handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), handler.query_body_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(u64, 1), handler.query_body_admission.stats().rejected_total);
 
     var control_request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/status");
     defer control_request.deinit();

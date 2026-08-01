@@ -1776,7 +1776,6 @@ pub const Client = struct {
             // allocated semaphore would be use-after-free.
             const sem = try self.allocator.create(Io.Semaphore);
             sem.* = .{ .permits = 0 };
-            stream.completion_sem = sem;
             // Re-fetch the stream pointer for cleanup since the backing
             // map may have rehashed while we were blocked on I/O.
             defer {
@@ -1796,6 +1795,14 @@ pub const Client = struct {
                 // local-only: emitting RST_STREAM for an idle stream violates
                 // RFC 7540 and can kill the shared connection.
                 if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                const published = h2.stream_manager.getStream(stream_id) orelse
+                    return error.ConnectionClosed;
+                if (published.stream_error) |err| return normalizeH2ResponseError(err);
+                if (published.completed) return error.ConnectionClosed;
+                // Publish the waiter under the same lock used by the receive
+                // loop. This makes pointer publication and the pre-send error
+                // check atomic with connection teardown.
+                published.completion_sem = sem;
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
@@ -2083,7 +2090,6 @@ pub const Client = struct {
         // Heap-allocate event for pointer stability and timed waits.
         data_event = try self.allocator.create(Io.Event);
         data_event.?.* = .unset;
-        stream.data_event = data_event;
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -2128,6 +2134,13 @@ pub const Client = struct {
         {
             h2.write_mutex.lockUncancelable(self.io);
             defer h2.write_mutex.unlock(self.io);
+            const published = h2.stream_manager.getStream(stream_id) orelse
+                return error.ConnectionClosed;
+            if (published.stream_error) |err| return normalizeH2ResponseError(err);
+            if (published.completed) return error.ConnectionClosed;
+            // The receive loop reads and signals this pointer while holding
+            // write_mutex; publish it under that same lock before HEADERS.
+            published.data_event = data_event;
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
