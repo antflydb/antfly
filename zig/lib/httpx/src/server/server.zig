@@ -1582,7 +1582,7 @@ pub const Server = struct {
             }
             // H2 idle timeout (mirrors handleH2Connection).
             if (self.config.h2_idle_timeout_ms > 0 and
-                h2.stream_manager.activeStreamCount() == 0)
+                h2ActiveStreamCount(&h2) == 0)
             {
                 const idle_ms = milliTimestamp(self.io) - last_activity;
                 if (idle_ms >= @as(i64, @intCast(self.config.h2_idle_timeout_ms))) break;
@@ -1604,43 +1604,19 @@ pub const Server = struct {
 
             const sid = maybe_sid orelse continue;
             last_activity = milliTimestamp(self.io);
-            const stream = h2.stream_manager.getStream(sid) orelse continue;
-
-            if (!stream.got_headers) continue;
-            if (stream.data_event != null) continue;
-            if (stream.stream_error != null) {
-                h2.stream_manager.removeStream(sid);
-                continue;
-            }
-            if (self.shutdown_mode.load(.acquire) != 0) {
-                h2.write_mutex.lockUncancelable(h2.io);
-                h2.sendRstStream(sock, sid, .refused_stream) catch {};
-                h2.write_mutex.unlock(h2.io);
-                h2.stream_manager.removeStream(sid);
-                continue;
-            }
-
-            // Use > (not >=) because deliverToMailbox already added this
-            // stream to the map, so activeStreamCount() includes it.
-            if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
-                h2.write_mutex.lockUncancelable(h2.io);
-                h2.sendRstStream(sock, sid, .refused_stream) catch {};
-                h2.write_mutex.unlock(h2.io);
-                h2.stream_manager.removeStream(sid);
-                continue;
-            }
-
-            h2c_request_count += 1;
-
             const data_event = self.allocator.create(Io.Event) catch {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .internal_error) catch {};
-                h2.write_mutex.unlock(h2.io);
                 h2.stream_manager.removeStream(sid);
+                h2.write_mutex.unlock(h2.io);
                 continue;
             };
             data_event.* = .unset;
-            stream.data_event = data_event;
+            if (!self.claimH2StreamForHandler(&h2, sock, sid, data_event)) {
+                self.allocator.destroy(data_event);
+                continue;
+            }
+            h2c_request_count += 1;
 
             // Reserve drain ownership before publishing the handler fiber. A
             // concurrent graceful shutdown must not observe an accepted stream
@@ -1732,7 +1708,7 @@ pub const Server = struct {
             // H2 idle timeout: initiate graceful shutdown if no streams are
             // active and idle threshold is exceeded.
             if (self.config.h2_idle_timeout_ms > 0 and
-                h2.stream_manager.activeStreamCount() == 0)
+                h2ActiveStreamCount(&h2) == 0)
             {
                 const idle_ms = milliTimestamp(self.io) - last_activity;
                 if (idle_ms >= @as(i64, @intCast(self.config.h2_idle_timeout_ms))) break;
@@ -1762,55 +1738,20 @@ pub const Server = struct {
             // reset the timer — otherwise a client can hold a connection open
             // indefinitely by sending periodic PINGs without opening streams.
             last_activity = milliTimestamp(self.io);
-            const stream = h2.stream_manager.getStream(sid) orelse continue;
-
-            // Dispatch as soon as HEADERS arrive. Use data_event as the
-            // "already dispatched" flag — once installed, the receive loop
-            // won't dispatch again for this stream.
-            if (!stream.got_headers) continue;
-            if (stream.data_event != null) continue;
-            // Stream errors on not-yet-dispatched streams: signal and let
-            // the handler fiber (or immediate cleanup) handle removal.
-            if (stream.stream_error != null) {
-                // No handler fiber owns this stream yet, so remove directly.
-                h2.stream_manager.removeStream(sid);
-                continue;
-            }
-            if (self.shutdown_mode.load(.acquire) != 0) {
-                h2.write_mutex.lockUncancelable(h2.io);
-                h2.sendRstStream(sock, sid, .refused_stream) catch {};
-                h2.write_mutex.unlock(h2.io);
-                h2.stream_manager.removeStream(sid);
-                continue;
-            }
-
-            // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
-            // Check before incrementing h2_request_count so refused streams
-            // don't drain the h2_max_requests budget.
-            // Use > (not >=) because deliverToMailbox already added this
-            // stream to the map, so activeStreamCount() includes it.
-            if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
-                h2.write_mutex.lockUncancelable(h2.io);
-                h2.sendRstStream(sock, sid, .refused_stream) catch {};
-                h2.write_mutex.unlock(h2.io);
-                h2.stream_manager.removeStream(sid);
-                continue;
-            }
-
-            h2_request_count += 1;
-
-            // Install data_event before spawning the fiber so the receive
-            // loop can signal it for subsequent DATA frames.
             const data_event = self.allocator.create(Io.Event) catch {
                 // Alloc failure: reject the stream to avoid a leak.
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .internal_error) catch {};
-                h2.write_mutex.unlock(h2.io);
                 h2.stream_manager.removeStream(sid);
+                h2.write_mutex.unlock(h2.io);
                 continue;
             };
             data_event.* = .unset;
-            stream.data_event = data_event;
+            if (!self.claimH2StreamForHandler(&h2, sock, sid, data_event)) {
+                self.allocator.destroy(data_event);
+                continue;
+            }
+            h2_request_count += 1;
 
             // Spawn a fiber to handle this stream's request. Falls back to
             // synchronous handling if the Io backend doesn't support fibers.
@@ -2191,6 +2132,36 @@ pub const Server = struct {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
         return h2.stream_manager.getStream(stream_id);
+    }
+
+    /// Atomically claims a received H2 stream for one handler fiber. The
+    /// frame pump and handler cleanup both mutate StreamManager, so map lookup,
+    /// admission, reset, removal, and data_event publication share its mutex.
+    fn claimH2StreamForHandler(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) bool {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+
+        const stream = h2.stream_manager.getStream(stream_id) orelse return false;
+        if (!stream.got_headers or stream.data_event != null) return false;
+        if (stream.stream_error != null) {
+            h2.stream_manager.removeStream(stream_id);
+            return false;
+        }
+        if (self.shutdown_mode.load(.acquire) != 0 or
+            h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams)
+        {
+            h2.sendRstStream(sock, stream_id, .refused_stream) catch {};
+            h2.stream_manager.removeStream(stream_id);
+            return false;
+        }
+        stream.data_event = data_event;
+        return true;
+    }
+
+    fn h2ActiveStreamCount(h2: *H2Connection) usize {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+        return h2.stream_manager.activeStreamCount();
     }
 
     /// Sends an error response.
