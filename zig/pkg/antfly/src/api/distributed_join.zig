@@ -1556,6 +1556,8 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         appended_left_field,
     ) catch |err| switch (err) {
         error.InvalidQueryRequest => return error.InvalidQueryRequest,
+        error.Cancelled => return error.Cancelled,
+        error.Timeout => return error.Timeout,
         else => return error.InternalFailure,
     };
     try maybeAttachJoinProfile(alloc, &owned_response, stats, plan, right_result.strategy_used, right_result.distributed_execution, right_result.groups_queried);
@@ -2334,6 +2336,7 @@ const StatefulDistributedShuffleEngine = struct {
                     .succeeded = false,
                 });
                 if (err == error.Timeout) return error.Timeout;
+                if (err == error.Cancelled) return error.Cancelled;
                 continue;
             };
             try state.worker_attempts.append(self.alloc, .{
@@ -4820,6 +4823,7 @@ pub fn applyJoinedRightHitsToResponse(
 ) !JoinedQueryStats {
     return try applyJoinedRightHitsToResponseWithDeadline(
         null,
+        null,
         alloc,
         root,
         left_hits,
@@ -4842,6 +4846,7 @@ pub fn applyJoinedRightHitsToResponseWithContext(
 ) !JoinedQueryStats {
     return try applyJoinedRightHitsToResponseWithDeadline(
         ctx.execution_deadline_ns,
+        ctx.cancellation,
         alloc,
         root,
         left_hits,
@@ -4854,6 +4859,7 @@ pub fn applyJoinedRightHitsToResponseWithContext(
 
 fn applyJoinedRightHitsToResponseWithDeadline(
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     alloc: std.mem.Allocator,
     root: *std.json.Value,
     left_hits: []const std.json.Value,
@@ -4864,6 +4870,7 @@ fn applyJoinedRightHitsToResponseWithDeadline(
 ) !JoinedQueryStats {
     var merged = try mergeJoinedRightHitsAllocWithDeadline(
         deadline_ns,
+        cancellation,
         alloc,
         left_hits,
         join,
@@ -4886,6 +4893,7 @@ pub fn mergeJoinedRightHitsAlloc(
 ) !JoinedRightMergeResult {
     return try mergeJoinedRightHitsAllocWithDeadline(
         null,
+        null,
         alloc,
         left_hits,
         join,
@@ -4906,6 +4914,7 @@ fn mergeJoinedRightHitsAllocWithContext(
 ) !JoinedRightMergeResult {
     return try mergeJoinedRightHitsAllocWithDeadline(
         ctx.execution_deadline_ns,
+        ctx.cancellation,
         alloc,
         left_hits,
         join,
@@ -4917,6 +4926,7 @@ fn mergeJoinedRightHitsAllocWithContext(
 
 fn mergeJoinedRightHitsAllocWithDeadline(
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     alloc: std.mem.Allocator,
     left_hits: []const std.json.Value,
     join: SupportedJoinRequest,
@@ -4938,11 +4948,11 @@ fn mergeJoinedRightHitsAllocWithDeadline(
     }
 
     var equality_index: ?EqualityJoinIndex = if (join.operator == .eq and right_hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns, null)
+        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns, cancellation)
     else
         null;
     defer if (equality_index) |*index| index.deinit(alloc);
-    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
 
     for (left_hits) |hit_value| {
         try poller.poll();
@@ -6513,6 +6523,7 @@ test "distributed join merge rejects an expired deadline before scanning" {
         error.Timeout,
         mergeJoinedRightHitsAllocWithDeadline(
             platform_time.monotonicNs(),
+            null,
             alloc,
             &.{left_hit},
             join,
