@@ -1890,27 +1890,74 @@ pub const Client = struct {
         /// Releases the stream. Sends RST_STREAM(CANCEL) if the stream
         /// hasn't completed, telling the server to stop sending DATA frames.
         pub fn close(self: *H2StreamReader) void {
-            const stream_id = self.stream.id;
-            const completed = self.stream.completed;
-            self.stream.data_event = null;
-            self.stream.completion_sem = null;
-
-            if (!completed) {
-                self.h2.write_mutex.lockUncancelable(self.io);
-                defer self.h2.write_mutex.unlock(self.io);
-                if (self.entry.is_tls) {
-                    if (self.entry.session.getWriter()) |w|
-                        self.h2.sendRstStream(w, stream_id, .cancel) catch {}
-                    else |_| {}
-                } else {
-                    self.h2.sendRstStream(&self.entry.socket, stream_id, .cancel) catch {};
-                }
-            }
-
-            self.h2.stream_manager.removeStream(stream_id);
-            self.allocator.destroy(self.data_event);
+            Client.cleanupH2Stream(
+                self.entry,
+                self.stream.id,
+                self.data_event,
+                true,
+                self.io,
+                self.allocator,
+            );
         }
     };
+
+    /// Detaches a streaming response's receive-loop pointers while holding the
+    /// same mutex that protects mailbox delivery.  Once the event is detached
+    /// and the stream removed, no producer can retain either allocation; only
+    /// then is it safe to destroy the event.  `headers_sent` distinguishes a
+    /// locally allocated idle stream from one the peer can still be sending on.
+    fn cleanupH2Stream(
+        entry: *H2PoolEntry,
+        stream_id: u31,
+        data_event: ?*Io.Event,
+        headers_sent: bool,
+        io: Io,
+        allocator: Allocator,
+    ) void {
+        const h2 = &entry.h2;
+        h2.write_mutex.lockUncancelable(io);
+        const cancel_peer = prepareH2StreamCleanupLocked(h2, stream_id, data_event, headers_sent);
+        if (cancel_peer) {
+            if (entry.is_tls) {
+                if (entry.session.getWriter()) |writer|
+                    h2.sendRstStream(writer, stream_id, .cancel) catch {}
+                else |_| {}
+            } else {
+                h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
+            }
+        }
+        h2.stream_manager.removeStream(stream_id);
+        h2.write_mutex.unlock(io);
+
+        if (data_event) |event| allocator.destroy(event);
+    }
+
+    /// Prepares a stream for teardown while `h2.write_mutex` is held.
+    /// Returns whether the peer must be told about cancellation before the
+    /// caller removes the stream.
+    fn prepareH2StreamCleanupLocked(
+        h2: *H2Connection,
+        stream_id: u31,
+        data_event: ?*Io.Event,
+        headers_sent: bool,
+    ) bool {
+        const stream = h2.stream_manager.getStream(stream_id) orelse return false;
+        if (data_event) |event| {
+            if (stream.data_event == event) stream.data_event = null;
+        }
+        // This request-stream path does not install a completion waiter, but
+        // clearing it here keeps removal safe if that changes.
+        stream.completion_sem = null;
+
+        // Never RST an idle stream: before HEADERS reaches the peer it is only
+        // a local allocation. Once HEADERS is live, reset it before removal so
+        // the peer does not retain a half-open stream.
+        if (!headers_sent or stream.completed) return false;
+        stream.stream_error = error.Cancelled;
+        stream.completed = true;
+        stream.reset();
+        return true;
+    }
 
     /// Response from a streaming H2 request. Contains response headers
     /// and an incremental reader for the response body.
@@ -1943,16 +1990,14 @@ pub const Client = struct {
         const stream = try h2.stream_manager.createStream();
         self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
-        errdefer h2.stream_manager.removeStream(stream_id);
+        var data_event: ?*Io.Event = null;
+        var headers_sent = false;
+        errdefer cleanupH2Stream(entry, stream_id, data_event, headers_sent, self.io, self.allocator);
 
         // Heap-allocate event for pointer stability and timed waits.
-        const data_event = try self.allocator.create(Io.Event);
-        data_event.* = .unset;
+        data_event = try self.allocator.create(Io.Event);
+        data_event.?.* = .unset;
         stream.data_event = data_event;
-        errdefer {
-            stream.data_event = null;
-            self.allocator.destroy(data_event);
-        }
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -2000,9 +2045,11 @@ pub const Client = struct {
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                headers_sent = true;
                 if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                headers_sent = true;
                 if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
             }
         }
@@ -2016,9 +2063,9 @@ pub const Client = struct {
         else
             .none;
         while (!stream.got_headers and !stream.completed) {
-            data_event.reset();
+            data_event.?.reset();
             if (stream.got_headers or stream.completed) break;
-            data_event.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
+            data_event.?.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 error.Canceled => return error.Canceled,
             };
@@ -2050,7 +2097,7 @@ pub const Client = struct {
                 .io = self.io,
                 .h2 = h2,
                 .entry = entry,
-                .data_event = data_event,
+                .data_event = data_event.?,
                 .allocator = self.allocator,
             },
         };
@@ -3117,8 +3164,14 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     const allocator = std.testing.allocator;
 
     // Set up an H2Connection with a stream that has pre-buffered data.
-    var h2 = H2Connection.initClient(allocator, std.testing.io);
-    defer h2.deinit();
+    var entry = H2PoolEntry{
+        .socket = undefined,
+        .session = undefined,
+        .h2 = H2Connection.initClient(allocator, std.testing.io),
+        .is_tls = false,
+    };
+    defer entry.h2.deinit();
+    const h2 = &entry.h2;
 
     const stream = try h2.stream_manager.createStream();
     const stream_id = stream.id;
@@ -3135,8 +3188,8 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     var reader = Client.H2StreamReader{
         .stream = stream,
         .io = std.testing.io,
-        .h2 = &h2,
-        .entry = undefined, // Not dereferenced: stream.completed=true so close() skips RST_STREAM.
+        .h2 = h2,
+        .entry = &entry, // completed=true means close() skips socket/TLS access.
         .data_event = data_event,
         .allocator = allocator,
     };
@@ -3162,6 +3215,44 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 
     // Verify stream was removed.
     try std.testing.expect(h2.stream_manager.getStream(stream_id) == null);
+}
+
+test "H2 stream cleanup detaches receiver before resetting a published stream" {
+    const allocator = std.testing.allocator;
+    var h2 = H2Connection.initClient(allocator, std.testing.io);
+    defer h2.deinit();
+
+    const published = try h2.stream_manager.createStream();
+    const published_event = try allocator.create(Io.Event);
+    published_event.* = .unset;
+    published.data_event = published_event;
+
+    h2.write_mutex.lockUncancelable(std.testing.io);
+    try std.testing.expect(Client.prepareH2StreamCleanupLocked(&h2, published.id, published_event, true));
+    // The receive loop takes this mutex before delivering an event, so after
+    // this detach it cannot retain the event pointer across destruction.
+    try std.testing.expect(published.data_event == null);
+    try std.testing.expectEqual(error.Cancelled, published.stream_error.?);
+    try std.testing.expect(published.completed);
+    try std.testing.expectEqual(.closed, published.state);
+    h2.stream_manager.removeStream(published.id);
+    h2.write_mutex.unlock(std.testing.io);
+    allocator.destroy(published_event);
+
+    // A stream that never sent HEADERS is local-only and must not be reset.
+    const idle = try h2.stream_manager.createStream();
+    const idle_event = try allocator.create(Io.Event);
+    idle_event.* = .unset;
+    idle.data_event = idle_event;
+
+    h2.write_mutex.lockUncancelable(std.testing.io);
+    try std.testing.expect(!Client.prepareH2StreamCleanupLocked(&h2, idle.id, idle_event, false));
+    try std.testing.expect(idle.data_event == null);
+    try std.testing.expect(!idle.completed);
+    try std.testing.expectEqual(.open, idle.state);
+    h2.stream_manager.removeStream(idle.id);
+    h2.write_mutex.unlock(std.testing.io);
+    allocator.destroy(idle_event);
 }
 
 const test_tls_cert_pem =
