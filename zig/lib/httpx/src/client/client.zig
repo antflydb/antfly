@@ -244,6 +244,12 @@ const H2PoolEntry = struct {
     h2: H2Connection,
     is_tls: bool,
     broken: bool = false,
+    /// Once removed from h2_conns, no new request may acquire this entry.
+    /// Existing request leases keep it alive until they release.
+    retired: bool = false,
+    active_requests: u32 = 0,
+    /// Owned map key retained after retirement so the final lease can free it.
+    retired_key: ?[]const u8 = null,
     /// Tracks the background receive-loop fiber (if spawned).
     recv_group: Io.Group = Io.Group.init,
     /// True when a receive-loop fiber is actively pumping frames.
@@ -361,6 +367,20 @@ pub const Client = struct {
     h2_mutex: Io.Mutex = Io.Mutex.init,
 
     const Self = @This();
+
+    /// An H2 pool entry remains valid for the lifetime of this lease. Leases
+    /// are acquired under h2_mutex, closing the handoff race with replacement.
+    const H2Lease = struct {
+        client: *Self,
+        entry: *H2PoolEntry,
+        active: bool = true,
+
+        fn release(self: *H2Lease) void {
+            if (!self.active) return;
+            self.active = false;
+            self.client.releaseH2Lease(self.entry);
+        }
+    };
 
     /// Creates a new HTTP client with default configuration.
     pub fn init(allocator: Allocator, io: Io) Self {
@@ -1137,7 +1157,9 @@ pub const Client = struct {
         // Reuses a pooled connection per host when available.
         if (self.config.http2_enabled or self.config.force_http2) {
             const is_tls = req.uri.isTls();
-            const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+            var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+            defer lease.release();
+            const entry = lease.entry;
             const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
                 // Only mark the connection broken for transport/framing errors.
                 // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
@@ -1396,7 +1418,7 @@ pub const Client = struct {
     /// blocking I/O (DNS, TCP connect, TLS handshake, SETTINGS exchange).
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
-    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !*H2PoolEntry {
+    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !H2Lease {
         var key_buf: [280]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
 
@@ -1406,7 +1428,10 @@ pub const Client = struct {
             defer self.h2_mutex.unlock(self.io);
 
             if (self.h2_conns.get(key)) |entry| {
-                if (!entry.broken and !entry.h2.goaway_received) return entry;
+                if (!entry.retired and !entry.broken and !entry.h2.goaway_received) {
+                    entry.active_requests += 1;
+                    return .{ .client = self, .entry = entry };
+                }
                 if (entry.h2.goaway_received) entry.broken = true;
             }
         }
@@ -1479,9 +1504,8 @@ pub const Client = struct {
         // Collect entries to tear down outside the lock (await yields the
         // fiber, so we must not hold h2_mutex during teardown).
         var race_winner: ?*H2PoolEntry = null;
-        var stale_removed: ?std.StringHashMapUnmanaged(*H2PoolEntry).KV = null;
-        // Use defer so stale entry is cleaned up even if allocPrint/put fail.
-        defer if (stale_removed) |removed| self.destroyH2EntryKeyed(removed);
+        var stale_to_destroy: ?*H2PoolEntry = null;
+        errdefer if (stale_to_destroy) |stale| self.destroyRetiredH2Entry(stale);
 
         {
             self.h2_mutex.lockUncancelable(self.io);
@@ -1489,28 +1513,40 @@ pub const Client = struct {
 
             // Another fiber may have raced us and inserted a connection.
             if (self.h2_conns.get(key)) |existing| {
-                if (!existing.broken and !existing.h2.goaway_received) {
+                if (!existing.retired and !existing.broken and !existing.h2.goaway_received) {
+                    existing.active_requests += 1;
                     race_winner = existing;
                 }
             }
 
             if (race_winner == null) {
                 // Remove stale/broken entry if present.
-                stale_removed = self.h2_conns.fetchRemove(key);
+                if (self.h2_conns.fetchRemove(key)) |removed| {
+                    const stale = removed.value;
+                    stale.retired = true;
+                    stale.retired_key = removed.key;
+                    if (stale.active_requests == 0) stale_to_destroy = stale;
+                }
 
                 const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
                 errdefer self.allocator.free(owned_key);
                 try self.h2_conns.put(self.allocator, owned_key, entry);
+                entry.active_requests = 1;
             }
+        }
+
+        if (stale_to_destroy) |stale| {
+            self.destroyRetiredH2Entry(stale);
+            stale_to_destroy = null;
         }
 
         if (race_winner) |existing| {
             // Loser: tear down our connection, use the winner's.
             self.destroyH2Entry(entry);
-            return existing;
+            return .{ .client = self, .entry = existing };
         }
 
-        return entry;
+        return .{ .client = self, .entry = entry };
     }
 
     /// Tears down an H2PoolEntry that was never inserted into h2_conns.
@@ -1527,16 +1563,21 @@ pub const Client = struct {
         self.allocator.destroy(entry);
     }
 
-    /// Tears down an H2PoolEntry that was removed from h2_conns via fetchRemove.
-    fn destroyH2EntryKeyed(self: *Self, removed: std.StringHashMapUnmanaged(*H2PoolEntry).KV) void {
-        const e = removed.value;
-        e.socket.close();
-        e.recv_group.await(self.io) catch {};
-        e.ping_group.await(self.io) catch {};
-        e.h2.deinit();
-        e.session.deinit();
-        self.allocator.destroy(e);
-        self.allocator.free(removed.key);
+    fn destroyRetiredH2Entry(self: *Self, entry: *H2PoolEntry) void {
+        const key = entry.retired_key orelse unreachable;
+        self.destroyH2Entry(entry);
+        self.allocator.free(key);
+    }
+
+    fn releaseH2Lease(self: *Self, entry: *H2PoolEntry) void {
+        var destroy: ?*H2PoolEntry = null;
+        self.h2_mutex.lockUncancelable(self.io);
+        std.debug.assert(entry.active_requests > 0);
+        entry.active_requests -= 1;
+        if (entry.retired and entry.active_requests == 0) destroy = entry;
+        self.h2_mutex.unlock(self.io);
+        // Teardown may await fibers, and must never run while h2_mutex is held.
+        if (destroy) |retired| self.destroyRetiredH2Entry(retired);
     }
 
     /// Reads frames until the server's initial SETTINGS has been received and ACKed.
@@ -1851,6 +1892,7 @@ pub const Client = struct {
         entry: *H2PoolEntry,
         data_event: *Io.Event,
         allocator: Allocator,
+        lease: ?H2Lease = null,
         read_timeout: Io.Timeout = .none,
 
         /// Reads up to `buf.len` bytes. Blocks until data is available.
@@ -1898,6 +1940,7 @@ pub const Client = struct {
                 self.io,
                 self.allocator,
             );
+            if (self.lease) |*lease| lease.release();
         }
     };
 
@@ -1979,7 +2022,10 @@ pub const Client = struct {
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
-        const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+        var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+        var lease_transferred = false;
+        defer if (!lease_transferred) lease.release();
+        const entry = lease.entry;
         if (!entry.recv_running) return error.MultiplexingRequired;
 
         const h2 = &entry.h2;
@@ -2089,6 +2135,7 @@ pub const Client = struct {
             }
         }
 
+        lease_transferred = true;
         return .{
             .status_code = status_code orelse return error.InvalidResponse,
             .headers = response_headers,
@@ -2099,6 +2146,7 @@ pub const Client = struct {
                 .entry = entry,
                 .data_event = data_event.?,
                 .allocator = self.allocator,
+                .lease = lease,
             },
         };
     }
@@ -3215,6 +3263,29 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 
     // Verify stream was removed.
     try std.testing.expect(h2.stream_manager.getStream(stream_id) == null);
+}
+
+test "H2 entry lease defers retired teardown while another request is in flight" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+
+    var entry = H2PoolEntry{
+        .socket = undefined,
+        .session = undefined,
+        .h2 = H2Connection.initClient(std.testing.allocator, std.testing.io),
+        .is_tls = false,
+        .retired = true,
+        .active_requests = 2,
+    };
+    defer entry.h2.deinit();
+
+    var old_request = Client.H2Lease{ .client = &client, .entry = &entry };
+    old_request.release();
+
+    // Replacing the broken map entry must not tear down its socket/H2 state
+    // until the final old request releases its lease.
+    try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+    try std.testing.expect(entry.retired);
 }
 
 test "H2 stream cleanup detaches receiver before resetting a published stream" {

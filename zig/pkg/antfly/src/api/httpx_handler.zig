@@ -112,10 +112,11 @@ pub const QueryAdmission = struct {
 };
 
 /// Watches only for a terminal peer socket event while a query is executing.
-/// It deliberately does not read the socket: HTTP/1 pipelined bytes remain
-/// owned by httpx's connection loop. HTTP/2 stream reset support remains in
-/// httpx's stream layer; this adapter therefore treats an unavailable watcher
-/// as no cancellation signal rather than guessing from readable bytes.
+/// It deliberately does not read the socket. This endpoint does not support
+/// HTTP/1 keep-alive or pipelining, so a readable peer socket is terminal
+/// (including Darwin's normal-FIN readiness) rather than request bytes owned
+/// by httpx's connection loop. HTTP/2 stream reset support remains in httpx's
+/// stream layer.
 const PeerCancellationWatcher = struct {
     socket: *httpx.Socket,
     cancellation: *http_common.RequestCancellation,
@@ -137,12 +138,12 @@ const PeerCancellationWatcher = struct {
         while (!self.done.load(.acquire)) {
             var fds = [_]std.posix.pollfd{.{
                 .fd = self.socket.handle,
-                .events = 0,
+                .events = std.posix.POLL.IN | std.posix.POLL.ERR,
                 .revents = 0,
             }};
             const ready = std.posix.poll(&fds, 25) catch return;
             if (ready == 0) continue;
-            if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+            if (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
                 self.cancellation.cancel();
                 return;
             }

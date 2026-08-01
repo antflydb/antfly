@@ -2298,8 +2298,9 @@ pub const ApiHttpServer = struct {
         );
     }
 
-    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64) anyerror!query_api.OwnedQueryRequest {
+    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!query_api.OwnedQueryRequest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
         return try self.buildOwnedSearchRequestFromQueryValue(
             alloc,
             table_name,
