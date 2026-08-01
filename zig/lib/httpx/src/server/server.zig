@@ -2097,9 +2097,7 @@ pub const Server = struct {
         var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
         defer resp_extra.deinit(self.allocator);
 
-        for (response.headers.entries.items) |entry| {
-            try resp_extra.append(self.allocator, .{ .name = entry.name, .value = entry.value });
-        }
+        try appendH2ResponseHeaders(self.allocator, &resp_extra, &response.headers);
 
         var status_buf: [3]u8 = undefined;
         const h2_headers = try H2Connection.buildResponseHeaders(
@@ -2298,6 +2296,21 @@ fn isH2ForbiddenHeader(name: []const u8, value: []const u8) bool {
         return !std.ascii.eqlIgnoreCase(value, "trailers");
     }
     return false;
+}
+
+fn appendH2ResponseHeaders(
+    allocator: Allocator,
+    destination: *std.ArrayListUnmanaged(hpack.HeaderEntry),
+    source: *const Headers,
+) !void {
+    for (source.entries.items) |entry| {
+        // RFC 9113 section 8.2.2: connection-specific fields are an H1
+        // concern and MUST NOT be generated in an H2 response. Filtering
+        // centrally keeps arbitrary middleware and application handlers from
+        // accidentally producing a malformed stream.
+        if (isH2ForbiddenHeader(entry.name, entry.value)) continue;
+        try destination.append(allocator, .{ .name = entry.name, .value = entry.value });
+    }
 }
 
 /// Returns true if `path` contains traversal sequences (`..`), null bytes,
@@ -2954,6 +2967,27 @@ test "isH2ForbiddenHeader rejects connection-specific headers" {
     // Normal headers are allowed.
     try std.testing.expect(!isH2ForbiddenHeader("content-type", "text/html"));
     try std.testing.expect(!isH2ForbiddenHeader("accept", "*/*"));
+}
+
+test "H2 response serialization strips connection-specific headers" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+    try headers.set("Connection", "close");
+    try headers.set("Keep-Alive", "timeout=5");
+    try headers.set("Transfer-Encoding", "chunked");
+    try headers.set("TE", "trailers");
+    try headers.set("Retry-After", "1");
+
+    var encoded = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+    defer encoded.deinit(allocator);
+    try appendH2ResponseHeaders(allocator, &encoded, &headers);
+
+    try std.testing.expectEqual(@as(usize, 2), encoded.items.len);
+    try std.testing.expectEqualStrings("TE", encoded.items[0].name);
+    try std.testing.expectEqualStrings("trailers", encoded.items[0].value);
+    try std.testing.expectEqualStrings("Retry-After", encoded.items[1].name);
+    try std.testing.expectEqualStrings("1", encoded.items[1].value);
 }
 
 test "shutdown publishes graceful listener-thread work" {

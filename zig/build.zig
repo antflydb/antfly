@@ -2510,6 +2510,12 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const httpx_transport_regression_tests = b.addTest(.{
+        .root_module = httpx_mod,
+        .filters = &.{"H2 response serialization strips connection-specific headers"},
+    });
+    const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
+
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/json_helpers.zig"),
         .target = target,
@@ -4475,6 +4481,9 @@ pub fn build(b: *std.Build) void {
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
+        "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
+        "httpx production path sheds 128 abandoned queries and preserves control recovery",
+        "httpx production query preserves high-frequency keyword recall across clean restarts",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
         "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",
@@ -5964,6 +5973,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
+    unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
@@ -6391,6 +6401,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
             "db one real delete keeps filtered full text on complement path across restart",
+            "db production ingest preserves high-frequency keyword recall across clean restarts",
             "non-visible doc set complements visibility per generation",
             "built-in exact dense scorer filters metadata before vector reads",
             "sorted unique vector id subtraction handles sparse and dense exclusions",
