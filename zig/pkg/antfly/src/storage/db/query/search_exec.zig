@@ -8825,7 +8825,7 @@ fn collectStructuredFilterDocIdsAlloc(
         text_entry.runtime_schema,
         false,
     ))) return null;
-    const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
+    const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
         .k = k,
@@ -10962,6 +10962,40 @@ fn uniqueSortedU64(values: []u64) usize {
     return out;
 }
 
+fn isSortedUniqueU64(values: []const u64) bool {
+    if (values.len < 2) return true;
+    for (values[1..], values[0 .. values.len - 1]) |value, previous| {
+        if (value <= previous) return false;
+    }
+    return true;
+}
+
+/// Remove a sorted, unique exclusion set from a sorted, unique value set in
+/// place. Both cursors advance monotonically, keeping selective ANN planning
+/// O(filters log filters + exclusions log exclusions) rather than O(F * E).
+fn subtractSortedUniqueU64InPlace(values: []u64, excluded: []const u64) usize {
+    var out: usize = 0;
+    var excluded_index: usize = 0;
+    for (values) |value| {
+        while (excluded_index < excluded.len and excluded[excluded_index] < value) {
+            excluded_index += 1;
+        }
+        if (excluded_index < excluded.len and excluded[excluded_index] == value) continue;
+        values[out] = value;
+        out += 1;
+    }
+    return out;
+}
+
+test "sorted unique vector id subtraction handles sparse and dense exclusions" {
+    var values = [_]u64{ 1, 2, 4, 7, 9, 12 };
+    const len = subtractSortedUniqueU64InPlace(&values, &.{ 0, 2, 3, 4, 8, 12, 14 });
+    try std.testing.expectEqualSlices(u64, &.{ 1, 7, 9 }, values[0..len]);
+    try std.testing.expect(isSortedUniqueU64(values[0..len]));
+    try std.testing.expect(!isSortedUniqueU64(&.{ 1, 1, 2 }));
+    try std.testing.expect(!isSortedUniqueU64(&.{ 2, 1 }));
+}
+
 fn containsSortedU64(values: []const u64, expected: u64) bool {
     return std.sort.binarySearch(u64, values, expected, compareU64) != null;
 }
@@ -11500,7 +11534,7 @@ pub fn searchTextQuery(
         native_constraints.positive_filter,
         effective_req.identity_read_generation,
     );
-    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
+    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     // The primary document store is the source of truth. Production text
@@ -11832,7 +11866,7 @@ pub fn searchTextQuery(
                     native_constraints.filter_doc_ids.len,
                     native_constraints.exclude_doc_nums.len,
                     native_constraints.exclude_doc_ids.len,
-                    snapshot.global_doc_count,
+                    snapshot.liveDocCount(),
                     candidate_limit,
                     candidate_iterations,
                     late_visibility_paginate,
@@ -12388,7 +12422,7 @@ pub fn executeBackgroundQuery(
                 .term = term.term,
             } },
         },
-        .k = snapshot.global_doc_count,
+        .k = snapshot.liveDocCount(),
         .include_stored = false,
     };
     return search_mod.execute(alloc, snapshot, request);
@@ -13219,14 +13253,25 @@ fn exactScoreNativeDenseFilter(
     entry: *index_manager_mod.IndexManager.DenseIndex,
     req: vectorindex_mod.SearchRequest,
 ) !vectorindex_mod.SearchResults {
-    var candidate_ids = std.ArrayListUnmanaged(u64).empty;
-    defer candidate_ids.deinit(alloc);
-    try candidate_ids.ensureTotalCapacity(alloc, req.filter_ids.len);
-    for (req.filter_ids) |vector_id| {
-        if (!containsVectorId(req.exclude_ids, vector_id)) candidate_ids.appendAssumeCapacity(vector_id);
-    }
-    std.mem.sort(u64, candidate_ids.items, {}, u64LessThan);
-    const unique_candidate_ids = candidate_ids.items[0..uniqueSortedU64(candidate_ids.items)];
+    const candidate_storage = try alloc.dupe(u64, req.filter_ids);
+    defer alloc.free(candidate_storage);
+    std.mem.sort(u64, candidate_storage, {}, u64LessThan);
+    const sorted_unique_candidates = candidate_storage[0..uniqueSortedU64(candidate_storage)];
+
+    var owned_exclude_storage: ?[]u64 = null;
+    defer if (owned_exclude_storage) |storage| alloc.free(storage);
+    const sorted_unique_excludes: []const u64 = if (isSortedUniqueU64(req.exclude_ids))
+        req.exclude_ids
+    else blk: {
+        const storage = try alloc.dupe(u64, req.exclude_ids);
+        owned_exclude_storage = storage;
+        std.mem.sort(u64, storage, {}, u64LessThan);
+        break :blk storage[0..uniqueSortedU64(storage)];
+    };
+    const unique_candidate_ids = sorted_unique_candidates[0..subtractSortedUniqueU64InPlace(
+        sorted_unique_candidates,
+        sorted_unique_excludes,
+    )];
 
     var results = try vectorindex_mod.SearchResults.initCapacity(
         alloc,
@@ -14781,7 +14826,7 @@ fn planTextNativeSortFields(
                 return error.InvalidQueryRequest;
             }
         }
-        if (snapshot.global_doc_count == 0) continue;
+        if (snapshot.liveDocCount() == 0) continue;
         const coverage = try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field.field, mapping);
         if (coverage.status != .covered) {
             const reason = typedDocValuesCoverageRejectionReason(coverage.status) orelse .missing_doc_values_capability;

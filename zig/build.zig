@@ -6373,6 +6373,28 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
+    // Release-blocker regressions must run in the PR/base unit gate. Keep this
+    // as a focused artifact so CI does not need to run the entire DB suite.
+    const release_blocker_regression_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+            "db one real delete keeps filtered full text on complement path across restart",
+            "sorted unique vector id subtraction handles sparse and dense exclusions",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_release_blocker_regression_tests = addFilteredTestRunArtifact(b, release_blocker_regression_tests);
+    const release_blocker_regression_step = b.step(
+        "release-blocker-regression-test",
+        "Run selective ANN and post-delete full-text release-blocker regressions",
+    );
+    release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
+    unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
+
     const db_restore_identity_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{"db restore snapshot repeatedly validates run-backed doc identity metadata"},

@@ -14806,7 +14806,7 @@ pub const DB = struct {
             };
         }
         return .{
-            .global_doc_count = text_snapshot.global_doc_count,
+            .global_doc_count = text_snapshot.liveDocCount(),
             .total_bytes = total_bytes,
             .segments = segments,
             .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
@@ -17818,7 +17818,7 @@ pub const DB = struct {
             defer text_snapshot.release();
             return .{
                 .kind = .full_text,
-                .doc_count = text_snapshot.global_doc_count,
+                .doc_count = text_snapshot.liveDocCount(),
                 .updated_at_ns = platform_time.monotonicNs(),
             };
         }
@@ -18190,7 +18190,7 @@ pub const DB = struct {
                     if (self.core.textIndex(item.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
-                        item.doc_count = text_snapshot.global_doc_count;
+                        item.doc_count = text_snapshot.liveDocCount();
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
@@ -18537,7 +18537,7 @@ pub const DB = struct {
                     if (self.core.textIndex(cfg.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
-                        item.doc_count = text_snapshot.global_doc_count;
+                        item.doc_count = text_snapshot.liveDocCount();
                         item.term_count = textIndexTermCount(entry);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
@@ -18651,7 +18651,7 @@ pub const DB = struct {
         for (configs) |cfg| {
             if (cfg.kind != .full_text) continue;
             if (self.core.textIndex(cfg.name)) |entry| {
-                indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().global_doc_count);
+                indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().liveDocCount());
             }
         }
         const visible_doc_count = indexed_doc_count orelse try self.scanPrimaryDocCount(byte_range);
@@ -18711,7 +18711,7 @@ pub const DB = struct {
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        item.doc_count = entry.snapshot().global_doc_count;
+                        item.doc_count = entry.snapshot().liveDocCount();
                         indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
@@ -38599,8 +38599,8 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
         null;
 
     return .{
-        .source_doc_count = source_snapshot.global_doc_count,
-        .dest_doc_count = if (dest_snapshot) |snapshot| snapshot.global_doc_count else 0,
+        .source_doc_count = source_snapshot.liveDocCount(),
+        .dest_doc_count = if (dest_snapshot) |snapshot| snapshot.liveDocCount() else 0,
         .source_alpha_hits = try source_snapshot.termDocFreq(alloc, "title", "alpha"),
         .source_beta_hits = try source_snapshot.termDocFreq(alloc, "title", "beta"),
         .source_gamma_hits = try source_snapshot.termDocFreq(alloc, "title", "gamma"),
@@ -41877,17 +41877,29 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     hbc_mod.setTestGetVectorViewOrScratchHook(&vector_load_counter, VectorLoadCounter.onLoad);
     defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
 
-    const filters = [_][]const u8{
-        "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
-        "{\"term\":{\"bucket\":\"selected\"}}",
+    const cases = [_]struct {
+        filter_query_json: []const u8,
+        exclusion_query_json: []const u8 = "",
+    }{
+        .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
+        .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
+        // Exercise a highly selective positive filter together with a large,
+        // disjoint native exclusion set. Exact scoring must subtract the two
+        // ordered sets linearly instead of probing every exclusion for every
+        // candidate.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
+        },
     };
-    for (filters, 0..) |filter_query_json, filter_index| {
+    for (cases, 0..) |case, case_index| {
         var profiled = try db.searchDenseProfiled(alloc, .{
             .index_name = "dv_v1",
             .primary_text_index_name = "ft_v1",
             .limit = 100,
             .include_stored = false,
-            .filter_query_json = filter_query_json,
+            .filter_query_json = case.filter_query_json,
+            .exclusion_query_json = case.exclusion_query_json,
         }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });
         defer profiled.result.deinit();
 
@@ -41897,14 +41909,14 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.hbc_exact_vectors_scored);
         try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
         try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
-        try std.testing.expectEqual(eligible_count * (filter_index + 1), vector_load_counter.count);
+        try std.testing.expectEqual(eligible_count * (case_index + 1), vector_load_counter.count);
         for (profiled.result.hits, 0..) |hit, rank| {
             const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
             defer alloc.free(expected);
             try std.testing.expectEqualStrings(expected, hit.id);
         }
     }
-    try std.testing.expectEqual(eligible_count * filters.len, vector_load_counter.count);
+    try std.testing.expectEqual(eligible_count * cases.len, vector_load_counter.count);
 }
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
@@ -55071,7 +55083,7 @@ test "db asset enrichment full_text_index feeds default full text index after fu
     const asset_value = try db.core.store.get(alloc, asset_key);
     defer alloc.free(asset_value);
     try std.testing.expect(std.mem.indexOf(u8, asset_value, "crimson sunset harbor") != null);
-    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().global_doc_count > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().liveDocCount() > 0);
 
     var results = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
@@ -55458,7 +55470,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
     try std.testing.expect(chunk_records.len > 0);
-    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().global_doc_count > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().liveDocCount() > 0);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",
@@ -75277,7 +75289,7 @@ test "db shadow index manager backfills split-off range and ignores parent-range
     try db.createShadowIndexManager("doc:m", "");
     try std.testing.expect(db.shadow != null);
     try std.testing.expect(db.getShadowIndexDir().len > 0);
-    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.core.shard_manager.prepareSplit("doc:m");
     try db.core.shard_manager.split(0, "doc:m");
@@ -75288,7 +75300,7 @@ test "db shadow index manager backfills split-off range and ignores parent-range
         .sync_level = .full_index,
     });
 
-    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.closeShadowIndexManager();
     try std.testing.expectEqualStrings("", db.getShadowIndexDir());
@@ -78788,7 +78800,7 @@ test "db updateRange constrains index backfill" {
     });
 
     const text_index = db.core.index_manager.textIndex("ft_range").?;
-    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().liveDocCount());
 }
 
 test "db range cardinality remains exact across mutations and reopen" {

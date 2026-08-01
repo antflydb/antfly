@@ -1958,7 +1958,7 @@ pub const IndexManager = struct {
             checkpoint,
         );
 
-        const rebuilt = entry.persistent.snapshot().global_doc_count;
+        const rebuilt = entry.persistent.snapshot().liveDocCount();
         entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
         if (entry.compaction_pending) {
             TextMergeScheduler.schedule(entry);
@@ -1986,7 +1986,7 @@ pub const IndexManager = struct {
         try checkRepairCancelled(cancel_check);
         try entry.persistent.sync(true);
 
-        return entry.persistent.snapshot().global_doc_count;
+        return entry.persistent.snapshot().liveDocCount();
     }
 
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
@@ -5605,7 +5605,7 @@ pub const IndexManager = struct {
     ) !typed_dv_coverage.Status {
         if (!schema_mod.mappingHasNativeDocValues(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
-        if (snapshot.global_doc_count == 0) return .covered;
+        if (snapshot.liveDocCount() == 0) return .covered;
 
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
@@ -6657,15 +6657,25 @@ pub const IndexManager = struct {
             active_dense_vector_load_session = &vector_load_session.?;
         }
 
-        var candidate_ids = std.ArrayListUnmanaged(u64).empty;
-        defer candidate_ids.deinit(self.alloc);
-        try candidate_ids.ensureTotalCapacity(self.alloc, req.filter_ids.len);
-        for (req.filter_ids) |vector_id| {
-            if (std.mem.indexOfScalar(u64, req.exclude_ids, vector_id) != null) continue;
-            candidate_ids.appendAssumeCapacity(vector_id);
-        }
-        std.mem.sort(u64, candidate_ids.items, {}, std.sort.asc(u64));
-        const unique_candidate_ids = candidate_ids.items[0..uniqueSortedU64(candidate_ids.items)];
+        const candidate_storage = try self.alloc.dupe(u64, req.filter_ids);
+        defer self.alloc.free(candidate_storage);
+        std.mem.sort(u64, candidate_storage, {}, std.sort.asc(u64));
+        const sorted_unique_candidates = candidate_storage[0..uniqueSortedU64(candidate_storage)];
+
+        var owned_exclude_storage: ?[]u64 = null;
+        defer if (owned_exclude_storage) |storage| self.alloc.free(storage);
+        const sorted_unique_excludes: []const u64 = if (isSortedUniqueU64(req.exclude_ids))
+            req.exclude_ids
+        else blk: {
+            const storage = try self.alloc.dupe(u64, req.exclude_ids);
+            owned_exclude_storage = storage;
+            std.mem.sort(u64, storage, {}, std.sort.asc(u64));
+            break :blk storage[0..uniqueSortedU64(storage)];
+        };
+        const unique_candidate_ids = sorted_unique_candidates[0..subtractSortedUniqueU64InPlace(
+            sorted_unique_candidates,
+            sorted_unique_excludes,
+        )];
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -8999,7 +9009,7 @@ pub const IndexManager = struct {
                     rebuild_from_scratch_after_interruption = true;
                 }
 
-                if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
+                if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().liveDocCount() == 0 and persisted_ranges.len == 0))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
@@ -17177,6 +17187,28 @@ fn uniqueSortedU64(items: []u64) usize {
     return write;
 }
 
+fn isSortedUniqueU64(items: []const u64) bool {
+    if (items.len < 2) return true;
+    for (items[1..], items[0 .. items.len - 1]) |item, previous| {
+        if (item <= previous) return false;
+    }
+    return true;
+}
+
+fn subtractSortedUniqueU64InPlace(values: []u64, excluded: []const u64) usize {
+    var out: usize = 0;
+    var excluded_index: usize = 0;
+    for (values) |value| {
+        while (excluded_index < excluded.len and excluded[excluded_index] < value) {
+            excluded_index += 1;
+        }
+        if (excluded_index < excluded.len and excluded[excluded_index] == value) continue;
+        values[out] = value;
+        out += 1;
+    }
+    return out;
+}
+
 fn containsU64(items: []const u64, id: u64) bool {
     for (items) |item| {
         if (item == id) return true;
@@ -17748,8 +17780,8 @@ const IndexManagerSimRuntime = struct {
         const source = self.source_manager.textIndex(index_manager_sim_index_name) orelse return error.IndexNotFound;
         const dest = self.dest_manager.textIndex(index_manager_sim_index_name) orelse return error.IndexNotFound;
         return .{
-            .source_doc_count = source.snapshot().global_doc_count,
-            .dest_doc_count = dest.snapshot().global_doc_count,
+            .source_doc_count = source.snapshot().liveDocCount(),
+            .dest_doc_count = dest.snapshot().liveDocCount(),
             .source_alpha_hits = try source.snapshot().termDocFreq(alloc, "title", "alpha"),
             .source_beta_hits = try source.snapshot().termDocFreq(alloc, "title", "beta"),
             .source_gamma_hits = try source.snapshot().termDocFreq(alloc, "title", "gamma"),
@@ -22529,7 +22561,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     const snapshot = entry.persistent.snapshot();
     try std.testing.expect(snapshot.segments.len <= default_text_merge_max_segments_per_tier);
-    try std.testing.expectEqual(@as(u64, 11), snapshot.global_doc_count);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.liveDocCount());
 }
 
 test "text merge task records input and output bytes" {
@@ -22636,7 +22668,7 @@ test "text delete clears handed-off stale docs outside current range" {
     try manager.deleteTextBatchByName("ft_v1", &.{ "doc:m", "doc:z" });
 
     const snapshot = manager.textIndex("ft_v1").?.snapshot();
-    try std.testing.expectEqual(@as(u64, 1), snapshot.global_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "title", "alpha"));
     try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "title", "middle"));
     try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "title", "zeta"));
