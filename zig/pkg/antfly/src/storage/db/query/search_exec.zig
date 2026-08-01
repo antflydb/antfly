@@ -12814,7 +12814,14 @@ fn searchDenseInternal(
     const collect_sort_profile = bench_query_profile or req.profile;
     const collect_hbc_profile = include_hbc_profile or bench_query_profile;
 
-    if (native_constraints.positive_filter and native_constraints.filter_ids.len == 0) {
+    const effective_filter_ids = if (native_constraints.positive_filter) native_constraints.filter_ids else req.filter_ids;
+    profile.native_filter_candidate_count = @intCast(effective_filter_ids.len);
+    const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
+    const effective_native_filter_candidate_count = if (native_constraints.positive_filter)
+        dense_exact.differenceCandidateUpperBound(effective_filter_ids, effective_exclude_ids) orelse effective_filter_ids.len
+    else
+        effective_filter_ids.len;
+    if (native_constraints.positive_filter and effective_native_filter_candidate_count == 0) {
         profile.search_route = "empty_result";
         profile.route_reason = "empty_native_filter";
         profile.returned_hit_count = 0;
@@ -12827,12 +12834,8 @@ fn searchDenseInternal(
             .graph_results = &.{},
         };
     }
-
-    const effective_filter_ids = if (native_constraints.positive_filter) native_constraints.filter_ids else req.filter_ids;
-    profile.native_filter_candidate_count = @intCast(effective_filter_ids.len);
-    const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
     var bounded_full_candidate_count: u32 = if (native_constraints.positive_filter)
-        @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
+        @intCast(@min(effective_native_filter_candidate_count, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
     if (!native_constraints.positive_filter and native_constraints.broad_live_exclude_ids.len > 0) {
@@ -12884,7 +12887,12 @@ fn searchDenseInternal(
         };
 
         const hbc_search_start = platform_time.monotonicNs();
-        const route = denseSearchRoute(native_constraints, paging, executor.exact_dense_search != null);
+        const route = denseSearchRoute(
+            native_constraints.positive_filter,
+            effective_native_filter_candidate_count,
+            paging,
+            executor.exact_dense_search != null,
+        );
         profile.search_route = route.name;
         profile.route_reason = route.reason;
         var results = if (route.exact_native_filter) blk: {
@@ -13103,23 +13111,24 @@ const DenseSearchRoute = struct {
 };
 
 fn denseSearchRoute(
-    native_constraints: NativeDenseConstraints,
+    positive_filter: bool,
+    effective_candidate_count: usize,
     paging: ComponentPaging,
     exact_executor_available: bool,
 ) DenseSearchRoute {
-    if (!native_constraints.positive_filter) return .{
+    if (!positive_filter) return .{
         .exact_native_filter = false,
         .name = "hbc",
         .reason = "no_native_filter",
     };
-    if (native_constraints.filter_ids.len == 0) return .{
+    if (effective_candidate_count == 0) return .{
         .exact_native_filter = false,
         .name = "hbc",
         .reason = "empty_native_filter",
     };
     const paging_budget = pagingCandidateWindow(paging) *| 32;
     const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
-    if (native_constraints.filter_ids.len <= budget) return .{
+    if (effective_candidate_count <= budget) return .{
         .exact_native_filter = true,
         .name = "exact_native_filter",
         .reason = if (exact_executor_available)
@@ -13137,36 +13146,29 @@ fn denseSearchRoute(
 test "dense search route reports exact native filter budget decisions" {
     const paging = ComponentPaging{ .offset = 0, .limit = 100 };
 
-    const no_filter = denseSearchRoute(.{}, paging, false);
+    const no_filter = denseSearchRoute(false, 0, paging, false);
     try std.testing.expect(!no_filter.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", no_filter.name);
     try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
 
-    var within_budget_ids: [500]u64 = undefined;
-    const within_budget = denseSearchRoute(.{
-        .positive_filter = true,
-        .filter_ids = &within_budget_ids,
-    }, paging, true);
+    const within_budget = denseSearchRoute(true, 500, paging, true);
     try std.testing.expect(within_budget.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
 
-    const builtin_fallback = denseSearchRoute(.{
-        .positive_filter = true,
-        .filter_ids = &within_budget_ids,
-    }, paging, false);
+    const builtin_fallback = denseSearchRoute(true, 500, paging, false);
     try std.testing.expect(builtin_fallback.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
 
-    var over_budget_ids: [3201]u64 = undefined;
-    const over_budget = denseSearchRoute(.{
-        .positive_filter = true,
-        .filter_ids = &over_budget_ids,
-    }, paging, false);
+    const over_budget = denseSearchRoute(true, 3201, paging, false);
     try std.testing.expect(!over_budget.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", over_budget.name);
     try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
+
+    const exclusion_reduced = denseSearchRoute(true, 201, paging, true);
+    try std.testing.expect(exclusion_reduced.exact_native_filter);
+    try std.testing.expectEqualStrings("candidate_count_within_budget", exclusion_reduced.reason);
 }
 
 fn pagingCandidateWindow(paging: ComponentPaging) u32 {

@@ -74,6 +74,74 @@ pub const CandidateDifference = struct {
     }
 };
 
+/// Return the exact cardinality of `include_ids \\ exclude_ids` without
+/// allocating when both inputs already satisfy the scorer's normalized set
+/// contract. Null means a caller must normalize first or use a conservative
+/// upper bound.
+pub fn sortedUniqueDifferenceCount(
+    include_ids: []const u64,
+    exclude_ids: []const u64,
+) ?usize {
+    if (!isSortedUniqueU64(include_ids) or !isSortedUniqueU64(exclude_ids)) return null;
+
+    return sortedUniqueDifferenceCountAssumeNormalized(include_ids, exclude_ids);
+}
+
+fn sortedUniqueDifferenceCountAssumeNormalized(
+    include_ids: []const u64,
+    exclude_ids: []const u64,
+) usize {
+    var count: usize = 0;
+    var excluded_index: usize = 0;
+    for (include_ids) |value| {
+        while (excluded_index < exclude_ids.len and exclude_ids[excluded_index] < value) {
+            excluded_index += 1;
+        }
+        if (excluded_index < exclude_ids.len and exclude_ids[excluded_index] == value) continue;
+        count += 1;
+    }
+    return count;
+}
+
+/// Return a conservative cardinality for `include_ids \\ exclude_ids` without
+/// allocating when the exclusion set is sorted and unique.
+///
+/// Index-derived include IDs are unique but intentionally retain document
+/// order, so requiring them to be sorted would discard the useful fast path.
+/// An unordered or duplicate include can only make this value too large: each
+/// occurrence is counted independently. That is safe for routing because it
+/// can keep a query on ANN, but can never route too many unique candidates to
+/// exact scoring. Sorted unique inputs use the linear exact-count path.
+pub fn differenceCandidateUpperBound(
+    include_ids: []const u64,
+    exclude_ids: []const u64,
+) ?usize {
+    if (!isSortedUniqueU64(exclude_ids)) return null;
+    if (isSortedUniqueU64(include_ids)) {
+        return sortedUniqueDifferenceCountAssumeNormalized(include_ids, exclude_ids);
+    }
+
+    var count: usize = 0;
+    for (include_ids) |value| {
+        if (!containsSortedU64(exclude_ids, value)) count += 1;
+    }
+    return count;
+}
+
+fn containsSortedU64(values: []const u64, needle: u64) bool {
+    var low: usize = 0;
+    var high: usize = values.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (values[mid] < needle) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low < values.len and values[low] == needle;
+}
+
 fn uniqueSortedU64(values: []u64) usize {
     if (values.len == 0) return 0;
     var out: usize = 1;
@@ -127,4 +195,19 @@ test "sorted unique vector id subtraction handles sparse and dense exclusions" {
     var empty = try CandidateDifference.init(std.testing.allocator, &.{ 2, 2 }, &.{ 2, 2 });
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.values.len);
+
+    try std.testing.expectEqual(
+        @as(?usize, 3),
+        sortedUniqueDifferenceCount(&.{ 1, 2, 4, 7, 9, 12 }, &.{ 0, 2, 3, 4, 8, 12, 14 }),
+    );
+    try std.testing.expectEqual(@as(?usize, null), sortedUniqueDifferenceCount(&.{ 2, 1 }, &.{}));
+    try std.testing.expectEqual(@as(?usize, null), sortedUniqueDifferenceCount(&.{ 1, 2 }, &.{ 1, 1 }));
+
+    try std.testing.expectEqual(
+        @as(?usize, 3),
+        differenceCandidateUpperBound(&.{ 12, 1, 4, 2, 9, 7 }, &.{ 0, 2, 3, 4, 8, 12, 14 }),
+    );
+    // Duplicate survivors deliberately overestimate the unique difference.
+    try std.testing.expectEqual(@as(?usize, 2), differenceCandidateUpperBound(&.{ 7, 7 }, &.{ 1, 2 }));
+    try std.testing.expectEqual(@as(?usize, null), differenceCandidateUpperBound(&.{ 1, 2 }, &.{ 2, 1 }));
 }

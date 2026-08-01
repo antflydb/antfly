@@ -1400,8 +1400,14 @@ pub fn nonVisibleDocSetFromStoreAlloc(
     var txn = try store.beginReadTxn();
     defer txn.abort();
 
-    if (generation == null) {
-        if (try readVisibilitySummaryTxn(&txn)) |summary| {
+    if (try readVisibilitySummaryTxn(&txn)) |summary| {
+        // A request generation at or beyond the latest identity mutation has
+        // current-state visibility semantics. Use the compact deleted-ordinal
+        // side index just like an unpinned current read; older generations
+        // still require visibility chunks to account for later creates.
+        const current_state_read = generation == null or
+            generation.? >= latestGenerationFromSummary(summary);
+        if (current_state_read) {
             if (summary.tombstone_ordinals == 0) return .none;
             if (try currentNonVisibleDocSetFromDeletedChunksAlloc(alloc, store, &txn, summary, max_entries)) |current| {
                 return current;
@@ -3337,6 +3343,14 @@ test "non-visible doc set complements visibility per generation" {
     try std.testing.expectEqual(@as(?usize, 1), excluded_live.estimatedCardinality());
     try std.testing.expect(excluded_live.containsOrdinal(2));
     try std.testing.expect(!excluded_live.containsOrdinal(3));
+
+    // A pinned read at the latest generation has the same current-state
+    // complement and can use the compact deleted side index.
+    var excluded_at_latest = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 13, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_at_latest.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), excluded_at_latest.estimatedCardinality());
+    try std.testing.expect(excluded_at_latest.containsOrdinal(2));
+    try std.testing.expect(!excluded_at_latest.containsOrdinal(3));
 
     // The current-read side index is required for validation. Query-time falls
     // back to the authoritative chunk when the summary says the side index is

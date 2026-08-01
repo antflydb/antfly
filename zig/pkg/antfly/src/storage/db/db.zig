@@ -41881,7 +41881,10 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     const cases = [_]struct {
         filter_query_json: []const u8,
         exclusion_query_json: []const u8 = "",
+        expected_candidates: usize = eligible_count,
         expected_scored: usize = eligible_count,
+        expected_route: []const u8 = "exact_native_filter",
+        expected_route_reason: []const u8 = "candidate_count_within_budget",
     }{
         .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
         .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
@@ -41901,6 +41904,24 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
             .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9989,\"inclusive_max\":true}}",
             .expected_scored = 10,
         },
+        // A completely excluded native filter is authoritative and should
+        // return immediately without entering either exact scoring or ANN.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .expected_scored = 0,
+            .expected_route = "empty_result",
+            .expected_route_reason = "empty_native_filter",
+        },
+        // The positive set alone exceeds the exact-scoring budget, but the
+        // ordered exclusion leaves only 20 effective candidates. Route on the
+        // allocation-free set-difference cardinality instead of falling back
+        // to filtered ANN for this highly selective result.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":6000,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
+            .expected_candidates = 4000,
+        },
     };
     var expected_vector_loads: usize = 0;
     for (cases) |case| {
@@ -41917,10 +41938,10 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         expected_vector_loads += case.expected_scored;
         try std.testing.expectEqual(@as(u32, @intCast(case.expected_scored)), profiled.result.total_hits);
         try std.testing.expectEqual(case.expected_scored, profiled.result.hits.len);
-        try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.native_filter_candidate_count);
+        try std.testing.expectEqual(@as(u64, @intCast(case.expected_candidates)), profiled.profile.native_filter_candidate_count);
         try std.testing.expectEqual(@as(u64, @intCast(case.expected_scored)), profiled.profile.hbc_exact_vectors_scored);
-        try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
-        try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
+        try std.testing.expectEqualStrings(case.expected_route, profiled.profile.search_route);
+        try std.testing.expectEqualStrings(case.expected_route_reason, profiled.profile.route_reason);
         try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
         for (profiled.result.hits, 0..) |hit, rank| {
             const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
