@@ -1641,7 +1641,6 @@ pub const Client = struct {
         const stream = try h2.stream_manager.createStream();
         self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
-        interrupt.publishH2(entry, stream_id, self.io);
         defer interrupt.clearH2(entry, stream_id, self.io);
         errdefer h2.stream_manager.removeStream(stream_id);
 
@@ -1706,6 +1705,10 @@ pub const Client = struct {
             {
                 h2.write_mutex.lockUncancelable(self.io);
                 defer h2.write_mutex.unlock(self.io);
+                // Cancellation before request HEADERS have reached the wire is
+                // local-only: emitting RST_STREAM for an idle stream violates
+                // RFC 7540 and can kill the shared connection.
+                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
@@ -1716,19 +1719,26 @@ pub const Client = struct {
                 }
             }
 
+            // The completion semaphore is installed before publication, so a
+            // cancellation racing immediately after HEADERS can wake us.
+            interrupt.publishH2(entry, stream_id, self.io);
+
             // Wait for the receive loop to deliver the response.
             sem.waitUncancelable(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
+            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
             if (entry.is_tls) {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                interrupt.publishH2(entry, stream_id, self.io);
                 try h2.awaitStreamComplete(r, w, stream_id);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                interrupt.publishH2(entry, stream_id, self.io);
                 try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
             }
         }

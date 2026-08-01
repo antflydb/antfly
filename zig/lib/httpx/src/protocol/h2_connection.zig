@@ -1124,6 +1124,7 @@ pub const H2Connection = struct {
         var it = self.stream_manager.streams.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr.*;
+            s.cancellation.store(true, .release);
             if (!s.completed) {
                 s.stream_error = err;
                 s.completed = true;
@@ -2944,6 +2945,23 @@ test "RST_STREAM signals the stream cancellation before waking its handler" {
     try std.testing.expect(stream.cancellation.load(.acquire));
     try std.testing.expect(stream.completed);
     try std.testing.expectEqual(error.StreamReset, stream.stream_error.?);
+}
+
+test "connection EOF signals cancellation on every active stream" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const first = try server.stream_manager.getOrCreateStream(1);
+    first.state = .open;
+    const second = try server.stream_manager.getOrCreateStream(3);
+    second.state = .half_closed_remote;
+    server.signalAllStreams(error.ConnectionClosed);
+
+    try std.testing.expect(first.cancellation.load(.acquire));
+    try std.testing.expect(second.cancellation.load(.acquire));
+    try std.testing.expectEqual(error.ConnectionClosed, first.stream_error.?);
+    try std.testing.expectEqual(error.ConnectionClosed, second.stream_error.?);
 }
 
 test "SETTINGS_MAX_HEADER_LIST_SIZE enforced in HPACK decode" {
