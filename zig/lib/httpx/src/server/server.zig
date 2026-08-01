@@ -155,6 +155,9 @@ pub const Context = struct {
     h2_sock: ?*Socket = null,
     h2_stream_id: u31 = 0,
     h2_stream_sent: bool = false,
+    /// Borrowed stream-local peer-cancellation signal for HTTP/2. Null for
+    /// HTTP/1 where adapters may install their own socket watcher.
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     /// Streaming body reader for HTTP/2 requests where the body arrives
     /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
@@ -1910,6 +1913,9 @@ pub const Server = struct {
         ctx.h2_sock = sock;
         ctx.h2_body_reader = body_reader;
         ctx.h2_stream_id = stream_id;
+        if (h2.stream_manager.getStream(stream_id)) |stream| {
+            ctx.cancellation = &stream.cancellation;
+        }
         defer ctx.deinit();
 
         for (self.pre_route_hooks.items) |hook| {

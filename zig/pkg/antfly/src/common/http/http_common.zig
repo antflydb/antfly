@@ -29,15 +29,27 @@ pub const Method = enum {
 /// must never outlive the request that supplied it.
 pub const RequestCancellation = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
+    /// borrowed for the request lifetime and complements local cancellation.
+    borrowed: ?*const std.atomic.Value(bool) = null,
 
     pub fn cancel(self: *RequestCancellation) void {
         self.cancelled.store(true, .release);
     }
 
     pub fn isCancelled(self: *const RequestCancellation) bool {
-        return self.cancelled.load(.acquire);
+        return self.cancelled.load(.acquire) or
+            (self.borrowed != null and self.borrowed.?.load(.acquire));
     }
 };
+
+test "RequestCancellation observes a borrowed listener signal" {
+    var listener_signal = std.atomic.Value(bool).init(false);
+    const cancellation = RequestCancellation{ .borrowed = &listener_signal };
+    try std.testing.expect(!cancellation.isCancelled());
+    listener_signal.store(true, .release);
+    try std.testing.expect(cancellation.isCancelled());
+}
 
 pub const HttpRequest = struct {
     method: Method,

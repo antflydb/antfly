@@ -963,6 +963,7 @@ pub const H2Connection = struct {
                 // RFC 7540 §5.1: RST_STREAM on an idle stream is a
                 // connection error (PROTOCOL_ERROR).
                 if (stream.state == .idle) return error.ProtocolError;
+                stream.cancellation.store(true, .release);
                 stream.stream_error = error.StreamReset;
                 stream.completed = true;
                 stream.reset();
@@ -2924,6 +2925,25 @@ test "RST_STREAM on idle stream is connection error" {
     };
     // RFC 7540 §5.1: RST_STREAM on idle stream must be a connection error.
     try std.testing.expectError(error.ProtocolError, server.deliverToMailbox(&frame));
+}
+
+test "RST_STREAM signals the stream cancellation before waking its handler" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const rst_payload = stream_mod.buildRstStreamPayload(.cancel);
+    var frame = Frame{
+        .header = .{ .length = 4, .frame_type = .rst_stream, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&rst_payload),
+    };
+
+    try server.deliverToMailbox(&frame);
+    try std.testing.expect(stream.cancellation.load(.acquire));
+    try std.testing.expect(stream.completed);
+    try std.testing.expectEqual(error.StreamReset, stream.stream_error.?);
 }
 
 test "SETTINGS_MAX_HEADER_LIST_SIZE enforced in HPACK decode" {

@@ -109,6 +109,8 @@ const RequestInterrupt = struct {
     mutex: Io.Mutex = Io.Mutex.init,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     socket: ?*Socket = null,
+    h2_entry: ?*H2PoolEntry = null,
+    h2_stream_id: ?u31 = null,
 
     fn publish(self: *RequestInterrupt, socket: *Socket, io: Io) void {
         self.mutex.lockUncancelable(io);
@@ -126,11 +128,49 @@ const RequestInterrupt = struct {
         if (self.socket == socket) self.socket = null;
     }
 
+    fn publishH2(self: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.h2_entry = entry;
+        self.h2_stream_id = stream_id;
+        if (self.cancelled.load(.acquire)) self.cancelH2Locked(entry, stream_id, io);
+    }
+
+    fn clearH2(self: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.h2_entry == entry and self.h2_stream_id == stream_id) {
+            self.h2_entry = null;
+            self.h2_stream_id = null;
+        }
+    }
+
+    fn cancelH2Locked(_: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
+        const h2 = &entry.h2;
+        if (h2.stream_manager.getStream(stream_id)) |stream| {
+            stream.stream_error = error.Cancelled;
+            stream.completed = true;
+            stream.reset();
+            if (stream.completion_sem) |sem| sem.post(io);
+            if (stream.data_event) |event| event.set(io);
+        }
+        h2.write_mutex.lockUncancelable(io);
+        defer h2.write_mutex.unlock(io);
+        if (entry.is_tls) {
+            if (entry.session.getWriter()) |writer|
+                h2.sendRstStream(writer, stream_id, .cancel) catch {}
+            else |_| {}
+        } else {
+            h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
+        }
+    }
+
     fn cancel(self: *RequestInterrupt, io: Io) void {
         self.cancelled.store(true, .release);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.socket) |socket| socket.shutdown();
+        if (self.h2_entry) |entry| self.cancelH2Locked(entry, self.h2_stream_id.?, io);
     }
 };
 
@@ -1069,12 +1109,15 @@ pub const Client = struct {
         if (self.config.http2_enabled or self.config.force_http2) {
             const is_tls = req.uri.isTls();
             const entry = try self.getOrCreateH2Conn(host, port, is_tls);
-            const result = self.executeH2OnPooled(entry, req) catch |err| {
+            const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
                 // Only mark the connection broken for transport/framing errors.
                 // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
                 // StreamDataOverflow) don't indicate a bad connection — other streams
                 // may still be healthy.
                 switch (err) {
+                    // A caller cancellation only reset its own stream. The
+                    // shared H2 connection remains usable by other requests.
+                    error.Cancelled,
                     error.MaxConcurrentStreamsExceeded,
                     error.ContentLengthMismatch,
                     error.StreamDataOverflow,
@@ -1589,7 +1632,7 @@ pub const Client = struct {
     /// In multiplexed mode (recv_running=true), the background receive fiber
     /// pumps frames while this fiber waits on a per-stream event.
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
-    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt) !Response {
         const h2 = &entry.h2;
         if (h2.goaway_received) {
             entry.broken = true;
@@ -1598,6 +1641,8 @@ pub const Client = struct {
         const stream = try h2.stream_manager.createStream();
         self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
+        interrupt.publishH2(entry, stream_id, self.io);
+        defer interrupt.clearH2(entry, stream_id, self.io);
         errdefer h2.stream_manager.removeStream(stream_id);
 
         // Build request pseudo-headers.

@@ -1477,7 +1477,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
-        var cancellation = http_common.RequestCancellation{};
+        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
         var watcher: ?PeerCancellationWatcher = null;
         startPeerCancellationWatcher(ctx, &cancellation, &watcher);
         defer if (watcher) |*value| value.deinit();
@@ -2074,7 +2074,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
-        var cancellation = http_common.RequestCancellation{};
+        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
         var watcher: ?PeerCancellationWatcher = null;
         startPeerCancellationWatcher(ctx, &cancellation, &watcher);
         defer if (watcher) |*value| value.deinit();

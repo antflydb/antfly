@@ -58,6 +58,9 @@ pub const Stream = struct {
     id: u31,
     state: StreamState = .idle,
     priority: StreamPriority = .{},
+    /// Raised when the peer cancels this stream. Server request contexts borrow
+    /// this signal so application work can release its own admission promptly.
+    cancellation: std.atomic.Value(bool) = .init(false),
 
     /// Local send window (how much we can send).
     send_window: i32 = 65535,
