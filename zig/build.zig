@@ -6380,6 +6380,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
             "db one real delete keeps filtered full text on complement path across restart",
+            "non-visible doc set complements visibility per generation",
+            "built-in exact dense scorer filters metadata before vector reads",
             "sorted unique vector id subtraction handles sparse and dense exclusions",
         },
         .test_runner = .{

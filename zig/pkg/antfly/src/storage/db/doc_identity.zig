@@ -3345,13 +3345,22 @@ test "non-visible doc set complements visibility per generation" {
     try std.testing.expect(!excluded_live.containsOrdinal(3));
 
     // A pinned read at the latest generation has the same current-state
-    // complement. Remove the authoritative visibility chunk first so this
-    // assertion proves the compact deleted side index served the request.
+    // complement. Remove both fallback sources for the tombstoned ordinal so
+    // only the compact deleted side index can produce it. Deleting merely the
+    // visibility chunk is insufficient: the fallback can reconstruct that
+    // chunk from ordinal-state rows.
+    const tombstone_state = blk: {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        break :blk (try lookupStateTxn(&txn, 2)) orelse return error.TestUnexpectedResult;
+    };
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         const chunk_key = internal_keys.identityVisibilityChunkKey(0);
         try txn.delete(chunk_key[0..]);
+        const state_key = internal_keys.identityOrdinalStateKey(2);
+        try txn.delete(state_key[0..]);
         try txn.commit();
     }
     var excluded_at_latest = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 13, 16)) orelse return error.TestUnexpectedResult;
@@ -3363,6 +3372,7 @@ test "non-visible doc set complements visibility per generation" {
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
+        try writeOrdinalStateTxn(&txn, 2, tombstone_state);
         var chunk = try rebuildVisibilityChunkFromIdentityStatesAlloc(alloc, &store, &txn, 0);
         defer chunk.deinit(alloc);
         try writeVisibilityChunkTxn(alloc, &txn, 0, &chunk);

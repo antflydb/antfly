@@ -40,6 +40,7 @@ const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
 const schema_api = @import("../../../schema/mod.zig");
 const persistent_mod = @import("../../persistent.zig");
+const hbc_mod = @import("../../hbc_adapter.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const vectorindex_mod = @import("antfly_vectorindex");
@@ -13292,6 +13293,72 @@ fn exactScoreNativeDenseFilter(
         .results = results,
         .vectors_scored = vectors_scored,
     };
+}
+
+test "built-in exact dense scorer filters metadata before vector reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/builtin-exact-prefix", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+    try index.bulkBuildWithMetadata(&.{
+        .{ .vector_id = 1, .vector = &.{ 0.0, 0.0 }, .metadata = "doc:keep:a" },
+        .{ .vector_id = 2, .vector = &.{ 1.0, 0.0 }, .metadata = "doc:keep:b" },
+        .{ .vector_id = 3, .vector = &.{ 2.0, 0.0 }, .metadata = "doc:drop:a" },
+        .{ .vector_id = 4, .vector = &.{ 3.0, 0.0 }, .metadata = "doc:drop:b" },
+    });
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = 2,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
+    };
+    var counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    var outcome = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &.{ 0.0, 0.0 },
+        .k = 4,
+        .filter_prefix = "doc:keep:",
+        .filter_ids = &.{ 4, 2, 3, 1 },
+    });
+    defer outcome.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), outcome.vectors_scored);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
+    const hits = outcome.results.getHits();
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 2), hits[1].vector_id);
 }
 
 fn countActiveDenseVectorIdsAlloc(
