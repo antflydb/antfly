@@ -333,6 +333,12 @@ pub const H2Connection = struct {
         const max_size = self.peer_settings.max_frame_size;
         const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
 
+        // A handler can race a peer RST_STREAM while preparing its response.
+        // Reject before touching flow-control windows or emitting an empty
+        // END_STREAM DATA frame on a reset stream.
+        if (stream.stream_error) |err| return err;
+        if (stream.state == .closed and stream.cancellation.load(.acquire)) return error.StreamReset;
+
         if (data.len > std.math.maxInt(i32)) return error.FlowControlError;
         const data_i32: i32 = @intCast(data.len);
         if (stream.send_window < data_i32) return error.FlowControlError;
@@ -2980,6 +2986,27 @@ test "sendHeaders emits no response bytes after peer RST_STREAM" {
         error.StreamReset,
         server.sendHeaders(writer, 1, &.{.{ .name = ":status", .value = "200" }}, true),
     );
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+}
+
+test "writeData emits no END_STREAM bytes after peer RST_STREAM" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const rst_payload = stream_mod.buildRstStreamPayload(.cancel);
+    var rst = Frame{
+        .header = .{ .length = 4, .frame_type = .rst_stream, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&rst_payload),
+    };
+    try server.deliverToMailbox(&rst);
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+    try std.testing.expectError(error.StreamReset, server.writeData(writer, 1, "", true));
     try std.testing.expectEqual(@as(usize, 0), wire.items.len);
 }
 
