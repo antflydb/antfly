@@ -16011,6 +16011,43 @@ fn loadRuntimeSchemaForTextIndex(alloc: Allocator, store: anytype, index_name: [
     return try schema_mod.loadSchemaVersion(store, alloc, explicit_version.?);
 }
 
+pub fn bindSchemaToEmptyTextIndexes(self: *IndexManager, schema: schema_mod.TableSchema) !void {
+    for (self.text_indexes.items) |*entry| {
+        if (entry.runtime_schema != null) continue;
+        const snapshot = entry.persistent.snapshot();
+        var has_documents = false;
+        for (snapshot.segments) |segment| {
+            if (segment.reader.doc_count != 0) {
+                has_documents = true;
+                break;
+            }
+        }
+        if (has_documents) continue;
+        if (textIndexSchemaVersion(entry.config.name)) |version| {
+            if (version != schema.version) continue;
+        }
+
+        const runtime_schema = try schema_mod.cloneSchema(self.alloc, schema);
+        var runtime_schema_moved = false;
+        errdefer if (!runtime_schema_moved) schema_mod.freeSchema(self.alloc, runtime_schema);
+
+        var text_analysis = try parseTextAnalysisForIndexConfig(
+            self.alloc,
+            entry.config.config_json,
+            runtime_schema,
+        );
+        var text_analysis_moved = false;
+        errdefer if (!text_analysis_moved) introducer_mod.freeTextAnalysisConfig(self.alloc, text_analysis);
+        try appendObservedFieldAnalyzers(self.alloc, &text_analysis, entry.observed_field_analyzers);
+
+        introducer_mod.freeTextAnalysisConfig(self.alloc, entry.text_analysis);
+        entry.text_analysis = text_analysis;
+        entry.runtime_schema = runtime_schema;
+        text_analysis_moved = true;
+        runtime_schema_moved = true;
+    }
+}
+
 fn textIndexSchemaVersion(index_name: []const u8) ?u32 {
     if (std.mem.eql(u8, index_name, "default") or std.mem.eql(u8, index_name, "full_text_index")) return 0;
     const prefix = "full_text_index_v";

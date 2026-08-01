@@ -4109,6 +4109,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db phrase query survives",
             "storage.db.db.test.db prefix wildcard and regexp",
             "storage.db.db.test.db typed and dictionary queries survive",
+            "storage.db.db.test.db schema installed after text index open keeps exact keyword filters across reopen",
             "storage.db.db.test.db mixed-type stored fields survive",
             "storage.db.db.test.db persists byte range across reopen",
             "storage.db.db.test.db snapshot copies current store and derived log",

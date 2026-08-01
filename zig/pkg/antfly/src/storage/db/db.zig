@@ -70827,6 +70827,58 @@ test "db versioned full text indexes reload matching schema mappings after reope
     }
 }
 
+test "db schema installed after text index open keeps exact keyword filters across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{"version":0,"default_type":"asset","document_schemas":{"asset":{"schema":{"type":"object","properties":{"state":{"type":"string","x-antfly-types":["keyword"]},"title":{"type":"string","x-antfly-types":["text"]}}}}}}
+    ;
+    const filter_json = "{\"term\":{\"state\":\"published\"}}";
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        try db.setSchemaJson(alloc, schema_json);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "asset:1", .value = "{\"_type\":\"asset\",\"state\":\"published\",\"title\":\"open archive\"}" },
+                .{ .key = "asset:2", .value = "{\"_type\":\"asset\",\"state\":\"draft\",\"title\":\"closed archive\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        var before = try db.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .query = .{ .match_all = {} },
+            .filter_query_json = filter_json,
+            .limit = 10,
+        });
+        defer before.deinit();
+        try std.testing.expectEqual(@as(u32, 1), before.total_hits);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer reopened.close();
+        var after = try reopened.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .query = .{ .match_all = {} },
+            .filter_query_json = filter_json,
+            .limit = 10,
+        });
+        defer after.deinit();
+        try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+    }
+}
+
 test "db additionalProperties true nested text fields survive reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");

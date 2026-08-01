@@ -575,6 +575,12 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
+pub fn cloneSchema(alloc: Allocator, schema: TableSchema) !TableSchema {
+    const encoded = try serializeSchema(alloc, schema);
+    defer alloc.free(encoded);
+    return try deserializeSchema(alloc, encoded);
+}
+
 /// Save a schema to DocStore. Returns whether durable state changed.
 pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !bool {
     const data = try serializeSchema(alloc, schema);
