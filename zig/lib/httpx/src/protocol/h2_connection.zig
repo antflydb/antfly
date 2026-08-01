@@ -341,7 +341,11 @@ pub const H2Connection = struct {
         // A handler can race a peer RST_STREAM while preparing its response.
         // Reject before touching flow-control windows or emitting an empty
         // END_STREAM DATA frame on a reset stream.
-        if (stream.stream_error) |err| return err;
+        if (stream.stream_error) |err| {
+            // Aggregate ingress exhaustion is a local admission decision, not
+            // a peer reset: the handler must still be able to return its 429.
+            if (err != error.BodyCapacityExceeded) return err;
+        }
         if (stream.state == .closed and stream.cancellation.load(.acquire)) return error.StreamReset;
 
         if (data.len > std.math.maxInt(i32)) return error.FlowControlError;
@@ -380,7 +384,10 @@ pub const H2Connection = struct {
         var offset: usize = 0;
         while (offset < data.len) {
             const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-            if (stream.stream_error) |err| return err;
+            if (stream.stream_error) |err| {
+                // See writeData(): permit the explicit overload response.
+                if (err != error.BodyCapacityExceeded) return err;
+            }
 
             const remaining = data.len - offset;
 
@@ -398,7 +405,9 @@ pub const H2Connection = struct {
                     self.send_window_event.reset();
                     // Re-check after reset (receive loop may have updated between our check and reset).
                     const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.stream_error) |err| return err;
+                    if (s2.stream_error) |err| {
+                        if (err != error.BodyCapacityExceeded) return err;
+                    }
                     const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
                     const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
                     if (sw2 == 0 or cw2 == 0) {
@@ -745,7 +754,12 @@ pub const H2Connection = struct {
         // a peer RST_STREAM cannot emit response bytes (or mutate the shared
         // encoder state) after that stream has been reset.
         if (stream) |value| {
-            if (value.stream_error) |err| return err;
+            // BodyCapacityExceeded is deliberately surfaced to the server
+            // handler as HTTP 429. It must not prevent that response from
+            // being serialized; peer terminal errors still fail closed.
+            if (value.stream_error) |err| {
+                if (err != error.BodyCapacityExceeded) return err;
+            }
             // Some existing in-memory callers write an initial HEADERS frame
             // without first registering a stream. A peer reset is always
             // registered and marks cancellation, so guard that closed state
@@ -3071,6 +3085,28 @@ test "sendHeaders emits no response bytes after peer RST_STREAM" {
         server.sendHeaders(writer, 1, &.{.{ .name = ":status", .value = "200" }}, true),
     );
     try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+}
+
+test "body capacity exhaustion permits the server overload response" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.stream_error = error.BodyCapacityExceeded;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+    const headers = [_]hpack.HeaderEntry{.{ .name = ":status", .value = "429" }};
+
+    server.write_mutex.lockUncancelable(std.testing.io);
+    defer server.write_mutex.unlock(std.testing.io);
+    try server.sendHeaders(writer, 1, &headers, false);
+    try server.writeDataBlocking(writer, 1, "overloaded", true);
+    try std.testing.expect(wire.items.len > 0);
+    try std.testing.expect(stream.end_stream_sent);
 }
 
 test "writeData emits no END_STREAM bytes after peer RST_STREAM" {
