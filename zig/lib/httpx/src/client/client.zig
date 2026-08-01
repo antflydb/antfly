@@ -169,11 +169,6 @@ const RequestInterrupt = struct {
         stream.stream_error = error.Cancelled;
         stream.completed = true;
         stream.reset();
-        // Stream removal can run as soon as we wake its owner. Keep only the
-        // waiter pointers after unlock; never dereference the map-owned Stream
-        // outside the connection mutex.
-        const completion_sem = stream.completion_sem;
-        const data_event = stream.data_event;
         if (entry.is_tls) {
             if (entry.session.getWriter()) |writer|
                 h2.sendRstStream(writer, stream_id, .cancel) catch {}
@@ -181,12 +176,15 @@ const RequestInterrupt = struct {
         } else {
             h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
         }
+        // Posting while still holding write_mutex is paired with waiter
+        // teardown below: a woken owner must acquire this mutex to unregister
+        // its pointer before destroying it, so no producer can retain a raw
+        // waiter pointer across destruction.
+        if (stream.completion_sem) |sem| sem.post(io);
+        if (stream.data_event) |event| event.set(io);
         h2.write_mutex.unlock(io);
 
-        // Wake waiters only after publishing the reset under the connection
-        // lock; a body blocked on flow control can now observe stream_error.
-        if (completion_sem) |sem| sem.post(io);
-        if (data_event) |event| event.set(io);
+        // A body blocked on flow control can now observe stream_error.
         h2.send_window_event.set(io);
         if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
     }
@@ -1726,9 +1724,11 @@ pub const Client = struct {
             // Re-fetch the stream pointer for cleanup since the backing
             // map may have rehashed while we were blocked on I/O.
             defer {
+                h2.write_mutex.lockUncancelable(self.io);
                 if (h2.stream_manager.getStream(stream_id)) |s| {
                     s.completion_sem = null;
                 }
+                h2.write_mutex.unlock(self.io);
                 self.allocator.destroy(sem);
             }
 

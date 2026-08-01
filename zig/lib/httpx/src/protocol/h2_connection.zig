@@ -1139,6 +1139,8 @@ pub const H2Connection = struct {
     /// Signals all active streams with an error and posts their events/semaphores
     /// so waiting fibers don't hang forever after the receive loop exits.
     pub fn signalAllStreams(self: *Self, err: anyerror) void {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         var it = self.stream_manager.streams.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr.*;
