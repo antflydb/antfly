@@ -13688,6 +13688,51 @@ pub const IndexManager = struct {
         }
     };
 
+    fn sortDenseArtifactReadKeysCancellable(
+        alloc: Allocator,
+        items: []DenseArtifactReadKey,
+        request: hbc_mod.SearchRequest,
+    ) !void {
+        if (items.len < 2) return;
+        const scratch = try alloc.alloc(DenseArtifactReadKey, items.len);
+        defer alloc.free(scratch);
+
+        var width: usize = 1;
+        while (width < items.len) : (width *= 2) {
+            var left: usize = 0;
+            while (left < items.len) : (left += width * 2) {
+                try hbc_mod.checkCancelled(request);
+                const middle = @min(left + width, items.len);
+                const right = @min(left + width * 2, items.len);
+                var i = left;
+                var j = middle;
+                var out = left;
+                while (i < middle and j < right) : (out += 1) {
+                    if ((out - left) % 64 == 0) try hbc_mod.checkCancelled(request);
+                    if (DenseArtifactReadKey.lessThan({}, items[j], items[i])) {
+                        scratch[out] = items[j];
+                        j += 1;
+                    } else {
+                        scratch[out] = items[i];
+                        i += 1;
+                    }
+                }
+                while (i < middle) : ({ i += 1; out += 1; }) {
+                    if ((out - left) % 64 == 0) try hbc_mod.checkCancelled(request);
+                    scratch[out] = items[i];
+                }
+                while (j < right) : ({ j += 1; out += 1; }) {
+                    if ((out - left) % 64 == 0) try hbc_mod.checkCancelled(request);
+                    scratch[out] = items[j];
+                }
+                for (scratch[left..right], left..) |item, index| {
+                    if ((index - left) % 64 == 0) try hbc_mod.checkCancelled(request);
+                    items[index] = item;
+                }
+            }
+        }
+    }
+
     fn loadDenseVectorsForHbcBatch(
         ctx: *anyopaque,
         vector_ids: []const u64,
@@ -13989,7 +14034,7 @@ pub const IndexManager = struct {
         }
         if (key_count == 0) return;
         try hbc_mod.checkCancelled(request);
-        std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
+        try sortDenseArtifactReadKeysCancellable(key_alloc, artifact_reads[0..key_count], request);
         if (profile) |p| p.rerank_artifact_key_ns += platform_time.monotonicNs() - key_start;
 
         const artifact_keys = scratch.artifact_keys[0..key_count];
