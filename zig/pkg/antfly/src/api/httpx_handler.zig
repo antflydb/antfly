@@ -71,9 +71,11 @@ const ParsedGlobalQueryTable = struct {
     }
 };
 
-fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
-    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
+    var value = try query_contract.parseJsonValueCancellable(alloc, body, null, cancellation);
+    defer value.deinit();
+    try query_contract.validatePublicQuerySortTupleValueContract(value.value);
+    var parsed = std.json.parseFromValue(metadata_openapi.QueryRequest, alloc, value.value, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
     return .{
         .parsed = parsed,
@@ -1562,7 +1564,7 @@ pub const AntflyApiHandler = struct {
             );
             return respondWithAllocator(ctx, &resp, self.api_server.alloc);
         }
-        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
+        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data, &cancellation) catch {
             _ = ctx.status(400);
             return ctx.text("invalid query request");
         };
@@ -4361,6 +4363,8 @@ test "httpx antfly schema update returns full table status after projection" {
 test "httpx global query table name comes from request body" {
     var parsed_table = try parseGlobalQueryTable(std.testing.allocator,
         \\{"table":"files","limit":5}
+        ,
+        null,
     );
     defer parsed_table.deinit();
 

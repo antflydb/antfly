@@ -2153,13 +2153,11 @@ const CancellableJsonReader = struct {
     pub const AllocError = std.json.Reader.AllocError || error{ Cancelled, Timeout };
     pub const PeekError = std.json.Reader.PeekError || error{ Cancelled, Timeout };
 
-    fn init(alloc: std.mem.Allocator, body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) @This() {
-        var source: @This() = undefined;
-        source.io_reader = .fixed(body);
-        source.reader = std.json.Reader.init(alloc, &source.io_reader);
-        source.deadline_ns = deadline_ns;
-        source.cancellation = cancellation;
-        return source;
+    fn init(self: *@This(), alloc: std.mem.Allocator, body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) void {
+        self.io_reader = .fixed(body);
+        self.reader = std.json.Reader.init(alloc, &self.io_reader);
+        self.deadline_ns = deadline_ns;
+        self.cancellation = cancellation;
     }
 
     fn deinit(self: *@This()) void {
@@ -2197,7 +2195,8 @@ pub fn parseJsonValueCancellable(
     deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
 ) !std.json.Parsed(std.json.Value) {
-    var source = CancellableJsonReader.init(alloc, body, deadline_ns, cancellation);
+    var source: CancellableJsonReader = undefined;
+    source.init(alloc, body, deadline_ns, cancellation);
     defer source.deinit();
     return std.json.parseFromTokenSource(std.json.Value, alloc, &source, .{}) catch |err| switch (err) {
         error.Cancelled => error.Cancelled,
@@ -3171,7 +3170,10 @@ fn tryParseFastDensePublicQueryRequest(
             .index_name = try alloc.dupe(u8, index_name),
             .query = .{
                 .vector = switch (embedding) {
-                    .@"packed" => |encoded| vector_codec.decodePackedF32Base64Alloc(alloc, encoded) catch return error.InvalidQueryRequest,
+                    .@"packed" => |encoded| decodePackedF32Base64Cancellable(alloc, encoded, &lifecycle) catch |err| switch (err) {
+                        error.Cancelled, error.Timeout => return err,
+                        else => return error.InvalidQueryRequest,
+                    },
                     .dense => |dense| try alloc.dupe(f32, dense),
                 },
                 .k = req.limit,
@@ -3186,6 +3188,42 @@ fn tryParseFastDensePublicQueryRequest(
         .fields = fields,
         .req = req,
     };
+}
+
+fn decodePackedF32Base64Cancellable(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    lifecycle: *QueryDeadlinePoller,
+) ![]f32 {
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = try decoder.calcSizeForSlice(encoded);
+    if (decoded_len % @sizeOf(f32) != 0) return error.InvalidPackedVector;
+    const bytes = try alloc.alloc(u8, decoded_len);
+    defer alloc.free(bytes);
+    const encoded_chunk_bytes = 12 * 1024;
+    var encoded_offset: usize = 0;
+    var decoded_offset: usize = 0;
+    while (encoded_offset < encoded.len) {
+        try lifecycle.poll();
+        const remaining = encoded.len - encoded_offset;
+        const chunk_len = if (remaining > encoded_chunk_bytes) encoded_chunk_bytes else remaining;
+        const decoded_chunk_len = try decoder.calcSizeForSlice(encoded[encoded_offset..][0..chunk_len]);
+        try decoder.decode(bytes[decoded_offset..][0..decoded_chunk_len], encoded[encoded_offset..][0..chunk_len]);
+        encoded_offset += chunk_len;
+        decoded_offset += decoded_chunk_len;
+    }
+    const vector = try alloc.alloc(f32, decoded_len / @sizeOf(f32));
+    errdefer alloc.free(vector);
+    var byte_offset: usize = 0;
+    while (byte_offset < bytes.len) : (byte_offset += 12 * 1024) {
+        try lifecycle.poll();
+        const end = @min(bytes.len, byte_offset + 12 * 1024);
+        var scalar_offset = byte_offset;
+        while (scalar_offset < end) : (scalar_offset += @sizeOf(f32)) {
+            vector[scalar_offset / @sizeOf(f32)] = @bitCast(std.mem.readInt(u32, bytes[scalar_offset..][0..4], .little));
+        }
+    }
+    return vector;
 }
 
 fn parseDenseArrayAlloc(
@@ -8983,7 +9021,8 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     cancellation: ?*const std.atomic.Value(bool),
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var source = CancellableJsonReader.init(alloc, body, deadline_ns, cancellation);
+    var source: CancellableJsonReader = undefined;
+    source.init(alloc, body, deadline_ns, cancellation);
     defer source.deinit();
     var parsed = std.json.parseFromTokenSource(std.json.Value, alloc, &source, .{}) catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,

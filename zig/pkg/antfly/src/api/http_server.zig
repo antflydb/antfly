@@ -117,8 +117,11 @@ const ParsedGlobalQueryTable = struct {
     }
 };
 
-fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
-    var parsed = parsePublicGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
+    var value = query_contract.parseJsonValueCancellable(alloc, body, null, cancellation) catch return error.InvalidQueryRequest;
+    defer value.deinit();
+    try query_contract.validatePublicQuerySortTupleValueContract(value.value);
+    var parsed = std.json.parseFromValue(metadata_openapi.QueryRequest, alloc, value.value, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
     return .{
         .parsed = parsed,
@@ -10950,7 +10953,7 @@ pub const ApiHttpServer = struct {
             if (line.len == 0) continue;
 
             const table_name = if (route_table_name) |name| name else blk: {
-                var parsed_table = parseGlobalQueryTable(arena, line) catch {
+                var parsed_table = parseGlobalQueryTable(arena, line, cancellation) catch {
                     return try textResponse(self.alloc, 400, "invalid query request");
                 };
                 defer parsed_table.deinit();
