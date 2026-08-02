@@ -43,8 +43,8 @@ jobs:
             archive_arch: arm64
             metal: "false"
             system_blas: "false"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
+            zig_optimize: ReleaseSmall
+            zig_jobs: "1"
           - artifact_name: antfly-zig-darwin-arm64
             runner: macos-15
             os: darwin
