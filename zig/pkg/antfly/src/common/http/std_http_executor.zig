@@ -521,6 +521,13 @@ test "std http executor resets reuse count when server closes connection" {
     try std.testing.expectEqual(@as(u32, 0), executor.requests_on_current_connection);
 }
 
+fn sleepTestMs(io: std.Io, ms: u64) void {
+    std.Io.Clock.Duration.sleep(.{
+        .clock = .awake,
+        .raw = .fromMilliseconds(@intCast(ms)),
+    }, io) catch {};
+}
+
 test "std http executor cancellation interrupts a request queued for the pooled client" {
     const RequestThread = struct {
         executor: common.RequestExecutor,
@@ -569,16 +576,16 @@ test "std http executor cancellation interrupts a request queued for the pooled 
         admitted = executor.in_flight == 1;
         executor.lifecycle_mutex.unlock(io);
         if (admitted) break;
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepTestMs(io, 1);
     }
     try std.testing.expect(admitted);
     // Allow the network task to reach the deliberately held client mutex.
-    std.Thread.sleep(25 * std.time.ns_per_ms);
+    sleepTestMs(io, 25);
 
     cancellation.cancel();
     for (0..1_000) |_| {
         if (request_state.outcome.load(.acquire) != 0) break;
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepTestMs(io, 1);
     }
     const cancelled_while_queued = request_state.outcome.load(.acquire) == 1;
 

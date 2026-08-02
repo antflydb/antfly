@@ -1114,7 +1114,7 @@ test "std http executor cancels an in-flight production request and retires its 
                     self.observed_peer_cancel.store(true, .release);
                     return error.Cancelled;
                 }
-                std.Thread.sleep(std.time.ns_per_ms);
+                sleepMs(1);
             }
             return .{
                 .status = 200,
@@ -1171,14 +1171,14 @@ test "std http executor cancels an in-flight production request and retires its 
 
     for (0..10_000) |_| {
         if (app.entered.load(.acquire)) break;
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepMs(1);
     }
     try std.testing.expect(app.entered.load(.acquire));
 
     cancellation.cancel();
     for (0..2_000) |_| {
         if (request_state.outcome.load(.acquire) != 0 and app.observed_peer_cancel.load(.acquire)) break;
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepMs(1);
     }
     try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));
     try std.testing.expect(app.observed_peer_cancel.load(.acquire));
