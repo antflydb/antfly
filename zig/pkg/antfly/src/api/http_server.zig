@@ -1291,6 +1291,53 @@ fn persistRestoreTableIntent(
     _ = try workflow.createTableWithRanges(service, spec.table, spec.ranges);
 }
 
+const cancellation_stringify_chunk_bytes = 16 * 1024;
+
+const CancellableResponseWriter = struct {
+    destination: *std.Io.Writer,
+    cancellation: ?*const http_common.RequestCancellation,
+    cancellation_observed: bool = false,
+    writer: std.Io.Writer,
+
+    fn init(destination: *std.Io.Writer, cancellation: ?*const http_common.RequestCancellation) @This() {
+        return .{
+            .destination = destination,
+            .cancellation = cancellation,
+            .writer = .{
+                .vtable = &.{ .drain = drain, .flush = std.Io.Writer.noopFlush },
+                .buffer = &.{},
+            },
+        };
+    }
+
+    fn checkCancellation(self: *@This()) std.Io.Writer.Error!void {
+        if (self.cancellation) |value| {
+            if (value.isCancelled()) {
+                self.cancellation_observed = true;
+                return error.WriteFailed;
+            }
+        }
+    }
+
+    fn writeSlice(self: *@This(), bytes: []const u8) std.Io.Writer.Error!void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            try self.checkCancellation();
+            const count = @min(remaining.len, cancellation_stringify_chunk_bytes);
+            try self.destination.writeAll(remaining[0..count]);
+            remaining = remaining[count..];
+        }
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @fieldParentPtr("writer", writer);
+        for (data[0 .. data.len - 1]) |bytes| try self.writeSlice(bytes);
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| try self.writeSlice(pattern);
+        return std.Io.Writer.countSplat(data, splat);
+    }
+};
+
 pub const ApiHttpServer = struct {
     const SupportedJoinRequest = distributed_join.SupportedJoinRequest;
     const SupportedJoinFilters = distributed_join.SupportedJoinFilters;
@@ -10983,9 +11030,15 @@ pub const ApiHttpServer = struct {
             ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 
-            var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
-                .allocate = .alloc_always,
-            }) catch return try textResponse(self.alloc, 500, "query failed");
+            var parsed = query_contract.parseJsonValueCancellable(
+                arena,
+                response_body,
+                null,
+                if (cancellation) |value| value.signal() else null,
+            ) catch |err| switch (err) {
+                error.Cancelled, error.Timeout => return try self.publicQueryDispatchErrorResponse(table_name, line, err),
+                else => return try textResponse(self.alloc, 500, "query failed"),
+            };
             defer parsed.deinit();
             const object = switch (parsed.value) {
                 .object => |object| object,
@@ -10996,9 +11049,15 @@ pub const ApiHttpServer = struct {
                 .array => |array| array.items,
                 else => return try textResponse(self.alloc, 500, "query failed"),
             };
+            var cancellable_out = CancellableResponseWriter.init(&out.writer, cancellation);
             for (responses) |response_value| {
                 if (emitted > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(response_value, .{}, &out.writer);
+                std.json.Stringify.value(response_value, .{}, &cancellable_out.writer) catch |err| {
+                    if (cancellable_out.cancellation_observed) {
+                        return try self.publicQueryDispatchErrorResponse(table_name, line, error.Cancelled);
+                    }
+                    return err;
+                };
                 emitted += 1;
             }
         }
