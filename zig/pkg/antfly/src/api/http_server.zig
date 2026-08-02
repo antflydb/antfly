@@ -9231,6 +9231,7 @@ pub const ApiHttpServer = struct {
             table_name,
             body,
             request_deadline_ns,
+            cancellation,
         ) catch |err| {
             const normalized = normalizePublicQueryParseError(err);
             if (normalized == error.InvalidQueryRequest or
@@ -9389,6 +9390,7 @@ pub const ApiHttpServer = struct {
             table_name,
             query_body,
             execution_deadline_ns,
+            cancellation,
         );
         errdefer owned.deinit(alloc);
         owned.req.cancellation = cancellation;

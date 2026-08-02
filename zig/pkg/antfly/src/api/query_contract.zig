@@ -2154,6 +2154,13 @@ fn ensureQueryDeadline(deadline_ns: ?u64) !void {
     }
 }
 
+fn ensureQueryActive(deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !void {
+    if (cancellation) |signal| {
+        if (signal.load(.acquire)) return error.Cancelled;
+    }
+    try ensureQueryDeadline(deadline_ns);
+}
+
 const QueryDeadlinePoller = struct {
     deadline_ns: ?u64,
     work_until_check: u8 = 1,
@@ -2184,6 +2191,7 @@ pub fn parseQueryRequest(
         table_name,
         body,
         execution_deadline_ns,
+        null,
     );
 }
 
@@ -2196,11 +2204,12 @@ pub fn parseQueryRequestWithDeadline(
     table_name: []const u8,
     body: []const u8,
     execution_deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !OwnedQueryRequest {
     if (body.len == 0) return error.InvalidQueryRequest;
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
 
     // Structured named filters stay in compact binding form so the algebraic
     // resolver can cache and reuse them. Bindings that require the text index
@@ -2222,7 +2231,7 @@ pub fn parseQueryRequestWithDeadline(
             var owned = fast;
             errdefer owned.deinit(alloc);
             owned.req.execution_deadline_ns = execution_deadline_ns;
-            try ensureQueryDeadline(execution_deadline_ns);
+            try ensureQueryActive(execution_deadline_ns, cancellation);
             return owned;
         }
     }
@@ -2231,7 +2240,7 @@ pub fn parseQueryRequestWithDeadline(
     // honoring escaped member names, this avoids repeatedly materializing the
     // same request tree on the query admission hot path.
     const contract_fields = try queryBodyContractFields(alloc, effective_body);
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, effective_body, .{
         .strip_internal_shard_fields = contract_fields.has_internal_shard_fields,
         .strip_public_doc_filter_bindings = contract_fields.has_public_doc_filter_bindings,
@@ -2241,7 +2250,7 @@ pub fn parseQueryRequestWithDeadline(
         .strip_query_timeout = contract_fields.has_query_timeout,
     });
     defer if (contract_body) |owned| alloc.free(owned);
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     const body_for_contract = contract_body orelse effective_body;
 
     var parsed = ant_json.parseFromSlice(
@@ -2251,7 +2260,7 @@ pub fn parseQueryRequestWithDeadline(
         .{},
     ) catch return classifyPublicFilterContractErrorAlloc(alloc, effective_body);
     defer parsed.deinit();
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     const request = parsed.value;
 
     if (request.analyses != null) return error.UnsupportedQueryRequest;
@@ -2267,14 +2276,14 @@ pub fn parseQueryRequestWithDeadline(
     try applyPublicHierarchyControls(alloc, effective_body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body);
     try parseInternalDocIdConstraintsAlloc(alloc, effective_body, &req);
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
 
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
 
     var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit);
     errdefer normalized_query.deinit(alloc);
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
 
     if (req.reranker != null) {
         req.reranker_query_text = try buildRerankerQueryText(alloc, request);
@@ -2313,11 +2322,11 @@ pub fn parseQueryRequestWithDeadline(
         req.exclusion_query_json,
         execution_deadline_ns,
     );
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
 
     const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
     errdefer vector_queries.deinit(alloc);
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
@@ -2345,6 +2354,7 @@ pub fn parsePublicQueryRequest(
         table_name,
         body,
         execution_deadline_ns,
+        null,
     );
 }
 
@@ -2354,16 +2364,18 @@ pub fn parsePublicQueryRequestWithDeadline(
     table_name: []const u8,
     body: []const u8,
     execution_deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !OwnedQueryRequest {
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     if (try queryBodyHasForbiddenPublicDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
-    try ensureQueryDeadline(execution_deadline_ns);
+    try ensureQueryActive(execution_deadline_ns, cancellation);
     return try parseQueryRequestWithDeadline(
         alloc,
         semantic_resolver,
         table_name,
         body,
         execution_deadline_ns,
+        cancellation,
     );
 }
 
@@ -10090,6 +10102,22 @@ test "api query contract honors caller absolute deadline during normalization" {
             \\}
         ,
             0,
+            null,
+        ),
+    );
+}
+
+test "api public query normalization observes cancellation" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        parsePublicQueryRequestWithDeadline(
+            std.testing.allocator,
+            null,
+            "docs",
+            "{\"with\":{\"receipt\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}},\"filter_query\":{\"ref\":\"receipt\"}}",
+            null,
+            &cancelled,
         ),
     );
 }
