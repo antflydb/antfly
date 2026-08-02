@@ -6897,7 +6897,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -8289,6 +8289,7 @@ pub const TransformOpType = enum {
     @"$set_on_insert",
     @"$unset",
     @"$inc",
+    @"$push",
     @"$add_to_set",
     @"$max",
 
@@ -8298,6 +8299,7 @@ pub const TransformOpType = enum {
             .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
+            .@"$push" => "$push",
             .@"$add_to_set" => "$addToSet",
             .@"$max" => "$max",
         };
@@ -8314,6 +8316,7 @@ pub const TransformOpType = enum {
             .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
+            .{ "$push", .@"$push" },
             .{ "$addToSet", .@"$add_to_set" },
             .{ "$max", .@"$max" },
         });

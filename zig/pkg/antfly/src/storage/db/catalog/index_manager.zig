@@ -954,6 +954,7 @@ pub const IndexManager = struct {
 
     pub const TextIndex = struct {
         apply_mutex: *std.atomic.Mutex,
+        analysis_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
         config: types.IndexConfig,
         chunk_name: ?[]u8,
         text_analysis: introducer_mod.TextAnalysisConfig,
@@ -962,6 +963,14 @@ pub const IndexManager = struct {
         rebuild_root_path: []u8,
         persistent: persistent_mod.PersistentIndex,
         compaction_pending: bool = false,
+
+        pub fn lockAnalysisShared(self: *TextIndex) void {
+            self.analysis_mutex.lockShared();
+        }
+
+        pub fn unlockAnalysisShared(self: *TextIndex) void {
+            self.analysis_mutex.unlockShared();
+        }
     };
 
     pub const OwnedFieldAnalyzer = struct {
@@ -1743,6 +1752,8 @@ pub const IndexManager = struct {
     }
 
     fn deinitTextIndexEntry(self: *IndexManager, entry: *TextIndex, abandon_after_crash: bool) void {
+        entry.analysis_mutex.lockExclusive();
+        defer entry.analysis_mutex.unlockExclusive();
         if (abandon_after_crash) {
             entry.persistent.abandonAfterCrash();
         } else {
@@ -2152,11 +2163,10 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |*entry| {
             lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
+            entry.analysis_mutex.lockExclusive();
+            defer entry.analysis_mutex.unlockExclusive();
 
-            const snapshot = entry.persistent.acquireSnapshot();
-            const empty = snapshot.liveDocCount() == 0;
-            snapshot.release();
-            if (!empty) continue;
+            if (entry.persistent.hasPhysicalSegments()) continue;
 
             const runtime_schema = try loadRuntimeSchemaForTextIndex(self.alloc, store, entry.config.name);
             var runtime_schema_owned = runtime_schema;
@@ -2166,7 +2176,17 @@ pub const IndexManager = struct {
             var text_analysis_owned = true;
             errdefer if (text_analysis_owned) introducer_mod.freeTextAnalysisConfig(self.alloc, text_analysis);
             try appendObservedFieldAnalyzers(self.alloc, &text_analysis, entry.observed_field_analyzers);
+            const provenance = try TextProjectionProvenance.fromRuntimeSchema(
+                self.alloc,
+                entry.config,
+                runtime_schema_owned,
+            );
+
+            // Registry claims may be safely ahead of an empty generation, but
+            // the generation witness must never be ahead of its live runtime.
+            // Persist claims first, then the witness, then swap infallibly.
             try publishFullTextDictionaryRegistry(store, self.alloc, entry.config.name, text_analysis);
+            try saveTextProjectionProvenance(&entry.persistent, self.alloc, provenance);
 
             const previous_schema = entry.runtime_schema;
             const previous_analysis = entry.text_analysis;
@@ -5537,12 +5557,6 @@ pub const IndexManager = struct {
         return null;
     }
 
-    pub fn textAnalyzerForField(self: *IndexManager, name: ?[]const u8, field: []const u8) ?*const analysis_mod.Analyzer {
-        const entry = self.textIndexEntry(name) orelse return null;
-        const analyzer_name = textFieldAnalyzerName(entry, field) orelse return null;
-        return introducer_mod.resolveAnalyzerName(analyzer_name, entry.text_analysis);
-    }
-
     pub fn acquireTextQueryLease(
         self: *IndexManager,
         alloc: Allocator,
@@ -5553,6 +5567,8 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockShared();
 
         const entry = self.textIndexEntry(name) orelse return null;
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
         const snapshot = entry.persistent.acquireSnapshot();
         errdefer snapshot.release();
 
@@ -5582,6 +5598,17 @@ pub const IndexManager = struct {
         name: ?[]const u8,
     ) ![]schema_mod.FieldCapability {
         const entry = self.textIndexEntry(name) orelse return &.{};
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
+        return try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry);
+    }
+
+    fn observedDynamicFieldCapabilitiesLockedAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        entry: *IndexManager.TextIndex,
+    ) ![]schema_mod.FieldCapability {
+        _ = self;
         const declared_capability_count = declaredRuntimeNativeDocValueFieldCapabilityCount(entry);
         const capability_count = entry.observed_field_analyzers.len + declared_capability_count;
         if (capability_count == 0) return &.{};
@@ -5644,7 +5671,7 @@ pub const IndexManager = struct {
 
     fn observedDynamicFieldTypedDocValueCoverageStatus(
         alloc: Allocator,
-        entry: *TextIndex,
+        entry: *IndexManager.TextIndex,
         field: []const u8,
         mapping: schema_mod.FieldMapping,
     ) !typed_dv_coverage.Status {
@@ -5681,6 +5708,14 @@ pub const IndexManager = struct {
         self: *IndexManager,
         alloc: Allocator,
     ) ![]ObservedDynamicFieldCapabilitySet {
+        for (self.text_indexes.items) |*entry| entry.analysis_mutex.lockShared();
+        defer {
+            var i = self.text_indexes.items.len;
+            while (i > 0) {
+                i -= 1;
+                self.text_indexes.items[i].analysis_mutex.unlockShared();
+            }
+        }
         var set_count: usize = 0;
         for (self.text_indexes.items) |*entry| {
             if (entry.observed_field_analyzers.len > 0 or declaredRuntimeNativeDocValueFieldCapabilityCount(entry) > 0) set_count += 1;
@@ -5699,7 +5734,7 @@ pub const IndexManager = struct {
             sets[initialized] = blk: {
                 const index_name = try alloc.dupe(u8, entry.config.name);
                 errdefer alloc.free(index_name);
-                const field_capabilities = try self.observedDynamicFieldCapabilitiesAlloc(alloc, entry.config.name);
+                const field_capabilities = try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry);
                 break :blk .{
                     .index_name = index_name,
                     .field_capabilities = field_capabilities,
@@ -5712,15 +5747,11 @@ pub const IndexManager = struct {
 
     pub fn fullTextLexicalAccessPath(self: *IndexManager, name: ?[]const u8, field: []const u8, analyzer: []const u8) ?algebraic_mod.ir.PhysicalAccessPath {
         const entry = self.textIndexEntry(name) orelse return null;
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
         if (!textFieldAnalyzerMatches(entry, field, analyzer)) return null;
         const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText(entry.config.name, field, analyzer);
         return algebraic_mod.ir.lexicalAccessPath(entry.config.name, .full_text_postings, identity, true);
-    }
-
-    pub fn fullTextLexicalAccessPathForField(self: *IndexManager, name: ?[]const u8, field: []const u8) ?algebraic_mod.ir.PhysicalAccessPath {
-        const entry = self.textIndexEntry(name) orelse return null;
-        const analyzer = textFieldAnalyzerName(entry, field) orelse return null;
-        return self.fullTextLexicalAccessPath(entry.config.name, field, analyzer);
     }
 
     pub fn planFullTextLexicalAccessPathAlloc(
@@ -5732,6 +5763,8 @@ pub const IndexManager = struct {
         fragment: algebraic_mod.ir.TensorFragment,
     ) !?algebraic_mod.ir.AccessPathPlan {
         const entry = self.textIndexEntry(name) orelse return null;
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
         const resolved_analyzer = if (analyzer) |explicit| blk: {
             if (!textFieldAnalyzerMatches(entry, field, explicit)) return null;
             break :blk explicit;
@@ -8969,6 +9002,18 @@ pub const IndexManager = struct {
                 var runtime_schema_moved = false;
                 errdefer if (!runtime_schema_moved) {
                     if (runtime_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+                };
+                const projection_provenance = try TextProjectionProvenance.fromRuntimeSchema(
+                    self.alloc,
+                    cfg,
+                    runtime_schema,
+                );
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, read_only) catch |err| {
+                    std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
+                        cfg.name,
+                        @errorName(err),
+                    });
+                    return err;
                 };
                 var text_analysis = parseTextAnalysisForIndexConfig(self.alloc, cfg.config_json, runtime_schema) catch |err| {
                     std.log.warn("full_text open failed step=text_analysis name={s} err={s}", .{
@@ -16016,6 +16061,9 @@ fn mergeObservedTextFieldAnalyzers(
 ) !void {
     if (observed.len == 0) return;
 
+    entry.analysis_mutex.lockExclusive();
+    defer entry.analysis_mutex.unlockExclusive();
+
     var additions = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
     defer {
         for (additions.items) |item| {
@@ -16027,9 +16075,14 @@ fn mergeObservedTextFieldAnalyzers(
 
     for (observed) |item| {
         if (containsObservedFieldAnalyzer(entry.observed_field_analyzers, item)) continue;
+        if (containsObservedFieldAnalyzer(additions.items, item)) continue;
+        const field_name = try self.alloc.dupe(u8, item.field_name);
+        errdefer self.alloc.free(field_name);
+        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
+        errdefer self.alloc.free(analyzer_name);
         try additions.append(self.alloc, .{
-            .field_name = try self.alloc.dupe(u8, item.field_name),
-            .analyzer_name = try self.alloc.dupe(u8, item.analyzer_name),
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
             .field_type = item.field_type,
             .do_index = item.do_index,
             .store = item.store,
@@ -16041,12 +16094,29 @@ fn mergeObservedTextFieldAnalyzers(
     }
     if (additions.items.len == 0) return;
 
-    const original_len = entry.observed_field_analyzers.len;
-    const expanded = try self.alloc.realloc(entry.observed_field_analyzers, original_len + additions.items.len);
+    const original_observed_len = entry.observed_field_analyzers.len;
+    const expanded_observed = try self.alloc.alloc(
+        mapper.ObservedFieldAnalyzer,
+        original_observed_len + additions.items.len,
+    );
+    var observed_initialized = original_observed_len;
+    var observed_published = false;
+    defer if (!observed_published) {
+        for (expanded_observed[original_observed_len..observed_initialized]) |item| {
+            self.alloc.free(item.field_name);
+            self.alloc.free(item.analyzer_name);
+        }
+        self.alloc.free(expanded_observed);
+    };
+    for (entry.observed_field_analyzers, 0..) |item, i| expanded_observed[i] = item;
     for (additions.items, 0..) |item, i| {
-        expanded[original_len + i] = .{
-            .field_name = try self.alloc.dupe(u8, item.field_name),
-            .analyzer_name = try self.alloc.dupe(u8, item.analyzer_name),
+        const field_name = try self.alloc.dupe(u8, item.field_name);
+        errdefer self.alloc.free(field_name);
+        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
+        errdefer self.alloc.free(analyzer_name);
+        expanded_observed[original_observed_len + i] = .{
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
             .field_type = item.field_type,
             .do_index = item.do_index,
             .store = item.store,
@@ -16055,12 +16125,52 @@ fn mergeObservedTextFieldAnalyzers(
             .missing_null_policy = item.missing_null_policy,
             .include_in_all = item.include_in_all,
         };
+        observed_initialized += 1;
     }
-    entry.observed_field_analyzers = expanded;
 
-    try appendObservedFieldAnalyzers(self.alloc, &entry.text_analysis, additions.items);
-    try saveObservedTextFieldAnalyzers(store, self.alloc, entry.config.name, entry.observed_field_analyzers);
-    try publishFullTextDictionaryRegistry(store, self.alloc, entry.config.name, entry.text_analysis);
+    const FieldAnalyzer = std.meta.Child(@TypeOf(entry.text_analysis.field_analyzers));
+    const original_analysis_len = entry.text_analysis.field_analyzers.len;
+    const expanded_analysis = try self.alloc.alloc(FieldAnalyzer, original_analysis_len + additions.items.len);
+    var analysis_initialized = original_analysis_len;
+    var analysis_published = false;
+    defer if (!analysis_published) {
+        for (expanded_analysis[original_analysis_len..analysis_initialized]) |item| {
+            self.alloc.free(item.field_name);
+            self.alloc.free(item.analyzer_name);
+        }
+        self.alloc.free(expanded_analysis);
+    };
+    for (entry.text_analysis.field_analyzers, 0..) |item, i| expanded_analysis[i] = item;
+    for (additions.items, 0..) |item, i| {
+        const field_name = try self.alloc.dupe(u8, item.field_name);
+        errdefer self.alloc.free(field_name);
+        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
+        errdefer self.alloc.free(analyzer_name);
+        expanded_analysis[original_analysis_len + i] = .{
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
+        };
+        analysis_initialized += 1;
+    }
+
+    var candidate_analysis = entry.text_analysis;
+    candidate_analysis.field_analyzers = expanded_analysis;
+    try publishFullTextMetadata(
+        store,
+        self.alloc,
+        entry.config.name,
+        candidate_analysis,
+        expanded_observed,
+    );
+
+    const previous_observed = entry.observed_field_analyzers;
+    const previous_analysis = entry.text_analysis.field_analyzers;
+    entry.observed_field_analyzers = expanded_observed;
+    entry.text_analysis.field_analyzers = expanded_analysis;
+    observed_published = true;
+    analysis_published = true;
+    if (previous_observed.len > 0) self.alloc.free(previous_observed);
+    if (previous_analysis.len > 0) self.alloc.free(previous_analysis);
 }
 
 fn containsObservedFieldAnalyzer(
@@ -17235,31 +17345,144 @@ fn containsU32(items: []const u32, id: u32) bool {
     return false;
 }
 
+/// Durable witness for the projection semantics used to build a full-text
+/// generation. It lives in the persistent generation's own metadata backend,
+/// so shadows and replacement roots cannot overwrite the active witness.
+const TextProjectionProvenance = struct {
+    coverage_generation: u64,
+    index_config_hash: u64,
+    schema_version: ?u32,
+    schema_fingerprint: u64,
+
+    fn fromRuntimeSchema(
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        schema: ?schema_mod.TableSchema,
+    ) !TextProjectionProvenance {
+        const schema_fingerprint = if (schema) |value| blk: {
+            const encoded = try schema_mod.serializeSchema(alloc, value);
+            defer alloc.free(encoded);
+            break :blk std.hash.Wyhash.hash(0x41545052534d0001, encoded);
+        } else std.hash.Wyhash.hash(0x41545052534d0001, "schema-less");
+        return .{
+            .coverage_generation = coverageGenerationForConfig(cfg),
+            .index_config_hash = types.indexConfigHash(cfg),
+            .schema_version = if (schema) |value| value.version else null,
+            .schema_fingerprint = schema_fingerprint,
+        };
+    }
+
+    fn eql(left: TextProjectionProvenance, right: TextProjectionProvenance) bool {
+        return left.coverage_generation == right.coverage_generation and
+            left.index_config_hash == right.index_config_hash and
+            left.schema_version == right.schema_version and
+            left.schema_fingerprint == right.schema_fingerprint;
+    }
+
+    fn encodeAlloc(self: TextProjectionProvenance, alloc: Allocator) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "ATPP");
+        try appendU32(&out, alloc, 2);
+        try appendU64(&out, alloc, self.coverage_generation);
+        try appendU64(&out, alloc, self.index_config_hash);
+        try out.append(alloc, if (self.schema_version != null) 1 else 0);
+        try appendU32(&out, alloc, self.schema_version orelse 0);
+        try appendU64(&out, alloc, self.schema_fingerprint);
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn decode(data: []const u8) !TextProjectionProvenance {
+        if (data.len != 37 or !std.mem.eql(u8, data[0..4], "ATPP")) return error.InvalidTextProjectionProvenance;
+        var pos: usize = 4;
+        if (try readU32(data, &pos) != 2) return error.UnsupportedTextProjectionProvenanceVersion;
+        const coverage_generation = try readU64(data, &pos);
+        const index_config_hash = try readU64(data, &pos);
+        const has_schema = switch (data[pos]) {
+            0 => false,
+            1 => true,
+            else => return error.InvalidTextProjectionProvenance,
+        };
+        pos += 1;
+        const schema_version = try readU32(data, &pos);
+        const schema_fingerprint = try readU64(data, &pos);
+        return .{
+            .coverage_generation = coverage_generation,
+            .index_config_hash = index_config_hash,
+            .schema_version = if (has_schema) schema_version else null,
+            .schema_fingerprint = schema_fingerprint,
+        };
+    }
+};
+
+fn saveTextProjectionProvenance(
+    persistent: *persistent_mod.PersistentIndex,
+    alloc: Allocator,
+    provenance: TextProjectionProvenance,
+) !void {
+    const data = try provenance.encodeAlloc(alloc);
+    defer alloc.free(data);
+    try persistent.writeGenerationMetadata(persistent_mod.text_projection_provenance_meta_key, data);
+}
+
+fn ensureTextProjectionProvenance(
+    alloc: Allocator,
+    persistent: *persistent_mod.PersistentIndex,
+    expected: TextProjectionProvenance,
+    read_only: bool,
+) !void {
+    const encoded = try persistent.readGenerationMetadataAlloc(
+        alloc,
+        persistent_mod.text_projection_provenance_meta_key,
+    );
+    defer if (encoded) |bytes| alloc.free(bytes);
+    const persisted = if (encoded) |bytes| try TextProjectionProvenance.decode(bytes) else null;
+    if (persisted != null and persisted.?.eql(expected)) return;
+
+    if (persistent.hasPhysicalSegments()) {
+        // There is no trustworthy upgrade witness for legacy postings. Keep
+        // the configured index visible through load status, but do not attach
+        // analyzers that may interpret its postings under different semantics.
+        if (persisted == null) return error.MissingTextProjectionProvenance;
+        return error.TextProjectionProvenanceMismatch;
+    }
+    // A physically empty writable generation has no postings to reinterpret.
+    // This covers fresh creation, portable restore before explicit backfill,
+    // and schema installation before the first write.
+    if (read_only) {
+        if (persisted == null) return error.MissingTextProjectionProvenance;
+        return error.TextProjectionProvenanceMismatch;
+    }
+    try saveTextProjectionProvenance(persistent, alloc, expected);
+}
+
 fn textFieldAnalyzersKey(alloc: Allocator, index_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ text_field_analyzers_prefix, index_name });
 }
 
-fn saveObservedTextFieldAnalyzers(store: anytype, alloc: Allocator, index_name: []const u8, observed: []const mapper.ObservedFieldAnalyzer) !void {
-    const key = try textFieldAnalyzersKey(alloc, index_name);
-    defer alloc.free(key);
-    const data = try serializeObservedTextFieldAnalyzers(alloc, observed);
-    defer alloc.free(data);
-
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    try txn.put(key, data);
-    try txn.commit();
+fn publishFullTextDictionaryRegistry(store: anytype, alloc: Allocator, index_name: []const u8, text_analysis: introducer_mod.TextAnalysisConfig) !void {
+    try publishFullTextMetadata(store, alloc, index_name, text_analysis, null);
 }
 
-fn publishFullTextDictionaryRegistry(store: anytype, alloc: Allocator, index_name: []const u8, text_analysis: introducer_mod.TextAnalysisConfig) !void {
-    if (text_analysis.field_analyzers.len == 0) return;
+fn publishFullTextMetadata(
+    store: anytype,
+    alloc: Allocator,
+    index_name: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    observed: ?[]const mapper.ObservedFieldAnalyzer,
+) !void {
+    if (text_analysis.field_analyzers.len == 0 and observed == null) return;
 
+    const observed_key = if (observed != null) try textFieldAnalyzersKey(alloc, index_name) else null;
+    defer if (observed_key) |key| alloc.free(key);
+    const observed_data = if (observed) |items| try serializeObservedTextFieldAnalyzers(alloc, items) else null;
+    defer if (observed_data) |data| alloc.free(data);
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+
+    if (observed_key) |key| try txn.put(key, observed_data.?);
 
     for (text_analysis.field_analyzers) |item| {
         if (item.field_name.len == 0 or item.analyzer_name.len == 0) continue;
@@ -19653,6 +19876,129 @@ test "observed full text analyzers publish shared dictionary ownership" {
     );
 }
 
+test "observed analyzer publication leaves runtime and metadata unchanged on registry conflict" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+
+    const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText("ft_v1", "meta.body", "french");
+    {
+        var runtime = try initRuntimeStore(alloc, &store);
+        defer runtime.deinit();
+        var txn = try runtime.store.beginWrite();
+        errdefer txn.abort();
+        try std.testing.expectEqual(
+            algebraic_mod.lexical.RegistryClaim.claimed,
+            try algebraic_mod.lexical.claimRegistryOwnerTxn(
+                alloc,
+                &txn,
+                identity,
+                "algebraic:path-promotion",
+                .lexicon_postings_rows,
+                "ready",
+            ),
+        );
+        try txn.commit();
+    }
+
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = @constCast("meta.body"),
+        .analyzer_name = @constCast("french"),
+    }};
+    try std.testing.expectError(
+        error.InvalidIndexConfig,
+        mergeObservedTextFieldAnalyzers(&manager, &store, entry, &observed),
+    );
+    try std.testing.expectEqual(@as(usize, 0), entry.observed_field_analyzers.len);
+    try std.testing.expectEqual(@as(usize, 0), entry.text_analysis.field_analyzers.len);
+
+    const persisted = try loadObservedTextFieldAnalyzers(alloc, &store, "ft_v1");
+    defer freeObservedTextFieldAnalyzers(alloc, persisted);
+    try std.testing.expectEqual(@as(usize, 0), persisted.len);
+}
+
+test "observed analyzer publication waits for active analysis readers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = @constCast("meta.body"),
+        .analyzer_name = @constCast("french"),
+    }};
+    const Worker = struct {
+        manager: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *IndexManager.TextIndex,
+        observed: []const mapper.ObservedFieldAnalyzer,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            mergeObservedTextFieldAnalyzers(self.manager, self.store, self.entry, self.observed) catch |err| {
+                self.err = err;
+            };
+            self.finished.store(true, .release);
+        }
+    };
+    var worker = Worker{
+        .manager = &manager,
+        .store = &store,
+        .entry = entry,
+        .observed = &observed,
+    };
+
+    entry.lockAnalysisShared();
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..128) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!worker.finished.load(.acquire));
+    entry.unlockAnalysisShared();
+    thread.join();
+
+    if (worker.err) |err| return err;
+    try std.testing.expect(worker.finished.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), entry.observed_field_analyzers.len);
+    try std.testing.expectEqualStrings("meta.body", entry.text_analysis.field_analyzers[0].field_name);
+}
+
 test "text query lease retains snapshot and analyzer across catalog removal" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -20004,6 +20350,317 @@ test "empty text index refreshes schema committed after index provisioning" {
     try std.testing.expectEqual(@as(usize, 1), runtime_schema.full_text_documents.len);
     try std.testing.expectEqualStrings("state", runtime_schema.full_text_documents[0].fields[0].emitted_name);
     try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
+}
+
+test "fresh text generation persists provenance before its first segment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        const entry = manager.textIndexEntry("ft_v1").?;
+        try std.testing.expect(!entry.persistent.hasPhysicalSegments());
+        const encoded = (try entry.persistent.readGenerationMetadataAlloc(
+            alloc,
+            persistent_mod.text_projection_provenance_meta_key,
+        )) orelse return error.TestExpectedEqual;
+        defer alloc.free(encoded);
+        _ = try TextProjectionProvenance.decode(encoded);
+        try entry.persistent.sync(true);
+    }
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const entry = reopened.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!entry.persistent.hasPhysicalSegments());
+    try reopened.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }});
+    try std.testing.expect(entry.persistent.hasPhysicalSegments());
+}
+
+test "empty generation adopts schema provenance after schema-only crash boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+    }
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    }));
+
+    // Model a crash after schema metadata commits but before the live manager
+    // refreshes its empty full-text generation.
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const entry = reopened.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 0), entry.runtime_schema.?.version);
+    try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
+}
+
+test "non-empty schema-less text generation fails closed when a schema appears" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{
+            .{ .key = "doc:a", .value = "{\"state\":\"published\"}" },
+            .{ .key = "doc:b", .value = "{\"state\":\"draft\"}" },
+        });
+    }
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    }));
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("full_text_index_v0") == null);
+    try std.testing.expectEqualStrings(
+        "TextProjectionProvenanceMismatch",
+        reopened.loadFailure("full_text_index_v0") orelse return error.TestExpectedEqual,
+    );
+}
+
+test "non-empty text generation without provenance fails closed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"published\"}" }});
+        const entry = manager.textIndexEntry("ft_v1").?;
+        try entry.persistent.deleteGenerationMetadata(persistent_mod.text_projection_provenance_meta_key);
+    }
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqualStrings(
+        "MissingTextProjectionProvenance",
+        reopened.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
+    );
+}
+
+test "deleted-only text generation cannot adopt different schema provenance" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"published\"}" }});
+        try manager.deleteTextBatchByName("ft_v1", &.{"doc:a"});
+
+        const entry = manager.textIndexEntry("ft_v1").?;
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(u32, 0), snapshot.liveDocCount());
+        try std.testing.expect(snapshot.segments.len != 0);
+    }
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    }));
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqualStrings(
+        "TextProjectionProvenanceMismatch",
+        reopened.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
+    );
+}
+
+test "shadow text generation owns provenance without mutating active generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    const shadow_path = try std.fmt.allocPrint(alloc, "{s}/shadow", .{path});
+    defer alloc.free(shadow_path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var source = try IndexManager.init(alloc, path);
+        defer source.deinit();
+        source.updateRange(.{ .start = "", .end = "" });
+        try source.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try source.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"published\"}" }});
+
+        const fields = [_]schema_mod.FullTextField{.{
+            .path = "state",
+            .emitted_name = "state",
+            .analyzer = "keyword",
+        }};
+        const documents = [_]schema_mod.FullTextDocument{.{
+            .name = "product",
+            .fields = &fields,
+        }};
+        try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+            .version = 0,
+            .default_type = "product",
+            .full_text_documents = &documents,
+        }));
+
+        var shadow = try IndexManager.init(alloc, shadow_path);
+        defer shadow.deinit();
+        shadow.updateRange(.{ .start = "doc:m", .end = "" });
+        try shadow.registerShadowIndex(&store, source.textIndexEntry("ft_v1").?.config);
+
+        const shadow_entry = shadow.textIndexEntry("ft_v1").?;
+        const encoded = (try shadow_entry.persistent.readGenerationMetadataAlloc(
+            alloc,
+            persistent_mod.text_projection_provenance_meta_key,
+        )) orelse return error.TestExpectedEqual;
+        defer alloc.free(encoded);
+        const persisted = try TextProjectionProvenance.decode(encoded);
+        const expected = try TextProjectionProvenance.fromRuntimeSchema(
+            alloc,
+            shadow_entry.config,
+            shadow_entry.runtime_schema,
+        );
+        try std.testing.expect(persisted.eql(expected));
+    }
+
+    // The source generation still owns its schema-less witness. A shadow
+    // created after schema installation must not rewrite it by public name.
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqualStrings(
+        "TextProjectionProvenanceMismatch",
+        reopened.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
+    );
 }
 
 test "observed dynamic sortable field capability stays declared for sparse doc values" {

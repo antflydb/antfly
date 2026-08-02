@@ -2374,6 +2374,8 @@ fn collectFullTextResolvedDocSetAlloc(
     text_query: types.TextQuery,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -8619,6 +8621,8 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     filter_query_json: []const u8,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -8723,6 +8727,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
     filter_query_json: []const u8,
 ) !?TextDocNumSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -8815,6 +8821,8 @@ fn collectStructuredFilterDocIdsAlloc(
     filter_query_json: []const u8,
 ) !?[]const []const u8 {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -11419,6 +11427,8 @@ pub fn searchTextQuery(
         .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
         else => error.IndexNotFound,
     };
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
     if (effective_req.index_name == null) effective_req.index_name = text_entry.config.name;
     const text_index = &text_entry.persistent;
     const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
@@ -12054,26 +12064,42 @@ pub fn collectSearchRequestTextStats(
     if (req.full_text_queries.len == 0) {
         if (req.full_text) |text_query| {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
-            try collectTextQueryTerms(alloc, &stats_map, req.index_name, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+            {
+                text_entry.lockAnalysisShared();
+                defer text_entry.unlockAnalysisShared();
+                try collectTextQueryTerms(alloc, &stats_map, req.index_name, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         } else if (isTextQuery(req.query) and !isDefaultMatchAll(req.query)) {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
-            try collectQueryTerms(alloc, &stats_map, req.index_name, req.query, text_entry.text_analysis, text_entry.runtime_schema);
+            {
+                text_entry.lockAnalysisShared();
+                defer text_entry.unlockAnalysisShared();
+                try collectQueryTerms(alloc, &stats_map, req.index_name, req.query, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         }
     } else {
         for (req.full_text_queries) |item| {
             const text_entry = (try executor.text_index_entry(executor.ctx, item.index_name)) orelse continue;
-            try collectTextQueryTerms(alloc, &stats_map, item.index_name, item.query, text_entry.text_analysis, text_entry.runtime_schema);
+            {
+                text_entry.lockAnalysisShared();
+                defer text_entry.unlockAnalysisShared();
+                try collectTextQueryTerms(alloc, &stats_map, item.index_name, item.query, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         }
     }
 
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) {
         const filter_index_name = req.primary_text_index_name orelse req.index_name;
         const text_entry = (try executor.text_index_entry(executor.ctx, filter_index_name)) orelse return &.{};
-        if (req.filter_query_json.len > 0) {
-            try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.filter_query_json, text_entry.text_analysis, text_entry.runtime_schema);
-        }
-        if (req.exclusion_query_json.len > 0) {
-            try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.exclusion_query_json, text_entry.text_analysis, text_entry.runtime_schema);
+        {
+            text_entry.lockAnalysisShared();
+            defer text_entry.unlockAnalysisShared();
+            if (req.filter_query_json.len > 0) {
+                try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.filter_query_json, text_entry.text_analysis, text_entry.runtime_schema);
+            }
+            if (req.exclusion_query_json.len > 0) {
+                try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.exclusion_query_json, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         }
     }
 
@@ -15422,6 +15448,8 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         );
         return error.UnsupportedExactSort;
     };
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
     const plan = try planTextNativeSortFields(effective_req, text_entry.persistent.snapshot(), text_entry.runtime_schema);
     if (plan.sorted_segment_executor_available) {
         return .{
@@ -15494,6 +15522,8 @@ fn buildMatchAllNativeSortContextAlloc(
     if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
     try validateMatchAllSortDoesNotUseScore(req);
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
     const snapshot = text_entry.persistent.snapshot();
     const plan = try planTextNativeSortFields(req, snapshot, text_entry.runtime_schema);
     if (plan.kind != .native_doc_values_top_n) return null;
