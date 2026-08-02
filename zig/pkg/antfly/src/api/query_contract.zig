@@ -2216,6 +2216,8 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
     var timeout_value_pending = false;
     var key = std.ArrayListUnmanaged(u8).empty;
     defer key.deinit(alloc);
+    var timeout_value = std.ArrayListUnmanaged(u8).empty;
+    defer timeout_value.deinit(alloc);
 
     while (true) {
         const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, null, cancellation);
@@ -2244,23 +2246,23 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
             },
             .partial_string => |part| {
                 if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part)
-                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                else if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part);
             },
             .partial_string_escaped_1 => |part| {
                 if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
-                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                else if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part[0..]);
             },
             .partial_string_escaped_2 => |part| {
                 if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
-                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                else if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part[0..]);
             },
             .partial_string_escaped_3 => |part| {
                 if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
-                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                else if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part[0..]);
             },
             .partial_string_escaped_4 => |part| {
                 if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
-                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                else if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part[0..]);
             },
             .string => |part| {
                 if (depth == 1 and root_expects_key) {
@@ -2269,12 +2271,16 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
                     key.clearRetainingCapacity();
                     root_expects_key = false;
                 } else if (depth == 1 and timeout_value_pending) {
-                    return std.fmt.parseUnsigned(u64, part, 10) catch error.InvalidQueryRequest;
+                    try timeout_value.appendSlice(alloc, part);
+                    return std.fmt.parseUnsigned(u64, timeout_value.items, 10) catch error.InvalidQueryRequest;
                 } else if (depth == 1) root_expects_key = true;
             },
-            .partial_number => if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest,
+            .partial_number => |part| if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part),
             .number => |value| {
-                if (depth == 1 and timeout_value_pending) return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidQueryRequest;
+                if (depth == 1 and timeout_value_pending) {
+                    try timeout_value.appendSlice(alloc, value);
+                    return std.fmt.parseUnsigned(u64, timeout_value.items, 10) catch error.InvalidQueryRequest;
+                }
                 if (depth == 1) root_expects_key = true;
             },
             .null => {
@@ -5932,7 +5938,10 @@ fn validatePublicQueryTraversalBudgetWithDeadlineAlloc(
     var visited: usize = 0;
     while (pending.pop()) |entry| {
         visited += 1;
-        if (visited & 63 == 0) try ensureQueryActive(deadline_ns, cancellation);
+        if (visited & 63 == 0) {
+            try ensureQueryActive(deadline_ns, cancellation);
+            try pollPublicNormalization();
+        }
         if (visited > public_query_max_tree_nodes or
             entry.depth > public_query_max_tree_depth)
         {
@@ -10440,6 +10449,22 @@ test "api public query normalization observes cancellation" {
             &cancelled,
         ),
     );
+}
+
+test "api query timeout scanner accepts a scalar split across its input chunk" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"payload\":\"";
+    const timeout_prefix = "\",\"timeout_ms\":";
+    const scalar_offset = query_timeout_scan_chunk_bytes - 1;
+    const padding_len = scalar_offset - prefix.len - timeout_prefix.len;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, prefix);
+    try body.appendNTimes(alloc, 'x', padding_len);
+    try body.appendSlice(alloc, timeout_prefix);
+    try body.appendSlice(alloc, "60000}");
+
+    try std.testing.expectEqual(@as(?u64, 60_000), try parseQueryTimeoutMs(alloc, body.items, null));
 }
 
 test "api query contract expansion budget checks its absolute deadline" {
