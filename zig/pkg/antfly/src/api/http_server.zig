@@ -118,7 +118,10 @@ const ParsedGlobalQueryTable = struct {
 };
 
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
-    var value = query_contract.parseJsonValueCancellable(alloc, body, null, cancellation) catch return error.InvalidQueryRequest;
+    var value = query_contract.parseJsonValueCancellable(alloc, body, null, cancellation) catch |err| switch (err) {
+        error.Cancelled, error.Timeout => return err,
+        else => return error.InvalidQueryRequest,
+    };
     defer value.deinit();
     try query_contract.validatePublicQuerySortTupleValueContract(value.value);
     var parsed = std.json.parseFromValue(metadata_openapi.QueryRequest, alloc, value.value, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
@@ -10953,8 +10956,9 @@ pub const ApiHttpServer = struct {
             if (line.len == 0) continue;
 
             const table_name = if (route_table_name) |name| name else blk: {
-                var parsed_table = parseGlobalQueryTable(arena, line, cancellation) catch {
-                    return try textResponse(self.alloc, 400, "invalid query request");
+                var parsed_table = parseGlobalQueryTable(arena, line, cancellation) catch |err| switch (err) {
+                    error.Cancelled, error.Timeout => return try self.publicQueryDispatchErrorResponse(route_table_name orelse "", line, err),
+                    else => return try textResponse(self.alloc, 400, "invalid query request"),
                 };
                 defer parsed_table.deinit();
                 if (parsed_table.table_name.len == 0) {

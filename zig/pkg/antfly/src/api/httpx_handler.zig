@@ -1564,9 +1564,19 @@ pub const AntflyApiHandler = struct {
             );
             return respondWithAllocator(ctx, &resp, self.api_server.alloc);
         }
-        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data, &cancellation) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid query request");
+        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data, &cancellation) catch |err| switch (err) {
+            error.Cancelled => {
+                _ = ctx.status(499);
+                return ctx.text("query cancelled");
+            },
+            error.Timeout => {
+                _ = ctx.status(504);
+                return ctx.text("query timed out");
+            },
+            else => {
+                _ = ctx.status(400);
+                return ctx.text("invalid query request");
+            },
         };
         defer parsed_table.deinit();
         var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
