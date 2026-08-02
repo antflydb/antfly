@@ -2179,9 +2179,10 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
                 }
             },
             .partial_string => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part),
-            .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
-                if (depth == 1 and root_expects_key) try key.append(alloc, 0);
-            },
+            .partial_string_escaped_1 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string_escaped_2 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string_escaped_3 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string_escaped_4 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
             .string => |part| {
                 if (depth == 1 and root_expects_key) {
                     try key.appendSlice(alloc, part);

@@ -6214,6 +6214,7 @@ pub const HBCIndex = struct {
 pub const SearchResult = vectorindex_search_results.SearchResult;
 const ApproxSearchResult = vectorindex_search_results.ApproxSearchResult;
 pub const SearchRequest = vectorindex_search_types.SearchRequest;
+pub const checkCancelled = vectorindex_search_types.checkCancelled;
 pub const SearchProfile = vectorindex_search_types.SearchProfile;
 
 pub const WriteProfile = vectorindex_hbc_runtime.WriteProfile;

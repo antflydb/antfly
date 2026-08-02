@@ -14047,6 +14047,7 @@ pub const IndexManager = struct {
                     p.rerank_distance_ns += elapsed;
                 }
             }
+            try hbc_mod.checkCancelled(request);
             return;
         }
         try hbc_mod.checkCancelled(request);
@@ -14066,6 +14067,7 @@ pub const IndexManager = struct {
         }
 
         for (raw_values, 0..) |maybe_raw, key_index| {
+            if (key_index % 64 == 0) try hbc_mod.checkCancelled(request);
             const slot = artifact_reads[key_index].position;
             const raw = maybe_raw orelse {
                 distances[slot] = std.math.inf(f32);
@@ -14092,6 +14094,7 @@ pub const IndexManager = struct {
                 p.rerank_distance_ns += elapsed;
             }
         }
+        try hbc_mod.checkCancelled(request);
     }
 
     fn exactStoredVectorDistance(
