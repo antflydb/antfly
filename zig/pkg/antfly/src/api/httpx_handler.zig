@@ -71,8 +71,8 @@ const ParsedGlobalQueryTable = struct {
     }
 };
 
-fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
-    var value = try query_contract.parseJsonValueCancellable(alloc, body, null, cancellation);
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
+    var value = try query_contract.parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
     defer value.deinit();
     try query_contract.validatePublicQuerySortTupleValueContract(value.value);
     var parsed = std.json.parseFromValue(metadata_openapi.QueryRequest, alloc, value.value, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
@@ -1564,7 +1564,21 @@ pub const AntflyApiHandler = struct {
             );
             return respondWithAllocator(ctx, &resp, self.api_server.alloc);
         }
-        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data, &cancellation) catch |err| switch (err) {
+        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(ctx.allocator, body_data, cancellation.signal()) catch |err| switch (err) {
+            error.Cancelled => {
+                _ = ctx.status(499);
+                return ctx.text("query cancelled");
+            },
+            error.Timeout => {
+                _ = ctx.status(504);
+                return ctx.text("query timed out");
+            },
+            else => {
+                _ = ctx.status(400);
+                return ctx.text("invalid query request");
+            },
+        };
+        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data, request_deadline_ns, cancellation.signal()) catch |err| switch (err) {
             error.Cancelled => {
                 _ = ctx.status(499);
                 return ctx.text("query cancelled");
@@ -1579,11 +1593,11 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer parsed_table.deinit();
-        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
+        var resp = try self.api_server.handlePublicTableQueryWithDeadlineCancellation(
             parsed_table.table_name,
             body_data,
-            ctx.header("content-type"),
             authenticated_identity,
+            request_deadline_ns,
             &cancellation,
         );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
@@ -4374,6 +4388,7 @@ test "httpx global query table name comes from request body" {
     var parsed_table = try parseGlobalQueryTable(std.testing.allocator,
         \\{"table":"files","limit":5}
         ,
+        null,
         null,
     );
     defer parsed_table.deinit();

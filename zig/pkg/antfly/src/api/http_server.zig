@@ -117,8 +117,8 @@ const ParsedGlobalQueryTable = struct {
     }
 };
 
-fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
-    var value = query_contract.parseJsonValueCancellable(alloc, body, null, cancellation) catch |err| switch (err) {
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !ParsedGlobalQueryTable {
+    var value = query_contract.parseJsonValueCancellable(alloc, body, deadline_ns, cancellation) catch |err| switch (err) {
         error.Cancelled, error.Timeout => return err,
         else => return error.InvalidQueryRequest,
     };
@@ -1296,12 +1296,15 @@ const cancellation_stringify_chunk_bytes = 16 * 1024;
 const CancellableResponseWriter = struct {
     destination: *std.Io.Writer,
     cancellation: ?*const http_common.RequestCancellation,
+    deadline_ns: ?u64,
     cancellation_observed: bool = false,
+    timeout_observed: bool = false,
     writer: std.Io.Writer,
 
-    fn init(destination: *std.Io.Writer, cancellation: ?*const http_common.RequestCancellation) @This() {
+    fn init(destination: *std.Io.Writer, deadline_ns: ?u64, cancellation: ?*const http_common.RequestCancellation) @This() {
         return .{
             .destination = destination,
+            .deadline_ns = deadline_ns,
             .cancellation = cancellation,
             .writer = .{
                 .vtable = &.{ .drain = drain, .flush = std.Io.Writer.noopFlush },
@@ -1314,6 +1317,12 @@ const CancellableResponseWriter = struct {
         if (self.cancellation) |value| {
             if (value.isCancelled()) {
                 self.cancellation_observed = true;
+                return error.WriteFailed;
+            }
+        }
+        if (self.deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) {
+                self.timeout_observed = true;
                 return error.WriteFailed;
             }
         }
@@ -8635,7 +8644,8 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, null) catch |err| switch (err) {
+        const request_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body, null);
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request_deadline_ns, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -8691,15 +8701,12 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        request_deadline_ns: ?u64,
         cancellation: ?*const std.atomic.Value(bool),
     ) ![]u8 {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
-        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body, cancellation) catch |err| switch (err) {
-            error.Cancelled => return error.Cancelled,
-            else => return error.InvalidQueryRequest,
-        };
         while (true) {
             try ensureRequestActive(cancellation);
             if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
@@ -10941,6 +10948,24 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !http_common.HttpResponse {
+        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(
+            self.alloc,
+            body,
+            if (cancellation) |value| value.signal() else null,
+        ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
+        return try self.handlePublicTableQueryWithDeadlineCancellation(table_name, body, authenticated_identity, request_deadline_ns, cancellation);
+    }
+
+    /// The global router discovers its table name from the body. It must keep
+    /// the same deadline it established before that preliminary parse.
+    pub fn handlePublicTableQueryWithDeadlineCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        request_deadline_ns: ?u64,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
@@ -10953,6 +10978,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
+            request_deadline_ns,
             if (cancellation) |value| value.signal() else null,
         ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
         defer self.alloc.free(response_body);
@@ -10987,6 +11013,7 @@ pub const ApiHttpServer = struct {
         defer out.deinit();
         try out.writer.writeAll("{\"responses\":[");
         var emitted: usize = 0;
+        var last_deadline_ns: ?u64 = null;
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
@@ -11001,9 +11028,15 @@ pub const ApiHttpServer = struct {
             }
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
+            const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(
+                arena,
+                line,
+                if (cancellation) |value| value.signal() else null,
+            ) catch |err| return try self.publicQueryDispatchErrorResponse(route_table_name orelse "", line, err);
+            last_deadline_ns = request_deadline_ns;
 
             const table_name = if (route_table_name) |name| name else blk: {
-                var parsed_table = parseGlobalQueryTable(arena, line, if (cancellation) |value| value.signal() else null) catch |err| switch (err) {
+                var parsed_table = parseGlobalQueryTable(arena, line, request_deadline_ns, if (cancellation) |value| value.signal() else null) catch |err| switch (err) {
                     error.Cancelled, error.Timeout => return try self.publicQueryDispatchErrorResponse(route_table_name orelse "", line, err),
                     else => return try textResponse(self.alloc, 400, "invalid query request"),
                 };
@@ -11026,6 +11059,7 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
+                request_deadline_ns,
                 if (cancellation) |value| value.signal() else null,
             ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
@@ -11033,7 +11067,7 @@ pub const ApiHttpServer = struct {
             var parsed = query_contract.parseJsonValueCancellable(
                 arena,
                 response_body,
-                null,
+                request_deadline_ns,
                 if (cancellation) |value| value.signal() else null,
             ) catch |err| switch (err) {
                 error.Cancelled, error.Timeout => return try self.publicQueryDispatchErrorResponse(table_name, line, err),
@@ -11049,12 +11083,15 @@ pub const ApiHttpServer = struct {
                 .array => |array| array.items,
                 else => return try textResponse(self.alloc, 500, "query failed"),
             };
-            var cancellable_out = CancellableResponseWriter.init(&out.writer, cancellation);
+            var cancellable_out = CancellableResponseWriter.init(&out.writer, request_deadline_ns, cancellation);
             for (responses) |response_value| {
                 if (emitted > 0) try out.writer.writeByte(',');
                 std.json.Stringify.value(response_value, .{}, &cancellable_out.writer) catch |err| {
                     if (cancellable_out.cancellation_observed) {
                         return try self.publicQueryDispatchErrorResponse(table_name, line, error.Cancelled);
+                    }
+                    if (cancellable_out.timeout_observed) {
+                        return try self.publicQueryDispatchErrorResponse(table_name, line, error.Timeout);
                     }
                     return err;
                 };
@@ -11063,6 +11100,10 @@ pub const ApiHttpServer = struct {
         }
 
         if (emitted == 0) return try textResponse(self.alloc, 400, "invalid query request");
+        if (last_deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline)
+                return try self.publicQueryDispatchErrorResponse(route_table_name orelse "", body, error.Timeout);
+        }
         try out.writer.writeAll("]}");
         return try jsonBodyResponseWithStatus(self.alloc, 200, out.written());
     }
