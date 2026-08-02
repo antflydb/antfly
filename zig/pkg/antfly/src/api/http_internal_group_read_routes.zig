@@ -312,6 +312,17 @@ pub fn planSemanticQuery(
                 break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
             const budget = planning.query_embedding_budget orelse
                 break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            // Disabling retention is a supported resource policy, not a
+            // license to detach request lifecycle or bypass provider
+            // admission. Keep that mode on the bounded request-owned path.
+            if (!cache.config.enabled) {
+                break :blk try cache.computeUncached(
+                    alloc,
+                    embedding_deadline_ns,
+                    &compute_context,
+                    DenseQueryComputeContext.run,
+                );
+            }
             const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
                 error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
                 else => return err,
