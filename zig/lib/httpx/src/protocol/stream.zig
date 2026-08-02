@@ -17,6 +17,7 @@ const Io = std.Io;
 
 const http = @import("http.zig");
 const hpack = @import("hpack.zig");
+const SharedBodyBudget = @import("body_budget.zig").SharedBodyBudget;
 
 /// Overflow-guarded window delta addition per RFC 7540 §6.9.1.
 fn addWindowDelta(current: i32, delta: i32) error{FlowControlError}!i32 {
@@ -51,68 +52,6 @@ pub const StreamPriority = struct {
     weight: u8 = 16,
     /// Exclusive dependency flag.
     exclusive: bool = false,
-};
-
-/// Process-wide byte budget for request DATA retained by HTTP/2 stream
-/// mailboxes. HTTP/2 flow control limits bytes per connection, but does not
-/// bound the aggregate memory retained across many connections. Servers share
-/// one of these budgets across every H2 connection and fail new DATA closed
-/// when the process-wide ceiling is reached.
-pub const SharedDataBudget = struct {
-    capacity: usize,
-    in_use: std.atomic.Value(usize) = .init(0),
-    peak_in_use: std.atomic.Value(usize) = .init(0),
-    rejected_total: std.atomic.Value(u64) = .init(0),
-
-    pub fn init(capacity: usize) SharedDataBudget {
-        return .{ .capacity = capacity };
-    }
-
-    pub fn tryReserve(self: *@This(), amount: usize) bool {
-        if (amount == 0) return true;
-        var observed = self.in_use.load(.acquire);
-        while (true) {
-            const next = std.math.add(usize, observed, amount) catch {
-                _ = self.rejected_total.fetchAdd(1, .monotonic);
-                return false;
-            };
-            if (next > self.capacity) {
-                _ = self.rejected_total.fetchAdd(1, .monotonic);
-                return false;
-            }
-            if (self.in_use.cmpxchgWeak(observed, next, .acq_rel, .acquire) == null) {
-                var peak = self.peak_in_use.load(.acquire);
-                while (peak < next) {
-                    if (self.peak_in_use.cmpxchgWeak(peak, next, .acq_rel, .acquire) == null) break;
-                    peak = self.peak_in_use.load(.acquire);
-                }
-                return true;
-            }
-            observed = self.in_use.load(.acquire);
-        }
-    }
-
-    pub fn release(self: *@This(), amount: usize) void {
-        if (amount == 0) return;
-        const previous = self.in_use.fetchSub(amount, .acq_rel);
-        std.debug.assert(previous >= amount);
-    }
-
-    pub const Stats = struct {
-        capacity: usize,
-        in_use: usize,
-        peak_in_use: usize,
-        rejected_total: u64,
-    };
-
-    pub fn stats(self: *const @This()) Stats {
-        return .{
-            .capacity = self.capacity,
-            .in_use = self.in_use.load(.acquire),
-            .peak_in_use = self.peak_in_use.load(.acquire),
-            .rejected_total = self.rejected_total.load(.acquire),
-        };
-    }
 };
 
 /// Represents an HTTP/2 stream.
@@ -177,7 +116,7 @@ pub const Stream = struct {
 
     /// Bytes charged to the server's aggregate H2 mailbox budget. The stream
     /// owns this reservation until removal, including error paths.
-    data_budget: ?*SharedDataBudget = null,
+    data_budget: ?*SharedBodyBudget = null,
     data_budget_reserved: usize = 0,
 
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
@@ -216,6 +155,16 @@ pub const Stream = struct {
             .open, .half_closed_local => true,
             else => false,
         };
+    }
+
+    /// Returns an error that must prevent local response writes. Aggregate
+    /// request-body admission is an inbound terminal error, but the server
+    /// must still be able to send its explicit 429 response before resetting
+    /// the remote half of the stream. Peer resets and protocol errors remain
+    /// hard write barriers.
+    pub fn responseWriteError(self: *const Self) ?anyerror {
+        const err = self.stream_error orelse return null;
+        return if (err == error.BodyCapacityExceeded) null else err;
     }
 
     /// Transitions state after sending END_STREAM.

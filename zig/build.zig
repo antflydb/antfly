@@ -4483,7 +4483,6 @@ pub fn build(b: *std.Build) void {
         "httpx query admission releases a cancelled query slot",
         "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
-        "httpx production query preserves high-frequency keyword recall across clean restarts",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
         "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",

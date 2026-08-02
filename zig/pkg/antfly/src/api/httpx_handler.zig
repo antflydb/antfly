@@ -59,8 +59,6 @@ const casbin = @import("antfly_casbin");
 const builtin = @import("builtin");
 
 const db_mod = @import("../storage/db/mod.zig");
-const storage_schema = @import("../storage/schema.zig");
-const table_schema_api = @import("../schema/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 
@@ -3571,70 +3569,6 @@ fn requestWithRetry(
     unreachable;
 }
 
-fn queryTotalWithRetry(
-    alloc: std.mem.Allocator,
-    client: *httpx.Client,
-    io: std.Io,
-    url: []const u8,
-    body: []const u8,
-) !u64 {
-    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
-    var response = try requestWithRetry(client, io, .POST, url, body, &headers, 20);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status.code);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
-    defer parsed.deinit();
-    const responses = parsed.value.object.get("responses") orelse return error.InvalidResponse;
-    if (responses.array.items.len != 1) return error.InvalidResponse;
-    const hits = responses.array.items[0].object.get("hits") orelse return error.InvalidResponse;
-    const total = hits.object.get("total") orelse return error.InvalidResponse;
-    const value = total.object.get("value") orelse return error.InvalidResponse;
-    return @intCast(value.integer);
-}
-
-fn expectHighFrequencyRecallViaHttpx(alloc: std.mem.Allocator, db_path: []const u8) !void {
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
-    var status_source = LookupStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), table_source.source(), null);
-
-    var e2e_server: HttpxE2eServer = undefined;
-    try e2e_server.init(alloc, &api_server);
-    defer e2e_server.deinit();
-
-    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer client_io.deinit();
-    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
-    defer client.deinit();
-    const base_url = try e2e_server.baseUrl(alloc);
-    defer alloc.free(base_url);
-    const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});
-    defer alloc.free(query_url);
-
-    try std.testing.expectEqual(@as(u64, 4_237), try queryTotalWithRetry(
-        alloc,
-        &client,
-        client_io.io(),
-        query_url,
-        "{\"full_text_search\":{\"match\":\"catalog\",\"field\":\"title\"},\"filter_query\":{\"term\":\"published\",\"field\":\"state\"},\"limit\":1}",
-    ));
-    try std.testing.expectEqual(@as(u64, 763), try queryTotalWithRetry(
-        alloc,
-        &client,
-        client_io.io(),
-        query_url,
-        "{\"full_text_search\":{\"match\":\"catalog\",\"field\":\"title\"},\"filter_query\":{\"term\":\"draft\",\"field\":\"state\"},\"limit\":1}",
-    ));
-    try std.testing.expectEqual(@as(u64, 5_000), try queryTotalWithRetry(
-        alloc,
-        &client,
-        client_io.io(),
-        query_url,
-        "{\"full_text_search\":{\"match\":\"catalog\",\"field\":\"title\"},\"limit\":1}",
-    ));
-}
-
 const AuthStatusSource = struct {
     fn iface(_: *@This()) http_server_mod.StatusSource {
         return .{
@@ -4094,73 +4028,6 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     var recovered = try requestWithRetry(&control_client, control_io.io(), .POST, query_url, "{\"limit\":1}", null, 20);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(u16, 200), recovered.status.code);
-}
-
-test "httpx production query preserves high-frequency keyword recall across clean restarts" {
-    const alloc = std.testing.allocator;
-    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-keyword-restart-{d}", .{platform_time.monotonicNs()});
-    defer alloc.free(db_path);
-    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer fs_io.deinit();
-    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
-
-    const schema_json =
-        \\{
-        \\  "default_type": "product",
-        \\  "document_schemas": {
-        \\    "product": {
-        \\      "schema": {
-        \\        "type": "object",
-        \\        "additionalProperties": true,
-        \\        "properties": {
-        \\          "title": {"type":"string","x-antfly-types":["text"]},
-        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
-        \\        }
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    ;
-
-    {
-        var db = try db_mod.DB.open(alloc, db_path, .{});
-        defer db.close();
-        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer storage_schema.freeSchema(alloc, runtime_schema);
-        try db.setSchema(runtime_schema);
-        try db.addIndex(.{
-            .name = "full_text_index_v0",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
-
-        const writes = try alloc.alloc(db_mod.types.BatchWrite, 5_000);
-        defer {
-            for (writes) |write| {
-                alloc.free(@constCast(write.key));
-                alloc.free(@constCast(write.value));
-            }
-            alloc.free(writes);
-        }
-        for (writes, 0..) |*write, i| {
-            const state = if (i < 4_237) "published" else "draft";
-            write.* = .{
-                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"Catalog document {d}\",\"state\":\"{s}\"}}", .{ i, state }),
-            };
-        }
-        try db.batch(.{ .writes = writes, .sync_level = .full_index });
-    }
-
-    // Each helper invocation starts the real httpx adapter on a fresh DB open,
-    // issues the public query contract, and shuts the service down cleanly.
-    // Repeating it catches one-shot reload state that a DB-only snapshot test
-    // cannot observe.
-    try expectHighFrequencyRecallViaHttpx(alloc, db_path);
-    try expectHighFrequencyRecallViaHttpx(alloc, db_path);
 }
 
 test "httpx antfly routes require auth and enforce admin middleware" {

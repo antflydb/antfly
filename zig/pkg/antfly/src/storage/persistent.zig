@@ -2783,16 +2783,16 @@ fn buildMultiDocSegment(alloc: Allocator, docs: []const struct { doc_id: []const
     return seg_writer.build();
 }
 
-fn buildHighFrequencyKeywordSegment(alloc: Allocator) ![]u8 {
+fn buildHighFrequencyKeywordSegmentRange(alloc: Allocator, start: usize, count: usize) ![]u8 {
     const published_count = 4_237;
-    const total_count = 5_000;
     var body_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
     defer body_builder.deinit();
     var state_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
     defer state_builder.deinit();
 
-    for (0..total_count) |i| {
-        const doc_num: u32 = @intCast(i);
+    for (0..count) |local_doc| {
+        const doc_num: u32 = @intCast(local_doc);
+        const i = start + local_doc;
         try body_builder.addDocument(doc_num, &.{.{ .term = "document", .freq = 1, .norm = 10 }});
         try state_builder.addDocument(doc_num, &.{.{
             .term = if (i < published_count) "published" else "draft",
@@ -2812,11 +2812,16 @@ fn buildHighFrequencyKeywordSegment(alloc: Allocator) ![]u8 {
     const state_field = try seg_writer.addField("state");
     try seg_writer.addSection(state_field, .inverted_text, state_data);
     var doc_id_buf: [32]u8 = undefined;
-    for (0..total_count) |i| {
+    for (0..count) |local_doc| {
+        const i = start + local_doc;
         const doc_id = try std.fmt.bufPrint(&doc_id_buf, "doc:{d}", .{i});
         try seg_writer.addStoredDoc(doc_id, "{}");
     }
     return seg_writer.build();
+}
+
+fn buildHighFrequencyKeywordSegment(alloc: Allocator) ![]u8 {
+    return buildHighFrequencyKeywordSegmentRange(alloc, 0, 5_000);
 }
 
 var persist_tmp_nonce: u64 = 0;
@@ -2931,6 +2936,38 @@ test "persistent index keeps high-frequency keyword postings across two read-onl
         try std.testing.expectEqual(@as(u32, 5_000), unfiltered.total_count);
         try std.testing.expectEqual(@as(u32, 5_000), snapshot.liveDocCount());
     }
+}
+
+test "persistent index keeps high-frequency keyword postings across many segments on restart" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path, .main_backend = .lsm });
+        defer index.close();
+        for (0..10) |batch| {
+            const segment = try buildHighFrequencyKeywordSegmentRange(alloc, batch * 500, 500);
+            defer alloc.free(segment);
+            try index.indexSegment(segment);
+        }
+        try index.syncMain(true);
+    }
+
+    var reopened = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .lsm,
+        .read_only = true,
+    });
+    defer reopened.close();
+    const snapshot = reopened.snapshot();
+    const published = try snapshot.search(alloc, "state", &.{"published"}, 5_000);
+    defer alloc.free(published.hits);
+    try std.testing.expectEqual(@as(u32, 4_237), published.total_count);
+    const draft = try snapshot.search(alloc, "state", &.{"draft"}, 5_000);
+    defer alloc.free(draft.hits);
+    try std.testing.expectEqual(@as(u32, 763), draft.total_count);
 }
 
 test "persistent index exposes wal and lmdb commit stats" {

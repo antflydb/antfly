@@ -236,10 +236,10 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP/2 request-body mailbox capacity", http.h2_body_buffer_capacity_bytes);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_in_use_bytes", "gauge", "HTTP/2 request-body bytes retained in stream mailboxes", http.h2_body_buffer_in_use_bytes);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_peak_bytes", "gauge", "Peak HTTP/2 request-body mailbox bytes since process start", http.h2_body_buffer_peak_bytes);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http2_body_buffer_rejected_total", "counter", "HTTP/2 DATA frames rejected by aggregate body budget", http.h2_body_buffer_rejected_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_in_use_bytes", "gauge", "HTTP request-body bytes admitted across HTTP/1 and HTTP/2", http.body_buffer_in_use_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_peak_bytes", "gauge", "Peak admitted HTTP request-body bytes since process start", http.body_buffer_peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_rejected_total", "counter", "HTTP request bodies rejected by aggregate memory admission", http.body_buffer_rejected_total);
         }
     }
 };
@@ -2462,10 +2462,10 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
-        // Bound aggregate H2 request-body buffering independently from query
-        // execution. Four maximum-sized public requests may complete while
-        // excess uploads are shed before allocator pressure becomes systemic.
-        .h2_body_buffer_budget_bytes = 256 * 1024 * 1024,
+        // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
+        // Four maximum-sized public requests may complete while excess uploads
+        // are shed before allocator pressure becomes systemic.
+        .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
         // Query execution admits 32 requests. Apply the same bound while H1
         // bodies are still streaming so the remaining public connections can
         // service health, control, and recovery traffic.
@@ -5353,6 +5353,7 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
     try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);

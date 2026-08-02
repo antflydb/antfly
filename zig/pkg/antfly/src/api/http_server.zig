@@ -8682,7 +8682,6 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const std.atomic.Value(bool),
     ) ![]u8 {
         try ensureRequestActive(cancellation);
-        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
             var result = self.executePlainPublicTableQuery(
@@ -8733,7 +8732,6 @@ pub const ApiHttpServer = struct {
         defer contract_req.deinit();
 
         try ensureRequestActive(cancellation);
-        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -8770,7 +8768,6 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        try ensureRequestActive(cancellation);
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (join_req) |owned_join| {
@@ -8872,11 +8869,9 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const std.atomic.Value(bool),
     ) anyerror!?[]u8 {
         try ensureRequestActive(cancellation);
-        try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         var parsed_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
-        try ensureRequestActive(cancellation);
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         const request = &parsed_request.value;
@@ -8889,7 +8884,6 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer foreign_sources.deinit(alloc);
-        try ensureRequestActive(cancellation);
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
 

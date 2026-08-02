@@ -29,7 +29,7 @@ const Http2Settings = types.Http2Settings;
 const StreamManager = stream_mod.StreamManager;
 const Stream = stream_mod.Stream;
 const StreamPriority = stream_mod.StreamPriority;
-const SharedDataBudget = stream_mod.SharedDataBudget;
+const SharedBodyBudget = @import("body_budget.zig").SharedBodyBudget;
 
 /// A received HTTP/2 frame (header + payload).
 pub const Frame = struct {
@@ -76,7 +76,7 @@ pub const H2Connection = struct {
 
     /// Optional aggregate budget shared by all server-side H2 connections.
     /// Each stream reservation is released by Stream.deinit().
-    recv_data_budget: ?*SharedDataBudget = null,
+    recv_data_budget: ?*SharedBodyBudget = null,
 
     /// Timeout for writeDataBlocking to wait for flow-control window space.
     /// Prevents indefinite blocking when a peer stops sending WINDOW_UPDATE.
@@ -341,11 +341,7 @@ pub const H2Connection = struct {
         // A handler can race a peer RST_STREAM while preparing its response.
         // Reject before touching flow-control windows or emitting an empty
         // END_STREAM DATA frame on a reset stream.
-        if (stream.stream_error) |err| {
-            // Aggregate ingress exhaustion is a local admission decision, not
-            // a peer reset: the handler must still be able to return its 429.
-            if (err != error.BodyCapacityExceeded) return err;
-        }
+        if (stream.responseWriteError()) |err| return err;
         if (stream.state == .closed and stream.cancellation.load(.acquire)) return error.StreamReset;
 
         if (data.len > std.math.maxInt(i32)) return error.FlowControlError;
@@ -384,10 +380,7 @@ pub const H2Connection = struct {
         var offset: usize = 0;
         while (offset < data.len) {
             const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-            if (stream.stream_error) |err| {
-                // See writeData(): permit the explicit overload response.
-                if (err != error.BodyCapacityExceeded) return err;
-            }
+            if (stream.responseWriteError()) |err| return err;
 
             const remaining = data.len - offset;
 
@@ -405,9 +398,7 @@ pub const H2Connection = struct {
                     self.send_window_event.reset();
                     // Re-check after reset (receive loop may have updated between our check and reset).
                     const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.stream_error) |err| {
-                        if (err != error.BodyCapacityExceeded) return err;
-                    }
+                    if (s2.responseWriteError()) |err| return err;
                     const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
                     const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
                     if (sw2 == 0 or cw2 == 0) {
@@ -754,12 +745,7 @@ pub const H2Connection = struct {
         // a peer RST_STREAM cannot emit response bytes (or mutate the shared
         // encoder state) after that stream has been reset.
         if (stream) |value| {
-            // BodyCapacityExceeded is deliberately surfaced to the server
-            // handler as HTTP 429. It must not prevent that response from
-            // being serialized; peer terminal errors still fail closed.
-            if (value.stream_error) |err| {
-                if (err != error.BodyCapacityExceeded) return err;
-            }
+            if (value.responseWriteError()) |err| return err;
             // Some existing in-memory callers write an initial HEADERS frame
             // without first registering a stream. A peer reset is always
             // registered and marks cancellation, so guard that closed state
@@ -1017,6 +1003,11 @@ pub const H2Connection = struct {
                 // RFC 7540 §5.1: RST_STREAM on an idle stream is a
                 // connection error (PROTOCOL_ERROR).
                 if (stream.state == .idle) return error.ProtocolError;
+                // A late reset after both halves completed cannot invalidate a
+                // response already delivered with END_STREAM. Servers use this
+                // sequence for early 429 responses followed by a reset that
+                // stops any remaining request upload.
+                if (stream.state == .closed) return;
                 stream.cancellation.store(true, .release);
                 stream.stream_error = error.StreamReset;
                 stream.completed = true;
@@ -2359,7 +2350,7 @@ test "deliverToMailbox fails closed when cumulative DATA accounting overflows" {
 
 test "deliverToMailbox enforces and releases shared DATA budget across streams" {
     const allocator = std.testing.allocator;
-    var budget = stream_mod.SharedDataBudget.init(5);
+    var budget = SharedBodyBudget.init(5);
     var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
     server.recv_data_budget = &budget;
@@ -3061,6 +3052,27 @@ test "RST_STREAM signals the stream cancellation before waking its handler" {
     try std.testing.expect(stream.cancellation.load(.acquire));
     try std.testing.expect(stream.completed);
     try std.testing.expectEqual(error.StreamReset, stream.stream_error.?);
+}
+
+test "late RST_STREAM does not invalidate a completed response" {
+    const allocator = std.testing.allocator;
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+
+    const stream = try client.stream_manager.createStream();
+    stream.sendEndStream();
+    stream.completed = true;
+    stream.receiveEndStream();
+    try std.testing.expectEqual(.closed, stream.state);
+
+    const rst_payload = stream_mod.buildRstStreamPayload(.enhance_your_calm);
+    var frame = Frame{
+        .header = .{ .length = 4, .frame_type = .rst_stream, .flags = 0, .stream_id = stream.id },
+        .payload = @constCast(&rst_payload),
+    };
+    try client.deliverToMailbox(&frame);
+    try std.testing.expect(stream.stream_error == null);
+    try std.testing.expect(!stream.cancellation.load(.acquire));
 }
 
 test "sendHeaders emits no response bytes after peer RST_STREAM" {

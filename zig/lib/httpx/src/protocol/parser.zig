@@ -17,6 +17,7 @@ const headers_mod = @import("../core/headers.zig");
 const Headers = headers_mod.Headers;
 const containsToken = headers_mod.containsToken;
 const Status = @import("../core/status.zig").Status;
+const SharedBodyBudget = @import("body_budget.zig").SharedBodyBudget;
 
 /// Parser state machine states.
 pub const ParserState = enum {
@@ -45,6 +46,7 @@ pub const ErrorReason = enum {
     header_too_large,
     too_many_headers,
     body_too_large,
+    body_capacity_exceeded,
     invalid_header,
     invalid_chunk_encoding,
     malformed_request_line,
@@ -77,6 +79,11 @@ pub const Parser = struct {
     max_header_size: usize = 8192,
     max_headers: usize = 100,
     max_body_size: usize = 100 * 1024 * 1024, // 100 MB
+    /// Optional process-wide reservation shared by all inbound connections.
+    /// Fixed-length bodies reserve once at header completion; chunked bodies
+    /// reserve incrementally as decoded payload bytes arrive.
+    body_budget: ?*SharedBodyBudget = null,
+    body_budget_reserved: usize = 0,
     header_bytes: usize = 0,
     header_count: usize = 0,
     total_body_bytes: usize = 0,
@@ -108,6 +115,7 @@ pub const Parser = struct {
 
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
+        self.releaseBodyBudget();
         self.headers.deinit();
         self.body_buffer.deinit(self.allocator);
         self.line_buffer.deinit(self.allocator);
@@ -195,6 +203,7 @@ pub const Parser = struct {
 
     /// Resets the parser for reuse.
     pub fn reset(self: *Self) void {
+        self.releaseBodyBudget();
         self.state = .start;
         self.error_reason = .none;
         self.method = null;
@@ -227,6 +236,21 @@ pub const Parser = struct {
         self.header_bytes = 0;
         self.header_count = 0;
         self.total_body_bytes = 0;
+    }
+
+    fn releaseBodyBudget(self: *Self) void {
+        if (self.body_budget) |budget| budget.release(self.body_budget_reserved);
+        self.body_budget_reserved = 0;
+    }
+
+    fn reserveBodyBytes(self: *Self, amount: usize) !void {
+        const budget = self.body_budget orelse return;
+        if (!budget.tryReserve(amount)) {
+            self.state = .err;
+            self.error_reason = .body_capacity_exceeded;
+            return error.BodyCapacityExceeded;
+        }
+        self.body_budget_reserved += amount;
     }
 
     fn checkLineBufferLimit(self: *Self) !void {
@@ -363,7 +387,7 @@ pub const Parser = struct {
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             try self.bumpHeaderBytes(0);
-            self.determineBodyState();
+            try self.determineBodyState();
             return lr.consumed;
         }
 
@@ -416,7 +440,7 @@ pub const Parser = struct {
         return lr.consumed;
     }
 
-    fn determineBodyState(self: *Self) void {
+    fn determineBodyState(self: *Self) !void {
         // RFC 7230 §3.3.3: reject messages with both Content-Length and
         // Transfer-Encoding to prevent request smuggling.
         if (self.chunked and self.content_length != null) {
@@ -442,10 +466,12 @@ pub const Parser = struct {
                 return;
             }
             if (len > 0) {
-                // Pre-allocate the body buffer to avoid repeated reallocs
-                // during incremental parsing of fixed-length bodies.
+                const body_len: usize = @intCast(len);
                 if (self.store_body) {
-                    self.body_buffer.ensureTotalCapacity(self.allocator, @intCast(len)) catch {};
+                    try self.reserveBodyBytes(body_len);
+                    // Pre-allocate the body buffer to avoid repeated reallocs
+                    // during incremental parsing of fixed-length bodies.
+                    try self.body_buffer.ensureTotalCapacity(self.allocator, body_len);
                 }
                 self.state = .body;
             } else {
@@ -484,6 +510,7 @@ pub const Parser = struct {
             return error.BodyTooLarge;
         }
         if (self.store_body) {
+            try self.reserveBodyBytes(data.len);
             try self.body_buffer.appendSlice(self.allocator, data);
         }
         return data.len;
@@ -535,6 +562,7 @@ pub const Parser = struct {
         }
 
         if (self.store_body) {
+            try self.reserveBodyBytes(to_read);
             try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
         }
         self.bytes_read += to_read;
@@ -722,6 +750,55 @@ test "Parser frames a partial large body without storing it" {
     try std.testing.expect(!parser.isComplete());
     try std.testing.expectEqual(@as(usize, 0), parser.body_buffer.items.len);
     try std.testing.expectEqual(@as(usize, 0), parser.body_buffer.capacity);
+}
+
+test "Parser reserves fixed request bodies before allocation and releases on reset" {
+    const allocator = std.testing.allocator;
+    var budget = SharedBodyBudget.init(5);
+
+    var first = Parser.init(allocator);
+    defer first.deinit();
+    first.body_budget = &budget;
+    _ = try first.feed("POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 4), budget.stats().in_use);
+    try std.testing.expect(first.body_buffer.capacity >= 4);
+
+    var rejected = Parser.init(allocator);
+    defer rejected.deinit();
+    rejected.body_budget = &budget;
+    try std.testing.expectError(
+        error.BodyCapacityExceeded,
+        rejected.feed("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n"),
+    );
+    try std.testing.expectEqual(.body_capacity_exceeded, rejected.getErrorReason());
+    try std.testing.expectEqual(@as(usize, 4), budget.stats().in_use);
+
+    first.reset();
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    rejected.reset();
+    _ = try rejected.feed("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n12345");
+    try std.testing.expect(rejected.isComplete());
+    try std.testing.expectEqual(@as(usize, 5), budget.stats().in_use);
+}
+
+test "Parser applies shared body admission incrementally to chunked requests" {
+    const allocator = std.testing.allocator;
+    var budget = SharedBodyBudget.init(5);
+
+    var first = Parser.init(allocator);
+    defer first.deinit();
+    first.body_budget = &budget;
+    _ = try first.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 3), budget.stats().in_use);
+
+    var rejected = Parser.init(allocator);
+    defer rejected.deinit();
+    rejected.body_budget = &budget;
+    try std.testing.expectError(
+        error.BodyCapacityExceeded,
+        rejected.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\ndef\r\n0\r\n\r\n"),
+    );
+    try std.testing.expectEqual(@as(usize, 3), budget.stats().in_use);
 }
 
 test "header size limit returns HeaderTooLarge" {

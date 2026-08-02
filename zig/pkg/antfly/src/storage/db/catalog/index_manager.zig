@@ -2136,6 +2136,50 @@ pub const IndexManager = struct {
         return self.failed_index_loads.count() > 0;
     }
 
+    /// Refresh schema-derived mapping state for text indexes that have not
+    /// published any documents yet. Table creation can provision the default
+    /// full-text index before its schema metadata is committed locally; without
+    /// this refresh, early writes are projected with dynamic mappings and become
+    /// unreachable through the declared field after a clean restart.
+    ///
+    /// Non-empty generations are deliberately immutable here. Schema migration
+    /// serves those through their versioned runtime until a new generation is
+    /// built and promoted.
+    pub fn refreshEmptyTextIndexSchemas(self: *IndexManager, store: anytype) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+
+        for (self.text_indexes.items) |*entry| {
+            lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+
+            const snapshot = entry.persistent.acquireSnapshot();
+            const empty = snapshot.liveDocCount() == 0;
+            snapshot.release();
+            if (!empty) continue;
+
+            const runtime_schema = try loadRuntimeSchemaForTextIndex(self.alloc, store, entry.config.name);
+            var runtime_schema_owned = runtime_schema;
+            errdefer if (runtime_schema_owned) |schema| schema_mod.freeSchema(self.alloc, schema);
+
+            var text_analysis = try parseTextAnalysisForIndexConfig(self.alloc, entry.config.config_json, runtime_schema_owned);
+            var text_analysis_owned = true;
+            errdefer if (text_analysis_owned) introducer_mod.freeTextAnalysisConfig(self.alloc, text_analysis);
+            try appendObservedFieldAnalyzers(self.alloc, &text_analysis, entry.observed_field_analyzers);
+            try publishFullTextDictionaryRegistry(store, self.alloc, entry.config.name, text_analysis);
+
+            const previous_schema = entry.runtime_schema;
+            const previous_analysis = entry.text_analysis;
+            entry.runtime_schema = runtime_schema_owned;
+            entry.text_analysis = text_analysis;
+            runtime_schema_owned = null;
+            text_analysis_owned = false;
+
+            if (previous_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+            introducer_mod.freeTextAnalysisConfig(self.alloc, previous_analysis);
+        }
+    }
+
     pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -19913,6 +19957,53 @@ test "declared runtime sortable field capability is queryable for empty index" {
     try std.testing.expect(capabilities[0].sortable);
     try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
     try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
+}
+
+test "empty text index refreshes schema committed after index provisioning" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+    try std.testing.expect(manager.textIndexEntry("full_text_index_v0").?.runtime_schema == null);
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    const schema = schema_mod.TableSchema{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    };
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, schema));
+    try manager.refreshEmptyTextIndexSchemas(&store);
+
+    const entry = manager.textIndexEntry("full_text_index_v0").?;
+    const runtime_schema = entry.runtime_schema.?;
+    try std.testing.expectEqual(@as(usize, 1), runtime_schema.full_text_documents.len);
+    try std.testing.expectEqualStrings("state", runtime_schema.full_text_documents[0].fields[0].emitted_name);
+    try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
 }
 
 test "observed dynamic sortable field capability stays declared for sparse doc values" {
