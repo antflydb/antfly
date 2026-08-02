@@ -1064,40 +1064,6 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
     };
 }
 
-/// Read MemTotal / MemAvailable from /proc/meminfo (values are in kB). Returns
-/// null if the file is unreadable or MemTotal is missing, so callers fall back
-/// to their conservative defaults on unsupported hosts.
-fn probeSystemMemoryInfoLinux() ?SystemMemoryInfo {
-    if (builtin.os.tag != .linux) return null;
-    var file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return null;
-    defer file.close();
-    var buf: [4096]u8 = undefined;
-    const n = file.read(&buf) catch return null;
-    const contents = buf[0..n];
-
-    const parseKb = struct {
-        fn get(text: []const u8, key: []const u8) ?u64 {
-            const idx = std.mem.indexOf(u8, text, key) orelse return null;
-            var rest = text[idx + key.len ..];
-            // Skip the ':' and any leading whitespace before the number.
-            while (rest.len > 0 and (rest[0] == ':' or rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
-            var end: usize = 0;
-            while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
-            if (end == 0) return null;
-            const kb = std.fmt.parseUnsigned(u64, rest[0..end], 10) catch return null;
-            return kb * 1024;
-        }
-    }.get;
-
-    const total = parseKb(contents, "MemTotal") orelse return null;
-    if (total == 0) return null;
-    const available = parseKb(contents, "MemAvailable");
-    return .{
-        .total_bytes = @intCast(total),
-        .available_bytes = if (available) |a| @intCast(@min(a, total)) else null,
-    };
-}
-
 fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits {
     const total = info.total_bytes;
     const available = info.available_bytes orelse total;
