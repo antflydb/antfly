@@ -2428,10 +2428,15 @@ pub fn parseQueryRequestWithDeadline(
     try ensureQueryActive(execution_deadline_ns, cancellation);
     const body_for_contract = contract_body orelse effective_body;
 
-    var parsed = ant_json.parseFromSlice(
+    var contract_value = parseJsonValueCancellable(alloc, body_for_contract, execution_deadline_ns, cancellation) catch |err| switch (err) {
+        error.Cancelled, error.Timeout => return err,
+        else => return classifyPublicFilterContractErrorAlloc(alloc, effective_body),
+    };
+    defer contract_value.deinit();
+    var parsed = ant_json.parseFromValue(
         metadata_openapi.QueryRequest,
         alloc,
-        body_for_contract,
+        contract_value.value,
         .{},
     ) catch return classifyPublicFilterContractErrorAlloc(alloc, effective_body);
     defer parsed.deinit();
@@ -2448,9 +2453,9 @@ pub fn parseQueryRequestWithDeadline(
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
     req.execution_deadline_ns = execution_deadline_ns;
-    try applyPublicHierarchyControls(alloc, effective_body, &req);
-    req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body);
-    try parseInternalDocIdConstraintsAlloc(alloc, effective_body, &req);
+    try applyPublicHierarchyControls(alloc, effective_body, execution_deadline_ns, cancellation, &req);
+    req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body, execution_deadline_ns, cancellation);
+    try parseInternalDocIdConstraintsAlloc(alloc, effective_body, execution_deadline_ns, cancellation, &req);
     try ensureQueryActive(execution_deadline_ns, cancellation);
 
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
@@ -9217,11 +9222,11 @@ fn queryBodyHasPublicHierarchyControls(alloc: std.mem.Allocator, body: []const u
 fn applyPublicHierarchyControls(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     req: *db_mod.types.SearchRequest,
 ) !void {
-    if (!(try queryBodyHasPublicHierarchyControls(alloc, body))) return;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = try parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const hierarchy = parsed.value.object.get("hierarchy") orelse return;
@@ -9690,11 +9695,11 @@ fn parseInternalFilterJsonStringAlloc(alloc: std.mem.Allocator, value: std.json.
 fn parseInternalDocIdConstraintsAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     req: *db_mod.types.SearchRequest,
 ) !void {
-    if (!(try queryBodyHasInternalShardFields(alloc, body))) return;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return;
+    var parsed = try parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
     defer parsed.deinit();
     if (parsed.value != .object) return;
 
@@ -9745,10 +9750,12 @@ fn parseInternalDocIdArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value)
 fn parseDistributedTextStatsAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) ![]const @import("../search/distributed_stats.zig").TextFieldStats {
     const distributed_stats_mod = @import("../search/distributed_stats.zig");
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return &.{};
+    var parsed = try parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
     defer parsed.deinit();
     if (parsed.value != .object) return &.{};
     const encoded = parsed.value.object.get("_distributed_text_stats") orelse return &.{};
