@@ -8644,7 +8644,10 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        const request_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body, null);
+        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body, null) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            else => return error.InternalFailure,
+        };
         return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request_deadline_ns, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
