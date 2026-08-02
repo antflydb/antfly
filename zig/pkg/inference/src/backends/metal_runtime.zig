@@ -6214,18 +6214,32 @@ pub fn decoderRuntimeTrainingAdamWF32(
     return true;
 }
 
+/// Batched AdamW options. Bias correction is deliberately absent: each batch
+/// item carries its own, because a parameter gated out of an optimizer step
+/// does not advance its Adam step count.
+pub const TrainingAdamWBatchOptions = struct {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32 = 1.0,
+};
+
 pub const TrainingAdamWBatch = struct {
     weight: MetalTensor,
     grad: MetalTensor,
     m: MetalTensor,
     v: MetalTensor,
     elem_count: usize,
+    bias_correction1: f32,
+    bias_correction2: f32,
 };
 
 pub fn decoderRuntimeTrainingAdamWManyF32(
     self: anytype,
     batch: []const TrainingAdamWBatch,
-    opts: TrainingAdamWOptions,
+    opts: TrainingAdamWBatchOptions,
 ) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
@@ -6251,6 +6265,10 @@ pub fn decoderRuntimeTrainingAdamWManyF32(
     defer allocator.free(v_offsets);
     var elem_counts = try allocator.alloc(usize, batch.len);
     defer allocator.free(elem_counts);
+    var bias_correction1s = try allocator.alloc(f32, batch.len);
+    defer allocator.free(bias_correction1s);
+    var bias_correction2s = try allocator.alloc(f32, batch.len);
+    defer allocator.free(bias_correction2s);
 
     for (batch, 0..) |item, idx| {
         if (!item.weight.isDevice() or !item.grad.isDevice() or !item.m.isDevice() or !item.v.isDevice()) return false;
@@ -6264,6 +6282,8 @@ pub fn decoderRuntimeTrainingAdamWManyF32(
         v_handles[idx] = item.v.deviceHandle();
         v_offsets[idx] = item.v.deviceByteOffset();
         elem_counts[idx] = item.elem_count;
+        bias_correction1s[idx] = item.bias_correction1;
+        bias_correction2s[idx] = item.bias_correction2;
     }
 
     const rc = termite_metal_decode_runtime_training_adamw_many_f32(
@@ -6277,14 +6297,14 @@ pub fn decoderRuntimeTrainingAdamWManyF32(
         v_handles.ptr,
         v_offsets.ptr,
         elem_counts.ptr,
+        bias_correction1s.ptr,
+        bias_correction2s.ptr,
         batch.len,
         opts.lr,
         opts.beta1,
         opts.beta2,
         opts.eps,
         opts.weight_decay,
-        opts.bias_correction1,
-        opts.bias_correction2,
         opts.grad_scale,
     );
     if (rc != 0) return error.MetalTrainingAdamWFailed;
@@ -10423,14 +10443,14 @@ pub extern fn termite_metal_decode_runtime_training_adamw_many_f32(
     v_handles: [*]const ?*anyopaque,
     v_offsets: [*]const usize,
     elem_counts: [*]const usize,
+    bias_correction1s: [*]const f32,
+    bias_correction2s: [*]const f32,
     input_count: usize,
     lr: f32,
     beta1: f32,
     beta2: f32,
     eps: f32,
     weight_decay: f32,
-    bias_correction1: f32,
-    bias_correction2: f32,
     grad_scale: f32,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_training_sumsq_f32(

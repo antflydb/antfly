@@ -329,6 +329,28 @@ test "legacy entity rows become one upstream entities task" {
     try std.testing.expectEqual(@as(usize, 3), task.fields.len);
 }
 
+test "legacy entity rows reject Unicode annotations instead of using ASCII matching" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"text":"ÉCOLE","entities":[{"text":"école","label":"place","start":0,"end":6}]}
+        \\
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "legacy-unicode.jsonl", .data = data });
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/legacy-unicode.jsonl", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    try std.testing.expectError(
+        error.UnsupportedLegacyUnicodeAnnotation,
+        gliner2_data.loadExamples(allocator, path, null),
+    );
+    try std.testing.expectError(
+        error.UnsupportedLegacyUnicodeAnnotation,
+        gliner2_data.loadTrainingRecords(allocator, path, null),
+    );
+}
+
 test "entity schemas preserve empty labels as negative supervision" {
     const allocator = std.testing.allocator;
     var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_negative_entity_schema_smoke.jsonl", null);
@@ -478,6 +500,20 @@ test "malformed upstream schema conditioning metadata fails closed in both loade
             \\
             ,
             .expected = error.InvalidClassificationLabelDescriptions,
+        },
+        .{
+            .data =
+            \\{"input":"Good.","output":{"classifications":[{"task":"sentiment","labels":["positive"],"true_label":["positive"],"label_descriptions":{"negative":"unfavorable"}}]}}
+            \\
+            ,
+            .expected = error.UnknownLabelDescription,
+        },
+        .{
+            .data =
+            \\{"input":"Good.","output":{"classifications":[{"task":"sentiment","labels":["positive"],"true_label":["positive"],"examples":[["Bad.","negative"]]}]}}
+            \\
+            ,
+            .expected = error.UnknownClassificationExampleLabel,
         },
         .{
             .data =

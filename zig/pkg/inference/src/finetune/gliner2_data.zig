@@ -17,6 +17,8 @@ const compat = @import("../io/compat.zig");
 const upstream_unicode = @import("gliner2_unicode_tables.zig");
 
 pub const upstream_unicode_version = upstream_unicode.unicode_version;
+pub const canonical_scoring_normalization = "unicode_nfc_collapsed_whitespace_casefold/v1";
+pub const canonical_scoring_normalization_profile = "Unicode 15 NFC-inert/simple-casefold subset; unsupported values fail closed";
 
 pub const Entity = struct {
     text: []const u8,
@@ -2859,7 +2861,15 @@ fn appendLegacyEntityTasks(
         if (invalidSchemaIdentifier(label)) return error.InvalidEntitySchema;
         const start = try jsonUsize(obj.get("start") orelse return error.InvalidGliner2Example);
         const end = try jsonUsize(obj.get("end") orelse return error.InvalidGliner2Example);
-        if (mention.len == 0 or end > text.len or start >= end or !std.ascii.eqlIgnoreCase(text[start..end], mention)) return error.AnnotationNotFound;
+        if (mention.len == 0 or end > text.len or start >= end) return error.AnnotationNotFound;
+        // The legacy {text, entities} contract historically used ASCII-only
+        // case-insensitive matching. Reject non-ASCII annotations instead of
+        // silently applying the wrong comparison; Unicode-capable datasets
+        // should use the upstream {input, output} task contract.
+        if (containsNonAscii(text[start..end]) or containsNonAscii(mention)) {
+            return error.UnsupportedLegacyUnicodeAnnotation;
+        }
+        if (!std.ascii.eqlIgnoreCase(text[start..end], mention)) return error.AnnotationNotFound;
         if (char_to_word[start] < 0 or char_to_word[end - 1] < 0 or
             (start > 0 and char_to_word[start - 1] == char_to_word[start]) or
             (end < char_to_word.len and char_to_word[end] == char_to_word[end - 1]))
@@ -2995,7 +3005,11 @@ fn appendLegacyEntitiesFromJson(
         if (invalidSchemaIdentifier(label)) return error.InvalidEntitySchema;
         const start = try jsonUsize(obj.get("start") orelse return error.InvalidGliner2Example);
         const end = try jsonUsize(obj.get("end") orelse return error.InvalidGliner2Example);
-        if (entity_text.len == 0 or end > text.len or start >= end or !std.ascii.eqlIgnoreCase(text[start..end], entity_text)) return error.AnnotationNotFound;
+        if (entity_text.len == 0 or end > text.len or start >= end) return error.AnnotationNotFound;
+        if (containsNonAscii(text[start..end]) or containsNonAscii(entity_text)) {
+            return error.UnsupportedLegacyUnicodeAnnotation;
+        }
+        if (!std.ascii.eqlIgnoreCase(text[start..end], entity_text)) return error.AnnotationNotFound;
         try entities.append(allocator, .{
             .text = text[start..end],
             .label = label,
@@ -3100,6 +3114,23 @@ fn validateUpstreamSchema(output: std.json.ObjectMap) !void {
         if (cls.get("multi_label")) |multi_label| if (multi_label != .bool) return error.InvalidClassificationMultiLabel;
         if (cls.get("examples")) |examples| if (!validClassificationExamples(examples)) return error.InvalidClassificationExamples;
         if (cls.get("label_descriptions")) |descriptions| if (!validDescriptionMap(descriptions)) return error.InvalidClassificationLabelDescriptions;
+        if (cls.get("labels")) |labels| if (labels == .array) {
+            if (cls.get("label_descriptions")) |descriptions| if (descriptions == .object) {
+                var description_iter = descriptions.object.iterator();
+                while (description_iter.next()) |entry| {
+                    if (!jsonStringArrayContains(labels.array.items, entry.key_ptr.*)) return error.UnknownLabelDescription;
+                }
+            };
+            if (cls.get("examples")) |examples| if (examples == .array) {
+                for (examples.array.items) |example| {
+                    if (example == .array and example.array.items.len == 2 and example.array.items[1] == .string and
+                        !jsonStringArrayContains(labels.array.items, example.array.items[1].string))
+                    {
+                        return error.UnknownClassificationExampleLabel;
+                    }
+                }
+            };
+        };
         if (cls.get("task")) |task| if (task == .string and invalidSchemaIdentifier(task.string)) {
             return error.InvalidClassificationSchema;
         };
@@ -3111,6 +3142,13 @@ fn validateUpstreamSchema(output: std.json.ObjectMap) !void {
             }
         }
     }
+}
+
+fn jsonStringArrayContains(values: []const std.json.Value, needle: []const u8) bool {
+    for (values) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, needle)) return true;
+    }
+    return false;
 }
 
 fn validDescriptionMap(value: std.json.Value) bool {
@@ -3150,7 +3188,7 @@ fn parseLabelDescriptions(
     defer out.deinit(allocator);
     var iter = descriptions.object.iterator();
     while (iter.next()) |entry| {
-        if (!sliceContainsString(labels, entry.key_ptr.*)) continue;
+        if (!sliceContainsString(labels, entry.key_ptr.*)) return error.UnknownLabelDescription;
         try out.append(allocator, .{
             .label = entry.key_ptr.*,
             .description = entry.value_ptr.string,
@@ -3169,7 +3207,7 @@ fn parseClassificationExamples(
     defer out.deinit(allocator);
     for (examples.array.items) |example| {
         const output = example.array.items[1].string;
-        if (!sliceContainsString(labels, output)) continue;
+        if (!sliceContainsString(labels, output)) return error.UnknownClassificationExampleLabel;
         try out.append(allocator, .{
             .input = example.array.items[0].string,
             .output = output,
@@ -3180,6 +3218,72 @@ fn parseClassificationExamples(
 
 fn invalidSchemaIdentifier(value: []const u8) bool {
     return value.len == 0 or std.ascii.isWhitespace(value[0]) or std.ascii.isWhitespace(value[value.len - 1]);
+}
+
+fn containsNonAscii(value: []const u8) bool {
+    for (value) |byte| {
+        if (byte >= 0x80) return true;
+    }
+    return false;
+}
+
+const CanonicalScoringIterator = struct {
+    iterator: std.unicode.Utf8Iterator,
+    pending_codepoint: ?u21 = null,
+    pending_space: bool = false,
+    emitted_value: bool = false,
+
+    fn init(value: []const u8) !CanonicalScoringIterator {
+        const view = std.unicode.Utf8View.init(value) catch return error.InvalidUtf8;
+        return .{ .iterator = view.iterator() };
+    }
+
+    fn next(self: *CanonicalScoringIterator) !?u21 {
+        if (self.pending_codepoint) |cp| {
+            self.pending_codepoint = null;
+            self.emitted_value = true;
+            return cp;
+        }
+        while (self.iterator.nextCodepoint()) |cp| {
+            if (upstream_unicode.isWhitespace(cp)) {
+                if (self.emitted_value) self.pending_space = true;
+                continue;
+            }
+            // The Python oracle first applies NFC and then full casefold. Zig
+            // admits only concatenation-safe, normalization-inert scalars
+            // whose casefold is exactly one pinned simple-lower scalar. This
+            // is intentionally conservative and errors instead of silently
+            // producing a different score for unsupported Unicode.
+            if (!upstream_unicode.isPinnedNormalizerInert(cp)) return error.UnsupportedCanonicalNormalization;
+            if (!upstream_unicode.isSimpleCasefold(cp)) return error.UnsupportedCanonicalCasefold;
+            const folded = upstream_unicode.simpleLower(cp);
+            if (self.pending_space) {
+                self.pending_space = false;
+                self.pending_codepoint = folded;
+                return ' ';
+            }
+            self.emitted_value = true;
+            return folded;
+        }
+        // A pending separator is trailing whitespace and is discarded.
+        self.pending_space = false;
+        return null;
+    }
+};
+
+/// Compare exact-match atoms with the release scoring contract. The admitted
+/// Zig profile is a fail-closed subset of Python's NFC + whitespace collapse
+/// + casefold behavior; every accepted input has the same canonical value.
+pub fn canonicalScoringValueEqual(lhs: []const u8, rhs: []const u8) !bool {
+    var lhs_iter = try CanonicalScoringIterator.init(lhs);
+    var rhs_iter = try CanonicalScoringIterator.init(rhs);
+    var equal = true;
+    while (true) {
+        const lhs_cp = try lhs_iter.next();
+        const rhs_cp = try rhs_iter.next();
+        if (lhs_cp != rhs_cp) equal = false;
+        if (lhs_cp == null and rhs_cp == null) return equal;
+    }
 }
 
 fn rejectInvalidChoiceIdentifiers(value: std.json.Value) !void {

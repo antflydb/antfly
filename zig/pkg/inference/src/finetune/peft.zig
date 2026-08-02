@@ -742,7 +742,7 @@ pub fn runEvalCapture(
         .stopped => |sig| .{
             .phase = phase,
             .term = "stopped",
-            .signal = @intFromEnum(sig),
+            .signal = sig,
             .stdout = result.stdout,
             .stderr = result.stderr,
             .success = false,

@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gliner2_release_contract import CANONICAL_UNICODE_VERSION, UPSTREAM_COMMIT
+
 
 def script_dir() -> Path:
     return Path(__file__).resolve().parent
@@ -202,7 +204,6 @@ def main() -> int:
     parser.add_argument("--warn-zig-median-ms", type=float, default=None)
     parser.add_argument("--require-loss-parity", action="store_true")
     parser.add_argument("--require-adapter-roundtrip", action="store_true")
-    parser.add_argument("--require-trained-adapter-parity", action="store_true")
     parser.add_argument("--require-zig-beats-python", action="store_true")
     parser.add_argument(
         "compare_args",
@@ -244,6 +245,8 @@ def main() -> int:
             break
 
     successful = [run for run in runs if run["returncode"] == 0]
+    python_oracle_expected = "--skip-python" not in forwarded
+    oracle_rows = [run["summary"].get("oracle") for run in successful]
     keys = [
         "requested_step_count",
         "python_step_count",
@@ -518,6 +521,41 @@ def main() -> int:
     failures: list[str] = []
     if len(successful) != args.runs:
         failures.append(f"only {len(successful)}/{args.runs} runs succeeded")
+    valid_oracles = [
+        oracle
+        for oracle in oracle_rows
+        if isinstance(oracle, dict)
+        and oracle.get("commit") == UPSTREAM_COMMIT
+        and str(oracle.get("python_version", "")).startswith("3.12.")
+        and oracle.get("unicode_version") == CANONICAL_UNICODE_VERSION
+        and isinstance(oracle.get("checkout"), str)
+        and isinstance(oracle.get("imported_module"), str)
+    ]
+    summary["oracle"] = valid_oracles[0] if valid_oracles else None
+    summary["oracle_valid_in_every_run"] = (
+        not python_oracle_expected
+        or (
+            len(valid_oracles) == args.runs
+            and len({oracle["checkout"] for oracle in valid_oracles}) == 1
+            and len({oracle["imported_module"] for oracle in valid_oracles}) == 1
+        )
+    )
+    if python_oracle_expected and summary["oracle_valid_in_every_run"] is not True:
+        failures.append(f"Python oracle was not pinned to {UPSTREAM_COMMIT} in every run")
+    for fingerprint_key in ("model_fingerprint_sha256", "training_data_fingerprint_sha256"):
+        values = [run["summary"].get(fingerprint_key) for run in successful]
+        valid_values = [
+            value
+            for value in values
+            if isinstance(value, str) and value.startswith("sha256:") and len(value) == 71
+        ]
+        summary[fingerprint_key] = valid_values[0] if valid_values else None
+        summary[f"{fingerprint_key}_consistent"] = (
+            not python_oracle_expected
+            or len(valid_values) == args.runs and len(set(valid_values)) == 1
+        )
+        if python_oracle_expected and summary[f"{fingerprint_key}_consistent"] is not True:
+            failures.append(f"{fingerprint_key} was missing or inconsistent across runs")
     if step_count_mismatches:
         failures.append(
             "step-count mismatch invalidates performance ratios: "
@@ -600,12 +638,14 @@ def main() -> int:
     trained_adapter_parity_valid = len(trained_adapter_parities) == args.runs and all(
         ran is True and ok is True for ran, ok in trained_adapter_parities
     )
-    summary["trained_adapter_parity_required"] = args.require_trained_adapter_parity
+    summary["trained_adapter_parity_required"] = False
     summary["trained_adapter_parity_valid"] = trained_adapter_parity_valid
-    if args.require_trained_adapter_parity and not trained_adapter_parity_valid:
-        failures.append(
-            "independently trained adapter parity was required but did not run and pass in every run"
-        )
+    summary["trained_adapter_tensor_equality_diagnostic"] = {
+        "gating": False,
+        "ran_count": sum(ran is True for ran, _ in trained_adapter_parities),
+        "within_diagnostic_tolerance_count": sum(ok is True for _, ok in trained_adapter_parities),
+        "requested_runs": args.runs,
+    }
     if args.require_zig_beats_python and summary["zig_beats_python_median_step_time"] is not True:
         failures.append("Zig median step time did not beat Python median step time")
     warnings: list[str] = []

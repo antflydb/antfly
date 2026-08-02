@@ -986,6 +986,7 @@ fn fillFullTaskEvalTargets(
     const start_idx_offset = 5 * E;
     const parent_idx_offset = gliner2_autodiff.gliner2TotalLossParentIndexOffset(E);
     const task_groups_offset = gliner2_autodiff.gliner2TotalLossTaskGroupsOffset(E, max_instances);
+    const active_fields_offset = gliner2_autodiff.gliner2TotalLossActiveFieldsOffset(E, max_instances);
 
     const active = try allocator.alloc(bool, E);
     defer allocator.free(active);
@@ -1013,7 +1014,12 @@ fn fillFullTaskEvalTargets(
             row[schema_idx_offset + label_idx] = @floatFromInt(schema_pos);
             row[row_idx_offset + label_idx] = @floatFromInt(span_idx);
             row[count_idx_offset + label_idx] = @floatFromInt(label_idx);
-            if (active[label_idx]) row[E + label_idx] = 1.0;
+            if (active[label_idx]) {
+                row[E + label_idx] = 1.0;
+                // The count transformer reads schema activity from its own
+                // block; leaving it zero masks out every field at eval time.
+                row[active_fields_offset + label_idx] = 1.0;
+            }
         }
         if (encoded.span_mask[span_idx] <= 0.0) continue;
         const start_word = encoded.span_indices[span_idx * 2];

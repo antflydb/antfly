@@ -96,10 +96,10 @@ pub const GlinerObjective = enum {
     /// First graph-native span objective: gather the span start token hidden
     /// state and score entity labels directly over candidate spans.
     span_start,
-    /// Upstream GLiNER2 total-loss objective. This currently reuses the
-    /// schema-conditioned span-start graph path; classification/count loss
-    /// components are exposed as an explicit parity gap in the harness until
-    /// their graph-native targets are available.
+    /// Upstream GLiNER2 total-loss objective. The graph consumes contextual
+    /// per-sample schema slots and includes entity/span, classification,
+    /// structure/relation, and count components. Cross-runtime parity is gated
+    /// component-by-component by the GLiNER2 release harness.
     gliner2_total_loss,
 };
 
@@ -565,6 +565,27 @@ pub const GlinerAutodiffCtx = struct {
                 Shape.init(.f32, &.{ @intCast(compact_schema_rows), @intCast(H) }),
             );
             self.span_debug_schema_hidden = schema_hidden;
+            // H1: the count-embed attention key mask is the *schema activity*
+            // mask and must never be the structure BCE mask at `[E, 2E)`.
+            // `fillSpanStartTargetsFromEncodedBatchWithOptions` writes that
+            // block per (span, field) as the BCE weight — 1.0, or
+            // `--span-hard-negative-weight` for negatives that overlap a
+            // positive — and the trainer's `applySpanNegativeMask` then
+            // stochastically rewrites entries to 0.0
+            // (`--span-negative-mask-rate`, default 0.5). Gathering it here fed
+            // the negative sampler into `buildCountScaledDotProductAttention`,
+            // which (a) made the schema projection differ between training and
+            // eval (the eval adapter never masks) and (b) let a weight > 1 flip
+            // the additive bias sign: `(1 - 2) * -1e9 = +1e9` pins attention
+            // onto exactly the key it was meant to down-weight, which is
+            // bit-identical to masking every other field out. Upstream applies
+            // the random mask only to the loss weight — `count_embed` always
+            // sees the full schema. The `.span_start` encoder builds one global
+            // entity-type list shared by every sample, so all `E` fields are
+            // genuinely active and the true activity mask is all-ones; keeping
+            // it explicit (rather than passing `null`) leaves the hook in place
+            // should this layout ever gain a real per-sample active-field block
+            // like the total-loss layout's `gliner2TotalLossActiveFieldsOffset`.
             const compact_active_mask_2d = try bld.gather(
                 mask,
                 first_span_rows_i64,
@@ -828,8 +849,14 @@ pub const GlinerAutodiffCtx = struct {
         const schema_hidden = try bld.gather(hidden_flat, schema_idx_i64, Shape.init(.f32, &.{ @intCast(compact_schema_rows), @intCast(H) }));
         self.span_debug_schema_hidden = schema_hidden;
 
-        const mask_2d = try bld.sliceLastDim(targets, @intCast(E), @intCast(2 * E)); // [span_rows, E]
-        const compact_active_2d = try bld.gather(mask_2d, first_span_rows_i64, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }));
+        // Schema activity comes from its own never-mutated block, not from the
+        // structure BCE mask at [E, 2E): the trainer's stochastic negative
+        // masking rewrites that mask in place, and upstream applies the random
+        // mask only to the loss weight — `count_embed` always sees the full
+        // schema.
+        const active_offset: i64 = @intCast(gliner2TotalLossActiveFieldsOffset(@intCast(E), max_gold));
+        const active_2d = try bld.sliceLastDim(targets, active_offset, active_offset + @as(i64, @intCast(E))); // [span_rows, E]
+        const compact_active_2d = try bld.gather(active_2d, first_span_rows_i64, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }));
         const compact_active = try bld.reshape(compact_active_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
 
         // Each active schema field carries its upstream task id. The count
@@ -2759,8 +2786,9 @@ fn gliner2TotalLossBaseTargetWidth(num_entity_types: usize) usize {
 /// (`max_instances * E` each). These tensors preserve repeated values and
 /// independent stochastic negative masks. Every total-loss layout then
 /// appends one task-group id per field so count-transformer attention stays
-/// block-diagonal across upstream schemas; `max_instances == 1` continues to
-/// read labels and masks from the legacy base columns.
+/// block-diagonal across upstream schemas, followed by one active-field flag
+/// per field; `max_instances == 1` continues to read labels and masks from
+/// the legacy base columns.
 pub fn gliner2TotalLossInstanceLabelsOffset(num_entity_types: usize) usize {
     return gliner2TotalLossBaseTargetWidth(num_entity_types);
 }
@@ -2777,8 +2805,17 @@ pub fn gliner2TotalLossTaskGroupsOffset(num_entity_types: usize, max_instances: 
     return gliner2TotalLossBaseTargetWidth(num_entity_types);
 }
 
-pub fn gliner2TotalLossTargetWidthEx(num_entity_types: usize, max_instances: u32) usize {
+/// Which schema fields the count transformer may attend to. Upstream
+/// `_compute_sample_loss` drops zero-count structure schemas before they reach
+/// `count_embed`, so this is narrower than the task-group column (which is
+/// non-zero for every structure field) and cannot be derived from the
+/// structure BCE mask at `[E, 2E)`: `applySpanNegativeMask` mutates that mask.
+pub fn gliner2TotalLossActiveFieldsOffset(num_entity_types: usize, max_instances: u32) usize {
     return gliner2TotalLossTaskGroupsOffset(num_entity_types, max_instances) + num_entity_types;
+}
+
+pub fn gliner2TotalLossTargetWidthEx(num_entity_types: usize, max_instances: u32) usize {
+    return gliner2TotalLossActiveFieldsOffset(num_entity_types, max_instances) + num_entity_types;
 }
 
 pub fn gliner2TotalLossTargetWidth(num_entity_types: usize) usize {
@@ -3409,6 +3446,301 @@ test "span_start objective builds span logits and masked loss" {
     try testing.expectEqual(@as(u8, 2), loss_shape.rank());
     try testing.expectEqual(@as(i64, 1), loss_shape.dim(0));
     try testing.expectEqual(@as(i64, 1), loss_shape.dim(1));
+}
+
+/// Run the already-built graph's single output with `targets` swapped in for
+/// `targets_node`. Caller owns the returned f32 slice.
+fn evalGraphOutputForTargets(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    g: *const Graph,
+    shared_inputs: []const interpreter.RuntimeInput,
+    targets_node: NodeId,
+    targets: []const f32,
+    targets_shape: Shape,
+) ![]f32 {
+    const dims = [2]i32{ @intCast(targets_shape.dim(0)), @intCast(targets_shape.dim(1)) };
+    const targets_ct = try cb.fromFloat32Shape(targets, &dims);
+    defer cb.free(targets_ct);
+
+    const inputs = try allocator.alloc(interpreter.RuntimeInput, shared_inputs.len + 1);
+    defer allocator.free(inputs);
+    @memcpy(inputs[0..shared_inputs.len], shared_inputs);
+    inputs[shared_inputs.len] = .{ .node_id = targets_node, .value = targets_ct };
+
+    var result = try interpreter.execute(allocator, g, cb, .{ .runtime_inputs = inputs });
+    defer result.deinit(cb);
+    return cb.toFloat32(result.outputs[0], allocator);
+}
+
+test "count-embed schema projection is invariant to span negative masking" {
+    const allocator = testing.allocator;
+    const native_compute = @import("../ops/native_compute.zig");
+
+    const graph_batch: u32 = 2;
+    const seq_len: u32 = 8;
+    const max_spans: u32 = 2;
+    const E: usize = 2;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    var ctx = GlinerAutodiffCtx.init(.{
+        .graph_config = tinyConfig(),
+        .num_classes = @intCast(E + 1),
+        .objective = .gliner2_total_loss,
+        .structure_max_instances = 1,
+        .max_schema_tasks = 1,
+    });
+    // buildForward would latch this in the real trainer.
+    ctx.graph_batch = graph_batch;
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{
+        @intCast(graph_batch * seq_len),
+        @intCast(tinyConfig().hidden_size),
+    }));
+    const targets_shape = gliner2TotalLossTargetsShapeEx(graph_batch, max_spans, @intCast(E), 1);
+    const targets_node = try b.parameter("__targets", targets_shape);
+    _ = try GlinerAutodiffCtx.buildLoss(@ptrCast(&ctx), &b, hidden, targets_node);
+    const projection = ctx.span_debug_schema_projection orelse return error.ExpectedSchemaProjectionNode;
+    try g.markOutput(projection);
+
+    const width = gliner2TotalLossTargetWidthEx(E, 1);
+    const task_groups_offset = gliner2TotalLossTaskGroupsOffset(E, 1);
+    const active_offset = gliner2TotalLossActiveFieldsOffset(E, 1);
+    const rows: usize = graph_batch * max_spans;
+
+    const unmasked = try allocator.alloc(f32, rows * width);
+    defer allocator.free(unmasked);
+    @memset(unmasked, 0.0);
+    for (0..rows) |row_idx| {
+        const sample = row_idx / max_spans;
+        const row = unmasked[row_idx * width ..][0..width];
+        for (0..E) |field| {
+            row[E + field] = 1.0;
+            row[2 * E + field] = @floatFromInt(sample * seq_len + 1 + field);
+            row[3 * E + field] = @floatFromInt(row_idx);
+            row[4 * E + field] = @floatFromInt(sample * E + field);
+            row[task_groups_offset + field] = 1.0;
+            row[active_offset + field] = 1.0;
+        }
+        row[5 * E] = @floatFromInt(sample * seq_len + 3);
+        row[5 * E + 1] = @floatFromInt(sample * seq_len + 4);
+    }
+
+    // What mask-rate 1.0 packing produces: every negative loses its structure
+    // BCE mask and nothing else in the row moves.
+    const masked = try allocator.dupe(f32, unmasked);
+    defer allocator.free(masked);
+    for (0..rows) |row_idx| {
+        const row = masked[row_idx * width ..][0..width];
+        for (0..E) |field| row[E + field] = 0.0;
+    }
+
+    // Same rows, but the second schema field is genuinely inactive.
+    const narrowed = try allocator.dupe(f32, unmasked);
+    defer allocator.free(narrowed);
+    for (0..rows) |row_idx| {
+        narrowed[row_idx * width + active_offset + 1] = 0.0;
+    }
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    const cb = compute.computeBackend();
+
+    var owned = std.ArrayListUnmanaged(CT).empty;
+    defer {
+        for (owned.items) |ct| cb.free(ct);
+        owned.deinit(allocator);
+    }
+    var shared_inputs = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
+    defer shared_inputs.deinit(allocator);
+    for (g.parameters.items) |param_id| {
+        if (param_id == targets_node) continue;
+        const shape = g.node(param_id).output_shape;
+        const count: usize = @intCast(shape.numElements() orelse return error.UnexpectedDynamicParameterShape);
+        const data = try allocator.alloc(f32, count);
+        defer allocator.free(data);
+        for (data, 0..) |*dst, idx| {
+            dst.* = 0.25 + 0.5 * @sin(@as(f32, @floatFromInt(idx)) * 0.37 + @as(f32, @floatFromInt(param_id)) * 1.13);
+        }
+        var dims: [ml.graph.shape.max_rank]i32 = undefined;
+        for (0..shape.rank()) |axis| dims[axis] = @intCast(shape.dim(@intCast(axis)));
+        const ct = try cb.fromFloat32Shape(data, dims[0..shape.rank()]);
+        try owned.append(allocator, ct);
+        try shared_inputs.append(allocator, .{ .node_id = param_id, .value = ct });
+    }
+
+    const baseline = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, unmasked, targets_shape);
+    defer allocator.free(baseline);
+    const after_negative_mask = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, masked, targets_shape);
+    defer allocator.free(after_negative_mask);
+    try testing.expectEqualSlices(f32, baseline, after_negative_mask);
+
+    // Guard against a vacuous pass: the active block must still drive the
+    // count transformer's block-diagonal attention.
+    const after_deactivation = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, narrowed, targets_shape);
+    defer allocator.free(after_deactivation);
+    try testing.expect(!std.mem.eql(f32, baseline, after_deactivation));
+}
+
+test "span_start count-embed schema projection ignores the structure BCE mask" {
+    const allocator = testing.allocator;
+    const native_compute = @import("../ops/native_compute.zig");
+
+    const graph_batch: u32 = 2;
+    const seq_len: u32 = 8;
+    const max_spans: u32 = 2;
+    const E: usize = 2;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    var ctx = GlinerAutodiffCtx.init(.{
+        .graph_config = tinyConfig(),
+        .num_classes = @intCast(E + 1),
+        .objective = .span_start,
+    });
+    // buildForward would latch this in the real trainer.
+    ctx.graph_batch = graph_batch;
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{
+        @intCast(graph_batch * seq_len),
+        @intCast(tinyConfig().hidden_size),
+    }));
+    const targets_shape = spanStartTargetsShape(graph_batch, max_spans, @intCast(E));
+    const targets_node = try b.parameter("__targets", targets_shape);
+    _ = try GlinerAutodiffCtx.buildLoss(@ptrCast(&ctx), &b, hidden, targets_node);
+    const projection = ctx.span_debug_schema_projection orelse return error.ExpectedSchemaProjectionNode;
+    try g.markOutput(projection);
+
+    // Unweighted schema+count layout: labels[0:E], mask[E:2E], schema_idx[2E:3E],
+    // row_idx[3E:4E], count_idx[4E:5E], start[5E], end[5E+1].
+    const width = spanStartTargetWidth(E);
+    const mask_offset = E;
+    const schema_idx_offset = 2 * E;
+    const row_idx_offset = 3 * E;
+    const count_idx_offset = 4 * E;
+    const rows: usize = graph_batch * max_spans;
+
+    const baseline_targets = try allocator.alloc(f32, rows * width);
+    defer allocator.free(baseline_targets);
+    @memset(baseline_targets, 0.0);
+    for (0..rows) |row_idx| {
+        const sample = row_idx / max_spans;
+        const ordinal = row_idx % max_spans;
+        const row = baseline_targets[row_idx * width ..][0..width];
+        for (0..E) |field| {
+            // Exactly what the packer writes for a valid span with
+            // `hard_negative_weight == 1`: an all-ones BCE mask row.
+            row[mask_offset + field] = 1.0;
+            row[schema_idx_offset + field] = @floatFromInt(sample * seq_len + 1 + field);
+            row[row_idx_offset + field] = @floatFromInt(row_idx);
+            row[count_idx_offset + field] = @floatFromInt(ordinal * graph_batch * E + sample * E + field);
+        }
+        row[5 * E] = @floatFromInt(sample * seq_len + 3);
+        row[5 * E + 1] = @floatFromInt(sample * seq_len + 4);
+    }
+
+    // (1) `applySpanNegativeMask` dropping field 1's negative. Note the drop has
+    // to be partial to be observable at all: the key bias is uniform over the
+    // key axis when every field is dropped, and softmax subtracts the row max,
+    // so an all-zero mask is a no-op even without the fix.
+    const negative_masked = try allocator.dupe(f32, baseline_targets);
+    defer allocator.free(negative_masked);
+    for (0..rows) |row_idx| {
+        negative_masked[row_idx * width + mask_offset + 1] = 0.0;
+    }
+
+    // (2) `--span-hard-negative-weight 2` on field 0. Through the key-mask path
+    // this yielded `(1 - 2) * -1e9 = +1e9` — the opposite sign — pinning
+    // attention onto field 0 and making the projection bit-identical to (1),
+    // i.e. to masking every other field out entirely.
+    const hard_negative_weighted = try allocator.dupe(f32, baseline_targets);
+    defer allocator.free(hard_negative_weighted);
+    for (0..rows) |row_idx| {
+        hard_negative_weighted[row_idx * width + mask_offset] = 2.0;
+    }
+
+    // (3) Anti-vacuity control: move the schema token indices, which legitimately
+    // select different encoder rows for `schema_hidden`.
+    const schema_shifted = try allocator.dupe(f32, baseline_targets);
+    defer allocator.free(schema_shifted);
+    for (0..rows) |row_idx| {
+        const sample = row_idx / max_spans;
+        const row = schema_shifted[row_idx * width ..][0..width];
+        for (0..E) |field| row[schema_idx_offset + field] = @floatFromInt(sample * seq_len + 5 + field);
+    }
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    const cb = compute.computeBackend();
+
+    var owned = std.ArrayListUnmanaged(CT).empty;
+    defer {
+        for (owned.items) |ct| cb.free(ct);
+        owned.deinit(allocator);
+    }
+    var shared_inputs = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
+    defer shared_inputs.deinit(allocator);
+    for (g.parameters.items) |param_id| {
+        if (param_id == targets_node) continue;
+        const shape = g.node(param_id).output_shape;
+        const count: usize = @intCast(shape.numElements() orelse return error.UnexpectedDynamicParameterShape);
+        const data = try allocator.alloc(f32, count);
+        defer allocator.free(data);
+        // Deterministic but full-rank, and small enough that the count
+        // transformer's attention logits stay unsaturated. A `sin(a*idx + b)`
+        // fill is tempting but useless here: every row of a weight matrix is
+        // then the same sinusoid at a different phase, i.e. the matrix is rank
+        // 2, the whole head collapses onto a 2-D subspace, and even forcing
+        // attention onto a single key moves the projection by only an ULP.
+        var prng = std.Random.DefaultPrng.init(0x5eed_0000 +% @as(u64, param_id));
+        const rng = prng.random();
+        for (data) |*dst| dst.* = 0.25 * (rng.float(f32) - 0.5);
+        var dims: [ml.graph.shape.max_rank]i32 = undefined;
+        for (0..shape.rank()) |axis| dims[axis] = @intCast(shape.dim(@intCast(axis)));
+        const ct = try cb.fromFloat32Shape(data, dims[0..shape.rank()]);
+        try owned.append(allocator, ct);
+        try shared_inputs.append(allocator, .{ .node_id = param_id, .value = ct });
+    }
+
+    const baseline = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, baseline_targets, targets_shape);
+    defer allocator.free(baseline);
+
+    const after_negative_mask = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, negative_masked, targets_shape);
+    defer allocator.free(after_negative_mask);
+    try testing.expectEqualSlices(f32, baseline, after_negative_mask);
+
+    const after_hard_negative_weight = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, hard_negative_weighted, targets_shape);
+    defer allocator.free(after_hard_negative_weight);
+    try testing.expectEqualSlices(f32, baseline, after_hard_negative_weight);
+    for (after_hard_negative_weight) |value| try testing.expect(std.math.isFinite(value));
+
+    // Both BCE-mask perturbations are inert, so no mask value — including one
+    // above 1.0 — can reach the `(1 - mask) * -1e9` key bias and flip its sign.
+    // The control below proves the projection is not simply constant, and that
+    // the fixture is well conditioned enough for a real change to be visible far
+    // above rounding noise.
+    const after_schema_shift = try evalGraphOutputForTargets(allocator, &cb, &g, shared_inputs.items, targets_node, schema_shifted, targets_shape);
+    defer allocator.free(after_schema_shift);
+    var max_control_delta: f32 = 0.0;
+    var max_control_magnitude: f32 = 0.0;
+    for (baseline, after_schema_shift) |a, c| {
+        max_control_delta = @max(max_control_delta, @abs(a - c));
+        max_control_magnitude = @max(max_control_magnitude, @abs(a));
+    }
+    try testing.expect(max_control_delta > 0.01 * max_control_magnitude);
 }
 
 test "span_start objective accepts weighted span targets" {

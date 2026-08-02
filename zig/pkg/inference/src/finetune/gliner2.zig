@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tensor_mod = @import("../backends/tensor.zig");
 const Tensor = tensor_mod.Tensor;
 const DType = tensor_mod.DType;
@@ -25,7 +26,8 @@ const safetensors = @import("../models/safetensors.zig");
 const tensor_access = @import("../models/tensor_access.zig");
 const weight_source = @import("../models/weight_source.zig");
 
-pub const artifact_family_version = "gliner2_lora/v1alpha1";
+pub const artifact_family_version = "gliner2_lora/v1";
+pub const legacy_artifact_family_version = "gliner2_lora/v1alpha1";
 pub const checkpoint_file_name = "model.safetensors";
 pub const config_file_name = "config.json";
 pub const encoder_config_file_name = "encoder_config/config.json";
@@ -35,6 +37,15 @@ pub const task_head_checkpoint_file_name = "task_head.safetensors";
 pub const tokenizer_file_name = "tokenizer.json";
 pub const tokenizer_config_file_name = "tokenizer_config.json";
 pub const special_tokens_map_file_name = "special_tokens_map.json";
+pub const added_tokens_file_name = "added_tokens.json";
+pub const sentencepiece_model_file_name = "spm.model";
+pub const materialization_manifest_file_name = "materialization_manifest.json";
+pub const materialization_schema_version = "gliner2_materialized_model/v1";
+
+pub fn isSupportedArtifactFamilyVersion(version: []const u8) bool {
+    return std.mem.eql(u8, version, artifact_family_version) or
+        std.mem.eql(u8, version, legacy_artifact_family_version);
+}
 
 pub const default_lora_target_modules = [_][]const u8{
     "encoder",
@@ -405,6 +416,33 @@ pub const MaterializeSummary = struct {
     copied_base_tensor_count: usize,
 };
 
+const MaterializationInventory = struct {
+    config: bool,
+    encoder_config: bool,
+    tokenizer: bool,
+    tokenizer_config: bool,
+    special_tokens_map: bool,
+    added_tokens: bool,
+    sentencepiece_model: bool,
+};
+
+const MaterializationManifest = struct {
+    schema_version: []const u8 = materialization_schema_version,
+    status: []const u8 = "complete",
+    artifact_family_version: []const u8,
+    checkpoint_file: []const u8 = checkpoint_file_name,
+    base_model_dir: []const u8,
+    adapter_model_dir: []const u8,
+    merged_lora_tensor_count: usize,
+    merged_dora_tensor_count: usize,
+    task_head_passthrough_tensor_count: usize,
+    attached_task_head_tensor_count: usize,
+    copied_boundary_head: bool,
+    copied_boundary_task_head: bool,
+    copied_cleanup_head: bool,
+    supporting_artifacts: MaterializationInventory,
+};
+
 pub const ClassifierTaskHead = struct {
     allocator: std.mem.Allocator,
     weight: []f32,
@@ -535,7 +573,7 @@ pub fn inspectCheckpoint(
     defer reader.deinit();
 
     var summary = CheckpointInspection{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
+        .artifact_family_version = try inspectionArtifactFamilyVersion(allocator, paths.model_dir),
         .model_dir = try allocator.dupe(u8, paths.model_dir),
         .checkpoint_path = try allocator.dupe(u8, paths.checkpoint_path),
         .config_path = try allocator.dupe(u8, paths.config_path),
@@ -1164,6 +1202,11 @@ pub fn materializeMergedModel(
     adapter_model_dir: []const u8,
     out_dir: []const u8,
 ) !MaterializeSummary {
+    if (pathExists(out_dir)) return error.OutputDirectoryAlreadyExists;
+    const staging_dir = try materializationStagingPath(allocator, out_dir);
+    defer allocator.free(staging_dir);
+    if (pathExists(staging_dir)) return error.MaterializationStagingDirectoryExists;
+
     var bundle = try loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
     defer bundle.deinit();
 
@@ -1220,24 +1263,28 @@ pub fn materializeMergedModel(
     }
     const attached_task_head_tensor_count = try attachTaskHeadCheckpointIfPresent(allocator, adapter_model_dir, &merged);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
-    const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
-    errdefer allocator.free(output_checkpoint_path);
+    try compat.cwd().createDirPath(compat.io(), staging_dir);
+    var staging_published = false;
+    defer if (!staging_published) compat.cwd().deleteTree(compat.io(), staging_dir) catch {};
+
+    const staged_checkpoint_path = try std.fs.path.join(allocator, &.{ staging_dir, checkpoint_file_name });
+    defer allocator.free(staged_checkpoint_path);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_checkpoint_path, .data = bytes });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staged_checkpoint_path, .data = bytes });
 
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, encoder_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, special_tokens_map_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, special_tokens_map_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, gliner2_boundary.boundary_head_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, gliner2_boundary.boundary_task_head_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, entity_cleanup_model.head_file_name);
+    const inventory = MaterializationInventory{
+        .config = try copySupportingArtifactFromPreferredSource(allocator, base_model_dir, null, staging_dir, config_file_name, true),
+        .encoder_config = try copySupportingArtifactFromPreferredSource(allocator, base_model_dir, null, staging_dir, encoder_config_file_name, true),
+        .tokenizer = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, tokenizer_file_name, true),
+        .tokenizer_config = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, tokenizer_config_file_name, true),
+        .special_tokens_map = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, special_tokens_map_file_name, true),
+        .added_tokens = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, added_tokens_file_name, true),
+        .sentencepiece_model = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, sentencepiece_model_file_name, false),
+    };
+    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, gliner2_boundary.boundary_head_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, gliner2_boundary.boundary_task_head_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, entity_cleanup_model.head_file_name);
 
     var span_rep_passthrough_tensor_count: usize = 0;
     var count_embed_passthrough_tensor_count: usize = 0;
@@ -1246,26 +1293,40 @@ pub fn materializeMergedModel(
         if (isCountEmbedName(item.name)) count_embed_passthrough_tensor_count += 1;
     }
     const copied_boundary_head = blk: {
-        const path = try std.fs.path.join(allocator, &.{ out_dir, gliner2_boundary.boundary_head_file_name });
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, gliner2_boundary.boundary_head_file_name });
         defer allocator.free(path);
         break :blk isRegularFilePath(path);
     };
     const copied_boundary_task_head = blk: {
-        const path = try std.fs.path.join(allocator, &.{ out_dir, gliner2_boundary.boundary_task_head_file_name });
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, gliner2_boundary.boundary_task_head_file_name });
         defer allocator.free(path);
         break :blk isRegularFilePath(path);
     };
     const copied_cleanup_head = blk: {
-        const path = try std.fs.path.join(allocator, &.{ out_dir, entity_cleanup_model.head_file_name });
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, entity_cleanup_model.head_file_name });
         defer allocator.free(path);
         break :blk isRegularFilePath(path);
     };
 
-    return .{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
-        .base_model_dir = try allocator.dupe(u8, base_model_dir),
-        .adapter_model_dir = try allocator.dupe(u8, adapter_model_dir),
-        .output_dir = try allocator.dupe(u8, out_dir),
+    var reloaded = try inspectCheckpoint(allocator, staging_dir, null);
+    defer freeCheckpointInspection(allocator, &reloaded);
+    if (!reloaded.core_backbone_loadable) return error.MaterializedCheckpointNotLoadable;
+
+    const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
+    errdefer allocator.free(output_checkpoint_path);
+    const summary_family_version = try allocator.dupe(u8, artifact_family_version);
+    errdefer allocator.free(summary_family_version);
+    const summary_base_model_dir = try allocator.dupe(u8, base_model_dir);
+    errdefer allocator.free(summary_base_model_dir);
+    const summary_adapter_model_dir = try allocator.dupe(u8, adapter_model_dir);
+    errdefer allocator.free(summary_adapter_model_dir);
+    const summary_output_dir = try allocator.dupe(u8, out_dir);
+    errdefer allocator.free(summary_output_dir);
+    const summary = MaterializeSummary{
+        .artifact_family_version = summary_family_version,
+        .base_model_dir = summary_base_model_dir,
+        .adapter_model_dir = summary_adapter_model_dir,
+        .output_dir = summary_output_dir,
         .output_checkpoint_path = output_checkpoint_path,
         .merged_lora_tensor_count = bundle.layers.len + bundle.passthrough_tensors.len,
         .merged_dora_tensor_count = merged_dora_tensor_count,
@@ -1278,6 +1339,28 @@ pub fn materializeMergedModel(
         .copied_cleanup_head = copied_cleanup_head,
         .copied_base_tensor_count = base_names.len - bundle.layers.len,
     };
+
+    try syncMaterializationFiles(allocator, staging_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, materialization_manifest_file_name });
+    defer allocator.free(manifest_path);
+    try writeSyncedJsonFile(allocator, manifest_path, MaterializationManifest{
+        .artifact_family_version = artifact_family_version,
+        .base_model_dir = base_model_dir,
+        .adapter_model_dir = adapter_model_dir,
+        .merged_lora_tensor_count = summary.merged_lora_tensor_count,
+        .merged_dora_tensor_count = summary.merged_dora_tensor_count,
+        .task_head_passthrough_tensor_count = summary.task_head_passthrough_tensor_count,
+        .attached_task_head_tensor_count = summary.attached_task_head_tensor_count,
+        .copied_boundary_head = summary.copied_boundary_head,
+        .copied_boundary_task_head = summary.copied_boundary_task_head,
+        .copied_cleanup_head = summary.copied_cleanup_head,
+        .supporting_artifacts = inventory,
+    });
+    try syncDirectoryPath(staging_dir);
+    try std.Io.Dir.rename(compat.cwd(), staging_dir, compat.cwd(), out_dir, compat.io());
+    staging_published = true;
+    try syncDirectoryPath(std.fs.path.dirname(out_dir) orelse ".");
+    return summary;
 }
 
 pub fn freeCheckpointInspection(allocator: std.mem.Allocator, summary: *CheckpointInspection) void {
@@ -1346,6 +1429,15 @@ pub fn freeAutodiffRegularParamExportSummary(allocator: std.mem.Allocator, summa
     allocator.free(summary.artifact_family_version);
     allocator.free(summary.output_dir);
     allocator.free(summary.checkpoint_path);
+    summary.* = undefined;
+}
+
+pub fn freeMaterializeSummary(allocator: std.mem.Allocator, summary: *MaterializeSummary) void {
+    allocator.free(summary.artifact_family_version);
+    allocator.free(summary.base_model_dir);
+    allocator.free(summary.adapter_model_dir);
+    allocator.free(summary.output_dir);
+    allocator.free(summary.output_checkpoint_path);
     summary.* = undefined;
 }
 
@@ -1990,6 +2082,135 @@ fn copySupportingArtifactIfPresent(
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
 }
 
+fn copySupportingArtifactFromPreferredSource(
+    allocator: std.mem.Allocator,
+    preferred_source_dir: []const u8,
+    fallback_source_dir: ?[]const u8,
+    out_dir: []const u8,
+    file_name: []const u8,
+    required: bool,
+) !bool {
+    const preferred_path = try optionalPathInDir(allocator, preferred_source_dir, file_name);
+    defer if (preferred_path) |path| allocator.free(path);
+    const fallback_path = if (preferred_path == null and fallback_source_dir != null)
+        try optionalPathInDir(allocator, fallback_source_dir.?, file_name)
+    else
+        null;
+    defer if (fallback_path) |path| allocator.free(path);
+    const source_path = preferred_path orelse fallback_path orelse {
+        if (required) return error.RequiredSupportingArtifactMissing;
+        return false;
+    };
+
+    const bytes = try c_file.readFile(allocator, source_path);
+    defer allocator.free(bytes);
+    const dst = try std.fs.path.join(allocator, &.{ out_dir, file_name });
+    defer allocator.free(dst);
+    if (std.fs.path.dirname(dst)) |parent| try compat.cwd().createDirPath(compat.io(), parent);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
+    return true;
+}
+
+fn materializationStagingPath(allocator: std.mem.Allocator, out_dir: []const u8) ![]const u8 {
+    const name = std.fs.path.basename(out_dir);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.InvalidOutputDirectory;
+    }
+    const staging_name = try std.fmt.allocPrint(allocator, ".{s}.staging-{d}", .{ name, std.posix.system.getpid() });
+    defer allocator.free(staging_name);
+    return std.fs.path.join(allocator, &.{ std.fs.path.dirname(out_dir) orelse ".", staging_name });
+}
+
+fn pathExists(path: []const u8) bool {
+    _ = compat.cwd().statFile(compat.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn inspectionArtifactFamilyVersion(allocator: std.mem.Allocator, model_dir: []const u8) ![]const u8 {
+    const manifest_path = try std.fs.path.join(allocator, &.{ model_dir, materialization_manifest_file_name });
+    defer allocator.free(manifest_path);
+    if (!isRegularFilePath(manifest_path)) return allocator.dupe(u8, artifact_family_version);
+
+    const bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidMaterializationManifest;
+    const object = parsed.value.object;
+    const schema_value = object.get("schema_version") orelse return error.InvalidMaterializationManifest;
+    const status_value = object.get("status") orelse return error.InvalidMaterializationManifest;
+    const family_value = object.get("artifact_family_version") orelse return error.InvalidMaterializationManifest;
+    if (schema_value != .string or status_value != .string or family_value != .string) {
+        return error.InvalidMaterializationManifest;
+    }
+    if (!std.mem.eql(u8, schema_value.string, materialization_schema_version) or
+        !std.mem.eql(u8, status_value.string, "complete"))
+    {
+        return error.InvalidMaterializationManifest;
+    }
+    if (!isSupportedArtifactFamilyVersion(family_value.string)) return error.UnsupportedArtifactFamilyVersion;
+    return allocator.dupe(u8, family_value.string);
+}
+
+fn syncMaterializationFiles(allocator: std.mem.Allocator, staging_dir: []const u8) !void {
+    const file_names = [_][]const u8{
+        checkpoint_file_name,
+        config_file_name,
+        encoder_config_file_name,
+        tokenizer_file_name,
+        tokenizer_config_file_name,
+        special_tokens_map_file_name,
+        added_tokens_file_name,
+        sentencepiece_model_file_name,
+        gliner2_boundary.boundary_head_file_name,
+        gliner2_boundary.boundary_task_head_file_name,
+        entity_cleanup_model.head_file_name,
+    };
+    for (file_names) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, file_name });
+        defer allocator.free(path);
+        if (!isRegularFilePath(path)) continue;
+        var file = try compat.cwd().openFile(compat.io(), path, .{});
+        defer file.close(compat.io());
+        try file.sync(compat.io());
+    }
+    const encoder_dir = try std.fs.path.join(allocator, &.{ staging_dir, "encoder_config" });
+    defer allocator.free(encoder_dir);
+    try syncDirectoryPath(encoder_dir);
+    try syncDirectoryPath(staging_dir);
+}
+
+fn writeSyncedJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {
+    const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
+    defer allocator.free(rendered);
+    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+    defer file.close(compat.io());
+    try file.writeStreamingAll(compat.io(), rendered);
+    try file.sync(compat.io());
+}
+
+fn syncDirectoryPath(path: []const u8) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(compat.io(), path, .{ .iterate = true })
+    else
+        try compat.cwd().openDir(compat.io(), path, .{ .iterate = true });
+    defer dir.close(compat.io());
+    while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .INVAL => return,
+        .BADF => return error.InvalidFileDescriptor,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
 fn openTensorAccessForFile(allocator: std.mem.Allocator, path: []const u8) !tensor_access.TensorAccess {
     const access = try tensor_access.SafetensorsAccess.initAbsolute(allocator, path);
     return access.tensorAccess();
@@ -2279,6 +2500,13 @@ test "gliner2 lora dropout validates python-compatible range" {
     try std.testing.expectError(error.InvalidLoRADropout, validateLoRADropout(1.0));
 }
 
+test "gliner2 lora artifact family writes v1 and accepts legacy v1alpha1" {
+    try std.testing.expectEqualStrings("gliner2_lora/v1", artifact_family_version);
+    try std.testing.expect(isSupportedArtifactFamilyVersion(artifact_family_version));
+    try std.testing.expect(isSupportedArtifactFamilyVersion(legacy_artifact_family_version));
+    try std.testing.expect(!isSupportedArtifactFamilyVersion("gliner2_lora/v2"));
+}
+
 test "gliner2 bootstrap and inspect lora bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_bootstrap_test_{d}", .{std.posix.system.getpid()});
@@ -2301,6 +2529,16 @@ test "gliner2 bootstrap and inspect lora bundle" {
         .sub_path = encoder_config_path,
         .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
     });
+    for ([_][]const u8{
+        tokenizer_file_name,
+        tokenizer_config_file_name,
+        special_tokens_map_file_name,
+        added_tokens_file_name,
+    }) |file_name| {
+        const tokenizer_artifact_path = try std.fs.path.join(allocator, &.{ root, file_name });
+        defer allocator.free(tokenizer_artifact_path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_artifact_path, .data = "{}" });
+    }
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
@@ -2350,17 +2588,66 @@ test "gliner2 bootstrap and inspect lora bundle" {
 
     const materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized" });
     defer allocator.free(materialized_dir);
-    const materialize = try materializeMergedModel(allocator, root, out_dir, materialized_dir);
-    defer {
-        allocator.free(materialize.artifact_family_version);
-        allocator.free(materialize.base_model_dir);
-        allocator.free(materialize.adapter_model_dir);
-        allocator.free(materialize.output_dir);
-        allocator.free(materialize.output_checkpoint_path);
-    }
+    var materialize = try materializeMergedModel(allocator, root, out_dir, materialized_dir);
+    defer freeMaterializeSummary(allocator, &materialize);
     try std.testing.expect(materialize.copied_cleanup_head);
     try std.testing.expectEqual(@as(usize, 2), materialize.merged_dora_tensor_count);
     try std.testing.expectEqual(@as(usize, 2), materialize.attached_task_head_tensor_count);
+    try std.testing.expectError(error.OutputDirectoryAlreadyExists, materializeMergedModel(allocator, root, out_dir, materialized_dir));
+
+    const completion_path = try std.fs.path.join(allocator, &.{ materialized_dir, materialization_manifest_file_name });
+    defer allocator.free(completion_path);
+    const completion_bytes = try compat.cwd().readFileAlloc(compat.io(), completion_path, allocator, .limited(64 * 1024));
+    defer allocator.free(completion_bytes);
+    var completion = try std.json.parseFromSlice(std.json.Value, allocator, completion_bytes, .{});
+    defer completion.deinit();
+    try std.testing.expectEqualStrings("complete", completion.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings(artifact_family_version, completion.value.object.get("artifact_family_version").?.string);
+    const inventory = completion.value.object.get("supporting_artifacts").?.object;
+    try std.testing.expect(inventory.get("tokenizer").?.bool);
+    try std.testing.expect(inventory.get("added_tokens").?.bool);
+    try std.testing.expect(!inventory.get("sentencepiece_model").?.bool);
+
+    const manifest_inventory = MaterializationInventory{
+        .config = true,
+        .encoder_config = true,
+        .tokenizer = true,
+        .tokenizer_config = true,
+        .special_tokens_map = true,
+        .added_tokens = true,
+        .sentencepiece_model = false,
+    };
+    try writeSyncedJsonFile(allocator, completion_path, MaterializationManifest{
+        .artifact_family_version = legacy_artifact_family_version,
+        .base_model_dir = root,
+        .adapter_model_dir = out_dir,
+        .merged_lora_tensor_count = materialize.merged_lora_tensor_count,
+        .merged_dora_tensor_count = materialize.merged_dora_tensor_count,
+        .task_head_passthrough_tensor_count = materialize.task_head_passthrough_tensor_count,
+        .attached_task_head_tensor_count = materialize.attached_task_head_tensor_count,
+        .copied_boundary_head = materialize.copied_boundary_head,
+        .copied_boundary_task_head = materialize.copied_boundary_task_head,
+        .copied_cleanup_head = materialize.copied_cleanup_head,
+        .supporting_artifacts = manifest_inventory,
+    });
+    var legacy_reload = try inspectCheckpoint(allocator, materialized_dir, null);
+    defer freeCheckpointInspection(allocator, &legacy_reload);
+    try std.testing.expectEqualStrings(legacy_artifact_family_version, legacy_reload.artifact_family_version);
+
+    try writeSyncedJsonFile(allocator, completion_path, MaterializationManifest{
+        .artifact_family_version = "gliner2_lora/v2",
+        .base_model_dir = root,
+        .adapter_model_dir = out_dir,
+        .merged_lora_tensor_count = materialize.merged_lora_tensor_count,
+        .merged_dora_tensor_count = materialize.merged_dora_tensor_count,
+        .task_head_passthrough_tensor_count = materialize.task_head_passthrough_tensor_count,
+        .attached_task_head_tensor_count = materialize.attached_task_head_tensor_count,
+        .copied_boundary_head = materialize.copied_boundary_head,
+        .copied_boundary_task_head = materialize.copied_boundary_task_head,
+        .copied_cleanup_head = materialize.copied_cleanup_head,
+        .supporting_artifacts = manifest_inventory,
+    });
+    try std.testing.expectError(error.UnsupportedArtifactFamilyVersion, inspectCheckpoint(allocator, materialized_dir, null));
 
     var materialized_access = try openTensorAccessForFile(allocator, materialize.output_checkpoint_path);
     defer materialized_access.deinit();
@@ -2391,6 +2678,22 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try std.testing.expectApproxEqAbs(@as(f32, 16.5), adapter_logits[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 15.75), adapter_logits[1], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 16.75), adapter_logits[2], 1e-5);
+
+    // A missing required inventory file must leave neither a published model
+    // nor the same-process staging directory behind.
+    const added_tokens_path = try std.fs.path.join(allocator, &.{ root, added_tokens_file_name });
+    defer allocator.free(added_tokens_path);
+    try compat.cwd().deleteFile(compat.io(), added_tokens_path);
+    const failed_materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized-missing-inventory" });
+    defer allocator.free(failed_materialized_dir);
+    const failed_staging_dir = try materializationStagingPath(allocator, failed_materialized_dir);
+    defer allocator.free(failed_staging_dir);
+    try std.testing.expectError(
+        error.RequiredSupportingArtifactMissing,
+        materializeMergedModel(allocator, root, out_dir, failed_materialized_dir),
+    );
+    try std.testing.expect(!pathExists(failed_materialized_dir));
+    try std.testing.expect(!pathExists(failed_staging_dir));
 }
 
 test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {

@@ -3898,6 +3898,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub const TrainingAdamWOptions = metal_runtime.TrainingAdamWOptions;
+    pub const TrainingAdamWBatchOptions = metal_runtime.TrainingAdamWBatchOptions;
 
     pub const TrainingAdamWBatchInput = struct {
         weight: CT,
@@ -3905,6 +3906,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         m: CT,
         v: CT,
         elem_count: usize,
+        bias_correction1: f32,
+        bias_correction2: f32,
     };
 
     pub fn trainingAdamWF32(
@@ -3939,7 +3942,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn trainingAdamWManyF32(
         self: *MetalCompute,
         inputs: []const TrainingAdamWBatchInput,
-        opts: TrainingAdamWOptions,
+        opts: TrainingAdamWBatchOptions,
     ) !void {
         if (inputs.len == 0) return;
         var batch = try self.allocator.alloc(metal_runtime.TrainingAdamWBatch, inputs.len);
@@ -3960,6 +3963,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .m = undefined,
                 .v = undefined,
                 .elem_count = input.elem_count,
+                .bias_correction1 = input.bias_correction1,
+                .bias_correction2 = input.bias_correction2,
             };
             batch[idx].grad = try self.ownedDeviceMetalTensorFromCt(input.grad);
             batch[idx].m = try self.ownedDeviceMetalTensorFromCt(input.m);
@@ -28380,6 +28385,1211 @@ test "metal_compute: scaled dot product attention strides keys and output dimens
     try expectUniformMetalSdpa(std.testing.allocator, 1, 1, 1, 257, false);
 }
 
+// The disentangled-attention and SDPA threadgroup kernels reduce a row max
+// through `partials[]` and then reuse the same scratch for the sum reduction.
+// At the shapes below the threadgroup spans several SIMD groups (64 threads for
+// the deberta kernels, 256 for SDPA), so a missing barrier between the two
+// corrupts the row max of the lanes that had not read it yet — on some lanes,
+// some of the time. A single comparison against native passes either way, so
+// every metal result is also required to be bit-identical to the first one.
+const multi_simdgroup_repeats = 50;
+const multi_simdgroup_seq_len = 256;
+const multi_simdgroup_num_heads = 4;
+const multi_simdgroup_head_dim = 64;
+
+fn fillSignedUnit(data: []f32, seed: u64) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (data) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+}
+
+fn expectMetalRepeatsStable(
+    allocator: std.mem.Allocator,
+    metal_cb: *ops.ComputeBackend,
+    reference: []const f32,
+    tolerance: f32,
+    baseline: *?[]f32,
+    out: CT,
+) !void {
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(metal_cb, out));
+    const data = try metal_cb.toFloat32(out, allocator);
+    errdefer allocator.free(data);
+    try std.testing.expectEqual(reference.len, data.len);
+    for (reference, data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, tolerance);
+    }
+    if (baseline.*) |first| {
+        try std.testing.expectEqualSlices(f32, first, data);
+        allocator.free(data);
+    } else {
+        baseline.* = data;
+    }
+}
+
+test "metal_compute: disentangled relative attention backward matches native at multi-simdgroup threadgroup width" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const batch: usize = 1;
+    const seq_len = multi_simdgroup_seq_len;
+    const num_heads = multi_simdgroup_num_heads;
+    const head_dim = multi_simdgroup_head_dim;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    const rel_rows = 2 * seq_len - 1;
+
+    const q_data = try allocator.alloc(f32, total);
+    defer allocator.free(q_data);
+    const k_data = try allocator.alloc(f32, total);
+    defer allocator.free(k_data);
+    const v_data = try allocator.alloc(f32, total);
+    defer allocator.free(v_data);
+    const d_out_data = try allocator.alloc(f32, total);
+    defer allocator.free(d_out_data);
+    const q_r_data = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(q_r_data);
+    const k_r_data = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(k_r_data);
+    fillSignedUnit(q_data, 1);
+    fillSignedUnit(k_data, 2);
+    fillSignedUnit(v_data, 3);
+    fillSignedUnit(d_out_data, 4);
+    fillSignedUnit(q_r_data, 5);
+    fillSignedUnit(k_r_data, 6);
+
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+
+    const token_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    const rel_shape = [_]i32{ @intCast(rel_rows), @intCast(hidden) };
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(k_data, &token_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(v_data, &token_shape);
+    defer native_cb.free(native_v);
+    const native_d_out = try native_cb.fromFloat32Shape(d_out_data, &token_shape);
+    defer native_cb.free(native_d_out);
+    const native_q_r = try native_cb.fromFloat32Shape(q_r_data, &rel_shape);
+    defer native_cb.free(native_q_r);
+    const native_k_r = try native_cb.fromFloat32Shape(k_r_data, &rel_shape);
+    defer native_cb.free(native_k_r);
+
+    const native_out = try native_cb.disentangledRelativeAttentionBackward(
+        native_q,
+        native_k,
+        native_v,
+        native_q_r,
+        native_k_r,
+        mask,
+        native_d_out,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    defer native_cb.free(native_out);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const metal_q = try metal_cb.fromFloat32Shape(q_data, &token_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(k_data, &token_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(v_data, &token_shape);
+    defer metal_cb.free(metal_v);
+    const metal_d_out = try metal_cb.fromFloat32Shape(d_out_data, &token_shape);
+    defer metal_cb.free(metal_d_out);
+    const metal_q_r = try metal_cb.fromFloat32Shape(q_r_data, &rel_shape);
+    defer metal_cb.free(metal_q_r);
+    const metal_k_r = try metal_cb.fromFloat32Shape(k_r_data, &rel_shape);
+    defer metal_cb.free(metal_k_r);
+
+    var baseline: ?[]f32 = null;
+    defer if (baseline) |first| allocator.free(first);
+    for (0..multi_simdgroup_repeats) |_| {
+        const metal_out = try metal_cb.disentangledRelativeAttentionBackward(
+            metal_q,
+            metal_k,
+            metal_v,
+            metal_q_r,
+            metal_k_r,
+            mask,
+            metal_d_out,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+        defer metal_cb.free(metal_out);
+        try expectMetalRepeatsStable(allocator, &metal_cb, native_data, 1e-4, &baseline, metal_out);
+    }
+}
+
+fn expectStableDebertaForward(allocator: std.mem.Allocator) !void {
+    const batch: usize = 1;
+    const seq_len = multi_simdgroup_seq_len;
+    const num_heads = multi_simdgroup_num_heads;
+    const head_dim = multi_simdgroup_head_dim;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    const rel_rows = 2 * seq_len - 1;
+
+    const q_data = try allocator.alloc(f32, total);
+    defer allocator.free(q_data);
+    const k_data = try allocator.alloc(f32, total);
+    defer allocator.free(k_data);
+    const v_data = try allocator.alloc(f32, total);
+    defer allocator.free(v_data);
+    const q_r_data = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(q_r_data);
+    const k_r_data = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(k_r_data);
+    fillSignedUnit(q_data, 1);
+    fillSignedUnit(k_data, 2);
+    fillSignedUnit(v_data, 3);
+    fillSignedUnit(q_r_data, 5);
+    fillSignedUnit(k_r_data, 6);
+
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+
+    const token_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    const rel_shape = [_]i32{ @intCast(rel_rows), @intCast(hidden) };
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(k_data, &token_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(v_data, &token_shape);
+    defer native_cb.free(native_v);
+    const native_q_r = try native_cb.fromFloat32Shape(q_r_data, &rel_shape);
+    defer native_cb.free(native_q_r);
+    const native_k_r = try native_cb.fromFloat32Shape(k_r_data, &rel_shape);
+    defer native_cb.free(native_k_r);
+
+    const native_out = try native_cb.disentangledRelativeAttention(
+        native_q,
+        native_k,
+        native_v,
+        native_q_r,
+        native_k_r,
+        mask,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    defer native_cb.free(native_out);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const metal_q = try metal_cb.fromFloat32Shape(q_data, &token_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(k_data, &token_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(v_data, &token_shape);
+    defer metal_cb.free(metal_v);
+    const metal_q_r = try metal_cb.fromFloat32Shape(q_r_data, &rel_shape);
+    defer metal_cb.free(metal_q_r);
+    const metal_k_r = try metal_cb.fromFloat32Shape(k_r_data, &rel_shape);
+    defer metal_cb.free(metal_k_r);
+
+    var baseline: ?[]f32 = null;
+    defer if (baseline) |first| allocator.free(first);
+    for (0..multi_simdgroup_repeats) |_| {
+        const metal_out = try metal_cb.disentangledRelativeAttention(
+            metal_q,
+            metal_k,
+            metal_v,
+            metal_q_r,
+            metal_k_r,
+            mask,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+        defer metal_cb.free(metal_out);
+        try expectMetalRepeatsStable(allocator, &metal_cb, native_data, 1e-4, &baseline, metal_out);
+    }
+}
+
+test "metal_compute: disentangled relative attention forward matches native at multi-simdgroup threadgroup width" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    try expectStableDebertaForward(std.testing.allocator);
+}
+
+test "metal_compute: legacy threadgroup disentangled relative attention matches native at multi-simdgroup threadgroup width" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    // The `_tg` forward kernel is the only one of the three whose partials[]
+    // reduction no default dispatch reaches: flash4 wins for every shape it
+    // supports and uses a separate bests[] slot. Forcing it here is what gates
+    // its barrier — without it the kernel is ~10% off native at this shape.
+    const env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    if (env.setenv("TERMITE_METAL_FORCE_DEBERTA_TG", "1", 1) != 0) return error.SkipZigTest;
+    defer _ = env.unsetenv("TERMITE_METAL_FORCE_DEBERTA_TG");
+
+    try expectStableDebertaForward(std.testing.allocator);
+}
+
+test "metal_compute: threadgroup scaled dot product attention is stable at multi-simdgroup threadgroup width" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const batch: usize = 1;
+    const seq_len = multi_simdgroup_seq_len;
+    const num_heads = multi_simdgroup_num_heads;
+    const head_dim = multi_simdgroup_head_dim;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+
+    const q_data = try allocator.alloc(f32, total);
+    defer allocator.free(q_data);
+    const k_data = try allocator.alloc(f32, total);
+    defer allocator.free(k_data);
+    const v_data = try allocator.alloc(f32, total);
+    defer allocator.free(v_data);
+    fillSignedUnit(q_data, 7);
+    fillSignedUnit(k_data, 8);
+    fillSignedUnit(v_data, 9);
+
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+
+    const token_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+
+    const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(k_data, &token_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(v_data, &token_shape);
+    defer native_cb.free(native_v);
+
+    const native_out = try native_cb.scaledDotProductAttention(native_q, native_k, native_v, mask, null, batch, seq_len, num_heads, head_dim);
+    defer native_cb.free(native_out);
+    const native_data = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(native_data);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const metal_q = try metal_cb.fromFloat32Shape(q_data, &token_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(k_data, &token_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(v_data, &token_shape);
+    defer metal_cb.free(metal_v);
+
+    var baseline: ?[]f32 = null;
+    defer if (baseline) |first| allocator.free(first);
+    for (0..multi_simdgroup_repeats) |_| {
+        const metal_out = try metal_cb.scaledDotProductAttention(metal_q, metal_k, metal_v, mask, null, batch, seq_len, num_heads, head_dim);
+        defer metal_cb.free(metal_out);
+        try expectMetalRepeatsStable(allocator, &metal_cb, native_data, 1e-4, &baseline, metal_out);
+    }
+}
+
+// ── Lane 4 audit: metal-vs-native numeric equivalence for uncovered
+// GLiNER2 training ops. Every check compares against the native reference and
+// repeats the metal dispatch so a race cannot pass by luck.
+
+const audit_repeats = 20;
+
+const AuditNative = struct {
+    ws: native_compute_mod.WeightStore,
+    compute: native_compute_mod.NativeCompute,
+
+    fn init(allocator: std.mem.Allocator) AuditNative {
+        return .{
+            .ws = .{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty },
+            .compute = undefined,
+        };
+    }
+
+    fn backend(self: *AuditNative, allocator: std.mem.Allocator) ops.ComputeBackend {
+        self.compute = native_compute_mod.NativeCompute.init(allocator, &self.ws, null);
+        return self.compute.computeBackend();
+    }
+
+    fn deinit(self: *AuditNative, allocator: std.mem.Allocator) void {
+        self.ws.resident_weights.deinit(allocator);
+        self.ws.lazy_weights.deinit(allocator);
+    }
+};
+
+fn auditFill(data: []f32, seed: u64, scale: f32) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (data) |*value| value.* = (random.float(f32) * 2.0 - 1.0) * scale;
+}
+
+/// Upload a host slice and force it device-resident so the metal op takes its
+/// device kernel path instead of the host fallback.
+fn auditDeviceTensor(mc: *MetalCompute, cb: *ops.ComputeBackend, data: []const f32, shape: []const i32) !CT {
+    const host = try cb.fromFloat32Shape(data, shape);
+    defer cb.free(host);
+    return mc.ctFromOwnedMetalTensor(try mc.ownedDeviceMetalTensorFromCt(host));
+}
+
+fn auditMaxAbsDelta(a: []const f32, b: []const f32) f32 {
+    var worst: f32 = 0.0;
+    for (a, b) |x, y| worst = @max(worst, @abs(x - y));
+    return worst;
+}
+
+test "metal_compute: layer norm backward matches native across hidden widths" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const dims = [_]usize{ 768, 256, 128, 320, 192, 100, 48, 33, 3 };
+    const rows: usize = 5;
+    const eps: f32 = 1e-7;
+
+    var worst_overall: f32 = 0.0;
+    var worst_dim: usize = 0;
+    for (dims) |dim| {
+        var worst_this_dim: f32 = 0.0;
+        const total = rows * dim;
+        const x = try allocator.alloc(f32, total);
+        defer allocator.free(x);
+        const dy = try allocator.alloc(f32, total);
+        defer allocator.free(dy);
+        const gamma = try allocator.alloc(f32, dim);
+        defer allocator.free(gamma);
+        const beta = try allocator.alloc(f32, dim);
+        defer allocator.free(beta);
+        auditFill(x, 11 + dim, 1.0);
+        auditFill(dy, 22 + dim, 1.0);
+        auditFill(gamma, 33 + dim, 1.0);
+        auditFill(beta, 44 + dim, 1.0);
+
+        const in_shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        const vec_shape = [_]i32{@intCast(dim)};
+
+        var native_ctx = AuditNative.init(allocator);
+        defer native_ctx.deinit(allocator);
+        var native_cb = native_ctx.backend(allocator);
+        const n_x = try native_cb.fromFloat32Shape(x, &in_shape);
+        defer native_cb.free(n_x);
+        const n_dy = try native_cb.fromFloat32Shape(dy, &in_shape);
+        defer native_cb.free(n_dy);
+        const n_gamma = try native_cb.fromFloat32Shape(gamma, &vec_shape);
+        defer native_cb.free(n_gamma);
+        const n_beta = try native_cb.fromFloat32Shape(beta, &vec_shape);
+        defer native_cb.free(n_beta);
+        const n_out = (try native_cb.layerNormBackward(n_x, n_gamma, n_beta, n_dy, dim, eps)) orelse
+            return error.NativeLayerNormBackwardUnsupported;
+        defer native_cb.free(n_out);
+        const native_data = try native_cb.toFloat32(n_out, allocator);
+        defer allocator.free(native_data);
+
+        var metal_ws = testMetalWeightStoreInit(allocator);
+        defer metal_ws.lazy_weights.deinit(allocator);
+        var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+        defer metal_compute.deinit();
+        var metal_cb = metal_compute.computeBackend();
+        const m_x = try auditDeviceTensor(&metal_compute, &metal_cb, x, &in_shape);
+        defer metal_cb.free(m_x);
+        const m_dy = try auditDeviceTensor(&metal_compute, &metal_cb, dy, &in_shape);
+        defer metal_cb.free(m_dy);
+        const m_gamma = try auditDeviceTensor(&metal_compute, &metal_cb, gamma, &vec_shape);
+        defer metal_cb.free(m_gamma);
+        const m_beta = try auditDeviceTensor(&metal_compute, &metal_cb, beta, &vec_shape);
+        defer metal_cb.free(m_beta);
+
+        var baseline: ?[]f32 = null;
+        defer if (baseline) |first| allocator.free(first);
+        for (0..audit_repeats) |_| {
+            const m_out = (try metal_cb.layerNormBackward(m_x, m_gamma, m_beta, m_dy, dim, eps)) orelse
+                return error.MetalLayerNormBackwardUnsupported;
+            defer metal_cb.free(m_out);
+            const metal_data = try metal_cb.toFloat32(m_out, allocator);
+            defer allocator.free(metal_data);
+            try std.testing.expectEqual(native_data.len, metal_data.len);
+            const delta = auditMaxAbsDelta(native_data, metal_data);
+            worst_this_dim = @max(worst_this_dim, delta);
+            if (delta > worst_overall) {
+                worst_overall = delta;
+                worst_dim = dim;
+            }
+            if (baseline) |first| {
+                try std.testing.expectEqualSlices(f32, first, metal_data);
+            } else {
+                baseline = try allocator.dupe(f32, metal_data);
+            }
+        }
+        std.debug.print(
+            "\n[audit] layerNormBackward dim={d} (pow2={}) max|delta|={d}",
+            .{ dim, std.math.isPowerOfTwo(@min(dim, 256)), worst_this_dim },
+        );
+    }
+    std.debug.print(
+        "\n[audit] layerNormBackward worst max|delta|={d} (dim={d})\n",
+        .{ worst_overall, worst_dim },
+    );
+    try std.testing.expect(worst_overall <= 2e-4);
+}
+
+test "metal_compute: layer norm forward matches native across hidden widths" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const dims = [_]usize{ 768, 320, 192, 100, 48, 33 };
+    const rows: usize = 6;
+    const eps: f32 = 1e-7;
+
+    var worst_overall: f32 = 0.0;
+    var worst_dim: usize = 0;
+    for (dims) |dim| {
+        const total = rows * dim;
+        const x = try allocator.alloc(f32, total);
+        defer allocator.free(x);
+        const gamma = try allocator.alloc(f32, dim);
+        defer allocator.free(gamma);
+        const beta = try allocator.alloc(f32, dim);
+        defer allocator.free(beta);
+        auditFill(x, 55 + dim, 1.0);
+        auditFill(gamma, 66 + dim, 1.0);
+        auditFill(beta, 77 + dim, 1.0);
+
+        const in_shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        const vec_shape = [_]i32{@intCast(dim)};
+
+        var native_ctx = AuditNative.init(allocator);
+        defer native_ctx.deinit(allocator);
+        var native_cb = native_ctx.backend(allocator);
+        const n_x = try native_cb.fromFloat32Shape(x, &in_shape);
+        defer native_cb.free(n_x);
+        const n_gamma = try native_cb.fromFloat32Shape(gamma, &vec_shape);
+        defer native_cb.free(n_gamma);
+        const n_beta = try native_cb.fromFloat32Shape(beta, &vec_shape);
+        defer native_cb.free(n_beta);
+        const n_out = try native_cb.layerNorm(n_x, n_gamma, n_beta, dim, eps);
+        defer native_cb.free(n_out);
+        const native_data = try native_cb.toFloat32(n_out, allocator);
+        defer allocator.free(native_data);
+
+        var metal_ws = testMetalWeightStoreInit(allocator);
+        defer metal_ws.lazy_weights.deinit(allocator);
+        var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+        defer metal_compute.deinit();
+        var metal_cb = metal_compute.computeBackend();
+        const m_x = try auditDeviceTensor(&metal_compute, &metal_cb, x, &in_shape);
+        defer metal_cb.free(m_x);
+        const m_gamma = try auditDeviceTensor(&metal_compute, &metal_cb, gamma, &vec_shape);
+        defer metal_cb.free(m_gamma);
+        const m_beta = try auditDeviceTensor(&metal_compute, &metal_cb, beta, &vec_shape);
+        defer metal_cb.free(m_beta);
+
+        var baseline: ?[]f32 = null;
+        defer if (baseline) |first| allocator.free(first);
+        for (0..audit_repeats) |_| {
+            const m_out = try metal_cb.layerNorm(m_x, m_gamma, m_beta, dim, eps);
+            defer metal_cb.free(m_out);
+            const metal_data = try metal_cb.toFloat32(m_out, allocator);
+            defer allocator.free(metal_data);
+            try std.testing.expectEqual(native_data.len, metal_data.len);
+            const delta = auditMaxAbsDelta(native_data, metal_data);
+            if (delta > worst_overall) {
+                worst_overall = delta;
+                worst_dim = dim;
+            }
+            if (baseline) |first| {
+                try std.testing.expectEqualSlices(f32, first, metal_data);
+            } else {
+                baseline = try allocator.dupe(f32, metal_data);
+            }
+        }
+    }
+    std.debug.print(
+        "\n[audit] layerNorm forward max|delta|={d} (worst dim={d})\n",
+        .{ worst_overall, worst_dim },
+    );
+    try std.testing.expect(worst_overall <= 2e-4);
+}
+
+test "metal_compute: masked bce with logits loss and backward match native" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    // 4099 is deliberately not a multiple of the 256-wide threadgroup so the
+    // grid-stride tail is exercised.
+    const counts = [_]usize{ 1, 255, 256, 257, 4099 };
+    const positive_weight: f32 = 2.0;
+    const negative_weight: f32 = 0.5;
+    const eps: f32 = 1e-6;
+
+    var worst_loss: f32 = 0.0;
+    var worst_grad: f32 = 0.0;
+    for (counts) |count| {
+        const logits = try allocator.alloc(f32, count);
+        defer allocator.free(logits);
+        const labels = try allocator.alloc(f32, count);
+        defer allocator.free(labels);
+        const mask = try allocator.alloc(f32, count);
+        defer allocator.free(mask);
+        auditFill(logits, 101 + count, 4.0);
+        var prng = std.Random.DefaultPrng.init(202 + count);
+        const random = prng.random();
+        for (labels, mask, 0..) |*label, *m, i| {
+            label.* = if (random.boolean()) 1.0 else 0.0;
+            // Mix hard zeros (masked out), ones, and real fractional weights.
+            m.* = switch (i % 4) {
+                0 => 0.0,
+                1 => 1.0,
+                2 => 0.25,
+                else => 2.0,
+            };
+        }
+        // A masked-out position holding a non-finite logit must not poison the
+        // scalar loss on either backend.
+        if (count > 4) logits[0] = std.math.inf(f32);
+
+        const shape = [_]i32{@intCast(count)};
+        const scalar_shape = [_]i32{1};
+        const upstream = [_]f32{1.25};
+        const out_shape_i64 = [_]i64{1};
+        const logits_shape_i64 = [_]i64{@intCast(count)};
+
+        var native_ctx = AuditNative.init(allocator);
+        defer native_ctx.deinit(allocator);
+        var native_cb = native_ctx.backend(allocator);
+        const n_logits = try native_cb.fromFloat32Shape(logits, &shape);
+        defer native_cb.free(n_logits);
+        const n_labels = try native_cb.fromFloat32Shape(labels, &shape);
+        defer native_cb.free(n_labels);
+        const n_mask = try native_cb.fromFloat32Shape(mask, &shape);
+        defer native_cb.free(n_mask);
+        const n_upstream = try native_cb.fromFloat32Shape(&upstream, &scalar_shape);
+        defer native_cb.free(n_upstream);
+        const n_loss = try native_cb.maskedBceWithLogitsLoss(&.{
+            .logits = n_logits,
+            .labels = n_labels,
+            .mask = n_mask,
+            .positive_weight = positive_weight,
+            .negative_weight = negative_weight,
+            .eps = eps,
+            .mean_reduction = true,
+            .output_shape = &out_shape_i64,
+        });
+        defer native_cb.free(n_loss);
+        const native_loss = try native_cb.toFloat32(n_loss, allocator);
+        defer allocator.free(native_loss);
+        const n_grad = try native_cb.maskedBceWithLogitsBackward(&.{
+            .logits = n_logits,
+            .labels = n_labels,
+            .mask = n_mask,
+            .upstream = n_upstream,
+            .positive_weight = positive_weight,
+            .negative_weight = negative_weight,
+            .eps = eps,
+            .mean_reduction = true,
+            .logits_shape = &logits_shape_i64,
+        });
+        defer native_cb.free(n_grad);
+        const native_grad = try native_cb.toFloat32(n_grad, allocator);
+        defer allocator.free(native_grad);
+
+        var metal_ws = testMetalWeightStoreInit(allocator);
+        defer metal_ws.lazy_weights.deinit(allocator);
+        var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+        defer metal_compute.deinit();
+        var metal_cb = metal_compute.computeBackend();
+        const m_logits = try auditDeviceTensor(&metal_compute, &metal_cb, logits, &shape);
+        defer metal_cb.free(m_logits);
+        const m_labels = try auditDeviceTensor(&metal_compute, &metal_cb, labels, &shape);
+        defer metal_cb.free(m_labels);
+        const m_mask = try auditDeviceTensor(&metal_compute, &metal_cb, mask, &shape);
+        defer metal_cb.free(m_mask);
+        const m_upstream = try auditDeviceTensor(&metal_compute, &metal_cb, &upstream, &scalar_shape);
+        defer metal_cb.free(m_upstream);
+
+        var loss_baseline: ?f32 = null;
+        var grad_baseline: ?[]f32 = null;
+        defer if (grad_baseline) |first| allocator.free(first);
+        for (0..audit_repeats) |_| {
+            const m_loss = try metal_cb.maskedBceWithLogitsLoss(&.{
+                .logits = m_logits,
+                .labels = m_labels,
+                .mask = m_mask,
+                .positive_weight = positive_weight,
+                .negative_weight = negative_weight,
+                .eps = eps,
+                .mean_reduction = true,
+                .output_shape = &out_shape_i64,
+            });
+            defer metal_cb.free(m_loss);
+            const metal_loss = try metal_cb.toFloat32(m_loss, allocator);
+            defer allocator.free(metal_loss);
+            worst_loss = @max(worst_loss, @abs(metal_loss[0] - native_loss[0]));
+            if (loss_baseline) |first| {
+                try std.testing.expectEqual(first, metal_loss[0]);
+            } else {
+                loss_baseline = metal_loss[0];
+            }
+
+            const m_grad = try metal_cb.maskedBceWithLogitsBackward(&.{
+                .logits = m_logits,
+                .labels = m_labels,
+                .mask = m_mask,
+                .upstream = m_upstream,
+                .positive_weight = positive_weight,
+                .negative_weight = negative_weight,
+                .eps = eps,
+                .mean_reduction = true,
+                .logits_shape = &logits_shape_i64,
+            });
+            defer metal_cb.free(m_grad);
+            const metal_grad = try metal_cb.toFloat32(m_grad, allocator);
+            defer allocator.free(metal_grad);
+            try std.testing.expectEqual(native_grad.len, metal_grad.len);
+            worst_grad = @max(worst_grad, auditMaxAbsDelta(native_grad, metal_grad));
+            if (grad_baseline) |first| {
+                try std.testing.expectEqualSlices(f32, first, metal_grad);
+            } else {
+                grad_baseline = try allocator.dupe(f32, metal_grad);
+            }
+        }
+    }
+    std.debug.print(
+        "\n[audit] maskedBce loss max|delta|={d} grad max|delta|={d}\n",
+        .{ worst_loss, worst_grad },
+    );
+    try std.testing.expect(worst_loss <= 1e-4);
+    try std.testing.expect(worst_grad <= 1e-5);
+}
+
+test "metal_compute: softmax and gelu match native on device tensors" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 7;
+    const dims = [_]usize{ 768, 300, 129, 32 };
+
+    var worst_softmax: f32 = 0.0;
+    var worst_gelu: f32 = 0.0;
+    for (dims) |dim| {
+        const total = rows * dim;
+        const x = try allocator.alloc(f32, total);
+        defer allocator.free(x);
+        auditFill(x, 909 + dim, 6.0);
+        const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+
+        var native_ctx = AuditNative.init(allocator);
+        defer native_ctx.deinit(allocator);
+        var native_cb = native_ctx.backend(allocator);
+        const n_x = try native_cb.fromFloat32Shape(x, &shape);
+        defer native_cb.free(n_x);
+        const n_soft = try native_cb.primSoftmax(n_x, @intCast(dim));
+        defer native_cb.free(n_soft);
+        const native_soft = try native_cb.toFloat32(n_soft, allocator);
+        defer allocator.free(native_soft);
+        const n_gelu = try native_cb.gelu(n_x);
+        defer native_cb.free(n_gelu);
+        const native_gelu = try native_cb.toFloat32(n_gelu, allocator);
+        defer allocator.free(native_gelu);
+
+        var metal_ws = testMetalWeightStoreInit(allocator);
+        defer metal_ws.lazy_weights.deinit(allocator);
+        var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+        defer metal_compute.deinit();
+        var metal_cb = metal_compute.computeBackend();
+        const m_x = try auditDeviceTensor(&metal_compute, &metal_cb, x, &shape);
+        defer metal_cb.free(m_x);
+
+        var soft_baseline: ?[]f32 = null;
+        defer if (soft_baseline) |first| allocator.free(first);
+        var gelu_baseline: ?[]f32 = null;
+        defer if (gelu_baseline) |first| allocator.free(first);
+        for (0..audit_repeats) |_| {
+            const m_soft = try metal_cb.primSoftmax(m_x, @intCast(dim));
+            defer metal_cb.free(m_soft);
+            const metal_soft = try metal_cb.toFloat32(m_soft, allocator);
+            defer allocator.free(metal_soft);
+            try std.testing.expectEqual(native_soft.len, metal_soft.len);
+            worst_softmax = @max(worst_softmax, auditMaxAbsDelta(native_soft, metal_soft));
+            if (soft_baseline) |first| {
+                try std.testing.expectEqualSlices(f32, first, metal_soft);
+            } else {
+                soft_baseline = try allocator.dupe(f32, metal_soft);
+            }
+
+            const m_gelu = try metal_cb.gelu(m_x);
+            defer metal_cb.free(m_gelu);
+            const metal_gelu = try metal_cb.toFloat32(m_gelu, allocator);
+            defer allocator.free(metal_gelu);
+            worst_gelu = @max(worst_gelu, auditMaxAbsDelta(native_gelu, metal_gelu));
+            if (gelu_baseline) |first| {
+                try std.testing.expectEqualSlices(f32, first, metal_gelu);
+            } else {
+                gelu_baseline = try allocator.dupe(f32, metal_gelu);
+            }
+        }
+    }
+    std.debug.print(
+        "\n[audit] softmax max|delta|={d} gelu max|delta|={d}\n",
+        .{ worst_softmax, worst_gelu },
+    );
+    try std.testing.expect(worst_softmax <= 1e-5);
+    try std.testing.expect(worst_gelu <= 1e-5);
+}
+
+test "metal_compute: scatter add axis0 matches native for embedding-style gradients" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const value_rows: usize = 64;
+    const out_rows: usize = 11;
+    const dim: usize = 96;
+
+    const values = try allocator.alloc(f32, value_rows * dim);
+    defer allocator.free(values);
+    auditFill(values, 4242, 1.0);
+    const indices = try allocator.alloc(f32, value_rows);
+    defer allocator.free(indices);
+    var prng = std.Random.DefaultPrng.init(4243);
+    const random = prng.random();
+    for (indices) |*index| index.* = @floatFromInt(random.uintLessThan(usize, out_rows));
+
+    const value_shape = [_]i32{ @intCast(value_rows), @intCast(dim) };
+    const index_shape = [_]i32{@intCast(value_rows)};
+    // The op contract: `input_shape` describes the value rows, and
+    // `indices_shape[0]` carries the declared output row count.
+    const input_shape_i64 = [_]i64{ @intCast(value_rows), @intCast(dim) };
+    const index_shape_i64 = [_]i64{@intCast(out_rows)};
+
+    var native_ctx = AuditNative.init(allocator);
+    defer native_ctx.deinit(allocator);
+    var native_cb = native_ctx.backend(allocator);
+    const n_values = try native_cb.fromFloat32Shape(values, &value_shape);
+    defer native_cb.free(n_values);
+    const n_indices = try native_cb.fromFloat32Shape(indices, &index_shape);
+    defer native_cb.free(n_indices);
+    const n_out = try native_cb.primScatterAdd(n_values, n_indices, &input_shape_i64, &index_shape_i64, 0);
+    defer native_cb.free(n_out);
+    const native_data = try native_cb.toFloat32(n_out, allocator);
+    defer allocator.free(native_data);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const m_values = try auditDeviceTensor(&metal_compute, &metal_cb, values, &value_shape);
+    defer metal_cb.free(m_values);
+    const m_indices = try auditDeviceTensor(&metal_compute, &metal_cb, indices, &index_shape);
+    defer metal_cb.free(m_indices);
+
+    var worst: f32 = 0.0;
+    var baseline: ?[]f32 = null;
+    defer if (baseline) |first| allocator.free(first);
+    for (0..audit_repeats) |_| {
+        const m_out = try metal_cb.primScatterAdd(m_values, m_indices, &input_shape_i64, &index_shape_i64, 0);
+        defer metal_cb.free(m_out);
+        const metal_data = try metal_cb.toFloat32(m_out, allocator);
+        defer allocator.free(metal_data);
+        try std.testing.expectEqual(native_data.len, metal_data.len);
+        worst = @max(worst, auditMaxAbsDelta(native_data, metal_data));
+        if (baseline) |first| {
+            try std.testing.expectEqualSlices(f32, first, metal_data);
+        } else {
+            baseline = try allocator.dupe(f32, metal_data);
+        }
+    }
+    std.debug.print("\n[audit] scatterAdd axis0 max|delta|={d}\n", .{worst});
+    try std.testing.expect(worst <= 1e-5);
+}
+
+test "metal_compute: disentangled relative attention matches native with padded rows" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    // Two items with different valid lengths: exactly what a GLiNER2 training
+    // micro-batch looks like. The all-ones-mask tests never reach the device
+    // mask upload at all, because the op only uploads a mask when it sees a 0.
+    const batch: usize = 2;
+    const seq_len: usize = 48;
+    const num_heads: usize = 4;
+    const head_dim: usize = 16;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    const rel_rows = 2 * seq_len - 1;
+
+    const q = try allocator.alloc(f32, total);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, total);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, total);
+    defer allocator.free(v);
+    const d_out = try allocator.alloc(f32, total);
+    defer allocator.free(d_out);
+    const q_r = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(q_r);
+    const k_r = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(k_r);
+    auditFill(q, 3001, 1.0);
+    auditFill(k, 3002, 1.0);
+    auditFill(v, 3003, 1.0);
+    auditFill(d_out, 3004, 1.0);
+    auditFill(q_r, 3005, 1.0);
+    auditFill(k_r, 3006, 1.0);
+
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    defer allocator.free(mask);
+    for (mask, 0..) |*m, i| {
+        const item = i / seq_len;
+        const pos = i % seq_len;
+        const valid: usize = if (item == 0) 40 else 17;
+        m.* = if (pos < valid) 1 else 0;
+    }
+
+    const token_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    const rel_shape = [_]i32{ @intCast(rel_rows), @intCast(hidden) };
+
+    var native_ctx = AuditNative.init(allocator);
+    defer native_ctx.deinit(allocator);
+    var native_cb = native_ctx.backend(allocator);
+    const n_q = try native_cb.fromFloat32Shape(q, &token_shape);
+    defer native_cb.free(n_q);
+    const n_k = try native_cb.fromFloat32Shape(k, &token_shape);
+    defer native_cb.free(n_k);
+    const n_v = try native_cb.fromFloat32Shape(v, &token_shape);
+    defer native_cb.free(n_v);
+    const n_d_out = try native_cb.fromFloat32Shape(d_out, &token_shape);
+    defer native_cb.free(n_d_out);
+    const n_q_r = try native_cb.fromFloat32Shape(q_r, &rel_shape);
+    defer native_cb.free(n_q_r);
+    const n_k_r = try native_cb.fromFloat32Shape(k_r, &rel_shape);
+    defer native_cb.free(n_k_r);
+
+    const n_fwd = try native_cb.disentangledRelativeAttention(n_q, n_k, n_v, n_q_r, n_k_r, mask, batch, seq_len, num_heads, head_dim);
+    defer native_cb.free(n_fwd);
+    const native_fwd = try native_cb.toFloat32(n_fwd, allocator);
+    defer allocator.free(native_fwd);
+    const n_bwd = try native_cb.disentangledRelativeAttentionBackward(n_q, n_k, n_v, n_q_r, n_k_r, mask, n_d_out, batch, seq_len, num_heads, head_dim);
+    defer native_cb.free(n_bwd);
+    const native_bwd = try native_cb.toFloat32(n_bwd, allocator);
+    defer allocator.free(native_bwd);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const m_q = try auditDeviceTensor(&metal_compute, &metal_cb, q, &token_shape);
+    defer metal_cb.free(m_q);
+    const m_k = try auditDeviceTensor(&metal_compute, &metal_cb, k, &token_shape);
+    defer metal_cb.free(m_k);
+    const m_v = try auditDeviceTensor(&metal_compute, &metal_cb, v, &token_shape);
+    defer metal_cb.free(m_v);
+    const m_d_out = try auditDeviceTensor(&metal_compute, &metal_cb, d_out, &token_shape);
+    defer metal_cb.free(m_d_out);
+    const m_q_r = try auditDeviceTensor(&metal_compute, &metal_cb, q_r, &rel_shape);
+    defer metal_cb.free(m_q_r);
+    const m_k_r = try auditDeviceTensor(&metal_compute, &metal_cb, k_r, &rel_shape);
+    defer metal_cb.free(m_k_r);
+
+    var worst_fwd: f32 = 0.0;
+    var worst_bwd: f32 = 0.0;
+    var fwd_baseline: ?[]f32 = null;
+    defer if (fwd_baseline) |first| allocator.free(first);
+    var bwd_baseline: ?[]f32 = null;
+    defer if (bwd_baseline) |first| allocator.free(first);
+    for (0..audit_repeats) |_| {
+        const m_fwd = try metal_cb.disentangledRelativeAttention(m_q, m_k, m_v, m_q_r, m_k_r, mask, batch, seq_len, num_heads, head_dim);
+        defer metal_cb.free(m_fwd);
+        const metal_fwd = try metal_cb.toFloat32(m_fwd, allocator);
+        defer allocator.free(metal_fwd);
+        try std.testing.expectEqual(native_fwd.len, metal_fwd.len);
+        worst_fwd = @max(worst_fwd, auditMaxAbsDelta(native_fwd, metal_fwd));
+        if (fwd_baseline) |first| {
+            try std.testing.expectEqualSlices(f32, first, metal_fwd);
+        } else {
+            fwd_baseline = try allocator.dupe(f32, metal_fwd);
+        }
+
+        const m_bwd = try metal_cb.disentangledRelativeAttentionBackward(m_q, m_k, m_v, m_q_r, m_k_r, mask, m_d_out, batch, seq_len, num_heads, head_dim);
+        defer metal_cb.free(m_bwd);
+        const metal_bwd = try metal_cb.toFloat32(m_bwd, allocator);
+        defer allocator.free(metal_bwd);
+        try std.testing.expectEqual(native_bwd.len, metal_bwd.len);
+        worst_bwd = @max(worst_bwd, auditMaxAbsDelta(native_bwd, metal_bwd));
+        if (bwd_baseline) |first| {
+            try std.testing.expectEqualSlices(f32, first, metal_bwd);
+        } else {
+            bwd_baseline = try allocator.dupe(f32, metal_bwd);
+        }
+    }
+    std.debug.print(
+        "\n[audit] padded disentangled forward max|delta|={d} backward max|delta|={d}\n",
+        .{ worst_fwd, worst_bwd },
+    );
+    try std.testing.expect(worst_fwd <= 1e-4);
+    try std.testing.expect(worst_bwd <= 1e-4);
+}
+
+test "metal_compute: linear and dot_general match native on device tensors" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 33;
+    const in_dim: usize = 257;
+    const out_dim: usize = 129;
+
+    const input = try allocator.alloc(f32, rows * in_dim);
+    defer allocator.free(input);
+    const weight = try allocator.alloc(f32, out_dim * in_dim);
+    defer allocator.free(weight);
+    const bias = try allocator.alloc(f32, out_dim);
+    defer allocator.free(bias);
+    auditFill(input, 7001, 1.0);
+    auditFill(weight, 7002, 0.5);
+    auditFill(bias, 7003, 0.25);
+
+    const in_shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
+    const w_shape = [_]i32{ @intCast(out_dim), @intCast(in_dim) };
+    const b_shape = [_]i32{@intCast(out_dim)};
+
+    var native_ctx = AuditNative.init(allocator);
+    defer native_ctx.deinit(allocator);
+    var native_cb = native_ctx.backend(allocator);
+    const n_in = try native_cb.fromFloat32Shape(input, &in_shape);
+    defer native_cb.free(n_in);
+    const n_w = try native_cb.fromFloat32Shape(weight, &w_shape);
+    defer native_cb.free(n_w);
+    const n_b = try native_cb.fromFloat32Shape(bias, &b_shape);
+    defer native_cb.free(n_b);
+    const n_out = try native_cb.linear(n_in, n_w, n_b, rows, in_dim, out_dim);
+    defer native_cb.free(n_out);
+    const native_data = try native_cb.toFloat32(n_out, allocator);
+    defer allocator.free(native_data);
+    const n_nobias = try native_cb.linearNoBias(n_in, n_w, rows, in_dim, out_dim);
+    defer native_cb.free(n_nobias);
+    const native_nobias = try native_cb.toFloat32(n_nobias, allocator);
+    defer allocator.free(native_nobias);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const m_in = try auditDeviceTensor(&metal_compute, &metal_cb, input, &in_shape);
+    defer metal_cb.free(m_in);
+    const m_w = try auditDeviceTensor(&metal_compute, &metal_cb, weight, &w_shape);
+    defer metal_cb.free(m_w);
+    const m_b = try auditDeviceTensor(&metal_compute, &metal_cb, bias, &b_shape);
+    defer metal_cb.free(m_b);
+
+    var worst_linear: f32 = 0.0;
+    var worst_nobias: f32 = 0.0;
+    var linear_baseline: ?[]f32 = null;
+    defer if (linear_baseline) |first| allocator.free(first);
+    var nobias_baseline: ?[]f32 = null;
+    defer if (nobias_baseline) |first| allocator.free(first);
+    for (0..audit_repeats) |_| {
+        const m_out = try metal_cb.linear(m_in, m_w, m_b, rows, in_dim, out_dim);
+        defer metal_cb.free(m_out);
+        const metal_data = try metal_cb.toFloat32(m_out, allocator);
+        defer allocator.free(metal_data);
+        try std.testing.expectEqual(native_data.len, metal_data.len);
+        worst_linear = @max(worst_linear, auditMaxAbsDelta(native_data, metal_data));
+        if (linear_baseline) |first| {
+            try std.testing.expectEqualSlices(f32, first, metal_data);
+        } else {
+            linear_baseline = try allocator.dupe(f32, metal_data);
+        }
+
+        const m_nobias = try metal_cb.linearNoBias(m_in, m_w, rows, in_dim, out_dim);
+        defer metal_cb.free(m_nobias);
+        const metal_nobias = try metal_cb.toFloat32(m_nobias, allocator);
+        defer allocator.free(metal_nobias);
+        worst_nobias = @max(worst_nobias, auditMaxAbsDelta(native_nobias, metal_nobias));
+        if (nobias_baseline) |first| {
+            try std.testing.expectEqualSlices(f32, first, metal_nobias);
+        } else {
+            nobias_baseline = try allocator.dupe(f32, metal_nobias);
+        }
+    }
+    std.debug.print(
+        "\n[audit] linear max|delta|={d} linearNoBias max|delta|={d}\n",
+        .{ worst_linear, worst_nobias },
+    );
+    try std.testing.expect(worst_linear <= 1e-4);
+    try std.testing.expect(worst_nobias <= 1e-4);
+}
+
+test "metal_compute: threadgroup softmax rows is stable at multi-simdgroup width" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    // termite_apply_softmax_rows always runs 256 threads (8 SIMD groups) and
+    // reuses `shmem` for the max reduction and then the sum reduction. Long
+    // rows and many concurrent threadgroups maximise the skew between SIMD
+    // groups, which is what turns a missing barrier into a wrong row max.
+    const rows: usize = 2048;
+    const dim: usize = 2048;
+    const total = rows * dim;
+
+    const x = try allocator.alloc(f32, total);
+    defer allocator.free(x);
+    auditFill(x, 246810, 8.0);
+    const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+
+    var native_ctx = AuditNative.init(allocator);
+    defer native_ctx.deinit(allocator);
+    var native_cb = native_ctx.backend(allocator);
+    const n_x = try native_cb.fromFloat32Shape(x, &shape);
+    defer native_cb.free(n_x);
+    const n_out = try native_cb.primSoftmax(n_x, @intCast(dim));
+    defer native_cb.free(n_out);
+    const native_data = try native_cb.toFloat32(n_out, allocator);
+    defer allocator.free(native_data);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const m_x = try auditDeviceTensor(&metal_compute, &metal_cb, x, &shape);
+    defer metal_cb.free(m_x);
+
+    var worst: f32 = 0.0;
+    var baseline: ?[]f32 = null;
+    defer if (baseline) |first| allocator.free(first);
+    for (0..audit_repeats) |_| {
+        const m_out = try metal_cb.primSoftmax(m_x, @intCast(dim));
+        defer metal_cb.free(m_out);
+        // If this is not device-resident the test is not exercising the kernel.
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, m_out));
+        const metal_data = try metal_cb.toFloat32(m_out, allocator);
+        defer allocator.free(metal_data);
+        worst = @max(worst, auditMaxAbsDelta(native_data, metal_data));
+        if (baseline) |first| {
+            try std.testing.expectEqualSlices(f32, first, metal_data);
+        } else {
+            baseline = try allocator.dupe(f32, metal_data);
+        }
+    }
+    std.debug.print("\n[audit] softmax stress rows={d} dim={d} max|delta|={d}\n", .{ rows, dim, worst });
+    try std.testing.expect(worst <= 1e-6);
+}
+
+test "metal_compute: training sum-of-squares matches the f64 host grad-norm reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    // A DeBERTa FFN head gradient is 3072 x 768; grad magnitudes at this point
+    // in training are ~1e-3. The device kernel accumulates the whole tensor in
+    // one f32 register, the host grad-norm reference accumulates in f64.
+    const elem_count: usize = 3072 * 768;
+    const values = try allocator.alloc(f32, elem_count);
+    defer allocator.free(values);
+    var prng = std.Random.DefaultPrng.init(31337);
+    const random = prng.random();
+    for (values) |*value| value.* = (random.float(f32) * 2.0 - 1.0) * 1.0e-3;
+
+    var host_total: f64 = 0.0;
+    for (values) |value| host_total += @as(f64, value) * @as(f64, value);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const shape = [_]i32{@intCast(elem_count)};
+    const device = try metal_compute.trainingUploadF32(values, &shape);
+    defer metal_cb.free(device);
+
+    var baseline: ?f32 = null;
+    for (0..5) |_| {
+        const device_sumsq = try metal_compute.trainingSumSquaresF32(device, elem_count);
+        if (baseline) |first| {
+            try std.testing.expectEqual(first, device_sumsq);
+        } else {
+            baseline = device_sumsq;
+        }
+    }
+    const device_sumsq = baseline.?;
+    const host_norm = @sqrt(host_total);
+    const device_norm = @sqrt(@as(f64, device_sumsq));
+    const rel = @abs(device_norm - host_norm) / host_norm;
+    std.debug.print(
+        "\n[audit] sumsq n={d} host(f64)={d:.9} device(f32)={d:.9} grad-norm rel err={d:.9}\n",
+        .{ elem_count, host_total, device_sumsq, rel },
+    );
+    // Grad clipping scales every gradient by max_grad_norm/global_norm, so a
+    // relative grad-norm error is a relative learning-rate error.
+    try std.testing.expect(rel <= 1e-3);
+}
+
 test "metal_compute: linearTriple is owned by metal backend" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -28632,6 +29842,80 @@ test "metal_compute: training AdamW updates device-resident weights" {
     const cleared_grad = try metal_cb.toFloat32(grad_accum, allocator);
     defer allocator.free(cleared_grad);
     for (cleared_grad) |value| try std.testing.expectApproxEqAbs(0.0, value, 1e-7);
+}
+
+test "metal_compute: batched training AdamW applies per-item bias correction" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{4};
+    const initial = [_]f32{ 1.0, -2.0, 0.5, 3.0 };
+    const grad_values_a = [_]f32{ 0.2, -0.1, 0.0, 0.4 };
+    const grad_values_b = [_]f32{ -0.3, 0.25, 0.1, -0.05 };
+    // A parameter gated out of earlier optimizer steps lags the global step,
+    // so the two items must be corrected at different exponents. Passing one
+    // scalar for the whole batch would make the second comparison fail.
+    const steps = [_]u32{ 5, 1 };
+
+    const weight_a = try metal_compute.trainingUploadF32(&initial, &shape);
+    defer metal_cb.free(weight_a);
+    const weight_b = try metal_compute.trainingUploadF32(&initial, &shape);
+    defer metal_cb.free(weight_b);
+    const grad_a = try metal_compute.trainingUploadF32(&grad_values_a, &shape);
+    defer metal_cb.free(grad_a);
+    const grad_b = try metal_compute.trainingUploadF32(&grad_values_b, &shape);
+    defer metal_cb.free(grad_b);
+    const m_a = try metal_compute.trainingZeroF32(initial.len, &shape);
+    defer metal_cb.free(m_a);
+    const m_b = try metal_compute.trainingZeroF32(initial.len, &shape);
+    defer metal_cb.free(m_b);
+    const v_a = try metal_compute.trainingZeroF32(initial.len, &shape);
+    defer metal_cb.free(v_a);
+    const v_b = try metal_compute.trainingZeroF32(initial.len, &shape);
+    defer metal_cb.free(v_b);
+
+    const cfg = ml.graph.optimizers.AdamWConfig{ .weight_decay = 0.01 };
+    var batch: [2]MetalCompute.TrainingAdamWBatchInput = .{
+        .{ .weight = weight_a, .grad = grad_a, .m = m_a, .v = v_a, .elem_count = initial.len, .bias_correction1 = 0.0, .bias_correction2 = 0.0 },
+        .{ .weight = weight_b, .grad = grad_b, .m = m_b, .v = v_b, .elem_count = initial.len, .bias_correction1 = 0.0, .bias_correction2 = 0.0 },
+    };
+    for (&batch, steps) |*item, step| {
+        const t: f32 = @floatFromInt(step);
+        item.bias_correction1 = 1.0 - std.math.pow(f32, cfg.beta1, t);
+        item.bias_correction2 = 1.0 - std.math.pow(f32, cfg.beta2, t);
+    }
+    try metal_compute.trainingAdamWManyF32(&batch, .{
+        .lr = 0.001,
+        .beta1 = cfg.beta1,
+        .beta2 = cfg.beta2,
+        .eps = cfg.eps,
+        .weight_decay = cfg.weight_decay,
+        .grad_scale = 1.0,
+    });
+
+    for ([_]CT{ weight_a, weight_b }, [_]CT{ grad_a, grad_b }, [_][4]f32{ grad_values_a, grad_values_b }, steps) |weight, grad, grad_values, step| {
+        var expected = initial;
+        var expected_m = [_]f32{0.0} ** initial.len;
+        var expected_v = [_]f32{0.0} ** initial.len;
+        ml.graph.optimizers.stepSlices(.{ .adamw = cfg }, step, 0.001, &expected, &grad_values, &expected_m, &expected_v);
+
+        const actual = try metal_cb.toFloat32(weight, allocator);
+        defer allocator.free(actual);
+        for (expected, actual) |expected_value, actual_value| {
+            try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-5);
+        }
+        const cleared_grad = try metal_cb.toFloat32(grad, allocator);
+        defer allocator.free(cleared_grad);
+        for (cleared_grad) |value| try std.testing.expectApproxEqAbs(0.0, value, 1e-7);
+    }
 }
 
 test "metal_compute: causal self attention is owned by metal backend" {

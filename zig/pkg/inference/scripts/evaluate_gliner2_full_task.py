@@ -4,19 +4,31 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import math
-import subprocess
+import platform
 import sys
-import unicodedata
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from gliner2_release_contract import (
+    CANONICAL_NORMALIZATION,
+    CANONICAL_UNICODE_VERSION,
+    UPSTREAM_COMMIT,
+    canonical_text,
+    clean_text as contract_clean_text,
+    path_fingerprint,
+    verify_import_source,
+    verify_canonical_python_runtime,
+    verify_upstream_checkout,
+)
+from validate_gliner2_release_data import adapter_bundle_fingerprint, base_model_fingerprint
 
-UPSTREAM_COMMIT = "8f3fc399bcc5a00749a62a1565e5c6529f04b574"
+
+EVALUATION_CONTRACT = "gliner2_full_task_evaluation/v1"
+
 REQUIRED_MINIMA = frozenset(
     {
         "entities.micro_f1",
@@ -33,13 +45,11 @@ REQUIRED_MINIMA = frozenset(
 
 
 def clean_text(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"expected string value, got {type(value).__name__}")
-    return " ".join(unicodedata.normalize("NFC", value).split())
+    return contract_clean_text(value)
 
 
 def normalized_text(value: Any) -> str:
-    return clean_text(value).casefold()
+    return canonical_text(value)
 
 
 def values(value: Any) -> tuple[str, ...]:
@@ -532,27 +542,11 @@ def metric(metrics: dict[str, Any], key: str) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def verify_upstream(source: Path, expected_commit: str) -> str:
-    if not (source / "gliner2" / "__init__.py").is_file():
-        raise ValueError(f"{source}: expected an upstream GLiNER2 checkout")
-    proc = subprocess.run(
-        ["git", "-C", str(source), "rev-parse", "HEAD"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    commit = proc.stdout.strip() if proc.returncode == 0 else ""
-    if commit != expected_commit:
-        raise ValueError(f"upstream commit {commit or 'unknown'} does not match frozen {expected_commit}")
-    dirty = subprocess.run(
-        ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if dirty.returncode != 0 or dirty.stdout.strip():
-        raise ValueError("upstream checkout must be clean")
-    return commit
+def verify_upstream(source: Path, expected_commit: str = UPSTREAM_COMMIT) -> str:
+    """Compatibility wrapper around the non-overridable pinned oracle check."""
+    if expected_commit != UPSTREAM_COMMIT:
+        raise ValueError(f"the Python oracle commit is fixed at {UPSTREAM_COMMIT}")
+    return verify_upstream_checkout(source)["commit"]
 
 
 def batches(items: Iterable[tuple[str, dict[str, Any]]], size: int) -> Iterator[list[tuple[str, dict[str, Any]]]]:
@@ -577,7 +571,6 @@ def main() -> int:
     )
     parser.add_argument("--eval-data", type=Path, required=True)
     parser.add_argument("--upstream-source", type=Path, required=True)
-    parser.add_argument("--expected-upstream-commit", default=UPSTREAM_COMMIT)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-metric", action="append", default=[])
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -609,7 +602,8 @@ def main() -> int:
         if args.model_dir is None or args.adapter_dir is None:
             raise ValueError("provide --comparison-report or both --model-dir and --adapter-dir")
         minima = parse_minima(args.min_metric)
-        commit = verify_upstream(args.upstream_source.resolve(), args.expected_upstream_commit)
+        normalization_runtime = verify_canonical_python_runtime()
+        oracle = verify_upstream_checkout(args.upstream_source.resolve())
         for name in ("adapter_config.json", "adapter_model.safetensors"):
             if not (args.adapter_dir / name).is_file():
                 raise ValueError(f"adapter is missing {name}")
@@ -617,14 +611,13 @@ def main() -> int:
         if adapter_config.get("peft_type") != "LORA" or adapter_config.get("task_type") is not None:
             raise ValueError("adapter must use standard task-agnostic PEFT LoRA format")
 
+        sys.dont_write_bytecode = True
         sys.path.insert(0, str(args.upstream_source.resolve()))
         import torch
         from gliner2 import GLiNER2, __version__ as gliner2_version
         from peft import PeftModel
 
-        imported_from = Path(inspect.getfile(GLiNER2)).resolve()
-        if not imported_from.is_relative_to(args.upstream_source.resolve()):
-            raise ValueError(f"GLiNER2 imported from unpinned source: {imported_from}")
+        imported_from = verify_import_source(GLiNER2, args.upstream_source)
         torch.manual_seed(0)
         torch.use_deterministic_algorithms(True)
         base = GLiNER2.from_pretrained(str(args.model_dir), map_location="cpu")
@@ -688,6 +681,7 @@ def main() -> int:
             if actual is None or actual < count_minimum:
                 failures.append(f"{task}.count.accuracy={actual} below minimum {count_minimum}")
         report = {
+            "contract": EVALUATION_CONTRACT,
             "pass": not failures,
             "failures": failures,
             "record_count": record_count,
@@ -698,16 +692,33 @@ def main() -> int:
                 "threshold": args.threshold,
                 "batch_size": args.batch_size,
                 "max_length": args.max_length,
-                "normalization": "Unicode NFC, collapsed whitespace, casefolded exact atoms",
+                "normalization": CANONICAL_NORMALIZATION,
+                "normalization_runtime": normalization_runtime,
+                "unicode_version": CANONICAL_UNICODE_VERSION,
                 "relation_semantics": "upstream public head/tail decoder only",
             },
-            "upstream": {"commit": commit, "version": gliner2_version, "source": str(imported_from)},
+            "oracle": {
+                **oracle,
+                "imported_module": imported_from,
+                "gliner2_version": gliner2_version,
+                "python_version": platform.python_version(),
+                "unicode_version": CANONICAL_UNICODE_VERSION,
+                "torch_version": torch.__version__,
+            },
+            # Retain the old report key for readers while making its checkout
+            # and imported-module meanings unambiguous in ``oracle`` above.
+            "upstream": {"commit": oracle["commit"], "version": gliner2_version, "source": imported_from},
             "model_dir": str(args.model_dir),
             "adapter_dir": str(args.adapter_dir),
             "eval_data": str(args.eval_data),
+            "artifacts": {
+                "base_model_fingerprint_sha256": base_model_fingerprint(args.model_dir),
+                "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(args.adapter_dir),
+                "eval_data_fingerprint_sha256": path_fingerprint(args.eval_data),
+            },
         }
     except Exception as exc:
-        report = {"pass": False, "failures": [str(exc)]}
+        report = {"contract": EVALUATION_CONTRACT, "pass": False, "failures": [str(exc)]}
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")

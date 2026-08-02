@@ -1560,6 +1560,53 @@ const pinned_normalizer_inert_ranges = [_]Range{
     .{ .first = 0x31350, .last = 0x323AF },
 };
 
+const simple_casefold_ranges = [_]Range{
+    .{ .first = 0x0, .last = 0xB4 },
+    .{ .first = 0xB6, .last = 0xDE },
+    .{ .first = 0xE0, .last = 0x12F },
+    .{ .first = 0x131, .last = 0x148 },
+    .{ .first = 0x14A, .last = 0x17E },
+    .{ .first = 0x180, .last = 0x1EF },
+    .{ .first = 0x1F1, .last = 0x344 },
+    .{ .first = 0x346, .last = 0x38F },
+    .{ .first = 0x391, .last = 0x3AF },
+    .{ .first = 0x3B1, .last = 0x3C1 },
+    .{ .first = 0x3C3, .last = 0x3CF },
+    .{ .first = 0x3D2, .last = 0x3D4 },
+    .{ .first = 0x3D7, .last = 0x3EF },
+    .{ .first = 0x3F2, .last = 0x3F4 },
+    .{ .first = 0x3F6, .last = 0x586 },
+    .{ .first = 0x588, .last = 0x139F },
+    .{ .first = 0x13F6, .last = 0x13F7 },
+    .{ .first = 0x13FE, .last = 0x1C7F },
+    .{ .first = 0x1C89, .last = 0x1E95 },
+    .{ .first = 0x1E9C, .last = 0x1E9D },
+    .{ .first = 0x1E9F, .last = 0x1F4F },
+    .{ .first = 0x1F51, .last = 0x1F51 },
+    .{ .first = 0x1F53, .last = 0x1F53 },
+    .{ .first = 0x1F55, .last = 0x1F55 },
+    .{ .first = 0x1F57, .last = 0x1F7F },
+    .{ .first = 0x1FB0, .last = 0x1FB1 },
+    .{ .first = 0x1FB5, .last = 0x1FB5 },
+    .{ .first = 0x1FB8, .last = 0x1FBB },
+    .{ .first = 0x1FBD, .last = 0x1FBD },
+    .{ .first = 0x1FBF, .last = 0x1FC1 },
+    .{ .first = 0x1FC5, .last = 0x1FC5 },
+    .{ .first = 0x1FC8, .last = 0x1FCB },
+    .{ .first = 0x1FCD, .last = 0x1FD1 },
+    .{ .first = 0x1FD4, .last = 0x1FD5 },
+    .{ .first = 0x1FD8, .last = 0x1FE1 },
+    .{ .first = 0x1FE5, .last = 0x1FE5 },
+    .{ .first = 0x1FE8, .last = 0x1FF1 },
+    .{ .first = 0x1FF5, .last = 0x1FF5 },
+    .{ .first = 0x1FF8, .last = 0x1FFB },
+    .{ .first = 0x1FFD, .last = 0xAB6F },
+    .{ .first = 0xABC0, .last = 0xD7FF },
+    .{ .first = 0xE000, .last = 0xFAFF },
+    .{ .first = 0xFB07, .last = 0xFB12 },
+    .{ .first = 0xFB18, .last = 0x10FFFF },
+};
+
 const cased_ranges = [_]Range{
     .{ .first = 0x41, .last = 0x5A },
     .{ .first = 0x61, .last = 0x7A },
@@ -2374,6 +2421,13 @@ pub fn isWhitespace(cp: u21) bool {
 /// leaves unchanged in any admitted fragment context.
 pub fn isPinnedNormalizerInert(cp: u21) bool {
     return inRanges(cp, &pinned_normalizer_inert_ranges);
+}
+
+/// True when Python 3.12 / Unicode 15 casefold is exactly the
+/// scalar returned by simpleLower. Expanding and distinct mappings
+/// are excluded so release scoring can fail closed.
+pub fn isSimpleCasefold(cp: u21) bool {
+    return inRanges(cp, &simple_casefold_ranges);
 }
 
 pub fn isCased(cp: u21) bool {

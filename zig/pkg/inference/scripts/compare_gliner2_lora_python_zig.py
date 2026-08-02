@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from gliner2_parity_data import allowed_labels_for_objective, normalize_python_record
+from gliner2_release_contract import CANONICAL_NORMALIZATION, UPSTREAM_COMMIT, verify_upstream_checkout
+from validate_gliner2_release_data import base_model_fingerprint, sha256_file
+
+
+COMPARISON_CONTRACT = "gliner2_python_zig_comparison/v2"
 
 
 DEFAULT_PYTHON = "/private/tmp/gliner2-parity-venv/bin/python"
@@ -188,6 +193,17 @@ def run_command(cmd: list[str], cwd: Path, timeout: int | None = None, env: dict
         "returncode": proc.returncode,
         "elapsed_seconds": time.time() - started,
         "output": proc.stdout,
+    }
+
+
+def oracle_subprocess_env(args: argparse.Namespace) -> dict[str, str]:
+    """Put the verified checkout first and make generated scripts self-check it."""
+    return {
+        "PYTHONHASHSEED": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(args.upstream_source),
+        "GLINER2_ORACLE_SOURCE": str(args.upstream_source),
+        "GLINER2_ORACLE_COMMIT": UPSTREAM_COMMIT,
     }
 
 
@@ -701,6 +717,63 @@ def compare_optimizer_parity(
     }
 
 
+def optimizer_parity_gate(
+    comparison: dict[str, Any] | None,
+    tolerance: float,
+) -> tuple[bool, list[str]]:
+    """Gate the sampled per-step gradient/Adam/update evidence.
+
+    Both runtimes emit every common LoRA tensor's first values plus aggregate
+    absolute sums.  The strict gate covers tensor/step bookkeeping and every
+    emitted gradient, first/second moment, and post-update weight head.  Full
+    independently-trained tensor equality remains a separate nongating
+    diagnostic.
+    """
+    failures: list[str] = []
+    if not isinstance(comparison, dict) or comparison.get("ran") is not True:
+        return False, ["optimizer parity dumps did not run"]
+    python_steps = comparison.get("python_step_count")
+    zig_steps = comparison.get("zig_step_count")
+    steps = comparison.get("steps")
+    if (
+        not isinstance(python_steps, int)
+        or isinstance(python_steps, bool)
+        or python_steps <= 0
+        or python_steps != zig_steps
+        or not isinstance(steps, list)
+        or len(steps) != python_steps
+    ):
+        failures.append("optimizer parity step counts are missing or unequal")
+        return False, failures
+    delta_fields = (
+        "derived_grad_head_max_abs_delta",
+        "python_true_grad_vs_zig_derived_max_abs_delta",
+        "m_head_max_abs_delta",
+        "v_head_max_abs_delta",
+        "weight_head_max_abs_delta",
+    )
+    for index, row in enumerate(steps, 1):
+        if not isinstance(row, dict) or row.get("step") != index:
+            failures.append(f"optimizer parity step {index} is missing or out of order")
+            continue
+        if (
+            not isinstance(row.get("tensors_compared"), int)
+            or row.get("tensors_compared", 0) <= 0
+            or row.get("python_only_tensors") != 0
+            or row.get("zig_only_tensors") != 0
+            or row.get("step_count_mismatch_count") != 0
+        ):
+            failures.append(f"optimizer parity step {index} has incomplete tensor/bookkeeping coverage")
+        for field in delta_fields:
+            detail = row.get(field)
+            delta = detail.get("max_abs_delta") if isinstance(detail, dict) else None
+            if not finite_number(delta) or abs(float(delta)) > tolerance:
+                failures.append(
+                    f"optimizer parity step {index} {field}={delta!r} exceeds {tolerance}"
+                )
+    return not failures, failures
+
+
 def summarize_preprocess_tasks(samples: list[dict[str, Any]] | None) -> dict[str, Any]:
     task_counts: dict[str, int] = {}
     sample_summaries: list[dict[str, Any]] = []
@@ -1178,14 +1251,35 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def python_training_script() -> str:
     return r'''
-import argparse, inspect, json, math, os, pathlib, time, types
+import argparse, inspect, json, math, os, pathlib, sys, time, types, unicodedata
 import torch
 import torch.nn.functional as F
+import gliner2
 import gliner2.model as gliner2_model
 from gliner2.model import Extractor
 from gliner2.training.lora import save_lora_adapter
 from gliner2.training.trainer import ExtractorCollator, TrainingConfig, GLiNER2Trainer
 from transformers import AutoConfig
+
+if sys.version_info[:2] != (3, 12) or unicodedata.unidata_version != "15.0.0":
+    raise RuntimeError(
+        "GLiNER2 oracle requires Python 3.12 / Unicode 15.0.0, found "
+        f"{sys.version_info.major}.{sys.version_info.minor} / {unicodedata.unidata_version}"
+    )
+
+oracle_source = pathlib.Path(os.environ["GLINER2_ORACLE_SOURCE"]).resolve()
+imported_gliner2 = pathlib.Path(inspect.getfile(gliner2_model)).resolve()
+if not imported_gliner2.is_relative_to(oracle_source):
+    raise RuntimeError(f"GLiNER2 imported from unpinned source: {imported_gliner2}")
+oracle = {
+    "commit": os.environ["GLINER2_ORACLE_COMMIT"],
+    "checkout": str(oracle_source),
+    "imported_module": str(imported_gliner2),
+    "python_version": __import__("platform").python_version(),
+    "unicode_version": unicodedata.unidata_version,
+    "torch_version": torch.__version__,
+    "gliner2_version": getattr(gliner2, "__version__", None),
+}
 
 p = argparse.ArgumentParser()
 p.add_argument("--model-dir", required=True)
@@ -2034,6 +2128,7 @@ payload = {
     "trainable_parameters": trainable,
     "total_parameters": total,
     "torch_version": torch.__version__,
+    "oracle": oracle,
     "disabled_dropout_modules": disabled_dropout_modules,
     "initial_adapter_checkpoint": str(initial_adapter_dir / "adapter_weights.safetensors"),
     "span_parity_debug": parity_debug[0] if parity_debug else None,
@@ -2060,13 +2155,34 @@ print("PYTHON_GLINER2_COMPARISON " + json.dumps(payload, sort_keys=True))
 
 def adapter_roundtrip_script() -> str:
     return r'''
-import argparse, json, math, os, pathlib, random, types
+import argparse, inspect, json, math, os, pathlib, random, sys, types, unicodedata
 import torch
+import gliner2
 import gliner2.model as gliner2_model
 from gliner2.model import Extractor
 from gliner2.training.trainer import ExtractorCollator
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig
+
+if sys.version_info[:2] != (3, 12) or unicodedata.unidata_version != "15.0.0":
+    raise RuntimeError(
+        "GLiNER2 oracle requires Python 3.12 / Unicode 15.0.0, found "
+        f"{sys.version_info.major}.{sys.version_info.minor} / {unicodedata.unidata_version}"
+    )
+
+oracle_source = pathlib.Path(os.environ["GLINER2_ORACLE_SOURCE"]).resolve()
+imported_gliner2 = pathlib.Path(inspect.getfile(gliner2_model)).resolve()
+if not imported_gliner2.is_relative_to(oracle_source):
+    raise RuntimeError(f"GLiNER2 imported from unpinned source: {imported_gliner2}")
+oracle = {
+    "commit": os.environ["GLINER2_ORACLE_COMMIT"],
+    "checkout": str(oracle_source),
+    "imported_module": str(imported_gliner2),
+    "python_version": __import__("platform").python_version(),
+    "unicode_version": unicodedata.unidata_version,
+    "torch_version": torch.__version__,
+    "gliner2_version": getattr(gliner2, "__version__", None),
+}
 
 p = argparse.ArgumentParser()
 p.add_argument("--model-dir", required=True)
@@ -2360,6 +2476,7 @@ result = {
     "zig_unexpected_adapter_keys": unexpected_keys[:20],
     "zig_unexpected_adapter_key_count": len(unexpected_keys),
     "batch_size": len(items),
+    "oracle": oracle,
 }
 pathlib.Path(args.result_json).write_text(json.dumps(result, indent=2), encoding="utf-8")
 print("ADAPTER_ROUNDTRIP " + json.dumps(result, sort_keys=True))
@@ -2393,7 +2510,7 @@ def run_adapter_comparison(
     ]
     if args.adapter_roundtrip_weights_tolerance is not None:
         cmd.extend(["--weights-tolerance", str(args.adapter_roundtrip_weights_tolerance)])
-    command_result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env={"PYTHONHASHSEED": "0"})
+    command_result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env=oracle_subprocess_env(args))
     result: dict[str, Any] = {
         "ran": True,
         "returncode": command_result.get("returncode"),
@@ -2522,7 +2639,7 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
         # trains on permuted batches and per-step losses compare unrelated
         # data (bit the perf benchmark in practice).
         cmd.append("--no-train-shuffle")
-    result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env={"PYTHONHASHSEED": "0"})
+    result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env=oracle_subprocess_env(args))
     metrics_path = out_dir / "python" / "comparison_metrics.json"
     result["metrics"] = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
     return result
@@ -2635,6 +2752,11 @@ def main() -> int:
     p.add_argument("--train-data", type=Path, default=default_train_data())
     p.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     p.add_argument("--python-bin", default=DEFAULT_PYTHON)
+    p.add_argument(
+        "--upstream-source",
+        type=Path,
+        help=f"Clean upstream GLiNER2 checkout at the fixed oracle commit {UPSTREAM_COMMIT}",
+    )
     p.add_argument("--entity-types", default=DEFAULT_LABELS)
     p.add_argument("--steps", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=1)
@@ -2823,6 +2945,22 @@ def main() -> int:
     if Path(str(args.python_model)).exists():
         args.python_model = str(Path(str(args.python_model)).expanduser().resolve())
 
+    oracle: dict[str, str] | None = None
+    model_fingerprint: str | None = None
+    train_data_fingerprint: str | None = None
+    if not args.skip_python:
+        if args.upstream_source is None:
+            p.error("--upstream-source is required whenever the Python oracle runs")
+        args.upstream_source = args.upstream_source.expanduser().resolve()
+        try:
+            oracle = verify_upstream_checkout(args.upstream_source)
+            model_fingerprint = base_model_fingerprint(args.model_dir)
+            train_data_fingerprint = sha256_file(args.train_data)
+        except ValueError as exc:
+            p.error(str(exc))
+    elif args.upstream_source is not None:
+        args.upstream_source = args.upstream_source.expanduser().resolve()
+
     if not args.keep_out_dir and args.out_dir.exists():
         shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -2839,8 +2977,14 @@ def main() -> int:
         allowed_labels,
     )
     report: dict[str, Any] = {
+        "contract": COMPARISON_CONTRACT,
         "task": "gliner2_lora_python_zig_apples_to_apples",
         "config": {
+            "oracle": oracle,
+            "model_fingerprint_sha256": model_fingerprint,
+            "training_data_fingerprint_sha256": train_data_fingerprint,
+            "recipe_contract": "gliner2_python_zig_deterministic_comparison/v1",
+            "scoring_normalization": CANONICAL_NORMALIZATION,
             "model_dir": str(args.model_dir),
             "python_model": str(args.python_model),
             "train_data": str(args.train_data),
@@ -3020,6 +3164,13 @@ def main() -> int:
             report.get("python", {}).get("metrics", {}).get("optimizer_parity_steps"),
             report.get("zig", {}).get("metrics", {}).get("optimizer_parity_steps"),
         )
+        optimizer_ok, optimizer_failures = optimizer_parity_gate(
+            optimizer_parity,
+            args.loss_parity_tolerance,
+        )
+        optimizer_parity["ok"] = optimizer_ok
+        optimizer_parity["failures"] = optimizer_failures
+        optimizer_parity["head_max_abs_tolerance"] = args.loss_parity_tolerance
         report["optimizer_parity"] = optimizer_parity
         if optimizer_parity.get("ran"):
             print("optimizer parity (per-step max-abs deltas over common adapter tensors):")
@@ -3211,6 +3362,13 @@ def main() -> int:
     elif not valid_loss_parity:
         loss_parity_warning = f"Python/Zig loss delta {loss_delta:.9g} exceeds tolerance {args.loss_parity_tolerance:.9g} or objective/trainable parity is incomplete"
     report["summary"] = {
+        "oracle": (
+            report.get("python", {}).get("metrics", {}).get("oracle")
+            if not args.skip_python
+            else None
+        ),
+        "model_fingerprint_sha256": model_fingerprint,
+        "training_data_fingerprint_sha256": train_data_fingerprint,
         "python_returncode": report.get("python", {}).get("returncode"),
         "zig_returncode": report.get("zig", {}).get("returncode"),
         "python_elapsed_seconds": report.get("python", {}).get("elapsed_seconds"),
@@ -3405,6 +3563,7 @@ def main() -> int:
         "classification_debug_matches": classification_debug_matches,
         "classification_debug_reconciliation": classification_debug_reconciliation,
         "classification_debug_deltas": classification_debug_deltas,
+        "optimizer_parity_ok": optimizer_parity.get("ok") if optimizer_parity is not None else None,
         "python_preprocess_task_breakdown": python_task_breakdown,
         "zig_manifest_backend": zig_manifest.get("backend"),
         "zig_manifest_objective": zig_manifest.get("objective"),
@@ -3441,6 +3600,15 @@ def main() -> int:
         "trained_adapter_parity_classification_logits_max_abs_delta": trained_adapter_parity.get("classification_logits_max_abs_delta"),
         "trained_adapter_parity_weights_max_abs_delta": trained_adapter_parity.get("weights_max_abs_delta"),
         "trained_adapter_parity_tolerance": args.adapter_roundtrip_tolerance,
+        "trained_adapter_tensor_equality_diagnostic": {
+            "gating": False,
+            "ran": bool(trained_adapter_parity.get("ran")),
+            "within_diagnostic_tolerance": trained_adapter_parity.get("ok"),
+            "reason": (
+                "independently trained tensors are cancellation- and RNG-sensitive; "
+                "release acceptance uses deterministic step parity plus multi-seed held-out convergence"
+            ),
+        },
         "entity_only_structure_parity": entity_only_structure_parity,
         "non_entity_task_annotations": source_non_entity_task_count,
         "training_slice_non_entity_task_annotations": non_entity_task_count,
@@ -3502,10 +3670,12 @@ def main() -> int:
         "preprocess_parity_matches": preprocess_matches if preprocess_applicable else None,
         "valid_full_loss_parity": report["summary"]["valid_full_loss_parity"] if full_loss_applicable else None,
         "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
-        # The independently-trained final-adapter comparison shares the
-        # roundtrip applicability gate; without this entry the multi-step
-        # e2e gate's required trained_adapter_parity_ok check can never pass.
-        "trained_adapter_parity_ok": bool(trained_adapter_parity.get("ok")) if roundtrip_applicable and trained_adapter_parity.get("ran") else None,
+        "optimizer_parity_ran": (
+            bool(optimizer_parity.get("ran")) if args.dump_optimizer_parity and optimizer_parity is not None else None
+        ),
+        "optimizer_parity_matches": (
+            bool(optimizer_parity.get("ok")) if args.dump_optimizer_parity and optimizer_parity is not None else None
+        ),
         "metal_graph_executor_dispatches_nonzero": bool(metal_dispatch_check) if metal_dispatch_applicable else None,
     }
     if metal_backend_ran:

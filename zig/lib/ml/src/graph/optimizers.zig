@@ -46,8 +46,16 @@ pub const LearningRateSchedule = union(enum) {
     warmup_constant: struct {
         initial_lr: f32,
         warmup_steps: u32,
+        total_steps: u32,
     },
 
+    /// `step_num` is the 0-based index of the optimizer step about to run: a run
+    /// of `total_steps` steps only ever asks for `0..total_steps-1`. Past
+    /// `total_steps` the schedules hold at their terminal value — zero for
+    /// `warmup_linear`, `warmup_constant` and `warmup_cosine_restarts`, and
+    /// `min_lr` for `warmup_cosine` — so an off-by-one cannot silently apply a
+    /// full-rate update, though a `warmup_cosine` caller with a non-zero
+    /// `min_lr` still needs to stop at its own horizon.
     pub fn lr(self: LearningRateSchedule, step_num: u32) f32 {
         return switch (self) {
             .constant => |val| val,
@@ -63,8 +71,8 @@ pub const LearningRateSchedule = union(enum) {
                     break :blk wc.initial_lr * warmup_progress;
                 }
                 // Cosine decay from initial_lr to min_lr over remaining steps
-                const decay_steps = wc.total_steps - wc.warmup_steps;
-                const decay_step = step_num - wc.warmup_steps;
+                const decay_steps = @max(wc.total_steps -| wc.warmup_steps, 1);
+                const decay_step = @min(step_num -| wc.warmup_steps, decay_steps);
                 const progress: f32 = @as(f32, @floatFromInt(decay_step)) / @as(f32, @floatFromInt(decay_steps));
                 const cosine_factor = 0.5 * (1.0 + @cos(std.math.pi * progress));
                 break :blk wc.min_lr + (wc.initial_lr - wc.min_lr) * cosine_factor;
@@ -74,6 +82,8 @@ pub const LearningRateSchedule = union(enum) {
                     const progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wc.warmup_steps));
                     break :blk wc.initial_lr * progress;
                 }
+                // Past the horizon the next cycle would restart at full lr.
+                if (step_num >= wc.total_steps) break :blk 0.0;
                 const decay_steps = @max(wc.total_steps -| wc.warmup_steps, 1);
                 const decay_step = step_num -| wc.warmup_steps;
                 const progress = @as(f32, @floatFromInt(decay_step)) / @as(f32, @floatFromInt(decay_steps));
@@ -96,6 +106,7 @@ pub const LearningRateSchedule = union(enum) {
                     const progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wc.warmup_steps));
                     break :blk wc.initial_lr * progress;
                 }
+                if (step_num >= wc.total_steps) break :blk 0.0;
                 break :blk wc.initial_lr;
             },
         };
@@ -653,6 +664,24 @@ test "warmup cosine LR schedule" {
 
     // Step 110: end => min_lr
     try expectApproxEqAbs(0.01, schedule.lr(110), 1e-6);
+
+    // Past the horizon the cosine holds at min_lr instead of rising again.
+    try expectApproxEqAbs(0.01, schedule.lr(140), 1e-6);
+}
+
+test "warmup cosine LR schedule with warmup past the horizon stays finite" {
+    const schedule = LearningRateSchedule{ .warmup_cosine = .{
+        .initial_lr = 0.1,
+        .min_lr = 0.01,
+        .warmup_steps = 20,
+        .total_steps = 10,
+    } };
+
+    // Warmup wins while it lasts, as in warmup_linear; the zero-width decay
+    // window that follows must not divide by zero.
+    try expectApproxEqAbs(0.05, schedule.lr(10), 1e-6);
+    try expectApproxEqAbs(0.1, schedule.lr(20), 1e-6);
+    try expectApproxEqAbs(0.01, schedule.lr(25), 1e-6);
 }
 
 test "warmup linear LR schedule" {
@@ -673,12 +702,15 @@ test "warmup constant LR schedule" {
     const schedule = LearningRateSchedule{ .warmup_constant = .{
         .initial_lr = 0.1,
         .warmup_steps = 2,
+        .total_steps = 30,
     } };
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), schedule.lr(0), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), schedule.lr(1), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), schedule.lr(2), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), schedule.lr(20), 1e-6);
+    // A step past the planned horizon must not apply a real update.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), schedule.lr(30), 1e-6);
 }
 
 test "warmup cosine restarts LR schedule" {
@@ -694,6 +726,8 @@ test "warmup cosine restarts LR schedule" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), schedule.lr(2), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), schedule.lr(4), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), schedule.lr(6), 1e-6);
+    // A step past the planned horizon must not restart the cycle at full lr.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), schedule.lr(10), 1e-6);
 }
 
 test "gradient clipping L2" {

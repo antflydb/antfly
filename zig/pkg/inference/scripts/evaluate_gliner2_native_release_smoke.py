@@ -10,6 +10,12 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
+from gliner2_release_contract import CANONICAL_NORMALIZATION, path_fingerprint
+from validate_gliner2_release_data import adapter_bundle_fingerprint, base_model_fingerprint
+
+
+NATIVE_EVALUATION_CONTRACT = "gliner2_native_full_task_evaluation/v1"
+
 FULL_TASK_MINIMUM_KEYS = (
     "classifications.micro_f1",
     "classifications.exact_match",
@@ -233,6 +239,7 @@ def main() -> int:
 
     passed = completed.returncode == 0 and native_summary.get("status") == "passed"
     report = {
+        "contract": NATIVE_EVALUATION_CONTRACT,
         "pass": passed,
         "status": "pass" if passed else "fail",
         "deployment_scope": "native_full_heldout_gliner2_quality",
@@ -246,6 +253,13 @@ def main() -> int:
         "evaluated_record_count": native_summary.get("example_count", 0),
         "evaluated_entity_record_count": native_summary.get("evaluated_entity_record_count", 0),
         "native_summary": native_summary,
+        "normalization": native_summary.get("full_task", {}).get("normalization"),
+        "expected_normalization": CANONICAL_NORMALIZATION,
+        "artifacts": {
+            "base_model_fingerprint_sha256": base_model_fingerprint(model_dir),
+            "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(adapter_dir),
+            "eval_data_fingerprint_sha256": path_fingerprint(eval_data),
+        },
     }
     write_report(output, report)
     if not passed:

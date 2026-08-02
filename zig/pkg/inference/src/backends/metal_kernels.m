@@ -3958,7 +3958,7 @@ static NSString *termite_metal_shader_source(void) {
            "        if (tid < stride) shmem[tid] = max(shmem[tid], shmem[tid + stride]);\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
-           "    const float row_max = shmem[0];\n"
+           "    const float row_max = shmem[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float local_sum = 0.0f;\n"
            "    for (uint col = tid; col < p.dim; col += threads) local_sum += exp(input[base + col] - row_max);\n"
            "    shmem[tid] = local_sum;\n"
@@ -4549,7 +4549,10 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "    float best = partials[0];\n"
+           // The barrier after reading partials[0] is mandatory: lane 0 overwrites
+           // partials[0] with the denominator below, and threads in other SIMD
+           // groups may not have read `best` yet.
+           "    float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    // Preserve scalar weight-sum and final-division order so Florence cached/full greedy decode remains token-identical.\n"
            "    if (lid == 0u) { float denom = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { float score = scores[ki]; float weight = score > neg_inf ? exp(score - best) : 0.0f; scores[ki] = weight; denom += weight; } partials[0] = denom; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float denom = partials[0];\n"
@@ -4618,7 +4621,9 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "    float best = partials[0]; float local_sum = 0.0f;\n"
+           // Barrier before partials is reused for the sum reduction: without it a
+           // fast thread's write races the `best` read of a slower SIMD group.
+           "    float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); float local_sum = 0.0f;\n"
            "    for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); }\n"
            "    partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
@@ -4684,7 +4689,9 @@ static NSString *termite_metal_shader_source(void) {
            "                s = acc * scale; local_best = max(local_best, s); } scores[ki] = s; }\n"
            "        partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint st = width >> 1u; st > 0u; st >>= 1u) { if (lid < st) partials[lid] = max(partials[lid], partials[lid + st]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "        float best = partials[0]; float lsum = 0.0f;\n"
+           // Barrier before partials is reused for the sum reduction: without it a
+           // fast thread's write races the `best` read of a slower SIMD group.
+           "        float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); float lsum = 0.0f;\n"
            "        for (uint ki = lid; ki < S; ki += width) { float s = scores[ki]; if (s > -3.0e38f) lsum += exp(s - best); }\n"
            "        partials[lid] = lsum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint st = width >> 1u; st > 0u; st >>= 1u) { if (lid < st) partials[lid] += partials[lid + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
@@ -4736,7 +4743,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u || qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
            "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint rel_len = p.seq_len * 2u - 1u; uint bh = b * p.num_heads + h; uint cc_base = (bh * p.seq_len + qi) * p.seq_len; uint c2p_base = (bh * p.seq_len + qi) * rel_len; float scale = rsqrt(float(p.head_dim) * 3.0f); threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
            "    float local_best = -3.402823466e+38f; for (uint ki = lid; ki < p.seq_len; ki += width) { bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; uint rel_idx = qi + p.seq_len - 1u - ki; uint p2c_idx = (bh * p.seq_len + ki) * rel_len + rel_idx; float score = allowed ? (cc[cc_base + ki] + c2p[c2p_base + rel_idx] + p2c[p2c_idx]) * scale : -3.402823466e+38f; scores[ki] = score; local_best = max(local_best, score); } partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0]; float local_sum = 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); } partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); float local_sum = 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); } partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    uint head_off = h * p.head_dim; for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[v_base + d]; } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
            "}\n"
@@ -5178,7 +5185,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n"
            "    const uint NT = 256u; const uint NW = 32u; const uint NSG = 8u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + 256u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n"
            "    for (uint base = 0u; base < p.kv_tokens; base += NSG) { uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; } uint physical_token = allowed ? termite_attention_page_token(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) { const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); } float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) { scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); } }\n"
-           "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float score = scores[ki]; local_best = score > local_best ? score : local_best; } partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) { float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; } threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0];\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float score = scores[ki]; local_best = score > local_best ? score : local_best; } partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) { float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; } threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float e = exp(scores[ki] - best); e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; } partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n"
            "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint d = uint(tid); d < p.head_dim; d += NT) { const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); } output[out_base + d] = value; }\n"
@@ -26564,8 +26571,9 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         }
         // flash4 is the default disentangled-attention kernel: it is bit-exact
         // against the host reference AND the fastest variant (the legacy `_tg`
-        // kernel is numerically WRONG — ~0.2% off — and is now opt-in only via
-        // TERMITE_METAL_FORCE_DEBERTA_TG for debugging; scalar is the correct
+        // kernel stays opt-in via TERMITE_METAL_FORCE_DEBERTA_TG for debugging —
+        // the accuracy gap that demoted it was the missing barrier between its
+        // partials[0] read and the sum reduction, now fixed; scalar is the
         // fallback when flash4 is unavailable, e.g. seq>512 or head_dim>256).
         const BOOL force_scalar = getenv("TERMITE_METAL_FORCE_DEBERTA_SCALAR") != NULL;
         const BOOL force_tg = getenv("TERMITE_METAL_FORCE_DEBERTA_TG") != NULL;
@@ -28219,26 +28227,25 @@ int termite_metal_decode_runtime_training_adamw_many_f32(
     const void **v_handles,
     const size_t *v_offsets,
     const size_t *elem_counts,
+    const float *bias_correction1s,
+    const float *bias_correction2s,
     size_t input_count,
     float lr,
     float beta1,
     float beta2,
     float eps,
     float weight_decay,
-    float bias_correction1,
-    float bias_correction2,
     float grad_scale
 ) {
     if (runtime == NULL || weight_handles == NULL || weight_offsets == NULL ||
         grad_handles == NULL || grad_offsets == NULL || m_handles == NULL ||
         m_offsets == NULL || v_handles == NULL || v_offsets == NULL ||
-        elem_counts == NULL)
+        elem_counts == NULL || bias_correction1s == NULL || bias_correction2s == NULL)
     {
         return -1;
     }
     if (runtime->training_adamw_pipeline == nil) return -2;
     if (input_count == 0 || input_count > UINT32_MAX) return -3;
-    if (bias_correction1 == 0.0f || bias_correction2 == 0.0f) return -4;
     @autoreleasepool {
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -28255,6 +28262,12 @@ int termite_metal_decode_runtime_training_adamw_many_f32(
             if (elem_count == 0 || elem_count > UINT32_MAX) {
                 [encoder endEncoding];
                 return -8;
+            }
+            // Each slot carries its own Adam step count, so bias correction is
+            // per item rather than per dispatch.
+            if (bias_correction1s[idx] == 0.0f || bias_correction2s[idx] == 0.0f) {
+                [encoder endEncoding];
+                return -4;
             }
             id<MTLBuffer> weight_buffer = (__bridge id<MTLBuffer>)weight_handles[idx];
             id<MTLBuffer> grad_buffer = (__bridge id<MTLBuffer>)grad_handles[idx];
@@ -28276,8 +28289,8 @@ int termite_metal_decode_runtime_training_adamw_many_f32(
                 .beta2 = beta2,
                 .eps = eps,
                 .weight_decay = weight_decay,
-                .bias_correction1 = bias_correction1,
-                .bias_correction2 = bias_correction2,
+                .bias_correction1 = bias_correction1s[idx],
+                .bias_correction2 = bias_correction2s[idx],
                 .grad_scale = grad_scale,
                 .reserved0 = 0u,
                 .reserved1 = 0u,
@@ -28432,6 +28445,15 @@ int termite_metal_decode_runtime_layer_norm_backward_f32(
         };
         uint32_t width = hidden_size < 256u ? (uint32_t)hidden_size : 256u;
         if (width == 0u) width = 1u;
+        // `termite_layer_norm_bwd_dx` reduces its partials with a halving tree
+        // (`for (stride = width >> 1; stride > 0; stride >>= 1)`), which only
+        // visits every slot when `width` is a power of two. A non-power-of-two
+        // width silently drops partial sums, corrupting mean/inv_std and every
+        // gradient derived from them (measured: max|delta| vs native 1.04 at
+        // hidden=192, 5.04 at hidden=3). The strided load loop `i = tid;
+        // i < hidden; i += width` stays correct at any width, so rounding the
+        // threadgroup down to the previous power of two is sufficient.
+        while ((width & (width - 1u)) != 0u) width &= (width - 1u);
 
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);

@@ -141,9 +141,50 @@ pub const GrpoConfig = struct {
     reward_mode: ?[]const u8 = null,
 };
 
+pub const EntityEvalMinimums = struct {
+    precision: ?f64 = null,
+    recall: ?f64 = null,
+    f1: f64,
+    exact_match: f64,
+};
+
+/// Required quality gates for every structured task scored by the native
+/// GLiNER2 total-loss evaluator. Keeping these fields non-optional makes a
+/// partially specified gate set invalid at recipe parse time.
+pub const FullTaskEvalMinimums = struct {
+    classifications_micro_f1: f64,
+    classifications_exact_match: f64,
+    json_structures_micro_f1: f64,
+    json_structures_exact_match: f64,
+    relations_micro_f1: f64,
+    relations_exact_match: f64,
+    count_accuracy: f64,
+};
+
 pub const EvalConfig = struct {
+    path: ?[]const u8 = null,
     max_examples: ?usize = null,
     split: ?[]const u8 = null,
+    every_epochs: ?u32 = null,
+    batch_size: ?u32 = null,
+    early_stopping_patience: ?u32 = null,
+    improvement_threshold: ?f64 = null,
+    /// Full-task structured scoring currently requires the Zig native
+    /// evaluator even when training itself runs through the Metal runtime.
+    backend: ?[]const u8 = null,
+    entity_minimums: ?EntityEvalMinimums = null,
+    full_task_minimums: ?FullTaskEvalMinimums = null,
+};
+
+pub const CheckpointConfig = struct {
+    every_epochs: ?u32 = null,
+    keep_last: ?u32 = null,
+    resume_path: ?[]const u8 = null,
+};
+
+pub const RuntimeConfig = struct {
+    compiled_required: ?bool = null,
+    graph_cache_capacity: ?u8 = null,
 };
 
 pub const ArtifactConfig = struct {
@@ -153,6 +194,9 @@ pub const ArtifactConfig = struct {
     adapter_dir: ?[]const u8 = null,
     trained_adapter_dir: ?[]const u8 = null,
     materialized_dir: ?[]const u8 = null,
+    validation_report_path: ?[]const u8 = null,
+    evaluation_report_path: ?[]const u8 = null,
+    reload_report_path: ?[]const u8 = null,
     report_path: ?[]const u8 = null,
 };
 
@@ -166,25 +210,27 @@ pub const Recipe = struct {
     preference: PreferenceConfig = .{},
     grpo: GrpoConfig = .{},
     eval: ?EvalConfig = null,
+    checkpoint: ?CheckpointConfig = null,
+    runtime: ?RuntimeConfig = null,
     artifacts: ArtifactConfig = .{},
     backend: ?[]const u8 = null,
     trainer: ?[]const u8 = null,
 };
 
-const Step = struct {
+pub const Step = struct {
     kind: StepKind = .command,
     name: []const u8,
     argv: []const []const u8,
 };
 
-const StepKind = enum {
+pub const StepKind = enum {
     command,
     direct_sft,
     direct_dpo,
     direct_grpo,
 };
 
-const Plan = struct {
+pub const Plan = struct {
     steps: []Step,
 };
 
@@ -1066,7 +1112,7 @@ fn makeRampF32(allocator: std.mem.Allocator, len: usize, scale: f32) ![]f32 {
     return data;
 }
 
-fn buildPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
+pub fn buildPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const kind = try parseKind(recipe.recipe orelse recipe.kind orelse return error.MissingRecipeKind);
     const family = recipe.model.family orelse try inferFamily(recipe);
 
@@ -1175,8 +1221,18 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
+    const eval_path = evalDatasetPath(recipe);
     const out_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    const validation_report_path = recipe.artifacts.validation_report_path orelse try defaultArtifactPath(allocator, recipe, "run_validation.json");
     const adapter = recipe.adapter orelse AdapterConfig{};
+    const checkpoint = recipe.checkpoint orelse CheckpointConfig{};
+    const runtime = recipe.runtime orelse RuntimeConfig{};
+    const eval = recipe.eval orelse EvalConfig{};
+    if ((eval.early_stopping_patience orelse 0) > 0 and eval_path == null) return error.EarlyStoppingRequiresEvalPath;
+    if (eval_path != null and eval.full_task_minimums == null) return error.MissingFullTaskQualityThreshold;
+    if (eval_path != null and eval.entity_minimums == null) return error.MissingEntityQualityThreshold;
+    const eval_backend = eval.backend orelse "native";
+    if (eval_path != null and !std.ascii.eqlIgnoreCase(eval_backend, "native")) return error.FullTaskEvaluationRequiresNativeBackend;
 
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
@@ -1204,13 +1260,73 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     if (recipe.optimizer.micro_batch_size) |batch| try appendMany(allocator, &train_argv, &.{ "--batch-size", try fmtInt(allocator, batch) });
     if (recipe.optimizer.gradient_accumulation_steps) |steps_count| try appendMany(allocator, &train_argv, &.{ "--grad-accum", try fmtInt(allocator, steps_count) });
     if (recipe.optimizer.max_grad_norm) |norm| try appendMany(allocator, &train_argv, &.{ "--max-grad-norm", try fmtFloat(allocator, norm) });
+    if (recipe.dataset.max_seq_len) |seq_len| try appendMany(allocator, &train_argv, &.{ "--seq-len", try fmtInt(allocator, seq_len) });
     if (adapter.rank) |rank| try appendMany(allocator, &train_argv, &.{ "--lora-rank", try fmtInt(allocator, rank) });
     if (adapter.alpha) |alpha| try appendMany(allocator, &train_argv, &.{ "--lora-alpha", try fmtFloat(allocator, alpha) });
     if (adapter.dropout) |dropout| try appendMany(allocator, &train_argv, &.{ "--lora-dropout", try fmtFloat(allocator, dropout) });
     if (adapter.target_modules) |modules| try appendMany(allocator, &train_argv, &.{ "--lora-targets", try std.mem.join(allocator, ",", modules) });
     if (recipe.dataset.max_examples) |max| try appendMany(allocator, &train_argv, &.{ "--max-examples", try fmtInt(allocator, max) });
+    if (recipe.dataset.labels) |labels| try appendMany(allocator, &train_argv, &.{ "--entity-types", labels });
+    if (eval_path) |path| try appendMany(allocator, &train_argv, &.{ "--eval-data", path });
+    if (eval.every_epochs) |every| try appendMany(allocator, &train_argv, &.{ "--eval-every-epochs", try fmtInt(allocator, every) });
+    if (eval.batch_size) |batch| try appendMany(allocator, &train_argv, &.{ "--eval-batch-size", try fmtInt(allocator, batch) });
+    if (eval.early_stopping_patience) |patience| try appendMany(allocator, &train_argv, &.{ "--early-stopping-patience", try fmtInt(allocator, patience) });
+    if (eval.improvement_threshold) |threshold| try appendMany(allocator, &train_argv, &.{ "--early-stopping-threshold", try fmtFloat(allocator, threshold) });
+    if (checkpoint.every_epochs) |every| try appendMany(allocator, &train_argv, &.{ "--checkpoint-every-epochs", try fmtInt(allocator, every) });
+    if (checkpoint.keep_last) |keep| try appendMany(allocator, &train_argv, &.{ "--checkpoint-keep-last", try fmtInt(allocator, keep) });
+    if (checkpoint.resume_path) |path| try appendMany(allocator, &train_argv, &.{ "--resume-checkpoint", path });
+    if (runtime.compiled_required orelse false) try train_argv.append(allocator, "--compiled-required");
+    if (runtime.graph_cache_capacity) |capacity| try appendMany(allocator, &train_argv, &.{ "--graph-cache-capacity", try fmtInt(allocator, capacity) });
     if (recipe.backend) |backend| try appendMany(allocator, &train_argv, &.{ "--backend", backend });
-    try steps.append(allocator, .{ .name = "train-eval", .argv = try train_argv.toOwnedSlice(allocator) });
+    try steps.append(allocator, .{ .name = "train", .argv = try train_argv.toOwnedSlice(allocator) });
+
+    try steps.append(allocator, .{ .name = "validate", .argv = try argv(allocator, &.{
+        "validate-gliner2-autodiff-run", out_dir, "--out", validation_report_path,
+    }) });
+
+    if (eval_path) |path| {
+        const evaluation_report_path = recipe.artifacts.evaluation_report_path orelse try defaultArtifactPath(allocator, recipe, "heldout_eval.json");
+        var eval_argv: std.ArrayList([]const u8) = .empty;
+        try appendMany(allocator, &eval_argv, &.{
+            "eval-gliner2-autodiff-adapter-dataset",
+            model_path,
+            out_dir,
+            path,
+            recipe.dataset.labels orelse "-",
+            "--objective",
+            "gliner2-total-loss",
+            "--out",
+            evaluation_report_path,
+        });
+        if (evalMaxExamples(recipe)) |max| try appendMany(allocator, &eval_argv, &.{ "--max-examples", try fmtInt(allocator, max) });
+        if (recipe.dataset.max_seq_len) |seq_len| try appendMany(allocator, &eval_argv, &.{ "--seq-len", try fmtInt(allocator, seq_len) });
+        try appendMany(allocator, &eval_argv, &.{ "--backend", eval_backend });
+        if (eval.entity_minimums) |minimums| {
+            if (minimums.precision) |threshold| try appendEntityMinimum(allocator, &eval_argv, "--min-precision", threshold);
+            if (minimums.recall) |threshold| try appendEntityMinimum(allocator, &eval_argv, "--min-recall", threshold);
+            try appendEntityMinimum(allocator, &eval_argv, "--min-f1", minimums.f1);
+            try appendEntityMinimum(allocator, &eval_argv, "--min-exact-match", minimums.exact_match);
+        }
+        const full_task_minimums = eval.full_task_minimums.?;
+        try appendFullTaskMinimum(allocator, &eval_argv, "classifications.micro_f1", full_task_minimums.classifications_micro_f1);
+        try appendFullTaskMinimum(allocator, &eval_argv, "classifications.exact_match", full_task_minimums.classifications_exact_match);
+        try appendFullTaskMinimum(allocator, &eval_argv, "json_structures.micro_f1", full_task_minimums.json_structures_micro_f1);
+        try appendFullTaskMinimum(allocator, &eval_argv, "json_structures.exact_match", full_task_minimums.json_structures_exact_match);
+        try appendFullTaskMinimum(allocator, &eval_argv, "relations.micro_f1", full_task_minimums.relations_micro_f1);
+        try appendFullTaskMinimum(allocator, &eval_argv, "relations.exact_match", full_task_minimums.relations_exact_match);
+        try appendFullTaskMinimum(allocator, &eval_argv, "count.accuracy", full_task_minimums.count_accuracy);
+        try steps.append(allocator, .{ .name = "evaluate", .argv = try eval_argv.toOwnedSlice(allocator) });
+    }
+
+    if (recipe.artifacts.materialized_dir) |materialized_dir| {
+        try steps.append(allocator, .{ .name = "materialize", .argv = try argv(allocator, &.{
+            "materialize-gliner2-lora", model_path, out_dir, materialized_dir,
+        }) });
+        const reload_report_path = recipe.artifacts.reload_report_path orelse try defaultArtifactPath(allocator, recipe, "materialized_reload.json");
+        try steps.append(allocator, .{ .name = "reload-validate", .argv = try argv(allocator, &.{
+            "inspect-gliner2-checkpoint", materialized_dir, "--out", reload_report_path,
+        }) });
+    }
 
     return .{ .steps = try steps.toOwnedSlice(allocator) };
 }
@@ -1962,6 +2078,7 @@ fn trainDatasetPath(recipe: Recipe) ?[]const u8 {
 }
 
 fn evalDatasetPath(recipe: Recipe) ?[]const u8 {
+    if (recipe.eval) |eval| if (eval.path) |path| return path;
     return recipe.dataset.eval_path;
 }
 
@@ -2068,6 +2185,7 @@ fn collectDatasetFingerprints(allocator: std.mem.Allocator, io: std.Io, recipe: 
     try appendUniquePlannedPath(allocator, &planned, "dataset", recipe.dataset.path);
     try appendUniquePlannedPath(allocator, &planned, "train_dataset", recipe.dataset.train_path);
     try appendUniquePlannedPath(allocator, &planned, "eval_dataset", recipe.dataset.eval_path);
+    if (recipe.eval) |eval| try appendUniquePlannedPath(allocator, &planned, "eval_dataset", eval.path);
     try appendUniquePlannedPath(allocator, &planned, "dataset_cache", recipe.dataset.cache_path);
     try appendUniquePlannedPath(allocator, &planned, "train_cache", recipe.dataset.train_cache_path);
     try appendUniquePlannedPath(allocator, &planned, "eval_cache", recipe.dataset.eval_cache_path);
@@ -2147,6 +2265,16 @@ fn appendArtifactPathsFromPlan(allocator: std.mem.Allocator, planned: *std.Array
                     try appendUniquePlannedPath(allocator, planned, "adapter_bootstrap", step.argv[2]);
                 } else if (std.mem.eql(u8, command, "train-eval-colqwen2-lora-bundle")) {
                     try appendUniquePlannedPath(allocator, planned, "trained_adapter", step.argv[4]);
+                } else if (std.mem.eql(u8, command, "train-gliner2-autodiff")) {
+                    try appendUniquePlannedPath(allocator, planned, "trained_adapter", step.argv[6]);
+                } else if (std.mem.eql(u8, command, "validate-gliner2-autodiff-run")) {
+                    try appendUniquePlannedPath(allocator, planned, "run_validation", step.argv[3]);
+                } else if (std.mem.eql(u8, command, "eval-gliner2-autodiff-adapter-dataset")) {
+                    try appendUniquePlannedPath(allocator, planned, "heldout_eval", step.argv[8]);
+                } else if (std.mem.eql(u8, command, "materialize-gliner2-lora")) {
+                    try appendUniquePlannedPath(allocator, planned, "materialized_model", step.argv[3]);
+                } else if (std.mem.eql(u8, command, "inspect-gliner2-checkpoint") and std.mem.eql(u8, step.name, "reload-validate")) {
+                    try appendUniquePlannedPath(allocator, planned, "materialized_reload", step.argv[3]);
                 }
             },
         }
@@ -5344,6 +5472,27 @@ fn fmtFloat(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{value});
 }
 
+fn appendEntityMinimum(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    flag: []const u8,
+    threshold: f64,
+) !void {
+    if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
+    try appendMany(allocator, list, &.{ flag, try fmtFloat(allocator, threshold) });
+}
+
+fn appendFullTaskMinimum(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    metric: []const u8,
+    threshold: f64,
+) !void {
+    if (!std.math.isFinite(threshold) or threshold <= 0 or threshold > 1) return error.InvalidFullTaskQualityThreshold;
+    const value = try std.fmt.allocPrint(allocator, "{s}={d}", .{ metric, threshold });
+    try appendMany(allocator, list, &.{ "--min-task-metric", value });
+}
+
 fn joinCsv(allocator: std.mem.Allocator, values: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -5390,7 +5539,7 @@ fn containsQwen35Signal(path: []const u8) bool {
         containsIgnoreCase(path, "chandra");
 }
 
-fn freePlan(allocator: std.mem.Allocator, plan: Plan) void {
+pub fn freePlan(allocator: std.mem.Allocator, plan: Plan) void {
     freeSteps(allocator, plan.steps);
     allocator.free(plan.steps);
 }
@@ -5595,7 +5744,7 @@ test "gliner2 lora recipe routes to autodiff trainer" {
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
-    try expectStepCommands(plan, &.{"train-gliner2-autodiff"});
+    try expectStepCommands(plan, &.{ "train-gliner2-autodiff", "validate-gliner2-autodiff-run" });
     const argv_items = plan.steps[0].argv;
     try std.testing.expectEqualStrings("--model-dir", argv_items[1]);
     try std.testing.expectEqualStrings("/models/gliner2", argv_items[2]);
@@ -5613,6 +5762,141 @@ test "gliner2 lora recipe routes to autodiff trainer" {
     try expectArgValue(argv_items, "--num-cycles", "2");
     try expectArgValue(argv_items, "--max-steps", "10");
     try expectArgValue(argv_items, "--lora-dropout", "0.05");
+}
+
+test "gliner2 production recipe wires lifecycle and runtime controls" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gliner2", .family = "gliner2" },
+        .dataset = .{
+            .train_path = "/data/train.jsonl",
+            .labels = "person,organization",
+            .max_seq_len = 128,
+            .eval_max_examples = 20,
+        },
+        .optimizer = .{ .gradient_accumulation_steps = 4 },
+        .eval = .{
+            .path = "/data/eval.jsonl",
+            .every_epochs = 2,
+            .batch_size = 8,
+            .early_stopping_patience = 3,
+            .improvement_threshold = 0.001,
+            .entity_minimums = .{
+                .precision = 0.5,
+                .recall = 0.4,
+                .f1 = 0.45,
+                .exact_match = 0.25,
+            },
+            .full_task_minimums = .{
+                .classifications_micro_f1 = 0.6,
+                .classifications_exact_match = 0.5,
+                .json_structures_micro_f1 = 0.55,
+                .json_structures_exact_match = 0.4,
+                .relations_micro_f1 = 0.5,
+                .relations_exact_match = 0.35,
+                .count_accuracy = 0.7,
+            },
+        },
+        .checkpoint = .{
+            .every_epochs = 2,
+            .keep_last = 4,
+            .resume_path = "/runs/prior/checkpoints/epoch-4.safetensors",
+        },
+        .runtime = .{
+            .compiled_required = true,
+            .graph_cache_capacity = 4,
+        },
+        .backend = "metal",
+        .artifacts = .{
+            .root = "/runs/gliner2",
+            .trained_adapter_dir = "/runs/gliner2/adapter",
+            .materialized_dir = "/runs/gliner2/model",
+            .validation_report_path = "/runs/gliner2/validation.json",
+            .evaluation_report_path = "/runs/gliner2/eval.json",
+            .reload_report_path = "/runs/gliner2/reload.json",
+        },
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try expectStepCommands(plan, &.{
+        "train-gliner2-autodiff",
+        "validate-gliner2-autodiff-run",
+        "eval-gliner2-autodiff-adapter-dataset",
+        "materialize-gliner2-lora",
+        "inspect-gliner2-checkpoint",
+    });
+    const train_args = plan.steps[0].argv;
+    try expectArgValue(train_args, "--eval-data", "/data/eval.jsonl");
+    try expectArgValue(train_args, "--eval-every-epochs", "2");
+    try expectArgValue(train_args, "--eval-batch-size", "8");
+    try expectArgValue(train_args, "--early-stopping-patience", "3");
+    try expectArgValue(train_args, "--early-stopping-threshold", "0.001");
+    try expectArgValue(train_args, "--checkpoint-every-epochs", "2");
+    try expectArgValue(train_args, "--checkpoint-keep-last", "4");
+    try expectArgValue(train_args, "--resume-checkpoint", "/runs/prior/checkpoints/epoch-4.safetensors");
+    try expectArgValue(train_args, "--graph-cache-capacity", "4");
+    try expectArgValue(train_args, "--seq-len", "128");
+    try expectArgValue(train_args, "--backend", "metal");
+    try expectArgPresent(train_args, "--compiled-required");
+    try std.testing.expectEqualStrings("/runs/gliner2/validation.json", plan.steps[1].argv[3]);
+    try std.testing.expectEqualStrings("/runs/gliner2/eval.json", plan.steps[2].argv[8]);
+    const eval_args = plan.steps[2].argv;
+    try expectArgValue(eval_args, "--backend", "native");
+    try expectArgValue(eval_args, "--min-precision", "0.5");
+    try expectArgValue(eval_args, "--min-recall", "0.4");
+    try expectArgValue(eval_args, "--min-f1", "0.45");
+    try expectArgValue(eval_args, "--min-exact-match", "0.25");
+    try expectArgPair(eval_args, "--min-task-metric", "classifications.micro_f1=0.6");
+    try expectArgPair(eval_args, "--min-task-metric", "classifications.exact_match=0.5");
+    try expectArgPair(eval_args, "--min-task-metric", "json_structures.micro_f1=0.55");
+    try expectArgPair(eval_args, "--min-task-metric", "json_structures.exact_match=0.4");
+    try expectArgPair(eval_args, "--min-task-metric", "relations.micro_f1=0.5");
+    try expectArgPair(eval_args, "--min-task-metric", "relations.exact_match=0.35");
+    try expectArgPair(eval_args, "--min-task-metric", "count.accuracy=0.7");
+    try std.testing.expect(!containsArg(eval_args, "--compiled-required"));
+    try std.testing.expectEqualStrings("/runs/gliner2/model", plan.steps[3].argv[3]);
+    try std.testing.expectEqualStrings("/runs/gliner2/reload.json", plan.steps[4].argv[3]);
+}
+
+test "gliner2 recipe rejects ungated heldout evaluation" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gliner2", .family = "gliner2" },
+        .dataset = .{ .train_path = "/data/train.jsonl" },
+        .eval = .{ .path = "/data/eval.jsonl" },
+    };
+    try std.testing.expectError(error.MissingFullTaskQualityThreshold, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gliner2 recipe requires entity release floors for heldout evaluation" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gliner2", .family = "gliner2" },
+        .dataset = .{ .train_path = "/data/train.jsonl" },
+        .eval = .{
+            .path = "/data/eval.jsonl",
+            .full_task_minimums = .{
+                .classifications_micro_f1 = 0.6,
+                .classifications_exact_match = 0.5,
+                .json_structures_micro_f1 = 0.55,
+                .json_structures_exact_match = 0.4,
+                .relations_micro_f1 = 0.5,
+                .relations_exact_match = 0.35,
+                .count_accuracy = 0.7,
+            },
+        },
+    };
+    try std.testing.expectError(error.MissingEntityQualityThreshold, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gliner2 recipe rejects early stopping without heldout data" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gliner2", .family = "gliner2" },
+        .dataset = .{ .train_path = "/data/train.jsonl" },
+        .eval = .{ .early_stopping_patience = 2 },
+    };
+    try std.testing.expectError(error.EarlyStoppingRequiresEvalPath, buildPlan(std.heap.page_allocator, recipe));
 }
 
 test "layoutlmv3 token recipe emits train eval positional paths" {
@@ -5834,4 +6118,25 @@ fn expectArgValue(args: []const []const u8, flag: []const u8, expected: []const 
         }
     }
     return error.MissingExpectedArgument;
+}
+
+fn expectArgPresent(args: []const []const u8, expected: []const u8) !void {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, expected)) return;
+    }
+    return error.MissingExpectedArgument;
+}
+
+fn expectArgPair(args: []const []const u8, flag: []const u8, expected: []const u8) !void {
+    for (args[0..args.len -| 1], 0..) |arg, idx| {
+        if (std.mem.eql(u8, arg, flag) and std.mem.eql(u8, args[idx + 1], expected)) return;
+    }
+    return error.MissingExpectedArgument;
+}
+
+fn containsArg(args: []const []const u8, expected: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, expected)) return true;
+    }
+    return false;
 }

@@ -693,6 +693,18 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         }
         return err;
     };
+    validateMetalAttentionMode(
+        selected_backend,
+        opts.seq_len,
+        deberta_graph.fusedDisentangledAttentionEnabledForProduction(),
+    ) catch |err| {
+        print(
+            "error: Metal GLiNER2 training at --seq-len={d} requires fused DeBERTa attention; " ++
+                "TERMITE_DEBERTA_FUSED_ATTENTION=0 is a native-only diagnostic setting below this safety boundary\n",
+            .{opts.seq_len},
+        );
+        return err;
+    };
 
     const cb = if (selected_backend == .metal) blk: {
         if (comptime build_options.enable_metal) {
@@ -701,12 +713,19 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 .prefix = "",
                 .lazy_weights = .{},
             };
+            // Initialization below owns cloned host tensors and map keys before
+            // the steady-state cleanup at the end of runTraining is installed.
+            // Keep the setup block failure-atomic so a bad checkpoint, head
+            // allocation failure, or backend-init error cannot leak a partial
+            // GPU-hosted store.
+            errdefer deinitGpuHostedWeightStore(allocator, &metal_ws);
             try loadSafetensorsIntoGpuHostedStore(allocator, &metal_ws, st_path);
             if (opts.objective != .gliner2_total_loss) {
                 try initClassifierHeadInGpuHostedStore(allocator, &metal_ws, opts.seed, deberta_config.hidden_size, opts.num_classes);
             }
             metal_compute.initPrefetchQueue(&metal_ws, allocator);
             metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_ws, null);
+            errdefer metal_backend.deinit();
             break :blk metal_backend.computeBackend();
         } else unreachable;
     } else blk: {
@@ -716,6 +735,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .resident_weights = .{},
             .lazy_weights = .{},
         };
+        errdefer deinitNativeWeightStore(allocator, &native_ws);
 
         if (SafetensorsSource.initAbsolute(allocator, st_path)) |src| {
             safetensors_source = src;
@@ -1182,42 +1202,14 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     });
 
     const total_examples = examples.len;
-    // Match the pinned upstream DataLoader: shrink one small dataset batch,
-    // otherwise drop a final partial training batch.
-    const drop_last = total_examples > @as(usize, opts.batch_size);
-    const examples_per_epoch = if (drop_last)
-        (total_examples / effective_batch_size) * effective_batch_size
-    else
-        total_examples;
-    const steps_per_epoch = examples_per_epoch / effective_batch_size;
-    const steps_per_epoch_u64: u64 = @intCast(steps_per_epoch);
-    const grad_accum_u64: u64 = opts.grad_accum;
-    // Accelerate flushes a final partial accumulation at the end of each
-    // epoch. Plan that update too; floor division would make the optimizer
-    // target stop the data loop before the last micro-batch.
-    const optimizer_steps_per_epoch = optimizerStepsForMicroBatches(steps_per_epoch_u64, grad_accum_u64);
-    // Upstream GLiNER2 sizes the LR schedule with floor division
-    // (len(train_loader) // grad_accum, clamped to >= 1) while still
-    // executing the end-of-epoch partial flush. Flush steps past that
-    // schedule horizon run at LR 0 (both LambdaLR's linear lambda and our
-    // warmup_linear clamp to zero there), so they are weight no-ops on both
-    // sides. Mirror it exactly: the schedule and warmup use the floor-based
-    // horizon; the execution plan keeps the ceil-based per-epoch step count
-    // so the flush still runs.
-    const schedule_steps_per_epoch: u64 = scheduleStepsForMicroBatches(steps_per_epoch_u64, grad_accum_u64);
-    const target_optimizer_steps: u64 = if (opts.max_steps > 0)
-        opts.max_steps
-    else
-        @as(u64, opts.epochs) * optimizer_steps_per_epoch;
+    const plan = planOptimizerSchedule(total_examples, opts.batch_size, opts.grad_accum, opts.epochs, opts.max_steps);
+    const examples_per_epoch = plan.examples_per_epoch;
+    const steps_per_epoch: usize = @intCast(plan.steps_per_epoch);
+    const steps_per_epoch_u64: u64 = plan.steps_per_epoch;
+    const target_optimizer_steps: u64 = plan.target_optimizer_steps;
     if (target_optimizer_steps > std.math.maxInt(u32)) return error.TooManyOptimizerSteps;
-    const schedule_horizon_steps: u64 = if (opts.max_steps > 0)
-        opts.max_steps
-    else
-        @as(u64, opts.epochs) * schedule_steps_per_epoch;
-    const planned_epoch_count: u64 = if (opts.max_steps > 0)
-        (target_optimizer_steps + schedule_steps_per_epoch - 1) / schedule_steps_per_epoch
-    else
-        opts.epochs;
+    const schedule_horizon_steps: u64 = plan.schedule_horizon_steps;
+    const planned_epoch_count: u64 = plan.planned_epoch_count;
     const configured_warmup_steps: u64 = if (opts.warmup_steps > 0)
         opts.warmup_steps
     else
@@ -1248,6 +1240,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .constant => .{ .warmup_constant = .{
             .initial_lr = opts.learning_rate,
             .warmup_steps = resolved_warmup_steps,
+            .total_steps = schedule_total_steps,
         } },
     };
     print("  lr_scheduler={s} warmup_steps={d} optimizer_steps={d} schedule_horizon={d}\n", .{
@@ -1256,6 +1249,14 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         target_optimizer_steps,
         schedule_horizon_steps,
     });
+    if (opts.max_steps == 0 and plan.optimizer_steps_per_epoch != plan.schedule_steps_per_epoch) {
+        print("  warning: {d} micro-batches/epoch is not a multiple of grad_accum={d}; matching upstream the run stops after {d} optimizer steps and will not complete all {d} requested epochs\n", .{
+            steps_per_epoch,
+            opts.grad_accum,
+            target_optimizer_steps,
+            opts.epochs,
+        });
+    }
     const resolved_activation_checkpoint_config = activationCheckpointConfig(
         opts.activation_checkpointing,
         opts.activation_checkpoint_interval,
@@ -2642,18 +2643,57 @@ fn runtimeMathIdentityAlloc(allocator: std.mem.Allocator, backend: Gliner2TrainB
     });
 }
 
+/// One file that participates in a run-identity fingerprint.
+///
+/// `optional` entries are hashed as a stable "absent" marker when the file is
+/// missing instead of aborting the run. See `fingerprintEntriesAlloc` for the
+/// framing that keeps "absent" from ever colliding with "present with some
+/// content".
+const FingerprintEntry = struct {
+    relative_path: []const u8,
+    optional: bool = false,
+};
+
+/// Framing byte written between the relative path and a *present* file's
+/// bytes. It is 0 so that a fingerprint over all-present entries is
+/// byte-identical to the digest produced before optional entries existed —
+/// adding optionality must not renumber the identity of snapshots that ship
+/// every file.
+const fingerprint_present_tag: u8 = 0;
+
+/// Framing byte written between the relative path and the absent marker. It
+/// differs from `fingerprint_present_tag`, so no file content can forge an
+/// "absent" record and no absent record can be mistaken for empty content.
+const fingerprint_absent_tag: u8 = 1;
+
+/// Fixed payload hashed in place of a missing optional file's bytes.
+const fingerprint_absent_marker = "<absent>";
+
+/// Run-identity fingerprint of the frozen base model.
+///
+/// `spm.model` is optional because the stock `fastino/gliner2-base-v1`
+/// HuggingFace snapshot does not ship it: it is a download-manifest candidate
+/// (`registry/download.zig`) that is never read for tokenization — the
+/// trainer's tokenizer is built purely from `tokenizer.json`. Requiring it
+/// made the stock snapshot impossible to train against. It stays in the list
+/// rather than being dropped so that a snapshot which *does* ship it keeps its
+/// existing fingerprint, and so present-vs-absent remains an explicit part of
+/// run identity.
+///
+/// The order below is load-bearing: it is the pre-existing hash order and must
+/// not be permuted, or every previously recorded fingerprint changes.
 fn gliner2BaseModelFingerprintAlloc(allocator: std.mem.Allocator, model_dir: []const u8) ![]const u8 {
-    const relative_paths = [_][]const u8{
-        "model.safetensors",
-        "config.json",
-        "encoder_config/config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "added_tokens.json",
-        "spm.model",
+    const entries = [_]FingerprintEntry{
+        .{ .relative_path = "model.safetensors" },
+        .{ .relative_path = "config.json" },
+        .{ .relative_path = "encoder_config/config.json" },
+        .{ .relative_path = "tokenizer.json" },
+        .{ .relative_path = "tokenizer_config.json" },
+        .{ .relative_path = "special_tokens_map.json" },
+        .{ .relative_path = "added_tokens.json" },
+        .{ .relative_path = "spm.model", .optional = true },
     };
-    return fingerprintRelativeFilesAlloc(allocator, model_dir, &relative_paths);
+    return fingerprintEntriesAlloc(allocator, model_dir, &entries);
 }
 
 fn gliner2AdapterBundleFingerprintAlloc(allocator: std.mem.Allocator, adapter_dir: []const u8) ![]const u8 {
@@ -2665,22 +2705,58 @@ fn gliner2AdapterBundleFingerprintAlloc(allocator: std.mem.Allocator, adapter_di
     return fingerprintRelativeFilesAlloc(allocator, adapter_dir, &relative_paths);
 }
 
+/// Fingerprint a fixed list of files, all of which must exist.
 fn fingerprintRelativeFilesAlloc(allocator: std.mem.Allocator, dir: []const u8, relative_paths: []const []const u8) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     for (relative_paths) |relative_path| {
-        const path = try std.fs.path.join(allocator, &.{ dir, relative_path });
-        defer allocator.free(path);
-        const stat = compat.cwd().statFile(compat.io(), path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.RequiredFingerprintFileMissing,
-            else => return err,
-        };
-        if (stat.kind != .file) return error.RequiredFingerprintFileNotRegular;
-        hasher.update(relative_path);
-        hasher.update(&.{0});
-        try updateSha256FromFile(&hasher, path);
-        hasher.update(&.{0});
+        try updateFingerprintEntry(allocator, &hasher, dir, .{ .relative_path = relative_path });
     }
     return sha256HexAlloc(allocator, &hasher);
+}
+
+/// Fingerprint a fixed list of entries, honouring per-entry optionality.
+fn fingerprintEntriesAlloc(allocator: std.mem.Allocator, dir: []const u8, entries: []const FingerprintEntry) ![]const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (entries) |entry| {
+        try updateFingerprintEntry(allocator, &hasher, dir, entry);
+    }
+    return sha256HexAlloc(allocator, &hasher);
+}
+
+fn updateFingerprintEntry(
+    allocator: std.mem.Allocator,
+    hasher: *std.crypto.hash.sha2.Sha256,
+    dir: []const u8,
+    entry: FingerprintEntry,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ dir, entry.relative_path });
+    defer allocator.free(path);
+    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!entry.optional) return error.RequiredFingerprintFileMissing;
+            // Absent is an identity of its own: it is recorded, not skipped,
+            // so a snapshot without the file can never share a fingerprint
+            // with one that has it.
+            hasher.update(entry.relative_path);
+            hasher.update(&.{fingerprint_absent_tag});
+            hasher.update(fingerprint_absent_marker);
+            hasher.update(&.{0});
+            return;
+        },
+        else => return err,
+    };
+    // A path that exists but is not a regular file is a broken layout, not an
+    // absent optional artifact, so it stays fatal for optional entries too.
+    if (stat.kind != .file) {
+        return if (entry.optional)
+            error.OptionalFingerprintFileNotRegular
+        else
+            error.RequiredFingerprintFileNotRegular;
+    }
+    hasher.update(entry.relative_path);
+    hasher.update(&.{fingerprint_present_tag});
+    try updateSha256FromFile(hasher, path);
+    hasher.update(&.{0});
 }
 
 fn updateSha256FromFile(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8) !void {
@@ -2748,6 +2824,66 @@ fn scheduleStepsForMicroBatches(micro_batches: u64, grad_accum: u64) u64 {
     std.debug.assert(micro_batches > 0);
     std.debug.assert(grad_accum > 0);
     return @max(micro_batches / grad_accum, 1);
+}
+
+const OptimizerSchedulePlan = struct {
+    examples_per_epoch: usize,
+    steps_per_epoch: u64,
+    /// Optimizer steps a full data pass executes, including the end-of-epoch
+    /// partial-accumulation flush. Diagnostic only: the run stops at
+    /// `target_optimizer_steps`, which is sized with the floor-based count.
+    optimizer_steps_per_epoch: u64,
+    schedule_steps_per_epoch: u64,
+    target_optimizer_steps: u64,
+    schedule_horizon_steps: u64,
+    planned_epoch_count: u64,
+};
+
+/// Upstream GLiNER2 executes exactly `max_steps = (len(train_loader) //
+/// grad_accum) * num_epochs` optimizer steps: `_flush_gradients` advances
+/// `global_step` and the scheduler like any other step, and both the inner and
+/// outer training loops break on `global_step >= max_steps` (trainer.py). The
+/// run therefore stops at the floor-based horizon and completes fewer than
+/// `epochs` data passes whenever `len(train_loader) % grad_accum != 0`. Stopping
+/// there is the only way to execute the same steps at the same learning rates:
+/// an extra flush would still advance AdamW's moments and per-parameter step
+/// counter even at LR 0, and would consume data upstream never sees.
+fn planOptimizerSchedule(
+    total_examples: usize,
+    batch_size: u32,
+    grad_accum: u32,
+    epochs: u32,
+    max_steps: u64,
+) OptimizerSchedulePlan {
+    std.debug.assert(total_examples > 0);
+    std.debug.assert(batch_size > 0);
+    const effective_batch_size = @min(total_examples, @as(usize, batch_size));
+    // Match the pinned upstream DataLoader: shrink one small dataset batch,
+    // otherwise drop a final partial training batch.
+    const drop_last = total_examples > @as(usize, batch_size);
+    const examples_per_epoch = if (drop_last)
+        (total_examples / effective_batch_size) * effective_batch_size
+    else
+        total_examples;
+    const steps_per_epoch: u64 = @intCast(examples_per_epoch / effective_batch_size);
+    const grad_accum_u64: u64 = grad_accum;
+    const schedule_steps_per_epoch = scheduleStepsForMicroBatches(steps_per_epoch, grad_accum_u64);
+    const horizon: u64 = if (max_steps > 0)
+        max_steps
+    else
+        @as(u64, epochs) * schedule_steps_per_epoch;
+    return .{
+        .examples_per_epoch = examples_per_epoch,
+        .steps_per_epoch = steps_per_epoch,
+        .optimizer_steps_per_epoch = optimizerStepsForMicroBatches(steps_per_epoch, grad_accum_u64),
+        .schedule_steps_per_epoch = schedule_steps_per_epoch,
+        .target_optimizer_steps = horizon,
+        .schedule_horizon_steps = horizon,
+        .planned_epoch_count = if (max_steps > 0)
+            (horizon + schedule_steps_per_epoch - 1) / schedule_steps_per_epoch
+        else
+            epochs,
+    };
 }
 
 fn trainingStateFingerprint(
@@ -4087,6 +4223,22 @@ fn selectBackend(
     };
 }
 
+fn validateMetalAttentionMode(backend: Gliner2TrainBackend, seq_len: u32, fused_attention_enabled: bool) !void {
+    if (backend == .metal and seq_len >= 128 and !fused_attention_enabled) {
+        return error.UnsafeMetalDebertaAttentionConfiguration;
+    }
+}
+
+test "Metal GLiNER2 training rejects the unsafe legacy DeBERTa attention path" {
+    try validateMetalAttentionMode(.native, 256, false);
+    try validateMetalAttentionMode(.metal, 127, false);
+    try validateMetalAttentionMode(.metal, 128, true);
+    try std.testing.expectError(
+        error.UnsafeMetalDebertaAttentionConfiguration,
+        validateMetalAttentionMode(.metal, 128, false),
+    );
+}
+
 fn backendLabel(backend: Gliner2TrainBackend) []const u8 {
     return switch (backend) {
         .auto => "auto",
@@ -4166,24 +4318,34 @@ fn initClassifierHeadInGpuHostedStore(
     defer allocator.free(w_data);
     const sd: f32 = 0.02;
     for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
-    const w_tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &.{ C, H }, w_data);
-    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "task_classifier.weight"), .{
-        .tensor_ref = undefined,
-        .host_loaded = .{ .tensor = w_tensor },
-        .active_tier = .host,
-        .loaded_bytes = w_tensor.data.len,
-    });
+    {
+        var w_tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &.{ C, H }, w_data);
+        errdefer w_tensor.deinit();
+        const owned_name = try allocator.dupe(u8, "task_classifier.weight");
+        errdefer allocator.free(owned_name);
+        try weight_store.lazy_weights.put(allocator, owned_name, .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = w_tensor },
+            .active_tier = .host,
+            .loaded_bytes = w_tensor.data.len,
+        });
+    }
 
     const b_data = try allocator.alloc(f32, C);
     defer allocator.free(b_data);
     @memset(b_data, 0.0);
-    const b_tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &.{C}, b_data);
-    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "task_classifier.bias"), .{
-        .tensor_ref = undefined,
-        .host_loaded = .{ .tensor = b_tensor },
-        .active_tier = .host,
-        .loaded_bytes = b_tensor.data.len,
-    });
+    {
+        var b_tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &.{C}, b_data);
+        errdefer b_tensor.deinit();
+        const owned_name = try allocator.dupe(u8, "task_classifier.bias");
+        errdefer allocator.free(owned_name);
+        try weight_store.lazy_weights.put(allocator, owned_name, .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = b_tensor },
+            .active_tier = .host,
+            .loaded_bytes = b_tensor.data.len,
+        });
+    }
     print("  initialized classifier head (Metal): [{d}, {d}] + [{d}]\n", .{ C, H, C });
     try initParityTopLevelWeightsMetal(allocator, weight_store, H);
 }
@@ -4204,23 +4366,40 @@ fn initClassifierHeadInNativeStore(
     defer allocator.free(w_data);
     const sd: f32 = 0.02;
     for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
-    const w_tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &.{ C, H }, w_data);
-    try weight_store.resident_weights.put(
-        allocator,
-        try allocator.dupe(u8, "task_classifier.weight"),
-        .{ .tensor = w_tensor },
-    );
+    {
+        var w_tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &.{ C, H }, w_data);
+        errdefer w_tensor.deinit();
+        const owned_name = try allocator.dupe(u8, "task_classifier.weight");
+        errdefer allocator.free(owned_name);
+        try weight_store.resident_weights.put(allocator, owned_name, .{ .tensor = w_tensor });
+    }
 
     const b_data = try allocator.alloc(f32, C);
     defer allocator.free(b_data);
     @memset(b_data, 0.0);
-    const b_tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &.{C}, b_data);
-    try weight_store.resident_weights.put(
-        allocator,
-        try allocator.dupe(u8, "task_classifier.bias"),
-        .{ .tensor = b_tensor },
-    );
+    {
+        var b_tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &.{C}, b_data);
+        errdefer b_tensor.deinit();
+        const owned_name = try allocator.dupe(u8, "task_classifier.bias");
+        errdefer allocator.free(owned_name);
+        try weight_store.resident_weights.put(allocator, owned_name, .{ .tensor = b_tensor });
+    }
     print("  initialized classifier head (native): [{d}, {d}] + [{d}]\n", .{ C, H, C });
+}
+
+test "classifier head setup is failure-atomic" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var weight_store = native_compute.WeightStore{
+                .allocator = allocator,
+                .resident_weights = .{},
+                .lazy_weights = .{},
+            };
+            defer deinitNativeWeightStore(allocator, &weight_store);
+            try initClassifierHeadInNativeStore(allocator, &weight_store, 42, 16, 4);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn fillRectIdentity(data: []f32, out_dim: usize, in_dim: usize) void {
@@ -5108,8 +5287,9 @@ fn printUsage() void {
         \\
         \\required:
         \\  --model-dir <path>        Directory with DeBERTa model (config.json + model.safetensors)
-        \\  --train-data <path>       JSONL training data with {text, entities} per line
-        \\  --eval-data <path>        Content-disjoint held-out JSONL (optional)
+        \\  --train-data <path>       JSONL records in upstream {input, output} full-task form;
+        \\                            legacy {text, entities} is accepted for entity objectives
+        \\  --eval-data <path>        Content-disjoint held-out JSONL in the matching format (optional)
         \\  --out-dir <path>          Output directory for LoRA adapter weights
         \\
         \\options:
@@ -5678,6 +5858,32 @@ test "optimizer step planning includes partial accumulation" {
     try std.testing.expectEqual(@as(u64, 1), scheduleStepsForMicroBatches(2, 5));
 }
 
+test "optimizer step target matches the upstream floor-based horizon" {
+    // 10 micro-batches per epoch with grad_accum 4 executes 3 optimizer steps
+    // per data pass but only budgets 2, so the run ends inside epoch 3.
+    const partial = planOptimizerSchedule(10, 1, 4, 3, 0);
+    try std.testing.expectEqual(@as(u64, 10), partial.steps_per_epoch);
+    try std.testing.expectEqual(@as(u64, 3), partial.optimizer_steps_per_epoch);
+    try std.testing.expectEqual(@as(u64, 2), partial.schedule_steps_per_epoch);
+    try std.testing.expectEqual(@as(u64, 6), partial.target_optimizer_steps);
+    try std.testing.expectEqual(partial.schedule_horizon_steps, partial.target_optimizer_steps);
+    try std.testing.expectEqual(@as(u64, 3), partial.planned_epoch_count);
+
+    // Exact division: nothing to trim, every requested epoch runs.
+    const exact = planOptimizerSchedule(10, 1, 1, 3, 0);
+    try std.testing.expectEqual(exact.optimizer_steps_per_epoch, exact.schedule_steps_per_epoch);
+    try std.testing.expectEqual(@as(u64, 30), exact.target_optimizer_steps);
+    try std.testing.expectEqual(exact.schedule_horizon_steps, exact.target_optimizer_steps);
+    try std.testing.expectEqual(@as(u64, 3), exact.planned_epoch_count);
+
+    // max_steps wins outright; the data passes it implies use the same
+    // floor-based per-epoch budget.
+    const capped = planOptimizerSchedule(10, 1, 4, 3, 7);
+    try std.testing.expectEqual(@as(u64, 7), capped.target_optimizer_steps);
+    try std.testing.expectEqual(capped.schedule_horizon_steps, capped.target_optimizer_steps);
+    try std.testing.expectEqual(@as(u64, 4), capped.planned_epoch_count);
+}
+
 test "training state fingerprint binds label ordering and execution settings" {
     const patterns = [_][]const u8{"encoder"};
     const labels = [_][]const u8{ "person", "organization" };
@@ -6011,6 +6217,7 @@ fn fillGliner2TotalLossTargetsFromRecords(
     const count_mask_offset = gliner2_autodiff.gliner2TotalLossCountMaskOffset(E);
     const parent_idx_offset = gliner2_autodiff.gliner2TotalLossParentIndexOffset(E);
     const task_groups_offset = gliner2_autodiff.gliner2TotalLossTaskGroupsOffset(E, max_instances);
+    const active_fields_offset = gliner2_autodiff.gliner2TotalLossActiveFieldsOffset(E, max_instances);
     const schema_idx_offset = 2 * E;
     const row_idx_offset = schema_idx_offset + E;
     const count_idx_offset = row_idx_offset + E;
@@ -6036,6 +6243,13 @@ fn fillGliner2TotalLossTargetsFromRecords(
             const row = out[flat_span_idx * total_width ..][0..total_width];
             @memcpy(row[task_groups_offset .. task_groups_offset + E], task_groups);
             for (0..E) |entity_type_idx| {
+                // Span-invariant, and deliberately written before the span
+                // validity checks below: the graph gathers this block from the
+                // first span row, which may itself be an invalid span.
+                row[active_fields_offset + entity_type_idx] = if (encoded.entity_type_kind.len > sample_idx * E + entity_type_idx and encoded.entity_type_kind[sample_idx * E + entity_type_idx] > 1)
+                    1.0
+                else
+                    0.0;
                 const label_token_pos_raw = encoded.e_token_positions[sample_idx * E + entity_type_idx];
                 const label_token_pos: usize = if (label_token_pos_raw >= 0) @intCast(label_token_pos_raw) else 0;
                 row[schema_idx_offset + entity_type_idx] = @floatFromInt(sample_idx * encoded.max_length + label_token_pos);
@@ -6362,6 +6576,88 @@ test "full-task negative masking is independent per structure instance" {
     try std.testing.expectEqual(@as(f32, 0.0), targets[masks_offset + 1]);
 }
 
+test "stochastic negative masking never touches the count-embed active-field block" {
+    const allocator = std.testing.allocator;
+    const E: usize = 3;
+    const max_instances: u32 = 1;
+
+    // Two structure schemas: the entity task has a gold instance, the JSON
+    // task has none. Upstream `_compute_sample_loss` drops zero-count schemas
+    // before they reach `count_embed`, so only the entity fields are active.
+    const entity_schema = [_][]const u8{ "person", "org" };
+    const product_schema = [_][]const u8{"name"};
+    const tasks = [_]gliner2_data.UpstreamTask{
+        .{ .kind = .entities, .name = "entities", .schema_fields = &entity_schema, .count = 1 },
+        .{ .kind = .json_structures, .name = "product", .schema_fields = &product_schema, .count = 0 },
+    };
+    const records = [_]gliner2_data.UpstreamRecord{.{ .text = "Alice", .tasks = &tasks }};
+
+    var first_token_positions = [_]i32{ 1, 2 };
+    var span_indices = [_]i32{ 0, 0, 1, 1 };
+    // Span row 1 is invalid on purpose: the active-field block must be written
+    // before the span-validity skip, or a sample whose first row is invalid
+    // would gate every schema field out of the count-embed attention.
+    var span_mask = [_]f32{ 1.0, 0.0 };
+    var span_labels = [_]f32{
+        1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+    };
+    var e_token_positions = [_]i32{ 3, 4, 5 };
+    // fillUpstreamSpanGrid stores min(task.count, 19) + 1.
+    var entity_type_kind = [_]i32{ 2, 2, 1 };
+    var schema_counts = [_]i32{2};
+    const encoded = gliner2_data.EncodedBatch{
+        .allocator = allocator,
+        .owns_memory = false,
+        .input_ids = &.{},
+        .attention_mask = &.{},
+        .words_mask = &.{},
+        .first_token_positions = &first_token_positions,
+        .word_lengths = &.{},
+        .word_has_digit = &.{},
+        .word_is_title = &.{},
+        .word_is_all_caps = &.{},
+        .span_indices = &span_indices,
+        .span_mask = &span_mask,
+        .span_labels = &span_labels,
+        .e_token_positions = &e_token_positions,
+        .e_token_end_positions = &.{},
+        .entity_type_kind = &entity_type_kind,
+        .schema_counts = &schema_counts,
+        .batch_size = 1,
+        .max_length = 8,
+        .max_words_per_sample = 2,
+        .max_spans = 2,
+        .num_entity_types = E,
+    };
+
+    const width = gliner2_autodiff.gliner2TotalLossTargetWidthEx(E, max_instances);
+    const targets = try allocator.alloc(f32, encoded.max_spans * width);
+    defer allocator.free(targets);
+    _ = try fillGliner2TotalLossTargetsFromRecords(allocator, &encoded, &records, max_instances, targets);
+
+    const active_offset = gliner2_autodiff.gliner2TotalLossActiveFieldsOffset(E, max_instances);
+    const task_groups_offset = gliner2_autodiff.gliner2TotalLossTaskGroupsOffset(E, max_instances);
+    var active_before: [E]f32 = undefined;
+    @memcpy(&active_before, targets[active_offset..][0..E]);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 1.0, 0.0 }, &active_before);
+    // The zero-count schema still carries a task-group id: task groups are a
+    // strict superset of the active fields and cannot stand in for them.
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 1.0, 2.0 }, targets[task_groups_offset..][0..E]);
+    // The graph gathers the block from the first span row only, so it must be
+    // identical on every row of the sample — including invalid rows, whose
+    // structure BCE mask is left empty by the span-validity skip.
+    try std.testing.expectEqualSlices(f32, &active_before, targets[width + active_offset ..][0..E]);
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0 }, targets[width + E ..][0..E]);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 1.0, 0.0 }, targets[E..][0..E]);
+
+    applySpanNegativeMask(targets, E, width, 1.0, 7);
+
+    try std.testing.expectEqualSlices(f32, &active_before, targets[active_offset..][0..E]);
+    // "org" is a negative on span row 0, so its structure BCE mask is dropped.
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 0.0 }, targets[E..][0..E]);
+}
+
 test "packed target stats count only final active schema cells" {
     const E = 3;
     const width = 2 * E;
@@ -6655,5 +6951,189 @@ test "artifact fingerprint rejects a missing required file" {
     try std.testing.expectError(
         error.RequiredFingerprintFileMissing,
         fingerprintRelativeFilesAlloc(allocator, dir, &required),
+    );
+}
+
+test "artifact fingerprint records an absent optional file instead of failing" {
+    const allocator = std.testing.allocator;
+
+    var absent_tmp = std.testing.tmpDir(.{});
+    defer absent_tmp.cleanup();
+    try absent_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "present", .data = "present" });
+    const absent_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{absent_tmp.sub_path});
+    defer allocator.free(absent_dir);
+
+    const entries = [_]FingerprintEntry{
+        .{ .relative_path = "present" },
+        .{ .relative_path = "maybe", .optional = true },
+    };
+    const absent_digest = try fingerprintEntriesAlloc(allocator, absent_dir, &entries);
+    defer allocator.free(absent_digest);
+
+    // An optional file that is present still contributes its bytes, so
+    // identity moves when it changes.
+    var present_tmp = std.testing.tmpDir(.{});
+    defer present_tmp.cleanup();
+    try present_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "present", .data = "present" });
+    try present_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "maybe", .data = "v1" });
+    const present_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{present_tmp.sub_path});
+    defer allocator.free(present_dir);
+
+    const present_digest = try fingerprintEntriesAlloc(allocator, present_dir, &entries);
+    defer allocator.free(present_digest);
+    try std.testing.expect(!std.mem.eql(u8, absent_digest, present_digest));
+
+    try present_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "maybe", .data = "v2" });
+    const changed_digest = try fingerprintEntriesAlloc(allocator, present_dir, &entries);
+    defer allocator.free(changed_digest);
+    try std.testing.expect(!std.mem.eql(u8, present_digest, changed_digest));
+
+    // The absent marker is framed with a tag byte a present file can never
+    // emit, so content equal to the marker cannot forge "absent".
+    try present_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "maybe",
+        .data = fingerprint_absent_marker,
+    });
+    const forged_digest = try fingerprintEntriesAlloc(allocator, present_dir, &entries);
+    defer allocator.free(forged_digest);
+    try std.testing.expect(!std.mem.eql(u8, absent_digest, forged_digest));
+
+    // An optional path that exists but is not a regular file is still fatal.
+    var broken_tmp = std.testing.tmpDir(.{});
+    defer broken_tmp.cleanup();
+    try broken_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "present", .data = "present" });
+    try broken_tmp.dir.createDirPath(std.testing.io, "maybe");
+    const broken_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{broken_tmp.sub_path});
+    defer allocator.free(broken_dir);
+    try std.testing.expectError(
+        error.OptionalFingerprintFileNotRegular,
+        fingerprintEntriesAlloc(allocator, broken_dir, &entries),
+    );
+}
+
+test "optional fingerprint entries keep fully present snapshots byte-stable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a", .data = "alpha" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b", .data = "beta" });
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(dir);
+
+    // Marking an entry optional must not renumber the identity of a snapshot
+    // that ships every file, or old and new runs of the same model would
+    // disagree.
+    const legacy_paths = [_][]const u8{ "a", "b" };
+    const legacy_digest = try fingerprintRelativeFilesAlloc(allocator, dir, &legacy_paths);
+    defer allocator.free(legacy_digest);
+
+    const entries = [_]FingerprintEntry{
+        .{ .relative_path = "a" },
+        .{ .relative_path = "b", .optional = true },
+    };
+    const digest = try fingerprintEntriesAlloc(allocator, dir, &entries);
+    defer allocator.free(digest);
+    try std.testing.expectEqualStrings(legacy_digest, digest);
+}
+
+test "gliner2 base model fingerprint accepts a stock HuggingFace cache layout" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Mirror the HF hub cache: content lives in a shared `blobs` directory and
+    // the snapshot exposes symlinks, with the encoder config in a subdirectory
+    // and no `spm.model` at all.
+    try tmp.dir.createDirPath(std.testing.io, "blobs");
+    try tmp.dir.createDirPath(std.testing.io, "snapshot/encoder_config");
+    const snapshot_files = [_][]const u8{
+        "model.safetensors",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+    };
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "snapshot" });
+    defer allocator.free(model_dir);
+
+    for (snapshot_files, 0..) |name, idx| {
+        const blob_rel = try std.fmt.allocPrint(allocator, "blobs/{d}", .{idx});
+        defer allocator.free(blob_rel);
+        const body = try std.fmt.allocPrint(allocator, "{{\"file\":\"{s}\"}}", .{name});
+        defer allocator.free(body);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = blob_rel, .data = body });
+
+        const link_rel = try std.fs.path.join(allocator, &.{ "snapshot", name });
+        defer allocator.free(link_rel);
+        const link_target = try std.fmt.allocPrint(allocator, "../blobs/{d}", .{idx});
+        defer allocator.free(link_target);
+        try tmp.dir.symLink(std.testing.io, link_target, link_rel, .{});
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "blobs/encoder", .data = "{\"hidden_size\":768}" });
+    try tmp.dir.symLink(
+        std.testing.io,
+        "../../blobs/encoder",
+        "snapshot/encoder_config/config.json",
+        .{},
+    );
+
+    const digest = try gliner2BaseModelFingerprintAlloc(allocator, model_dir);
+    defer allocator.free(digest);
+    try std.testing.expect(std.mem.startsWith(u8, digest, "sha256:"));
+
+    // Contents must be read *through* the symlinks: rewriting a blob has to
+    // move the fingerprint.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "blobs/encoder", .data = "{\"hidden_size\":1024}" });
+    const changed_digest = try gliner2BaseModelFingerprintAlloc(allocator, model_dir);
+    defer allocator.free(changed_digest);
+    try std.testing.expect(!std.mem.eql(u8, digest, changed_digest));
+
+    // Dropping a still-required file remains fatal.
+    try tmp.dir.deleteFile(std.testing.io, "snapshot/tokenizer.json");
+    try std.testing.expectError(
+        error.RequiredFingerprintFileMissing,
+        gliner2BaseModelFingerprintAlloc(allocator, model_dir),
+    );
+}
+
+test "gliner2 base model fingerprint matches the cross-language release golden" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "model/encoder_config");
+    const required_paths = [_][]const u8{
+        "model.safetensors",
+        "config.json",
+        "encoder_config/config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+    };
+    for (required_paths) |relative_path| {
+        const fixture_path = try std.fs.path.join(allocator, &.{ "model", relative_path });
+        defer allocator.free(fixture_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = fixture_path, .data = relative_path });
+    }
+
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model", .{tmp.sub_path});
+    defer allocator.free(root);
+    const absent_digest = try gliner2BaseModelFingerprintAlloc(allocator, root);
+    defer allocator.free(absent_digest);
+    try std.testing.expectEqualStrings(
+        "sha256:9317c6a7c2d586358da84851ecfe259a2075724436fbc26736b9f15d7fdaa638",
+        absent_digest,
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model/spm.model", .data = "spm.model" });
+    const present_digest = try gliner2BaseModelFingerprintAlloc(allocator, root);
+    defer allocator.free(present_digest);
+    try std.testing.expectEqualStrings(
+        "sha256:87543f2c1d708003977125e91fd1b0f2217c3500db7f480a503e87be38cce833",
+        present_digest,
     );
 }

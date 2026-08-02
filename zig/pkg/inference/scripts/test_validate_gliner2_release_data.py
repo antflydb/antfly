@@ -29,6 +29,20 @@ def dataset(records: list[str], texts: list[str], tasks: frozenset[str] = ALL_TA
 
 
 class ReleaseDataValidationTest(unittest.TestCase):
+    def test_base_model_fingerprint_accepts_absent_optional_spm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            for relative_path in MODEL_FINGERPRINT_FILES:
+                if relative_path == "spm.model":
+                    continue
+                path = model_dir / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(relative_path.encode())
+            self.assertEqual(
+                "sha256:9317c6a7c2d586358da84851ecfe259a2075724436fbc26736b9f15d7fdaa638",
+                base_model_fingerprint(model_dir),
+            )
+
     def test_accepts_disjoint_full_task_data_and_rejects_leaks(self) -> None:
         train = dataset(["train-a", "train-b"], ["alpha", "beta"])
         eval_ = dataset(["eval-a"], ["gamma"])
@@ -124,6 +138,8 @@ class ReleaseDataValidationTest(unittest.TestCase):
             (adapter_dir / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
             manifest = {
                 "schema_version": "gliner2_autodiff_training/v2",
+                "backend": "Metal",
+                "compiled_required": True,
                 "objective": "gliner2-total-loss",
                 "lora_only_trainables": True,
                 "graph_shape_policy": "batch-local-v1",
@@ -177,8 +193,60 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 "base_model_fingerprint_sha256": base_model_fingerprint(model_dir),
                 "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(adapter_dir),
             }
+            metal_step = {
+                "event": "step",
+                "step": 1,
+                "loss": 1.0,
+                "optimizer_backend": "metal",
+                "device_trainable_transfer_count": 0,
+                "device_resident_transfer_count": 0,
+                "device_trainable_bytes": 128,
+                "graph_executor_fallback_reason": None,
+                "graph_executor_partitions": 1,
+                "graph_executor_command_dispatches": 1,
+                "graph_executor_planned_dispatches": 1,
+                "graph_executor_interpreter_fallbacks": 0,
+                "graph_executor_true_host_outputs": 0,
+            }
+            def write_metal_steps(count: int) -> None:
+                (adapter_dir / "training_metrics.jsonl").write_text(
+                    "".join(json.dumps({**metal_step, "step": step}) + "\n" for step in range(1, count + 1)),
+                    encoding="utf-8",
+                )
+
+            write_metal_steps(1)
             (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+
+            for key, bad_value in (("backend", "native"), ("compiled_required", False)):
+                with self.subTest(production_manifest_field=key, bad_value=bad_value):
+                    original = manifest[key]
+                    manifest[key] = bad_value
+                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "Metal training with compiled_required"):
+                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+                    manifest[key] = original
+
+            bad_step_values = (
+                ("optimizer_backend", "host"),
+                ("device_resident_transfer_count", 1),
+                ("device_trainable_bytes", 0),
+                ("graph_executor_fallback_reason", "unsupported op"),
+                ("graph_executor_partitions", 0),
+                ("graph_executor_interpreter_fallbacks", 1),
+                ("graph_executor_true_host_outputs", 1),
+            )
+            for key, bad_value in bad_step_values:
+                with self.subTest(production_metric_field=key, bad_value=bad_value):
+                    bad_step = dict(metal_step)
+                    bad_step[key] = bad_value
+                    (adapter_dir / "training_metrics.jsonl").write_text(
+                        json.dumps(bad_step) + "\n", encoding="utf-8"
+                    )
+                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "release adapter step"):
+                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+            write_metal_steps(1)
 
             bad_shape_cache_values = (
                 ("graph_shape_policy", "dataset-global"),
@@ -350,6 +418,7 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 early_stopping_patience=1,
                 early_stopping_bad_epochs=1,
             )
+            write_metal_steps(2)
             (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["early_stopping_bad_epochs"] = 0
@@ -372,6 +441,7 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 early_stopping_patience=0,
                 early_stopping_bad_epochs=0,
             )
+            write_metal_steps(1)
 
             manifest.update(
                 example_count=101,
@@ -400,6 +470,7 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 micro_batch_steps=3,
                 total_steps=3,
             )
+            write_metal_steps(3)
             (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir, 3)
 
@@ -415,6 +486,7 @@ class ReleaseDataValidationTest(unittest.TestCase):
                 micro_batch_steps=1,
                 total_steps=1,
             )
+            write_metal_steps(1)
             (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
             manifest["grad_accum"] = 1

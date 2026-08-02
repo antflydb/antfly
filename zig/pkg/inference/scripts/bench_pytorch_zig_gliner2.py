@@ -35,6 +35,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gliner2_release_contract import (
+    UPSTREAM_COMMIT,
+    verify_canonical_python_runtime,
+    verify_import_source,
+    verify_upstream_checkout,
+)
+
 
 DEFAULT_TEXT = (
     "John Smith works for Apple Inc. and lives in San Francisco. "
@@ -66,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="/private/tmp/termite-gliner2-fp32-bench")
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--upstream-source",
+        type=Path,
+        help=f"Clean upstream GLiNER2 checkout at the fixed oracle commit {UPSTREAM_COMMIT}",
+    )
     parser.add_argument("--repo-root", default=str(root))
     parser.add_argument("--skip-pytorch", action="store_true")
     parser.add_argument("--skip-zig", action="store_true")
@@ -124,9 +136,13 @@ def run_pytorch(
     device: str,
     warmup_iters: int,
     measure_iters: int,
+    oracle: dict[str, str],
 ) -> dict[str, Any]:
     import torch
+    import gliner2
     from gliner2 import GLiNER2
+
+    imported_module = verify_import_source(GLiNER2, Path(oracle["checkout"]))
 
     available = device != "mps" or torch.backends.mps.is_available()
     if not available:
@@ -187,6 +203,14 @@ def run_pytorch(
         "score_sum": last_score_sum,
         "samples_ms": samples,
         **summarize_ms(samples),
+        "oracle": {
+            **oracle,
+            "imported_module": imported_module,
+            "python_version": __import__("platform").python_version(),
+            "unicode_version": __import__("unicodedata").unidata_version,
+            "torch_version": torch.__version__,
+            "gliner2_version": getattr(gliner2, "__version__", None),
+        },
     }
 
 
@@ -397,6 +421,18 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    oracle: dict[str, str] | None = None
+    if not args.skip_pytorch:
+        if args.upstream_source is None:
+            raise SystemExit("--upstream-source is required unless --skip-pytorch is set")
+        try:
+            verify_canonical_python_runtime()
+            oracle = verify_upstream_checkout(args.upstream_source)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, oracle["checkout"])
+
     rows: list[dict[str, Any]] = []
     if not args.skip_pytorch:
         for device in devices:
@@ -410,6 +446,7 @@ def main() -> int:
                         device,
                         args.warmup_iters,
                         args.measure_iters,
+                        oracle,
                     )
                 except Exception as exc:
                     row = {

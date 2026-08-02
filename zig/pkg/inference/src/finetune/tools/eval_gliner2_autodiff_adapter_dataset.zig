@@ -20,6 +20,9 @@ const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
 const compat = inference.io.compat;
 const adapter_eval = @import("eval_gliner2_autodiff_adapter.zig");
 
+const canonical_normalization = gliner2_data.canonical_scoring_normalization;
+const canonical_normalization_profile = gliner2_data.canonical_scoring_normalization_profile;
+
 const Options = struct {
     model_dir: []const u8,
     adapter_dir: []const u8,
@@ -141,7 +144,8 @@ const FullTaskSummary = struct {
     count: CountMetricSummary,
     /// Direct accuracy of the `count_pred` argmax before field decoding.
     raw_count: CountMetricSummary,
-    normalization: []const u8 = "trimmed ASCII case-insensitive exact atoms",
+    normalization: []const u8 = canonical_normalization,
+    normalization_profile: []const u8 = canonical_normalization_profile,
     relation_semantics: []const u8 = "ordered head/tail only",
 };
 
@@ -782,7 +786,7 @@ fn scoreExample(
         var correct = false;
         for (ex.entities, 0..) |ent, gold_idx| {
             if (gold_matched[gold_idx]) continue;
-            if (predictionMatchesGold(ex, ent, prediction, opts)) {
+            if (try predictionMatchesGold(ex, ent, prediction, opts)) {
                 gold_matched[gold_idx] = true;
                 correct = true;
                 break;
@@ -846,9 +850,9 @@ fn scoreFullTaskRecord(
         if (task.kind != predicted.kind or !std.mem.eql(u8, task.name, predicted.name)) return error.NativeTaskPredictionOrderMismatch;
         switch (task.kind) {
             .entities => {},
-            .classifications => scoreClassificationTask(&accum.classifications, task, predicted),
+            .classifications => try scoreClassificationTask(&accum.classifications, task, predicted),
             .json_structures => {
-                const correct = countMatchingFields(task.fields, predicted.fields);
+                const correct = try countMatchingFields(task.fields, predicted.fields);
                 const exact = try jsonInstancesExactAlloc(allocator, task, predicted);
                 accum.json_structures.add(task.fields.len, predicted.fields.len, correct, exact);
                 accum.count.add(task.count, predicted.emitted_count);
@@ -869,12 +873,12 @@ fn scoreClassificationTask(
     accum: *TaskMetricAccumulator,
     task: gliner2_data.UpstreamTask,
     prediction: adapter_eval.NativeTaskPrediction,
-) void {
+) !void {
     var matched: [gliner2_autodiff.max_span_start_entity_types]bool = @splat(false);
     var correct: usize = 0;
     for (prediction.classifications) |predicted| {
         for (task.true_labels, 0..) |gold, gold_idx| {
-            if (matched[gold_idx] or !normalizedValueEqual(gold, predicted.label)) continue;
+            if (matched[gold_idx] or !try normalizedValueEqual(gold, predicted.label)) continue;
             matched[gold_idx] = true;
             correct += 1;
             break;
@@ -888,16 +892,16 @@ fn scoreClassificationTask(
     );
 }
 
-fn countMatchingFields(gold: []const gliner2_data.UpstreamField, predicted: []const adapter_eval.NativeFieldPrediction) usize {
+fn countMatchingFields(gold: []const gliner2_data.UpstreamField, predicted: []const adapter_eval.NativeFieldPrediction) !usize {
     var correct: usize = 0;
     for (predicted, 0..) |candidate, candidate_idx| {
         var prior_matches: usize = 0;
         for (predicted[0..candidate_idx]) |prior| {
-            if (std.mem.eql(u8, prior.field, candidate.field) and normalizedValueEqual(prior.value, candidate.value)) prior_matches += 1;
+            if (std.mem.eql(u8, prior.field, candidate.field) and try normalizedValueEqual(prior.value, candidate.value)) prior_matches += 1;
         }
         var gold_matches: usize = 0;
         for (gold) |field| {
-            if (std.mem.eql(u8, field.name, candidate.field) and normalizedValueEqual(field.value, candidate.value)) gold_matches += 1;
+            if (std.mem.eql(u8, field.name, candidate.field) and try normalizedValueEqual(field.value, candidate.value)) gold_matches += 1;
         }
         if (prior_matches < gold_matches) correct += 1;
     }
@@ -917,7 +921,7 @@ fn jsonInstancesExactAlloc(
         var found = false;
         for (0..prediction.emitted_count) |predicted_instance| {
             if (matched[predicted_instance]) continue;
-            if (jsonInstanceEqual(task.fields, gold_instance, prediction.fields, predicted_instance)) {
+            if (try jsonInstanceEqual(task.fields, gold_instance, prediction.fields, predicted_instance)) {
                 matched[predicted_instance] = true;
                 found = true;
                 break;
@@ -933,7 +937,7 @@ fn jsonInstanceEqual(
     gold_instance: usize,
     predicted: []const adapter_eval.NativeFieldPrediction,
     predicted_instance: usize,
-) bool {
+) !bool {
     var gold_len: usize = 0;
     for (gold) |field| gold_len += @intFromBool(field.instance == gold_instance);
     var predicted_len: usize = 0;
@@ -943,11 +947,11 @@ fn jsonInstanceEqual(
         if (field.instance != gold_instance) continue;
         var prior_matches: usize = 0;
         for (gold[0..field_idx]) |prior| {
-            if (prior.instance == gold_instance and std.mem.eql(u8, prior.name, field.name) and normalizedValueEqual(prior.value, field.value)) prior_matches += 1;
+            if (prior.instance == gold_instance and std.mem.eql(u8, prior.name, field.name) and try normalizedValueEqual(prior.value, field.value)) prior_matches += 1;
         }
         var predicted_matches: usize = 0;
         for (predicted) |candidate| {
-            if (candidate.instance == predicted_instance and std.mem.eql(u8, candidate.field, field.name) and normalizedValueEqual(candidate.value, field.value)) predicted_matches += 1;
+            if (candidate.instance == predicted_instance and std.mem.eql(u8, candidate.field, field.name) and try normalizedValueEqual(candidate.value, field.value)) predicted_matches += 1;
         }
         if (predicted_matches <= prior_matches) return false;
     }
@@ -970,7 +974,7 @@ fn countMatchingRelationPairsAlloc(
             if (matched[predicted_instance]) continue;
             const predicted_head = relationPredictionValue(prediction.fields, predicted_instance, "head") orelse continue;
             const predicted_tail = relationPredictionValue(prediction.fields, predicted_instance, "tail") orelse continue;
-            if (!normalizedValueEqual(gold_head, predicted_head) or !normalizedValueEqual(gold_tail, predicted_tail)) continue;
+            if (!try normalizedValueEqual(gold_head, predicted_head) or !try normalizedValueEqual(gold_tail, predicted_tail)) continue;
             matched[predicted_instance] = true;
             correct += 1;
             break;
@@ -999,11 +1003,8 @@ fn relationPredictionValue(fields: []const adapter_eval.NativeFieldPrediction, i
     return result;
 }
 
-fn normalizedValueEqual(lhs: []const u8, rhs: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(
-        std.mem.trim(u8, lhs, " \t\r\n"),
-        std.mem.trim(u8, rhs, " \t\r\n"),
-    );
+fn normalizedValueEqual(lhs: []const u8, rhs: []const u8) !bool {
+    return gliner2_data.canonicalScoringValueEqual(lhs, rhs);
 }
 
 fn predictionMatchesGold(
@@ -1011,16 +1012,12 @@ fn predictionMatchesGold(
     ent: gliner2_data.Entity,
     prediction: adapter_eval.TopEntity,
     opts: Options,
-) bool {
-    if (!std.mem.eql(u8, ent.label, prediction.label)) return false;
+) !bool {
+    if (!try normalizedValueEqual(ent.label, prediction.label)) return false;
     if (!opts.match_text_label_only) return ent.start == prediction.start and ent.end == prediction.end;
 
     const gold_text = if (ent.text.len > 0) ent.text else spanText(ex.text, ent.start, ent.end);
-    return std.mem.eql(
-        u8,
-        std.mem.trim(u8, gold_text, " \t\r\n"),
-        std.mem.trim(u8, prediction.text, " \t\r\n"),
-    );
+    return normalizedValueEqual(gold_text, prediction.text);
 }
 
 fn appendFalsePositiveDiagnostic(
@@ -1667,6 +1664,27 @@ test "dataset evaluator can match by text and label without exact offsets" {
     try std.testing.expectEqual(@as(usize, 1), accum.correct_total);
     try std.testing.expectEqual(@as(usize, 1), accum.exact_cases);
     try std.testing.expectEqual(@as(usize, 1), accum.exact_correct);
+}
+
+test "release scoring uses the versioned Unicode normalization admitted profile" {
+    try std.testing.expectEqualStrings(
+        "unicode_nfc_collapsed_whitespace_casefold/v1",
+        canonical_normalization,
+    );
+    try std.testing.expect(try normalizedValueEqual("  CAFÉ\tworker ", "café  WORKER"));
+    try std.testing.expect(try normalizedValueEqual("Москва\u{00a0}東京", "МОСКВА 東京"));
+    try std.testing.expect(!(try normalizedValueEqual("café", "cafe")));
+
+    try std.testing.expectError(
+        error.UnsupportedCanonicalNormalization,
+        normalizedValueEqual("CAFE\u{0301}", "café"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedCanonicalCasefold,
+        normalizedValueEqual("straße", "STRASSE"),
+    );
+    const invalid_utf8 = [_]u8{ 0xc3, 0x28 };
+    try std.testing.expectError(error.InvalidUtf8, normalizedValueEqual(&invalid_utf8, ""));
 }
 
 test "dataset evaluator records false positive and false negative diagnostics" {

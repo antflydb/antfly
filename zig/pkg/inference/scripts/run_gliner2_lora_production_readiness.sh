@@ -9,7 +9,9 @@ Usage:
 Runs the strict GLiNER2 LoRA batch-32/seq-128 cross-runtime release-parity gate,
 a deterministic held-out full-task quality gate through the frozen upstream
 decoder, a native full-heldout GLiNER2 quality gate, and an opt-in head-MLP
-fusion guard.
+fusion guard. A separately generated five-seed convergence summary is required
+so independent-training equality is judged statistically rather than tensor by
+tensor.
 
 Options:
   --runs N                 Production gate repeated runs (default: 5)
@@ -23,6 +25,8 @@ Options:
   --eval-data FILE         Disjoint full-task eval JSONL (required and scored)
   --python-bin FILE        Python executable forwarded to the perf gate
   --upstream-source DIR    Clean upstream GLiNER2 checkout at the pinned commit (required)
+  --convergence-summary FILE
+                           Passing output from summarize_gliner2_convergence.py (required)
   --heldout-min KEY=FLOAT  Required held-out floor; repeat for every metric listed below
   --heldout-threshold N    Upstream extraction threshold (default: 0.5)
   --heldout-batch-size N   Upstream CPU evaluation batch size (default: 8)
@@ -31,10 +35,6 @@ Options:
   --warm-production-ready  Use strict warm-step production target defaults
   --loop-profile           Enable executor loop-profile timing summaries
   --hazard-profile         Enable planned-access hazard timing summaries
-  --max-zig-python-warm-step-ratio-median N
-                           Forward warm median Zig/Python ratio limit
-  --max-zig-python-warm-step-ratio-any-run N
-                           Forward warm any-run Zig/Python ratio limit
   --skip-head-opt-in       Skip the experimental head-MLP fusion guard
   --require-head-opt-in    Fail if the experimental head-MLP fusion guard fails
   --help                   Show this help
@@ -50,12 +50,10 @@ EOF
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 runs=5
-runs_explicit=0
 head_runs=1
 out_dir="/private/tmp/termite-gliner2-production-readiness"
 skip_head_opt_in=0
 require_head_opt_in=0
-warm_production_ready=0
 train_data_set=0
 eval_data_set=0
 train_data=""
@@ -64,6 +62,7 @@ model_dir=""
 release_adapter_dir=""
 python_bin="/private/tmp/gliner2-parity-venv/bin/python"
 upstream_source=""
+convergence_summary=""
 heldout_threshold="0.5"
 heldout_batch_size="8"
 heldout_max_length=""
@@ -75,7 +74,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --runs)
       runs="${2:?missing value for --runs}"
-      runs_explicit=1
       shift 2
       ;;
     --head-runs)
@@ -118,6 +116,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --upstream-source)
       upstream_source="${2:?missing value for --upstream-source}"
+      gate_args+=("$1" "${upstream_source}")
+      shift 2
+      ;;
+    --convergence-summary)
+      convergence_summary="${2:?missing value for --convergence-summary}"
       shift 2
       ;;
     --heldout-min)
@@ -136,12 +139,11 @@ while [[ $# -gt 0 ]]; do
       heldout_max_length="${2:?missing value for --heldout-max-length}"
       shift 2
       ;;
-    --compare-steps | --max-zig-python-warm-step-ratio-median | --max-zig-python-warm-step-ratio-any-run)
+    --compare-steps)
       gate_args+=("$1" "${2:?missing value for $1}")
       shift 2
       ;;
     --warm-production-ready)
-      warm_production_ready=1
       gate_args+=("$1")
       shift
       ;;
@@ -195,6 +197,14 @@ if (( skip_head_opt_in && require_head_opt_in )); then
   echo "--skip-head-opt-in and --require-head-opt-in are mutually exclusive" >&2
   exit 2
 fi
+if [[ ! "${runs}" =~ ^[0-9]+$ ]] || (( runs < 5 )); then
+  echo "production readiness requires at least five performance runs" >&2
+  exit 2
+fi
+if [[ ! "${head_runs}" =~ ^[0-9]+$ ]] || (( head_runs < 1 )); then
+  echo "--head-runs must be positive" >&2
+  exit 2
+fi
 
 if (( ! train_data_set || ! eval_data_set )); then
   echo "--train-data and --eval-data are required for release-parity validation" >&2
@@ -202,6 +212,10 @@ if (( ! train_data_set || ! eval_data_set )); then
 fi
 if [[ -z "${upstream_source}" ]]; then
   echo "--upstream-source is required for frozen upstream held-out evaluation" >&2
+  exit 2
+fi
+if [[ -z "${convergence_summary}" || ! -f "${convergence_summary}" ]]; then
+  echo "--convergence-summary must name a current five-seed convergence report" >&2
   exit 2
 fi
 if [[ -z "${model_dir}" || -z "${release_adapter_dir}" ]]; then
@@ -212,14 +226,14 @@ if [[ ! -d "${model_dir}" || ! -f "${release_adapter_dir}/adapter_config.json" |
   echo "release model, standard PEFT adapter, or Zig training manifest is missing" >&2
   exit 2
 fi
-python3 "${script_dir}/validate_gliner2_release_data.py" \
+"${python_bin}" "${script_dir}/validate_gliner2_release_data.py" \
   --train "${train_data}" --eval "${eval_data}" --require-full-task \
   --model-dir "${model_dir}" --release-adapter-dir "${release_adapter_dir}"
 heldout_preflight=("${upstream_source}" "${heldout_threshold}" "${heldout_batch_size}" "${heldout_max_length}")
 if ((${#heldout_minima[@]})); then
   heldout_preflight+=("${heldout_minima[@]}")
 fi
-PYTHONPATH="${script_dir}" python3 - "${heldout_preflight[@]}" <<'PY'
+PYTHONPATH="${script_dir}" "${python_bin}" - "${heldout_preflight[@]}" <<'PY'
 import sys
 from pathlib import Path
 from evaluate_gliner2_full_task import UPSTREAM_COMMIT, parse_minima, verify_upstream
@@ -235,6 +249,44 @@ try:
 except ValueError as exc:
     raise SystemExit(str(exc))
 PY
+PYTHONPATH="${script_dir}" "${python_bin}" - "${convergence_summary}" "${model_dir}" "${train_data}" "${eval_data}" "${upstream_source}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from gliner2_release_contract import (
+    CANONICAL_NORMALIZATION,
+    CANONICAL_UNICODE_VERSION,
+    UPSTREAM_COMMIT,
+    path_fingerprint,
+)
+from summarize_gliner2_convergence import EVIDENCE_CONTRACT, OUTPUT_CONTRACT, verify_summary_evidence
+from validate_gliner2_release_data import base_model_fingerprint
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected_fingerprints = {
+    "base_model": base_model_fingerprint(Path(sys.argv[2])),
+    "train_data": path_fingerprint(Path(sys.argv[3])),
+    "eval_data": path_fingerprint(Path(sys.argv[4])),
+}
+if (
+    not isinstance(report, dict)
+    or report.get("contract") != OUTPUT_CONTRACT
+    or report.get("evidence_contract") != EVIDENCE_CONTRACT
+    or report.get("evidence_bound") is not True
+    or report.get("pass") is not True
+    or report.get("seed_count") != 5
+    or report.get("oracle", {}).get("commit") != UPSTREAM_COMMIT
+    or report.get("oracle", {}).get("checkout") != str(Path(sys.argv[5]).resolve())
+    or report.get("normalization") != CANONICAL_NORMALIZATION
+    or report.get("unicode_version") != CANONICAL_UNICODE_VERSION
+    or report.get("fingerprints") != expected_fingerprints
+):
+    raise SystemExit("convergence summary is not a passing five-seed report for the selected model/train/eval artifacts")
+evidence_errors = verify_summary_evidence(report)
+if evidence_errors:
+    raise SystemExit("convergence evidence is stale or invalid: " + "; ".join(evidence_errors))
+PY
 
 native_min_f1=""
 native_min_exact_match=""
@@ -249,10 +301,6 @@ if [[ -z "${native_min_f1}" || -z "${native_min_exact_match}" ]]; then
   exit 2
 fi
 
-if (( warm_production_ready && ! runs_explicit )); then
-  runs=3
-fi
-
 default_rc=0
 head_rc=0
 quality_rc=1
@@ -263,6 +311,8 @@ default_cmd=(
   "--production-ready"
   "--runs" "${runs}"
   "--out-dir" "${default_dir}"
+  "--max-zig-python-warm-step-ratio-median" "1.0"
+  "--max-zig-python-warm-step-ratio-any-run" "1.10"
 )
 head_cmd=(
   "${script_dir}/run_gliner2_lora_perf_gate.sh"
@@ -336,120 +386,16 @@ else
 fi
 set -e
 
-python3 - "${out_dir}" "${default_rc}" "${head_rc}" "${quality_rc}" "${native_release_rc}" "${skip_head_opt_in}" "${require_head_opt_in}" <<'PY'
-from __future__ import annotations
-
-import json
-import sys
-from pathlib import Path
-
-out_dir = Path(sys.argv[1])
-default_rc = int(sys.argv[2])
-head_rc = int(sys.argv[3])
-quality_rc = int(sys.argv[4])
-native_release_rc = int(sys.argv[5])
-skip_head_opt_in = bool(int(sys.argv[6]))
-require_head_opt_in = bool(int(sys.argv[7]))
-
-
-def load_summary(path: Path) -> dict | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except json.JSONDecodeError as exc:
-        return {"error": f"invalid json: {exc}"}
-    summary = payload.get("summary")
-    return summary if isinstance(summary, dict) else None
-
-
-default_summary_path = out_dir / "default" / "perf_summary.json"
-head_summary_path = out_dir / "head-mlp-opt-in" / "perf_summary.json"
-quality_path = out_dir / "heldout_quality.json"
-native_release_path = out_dir / "native_full_task_quality.json"
-quality_report = None
-if quality_rc == 0:
-    try:
-        quality_report = json.loads(quality_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-native_release_report = None
-if native_release_rc == 0:
-    try:
-        native_release_report = json.loads(native_release_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-if not isinstance(quality_report, dict):
-    quality_report = None
-if not isinstance(native_release_report, dict):
-    native_release_report = None
-default_summary = load_summary(default_summary_path) if default_rc == 0 else None
-head_summary = load_summary(head_summary_path) if not skip_head_opt_in and head_rc == 0 else None
-default_ready = default_rc == 0 and default_summary is not None and default_summary.get("pass") is True
-quality_ready = quality_rc == 0 and quality_report is not None and quality_report.get("pass") is True
-native_ready = (
-    native_release_rc == 0
-    and native_release_report is not None
-    and native_release_report.get("pass") is True
-)
-head_ready = None if skip_head_opt_in else head_rc == 0 and head_summary is not None and head_summary.get("pass") is True
-head_required_ready = not require_head_opt_in or head_ready is True
-integrity_errors = []
-if default_rc == 0 and not default_ready:
-    integrity_errors.append("cross-runtime parity command returned success without a current passing summary")
-if quality_rc == 0 and not quality_ready:
-    integrity_errors.append("held-out quality command returned success without a current passing report")
-if native_release_rc == 0 and not native_ready:
-    integrity_errors.append("native full-task quality command returned success without a current passing report")
-if not skip_head_opt_in and head_rc == 0 and head_ready is not True:
-    integrity_errors.append("head opt-in command returned success without a current passing summary")
-blockers = []
-if not default_ready:
-    blockers.append("cross-runtime parity gate failed")
-if not quality_ready:
-    blockers.append("held-out full-task quality gate failed or did not run")
-if not native_ready:
-    blockers.append("native held-out full-task quality gate failed or did not run")
-blockers.extend(integrity_errors)
-blockers.extend(
-    [
-        "independently trained upstream/Zig held-out convergence parity is not evaluated",
-        "stock upstream SamplingConfig augmentation, shuffle, and stochastic dropout result parity are not implemented",
-        "U+0130 lowercase expansion and normalization-changing Unicode remain unsupported and fail closed",
-    ]
-)
-if not head_required_ready:
-    blockers.append("required head opt-in gate failed")
-summary = {
-    "cross_runtime_parity_ready": default_ready,
-    "heldout_quality_evaluated": quality_report is not None,
-    "heldout_quality_ready": quality_ready,
-    "native_heldout_full_task_quality_ready": native_ready,
-    "native_full_task_quality_evaluated": native_release_report is not None,
-    "upstream_peft_release_gate_ready": False,
-    "configured_upstream_peft_gate_ready": default_ready and quality_ready and head_required_ready,
-    "quality_policy": "caller_supplied_complete_minima",
-    "deployment_scope": "upstream_peft_and_antfly_native_full_heldout_gliner2_quality",
-    "production_ready": False,
-    "production_readiness_blockers": blockers,
-    "head_opt_in_ready": head_ready,
-    "default_rc": default_rc,
-    "head_opt_in_rc": None if skip_head_opt_in else head_rc,
-    "default_summary_path": str(default_summary_path),
-    "head_opt_in_summary_path": None if skip_head_opt_in else str(head_summary_path),
-    "heldout_quality_path": str(quality_path),
-    "heldout_quality": quality_report,
-    "native_full_task_quality_path": str(native_release_path),
-    "native_full_task_quality": native_release_report,
-    "default_summary": default_summary,
-    "head_opt_in_summary": head_summary,
-}
-out_path = out_dir / "readiness_summary.json"
-out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-print(f"readiness summary: {out_path}")
-if integrity_errors:
-    raise SystemExit(4)
-PY
+"${python_bin}" "${script_dir}/finalize_gliner2_readiness.py" \
+  --out-dir "${out_dir}" \
+  --convergence-summary "${convergence_summary}" \
+  --release-adapter-dir "${release_adapter_dir}" \
+  --default-rc "${default_rc}" \
+  --head-rc "${head_rc}" \
+  --quality-rc "${quality_rc}" \
+  --native-rc "${native_release_rc}" \
+  --skip-head-opt-in "${skip_head_opt_in}" \
+  --require-head-opt-in "${require_head_opt_in}"
 
 if (( default_rc != 0 )); then
   exit "${default_rc}"
@@ -463,5 +409,19 @@ fi
 if (( require_head_opt_in && head_rc != 0 )); then
   exit "${head_rc}"
 fi
-echo "production readiness remains blocked by held-out convergence parity, stock stochastic trace parity, and the fail-closed Unicode subset" >&2
+if "${python_bin}" - "${readiness_report}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if summary.get("production_ready") is not True:
+    for blocker in summary.get("production_readiness_blockers", []):
+        print(f"readiness blocker: {blocker}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  echo "GLiNER2 Zig Metal production readiness: PASS"
+  exit 0
+fi
 exit 3

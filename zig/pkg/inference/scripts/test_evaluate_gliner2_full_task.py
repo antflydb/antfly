@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import unittest
 
-from evaluate_gliner2_full_task import REQUIRED_MINIMA, Scores, parse_minima, schema_and_gold, score_prediction
+from evaluate_gliner2_full_task import (
+    REQUIRED_MINIMA,
+    Scores,
+    normalized_text,
+    parse_minima,
+    schema_and_gold,
+    score_prediction,
+)
 
 
 class FullTaskEvaluationTest(unittest.TestCase):
+    def test_scoring_uses_canonical_release_normalization(self) -> None:
+        self.assertEqual("café worker", normalized_text(" CAFE\u0301\tWORKER "))
+
     def test_perfect_raw_upstream_prediction_scores_every_task_and_count(self) -> None:
         record = {
             "input": "Alice founded Acme in Paris and marked it urgent.",

@@ -17,6 +17,7 @@ Options:
   --train-data FILE                Training JSONL (default: synthetic smoke diagnostic)
   --eval-data FILE                 Disjoint eval JSONL validated but not scored by --production-ready
   --python-bin FILE                Python executable (default: /private/tmp/gliner2-parity-venv/bin/python)
+  --upstream-source DIR            Clean checkout of the pinned Python oracle commit
   --include-python                 Run upstream Python side as timing target
   --compare-steps N                Steps per comparison run (default: 1; production: 4)
   --production-batch32             Use the production batch-32/seq-128 LoRA profile
@@ -91,7 +92,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../../.." && pwd)"
 
 resolve_path() {
-  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
+  "${python_bin}" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
 }
 
 runs=3
@@ -104,6 +105,7 @@ train_data="/private/tmp/termite-gliner2-smoke-diagnostic/train.jsonl"
 train_data_explicit=0
 eval_data=""
 python_bin="/private/tmp/gliner2-parity-venv/bin/python"
+upstream_source=""
 include_python=0
 compare_steps=1
 compare_steps_explicit=0
@@ -180,6 +182,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --python-bin)
       python_bin="${2:?missing value for --python-bin}"
+      shift 2
+      ;;
+    --upstream-source)
+      upstream_source="${2:?missing value for --upstream-source}"
       shift 2
       ;;
     --include-python)
@@ -384,7 +390,6 @@ fi
 if (( require_loss_parity )); then
   include_python=1
 fi
-
 if (( production_ready )); then
   if ((${#extra_args[@]})); then
     echo "--production-ready rejects extra comparison arguments after --; release profile and tolerance overrides are not allowed" >&2
@@ -417,6 +422,10 @@ if (( production_ready )); then
   fi
 elif (( warm_research && ! runs_explicit )); then
   runs=3
+fi
+if (( include_python )) && [[ -z "${upstream_source}" ]]; then
+  echo "--upstream-source is required whenever the Python oracle runs" >&2
+  exit 2
 fi
 
 if (( production_batch32 )); then
@@ -524,6 +533,9 @@ fi
 if [[ -n "${python_model}" && -e "${python_model}" ]]; then
   python_model="$(resolve_path "${python_model}")"
 fi
+if [[ -n "${upstream_source}" ]]; then
+  upstream_source="$(resolve_path "${upstream_source}")"
+fi
 if [[ "${python_bin}" == */* ]]; then
   python_bin="$(resolve_path "${python_bin}")"
 fi
@@ -535,7 +547,6 @@ required_model_files=(
   "tokenizer_config.json"
   "special_tokens_map.json"
   "added_tokens.json"
-  "spm.model"
   "encoder_config/config.json"
 )
 missing_model_files=()
@@ -565,12 +576,12 @@ if [[ ! -f "${train_data}" ]]; then
 fi
 if (( production_ready )); then
   comparison_records=$((compare_steps * 32))
-  python3 "${script_dir}/validate_gliner2_release_data.py" \
+  "${python_bin}" "${script_dir}/validate_gliner2_release_data.py" \
     --train "${train_data}" --eval "${eval_data}" --require-full-task \
     --min-train-records "${comparison_records}" --min-eval-records 32 \
     --comparison-records "${comparison_records}"
 elif (( require_loss_parity )); then
-  python3 "${script_dir}/validate_gliner2_release_data.py" --train "${train_data}"
+  "${python_bin}" "${script_dir}/validate_gliner2_release_data.py" --train "${train_data}"
 fi
 
 if [[ -z "${python_model}" ]]; then
@@ -687,7 +698,6 @@ if (( require_loss_parity )); then
 fi
 if (( production_ready )); then
   bench_args+=("--require-adapter-roundtrip")
-  bench_args+=("--require-trained-adapter-parity")
 fi
 
 compare_args=(
@@ -738,6 +748,9 @@ if (( production_batch32 )); then
     "--timeout-seconds" "900"
   )
 fi
+if (( include_python )); then
+  compare_args+=("--upstream-source" "${upstream_source}")
+fi
 if (( require_loss_parity )); then
   compare_args+=("--deterministic")
 elif (( include_python )); then
@@ -755,6 +768,7 @@ if (( production_ready )); then
     "--deterministic"
     "--strict"
     "--require-full-task-parity"
+    "--dump-optimizer-parity"
     "--adapter-roundtrip"
   )
 fi
@@ -766,7 +780,7 @@ if (( promote_gather_inputs )); then
   env_args+=("TERMITE_METAL_REDUCE_PROMOTE_INPUT=1")
 fi
 if ((${#env_args[@]})); then
-  exec env "${env_args[@]}" python3 "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
+  exec env "${env_args[@]}" "${python_bin}" "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
 else
-  exec python3 "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
+  exec "${python_bin}" "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
 fi

@@ -309,7 +309,11 @@ fn relScoreGatherEnabled() bool {
 // numbers), so do NOT disable the fused path for Metal training/inference at
 // seq>=128. Left as an escape hatch for native-backend diagnosis; keep the
 // default (fused) in production.
-fn fusedDisentangledAttentionEnabled() bool {
+/// Returns the effective fused-attention setting used by this graph builder.
+///
+/// Production callers use this to fail closed before selecting Metal for
+/// sequence lengths where the debug-only legacy path is known to be incorrect.
+pub fn fusedDisentangledAttentionEnabledForProduction() bool {
     if (@import("builtin").target.cpu.arch.isWasm()) return false;
     return platform.env.getenvBoolDefault("TERMITE_DEBERTA_FUSED_ATTENTION", true);
 }
@@ -708,7 +712,7 @@ fn encoderLayer(
     // P2C: Q_r[qi-ki+S-1] · K_c (position-to-content)
     //
     // scores = (C2C + C2P + P2C) / sqrt(3 * head_dim) + attn_bias
-    const attn_merged = if (fusedDisentangledAttentionEnabled()) blk: {
+    const attn_merged = if (fusedDisentangledAttentionEnabledForProduction()) blk: {
         // Single fused kernel over the [batch*seq, H] content projections and
         // the [num_rel, H] relative projections. Inputs are packed to fit the
         // 4-slot node: qkv_packed = [Q;K;V] ([3*total, H]),

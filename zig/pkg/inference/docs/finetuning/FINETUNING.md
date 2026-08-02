@@ -221,14 +221,14 @@ validation, LoRA bundle inspection, fixed-text semantic eval against the
 reloaded adapter, and optional materialization. Use `--dry-run
 --skip-semantic-eval` to verify build wiring without local model/data files.
 
-The authoritative cross-runtime release-readiness gate additionally requires
-deterministic multi-step full-task loss parity and an exact same-artifact
-adapter round-trip. It records independently trained Python/Zig one-step
-adapter deltas as a diagnostic, not a correctness gate: cancellation-sensitive
-near-zero encoder gradients can have different signs across frameworks and
-Adam amplifies those signs even when the forward objective agrees. A production
-claim still requires independently trained held-out convergence/result parity,
-which remains an explicit blocker in the generated readiness report:
+The authoritative Zig/Metal release-readiness gate additionally requires
+deterministic multi-step full-task loss/update parity, an exact same-artifact
+adapter round-trip, repeated production-shape performance, and a current
+five-seed Python/Zig convergence summary. Independently trained tensor equality
+is diagnostic only: cancellation-sensitive near-zero gradients can have
+different signs across frameworks even when the objective agrees. Deployment
+quality is instead gated statistically on held-out metrics. Python is the
+pinned oracle and timing baseline, not a production runtime dependency:
 
 ```sh
 scripts/run_gliner2_lora_production_readiness.sh \
@@ -237,7 +237,9 @@ scripts/run_gliner2_lora_production_readiness.sh \
   --release-adapter-dir /runs/gliner2-release-adapter \
   --train-data /data/gliner2_full_task_train.jsonl \
   --eval-data /data/gliner2_full_task_eval.jsonl \
+  --python-bin /usr/local/bin/python3.12 \
   --upstream-source /src/GLiNER2 \
+  --convergence-summary /runs/gliner2-convergence-summary.json \
   --heldout-min entities.micro_f1=0.80 \
   --heldout-min entities.exact_match=0.80 \
   --heldout-min classifications.micro_f1=0.80 \
@@ -256,7 +258,14 @@ evaluation rows, and non-empty entity, classification, JSON, and relation
 annotations inside the exact bounded training slice used by both runtimes.
 The separately supplied release adapter must contain its Zig training manifest;
 the gate verifies that its SHA-256 training-data and base-model fingerprints
-match these exact inputs. Release provenance also requires `--max-examples 0`,
+match these exact inputs. The base-model fingerprint hashes a fixed, ordered
+list of files in `--model-dir`. Most are required and a missing one aborts the
+run with `RequiredFingerprintFileMissing`; `spm.model` is optional because the
+stock `fastino/gliner2-base-v1` snapshot does not ship it and nothing reads it
+for tokenization. An optional file is hashed when present and hashed as an
+explicit "absent" marker when it is not, so present and absent snapshots never
+share a fingerprint, and a snapshot that does ship the file keeps the digest it
+had before the entry became optional. Release provenance also requires `--max-examples 0`,
 `--max-steps 0`, exact completion of every requested epoch and microbatch or a
 mathematically valid recorded early stop,
 no drop-last training records, a batch/accumulation shape that does not trigger
@@ -277,12 +286,10 @@ requires the same nine caller-supplied floors and positive task coverage;
 missing coverage, unsupported relation fields, decode errors, or scores below
 a floor fail closed. The report keeps the number of entity-bearing records
 separate from the total held-out record count.
-`production_ready` remains false while the other listed production-parity
-blockers remain, even when both full-task quality gates pass.
-The report intentionally keeps
-`upstream_peft_release_gate_ready = false`; the narrower
-`configured_upstream_peft_gate_ready` field does not claim a universal run-count
-or quality-floor policy.
+`production_ready` becomes true only when deterministic parity/performance,
+the pinned-oracle and Zig-native quality gates, five-seed convergence, and
+cross-report model/train/eval fingerprints all pass. Missing, stale, or
+inconsistent evidence remains an explicit blocker in the generated report.
 Training batching and partial accumulation match the pinned upstream trainer:
 datasets no larger than the requested batch use one reduced batch, larger
 datasets drop their final partial batch, and a partial accumulation flush keeps
@@ -293,7 +300,10 @@ backward batches, while `optimizer_steps` is the upstream global-step count and
 is what `--min-steps` release thresholds enforce.
 Upstream's public relation decoder returns only `head` and `tail`; held-out
 records with additional relation fields are rejected rather than partially
-scored. Exact atoms use Unicode NFC, collapsed whitespace, and case folding.
+scored. Exact atoms use the versioned
+`unicode_nfc_collapsed_whitespace_casefold/v1` contract. Python applies the
+complete normalization; Zig admits the proven Unicode 15 NFC-inert,
+single-scalar-casefold subset and fails closed outside it.
 Exact cross-runtime result parity is currently an augmentation-free,
 deterministic-core contract. The harness disables Python encoder/count-
 transformer dropout, LoRA dropout, negative-span masking, SamplingConfig data
@@ -315,14 +325,20 @@ deterministic form the Zig data pipeline always emits.
 gates. Stock upstream's stochastic conditioning selection remains part of the
 sampling-parity limitation above.
 
-2026-07-17 parity review notes (vs fastino-ai/GLiNER2 `31c8aba`):
+Parity review notes (vs the frozen fastino-ai/GLiNER2 oracle
+`8f3fc399bcc5a00749a62a1565e5c6529f04b574`):
 
 - LR schedule with `--grad-accum N > 1` now matches upstream: the schedule
-  horizon and warmup use upstream's floor-based
-  `len(train_loader) // grad_accum` (clamped >= 1) per epoch while the
-  execution plan keeps the ceil-based count, so end-of-epoch partial flushes
-  run at LR 0 exactly as upstream's flush steps do (weight no-ops on both
-  sides).
+  horizon, the warmup, *and* the optimizer-step target all use upstream's
+  floor-based `len(train_loader) // grad_accum` (clamped >= 1) per epoch.
+  Upstream's `_flush_gradients` advances `global_step` and the scheduler like
+  any other step and both training loops break on `global_step >= max_steps`,
+  so upstream stops at that horizon and completes fewer than `--epochs` data
+  passes whenever `len(train_loader) % grad_accum != 0`. The trainer prints a
+  warning when that happens. Running the extra end-of-epoch flushes instead
+  would not be equivalent even at LR 0: an AdamW step still advances the
+  moments and the per-parameter step counter, and it consumes data upstream
+  never sees.
 - `GlinerAutodiffConfig` struct defaults are now the upstream-parity values
   (`span_start_positive_weight=1.0`, `span_start_loss_reduction=.sum`); the
   previous 32.0/`.mean` defaults survived only for callers that bypassed the
@@ -341,7 +357,8 @@ sampling-parity limitation above.
 Same-day end-to-end run of every gate (bundle rebuilt from the HF cache)
 surfaced and fixed three further defects the gates had never executed:
 
-- Optimizer step gating now mirrors PyTorch's grad-presence semantics:
+- Optimizer step gating now mirrors PyTorch's grad-presence semantics on both
+  host and device optimizer paths:
   upstream leaves `grad=None` for head modules whose task family is absent
   from a batch (no Adam state advance, no decoupled decay), while the Zig
   graph always produced zero-valued grads and stepped everything. The trainer
@@ -351,10 +368,9 @@ surfaced and fixed three further defects the gates had never executed:
   gliner2-total-loss CLI registers `classifier.`, `count_pred.`,
   `span_rep.`, and `count_embed.` and marks presence from each micro-batch's
   task ids. The multi-step gate's per-parameter Adam step counts now match
-  exactly. Residuals: gating applies to the host optimizer path (the device/
-  Metal optimizer steps its full enrolled set), and presence is family-level
-  (a structure task with gold count 0 still marks its family; upstream would
-  leave those grads unset).
+  exactly. Presence is family-level (a structure task with gold count 0 marks
+  its family), and absent device families have their accumulated gradients
+  zeroed and skip their Adam step/decay.
 - `--require-full-task-parity` slice-coverage checks required every task
   family in the compared slice unconditionally, which no single-family
   fixture could satisfy; they now require only the families present in the
@@ -373,10 +389,10 @@ Python torch-CPU ≈ 0.2 s/step, Zig native ≈ 15 s/step (the correctness
 reference, not a performance target), Zig Metal ≈ 0.55 s/step; the
 performance target remains the Metal backend at production shapes
 (`run_gliner2_lora_perf_gate.sh`, warm-step median ≤ 1.0× Python at
-batch 32/seq 128). A 5-step data-cycling probe showed ~0.5% relative loss
-drift on a high-loss batch revisit — inside the multi-step gate's lr-scaled
-bound, beyond the single-step 1e-4 tolerance; characterizing that drift
-growth is what the pending multi-seed convergence study is for.
+batch 32/seq 128). Historical short probes are diagnostic only; the production
+wrapper now requires exactly five paired independent seeds, all deployment
+floors, at most 0.02 mean Zig metric deficit, and at most 0.05 deficit in any
+paired run.
 
 Accepted, deliberately not "fixed":
 
@@ -395,8 +411,9 @@ Accepted, deliberately not "fixed":
   (`flat = start_word * max_span_width + (end - start)`) is the intended
   tightening once the Python dump's span serialization (single `[s,e]` vs
   list-of-subspans) is pinned against a live run.
-- The Python parity gates and all Metal tests still run in no CI job (no
-  provisioned macOS test runner); this remains the largest untested surface.
+- CI runs the Python release-contract tests under Python 3.12 and requires the
+  native/Metal per-parameter gradient gate on a macOS runner. Real-model
+  performance and five-seed quality remain artifact-driven release jobs.
 The native trainer supports recoverable optimizer checkpoints at complete
 epoch boundaries with `--checkpoint-every-epochs`, and exact-run resume with
 `--resume-checkpoint`. Checkpoints include trainable weights, Adam moments,
@@ -440,7 +457,8 @@ that can participate as the second half of canonical composition; U+2581 and
 U+FFFD; leading, trailing, or repeated ASCII spaces; and emoji sequences
 containing marks or joiners fail closed. Regenerate and exhaustively verify the
 scalar/category/context tables with
-`python3 scripts/generate_gliner2_unicode_tables.py --check` under Python 3.12.
+`python3.12 scripts/generate_gliner2_unicode_tables.py --write` and verify with
+`python3.12 scripts/generate_gliner2_unicode_tables.py --check`.
 With the pinned model available, add
 `--tokenizer-json <model_dir>/tokenizer.json` to verify the normalizer shape,
 charsmap fingerprint, and every admitted scalar against the real tokenizer.

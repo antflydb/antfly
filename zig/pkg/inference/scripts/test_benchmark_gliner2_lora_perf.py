@@ -66,6 +66,33 @@ class BenchmarkGateTest(unittest.TestCase):
                     benchmark.main()
                 run.assert_not_called()
 
+    def test_independently_trained_tensor_equality_is_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = {
+                "run": 1,
+                "returncode": 0,
+                "elapsed_seconds": 0.0,
+                "argv": [],
+                "report_path": "unused",
+                "summary": {
+                    "step_count_valid": True,
+                    "trained_adapter_parity_ran": True,
+                    "trained_adapter_parity_ok": False,
+                },
+                "output_tail": "",
+            }
+            argv = ["benchmark", "--runs", "1", "--out-dir", tmp, "--", "--skip-python"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(benchmark, "run_compare", return_value=result),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(0, benchmark.main())
+            report = json.loads((Path(tmp) / "perf_summary.json").read_text(encoding="utf-8"))
+            diagnostic = report["summary"]["trained_adapter_tensor_equality_diagnostic"]
+            self.assertFalse(diagnostic["gating"])
+            self.assertEqual(0, diagnostic["within_diagnostic_tolerance_count"])
+
 
 if __name__ == "__main__":
     unittest.main()

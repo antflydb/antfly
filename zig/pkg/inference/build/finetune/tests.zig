@@ -43,6 +43,13 @@ const tests = [_]common.TestSpec{
         .native_link = .default,
     },
     .{
+        .step_name = "test-gliner2-backend-grad-parity",
+        .root_source_file = "src/finetune/test/test_gliner2_backend_grad_parity.zig",
+        .description = "Run GLiNER2 native/Metal per-parameter gradient parity gates",
+        .imports = &.{ .antfly_platform, .build_options, .ml, .inference_internal },
+        .native_link = .default,
+    },
+    .{
         .step_name = "test-gliner2-real-training",
         .root_source_file = "src/finetune/test/test_gliner2_real_training.zig",
         .description = "Run optional real-model GLiNER2 full-encoder LoRA training tests",
@@ -54,6 +61,13 @@ const tests = [_]common.TestSpec{
         .root_source_file = "src/finetune/test/test_gliner2_run_validation.zig",
         .description = "Run GLiNER2 autodiff training artifact and metrics validation tests",
         .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+    },
+    .{
+        .step_name = "test-gliner2-recipe",
+        .root_source_file = "src/finetune/test/test_gliner2_recipe.zig",
+        .description = "Run focused GLiNER2 finetune recipe lifecycle tests",
+        .imports = &.{.inference_internal},
         .native_link = .default,
     },
     .{

@@ -18,12 +18,35 @@ fn validateSkipTestFilter(value: []const u8) error{EmptySkipTestFilter}!void {
     if (value.len == 0) return error.EmptySkipTestFilter;
 }
 
+fn isTestRunnerOption(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--test-filter") or
+        std.mem.startsWith(u8, arg, "--test-filter=") or
+        std.mem.eql(u8, arg, "--skip-test-filter") or
+        std.mem.startsWith(u8, arg, "--skip-test-filter=") or
+        std.mem.startsWith(u8, arg, "--seed=") or
+        std.mem.startsWith(u8, arg, "--cache-dir=") or
+        std.mem.eql(u8, arg, "--listen=-");
+}
+
+fn containsNonTestOption(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--") and !isTestRunnerOption(arg)) return true;
+    }
+    return false;
+}
+
 pub fn select(
     alloc: std.mem.Allocator,
     args: []const []const u8,
     default_filters: []const []const u8,
 ) []const []const u8 {
     if (args.len == 0) return default_filters;
+
+    // Build arguments after `--` are global to the entire build graph. A run
+    // step such as `finetune` may therefore supply application options while
+    // the test steps are being configured. Keep accepting legacy positional
+    // test filters only when the argument list contains no foreign option.
+    const accept_positional_filters = !containsNonTestOption(args);
 
     var filters = std.ArrayListUnmanaged([]const u8).empty;
     filters.ensureTotalCapacity(alloc, args.len) catch @panic("OOM");
@@ -53,9 +76,7 @@ pub fn select(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             // Runtime-only controls do not participate in compile reachability.
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            @panic("unsupported test runner argument");
-        } else {
+        } else if (!std.mem.startsWith(u8, arg, "--") and accept_positional_filters) {
             filters.appendAssumeCapacity(arg);
         }
         i += 1;
@@ -97,8 +118,6 @@ pub fn addRuntimeControls(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             run.addArg(arg);
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            @panic("unsupported test runner argument");
         }
         i += 1;
     }
@@ -127,4 +146,27 @@ test "select accepts repeated filters and ignores runtime controls" {
 test "empty skip filters are rejected before compiling a zero-test selection" {
     try std.testing.expectError(error.EmptySkipTestFilter, validateSkipTestFilter(""));
     try validateSkipTestFilter("known flaky test");
+}
+
+test "application options do not become test filters" {
+    const filters = select(
+        std.testing.allocator,
+        &.{ "workflow", "gliner2-production", "--help" },
+        &.{"default"},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("default", filters[0]);
+}
+
+test "foreign options do not suppress explicit test filters" {
+    const filters = select(
+        std.testing.allocator,
+        &.{ "--help", "--test-filter", "GLiNER2 parity" },
+        &.{"default"},
+    );
+    defer std.testing.allocator.free(filters);
+
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("GLiNER2 parity", filters[0]);
 }

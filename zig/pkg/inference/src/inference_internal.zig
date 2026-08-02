@@ -70,6 +70,7 @@ pub const finetune = struct {
     pub const fused_chunker_train = @import("finetune/fused_chunker_train.zig");
     pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
     pub const peft = @import("finetune/peft.zig");
+    pub const recipe = @import("finetune/recipe.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
 pub const architectures = struct {

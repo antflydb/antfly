@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
 
     var out_dir: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
     var require_loss_decrease = false;
     var min_supervised_tokens_per_second: ?f64 = null;
     var max_avg_step_wall_ms: ?f64 = null;
@@ -318,6 +319,12 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArguments;
             };
             max_runtime_frame_ineligible_missing_model_metadata = try std.fmt.parseUnsigned(u64, value, 10);
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            out_path = args.next() orelse {
+                std.debug.print("error: missing value for {s}\n", .{arg});
+                printUsage();
+                return error.InvalidArguments;
+            };
         } else if (out_dir == null) {
             out_dir = arg;
         } else {
@@ -374,6 +381,15 @@ pub fn main(init: std.process.Init) !void {
     defer validation.freeRunValidationSummary(allocator, &summary);
 
     const io = init.io;
+    if (out_path) |path| {
+        if (std.fs.path.dirname(path)) |parent| {
+            if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
+        }
+        const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
+        defer allocator.free(rendered);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rendered });
+        return;
+    }
     const stdout = std.Io.File.stdout();
     var buf: [4096]u8 = undefined;
     var writer = stdout.writer(io, &buf);
@@ -384,7 +400,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: validate-gliner2-autodiff-run <out_dir> [--require-loss-decrease] [--min-supervised-tokens-per-second <f64>] [--max-avg-step-wall-ms <f64>] [--max-total-execute-ms <f64>] [--max-peak-resident-bytes <n>] [--max-metal-eager-arena-peak-bytes <n>] [--max-metal-eager-arena-spill-bytes <n>] [--max-metal-chunk-local-output-peak-bytes <n>] [--max-metal-chunk-local-output-spill-bytes <n>] [--max-metal-chunk-local-output-unconsumed-hints <n>] [--min-metal-chunk-local-output-consumed-hints <n>] [--min-examples <n>] [--min-steps <n>] [--min-entity-labels <n>] [--min-supervised-tokens <n>] [--min-entity-tokens <n>] [--max-graph-command-dispatch-count <n>] [--max-graph-host-output-count <n>] [--max-metal-frame-gpu-ms <f64>] [--max-metal-last-frame-compute-encoder-count <n>] [--min-metal-frame-chunk-boundary-count <n>] [--min-metal-frame-chunk-promoted-value-count <n>] [--min-metal-frame-chunk-swept-value-count <n>] [--min-graph-runtime-region-dispatch-count <n>] [--max-graph-runtime-region-fallback-count <n>] [--min-graph-runtime-region-elided-node-count <n>] [--min-metal-deberta-ffn-forward-region-count <n>] [--min-metal-deberta-encoder-lora-layer-region-count <n>] [--min-metal-deberta-encoder-lora-residual-layernorm-region-count <n>] [--max-metal-deberta-encoder-lora-layer-scaffold-count <n>] [--max-metal-deberta-encoder-lora-layer-fallback-count <n>] [--min-metal-deberta-attention-flash-call-count <n>] [--max-metal-deberta-attention-gemm-fallback-count <n>] [--min-metal-deberta-encoder-layer-success-count <n>] [--min-metal-deberta-ffn-fused-call-count <n>] [--max-metal-deberta-ffn-fused-fallback-count <n>] [--max-runtime-frame-ineligible-missing-model-metadata <n>]
+        \\usage: validate-gliner2-autodiff-run <out_dir> [--out <report.json>] [--require-loss-decrease] [--min-supervised-tokens-per-second <f64>] [--max-avg-step-wall-ms <f64>] [--max-total-execute-ms <f64>] [--max-peak-resident-bytes <n>] [--max-metal-eager-arena-peak-bytes <n>] [--max-metal-eager-arena-spill-bytes <n>] [--max-metal-chunk-local-output-peak-bytes <n>] [--max-metal-chunk-local-output-spill-bytes <n>] [--max-metal-chunk-local-output-unconsumed-hints <n>] [--min-metal-chunk-local-output-consumed-hints <n>] [--min-examples <n>] [--min-steps <n>] [--min-entity-labels <n>] [--min-supervised-tokens <n>] [--min-entity-tokens <n>] [--max-graph-command-dispatch-count <n>] [--max-graph-host-output-count <n>] [--max-metal-frame-gpu-ms <f64>] [--max-metal-last-frame-compute-encoder-count <n>] [--min-metal-frame-chunk-boundary-count <n>] [--min-metal-frame-chunk-promoted-value-count <n>] [--min-metal-frame-chunk-swept-value-count <n>] [--min-graph-runtime-region-dispatch-count <n>] [--max-graph-runtime-region-fallback-count <n>] [--min-graph-runtime-region-elided-node-count <n>] [--min-metal-deberta-ffn-forward-region-count <n>] [--min-metal-deberta-encoder-lora-layer-region-count <n>] [--min-metal-deberta-encoder-lora-residual-layernorm-region-count <n>] [--max-metal-deberta-encoder-lora-layer-scaffold-count <n>] [--max-metal-deberta-encoder-lora-layer-fallback-count <n>] [--min-metal-deberta-attention-flash-call-count <n>] [--max-metal-deberta-attention-gemm-fallback-count <n>] [--min-metal-deberta-encoder-layer-success-count <n>] [--min-metal-deberta-ffn-fused-call-count <n>] [--max-metal-deberta-ffn-fused-fallback-count <n>] [--max-runtime-frame-ineligible-missing-model-metadata <n>]
         \\example: validate-gliner2-autodiff-run /tmp/gliner2-run --require-loss-decrease --min-supervised-tokens-per-second 10 --max-avg-step-wall-ms 1000 --max-total-execute-ms 50000 --max-peak-resident-bytes 2000000000 --min-examples 100 --min-steps 100 --min-entity-labels 2 --min-supervised-tokens 1000 --min-entity-tokens 100
         \\
         \\Validates a train-gliner2-autodiff output directory containing:

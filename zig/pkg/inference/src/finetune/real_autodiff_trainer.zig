@@ -61,6 +61,15 @@ const metal_compute = if (build_options.enable_metal) @import("../ops/metal_comp
             tensor: CT,
             elem_count: usize,
         };
+        pub const TrainingAdamWBatchInput = struct {
+            weight: CT,
+            grad: CT,
+            m: CT,
+            v: CT,
+            elem_count: usize,
+            bias_correction1: f32,
+            bias_correction2: f32,
+        };
     };
 };
 const training = @import("../graph/training.zig");
@@ -566,6 +575,11 @@ pub const RealAutodiffTrainer = struct {
         block_id: ?grad_residency.GradBlockId = null,
         /// True once the block has been registered with the coordinator.
         block_registered: bool = false,
+        /// Optimizer steps this parameter actually took. Mirrors the host
+        /// `optimizers.ParamState.step_count`, which conditional-family gating
+        /// leaves behind the global optimizer step, and drives the device
+        /// AdamW bias correction.
+        adam_step_count: u32 = 0,
         device: ?DeviceOptimizerSlot = null,
     };
 
@@ -1099,6 +1113,26 @@ pub const RealAutodiffTrainer = struct {
         }
     }
 
+    /// Step one enrolled trainable on the host optimizer. Parameters whose
+    /// module produced gradients this window step even when those gradients are
+    /// exactly zero (e.g. LoRA-A at step 0, where grad_A ∝ B=0): PyTorch
+    /// advances the per-parameter step and applies decoupled weight decay
+    /// whenever `p.grad` EXISTS. Modules absent from the loss graph for the
+    /// whole window — registered conditional families with no matching batch
+    /// task — keep `grad=None` upstream, so they get no step and no decay.
+    fn stepHostAdamWSlot(
+        self: *RealAutodiffTrainer,
+        config: optimizers.Optimizer,
+        slot: *ParamSlot,
+        learning_rate: f32,
+    ) !void {
+        if (!self.optimizerFamilyAbsent(slot.name)) {
+            try optimizers.step(config, &self.optimizer_state, learning_rate, slot.name, slot.weights, slot.grad_accum);
+            slot.adam_step_count += 1;
+        }
+        @memset(slot.grad_accum, 0);
+    }
+
     /// upstream trainer: every micro-batch was divided by the configured
     /// accumulation count, and a partial flush keeps that divisor.
     pub fn flushAccumulatedGradients(self: *RealAutodiffTrainer) !?FlushResult {
@@ -1134,22 +1168,8 @@ pub const RealAutodiffTrainer = struct {
             }
 
             const optimizer = optimizers.Optimizer{ .adamw = self.config.optimizer };
-            for (self.lora_params.items) |*slot| {
-                if (self.optimizerFamilyAbsent(slot.name)) {
-                    @memset(slot.grad_accum, 0);
-                    continue;
-                }
-                try optimizers.step(optimizer, &self.optimizer_state, learning_rate, slot.name, slot.weights, slot.grad_accum);
-                @memset(slot.grad_accum, 0);
-            }
-            for (self.regular_params.items) |*slot| {
-                if (self.optimizerFamilyAbsent(slot.name)) {
-                    @memset(slot.grad_accum, 0);
-                    continue;
-                }
-                try optimizers.step(optimizer, &self.optimizer_state, learning_rate, slot.name, slot.weights, slot.grad_accum);
-                @memset(slot.grad_accum, 0);
-            }
+            for (self.lora_params.items) |*slot| try self.stepHostAdamWSlot(optimizer, slot, learning_rate);
+            for (self.regular_params.items) |*slot| try self.stepHostAdamWSlot(optimizer, slot, learning_rate);
         }
 
         self.optimizer_step_count += 1;
@@ -1602,54 +1622,11 @@ pub const RealAutodiffTrainer = struct {
                         profile.optimizer_backend = self.deviceOptimizerBackend();
                     } else {
                         const opt_config = optimizers.Optimizer{ .adamw = self.config.optimizer };
-                        // Step every enrolled trainable whose module produced
-                        // gradients this window — including exactly-zero
-                        // gradients (e.g. LoRA-A at step 0, where grad_A ∝
-                        // B=0): PyTorch advances the per-param step and applies
-                        // decoupled weight decay whenever `p.grad` EXISTS, even
-                        // when it is all-zero. Modules absent from the loss
-                        // graph for the whole window (registered conditional
-                        // families with no matching batch task) keep
-                        // `grad=None` upstream — no step, no decay — so they
-                        // are skipped here.
-                        for (self.lora_params.items) |*slot| {
-                            if (self.optimizerFamilyAbsent(slot.name)) {
-                                @memset(slot.grad_accum, 0);
-                                continue;
-                            }
-                            try optimizers.step(
-                                opt_config,
-                                &self.optimizer_state,
-                                learning_rate,
-                                slot.name,
-                                slot.weights,
-                                slot.grad_accum,
-                            );
-                            @memset(slot.grad_accum, 0);
-                        }
-                        for (self.regular_params.items) |*slot| {
-                            if (self.optimizerFamilyAbsent(slot.name)) {
-                                @memset(slot.grad_accum, 0);
-                                continue;
-                            }
-                            try optimizers.step(
-                                opt_config,
-                                &self.optimizer_state,
-                                learning_rate,
-                                slot.name,
-                                slot.weights,
-                                slot.grad_accum,
-                            );
-                            @memset(slot.grad_accum, 0);
-                        }
+                        for (self.lora_params.items) |*slot| try self.stepHostAdamWSlot(opt_config, slot, learning_rate);
+                        for (self.regular_params.items) |*slot| try self.stepHostAdamWSlot(opt_config, slot, learning_rate);
                     }
                     self.optimizer_step_count += 1;
                     self.accum_count = 0;
-                    // Note: the device-optimizer branch above steps its full
-                    // enrolled set on-device; conditional-family gating is a
-                    // host-path contract (the native parity gates). Window
-                    // presence still resets so host/device runs stay aligned
-                    // per optimizer step.
                     self.resetOptimizerFamilyWindow();
                     stepped = true;
                 }
@@ -1779,10 +1756,24 @@ pub const RealAutodiffTrainer = struct {
             if (weights.len != slot.weights.len or moments.m.len != slot.weights.len or moments.v.len != slot.weights.len) {
                 return error.CheckpointSizeMismatch;
             }
+            const adam_step = try self.allocTrainingStateScalar(owned_data, slot.adam_step_count);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "weight", slot.name, weights);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_m", slot.name, moments.m);
             try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_v", slot.name, moments.v);
+            try appendTrainingStateTensor(self.allocator, tensors, names, shapes, "adam_step", slot.name, adam_step);
         }
+    }
+
+    fn allocTrainingStateScalar(
+        self: *RealAutodiffTrainer,
+        owned_data: *std.ArrayListUnmanaged([]f32),
+        value: u32,
+    ) ![]f32 {
+        const values = try self.allocator.alloc(f32, 1);
+        errdefer self.allocator.free(values);
+        values[0] = @floatFromInt(value);
+        try owned_data.append(self.allocator, values);
+        return values;
     }
 
     fn downloadTrainingStateTensor(
@@ -1808,7 +1799,12 @@ pub const RealAutodiffTrainer = struct {
             const state = try self.optimizer_state.getOrCreate(slot.name, slot.weights.len, true);
             try readTrainingStateTensor(self.allocator, reader, "adam_m", slot.name, state.m);
             try readTrainingStateTensor(self.allocator, reader, "adam_v", slot.name, state.v);
-            state.step_count = @intCast(optimizer_steps);
+            // Checkpoints written before per-slot Adam step counts existed only
+            // carry the global optimizer step; that is the correct value for
+            // every parameter that never sat out a step.
+            const adam_step = try readTrainingStateStep(self.allocator, reader, slot.name) orelse @as(u32, @intCast(optimizer_steps));
+            state.step_count = adam_step;
+            slot.adam_step_count = adam_step;
         }
     }
 
@@ -2265,64 +2261,102 @@ pub const RealAutodiffTrainer = struct {
         };
     }
 
-    fn stepDeviceAdamW(self: *RealAutodiffTrainer, lr: f32, grad_scale: f32) !void {
+    /// Where one device AdamW step reads each parameter's gradient from.
+    pub const DeviceAdamWGradSource = union(enum) {
+        /// The slot's own device accumulator, filled over the window.
+        accumulated,
+        /// Per-parameter gradients produced directly by a compiled step.
+        step_result: *const training.TrainStepResult,
+    };
+
+    /// Build the device AdamW batch for one optimizer step and advance the
+    /// Adam step count of every slot that takes part. Parameters whose
+    /// conditional family never appeared in the accumulation window are left
+    /// out entirely — upstream those modules keep `grad=None`, so
+    /// `optimizer.step()` applies no update, no decoupled decay and no moment
+    /// decay to them. Touches no device state, so the gating and the per-slot
+    /// bias correction stay testable without a Metal device; the caller clears
+    /// the excluded slots' accumulators.
+    fn buildDeviceAdamWBatch(
+        self: *RealAutodiffTrainer,
+        grad_source: DeviceAdamWGradSource,
+    ) ![]metal_compute.MetalCompute.TrainingAdamWBatchInput {
+        var batch = try std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput).initCapacity(
+            self.allocator,
+            self.lora_params.items.len + self.regular_params.items.len,
+        );
+        errdefer batch.deinit(self.allocator);
+        try self.appendDeviceAdamWBatchSlots(&batch, self.lora_params.items, grad_source);
+        try self.appendDeviceAdamWBatchSlots(&batch, self.regular_params.items, grad_source);
+        return batch.toOwnedSlice(self.allocator);
+    }
+
+    fn appendDeviceAdamWBatchSlots(
+        self: *RealAutodiffTrainer,
+        batch: *std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput),
+        slots: []ParamSlot,
+        grad_source: DeviceAdamWGradSource,
+    ) !void {
         const opt = self.config.optimizer;
-        const t: f32 = @floatFromInt(self.optimizer_state.step_count);
-        const bias_correction1 = 1.0 - std.math.pow(f32, opt.beta1, t);
-        const bias_correction2 = 1.0 - std.math.pow(f32, opt.beta2, t);
-        if (self.compute_backend.kind() == .metal) {
-            if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-            const metal = try self.metalCompute();
-            var batch = try std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
-            defer batch.deinit(self.allocator);
-            for (self.lora_params.items) |*slot| {
-                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-                try batch.append(self.allocator, .{
-                    .weight = device.weight,
-                    .grad = device.grad_accum,
-                    .m = device.m,
-                    .v = device.v,
-                    .elem_count = slot.weights.len,
-                });
-            }
-            for (self.regular_params.items) |*slot| {
-                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-                try batch.append(self.allocator, .{
-                    .weight = device.weight,
-                    .grad = device.grad_accum,
-                    .m = device.m,
-                    .v = device.v,
-                    .elem_count = slot.weights.len,
-                });
-            }
-            var frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
-            errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
-            try metal.trainingAdamWManyF32(batch.items, .{
-                .lr = lr,
-                .beta1 = opt.beta1,
-                .beta2 = opt.beta2,
-                .eps = opt.eps,
-                .weight_decay = opt.weight_decay,
-                .bias_correction1 = bias_correction1,
-                .bias_correction2 = bias_correction2,
-                .grad_scale = grad_scale,
+        for (slots) |*slot| {
+            if (self.optimizerFamilyAbsent(slot.name)) continue;
+            const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+            const grad = switch (grad_source) {
+                .accumulated => device.grad_accum,
+                .step_result => |result| result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient,
+            };
+            const t: f32 = @floatFromInt(slot.adam_step_count + 1);
+            batch.appendAssumeCapacity(.{
+                .weight = device.weight,
+                .grad = grad,
+                .m = device.m,
+                .v = device.v,
+                .elem_count = slot.weights.len,
+                .bias_correction1 = 1.0 - std.math.pow(f32, opt.beta1, t),
+                .bias_correction2 = 1.0 - std.math.pow(f32, opt.beta2, t),
             });
-            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-            return;
         }
-        var frame_active = if (self.compute_backend.kind() == .metal) try self.compute_backend.decoderRuntimeBeginFrame() else false;
-        errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+    }
+
+    /// Advance the per-slot Adam step counters for exactly the slots the batch
+    /// builder admitted. Kept separate from `buildDeviceAdamWBatch` so the
+    /// counters — which are persisted into the checkpoint — can only move after
+    /// the device work they describe has actually landed. Gating is a pure
+    /// function of the accumulation window, which does not change in between.
+    fn commitDeviceAdamWStepCounts(self: *RealAutodiffTrainer) void {
         for (self.lora_params.items) |*slot| {
-            try self.stepDeviceAdamWSlot(slot, lr, grad_scale, bias_correction1, bias_correction2);
+            if (!self.optimizerFamilyAbsent(slot.name)) slot.adam_step_count += 1;
         }
         for (self.regular_params.items) |*slot| {
-            try self.stepDeviceAdamWSlot(slot, lr, grad_scale, bias_correction1, bias_correction2);
+            if (!self.optimizerFamilyAbsent(slot.name)) slot.adam_step_count += 1;
         }
-        if (frame_active) {
-            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-        }
+    }
+
+    fn stepDeviceAdamWBatch(self: *RealAutodiffTrainer, grad_source: DeviceAdamWGradSource, lr: f32, grad_scale: f32) !void {
+        const batch = try self.buildDeviceAdamWBatch(grad_source);
+        defer self.allocator.free(batch);
+        try self.zeroGatedDeviceGradAccum();
+        if (batch.len == 0) return;
+        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+        const metal = try self.metalCompute();
+        const opt = self.config.optimizer;
+        var frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
+        errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+        try metal.trainingAdamWManyF32(batch, .{
+            .lr = lr,
+            .beta1 = opt.beta1,
+            .beta2 = opt.beta2,
+            .eps = opt.eps,
+            .weight_decay = opt.weight_decay,
+            .grad_scale = grad_scale,
+        });
+        try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
+        self.commitDeviceAdamWStepCounts();
+    }
+
+    fn stepDeviceAdamW(self: *RealAutodiffTrainer, lr: f32, grad_scale: f32) !void {
+        return self.stepDeviceAdamWFrom(.accumulated, lr, grad_scale);
     }
 
     fn stepDeviceAdamWFromResult(
@@ -2331,79 +2365,67 @@ pub const RealAutodiffTrainer = struct {
         lr: f32,
         grad_scale: f32,
     ) !void {
+        return self.stepDeviceAdamWFrom(.{ .step_result = result }, lr, grad_scale);
+    }
+
+    fn stepDeviceAdamWFrom(self: *RealAutodiffTrainer, grad_source: DeviceAdamWGradSource, lr: f32, grad_scale: f32) !void {
+        if (self.compute_backend.kind() == .metal) return self.stepDeviceAdamWBatch(grad_source, lr, grad_scale);
+        for (self.lora_params.items) |*slot| try self.stepDeviceAdamWSlotGated(slot, grad_source, lr, grad_scale);
+        for (self.regular_params.items) |*slot| try self.stepDeviceAdamWSlotGated(slot, grad_source, lr, grad_scale);
+    }
+
+    /// Single-slot form of the batched step, for device backends without a
+    /// batched AdamW entry point. Applies the same conditional-family gate and
+    /// the same per-slot bias correction.
+    fn stepDeviceAdamWSlotGated(
+        self: *RealAutodiffTrainer,
+        slot: *ParamSlot,
+        grad_source: DeviceAdamWGradSource,
+        lr: f32,
+        grad_scale: f32,
+    ) !void {
+        if (self.optimizerFamilyAbsent(slot.name)) return self.zeroDeviceGradAccum(slot);
+        const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+        const grad = switch (grad_source) {
+            .accumulated => device.grad_accum,
+            .step_result => |result| result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient,
+        };
         const opt = self.config.optimizer;
-        const t: f32 = @floatFromInt(self.optimizer_state.step_count);
-        const bias_correction1 = 1.0 - std.math.pow(f32, opt.beta1, t);
-        const bias_correction2 = 1.0 - std.math.pow(f32, opt.beta2, t);
-        if (self.compute_backend.kind() == .metal) {
-            if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-            const metal = try self.metalCompute();
-            var batch = try std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
-            defer batch.deinit(self.allocator);
-            for (self.lora_params.items) |*slot| {
-                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-                const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-                try batch.append(self.allocator, .{
-                    .weight = device.weight,
-                    .grad = grad,
-                    .m = device.m,
-                    .v = device.v,
-                    .elem_count = slot.weights.len,
-                });
-            }
-            for (self.regular_params.items) |*slot| {
-                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-                const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-                try batch.append(self.allocator, .{
-                    .weight = device.weight,
-                    .grad = grad,
-                    .m = device.m,
-                    .v = device.v,
-                    .elem_count = slot.weights.len,
-                });
-            }
-            var frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
-            errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
-            try metal.trainingAdamWManyF32(batch.items, .{
-                .lr = lr,
-                .beta1 = opt.beta1,
-                .beta2 = opt.beta2,
-                .eps = opt.eps,
-                .weight_decay = opt.weight_decay,
-                .bias_correction1 = bias_correction1,
-                .bias_correction2 = bias_correction2,
-                .grad_scale = grad_scale,
-            });
-            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-            return;
-        }
-        var frame_active = if (self.compute_backend.kind() == .metal) try self.compute_backend.decoderRuntimeBeginFrame() else false;
-        errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+        slot.adam_step_count += 1;
+        const t: f32 = @floatFromInt(slot.adam_step_count);
+        try self.stepDeviceAdamWSlotWithGrad(
+            slot,
+            grad,
+            lr,
+            grad_scale,
+            1.0 - std.math.pow(f32, opt.beta1, t),
+            1.0 - std.math.pow(f32, opt.beta2, t),
+        );
+    }
+
+    fn zeroGatedDeviceGradAccum(self: *RealAutodiffTrainer) !void {
         for (self.lora_params.items) |*slot| {
-            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-            try self.stepDeviceAdamWSlotWithGrad(slot, grad, lr, grad_scale, bias_correction1, bias_correction2);
+            if (self.optimizerFamilyAbsent(slot.name)) try self.zeroDeviceGradAccum(slot);
         }
         for (self.regular_params.items) |*slot| {
-            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-            try self.stepDeviceAdamWSlotWithGrad(slot, grad, lr, grad_scale, bias_correction1, bias_correction2);
-        }
-        if (frame_active) {
-            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
+            if (self.optimizerFamilyAbsent(slot.name)) try self.zeroDeviceGradAccum(slot);
         }
     }
 
-    fn stepDeviceAdamWSlot(
-        self: *RealAutodiffTrainer,
-        slot: *ParamSlot,
-        lr: f32,
-        grad_scale: f32,
-        bias_correction1: f32,
-        bias_correction2: f32,
-    ) !void {
-        const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-        try self.stepDeviceAdamWSlotWithGrad(slot, device.grad_accum, lr, grad_scale, bias_correction1, bias_correction2);
+    /// Clear both halves of a slot's gradient accumulator. The device copy is
+    /// rewritten in place by accumulating it into itself at scale 0, which is
+    /// what `first` means to the accumulate kernel.
+    fn zeroDeviceGradAccum(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
+        @memset(slot.grad_accum, 0);
+        const device = slot.device orelse return;
+        switch (self.compute_backend.kind()) {
+            .metal => {
+                if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+                const metal = try self.metalCompute();
+                try metal.trainingAccumulateF32(device.grad_accum, device.grad_accum, slot.weights.len, 0.0, true);
+            },
+            else => return error.DeviceOptimizerBackendUnavailable,
+        }
     }
 
     fn stepDeviceAdamWSlotWithGrad(
@@ -2841,6 +2863,33 @@ fn readTrainingStateTensor(
     if (source.len != destination.len) return error.CheckpointSizeMismatch;
     for (source) |value| if (!std.math.isFinite(value)) return error.NonFiniteCheckpointState;
     @memcpy(destination, source);
+}
+
+/// Read a parameter's persisted Adam step count, or null when the checkpoint
+/// predates the per-slot counter.
+fn readTrainingStateStep(
+    allocator: std.mem.Allocator,
+    reader: *safetensors.MMapReader,
+    parameter_name: []const u8,
+) !?u32 {
+    const name = try std.fmt.allocPrint(allocator, "adam_step::{s}", .{parameter_name});
+    defer allocator.free(name);
+    var tensor = reader.readTensor(name) catch |err| switch (err) {
+        error.TensorNotFound => return null,
+        else => return err,
+    };
+    defer tensor.deinit();
+    if (tensor.dtype != .f32) return error.InvalidTrainingStateDType;
+    const source = tensor.asFloat32();
+    if (source.len != 1) return error.CheckpointSizeMismatch;
+    // f32 only represents integers exactly below 2^24, and no real run gets
+    // near that many optimizer steps, so a larger value is corruption.
+    const max_exact_step: f32 = std.math.maxInt(u24);
+    const value = source[0];
+    if (!std.math.isFinite(value) or value < 0 or value != @floor(value) or value > max_exact_step) {
+        return error.InvalidTrainingStateCounters;
+    }
+    return @intFromFloat(value);
 }
 
 fn putRuntimeInput(
@@ -3408,6 +3457,7 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     @memcpy(state.m, &[_]f32{ 0.25, -0.5 });
     @memcpy(state.v, &[_]f32{ 0.75, 1.25 });
     state.step_count = 3;
+    trainer.lora_params.items[0].adam_step_count = 3;
     trainer.optimizer_state.step_count = 3;
     trainer.step_count = 5;
     trainer.optimizer_step_count = 3;
@@ -3448,6 +3498,39 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     try testing.expectEqual(@as(u64, 5), trainer.microBatchSteps());
     try testing.expectEqual(@as(u64, 3), trainer.optimizerSteps());
     try testing.expectEqual(@as(u32, 3), restored.step_count);
+    try testing.expectEqual(@as(u32, 3), trainer.lora_params.items[0].adam_step_count);
+}
+
+test "RealAutodiffTrainer: training state without per-slot adam steps falls back to the optimizer step count" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, .{
+        .lora = .{ .rank = 1, .alpha = 1.0, .target_patterns = &.{"x"} },
+    });
+    defer trainer.deinit();
+    try appendTestDeviceParamSlot(&trainer, &trainer.lora_params, "x.lora_A", 1);
+    // Host-only restore path: the slot has no device counterpart.
+    trainer.lora_params.items[0].device = null;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/legacy_state.safetensors", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    // A checkpoint written before the per-slot Adam step count existed.
+    const counters = encodeTrainingStateCounters(5, 3);
+    const zeros = [_]f32{0.0};
+    try safetensors_checkpoint.save(allocator, path, &.{
+        .{ .name = "__trainer_counters", .data = &counters, .shape = &.{counters.len} },
+        .{ .name = "weight::x.lora_A", .data = &[_]f32{1.5}, .shape = &.{1} },
+        .{ .name = "adam_m::x.lora_A", .data = &zeros, .shape = &.{1} },
+        .{ .name = "adam_v::x.lora_A", .data = &zeros, .shape = &.{1} },
+    });
+
+    try trainer.loadTrainingState(path, null);
+    try testing.expectEqual(@as(f32, 1.5), trainer.lora_params.items[0].weights[0]);
+    try testing.expectEqual(@as(u32, 3), trainer.optimizer_state.param_states.get("x.lora_A").?.step_count);
+    try testing.expectEqual(@as(u32, 3), trainer.lora_params.items[0].adam_step_count);
 }
 
 test "RealAutodiffTrainer: init and deinit are clean with no graph built" {
@@ -3510,4 +3593,134 @@ test "RealAutodiffTrainer: conditional optimizer families gate absent-task steps
         error.TooManyConditionalOptimizerFamilies,
         trainer.registerConditionalOptimizerFamily("one_too_many."),
     );
+}
+
+/// Enroll a one-element trainable whose device handles are unique opaque
+/// markers, so batch membership can be checked without a Metal device.
+fn appendTestDeviceParamSlot(
+    trainer: *RealAutodiffTrainer,
+    slots: *std.ArrayListUnmanaged(RealAutodiffTrainer.ParamSlot),
+    name: []const u8,
+    marker_id: usize,
+) !void {
+    const allocator = trainer.allocator;
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const weights = try allocator.alloc(f32, 1);
+    errdefer allocator.free(weights);
+    weights[0] = 0.0;
+    const grad_accum = try allocator.alloc(f32, 1);
+    errdefer allocator.free(grad_accum);
+    grad_accum[0] = 0.0;
+    const dims = try allocator.dupe(i32, &.{1});
+    errdefer allocator.free(dims);
+    const marker: CT = @ptrFromInt(marker_id * @alignOf(usize));
+    try slots.append(allocator, .{
+        .name = owned_name,
+        .weights = weights,
+        .grad_accum = grad_accum,
+        .node_id = null_node,
+        .dims = dims,
+        .device = .{ .weight = marker, .grad_accum = marker, .m = marker, .v = marker },
+    });
+}
+
+fn findTestParamSlot(trainer: *RealAutodiffTrainer, name: []const u8) ?*RealAutodiffTrainer.ParamSlot {
+    for (trainer.lora_params.items) |*slot| {
+        if (std.mem.eql(u8, slot.name, name)) return slot;
+    }
+    for (trainer.regular_params.items) |*slot| {
+        if (std.mem.eql(u8, slot.name, name)) return slot;
+    }
+    return null;
+}
+
+test "RealAutodiffTrainer: device AdamW batch skips absent optimizer families and uses per-slot bias correction" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, .{
+        .lora = .{ .rank = 1, .alpha = 1.0, .target_patterns = &.{"q_proj"} },
+        .optimizer = .{ .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-8, .weight_decay = 0.01 },
+    });
+    defer {
+        // The device handles are identity markers, never real tensors; drop
+        // them before deinit so the dummy backend is not asked to free them.
+        for (trainer.lora_params.items) |*slot| slot.device = null;
+        for (trainer.regular_params.items) |*slot| slot.device = null;
+        trainer.deinit();
+    }
+
+    try trainer.registerConditionalOptimizerFamily("classifier.");
+    try trainer.registerConditionalOptimizerFamily("count_pred.");
+
+    const names = [_][]const u8{
+        "encoder.layer.0.attention.self.query_proj.weight.lora_A",
+        "classifier.0.weight",
+        "count_pred.0.weight",
+        "count_pred.2.bias",
+    };
+    try appendTestDeviceParamSlot(&trainer, &trainer.lora_params, names[0], 1);
+    for (names[1..], 2..) |name, marker_id| {
+        try appendTestDeviceParamSlot(&trainer, &trainer.regular_params, name, marker_id);
+    }
+
+    // The same window schedule driven through the host optimizer, whose
+    // per-parameter step count is the reference the device path must match.
+    var host_state = optimizers.OptimizerState.init(allocator);
+    defer host_state.deinit();
+    const host_config = optimizers.Optimizer{ .adamw = trainer.config.optimizer };
+    var host_weight = [_]f32{0.0};
+    const host_grad = [_]f32{0.1};
+
+    const opt = trainer.config.optimizer;
+    var committed_windows: u32 = 0;
+    // classification tasks appear in every window; count tasks only in the second.
+    for ([_]bool{ false, true, false }) |count_pred_present| {
+        trainer.markOptimizerFamilyPresent("classifier.");
+        if (count_pred_present) trainer.markOptimizerFamilyPresent("count_pred.");
+
+        const batch = try trainer.buildDeviceAdamWBatch(.accumulated);
+        defer allocator.free(batch);
+        try testing.expectEqual(@as(usize, if (count_pred_present) 4 else 2), batch.len);
+        // Building must not advance the persisted counters — an aborted step
+        // would otherwise leave them permanently ahead of the moments.
+        try testing.expectEqual(committed_windows, findTestParamSlot(&trainer, names[0]).?.adam_step_count);
+        if (!count_pred_present) {
+            for (names[2..]) |absent_name| {
+                const absent = findTestParamSlot(&trainer, absent_name).?;
+                for (batch) |item| try testing.expect(item.weight != absent.device.?.weight);
+            }
+        }
+        for (batch, 0..) |item, idx| {
+            // Batch order is lora slots then regular slots, gated entries removed.
+            const slot = findTestParamSlot(&trainer, names[idx]).?;
+            try testing.expectEqual(slot.device.?.weight, item.weight);
+            // Bias correction describes the step about to be taken, so it runs
+            // one ahead of the counter until the step is committed.
+            const t: f32 = @floatFromInt(slot.adam_step_count + 1);
+            try testing.expectEqual(1.0 - std.math.pow(f32, opt.beta1, t), item.bias_correction1);
+            try testing.expectEqual(1.0 - std.math.pow(f32, opt.beta2, t), item.bias_correction2);
+        }
+        trainer.commitDeviceAdamWStepCounts();
+        committed_windows += 1;
+
+        for (names) |name| {
+            if (trainer.optimizerFamilyAbsent(name)) continue;
+            try optimizers.step(host_config, &host_state, 1e-3, name, &host_weight, &host_grad);
+        }
+        trainer.resetOptimizerFamilyWindow();
+    }
+
+    try testing.expectEqual(@as(u32, 3), findTestParamSlot(&trainer, names[0]).?.adam_step_count);
+    try testing.expectEqual(@as(u32, 3), findTestParamSlot(&trainer, names[1]).?.adam_step_count);
+    try testing.expectEqual(@as(u32, 1), findTestParamSlot(&trainer, names[2]).?.adam_step_count);
+    try testing.expectEqual(@as(u32, 1), findTestParamSlot(&trainer, names[3]).?.adam_step_count);
+
+    for (names) |name| {
+        try testing.expectEqual(
+            host_state.param_states.get(name).?.step_count,
+            findTestParamSlot(&trainer, name).?.adam_step_count,
+        );
+    }
 }

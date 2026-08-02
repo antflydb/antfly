@@ -1209,7 +1209,13 @@ fn printUsage() void {
 }
 
 test "entity Metal readiness defaults include shaped quality eval" {
-    var opts = Options{};
+    var opts = Options{
+        .model_dir = "model",
+        .train_data = "train.jsonl",
+        .eval_data = "eval.jsonl",
+        .out_dir = "out",
+        .entity_types_csv = "person,organization,location",
+    };
     applyEntityMetalReadinessDefaults(&opts);
 
     try std.testing.expect(opts.entity_metal_readiness);

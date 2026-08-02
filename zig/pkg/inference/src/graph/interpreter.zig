@@ -65,6 +65,10 @@ pub const RuntimeInput = struct {
 pub const CachedAnalysis = struct {
     reachable: []const bool,
     last_use: []const u32,
+    /// Last use of the complete backing-storage alias group for each node.
+    /// This is stricter than `last_use` and is used only to decide whether an
+    /// in-place consume/donation is safe.
+    donation_last_use: []const u32,
     runtime_shape_capture: []const bool,
     gather_add_bias_preserve: []const bool,
 
@@ -74,12 +78,15 @@ pub const CachedAnalysis = struct {
         errdefer allocator.free(reachable);
         const last_use = try computeLastUse(allocator, graph, reachable);
         errdefer allocator.free(last_use);
+        const donation_last_use = try computeDonationLastUse(allocator, graph, reachable, last_use);
+        errdefer allocator.free(donation_last_use);
         const runtime_shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
         errdefer allocator.free(runtime_shape_capture);
         const gather_add_bias_preserve = try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
         return .{
             .reachable = reachable,
             .last_use = last_use,
+            .donation_last_use = donation_last_use,
             .runtime_shape_capture = runtime_shape_capture,
             .gather_add_bias_preserve = gather_add_bias_preserve,
         };
@@ -97,12 +104,15 @@ pub const CachedAnalysis = struct {
         errdefer allocator.free(reachable);
         const last_use = try computeLastUse(allocator, graph, reachable);
         errdefer allocator.free(last_use);
+        const donation_last_use = try computeDonationLastUse(allocator, graph, reachable, last_use);
+        errdefer allocator.free(donation_last_use);
         const runtime_shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
         errdefer allocator.free(runtime_shape_capture);
         const gather_add_bias_preserve = try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
         return .{
             .reachable = reachable,
             .last_use = last_use,
+            .donation_last_use = donation_last_use,
             .runtime_shape_capture = runtime_shape_capture,
             .gather_add_bias_preserve = gather_add_bias_preserve,
         };
@@ -112,10 +122,12 @@ pub const CachedAnalysis = struct {
     pub fn deinit(self: *CachedAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.reachable);
         allocator.free(self.last_use);
+        allocator.free(self.donation_last_use);
         allocator.free(self.runtime_shape_capture);
         allocator.free(self.gather_add_bias_preserve);
         self.reachable = &.{};
         self.last_use = &.{};
+        self.donation_last_use = &.{};
         self.runtime_shape_capture = &.{};
         self.gather_add_bias_preserve = &.{};
     }
@@ -474,6 +486,63 @@ pub fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, reachab
     return last_use;
 }
 
+/// Compute the last use of every backing-storage alias group.
+///
+/// A native reshape is a zero-copy view. Looking only at the reshape node's
+/// own last consumer can therefore authorize an in-place op while the source
+/// tensor still has a future consumer. That future consumer then observes the
+/// mutated bytes. This occurs naturally in multi-head loss graphs: one branch
+/// consumes a flattened encoder view before the next branch creates its own
+/// view of the same encoder output.
+///
+/// Keep ordinary `last_use` for freeing individual handles. For donation,
+/// group zero-copy pass-through/view nodes with their input and use the latest
+/// consumer anywhere in the group.
+fn computeDonationLastUse(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    reachable: []const bool,
+    last_use: []const u32,
+) ![]u32 {
+    const count = graph.nodeCount();
+    const roots = try allocator.alloc(NodeId, count);
+    defer allocator.free(roots);
+    for (roots, 0..) |*root, i| root.* = @intCast(i);
+
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const node_id: NodeId = @intCast(i);
+        const node = graph.node(node_id);
+        const aliases_input = switch (node.op) {
+            .reshape,
+            .transpose,
+            .broadcast_in_dim,
+            .slice,
+            .convert_dtype,
+            .fused_eval_tensor,
+            .fused_to_float32,
+            => true,
+            else => false,
+        };
+        if (!aliases_input or node.num_inputs == 0) continue;
+        const input_id = node.inputs[0];
+        if (input_id == null_node or input_id >= count) continue;
+        roots[i] = roots[@intCast(input_id)];
+    }
+
+    const donation_last_use = try allocator.dupe(u32, last_use);
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const root_idx: usize = @intCast(roots[i]);
+        donation_last_use[root_idx] = @max(donation_last_use[root_idx], last_use[i]);
+    }
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        donation_last_use[i] = donation_last_use[@intCast(roots[i])];
+    }
+    return donation_last_use;
+}
+
 fn computeGatherAddBiasPreserveSet(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]bool {
     const count = graph.nodeCount();
     const preserve = try allocator.alloc(bool, count);
@@ -546,6 +615,8 @@ pub fn execute(
     defer if (!have_cache) allocator.free(reachable);
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
+    const donation_last_use = if (options.cached_analysis) |ca| ca.donation_last_use else try computeDonationLastUse(allocator, graph, reachable, last_use);
+    defer if (!have_cache) allocator.free(donation_last_use);
     const gather_add_bias_preserve = if (options.cached_analysis) |ca| ca.gather_add_bias_preserve else try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(gather_add_bias_preserve);
 
@@ -596,7 +667,7 @@ pub fn execute(
     var exec_state = ExecState{
         .attention_layer = 0,
         .options = options,
-        .last_use = last_use,
+        .last_use = donation_last_use,
         .runtime_shapes = runtime_shapes,
     };
 
@@ -818,6 +889,8 @@ pub fn captureNodeValues(
     defer if (!have_cache) allocator.free(reachable);
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
+    const donation_last_use = if (options.cached_analysis) |ca| ca.donation_last_use else try computeDonationLastUse(allocator, graph, reachable, last_use);
+    defer if (!have_cache) allocator.free(donation_last_use);
 
     const rt_values = try allocator.alloc(?CT, count);
     defer allocator.free(rt_values);
@@ -869,7 +942,7 @@ pub fn captureNodeValues(
     var exec_state = ExecState{
         .attention_layer = 0,
         .options = options,
-        .last_use = last_use,
+        .last_use = donation_last_use,
         .runtime_shapes = runtime_shapes,
     };
     defer exec_state.freeMoeState();
@@ -2572,7 +2645,14 @@ pub fn executeNode(
             defer std.heap.page_allocator.free(actual);
             const runtime_dims = resolveRuntimeReshapeDims(actual, graph.node(ins[0]).output_shape, n.output_shape, &out_dims) orelse return result;
             if (safeElementCountFromDims(runtime_dims) != safeElementCountFromDims(actual)) return result;
-            return cb.primReshape(result, runtime_dims) catch result;
+            const reshaped = cb.primReshape(result, runtime_dims) catch return result;
+            // A consume path may return the graph input handle itself. That
+            // handle is still present in `values[ins[0]]` and the normal
+            // last-use cleanup owns it; freeing it here would double-free it.
+            // Fresh results and temporary declared-shape aliases are local to
+            // this branch and must release their pre-reshape handle.
+            if (reshaped != result and result != input_ct) cb.free(result);
+            return reshaped;
         },
 
         .fused_log_softmax => |attrs| {
@@ -2601,7 +2681,9 @@ pub fn executeNode(
             defer std.heap.page_allocator.free(actual);
             const runtime_dims = resolveRuntimeReshapeDims(actual, graph.node(ins[0]).output_shape, n.output_shape, &out_dims) orelse return result;
             if (safeElementCountFromDims(runtime_dims) != safeElementCountFromDims(actual)) return result;
-            return cb.primReshape(result, runtime_dims) catch result;
+            const reshaped = cb.primReshape(result, runtime_dims) catch return result;
+            if (reshaped != result and result != input_ct) cb.free(result);
+            return reshaped;
         },
 
         .fused_argmax_last_row => |attrs| {
@@ -3563,6 +3645,33 @@ test "computeLastUse tracks dependencies" {
 
     // output node should never be freed (sentinel value)
     try std.testing.expectEqual(std.math.maxInt(u32), last_use[out]);
+}
+
+test "donation last use includes future sibling reshape aliases" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+    const early_view = try b.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const two = try b.scalarConst(.f32, 2.0);
+    const scaled = try b.mul(early_view, two);
+    const later_view = try b.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const later_sum = try b.reduceSum(later_view, &.{ 0, 1 });
+    try g.markOutput(scaled);
+    try g.markOutput(later_sum);
+
+    const reachable = try computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const donation_last_use = try computeDonationLastUse(allocator, &g, reachable, last_use);
+    defer allocator.free(donation_last_use);
+
+    try std.testing.expectEqual(scaled, last_use[early_view]);
+    try std.testing.expectEqual(later_sum, donation_last_use[early_view]);
+    try std.testing.expect(donation_last_use[early_view] > scaled);
 }
 
 test "computeReachable with chained ops" {
@@ -4934,6 +5043,48 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
 const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
 const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
 const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
+
+test "native interpreter does not donate a reshape view before a future sibling view" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = ml.graph.Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{4}));
+    const early_view = try bld.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const two = try bld.scalarConst(.f32, 2.0);
+    const scaled = try bld.mul(early_view, two);
+    // Deliberately create this sibling view after `scaled`. Without
+    // alias-group liveness, native's in-place multiply mutates `x` before
+    // this node executes and the sum becomes 20 instead of 10.
+    const later_view = try bld.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const later_sum = try bld.reduceSum(later_view, &.{ 0, 1 });
+    try g.markOutput(scaled);
+    try g.markOutput(later_sum);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer cb_val.free(x_ct);
+    const rt_inputs = [_]RuntimeInput{.{ .node_id = x, .value = x_ct }};
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const scaled_data = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(scaled_data);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, scaled_data);
+    const sum_data = try cb_val.toFloat32(result.outputs[1], allocator);
+    defer allocator.free(sum_data);
+    try std.testing.expectEqualSlices(f32, &.{10}, sum_data);
+    const original_data = try cb_val.toFloat32(x_ct, allocator);
+    defer allocator.free(original_data);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original_data);
+}
 
 test "execute lowered graph through native backend" {
     // Build: y = linear(x, w, b) = x @ w^T + b

@@ -7,22 +7,21 @@ import argparse
 import hashlib
 import json
 import math
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from gliner2_release_contract import (
+    MODEL_FINGERPRINT_ENTRIES,
+    FingerprintEntry,
+    canonical_text,
+    directory_fingerprint as contract_directory_fingerprint,
+)
+
 
 TASK_KINDS = frozenset({"entities", "classifications", "json_structures", "relations"})
 MODEL_FINGERPRINT_FILES = (
-    "model.safetensors",
-    "config.json",
-    "encoder_config/config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "added_tokens.json",
-    "spm.model",
+    *(entry.relative_path for entry in MODEL_FINGERPRINT_ENTRIES),
 )
 ADAPTER_BUNDLE_FILES = ("adapter_model.safetensors", "adapter_config.json", "task_head.safetensors")
 FULL_TASK_OBJECTIVE = "gliner2-total-loss"
@@ -57,7 +56,7 @@ def record_text(record: dict[str, Any]) -> str:
     text = record.get("input", record.get("text"))
     if not isinstance(text, str) or not text.strip():
         raise ValueError("record has no non-empty input/text")
-    return unicodedata.normalize("NFC", " ".join(text.split()).casefold())
+    return canonical_text(text)
 
 
 def sha256_file(path: Path) -> str:
@@ -69,26 +68,71 @@ def sha256_file(path: Path) -> str:
 
 
 def directory_fingerprint(directory: Path, relative_paths: tuple[str, ...]) -> str:
-    hasher = hashlib.sha256()
-    for relative_path in relative_paths:
-        path = directory / relative_path
-        if not path.is_file():
-            raise ValueError(f"required fingerprint file is missing: {path}")
-        hasher.update(relative_path.encode())
-        hasher.update(b"\0")
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        hasher.update(b"\0")
-    return f"sha256:{hasher.hexdigest()}"
+    """Fingerprint required paths; retained for adapter-bundle compatibility."""
+    return contract_directory_fingerprint(
+        directory,
+        tuple(FingerprintEntry(relative_path) for relative_path in relative_paths),
+    )
 
 
 def base_model_fingerprint(model_dir: Path) -> str:
-    return directory_fingerprint(model_dir, MODEL_FINGERPRINT_FILES)
+    return contract_directory_fingerprint(model_dir, MODEL_FINGERPRINT_ENTRIES)
 
 
 def adapter_bundle_fingerprint(adapter_dir: Path) -> str:
     return directory_fingerprint(adapter_dir, ADAPTER_BUNDLE_FILES)
+
+
+def production_metal_step_metrics(adapter_dir: Path, expected_steps: int) -> list[dict[str, Any]]:
+    """Load retained step evidence proving the release adapter trained on Metal."""
+    metrics_path = adapter_dir / "training_metrics.jsonl"
+    try:
+        lines = metrics_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"release adapter has no retained Metal training metrics: {metrics_path}: {exc}") from exc
+    steps: list[dict[str, Any]] = []
+    for line_no, raw in enumerate(lines, 1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"release adapter has invalid retained Metal training metrics at line {line_no}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"release adapter training metric line {line_no} must be an object")
+        if row.get("event") == "step":
+            steps.append(row)
+    if len(steps) != expected_steps:
+        raise ValueError(
+            f"release adapter retained Metal training metrics have {len(steps)} steps, expected {expected_steps}"
+        )
+    for index, row in enumerate(steps, 1):
+        integer_zero_fields = (
+            "device_trainable_transfer_count",
+            "device_resident_transfer_count",
+            "graph_executor_interpreter_fallbacks",
+            "graph_executor_true_host_outputs",
+        )
+        positive_integer_fields = (
+            "device_trainable_bytes",
+            "graph_executor_partitions",
+            "graph_executor_command_dispatches",
+            "graph_executor_planned_dispatches",
+        )
+        if row.get("step") != index or row.get("optimizer_backend") != "metal":
+            raise ValueError(f"release adapter step {index} was not executed by the Metal optimizer")
+        if any(type(row.get(name)) is not int or row[name] != 0 for name in integer_zero_fields):
+            raise ValueError(
+                f"release adapter step {index} has device transfers, interpreter fallback, or true host output"
+            )
+        if any(type(row.get(name)) is not int or row[name] <= 0 for name in positive_integer_fields):
+            raise ValueError(f"release adapter step {index} lacks compiled device-resident dispatch evidence")
+        if (
+            "graph_executor_fallback_reason" not in row
+            or row.get("graph_executor_fallback_reason") not in (None, "")
+        ):
+            raise ValueError(f"release adapter step {index} reports a graph-executor fallback reason")
+    return steps
 
 
 def json_object(path: Path, label: str) -> dict[str, Any]:
@@ -126,6 +170,8 @@ def validate_release_artifact_provenance(
         raise ValueError("release adapter has an unsupported Zig training manifest")
     if manifest.get("objective") != FULL_TASK_OBJECTIVE or manifest.get("lora_only_trainables") is not True:
         raise ValueError("release adapter was not produced by LoRA-only full-task training")
+    if str(manifest.get("backend", "")).lower() != "metal" or manifest.get("compiled_required") is not True:
+        raise ValueError("release adapter provenance requires Metal training with compiled_required=true")
     cache_capacity = manifest.get("graph_cache_capacity")
     cache_stat_names = (
         "graph_cache_build_reserve_bytes",
@@ -350,6 +396,7 @@ def validate_release_artifact_provenance(
         or restored_epochs > epochs
     ):
         raise ValueError("release adapter has inconsistent resumed-run accounting")
+    production_metal_step_metrics(adapter_dir, micro_batch_steps)
     expected_train = sha256_file(train_data)
     if manifest.get("train_data_sha256") != expected_train:
         raise ValueError("release adapter training-data fingerprint does not match --train")

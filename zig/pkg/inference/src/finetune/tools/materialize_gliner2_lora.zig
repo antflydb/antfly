@@ -115,6 +115,7 @@ fn usageError() error{InvalidArguments} {
         \\usage: materialize-gliner2-lora <base_model_dir> <adapter_model_dir> <out_dir>
         \\       materialize-gliner2-lora [--eval <program>] <base_model_dir> <adapter_model_dir> <out_dir>
         \\example: materialize-gliner2-lora /tmp/gliner2_base /tmp/gliner2_lora /tmp/gliner2_materialized
+        \\out_dir must not already exist. Publication is transactional and writes materialization_manifest.json last.
         \\
         \\When --eval is provided, the program is run before and after export.
         \\

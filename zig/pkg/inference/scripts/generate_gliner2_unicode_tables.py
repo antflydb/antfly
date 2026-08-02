@@ -122,6 +122,26 @@ def pinned_normalizer_inert_table() -> list[tuple[int, int]]:
     return intervals(inert)
 
 
+def simple_casefold_table() -> list[tuple[int, int]]:
+    """Scalars whose Unicode 15 casefold is exactly one simple-lower scalar.
+
+    The Zig release scorer deliberately rejects expansions and mappings that
+    differ from the already pinned simple-lower table. This makes its admitted
+    profile exactly equivalent to Python's ``str.casefold`` without embedding
+    a second variable-length mapping table in the runtime.
+    """
+    simple = []
+    for cp in range(sys.maxunicode + 1):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        char = chr(cp)
+        folded = char.casefold()
+        lowered = char.lower()
+        if len(folded) == 1 and folded == lowered:
+            simple.append(cp)
+    return intervals(simple)
+
+
 def verify_pinned_tokenizer_json(tokenizer_json: Path) -> None:
     """Differential-check the admitted subset against the exact real normalizer."""
     import hashlib
@@ -222,11 +242,14 @@ def render() -> str:
     lower_ranges, lower_pairs, expansions = lower_tables()
     cased, case_ignorable = final_sigma_property_tables()
     normalizer_inert = pinned_normalizer_inert_table()
+    simple_casefold = simple_casefold_table()
     assert expansions == [(0x130, (0x69, 0x307))]
     assert "ΟΣ".lower() == "ος" and "ΟΣΑ".lower() == "οσα"
     assert "A\u0301Σ".lower() == "a\u0301ς" and "A-Σ".lower() == "a-σ"
     assert all(any(first <= ord(char) <= last for first, last in normalizer_inert) for char in "Москва東京😀é")
     assert all(not any(first <= ord(char) <= last for first, last in normalizer_inert) for char in "①Ａﬁ\u0301")
+    assert all(any(first <= ord(char) <= last for first, last in simple_casefold) for char in "AaÉéМосква東京😀")
+    assert all(not any(first <= ord(char) <= last for first, last in simple_casefold) for char in "ßςİ")
     verify_lower_context(lower_ranges, lower_pairs, cased, case_ignorable)
 
     lines = [
@@ -246,6 +269,8 @@ def render() -> str:
     lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in whitespace)
     lines.extend(["};", "", "const pinned_normalizer_inert_ranges = [_]Range{"])
     lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in normalizer_inert)
+    lines.extend(["};", "", "const simple_casefold_ranges = [_]Range{"])
+    lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in simple_casefold)
     lines.extend(["};", "", "const cased_ranges = [_]Range{"])
     lines.extend(f"    .{{ .first = 0x{first:X}, .last = 0x{last:X} }}," for first, last in cased)
     lines.extend(["};", "", "const case_ignorable_ranges = [_]Range{"])
@@ -271,11 +296,18 @@ def render() -> str:
             "",
             "/// Conservative scalar set that the exact pinned tokenizer normalizer",
             "/// leaves unchanged in any admitted fragment context.",
-            "pub fn isPinnedNormalizerInert(cp: u21) bool {",
-            "    return inRanges(cp, &pinned_normalizer_inert_ranges);",
-            "}",
-            "",
-            "pub fn isCased(cp: u21) bool {",
+        "pub fn isPinnedNormalizerInert(cp: u21) bool {",
+        "    return inRanges(cp, &pinned_normalizer_inert_ranges);",
+        "}",
+        "",
+        "/// True when Python 3.12 / Unicode 15 casefold is exactly the",
+        "/// scalar returned by simpleLower. Expanding and distinct mappings",
+        "/// are excluded so release scoring can fail closed.",
+        "pub fn isSimpleCasefold(cp: u21) bool {",
+        "    return inRanges(cp, &simple_casefold_ranges);",
+        "}",
+        "",
+        "pub fn isCased(cp: u21) bool {",
             "    return inRanges(cp, &cased_ranges);",
             "}",
             "",
@@ -316,16 +348,22 @@ def render() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--write", action="store_true")
     parser.add_argument("--tokenizer-json", type=Path)
     args = parser.parse_args()
+    if args.check and args.write:
+        parser.error("--check and --write are mutually exclusive")
     generated = render()
     if args.tokenizer_json is not None:
         verify_pinned_tokenizer_json(args.tokenizer_json)
     if args.check:
         actual = OUTPUT.read_text()
         if actual != generated:
-            print(f"stale Unicode tables: run {Path(__file__).name} and apply its output", file=sys.stderr)
+            print(f"stale Unicode tables: run {Path(__file__).name} --write", file=sys.stderr)
             return 1
+        return 0
+    if args.write:
+        OUTPUT.write_text(generated)
         return 0
     sys.stdout.write(generated)
     return 0

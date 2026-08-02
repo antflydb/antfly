@@ -991,12 +991,14 @@ test "GLiNER2 real training: gliner2_total_loss one step produces finite loss" {
 
     const targets = try allocator.alloc(f32, rows * total_width);
     defer allocator.free(targets);
+    const active_fields_offset = gliner2_autodiff.gliner2TotalLossActiveFieldsOffset(E, 1);
     @memset(targets, 0.0);
     for (0..rows) |row_idx| {
-        @memcpy(
-            targets[row_idx * total_width ..][0..span_width],
-            span_targets[row_idx * span_width ..][0..span_width],
-        );
+        const row = targets[row_idx * total_width ..][0..total_width];
+        @memcpy(row[0..span_width], span_targets[row_idx * span_width ..][0..span_width]);
+        // The count-embed active mask lives in its own block and is deliberately
+        // not derived from the span mask: this packer scores every entity type.
+        @memset(row[active_fields_offset..][0..E], 1.0);
     }
 
     var input_ids = try allocator.alloc(i64, encoded.batch_size * encoded.max_length);
