@@ -10956,7 +10956,7 @@ pub const ApiHttpServer = struct {
             if (line.len == 0) continue;
 
             const table_name = if (route_table_name) |name| name else blk: {
-                var parsed_table = parseGlobalQueryTable(arena, line, cancellation) catch |err| switch (err) {
+                var parsed_table = parseGlobalQueryTable(arena, line, if (cancellation) |value| value.signal() else null) catch |err| switch (err) {
                     error.Cancelled, error.Timeout => return try self.publicQueryDispatchErrorResponse(route_table_name orelse "", line, err),
                     else => return try textResponse(self.alloc, 400, "invalid query request"),
                 };

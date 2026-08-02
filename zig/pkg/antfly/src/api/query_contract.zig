@@ -2143,8 +2143,48 @@ fn nextQueryTimeoutToken(
     }
 }
 
+const json_cancellation_chunk_bytes = 64 * 1024;
+
+const BoundedJsonBodyReader = struct {
+    reader: std.Io.Reader,
+    buffer: [json_cancellation_chunk_bytes]u8 = undefined,
+    body: []const u8,
+    offset: usize = 0,
+    deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
+    interrupted: ?enum { cancelled, timeout } = null,
+
+    fn init(self: *@This(), body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) void {
+        self.body = body;
+        self.offset = 0;
+        self.deadline_ns = deadline_ns;
+        self.cancellation = cancellation;
+        self.interrupted = null;
+        self.reader = .{ .vtable = &.{ .stream = stream }, .buffer = &self.buffer, .seek = 0, .end = 0 };
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @fieldParentPtr("reader", reader);
+        ensureQueryActive(self.deadline_ns, self.cancellation) catch |err| switch (err) {
+            error.Cancelled => {
+                self.interrupted = .cancelled;
+                return error.ReadFailed;
+            },
+            error.Timeout => {
+                self.interrupted = .timeout;
+                return error.ReadFailed;
+            },
+        };
+        if (self.offset == self.body.len) return error.EndOfStream;
+        const count = @min(self.body.len - self.offset, @intFromEnum(limit));
+        try writer.writeAll(self.body[self.offset..][0..count]);
+        self.offset += count;
+        return count;
+    }
+};
+
 const CancellableJsonReader = struct {
-    io_reader: std.Io.Reader,
+    source: BoundedJsonBodyReader,
     reader: std.json.Reader,
     deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
@@ -2154,8 +2194,8 @@ const CancellableJsonReader = struct {
     pub const PeekError = std.json.Reader.PeekError || error{ Cancelled, Timeout };
 
     fn init(self: *@This(), alloc: std.mem.Allocator, body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) void {
-        self.io_reader = .fixed(body);
-        self.reader = std.json.Reader.init(alloc, &self.io_reader);
+        self.source.init(body, deadline_ns, cancellation);
+        self.reader = std.json.Reader.init(alloc, &self.source.reader);
         self.deadline_ns = deadline_ns;
         self.cancellation = cancellation;
     }
@@ -2165,12 +2205,19 @@ const CancellableJsonReader = struct {
     }
 
     fn check(self: *const @This()) !void {
+        if (self.source.interrupted) |interrupted| return switch (interrupted) {
+            .cancelled => error.Cancelled,
+            .timeout => error.Timeout,
+        };
         try ensureQueryActive(self.deadline_ns, self.cancellation);
     }
 
     pub fn next(self: *@This()) NextError!std.json.Token {
         try self.check();
-        return self.reader.next();
+        return self.reader.next() catch |err| {
+            self.check() catch |interrupted| return interrupted;
+            return err;
+        };
     }
 
     pub fn nextAllocMax(
@@ -2180,12 +2227,18 @@ const CancellableJsonReader = struct {
         max_value_len: usize,
     ) AllocError!std.json.Token {
         try self.check();
-        return self.reader.nextAllocMax(alloc, when, max_value_len);
+        return self.reader.nextAllocMax(alloc, when, max_value_len) catch |err| {
+            self.check() catch |interrupted| return interrupted;
+            return err;
+        };
     }
 
     pub fn peekNextTokenType(self: *@This()) PeekError!std.json.TokenType {
         try self.check();
-        return self.reader.peekNextTokenType();
+        return self.reader.peekNextTokenType() catch |err| {
+            self.check() catch |interrupted| return interrupted;
+            return err;
+        };
     }
 };
 
