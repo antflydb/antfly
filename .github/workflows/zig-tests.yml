@@ -705,7 +705,7 @@ jobs:
     needs: changes
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -801,8 +801,11 @@ jobs:
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
-          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: unsloth/Qwen3-1.7B-GGUF
+          # Use one model for ordinary, tool-calling, and multimodal generation
+          # so the ReleaseSafe suite does not retain competing generator sessions.
+          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
+          ANTFLY_INFERENCE_REQUEST_TIMEOUT: "120"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
       - name: Report full E2E result

@@ -8,7 +8,15 @@
 
 import json
 
-from .models import _env_model_specs, _looks_like_model_dir
+from . import models
+from .models import (
+    DEFAULT_GENERATOR_MODEL,
+    DEFAULT_MULTIMODAL_GENERATOR_MODEL,
+    DEFAULT_TOOL_GENERATOR_MODEL,
+    _env_model_specs,
+    _looks_like_model_dir,
+    bootstrap_models_for_listing,
+)
 
 
 def test_partial_model_directory_is_not_available(tmp_path):
@@ -109,3 +117,31 @@ def test_reader_environment_override_preserves_curated_variant(monkeypatch):
     florence = next(spec for spec in specs if spec.repo == "antflydb/florence-2-base")
 
     assert florence.pull_ref == "hf:antflydb/florence-2-base:gguf:Q4_K"
+
+
+def test_generator_environment_override_preserves_curated_variant(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "ggml-org/gemma-4-e2b-it-gguf")
+
+    specs = _env_model_specs()
+    gemma = next(spec for spec in specs if spec.repo == "ggml-org/gemma-4-e2b-it-gguf")
+
+    assert gemma.pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_K_M"
+
+
+def test_generation_defaults_share_one_model():
+    assert DEFAULT_GENERATOR_MODEL == DEFAULT_TOOL_GENERATOR_MODEL
+    assert DEFAULT_GENERATOR_MODEL == DEFAULT_MULTIMODAL_GENERATOR_MODEL
+
+
+def test_explicit_large_generator_is_bootstrapped(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL)
+    monkeypatch.setattr(models, "model_available", lambda spec: False)
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    listing = {
+        category: [{"name": "already-present"}] for category in models.LISTING_BOOTSTRAP
+    }
+
+    assert bootstrap_models_for_listing(listing)
+    assert [spec.repo for spec in pulled] == [DEFAULT_GENERATOR_MODEL]
