@@ -2352,6 +2352,12 @@ const QueryDeadlinePoller = struct {
     }
 };
 
+threadlocal var active_public_normalization_poller: ?*QueryDeadlinePoller = null;
+
+fn pollPublicNormalization() !void {
+    if (active_public_normalization_poller) |poller| try poller.poll();
+}
+
 pub fn parseQueryRequest(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
@@ -5392,7 +5398,11 @@ fn normalizePublicQueryBucketsAlloc(
     deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
 ) !NormalizedPublicQueryBuckets {
-    try ensureQueryActive(deadline_ns, cancellation);
+    var poller = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+    const previous_poller = active_public_normalization_poller;
+    active_public_normalization_poller = &poller;
+    defer active_public_normalization_poller = previous_poller;
+    try poller.check();
     var scoring_must = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
     errdefer deinitTextQueryArrayList(alloc, &scoring_must);
     var scoring_should = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
@@ -5503,6 +5513,7 @@ fn buildTextFilterQueryAlloc(
     queries: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
     mode: TextFilterMode,
 ) !?db_mod.types.TextQuery {
+    try pollPublicNormalization();
     if (queries.items.len == 0) {
         queries.deinit(alloc);
         queries.* = .empty;
@@ -5529,6 +5540,7 @@ fn appendPublicFilterOrTextClausesAlloc(
     query_or_queries: std.json.Value,
     limit: u32,
 ) !void {
+    try pollPublicNormalization();
     if (query_or_queries == .array) {
         if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
         for (query_or_queries.array.items) |item| {
@@ -5568,6 +5580,7 @@ fn appendPositiveMixedFilterConjunctionAlloc(
     value: std.json.Value,
     limit: u32,
 ) anyerror!bool {
+    try pollPublicNormalization();
     if (value != .object) return false;
 
     var mixed_structured = std.ArrayListUnmanaged([]u8).empty;
@@ -5667,6 +5680,7 @@ fn appendCanonicalPublicQueryAlloc(
     exclusion_clauses: *std.ArrayListUnmanaged([]u8),
     exclusion_text_queries: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
 ) !void {
+    try pollPublicNormalization();
     try validatePublicQueryTraversalBudgetAlloc(alloc, query);
     if (query == .object) {
         if (query.object.get("bool")) |bool_value| {
@@ -5788,6 +5802,7 @@ fn appendScoringQueryClausesAlloc(
     query_or_queries: std.json.Value,
     limit: u32,
 ) !void {
+    try pollPublicNormalization();
     if (query_or_queries == .array) {
         if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
         for (query_or_queries.array.items) |item| {
@@ -5807,6 +5822,7 @@ fn appendPublicFilterClausesAlloc(
     query_or_queries: std.json.Value,
     limit: u32,
 ) !void {
+    try pollPublicNormalization();
     try validatePublicQueryTraversalBudgetAlloc(alloc, query_or_queries);
     return appendPublicFilterClausesBoundedAlloc(alloc, list, query_or_queries, limit);
 }
@@ -5817,6 +5833,7 @@ fn appendPublicFilterClausesBoundedAlloc(
     query_or_queries: std.json.Value,
     limit: u32,
 ) !void {
+    try pollPublicNormalization();
     if (query_or_queries == .array) {
         if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
         for (query_or_queries.array.items) |item| {
@@ -5950,6 +5967,7 @@ fn appendRawStructuredFilterClausesAlloc(
     list: *std.ArrayListUnmanaged([]u8),
     query_or_queries: std.json.Value,
 ) !void {
+    try pollPublicNormalization();
     if (query_or_queries == .array) {
         if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
         for (query_or_queries.array.items) |item| {
@@ -6246,6 +6264,7 @@ fn buildScoringTextQueryAlloc(
     pure_should_optional: bool,
     boost: f32,
 ) !?db_mod.types.TextQuery {
+    try pollPublicNormalization();
     if (must.items.len == 0 and should.items.len == 0) return null;
 
     const owned_must = try alloc.dupe(db_mod.types.TextQuery, must.items);
@@ -6298,6 +6317,7 @@ fn buildStructuredFilterClausesJsonAlloc(
         .any => try out.appendSlice(alloc, "{\"bool\":{\"should\":["),
     }
     for (clauses, 0..) |clause, i| {
+        try pollPublicNormalization();
         if (i > 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, clause);
     }
@@ -6316,6 +6336,7 @@ fn appendBoolMustClausesAlloc(
     filter_clauses: *std.ArrayListUnmanaged([]u8),
     filter_text_queries: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
 ) !void {
+    try pollPublicNormalization();
     if (value == .array) {
         if (value.array.items.len == 0) return error.InvalidQueryRequest;
         for (value.array.items) |item| {
@@ -6364,6 +6385,7 @@ fn appendFullTextSearchClausesAlloc(
     value: std.json.Value,
     limit: u32,
 ) !void {
+    try pollPublicNormalization();
     if (value == .array) {
         if (value.array.items.len == 0) return error.InvalidQueryRequest;
         for (value.array.items) |item| {
@@ -6413,6 +6435,7 @@ fn deinitOwnedStringArrayList(alloc: std.mem.Allocator, list: *std.ArrayListUnma
 }
 
 fn parseSupportedFullTextQuery(alloc: std.mem.Allocator, query: std.json.Value, limit: u32) !db_mod.types.TextQuery {
+    try pollPublicNormalization();
     if (query != .object) return error.InvalidQueryRequest;
     if (query.object.get("dense_knn") != null) {
         return error.UnsupportedQueryRequest;
@@ -6816,6 +6839,7 @@ fn normalizeGeneratedBleveQuery(alloc: std.mem.Allocator, query: std.json.Value)
 }
 
 fn encodePatternFilterQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) ![]u8 {
+    try pollPublicNormalization();
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try appendPatternFilterQueryValue(alloc, &out, query);
@@ -9901,6 +9925,7 @@ fn freeTextQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) void {
 }
 
 fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
+    try pollPublicNormalization();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try std.json.Stringify.value(value, .{}, &out.writer);
