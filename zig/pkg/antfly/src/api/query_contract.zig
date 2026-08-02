@@ -2327,8 +2327,11 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
                     key.clearRetainingCapacity();
                     root_expects_key = false;
                 } else if (depth == 1 and timeout_value_pending) {
-                    try timeout_value.appendSlice(alloc, part);
-                    return std.fmt.parseUnsigned(u64, timeout_value.items, 10) catch error.InvalidQueryRequest;
+                    // The public OpenAPI contract declares timeout_ms as an
+                    // integer. Do not coerce a quoted numeric string merely
+                    // because the streaming scanner presents string content
+                    // incrementally.
+                    return error.InvalidQueryRequest;
                 } else if (depth == 1) root_expects_key = true;
             },
             .partial_number => |part| if (depth == 1 and timeout_value_pending) try timeout_value.appendSlice(alloc, part),
@@ -13200,6 +13203,9 @@ test "api query contract rejects invalid timeout_ms" {
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":"bad"}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"query":{"match_all":{}},"timeout_ms":"60000"}
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":1.5}
