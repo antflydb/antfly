@@ -3001,6 +3001,7 @@ pub const DB = struct {
     managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
+    index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
@@ -5374,10 +5375,22 @@ pub const DB = struct {
 
         const merge_effective_req_start_ns = monotonicTimeNs();
 
+        var owned_effective_graph_writes: ?[]types.GraphEdgeWrite = null;
+        defer if (owned_effective_graph_writes) |owned| self.alloc.free(owned);
+        const effective_graph_writes = if (effective_ops.graph_writes.items.len == 0)
+            req.graph_writes
+        else blk: {
+            const combined = try self.alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
+            @memcpy(combined[0..req.graph_writes.len], req.graph_writes);
+            @memcpy(combined[req.graph_writes.len..], effective_ops.graph_writes.items);
+            owned_effective_graph_writes = combined;
+            break :blk combined;
+        };
+
         const effective_req: types.BatchRequest = .{
             .writes = effective_ops.writes,
             .deletes = effective_ops.deletes,
-            .graph_writes = req.graph_writes,
+            .graph_writes = effective_graph_writes,
             .graph_deletes = req.graph_deletes,
             .transforms = &.{},
             .predicates = req.predicates,
@@ -6425,6 +6438,33 @@ pub const DB = struct {
         return desired or started;
     }
 
+    fn quiesceTextMergeForStructuralMutation(self: *DB) bool {
+        const runtime = self.text_merge_runtime orelse return false;
+        return runtime.stop();
+    }
+
+    fn quiesceSparseCompactionForStructuralMutation(self: *DB) bool {
+        const runtime = self.sparse_compaction_runtime orelse return false;
+        return runtime.stop();
+    }
+
+    fn restartTextMergeAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
+        const runtime = self.text_merge_runtime orelse return;
+        runtime.start() catch |err| {
+            // Index catalog durability is already decided at this point.
+            // Queries and foreground indexing remain available; surface the
+            // maintenance degradation without misreporting the mutation.
+            std.log.err("failed to restart text merge runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+        };
+    }
+
+    fn restartSparseCompactionAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
+        const runtime = self.sparse_compaction_runtime orelse return;
+        runtime.start() catch |err| {
+            std.log.err("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+        };
+    }
+
     fn scheduleGeneratedArtifactCleanup(self: *DB) void {
         scheduleGeneratedArtifactCleanupContext(
             self.async_context,
@@ -6642,6 +6682,7 @@ pub const DB = struct {
             entries: []Entry = &.{},
             writes: []T = &.{},
             deletes: [][]const u8 = &.{},
+            graph_writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
 
             fn deinit(self: *@This(), alloc: Allocator) void {
                 for (self.entries) |entry| {
@@ -6651,9 +6692,67 @@ pub const DB = struct {
                 if (self.entries.len > 0) alloc.free(self.entries);
                 if (self.writes.len > 0) alloc.free(self.writes);
                 if (self.deletes.len > 0) alloc.free(self.deletes);
+                for (self.graph_writes.items) |*write| deinitOwnedGraphEdgeWrite(alloc, write);
+                self.graph_writes.deinit(alloc);
                 self.* = .{};
             }
         };
+    }
+
+    fn deinitOwnedGraphEdgeWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+        write.* = undefined;
+    }
+
+    fn appendGraphTransformWrite(
+        self: *DB,
+        writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+        source: []const u8,
+        path: transform_mod.GraphProjectionPath,
+        value_json: []const u8,
+    ) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidGraphEdges;
+
+        const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
+        if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
+
+        const weight: f64 = if (parsed.value.object.get("weight")) |value| switch (value) {
+            .integer => |integer| @floatFromInt(integer),
+            .float => |float| float,
+            .number_string => |number| try std.fmt.parseFloat(f64, number),
+            else => return error.InvalidGraphEdges,
+        } else 1.0;
+        if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
+
+        const metadata_json: []const u8 = if (parsed.value.object.get("metadata")) |metadata|
+            try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
+        else
+            "";
+        errdefer if (metadata_json.len > 0) self.alloc.free(@constCast(metadata_json));
+
+        const index_name = try self.alloc.dupe(u8, path.index_name);
+        errdefer self.alloc.free(index_name);
+        const owned_source = try self.alloc.dupe(u8, source);
+        errdefer self.alloc.free(owned_source);
+        const target = try self.alloc.dupe(u8, target_value.string);
+        errdefer self.alloc.free(target);
+        const edge_type = try self.alloc.dupe(u8, path.edge_type);
+        errdefer self.alloc.free(edge_type);
+
+        try writes.append(self.alloc, .{
+            .index_name = index_name,
+            .source = owned_source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = weight,
+            .metadata_json = metadata_json,
+        });
     }
 
     const BulkIngestCoalescer = struct {
@@ -6915,13 +7014,16 @@ pub const DB = struct {
     ) !CoalescedKeyValueRequest(T) {
         var result = CoalescedKeyValueRequest(T){};
         var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
+        defer order.deinit(self.alloc);
+        var entries_transferred = false;
         errdefer {
-            result.entries = order.items;
-            order.items = &.{};
-            order.capacity = 0;
+            if (!entries_transferred) {
+                result.entries = order.items;
+                order.items = &.{};
+                order.capacity = 0;
+            }
             result.deinit(self.alloc);
         }
-        defer order.deinit(self.alloc);
 
         var positions = std.StringHashMapUnmanaged(usize){};
         defer positions.deinit(self.alloc);
@@ -6972,30 +7074,87 @@ pub const DB = struct {
                 if (base_json) |body| self.alloc.free(body);
             };
 
-            const resolved = try transform_mod.resolveDocumentTransform(self.alloc, base_json, transform) orelse {
-                if (maybe_index == null) continue;
-                const entry = order.items[maybe_index.?];
-                if (entry.kind == .delete) continue;
-                continue;
+            var document_operations = std.ArrayListUnmanaged(types.TransformOp).empty;
+            defer document_operations.deinit(self.alloc);
+            var graph_operations = std.ArrayListUnmanaged(struct {
+                path: transform_mod.GraphProjectionPath,
+                value_json: []const u8,
+            }).empty;
+            defer graph_operations.deinit(self.alloc);
+            for (transform.operations) |operation| {
+                const graph_path = try transform_mod.graphProjectionPath(operation.path);
+                if (graph_path) |path| {
+                    switch (operation.op) {
+                        .push, .add_to_set => {},
+                        else => return error.UnsupportedTransformOperation,
+                    }
+                    try graph_operations.append(self.alloc, .{
+                        .path = path,
+                        .value_json = operation.value_json orelse return error.InvalidArgument,
+                    });
+                } else {
+                    try document_operations.append(self.alloc, operation);
+                }
+            }
+
+            const graph_writes_start = result.graph_writes.items.len;
+            for (graph_operations.items) |operation| {
+                try self.appendGraphTransformWrite(
+                    &result.graph_writes,
+                    transform.key,
+                    operation.path,
+                    operation.value_json,
+                );
+            }
+
+            const document_transform: types.DocumentTransform = .{
+                .key = transform.key,
+                .operations = document_operations.items,
+                .upsert = transform.upsert,
             };
-            errdefer self.alloc.free(resolved);
+
+            // A non-upsert transform against an absent (or same-batch deleted)
+            // document is a no-op, but malformed document operations remain
+            // errors independent of state. Graph operands were validated while
+            // constructing their pending deltas above.
+            if (base_json == null and !transform.upsert) {
+                try transform_mod.validateDocumentTransform(self.alloc, document_transform);
+                for (result.graph_writes.items[graph_writes_start..]) |*write| {
+                    deinitOwnedGraphEdgeWrite(self.alloc, write);
+                }
+                result.graph_writes.shrinkRetainingCapacity(graph_writes_start);
+                continue;
+            }
+
+            // Even a graph-only transform remains a logical document write:
+            // preserve source version/timestamp and change-journal semantics
+            // while applying the projected edge as a delta. The mapper sees
+            // the unchanged stripped document and therefore does not clear
+            // the graph generation.
+            const resolved = try transform_mod.resolveDocumentTransform(self.alloc, base_json, document_transform);
+
+            const resolved_document = resolved orelse continue;
+            var resolved_document_owned = true;
+            defer if (resolved_document_owned) self.alloc.free(resolved_document);
 
             const gop = try positions.getOrPut(self.alloc, transform.key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = order.items.len;
                 try order.append(self.alloc, .{
                     .key = try self.alloc.dupe(u8, transform.key),
-                    .value = resolved,
+                    .value = resolved_document,
                     .kind = .write,
                     .owned_key = true,
                     .owned_value = true,
                 });
+                resolved_document_owned = false;
                 continue;
             }
 
             const entry = &order.items[gop.value_ptr.*];
             if (entry.owned_value) self.alloc.free(@constCast(entry.value.?));
-            try setCoalescedEntryToOwnedWrite(T, self.alloc, entry, transform.key, resolved);
+            try setCoalescedEntryToOwnedWrite(T, self.alloc, entry, transform.key, resolved_document);
+            resolved_document_owned = false;
         }
 
         var write_count: usize = 0;
@@ -7009,6 +7168,7 @@ pub const DB = struct {
 
         const final_entries = try order.toOwnedSlice(self.alloc);
         result.entries = final_entries;
+        entries_transferred = true;
         if (write_count > 0) result.writes = try self.alloc.alloc(T, write_count);
         if (delete_count > 0) result.deletes = try self.alloc.alloc([]const u8, delete_count);
 
@@ -13248,6 +13408,11 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
+        // Graph projections are maintained as artifact deltas, while the
+        // transaction intent format currently carries only primary key/value
+        // rows. Refuse this combination rather than acknowledging a transform
+        // whose graph half cannot participate in the transaction commit.
+        if (effective_ops.graph_writes.items.len != 0) return error.UnsupportedTransformOperation;
 
         var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
         defer intents.deinit(self.alloc);
@@ -14023,11 +14188,17 @@ pub const DB = struct {
 
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
+        defer self.index_structural_mutation_mutex.unlock();
         // Generated artifact namespaces can be shared across differently named
         // indexes. Cleanup is durable and owner-driven; never turn index
         // admission into an unbounded corpus scan. Metadata reconciliation can
         // retry after the conflicting generation's tombstone is retired.
         try self.rejectConflictingRetiredIndexCleanupForAdmission(cfg);
+        const restart_text_merge = self.quiesceTextMergeForStructuralMutation();
+        defer if (restart_text_merge) self.restartTextMergeAfterStructuralMutation("index creation", cfg.name);
+        const restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation();
+        defer if (restart_sparse_compaction) self.restartSparseCompactionAfterStructuralMutation("index creation", cfg.name);
         const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         var enrichment_restarted = false;
         errdefer if (restart_enrichment and !enrichment_restarted) {
@@ -15288,6 +15459,12 @@ pub const DB = struct {
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
+        defer self.index_structural_mutation_mutex.unlock();
+        const restart_text_merge = self.quiesceTextMergeForStructuralMutation();
+        defer if (restart_text_merge) self.restartTextMergeAfterStructuralMutation("index deletion", name);
+        const restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation();
+        defer if (restart_sparse_compaction) self.restartSparseCompactionAfterStructuralMutation("index deletion", name);
         const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         const removed = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("failed index deletion", name) catch |restart_err| {
@@ -69359,6 +69536,97 @@ test "db delete index persists across reopen" {
     }
 }
 
+test "db delete full text index drains active merge before closing generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+    for (0..12) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .full_text,
+        });
+    }
+
+    text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
+    text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
+    text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
+    defer {
+        text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+    }
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+
+    var merge_started = false;
+    for (0..200_000) |_| {
+        if (text_merge_runtime_mod.test_task_begin_entered.load(.acquire)) {
+            merge_started = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!merge_started) return error.TestTimeout;
+
+    const Delete = struct {
+        db: *DB,
+        completed: std.atomic.Value(bool) = .init(false),
+        removed: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.removed = self.db.deleteIndex("ft_v1") catch |err| {
+                self.err = err;
+                self.completed.store(true, .release);
+                return;
+            };
+            self.completed.store(true, .release);
+        }
+    };
+    var deletion = Delete{ .db = &db };
+    var delete_thread = try std.Thread.spawn(.{}, Delete.run, .{&deletion});
+    var joined = false;
+    defer if (!joined) {
+        text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        delete_thread.join();
+    };
+
+    // Deletion must wait for the task that borrowed the index runtime; it may
+    // not acknowledge catalog removal and close storage underneath that task.
+    for (0..512) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!deletion.completed.load(.acquire));
+
+    text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+    delete_thread.join();
+    joined = true;
+    try std.testing.expect(deletion.err == null);
+    try std.testing.expect(deletion.removed);
+
+    const source_doc = (try db.get(alloc, "doc:0")) orelse return error.TestExpectedEqual;
+    defer alloc.free(source_doc);
+    try std.testing.expect(std.mem.indexOf(u8, source_doc, "common token") != null);
+    try std.testing.expectError(error.IndexNotFound, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "common" } },
+    }));
+}
+
 test "db delete index persists across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -73757,6 +74025,110 @@ test "db batch resolves transforms against pending same-batch writes" {
         else => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
+}
+
+test "db graph push transform appends projected edge across restart" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\",\"weight\":2,\"metadata\":{\"since\":2024}}]}}}" },
+                .{ .key = "b", .value = "{\"title\":\"B\"}" },
+                .{ .key = "c", .value = "{\"title\":\"C\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        try db.batch(.{
+            .transforms = &.{.{
+                .key = "a",
+                .operations = &.{
+                    .{ .op = .push, .path = "$._edges.graph.FRIEND", .value_json = "{\"target\":\"c\",\"weight\":3}" },
+                    .{ .op = .set, .path = "title", .value_json = "\"A updated\"" },
+                },
+            }},
+            .sync_level = .full_index,
+        });
+
+        const stored = (try db.get(alloc, "a")) orelse return error.TestExpectedEqual;
+        defer alloc.free(stored);
+        try std.testing.expect(std.mem.indexOf(u8, stored, "A updated") != null);
+
+        const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+        var saw_b = false;
+        var saw_c = false;
+        for (edges) |edge| {
+            if (std.mem.eql(u8, edge.target, "b")) {
+                saw_b = true;
+                try std.testing.expectEqual(@as(f64, 2), edge.weight);
+                try std.testing.expect(std.mem.indexOf(u8, edge.metadata, "2024") != null);
+            }
+            if (std.mem.eql(u8, edge.target, "c")) {
+                saw_c = true;
+                try std.testing.expectEqual(@as(f64, 3), edge.weight);
+            }
+        }
+        try std.testing.expect(saw_b and saw_c);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 2), reopened_edges.len);
+}
+
+test "db graph transforms fail closed for replacement operations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\"}]}}}" }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectError(error.UnsupportedTransformOperation, db.batch(.{
+        .transforms = &.{.{
+            .key = "a",
+            .operations = &.{.{ .op = .set, .path = "$._edges.graph.FRIEND", .value_json = "[]" }},
+        }},
+        .sync_level = .full_index,
+    }));
+
+    // Validation is state-independent: an invalid projected edge cannot be
+    // acknowledged as a no-op just because its source document is absent.
+    try std.testing.expectError(error.InvalidGraphEdges, db.batch(.{
+        .transforms = &.{.{
+            .key = "missing",
+            .operations = &.{.{ .op = .push, .path = "$._edges.graph.FRIEND", .value_json = "{\"weight\":2}" }},
+        }},
+        .sync_level = .full_index,
+    }));
+
+    const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("b", edges[0].target);
 }
 
 test "db batch keeps delete when same-batch transform targets deleted key" {

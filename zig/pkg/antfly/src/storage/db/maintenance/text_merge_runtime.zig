@@ -33,6 +33,10 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
+pub var test_block_after_task_begin: std.atomic.Value(bool) = .init(false);
+pub var test_task_begin_entered: std.atomic.Value(bool) = .init(false);
+pub var test_release_after_task_begin: std.atomic.Value(bool) = .init(false);
+
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
     defer_flag: ?*const std.atomic.Value(bool),
@@ -57,6 +61,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn start(self: *@This()) !void {
         if (self.config.enabled) return error.UnsupportedPlatform;
+    }
+
+    pub fn stop(_: *@This()) bool {
+        return false;
     }
 
     pub fn notify(self: *@This()) void {
@@ -92,6 +100,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
     shutdown: bool = false,
     notified: bool = false,
     backpressure_events: u64 = 0,
@@ -119,25 +128,44 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *TextMergeRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.notified = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        _ = self.stop();
         self.* = undefined;
     }
 
     pub fn start(self: *TextMergeRuntime) !void {
         if (!self.config.enabled) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
+        self.mutex.lockUncancelable(io);
+        self.shutdown = false;
+        self.notified = true;
+        self.mutex.unlock(io);
         self.future = try io.concurrent(workerMain, .{self});
+    }
+
+    /// Gracefully drains the active merge, if any, and stops the worker.
+    /// Structural catalog mutations call this before moving or closing an
+    /// inline index runtime, so no task can retain a pointer across mutation.
+    pub fn stop(self: *TextMergeRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        const io_impl = self.io_impl orelse return false;
+        const io = io_impl.io();
+        if (self.future == null) return false;
+
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        self.notified = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+
+        _ = self.future.?.await(io);
+        self.future = null;
+        return true;
     }
 
     pub fn notify(self: *TextMergeRuntime) void {
@@ -164,8 +192,17 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const work_alloc = self.index_manager.alloc;
         defer task.deinit(work_alloc);
 
+        if (builtin.is_test and test_block_after_task_begin.load(.acquire)) {
+            test_task_begin_entered.store(true, .release);
+            while (!test_release_after_task_begin.load(.acquire)) std.Thread.yield() catch {};
+        }
+
         var result = index_manager_mod.IndexManager.executeTextMergeTask(work_alloc, &task) catch |err| {
-            if (!lockApplyExclusiveBackoff(self)) return false;
+            // Once a task has borrowed an index runtime it must retire its
+            // scheduler state before a graceful stop can complete. Structural
+            // mutation waits for stop before taking the apply lock, so this
+            // acquisition cannot form a shutdown lock cycle.
+            lockApplyExclusive(self.apply_mutex);
             if (err == error.ResourceBudgetExceeded) {
                 self.index_manager.cancelTextMergeTask(&task);
                 self.apply_mutex.unlockExclusive();
@@ -177,7 +214,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         };
         defer result.deinit(work_alloc);
 
-        if (!lockApplyExclusiveBackoff(self)) return false;
+        lockApplyExclusive(self.apply_mutex);
         defer self.apply_mutex.unlockExclusive();
         _ = self.index_manager.finishTextMergeTask(&task, &result) catch |err| {
             self.index_manager.noteTextMergeFailure(&task, err);
@@ -317,12 +354,8 @@ fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
     lock.lockExclusive();
 }
 
-fn lockApplyExclusiveBackoff(runtime: *TextMergeRuntime) bool {
-    while (!runtime.apply_mutex.tryLockExclusive()) {
-        if (isShutdown(runtime)) return false;
-        sleepMs(runtime, 1);
-    }
-    return true;
+fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
 
 fn lockApplyShared(lock: *apply_rw_lock_mod.ApplyRwLock) void {

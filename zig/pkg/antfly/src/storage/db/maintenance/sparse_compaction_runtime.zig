@@ -49,6 +49,10 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         if (self.config.enabled) return error.UnsupportedPlatform;
     }
 
+    pub fn stop(_: *@This()) bool {
+        return false;
+    }
+
     pub fn notify(self: *@This()) void {
         _ = self;
     }
@@ -65,6 +69,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     config: Config,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
     shutdown: bool = false,
     notified: bool = false,
     future: ?Io.Future(void) = null,
@@ -88,24 +93,41 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 
     pub fn deinit(self: *SparseCompactionRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.notified = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        _ = self.stop();
         self.* = undefined;
     }
 
     pub fn start(self: *SparseCompactionRuntime) !void {
         if (!self.config.enabled) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        self.future = try io_impl.io().concurrent(workerMain, .{self});
+        const io = io_impl.io();
+        self.mutex.lockUncancelable(io);
+        self.shutdown = false;
+        self.notified = true;
+        self.mutex.unlock(io);
+        self.future = try io.concurrent(workerMain, .{self});
+    }
+
+    pub fn stop(self: *SparseCompactionRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        const io_impl = self.io_impl orelse return false;
+        const io = io_impl.io();
+        if (self.future == null) return false;
+
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        self.notified = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+
+        _ = self.future.?.await(io);
+        self.future = null;
+        return true;
     }
 
     pub fn notify(self: *SparseCompactionRuntime) void {
@@ -139,7 +161,9 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         };
         defer result.deinit(work_alloc);
 
-        if (!lockApplyExclusiveBackoff(self)) return false;
+        // A started task must retire before structural mutation can close its
+        // generation. The stopper waits without holding the apply lock.
+        lockApplyExclusive(self.apply_mutex);
         defer self.apply_mutex.unlockExclusive();
         _ = try self.index_manager.finishSparseCompactionTask(&task, &result);
         return true;
@@ -212,4 +236,12 @@ fn lockApplyExclusiveBackoff(runtime: *SparseCompactionRuntime) bool {
         sleepMs(runtime, 1);
     }
     return true;
+}
+
+fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
+    lock.lockExclusive();
+}
+
+fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
 }

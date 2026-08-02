@@ -278,6 +278,29 @@ fn normalizeJsonPath(path: []const u8) !NormalizedJsonPath {
     return parts;
 }
 
+pub const GraphProjectionPath = struct {
+    index_name: []const u8,
+    edge_type: []const u8,
+};
+
+/// Recognizes the logical graph-array paths exposed by document transforms.
+///
+/// `_edges` is projected out of the primary document and stored as graph edge
+/// artifacts. Callers must therefore apply append-like operations as graph
+/// deltas instead of resolving them against the stripped primary JSON. Any
+/// other path rooted at `_edges` is rejected: resolving it as ordinary JSON
+/// would silently reinterpret a partial projection as the complete edge set.
+pub fn graphProjectionPath(path: []const u8) !?GraphProjectionPath {
+    const normalized = try normalizeJsonPath(path);
+    const parts = normalized.slice();
+    if (parts.len == 0 or !std.mem.eql(u8, parts[0], "_edges")) return null;
+    if (parts.len != 3) return error.InvalidArgument;
+    return .{
+        .index_name = parts[1],
+        .edge_type = parts[2],
+    };
+}
+
 const NumericTransform = enum { add, max };
 
 fn applyNumericOp(

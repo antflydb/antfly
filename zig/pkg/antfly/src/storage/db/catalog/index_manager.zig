@@ -595,6 +595,20 @@ const TextMergeScheduler = struct {
         }
     }
 
+    fn removeIndex(self: *TextMergeScheduler, alloc: Allocator, index_name: []const u8) void {
+        self.supersedeInFlightForIndex(alloc, index_name);
+        var i: usize = 0;
+        while (i < self.quarantined.items.len) {
+            const merge = &self.quarantined.items[i];
+            if (!std.mem.eql(u8, merge.index_name, index_name)) {
+                i += 1;
+                continue;
+            }
+            merge.deinit(alloc);
+            _ = self.quarantined.orderedRemove(i);
+        }
+    }
+
     fn pruneExpiredQuarantines(self: *TextMergeScheduler, alloc: Allocator, now_ns: u64) void {
         var i: usize = 0;
         while (i < self.quarantined.items.len) {
@@ -4489,6 +4503,7 @@ pub const IndexManager = struct {
                     name,
                     try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
                 );
+                self.text_merge_scheduler.removeIndex(self.alloc, name);
                 self.freeTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
