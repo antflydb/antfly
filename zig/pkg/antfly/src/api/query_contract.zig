@@ -2187,6 +2187,21 @@ const CancellableJsonReader = struct {
     }
 };
 
+fn parseJsonValueCancellable(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
+) !std.json.Parsed(std.json.Value) {
+    var source = CancellableJsonReader.init(alloc, body, deadline_ns, cancellation);
+    defer source.deinit();
+    return std.json.parseFromTokenSource(std.json.Value, alloc, &source, .{}) catch |err| switch (err) {
+        error.Cancelled => error.Cancelled,
+        error.Timeout => error.Timeout,
+        else => error.InvalidQueryRequest,
+    };
+}
+
 /// Finds the top-level timeout without constructing a request DOM. This runs
 /// before query admission retries, so it must poll peer cancellation while
 /// consuming large bodies.
@@ -2283,8 +2298,13 @@ const QueryBodyContractFields = struct {
     has_query_timeout: bool,
 };
 
-fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+fn queryBodyContractFields(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
+) !QueryBodyContractFields {
+    var parsed = try parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return .{
@@ -2394,9 +2414,9 @@ pub fn parseQueryRequestWithDeadline(
     // Inspect the generated-contract extensions in one semantic parse. Besides
     // honoring escaped member names, this avoids repeatedly materializing the
     // same request tree on the query admission hot path.
-    const contract_fields = try queryBodyContractFields(alloc, effective_body);
+    const contract_fields = try queryBodyContractFields(alloc, effective_body, execution_deadline_ns, cancellation);
     try ensureQueryActive(execution_deadline_ns, cancellation);
-    const contract_body = try queryBodyForGeneratedContractAlloc(alloc, effective_body, .{
+    const contract_body = try queryBodyForGeneratedContractAlloc(alloc, effective_body, execution_deadline_ns, cancellation, .{
         .strip_internal_shard_fields = contract_fields.has_internal_shard_fields,
         .strip_public_doc_filter_bindings = contract_fields.has_public_doc_filter_bindings,
         .strip_public_hierarchy_controls = contract_fields.has_public_hierarchy_controls,
@@ -9131,11 +9151,13 @@ const QueryContractStripOptions = struct {
 fn queryBodyForGeneratedContractAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     options: QueryContractStripOptions,
 ) !?[]u8 {
     if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = try parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
 
@@ -9152,7 +9174,11 @@ fn queryBodyForGeneratedContractAlloc(
         _ = parsed.value.object.orderedRemove("timeout_ms");
     }
 
-    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    try ensureQueryActive(deadline_ns, cancellation);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(encoded);
+    try ensureQueryActive(deadline_ns, cancellation);
+    return encoded;
 }
 
 fn isInternalShardFieldName(name: []const u8) bool {
