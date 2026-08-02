@@ -131,9 +131,16 @@ fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.j
     return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
 }
 
-fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
-    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    return metadata_openapi.server.parseQueryTableBody(alloc, body);
+fn parsePublicTableQueryBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
+) !std.json.Parsed(metadata_openapi.QueryRequest) {
+    var value = try query_contract.parseJsonValueCancellable(alloc, body, deadline_ns, cancellation);
+    defer value.deinit();
+    try query_contract.validatePublicQuerySortTupleValueContract(value.value);
+    return std.json.parseFromValue(metadata_openapi.QueryRequest, alloc, value.value, .{ .ignore_unknown_fields = true });
 }
 
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
@@ -8731,7 +8738,10 @@ pub const ApiHttpServer = struct {
             return try alloc.dupe(u8, result.json);
         }
 
-        var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+        var contract_req = parsePublicTableQueryBody(alloc, body, request_deadline_ns, cancellation) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.InvalidQueryRequest,
+        };
         defer contract_req.deinit();
 
         try ensureRequestActive(cancellation);
@@ -8881,7 +8891,10 @@ pub const ApiHttpServer = struct {
     ) anyerror!?[]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        var parsed_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+        var parsed_request = parsePublicTableQueryBody(alloc, body, request_deadline_ns, cancellation) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.InvalidQueryRequest,
+        };
         defer parsed_request.deinit();
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -9063,7 +9076,10 @@ pub const ApiHttpServer = struct {
     ) anyerror![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        var contract_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+        var contract_request = parsePublicTableQueryBody(alloc, body, request_deadline_ns, cancellation) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return error.InvalidQueryRequest,
+        };
         defer contract_request.deinit();
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -9074,7 +9090,7 @@ pub const ApiHttpServer = struct {
         const primary_body = rewrite.body;
         defer alloc.free(primary_body);
 
-        var primary_request = try parsePublicTableQueryBody(alloc, primary_body);
+        var primary_request = try parsePublicTableQueryBody(alloc, primary_body, request_deadline_ns, cancellation);
         defer primary_request.deinit();
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);

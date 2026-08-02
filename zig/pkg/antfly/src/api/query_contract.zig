@@ -126,7 +126,11 @@ pub fn validatePublicQuerySortTupleContract(alloc: std.mem.Allocator, body: []co
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
-    const object = switch (parsed.value) {
+    return validatePublicQuerySortTupleValueContract(parsed.value);
+}
+
+pub fn validatePublicQuerySortTupleValueContract(value: std.json.Value) !void {
+    const object = switch (value) {
         .object => |object| object,
         else => return,
     };
