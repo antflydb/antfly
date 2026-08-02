@@ -39899,9 +39899,7 @@ test "db default primary backend survives reopen" {
     }
 
     {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{
-            .open_mode = .query_readonly,
-        });
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
         defer reopened.close();
 
         const raw = try reopened.get(alloc, "doc:a");

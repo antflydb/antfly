@@ -14714,6 +14714,8 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 fn normalizePublicQueryParseError(err: anyerror) anyerror {
     if (err == error.ModelNotFound or
         err == error.OutOfMemory or
+        err == error.Cancelled or
+        err == error.Timeout or
         err == error.InvalidFilterQueryRequest or
         err == error.InvalidExclusionQueryRequest or
         err == error.UnsupportedFilterQueryRequest or

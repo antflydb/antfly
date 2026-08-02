@@ -9581,13 +9581,13 @@ fn sortPublicDocFilterBindingsByDependenciesAlloc(
 
     for (bindings, 0..) |binding, binding_index| {
         try deadline.poll();
-        var parsed = std.json.parseFromSlice(
-            std.json.Value,
+        var parsed = parseJsonValueCancellable(
             alloc,
             binding.filter_query_json,
-            .{},
+            deadline_ns,
+            cancellation,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled, error.Timeout => return err,
             else => return error.InvalidQueryRequest,
         };
         defer parsed.deinit();
@@ -9656,13 +9656,13 @@ fn validatePublicDocFilterRootRefsAlloc(
     }
     for ([_][]const u8{ filter_query_json, exclusion_query_json }) |encoded| {
         if (encoded.len == 0) continue;
-        var parsed = std.json.parseFromSlice(
-            std.json.Value,
+        var parsed = parseJsonValueCancellable(
             alloc,
             encoded,
-            .{},
+            deadline_ns,
+            cancellation,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled, error.Timeout => return err,
             else => return error.InvalidQueryRequest,
         };
         defer parsed.deinit();
