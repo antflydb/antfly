@@ -25,6 +25,9 @@ Usage:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
     ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
 
+    # Optional inference server configuration:
+    ANTFLY_INFERENCE_SERVER_CONFIG=/path/to/config.json uv run --project e2e/inference pytest e2e/inference
+
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
 
@@ -94,7 +97,15 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
 class InferenceServer:
     """Manages a local inference server process."""
 
-    def __init__(self, command_prefix: list[str], models_path: str, ml_path: str, host: str, port: int):
+    def __init__(
+        self,
+        command_prefix: list[str],
+        models_path: str,
+        ml_path: str,
+        host: str,
+        port: int,
+        config_path: str | None = None,
+    ):
         self.url = f"http://{host}:{port}"
         self.output = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen(
@@ -109,6 +120,7 @@ class InferenceServer:
                 models_path,
                 "--ml-dir",
                 ml_path,
+                *(["--config", config_path] if config_path else []),
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
@@ -159,7 +171,14 @@ def base_url():
     ml_path = str(ml_dir())
 
     port = find_free_port()
-    server = InferenceServer(command_prefix, models_path, ml_path, "127.0.0.1", port)
+    server = InferenceServer(
+        command_prefix,
+        models_path,
+        ml_path,
+        "127.0.0.1",
+        port,
+        config_path=env_first("ANTFLY_INFERENCE_SERVER_CONFIG"),
+    )
     yield server.url
     server.stop()
 
