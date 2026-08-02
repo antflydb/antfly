@@ -14845,6 +14845,8 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
         const text_snapshot = entry.persistent.acquireSnapshot();
         defer text_snapshot.release();
 
@@ -14915,6 +14917,8 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
         const text_snapshot = entry.persistent.acquireSnapshot();
         defer text_snapshot.release();
         return try text_snapshot.textTermStats(alloc, field, term, doc_ordinal);
@@ -14932,6 +14936,8 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
         const text_snapshot = entry.persistent.acquireSnapshot();
         defer text_snapshot.release();
 
@@ -63906,6 +63912,11 @@ test "db generated artifact cleanup retries beyond the transient burst" {
     });
     defer db.close();
     try db.addIndex(cfg);
+    const old_provenance = (try db.core.textIndexEntry(cfg.name).?.persistent.readGenerationMetadataAlloc(
+        alloc,
+        persistent_mod.text_projection_provenance_meta_key,
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_provenance);
 
     index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(12, .release);
     defer index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
@@ -63917,6 +63928,12 @@ test "db generated artifact cleanup retries beyond the transient burst" {
         index_manager_mod.test_generated_artifact_cleanup_failures_remaining.load(.acquire),
     );
     try db.addIndex(cfg);
+    const new_provenance = (try db.core.textIndexEntry(cfg.name).?.persistent.readGenerationMetadataAlloc(
+        alloc,
+        persistent_mod.text_projection_provenance_meta_key,
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(new_provenance);
+    try std.testing.expect(!std.mem.eql(u8, old_provenance, new_provenance));
 }
 
 test "db generated artifact finalization releases page arbitration and preserves admission fence" {

@@ -10043,6 +10043,7 @@ components:
         - $setOnInsert
         - $unset
         - $inc
+        - $push
         - $addToSet
         - $max
       x-enum-varnames:
@@ -10050,6 +10051,7 @@ components:
         - SET_ON_INSERT
         - UNSET
         - INC
+        - PUSH
         - ADD_TO_SET
         - MAX
       description: MongoDB-style update operator
@@ -14653,7 +14655,7 @@ components:
         op:
           type: string
           description: >
-            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`,
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`,
             `$max`.
 
             Replication-specific: `$merge` (flatten JSONB into top-level fields),

@@ -578,6 +578,7 @@ const meta_next_seg_id = "next_seg_id";
 const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
 const meta_segment_range_prefix = "segment_range:";
+pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
 const meta_db_name = "meta";
 const deletions_db_name = "deletions";
@@ -862,6 +863,64 @@ pub const PersistentIndex = struct {
 
     pub fn backendStore(self: *PersistentIndex) BackendStore {
         return BackendStore.init(self);
+    }
+
+    /// Read generation-owned metadata from the same durable namespace as the
+    /// active segment catalog. The returned bytes are owned by `alloc`.
+    pub fn readGenerationMetadataAlloc(
+        self: *PersistentIndex,
+        alloc: Allocator,
+        key: []const u8,
+    ) !?[]u8 {
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const value = txn.get(.meta, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try alloc.dupe(u8, value);
+    }
+
+    /// Persist generation-owned metadata before any segment whose semantics
+    /// depend on it is admitted to the generation.
+    pub fn writeGenerationMetadata(
+        self: *PersistentIndex,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, key, value);
+        try txn.commit();
+    }
+
+    pub fn deleteGenerationMetadata(self: *PersistentIndex, key: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        txn.delete(.meta, key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try txn.commit();
+    }
+
+    /// Physical segments, including fully-deleted segments, are projection
+    /// history. They prevent changing a generation's analyzer semantics.
+    pub fn hasPhysicalSegments(self: *PersistentIndex) bool {
+        const snap = self.writer.acquireSnapshot();
+        defer snap.release();
+        return snap.segments.len != 0;
     }
 
     fn openMainStore(alloc: Allocator, index_path_z: [*:0]const u8, index_path: []const u8, opts: PersistentIndexOptions) !OpenedMainStore {

@@ -1368,6 +1368,7 @@ const (
 	TransformOpTypeADDTOSET    TransformOpType = "$addToSet"
 	TransformOpTypeINC         TransformOpType = "$inc"
 	TransformOpTypeMAX         TransformOpType = "$max"
+	TransformOpTypePUSH        TransformOpType = "$push"
 	TransformOpTypeSET         TransformOpType = "$set"
 	TransformOpTypeSETONINSERT TransformOpType = "$setOnInsert"
 	TransformOpTypeUNSET       TransformOpType = "$unset"
@@ -8765,7 +8766,7 @@ type ReplicationSourceStatus struct {
 
 // ReplicationTransformOp defines model for ReplicationTransformOp.
 type ReplicationTransformOp struct {
-	// Op Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`.
+	// Op Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`.
 	// Replication-specific: `$merge` (flatten JSONB into top-level fields),
 	// `$delete_document` (delete entire Antfly doc, `on_delete` only).
 	Op string `json:"op"`

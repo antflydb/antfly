@@ -21326,6 +21326,12 @@ test "bound table write source backs up and restores a local table" {
         std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     }
 
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
         .timestamp_ns = 1,
@@ -21367,6 +21373,13 @@ test "bound table write source backs up and restores a local table" {
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
 }
 
 test "bound table write source backs up and restores a portable local table" {
@@ -21390,6 +21403,12 @@ test "bound table write source backs up and restores a portable local table" {
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
         std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     }
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -21438,6 +21457,13 @@ test "bound table write source backs up and restores a portable local table" {
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
 }
 
 test "provisioned table write source backs up and restores a local table" {
