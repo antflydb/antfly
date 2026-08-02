@@ -714,6 +714,9 @@ jobs:
       # Keep production optimization while preserving runtime-safety checks and
       # std.debug.assert invariants exercised by the full E2E suite.
       ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      # Match release artifact symbol handling without disabling ReleaseSafe
+      # checks or std.debug.assert invariants.
+      ANTFLY_CI_ZIG_STRIP: "true"
     steps:
       - uses: actions/checkout@v6
         with:
