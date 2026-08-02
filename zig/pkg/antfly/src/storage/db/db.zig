@@ -71106,9 +71106,7 @@ test "db production ingest preserves high-frequency keyword recall across clean 
     // Exercise the same catalog/schema/index reload used by a clean service
     // restart. No re-upsert or write-side repair is allowed between checks.
     for (0..2) |_| {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{
-            .open_mode = .query_readonly,
-        });
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
         defer reopened.close();
         try expectHighFrequencyKeywordRecall(&reopened, alloc);
     }

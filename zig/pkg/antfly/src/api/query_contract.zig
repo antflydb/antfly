@@ -2414,7 +2414,12 @@ pub fn parseQueryRequestWithDeadline(
     // Packed dense requests are benchmark-oriented and unusual in production.
     // Skip the extra JSON parse unless the request even mentions embeddings.
     if (std.mem.indexOf(u8, effective_body, "\"embeddings\"") != null and fastDensePublicQueryMayApply(effective_body)) {
-        if (try tryParseFastDensePublicQueryRequest(alloc, effective_body)) |fast| {
+        if (try tryParseFastDensePublicQueryRequest(
+            alloc,
+            effective_body,
+            execution_deadline_ns,
+            cancellation,
+        )) |fast| {
             var owned = fast;
             errdefer owned.deinit(alloc);
             owned.req.execution_deadline_ns = execution_deadline_ns;
@@ -3095,8 +3100,15 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
 fn tryParseFastDensePublicQueryRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !?OwnedQueryRequest {
-    var parsed = ant_json.parseFromSlice(FastDensePublicQueryRequest, alloc, body, .{}) catch return null;
+    var parsed_value = parseJsonValueCancellable(alloc, body, deadline_ns, cancellation) catch |err| switch (err) {
+        error.Cancelled, error.Timeout => return err,
+        else => return null,
+    };
+    defer parsed_value.deinit();
+    var parsed = ant_json.parseFromValue(FastDensePublicQueryRequest, alloc, parsed_value.value, .{}) catch return null;
     defer parsed.deinit();
 
     const request = parsed.value;
@@ -8964,6 +8976,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     defer source.deinit();
     var parsed = std.json.parseFromTokenSource(std.json.Value, alloc, &source, .{}) catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,
+        error.Timeout => return error.Timeout,
         else => return error.InvalidQueryRequest,
     };
     defer parsed.deinit();
@@ -9381,7 +9394,10 @@ fn parsePublicDocFilterBindingsAlloc(
 
     var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     try deadline.check();
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = parseJsonValueCancellable(alloc, body, deadline_ns, cancellation) catch |err| switch (err) {
+        error.Cancelled, error.Timeout => return err,
+        else => return error.InvalidQueryRequest,
+    };
     defer parsed.deinit();
     try deadline.check();
     if (parsed.value != .object) return error.InvalidQueryRequest;
