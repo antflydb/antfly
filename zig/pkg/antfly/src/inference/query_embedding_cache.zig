@@ -39,6 +39,14 @@ pub const Stats = struct {
 
 pub const ComputeFn = *const fn (context: *anyopaque, alloc: std.mem.Allocator) anyerror![]f32;
 
+/// Work retained by a cache-owned producer. Unlike a request-owned compute
+/// context, this remains valid after an individual waiter is cancelled.
+pub const OwnedCompute = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]f32,
+    deinit: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) void,
+};
+
 const Entry = struct {
     key: Key,
     vector: []f32,
@@ -56,6 +64,10 @@ const Flight = struct {
     result: ?[]f32 = null,
     err: ?anyerror = null,
     ready: std.Io.Event = .unset,
+    cache: ?*QueryEmbeddingCache = null,
+    key: Key = undefined,
+    budget: ?*cache_budget.CacheBudget = null,
+    work: ?OwnedCompute = null,
 };
 
 /// Thread-safe byte-bounded LRU with per-key in-flight request coalescing.
@@ -75,6 +87,7 @@ pub const QueryEmbeddingCache = struct {
     live_bytes: usize = 0,
     active_pins: usize = 0,
     uncached_inflight: usize = 0,
+    shutting_down: std.atomic.Value(bool) = .init(false),
     counters: Stats = .{},
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, config: Config) QueryEmbeddingCache {
@@ -86,8 +99,15 @@ pub const QueryEmbeddingCache = struct {
     }
 
     pub fn deinit(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) void {
+        self.shutting_down.store(true, .release);
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            const active = self.flights.count();
+            self.mutex.unlock(self.io);
+            if (active == 0) break;
+            self.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
         self.mutex.lockUncancelable(self.io);
-        std.debug.assert(self.flights.count() == 0);
         std.debug.assert(self.uncached_inflight == 0);
         std.debug.assert(self.active_pins == 0);
         while (self.oldest) |entry| self.removeEntryLocked(entry, budget, false);
@@ -95,6 +115,10 @@ pub const QueryEmbeddingCache = struct {
         self.flights.deinit(self.alloc);
         self.mutex.unlock(self.io);
         self.* = undefined;
+    }
+
+    pub fn shutdownSignal(self: *const QueryEmbeddingCache) *const std.atomic.Value(bool) {
+        return &self.shutting_down;
     }
 
     pub fn getOrCompute(
@@ -107,6 +131,145 @@ pub const QueryEmbeddingCache = struct {
         compute: ComputeFn,
     ) ![]f32 {
         return self.getOrComputeCancellable(budget, caller_alloc, key, deadline_ns, null, context, compute);
+    }
+
+    /// Join a cache-owned producer. The creating request is a waiter too, so
+    /// its cancellation or deadline cannot become the result of the shared
+    /// flight.
+    pub fn getOrStartCancellable(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
+        work: OwnedCompute,
+    ) ![]f32 {
+        if (!self.config.enabled) {
+            defer work.deinit(work.ptr, self.alloc);
+            return work.run(work.ptr, caller_alloc);
+        }
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        if (self.entries.get(key)) |entry| {
+            const now = platform_time.monotonicNs();
+            if (now < entry.expires_at_ns) {
+                self.touchLocked(entry, now);
+                self.counters.hits +|= 1;
+                self.pinEntryLocked(entry);
+                self.mutex.unlock(io);
+                defer work.deinit(work.ptr, self.alloc);
+                const result = caller_alloc.dupe(f32, entry.vector) catch |err| {
+                    self.mutex.lockUncancelable(io);
+                    self.unpinEntryLocked(entry, budget);
+                    self.mutex.unlock(io);
+                    return err;
+                };
+                self.mutex.lockUncancelable(io);
+                self.unpinEntryLocked(entry, budget);
+                self.mutex.unlock(io);
+                return result;
+            }
+            self.removeEntryLocked(entry, budget, true);
+        }
+        if (self.flights.get(key)) |flight| {
+            flight.refs += 1;
+            self.counters.coalesced_waiters +|= 1;
+            self.mutex.unlock(io);
+            defer work.deinit(work.ptr, self.alloc);
+            return self.waitForOwnedFlightResult(key, flight, caller_alloc, deadline_ns, cancellation);
+        }
+        if (deadlineExpired(deadline_ns)) {
+            self.mutex.unlock(io);
+            work.deinit(work.ptr, self.alloc);
+            return error.Timeout;
+        }
+        if (self.totalInflightLocked() >= self.config.max_inflight) {
+            self.counters.inflight_rejections +|= 1;
+            self.mutex.unlock(io);
+            work.deinit(work.ptr, self.alloc);
+            return error.QueryEmbeddingOverloaded;
+        }
+        const flight = self.alloc.create(Flight) catch |err| {
+            self.counters.rejected_admissions +|= 1;
+            self.mutex.unlock(io);
+            work.deinit(work.ptr, self.alloc);
+            return err;
+        };
+        flight.* = .{ .refs = 2, .cache = self, .key = key, .budget = budget, .work = work };
+        self.flights.put(self.alloc, key, flight) catch |err| {
+            self.alloc.destroy(flight);
+            self.counters.rejected_admissions +|= 1;
+            self.mutex.unlock(io);
+            work.deinit(work.ptr, self.alloc);
+            return err;
+        };
+        self.counters.misses +|= 1;
+        self.counters.producer_computations +|= 1;
+        self.mutex.unlock(io);
+        const worker: ?std.Thread = std.Thread.spawn(.{}, runOwnedFlight, .{flight}) catch |err| blk: {
+            self.mutex.lockUncancelable(io);
+            const owned = flight.work.?;
+            flight.work = null;
+            owned.deinit(owned.ptr, self.alloc);
+            flight.err = err;
+            flight.done = true;
+            flight.ready.set(io);
+            self.releaseFlightLocked(key, flight);
+            self.mutex.unlock(io);
+            break :blk null;
+        };
+        if (worker) |thread| thread.detach();
+        return self.waitForOwnedFlightResult(key, flight, caller_alloc, deadline_ns, cancellation);
+    }
+
+    fn waitForOwnedFlightResult(
+        self: *QueryEmbeddingCache,
+        key: Key,
+        flight: *Flight,
+        caller_alloc: std.mem.Allocator,
+        deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
+    ) ![]f32 {
+        self.waitForFlight(flight, deadline_ns, cancellation) catch |err| {
+            self.mutex.lockUncancelable(self.io);
+            if (err == error.Timeout) self.counters.waiter_timeouts +|= 1;
+            self.releaseFlightLocked(key, flight);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        const result = copyFlightResult(caller_alloc, flight) catch |err| {
+            self.mutex.lockUncancelable(self.io);
+            self.releaseFlightLocked(key, flight);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.lockUncancelable(self.io);
+        self.releaseFlightLocked(key, flight);
+        self.mutex.unlock(self.io);
+        return result;
+    }
+
+    fn runOwnedFlight(flight: *Flight) void {
+        const self = flight.cache.?;
+        const io = self.io;
+        const work = flight.work.?;
+        const started_ns = platform_time.monotonicNs();
+        const computed = work.run(work.ptr, self.alloc);
+        work.deinit(work.ptr, self.alloc);
+        self.mutex.lockUncancelable(io);
+        flight.work = null;
+        self.recordProducerDurationLocked(started_ns);
+        if (computed) |result| {
+            flight.result = result;
+            self.admitLocked(flight.key, result, flight.budget.?) catch {
+                self.counters.rejected_admissions +|= 1;
+            };
+        } else |err| flight.err = err;
+        flight.done = true;
+        flight.ready.set(io);
+        self.releaseFlightLocked(flight.key, flight);
+        self.mutex.unlock(io);
     }
 
     pub fn getOrComputeCancellable(

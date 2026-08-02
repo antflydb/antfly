@@ -182,6 +182,43 @@ const DenseQueryComputeContext = struct {
     }
 };
 
+/// A cache flight owns every value it needs because the request that starts it
+/// may return as soon as its own cancellation/deadline fires.
+const DenseQueryFlightWork = struct {
+    runtime: managed_embedder.ManagedEmbedder,
+    index_name: []u8,
+    text: []u8,
+
+    fn create(
+        alloc: std.mem.Allocator,
+        runtime: managed_embedder.ManagedEmbedder,
+        index_name: []const u8,
+        text: []const u8,
+    ) !query_embedding_cache.OwnedCompute {
+        const self = try alloc.create(@This());
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .runtime = runtime,
+            .index_name = try alloc.dupe(u8, index_name),
+            .text = try alloc.dupe(u8, text),
+        };
+        return .{ .ptr = self, .run = run, .deinit = deinit };
+    }
+
+    fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return embedInteractive(&self.runtime, alloc, self.index_name, self.text);
+    }
+
+    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.runtime.deinit();
+        alloc.free(self.index_name);
+        alloc.free(self.text);
+        alloc.destroy(self);
+    }
+};
+
 const TemplateQueryComputeContext = struct {
     runtime: *const managed_embedder.ManagedEmbedder,
     index_name: []const u8,
@@ -275,25 +312,26 @@ pub fn planSemanticQuery(
                 break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
             const budget = planning.query_embedding_budget orelse
                 break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
-            // A coalesced flight is computed synchronously by the caller that
-            // creates it. Its provider runtime therefore belongs to that
-            // caller and observes its cancellation signal. Do not let a
-            // disconnecting public caller poison healthy followers with the
-            // producer's Cancelled result; retain per-request cancellation by
-            // using the bounded uncached path instead.
-            if (planning.query_cancellation != null) {
-                break :blk try cache.computeUncached(
-                    alloc,
-                    embedding_deadline_ns,
-                    &compute_context,
-                    DenseQueryComputeContext.run,
-                );
-            }
             const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
                 error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
                 else => return err,
             };
-            break :blk try cache.getOrComputeCancellable(budget, alloc, key, embedding_deadline_ns, planning.query_cancellation, &compute_context, DenseQueryComputeContext.run);
+            var producer_runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(cache.alloc, table.indexes_json, .{
+                .antfly_provider = planning.antfly_provider,
+                .io = planning.io,
+                .deadline_ns = now_ns +| default_query_embedding_timeout_ns,
+                .cancellation = cache.shutdownSignal(),
+                .remote_content = planning.remote_content,
+                .inference_api_url = planning.inference_api_url,
+                .inference_api_key = planning.inference_api_key,
+                .secret_store = planning.secret_store,
+            });
+            const work = DenseQueryFlightWork.create(cache.alloc, producer_runtime, index_name, semantic_search) catch |err| {
+                producer_runtime.deinit();
+                return err;
+            };
+            producer_runtime = undefined;
+            break :blk try cache.getOrStartCancellable(budget, alloc, key, embedding_deadline_ns, planning.query_cancellation, work);
         },
         .k = limit,
     };
@@ -415,8 +453,8 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     cancellable_request.query_cancellation = &request_cancellation;
     const cancellable = try planSemanticQuery(cancellable_request, alloc, "docs_a", "semantic_idx", "same query", null, 5);
     defer alloc.free(cancellable.vector);
-    try std.testing.expectEqual(@as(usize, 5), provider.calls);
-    try std.testing.expectEqual(@as(u64, 3), cache.stats(&budget).uncached_computations);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).uncached_computations);
 
     const oversized = try alloc.alloc(u8, max_query_embedding_input_bytes + 1);
     defer alloc.free(oversized);
@@ -425,7 +463,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", oversized, null, 5),
     );
-    try std.testing.expectEqual(@as(usize, 5), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
 
     const oversized_template = try alloc.alloc(u8, max_query_embedding_template_bytes + 1);
     defer alloc.free(oversized_template);
@@ -434,7 +472,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, 5),
     );
-    try std.testing.expectEqual(@as(usize, 5), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
 
     var expired = base;
     expired.query_embedding_deadline_ns = 1;
@@ -442,7 +480,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.Timeout,
         planSemanticQuery(expired, alloc, "docs_a", "semantic_idx", "same query", null, 5),
     );
-    try std.testing.expectEqual(@as(usize, 5), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
 }
 
 const SemanticStatusResolver = struct {
