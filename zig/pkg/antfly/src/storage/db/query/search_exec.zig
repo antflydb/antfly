@@ -13262,7 +13262,9 @@ fn exactScoreNativeDenseFilter(
     defer alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
         @memset(candidate_metadata, null);
+        try hbc_mod.checkCancelled(req);
         try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+        try hbc_mod.checkCancelled(req);
     }
 
     const vector_scratch = try alloc.alloc(f32, entry.dims);
@@ -13271,6 +13273,7 @@ fn exactScoreNativeDenseFilter(
     var vectors_scored: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
+        if (i % 64 == 0) try hbc_mod.checkCancelled(req);
         if (req.filter_prefix.len > 0) {
             const metadata = candidate_metadata[i] orelse continue;
             if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;

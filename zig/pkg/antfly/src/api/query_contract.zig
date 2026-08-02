@@ -9223,6 +9223,7 @@ fn parsePublicDocFilterBindingsAlloc(
         alloc,
         out.items,
         deadline_ns,
+        cancellation,
     );
     defer alloc.free(order);
     try deadline.check();
@@ -9249,6 +9250,7 @@ fn collectPublicDocFilterRefs(
         by_name,
         dependencies,
         null,
+        null,
     );
 }
 
@@ -9258,9 +9260,10 @@ fn collectPublicDocFilterRefsWithDeadline(
     by_name: *const std.StringHashMapUnmanaged(usize),
     dependencies: ?*std.AutoHashMapUnmanaged(usize, void),
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !void {
     var remaining_nodes: usize = public_query_max_tree_nodes;
-    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     return collectPublicDocFilterRefsBounded(
         alloc,
         value,
@@ -9347,8 +9350,9 @@ fn sortPublicDocFilterBindingsByDependenciesAlloc(
     alloc: std.mem.Allocator,
     bindings: []const db_mod.types.NamedDocFilterBinding,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) ![]usize {
-    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     try deadline.check();
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
@@ -9395,6 +9399,7 @@ fn sortPublicDocFilterBindingsByDependenciesAlloc(
             &by_name,
             &dependencies,
             deadline_ns,
+            cancellation,
         );
         var dependency_it = dependencies.keyIterator();
         while (dependency_it.next()) |dependency_index| {
@@ -9466,6 +9471,7 @@ fn validatePublicDocFilterRootRefsAlloc(
             &by_name,
             null,
             deadline_ns,
+            cancellation,
         );
     }
 }

@@ -2198,7 +2198,7 @@ fn scoreLeafMemberIds(
         exact_query_measure,
         vector_views[0..scored_count],
         exact_distances[0..scored_count],
-        req.cancellation,
+        req,
     );
     try search_types.checkCancelled(req);
     for (scored_positions[0..scored_count], 0..) |member_index, dist_index| {
@@ -2328,7 +2328,7 @@ pub fn rerankResults(
             }
             const dist_start = now_fn_u64();
             try search_types.checkCancelled(req);
-            try search_runtime.exactDistancesToStoredVectorsCancellable(self.config, query, query_measure, vector_views[0..loaded_count], exact_distances[0..loaded_count], req.cancellation);
+            try search_runtime.exactDistancesToStoredVectorsCancellable(self.config, query, query_measure, vector_views[0..loaded_count], exact_distances[0..loaded_count], req);
             try search_types.checkCancelled(req);
             profile.rerank_distance_ns += elapsed_fn_u64(dist_start);
         }
