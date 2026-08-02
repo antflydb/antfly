@@ -2178,11 +2178,26 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
                     timeout_value_pending = false;
                 }
             },
-            .partial_string => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part),
-            .partial_string_escaped_1 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
-            .partial_string_escaped_2 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
-            .partial_string_escaped_3 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
-            .partial_string_escaped_4 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string => |part| {
+                if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part)
+                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+            },
+            .partial_string_escaped_1 => |part| {
+                if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
+                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+            },
+            .partial_string_escaped_2 => |part| {
+                if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
+                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+            },
+            .partial_string_escaped_3 => |part| {
+                if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
+                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+            },
+            .partial_string_escaped_4 => |part| {
+                if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..])
+                else if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+            },
             .string => |part| {
                 if (depth == 1 and root_expects_key) {
                     try key.appendSlice(alloc, part);
@@ -2193,7 +2208,7 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
                     return std.fmt.parseUnsigned(u64, part, 10) catch error.InvalidQueryRequest;
                 } else if (depth == 1) root_expects_key = true;
             },
-            .partial_number => {},
+            .partial_number => if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest,
             .number => |value| {
                 if (depth == 1 and timeout_value_pending) return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidQueryRequest;
                 if (depth == 1) root_expects_key = true;
@@ -12864,6 +12879,16 @@ test "api query contract rejects invalid timeout_ms" {
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":1.5}
     ));
+}
+
+test "api query contract rejects a chunked timeout scalar" {
+    const alloc = std.testing.allocator;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, "{\"query\":{\"match_all\":{}},\"timeout_ms\":\"");
+    try body.appendNTimes(alloc, 'x', query_timeout_scan_chunk_bytes);
+    try body.appendSlice(alloc, "60000\"}");
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", body.items));
 }
 
 test "api query contract rejects legacy native doc id constraint fields" {
