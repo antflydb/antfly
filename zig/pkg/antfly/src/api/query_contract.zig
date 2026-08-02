@@ -2461,7 +2461,7 @@ pub fn parseQueryRequestWithDeadline(
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
 
-    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit);
+    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit, execution_deadline_ns, cancellation);
     errdefer normalized_query.deinit(alloc);
     try ensureQueryActive(execution_deadline_ns, cancellation);
 
@@ -2879,7 +2879,7 @@ fn buildPreflightSearchRequestAlloc(
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
 
-    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit);
+    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit, null, null);
     errdefer normalized_query.deinit(alloc);
 
     if (normalized_query.full_text) |query| {
@@ -5389,7 +5389,10 @@ fn normalizePublicQueryBucketsAlloc(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,
     limit: u32,
+    deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !NormalizedPublicQueryBuckets {
+    try ensureQueryActive(deadline_ns, cancellation);
     var scoring_must = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
     errdefer deinitTextQueryArrayList(alloc, &scoring_must);
     var scoring_should = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
@@ -5414,9 +5417,10 @@ fn normalizePublicQueryBucketsAlloc(
             &exclusion_clauses,
             &exclusion_text_queries,
         );
+        try ensureQueryActive(deadline_ns, cancellation);
     }
     if (request.full_text_search) |full_text_search| {
-        try validatePublicQueryTraversalBudgetAlloc(alloc, full_text_search);
+        try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, full_text_search, deadline_ns, cancellation);
         try appendFullTextSearchClausesAlloc(
             alloc,
             &scoring_must,
@@ -5425,6 +5429,7 @@ fn normalizePublicQueryBucketsAlloc(
             full_text_search,
             limit,
         );
+        try ensureQueryActive(deadline_ns, cancellation);
     }
     if (request.filter_query) |filter_query| {
         appendPublicFilterOrTextClausesAlloc(
@@ -5438,6 +5443,7 @@ fn normalizePublicQueryBucketsAlloc(
             error.UnsupportedQueryRequest => return error.UnsupportedFilterQueryRequest,
             else => return err,
         };
+        try ensureQueryActive(deadline_ns, cancellation);
     }
     if (request.exclusion_query) |exclusion_query| {
         appendPublicFilterOrTextClausesAlloc(
@@ -5451,6 +5457,7 @@ fn normalizePublicQueryBucketsAlloc(
             error.UnsupportedQueryRequest => return error.UnsupportedExclusionQueryRequest,
             else => return err,
         };
+        try ensureQueryActive(deadline_ns, cancellation);
     }
 
     var full_text = try buildScoringTextQueryAlloc(
