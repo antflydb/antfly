@@ -10985,8 +10985,33 @@ pub const ApiHttpServer = struct {
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
-        const parsed = try parseJsonResponseBody(metadata_openapi.QueryResponses, arena_impl.allocator(), response_body);
-        return try jsonResponse(self.alloc, parsed);
+        var parsed = query_contract.parseJsonValueCancellable(
+            arena_impl.allocator(),
+            response_body,
+            request_deadline_ns,
+            if (cancellation) |value| value.signal() else null,
+        ) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return try self.publicQueryDispatchErrorResponse(table_name, body, err),
+            else => return try textResponse(self.alloc, 500, "query failed"),
+        };
+        defer parsed.deinit();
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        var cancellable_out = CancellableResponseWriter.init(&out.writer, request_deadline_ns, cancellation);
+        std.json.Stringify.value(parsed.value, .{}, &cancellable_out.writer) catch |err| {
+            if (cancellable_out.cancellation_observed)
+                return try self.publicQueryDispatchErrorResponse(table_name, body, error.Cancelled);
+            if (cancellable_out.timeout_observed)
+                return try self.publicQueryDispatchErrorResponse(table_name, body, error.Timeout);
+            return err;
+        };
+        cancellable_out.checkCancellation() catch {
+            if (cancellable_out.cancellation_observed)
+                return try self.publicQueryDispatchErrorResponse(table_name, body, error.Cancelled);
+            return try self.publicQueryDispatchErrorResponse(table_name, body, error.Timeout);
+        };
+        return try jsonBodyResponseWithStatus(self.alloc, 200, out.written());
     }
 
     fn handlePublicTableMultiQuery(
