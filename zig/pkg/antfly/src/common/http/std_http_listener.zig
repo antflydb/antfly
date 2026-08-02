@@ -72,6 +72,10 @@ fn sleepMs(ms: u64) void {
     };
 }
 
+fn isRequestCancellation(err: anyerror) bool {
+    return err == error.Cancelled or err == error.Canceled;
+}
+
 pub const StdHttpListenerConfig = struct {
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
@@ -481,6 +485,11 @@ pub const StdHttpListener = struct {
         @memcpy(request_target_buf[0..request_target_len], request.head.target[0..request_target_len]);
         const request_target = request_target_buf[0..request_target_len];
         self.handleRequest(&owned_stream, &request) catch |err| {
+            // Request-lifecycle cancellation is an expected terminal state:
+            // the peer has gone away or the owning I/O task is being torn
+            // down. Do not turn disconnect storms into error-log storms or
+            // spend work attempting a 500 on a connection that cannot use it.
+            if (isRequestCancellation(err)) return;
             if (self.stopping.load(.acquire)) {
                 std.log.warn("http request canceled during listener stop method={s} target={s} err={s}", .{
                     request_method,
@@ -702,6 +711,10 @@ pub const StdHttpListener = struct {
             };
             const handled = streaming_app.execute(self.alloc, http_req, stream_writer.iface()) catch |err| {
                 if (stream_writer.started()) {
+                    // Once a streaming request is cancelled, closing the
+                    // connection is the response boundary. Finalizing a
+                    // partial body would incorrectly present it as complete.
+                    if (isRequestCancellation(err)) return;
                     std.log.err("http streaming request handler error after response start: {s}", .{@errorName(err)});
                     _ = stream_writer.end() catch {};
                     return;
@@ -965,6 +978,13 @@ test "std http listener wake address maps wildcard binds to loopback" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "std http listener classifies request cancellation as expected termination" {
+    try std.testing.expect(isRequestCancellation(error.Cancelled));
+    try std.testing.expect(isRequestCancellation(error.Canceled));
+    try std.testing.expect(!isRequestCancellation(error.Timeout));
+    try std.testing.expect(!isRequestCancellation(error.Unexpected));
 }
 
 test "std http listener and executor round-trip raft batch route" {
