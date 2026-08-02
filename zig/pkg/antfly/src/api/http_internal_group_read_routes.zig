@@ -275,6 +275,20 @@ pub fn planSemanticQuery(
                 break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
             const budget = planning.query_embedding_budget orelse
                 break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            // A coalesced flight is computed synchronously by the caller that
+            // creates it. Its provider runtime therefore belongs to that
+            // caller and observes its cancellation signal. Do not let a
+            // disconnecting public caller poison healthy followers with the
+            // producer's Cancelled result; retain per-request cancellation by
+            // using the bounded uncached path instead.
+            if (planning.query_cancellation != null) {
+                break :blk try cache.computeUncached(
+                    alloc,
+                    embedding_deadline_ns,
+                    &compute_context,
+                    DenseQueryComputeContext.run,
+                );
+            }
             const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
                 error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
                 else => return err,
@@ -396,6 +410,14 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     try std.testing.expectEqual(@as(usize, 4), provider.calls);
     try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).uncached_computations);
 
+    var request_cancellation = std.atomic.Value(bool).init(false);
+    var cancellable_request = base;
+    cancellable_request.query_cancellation = &request_cancellation;
+    const cancellable = try planSemanticQuery(cancellable_request, alloc, "docs_a", "semantic_idx", "same query", null, 5);
+    defer alloc.free(cancellable.vector);
+    try std.testing.expectEqual(@as(usize, 5), provider.calls);
+    try std.testing.expectEqual(@as(u64, 3), cache.stats(&budget).uncached_computations);
+
     const oversized = try alloc.alloc(u8, max_query_embedding_input_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
@@ -403,7 +425,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", oversized, null, 5),
     );
-    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(usize, 5), provider.calls);
 
     const oversized_template = try alloc.alloc(u8, max_query_embedding_template_bytes + 1);
     defer alloc.free(oversized_template);
@@ -412,7 +434,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, 5),
     );
-    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(usize, 5), provider.calls);
 
     var expired = base;
     expired.query_embedding_deadline_ns = 1;
@@ -420,7 +442,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.Timeout,
         planSemanticQuery(expired, alloc, "docs_a", "semantic_idx", "same query", null, 5),
     );
-    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(usize, 5), provider.calls);
 }
 
 const SemanticStatusResolver = struct {
