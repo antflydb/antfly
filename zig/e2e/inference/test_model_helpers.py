@@ -125,7 +125,7 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
     specs = _env_model_specs()
     gemma = next(spec for spec in specs if spec.repo == "ggml-org/gemma-4-e2b-it-gguf")
 
-    assert gemma.pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_K_M"
+    assert gemma.pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0"
 
 
 def test_generation_defaults_share_one_model():
@@ -134,6 +134,8 @@ def test_generation_defaults_share_one_model():
 
 
 def test_explicit_large_generator_is_bootstrapped(monkeypatch):
+    for env_name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
     monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL)
     monkeypatch.setattr(models, "model_available", lambda spec: False)

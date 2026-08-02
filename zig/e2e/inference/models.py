@@ -222,7 +222,7 @@ GENERATOR_MODELS = [
         name="gemma-4-e2b-it-gguf",
         repo="ggml-org/gemma-4-e2b-it-gguf",
         task="generators",
-        variant="gguf:Q4_K_M",
+        variant="gguf:Q4_0",
         large=True,
     ),
     ModelSpec(

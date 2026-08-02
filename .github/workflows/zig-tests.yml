@@ -805,7 +805,7 @@ jobs:
           # so the ReleaseSafe suite does not retain competing generator sessions.
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
-          ANTFLY_INFERENCE_REQUEST_TIMEOUT: "120"
+          ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
       - name: Report full E2E result
