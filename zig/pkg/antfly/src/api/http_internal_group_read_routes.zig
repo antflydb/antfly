@@ -279,7 +279,7 @@ pub fn planSemanticQuery(
                 error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
                 else => return err,
             };
-            break :blk try cache.getOrCompute(budget, alloc, key, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            break :blk try cache.getOrComputeCancellable(budget, alloc, key, embedding_deadline_ns, planning.query_cancellation, &compute_context, DenseQueryComputeContext.run);
         },
         .k = limit,
     };

@@ -5500,6 +5500,7 @@ fn distributedMergeHeapSiftDown(
 ) !void {
     var index: usize = 0;
     while (true) {
+        try checkSearchRequestDeadline(req);
         const left = index * 2 + 1;
         if (left >= heap.len) break;
         const right = left + 1;
@@ -12892,6 +12893,7 @@ fn searchDenseInternal(
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
             .cancellation = req.cancellation,
+            .execution_deadline_ns = req.execution_deadline_ns,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
@@ -12989,6 +12991,7 @@ fn searchDenseInternal(
             else => return err,
         };
         profile.hbc_search_ns += platform_time.monotonicNs() - hbc_search_start;
+        try checkSearchRequestDeadline(req);
         defer results.deinit();
 
         const raw_hits = results.getHits();

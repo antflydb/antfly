@@ -13922,6 +13922,7 @@ pub const IndexManager = struct {
         dims: usize,
         scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
         profile: ?*hbc_mod.SearchProfile,
+        request: hbc_mod.SearchRequest,
     ) !void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
@@ -13950,6 +13951,7 @@ pub const IndexManager = struct {
         const artifact_reads = try key_alloc.alloc(DenseArtifactReadKey, vector_ids.len);
         var key_count: usize = 0;
         for (metadata, 0..) |maybe_doc_key, i| {
+            if (i % 64 == 0) try hbc_mod.checkCancelled(request);
             if (load_session) |session| {
                 if (session.getVector(vector_ids[i])) |cached| {
                     if (cached.len != dims) return error.InvalidVectorDimensions;
@@ -13986,6 +13988,7 @@ pub const IndexManager = struct {
             key_count += 1;
         }
         if (key_count == 0) return;
+        try hbc_mod.checkCancelled(request);
         std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
         if (profile) |p| p.rerank_artifact_key_ns += platform_time.monotonicNs() - key_start;
 
@@ -14046,6 +14049,7 @@ pub const IndexManager = struct {
             }
             return;
         }
+        try hbc_mod.checkCancelled(request);
         if (profile) |p| {
             p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
             if (manager.lsm_cache) |cache| {

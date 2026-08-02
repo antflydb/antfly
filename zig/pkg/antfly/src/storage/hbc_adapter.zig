@@ -1506,6 +1506,7 @@ pub const HBCIndex = struct {
         dims: usize,
         scratch: ExternalVectorBatchDistanceScratch,
         profile: ?*vectorindex_search_types.SearchProfile,
+        request: vectorindex_search_types.SearchRequest,
     ) anyerror!void;
     pub const BorrowedNode = BorrowedNodeLease;
     pub const BorrowedQuantized = BorrowedQuantizedLease;
@@ -4917,6 +4918,7 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
         batch_scratch: []f32,
         profile: ?*SearchProfile,
+        request: vectorindex_search_types.SearchRequest,
     ) !bool {
         const loader = self.external_vector_batch_distance_loader orelse return false;
         const ctx = self.external_vector_ctx orelse return false;
@@ -4927,6 +4929,7 @@ pub const HBCIndex = struct {
 
         const vector_ids = vector_id_storage[0..rerank_positions.len];
         for (rerank_positions, 0..) |index, slot| {
+            if (slot % 64 == 0) try vectorindex_search_types.checkCancelled(request);
             vector_ids[slot] = ranked_items[index].vector_id;
             distances[slot] = std.math.inf(f32);
         }
@@ -4941,6 +4944,7 @@ pub const HBCIndex = struct {
             key_views_storage,
             values_storage,
         );
+        try vectorindex_search_types.checkCancelled(request);
         if (profile) |p| p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - metadata_start;
         loader(
             ctx,
@@ -4957,6 +4961,7 @@ pub const HBCIndex = struct {
                 .raw_values = values_storage,
             },
             profile,
+            request,
         ) catch |err| switch (err) {
             error.Unsupported => return false,
             else => return err,
@@ -4976,6 +4981,7 @@ pub const HBCIndex = struct {
         key_views_storage: [][]const u8,
         values_storage: []?[]const u8,
         batch_scratch: []f32,
+        request: vectorindex_search_types.SearchRequest,
     ) !bool {
         const loader = self.external_vector_batch_distance_loader orelse return false;
         const ctx = self.external_vector_ctx orelse return false;
@@ -4983,7 +4989,10 @@ pub const HBCIndex = struct {
         if (metadata_storage.len < vector_ids.len) return error.InvalidArgument;
         if (vector_ids.len == 0) return true;
 
-        for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
+        for (distances[0..vector_ids.len], 0..) |*distance, i| {
+            if (i % 64 == 0) try vectorindex_search_types.checkCancelled(request);
+            distance.* = std.math.inf(f32);
+        }
         const metadata = metadata_storage[0..vector_ids.len];
         try self.getMetadataManySortedInTxnWithScratch(
             txn,
@@ -4993,6 +5002,7 @@ pub const HBCIndex = struct {
             key_views_storage,
             values_storage,
         );
+        try vectorindex_search_types.checkCancelled(request);
         loader(
             ctx,
             vector_ids,
@@ -5008,6 +5018,7 @@ pub const HBCIndex = struct {
                 .raw_values = values_storage,
             },
             null,
+            request,
         ) catch |err| switch (err) {
             error.Unsupported => return false,
             else => return err,

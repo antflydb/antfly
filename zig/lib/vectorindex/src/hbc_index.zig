@@ -2152,7 +2152,9 @@ fn scoreLeafMemberIds(
             scratch.key_views,
             scratch.values,
             scratch.vector_batch,
+            req,
         );
+        try search_types.checkCancelled(req);
     }
 
     if (external_scored) {
@@ -2285,7 +2287,9 @@ pub fn rerankResults(
                 scratch.values,
                 scratch.vector_batch,
                 profile,
+                req,
             );
+            try search_types.checkCancelled(req);
             const score_elapsed = elapsed_fn_u64(score_start);
             profile.rerank_prefetch_ns += score_elapsed;
             profile.rerank_vector_load_ns += score_elapsed;

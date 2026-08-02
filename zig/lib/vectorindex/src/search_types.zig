@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const search_results = @import("search_results.zig");
@@ -38,11 +39,16 @@ pub const SearchRequest = struct {
     /// Borrowed request-lifecycle signal. Search loops poll this at bounded
     /// intervals so a disconnected caller does not retain query capacity.
     cancellation: ?*const std.atomic.Value(bool) = null,
+    /// Absolute request deadline propagated from the public query path.
+    execution_deadline_ns: ?u64 = null,
 };
 
 pub fn checkCancelled(req: SearchRequest) !void {
     if (req.cancellation) |cancellation| {
         if (cancellation.load(.acquire)) return error.Cancelled;
+    }
+    if (req.execution_deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
     }
 }
 

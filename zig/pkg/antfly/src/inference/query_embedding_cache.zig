@@ -106,6 +106,19 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
+        return self.getOrComputeCancellable(budget, caller_alloc, key, deadline_ns, null, context, compute);
+    }
+
+    pub fn getOrComputeCancellable(
+        self: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        caller_alloc: std.mem.Allocator,
+        key: Key,
+        deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
+        context: *anyopaque,
+        compute: ComputeFn,
+    ) ![]f32 {
         if (!self.config.enabled) return self.computeUncached(caller_alloc, deadline_ns, context, compute);
 
         const io = self.io;
@@ -136,7 +149,7 @@ pub const QueryEmbeddingCache = struct {
             flight.refs += 1;
             self.counters.coalesced_waiters +|= 1;
             self.mutex.unlock(io);
-            self.waitForFlight(flight, deadline_ns) catch |err| {
+            self.waitForFlight(flight, deadline_ns, cancellation) catch |err| {
                 self.mutex.lockUncancelable(io);
                 if (err == error.Timeout) self.counters.waiter_timeouts +|= 1;
                 self.releaseFlightLocked(key, flight);
@@ -281,17 +294,18 @@ pub const QueryEmbeddingCache = struct {
         self.mutex.unlock(io);
     }
 
-    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64) !void {
-        const deadline = deadline_ns orelse {
-            flight.ready.waitUncancelable(self.io);
-            return;
-        };
+    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !void {
         while (!flight.ready.isSet()) {
+            if (cancellation) |signal| if (signal.load(.acquire)) return error.Cancelled;
             const now = platform_time.monotonicNs();
-            if (now >= deadline) return error.Timeout;
+            if (deadline_ns) |deadline| if (now >= deadline) return error.Timeout;
+            const wait_ns = if (deadline_ns) |deadline|
+                @min(deadline - now, 10 * std.time.ns_per_ms)
+            else
+                10 * std.time.ns_per_ms;
             flight.ready.waitTimeout(self.io, .{
                 .duration = .{
-                    .raw = std.Io.Duration.fromNanoseconds(@intCast(deadline - now)),
+                    .raw = std.Io.Duration.fromNanoseconds(@intCast(wait_ns)),
                     .clock = .awake,
                 },
             }) catch |err| switch (err) {
