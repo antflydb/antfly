@@ -57,6 +57,9 @@ def _assert_expected_recall(stateful_api, table_name: str) -> None:
 def test_high_frequency_keyword_filter_recall_survives_clean_restarts(stateful_api):
     """Exercise public ingestion, durable keyword postings, and process recovery."""
 
+    if not stateful_api.supports_restart:
+        pytest.skip("restart is only available for locally managed stateful servers")
+
     table_name = f"restart_keyword_recall_{time.time_ns()}"
     created = stateful_api.post(
         f"/tables/{table_name}",
@@ -107,8 +110,5 @@ def test_high_frequency_keyword_filter_recall_survives_clean_restarts(stateful_a
     # Use two complete process cycles to catch recovery state that is consumed
     # or repaired during only the first reopen.
     for _ in range(2):
-        try:
-            stateful_api.restart_server()
-        except AssertionError as exc:
-            pytest.skip(str(exc))
+        stateful_api.restart_server()
         _assert_expected_recall(stateful_api, table_name)

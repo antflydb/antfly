@@ -1084,6 +1084,116 @@ test "std http executor enforces request timeout while waiting for response" {
     }));
 }
 
+test "std http executor cancels an in-flight production request and retires its socket" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        observed_peer_cancel: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, req.uri, "/fast")) {
+                return .{
+                    .status = 200,
+                    .body = try alloc.dupe(u8, "ok"),
+                };
+            }
+            const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) {
+                if (cancellation.isCancelled()) {
+                    self.observed_peer_cancel.store(true, .release);
+                    return error.Cancelled;
+                }
+                std.Thread.sleep(std.time.ns_per_ms);
+            }
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "late"),
+            };
+        }
+    };
+
+    const RequestThread = struct {
+        executor: common.RequestExecutor,
+        uri: []const u8,
+        cancellation: *const common.RequestCancellation,
+        outcome: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.heap.page_allocator, .{
+                .method = .GET,
+                .uri = self.uri,
+                .cancellation = self.cancellation,
+            }) catch |err| {
+                self.outcome.store(if (err == error.Cancelled) 1 else 2, .release);
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+            self.outcome.store(3, .release);
+        }
+    };
+
+    var app = App{};
+    var listener = StdHttpListener.init(std.testing.allocator, .{}, app.iface());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/expensive", .{base_uri});
+    defer std.testing.allocator.free(uri);
+    const fast_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/fast", .{base_uri});
+    defer std.testing.allocator.free(fast_uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{ .keep_alive = true });
+    defer executor.deinit();
+    var cancellation: common.RequestCancellation = .{};
+    var request_state = RequestThread{
+        .executor = executor.executor(),
+        .uri = uri,
+        .cancellation = &cancellation,
+    };
+    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});
+    defer {
+        app.release.store(true, .release);
+        request_thread.join();
+    }
+
+    for (0..10_000) |_| {
+        if (app.entered.load(.acquire)) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(app.entered.load(.acquire));
+
+    cancellation.cancel();
+    for (0..2_000) |_| {
+        if (request_state.outcome.load(.acquire) != 0 and app.observed_peer_cancel.load(.acquire)) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));
+    try std.testing.expect(app.observed_peer_cancel.load(.acquire));
+
+    // A canceled pooled request must not poison the serialized client or
+    // return its interrupted connection to the pool.
+    var fast_response = try executor.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = fast_uri,
+    });
+    defer fast_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), fast_response.status);
+    try std.testing.expectEqualStrings("ok", fast_response.body);
+}
+
 test "std http executor deinit drains the complete timed operation" {
     const std_http_executor = @import("std_http_executor.zig");
 

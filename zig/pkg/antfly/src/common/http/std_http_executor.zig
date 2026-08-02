@@ -17,6 +17,8 @@ const common = @import("http_common.zig");
 const std_http_listener = @import("std_http_listener.zig");
 const threaded_connect_io = @import("threaded_connect_io.zig");
 
+const cancellation_poll_interval_ms: i64 = 25;
+
 pub const StdHttpExecutorConfig = struct {
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 1024,
@@ -138,73 +140,138 @@ pub const StdHttpExecutor = struct {
         try self.beginRequest();
         defer self.endRequest();
 
-        if (req.timeout_ms) |timeout_ms| {
-            return try self.executeWithTimeout(alloc, req, timeout_ms);
+        if (req.cancellation) |cancellation| {
+            if (cancellation.isCancelled()) return error.Cancelled;
         }
+        if (req.timeout_ms != null or req.cancellation != null)
+            return try self.executeWithControl(alloc, req);
         return try self.executeDirect(alloc, req);
     }
 
-    fn executeWithTimeout(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest, timeout_ms: u32) !common.HttpResponse {
-        if (timeout_ms == 0) return error.Timeout;
+    fn executeWithControl(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+        if (req.timeout_ms != null and req.timeout_ms.? == 0) return error.Timeout;
 
         const RequestResult = anyerror!common.HttpResponse;
-        const TimeoutResult = anyerror!void;
-        const SelectResult = union(enum) {
-            request: RequestResult,
-            timeout: TimeoutResult,
+        const RequestState = struct {
+            result: RequestResult = error.Canceled,
+            done: std.Io.Event = .unset,
         };
 
         const Task = struct {
-            fn requestTask(http_executor: *StdHttpExecutor, request_alloc: std.mem.Allocator, request: common.HttpRequest) RequestResult {
-                return http_executor.executeDirect(request_alloc, request);
+            fn requestTask(
+                state: *RequestState,
+                task_io: std.Io,
+                http_executor: *StdHttpExecutor,
+                request_alloc: std.mem.Allocator,
+                request: common.HttpRequest,
+            ) std.Io.Cancelable!void {
+                state.result = http_executor.executeDirect(request_alloc, request);
+                state.done.set(task_io);
             }
 
-            fn timeoutTask(task_io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
-                return timeout.sleep(task_io);
+            fn drainResult(state: *RequestState, response_alloc: std.mem.Allocator) void {
+                if (!state.done.isSet()) return;
+                if (state.result) |response_value| {
+                    var response = response_value;
+                    response.deinit(response_alloc);
+                } else |_| {}
             }
 
-            fn drainLateResult(result: SelectResult, response_alloc: std.mem.Allocator) void {
-                switch (result) {
-                    .request => |request_result| {
-                        if (request_result) |response_value| {
-                            var response = response_value;
-                            response.deinit(response_alloc);
-                        } else |_| {}
-                    },
-                    .timeout => {},
-                }
+            fn cancelAndDrain(
+                group: *std.Io.Group,
+                state: *RequestState,
+                task_io: std.Io,
+                response_alloc: std.mem.Allocator,
+            ) void {
+                // Group cancellation joins the network task. executeDirect's
+                // request/client defers retire an interrupted connection before
+                // any request-owned pointers are allowed to leave this scope.
+                group.cancel(task_io);
+                drainResult(state, response_alloc);
             }
         };
 
         const io = self.io_impl.io();
-        var select_buffer: [2]SelectResult = undefined;
-        var select = std.Io.Select(SelectResult).init(io, &select_buffer);
-        try select.concurrent(.request, Task.requestTask, .{ self, alloc, req });
-        select.async(.timeout, Task.timeoutTask, .{
-            io,
-            std.Io.Timeout{ .duration = .{
-                .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+        const deadline = if (req.timeout_ms) |value|
+            std.Io.Clock.Timestamp.fromNow(io, .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(value)),
                 .clock = .awake,
-            } },
+            })
+        else
+            null;
+        var state = RequestState{};
+        var group: std.Io.Group = .init;
+        try group.concurrent(io, Task.requestTask, .{
+            &state,
+            io,
+            self,
+            alloc,
+            req,
         });
+        var group_active = true;
+        defer if (group_active) group.cancel(io);
 
-        const first = try select.await();
-        switch (first) {
-            .request => |request_result| {
-                select.cancelDiscard();
-                return try request_result;
-            },
-            .timeout => |timeout_result| {
-                try timeout_result;
-                while (select.cancel()) |late| Task.drainLateResult(late, alloc);
-                return error.Timeout;
-            },
+        while (!state.done.isSet()) {
+            if (req.cancellation) |cancellation| {
+                if (cancellation.isCancelled()) {
+                    Task.cancelAndDrain(&group, &state, io, alloc);
+                    group_active = false;
+                    return error.Cancelled;
+                }
+            }
+            if (deadline) |value| {
+                if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, value)) {
+                    Task.cancelAndDrain(&group, &state, io, alloc);
+                    group_active = false;
+                    return error.Timeout;
+                }
+            }
+
+            // The network completion event wakes this caller immediately. A
+            // bounded timeout is needed only to sample the listener-owned
+            // atomic cancellation token; it does not allocate a polling task
+            // or a second OS thread per outbound request.
+            const wait_deadline = if (req.cancellation != null) blk: {
+                const poll_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+                    .raw = std.Io.Duration.fromMilliseconds(cancellation_poll_interval_ms),
+                    .clock = .awake,
+                });
+                if (deadline) |value| {
+                    break :blk if (value.compare(.lt, poll_deadline)) value else poll_deadline;
+                }
+                break :blk poll_deadline;
+            } else deadline.?;
+            state.done.waitTimeout(io, .{ .deadline = wait_deadline }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => {
+                    Task.cancelAndDrain(&group, &state, io, alloc);
+                    group_active = false;
+                    return error.Canceled;
+                },
+            };
         }
+
+        group.await(io) catch |err| {
+            group_active = false;
+            Task.drainResult(&state, alloc);
+            return err;
+        };
+        group_active = false;
+        var response = try state.result;
+        if (req.cancellation) |cancellation| {
+            if (cancellation.isCancelled()) {
+                response.deinit(alloc);
+                return error.Cancelled;
+            }
+        }
+        return response;
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
-        if (self.cfg.keep_alive) self.client_mutex.lockUncancelable(io);
+        // A controlled request queued behind the serialized keep-alive client
+        // must remain interruptible before it acquires a socket of its own.
+        if (self.cfg.keep_alive) try self.client_mutex.lock(io);
         defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
 
         // std.http.Client owns mutable connection and resolver state. A pooled
@@ -452,4 +519,73 @@ test "std http executor resets reuse count when server closes connection" {
 
     executor.recordCompletedRequest(true, true);
     try std.testing.expectEqual(@as(u32, 0), executor.requests_on_current_connection);
+}
+
+test "std http executor cancellation interrupts a request queued for the pooled client" {
+    const RequestThread = struct {
+        executor: common.RequestExecutor,
+        cancellation: *const common.RequestCancellation,
+        outcome: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.heap.page_allocator, .{
+                .method = .GET,
+                .uri = "http://127.0.0.1:1/never-reached",
+                .cancellation = self.cancellation,
+            }) catch |err| {
+                self.outcome.store(if (err == error.Cancelled) 1 else 2, .release);
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+            self.outcome.store(3, .release);
+        }
+    };
+
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+    defer executor.deinit();
+    const io = threaded_connect_io.io(executor.io_impl, executor.io_vtable);
+    executor.client_mutex.lockUncancelable(io);
+    var client_locked = true;
+    defer if (client_locked) executor.client_mutex.unlock(io);
+
+    var cancellation: common.RequestCancellation = .{};
+    var request_state = RequestThread{
+        .executor = executor.executor(),
+        .cancellation = &cancellation,
+    };
+    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});
+    var request_joined = false;
+    defer if (!request_joined) {
+        if (client_locked) {
+            executor.client_mutex.unlock(io);
+            client_locked = false;
+        }
+        request_thread.join();
+    };
+
+    var admitted = false;
+    for (0..1_000) |_| {
+        executor.lifecycle_mutex.lockUncancelable(io);
+        admitted = executor.in_flight == 1;
+        executor.lifecycle_mutex.unlock(io);
+        if (admitted) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(admitted);
+    // Allow the network task to reach the deliberately held client mutex.
+    std.Thread.sleep(25 * std.time.ns_per_ms);
+
+    cancellation.cancel();
+    for (0..1_000) |_| {
+        if (request_state.outcome.load(.acquire) != 0) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const cancelled_while_queued = request_state.outcome.load(.acquire) == 1;
+
+    executor.client_mutex.unlock(io);
+    client_locked = false;
+    request_thread.join();
+    request_joined = true;
+    try std.testing.expect(cancelled_while_queued);
+    try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));
 }
