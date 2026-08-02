@@ -8686,7 +8686,7 @@ pub const ApiHttpServer = struct {
     ) ![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        if (try shouldDispatchPlainPublicSearch(alloc, body)) {
+        if (try shouldDispatchPlainPublicSearch(alloc, body, request_deadline_ns, cancellation)) {
             var result = self.executePlainPublicTableQuery(
                 alloc,
                 source,
@@ -8827,7 +8827,12 @@ pub const ApiHttpServer = struct {
         return try alloc.dupe(u8, result.json);
     }
 
-    fn shouldDispatchPlainPublicSearch(alloc: std.mem.Allocator, body: []const u8) !bool {
+    fn shouldDispatchPlainPublicSearch(
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
+    ) !bool {
         if (std.mem.indexOf(u8, body, "\"join\"") == null and
             std.mem.indexOf(u8, body, "\"foreign_sources\"") == null and
             (std.mem.indexOf(u8, body, "\"full_text_search\"") != null or
@@ -8839,7 +8844,10 @@ pub const ApiHttpServer = struct {
             return true;
         }
 
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+        var parsed = query_contract.parseJsonValueCancellable(alloc, body, deadline_ns, cancellation) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => return false,
+        };
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |object| object,
@@ -17495,6 +17503,8 @@ test "api http retryable embedding failures provide retry guidance" {
     try std.testing.expect(try ApiHttpServer.shouldDispatchPlainPublicSearch(
         std.testing.allocator,
         "{\"semantic_search\":\"bounded failure mapping\",\"indexes\":[\"semantic_idx\"]}",
+        null,
+        null,
     ));
 
     var response = try retryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");

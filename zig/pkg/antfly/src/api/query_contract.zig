@@ -2187,7 +2187,7 @@ const CancellableJsonReader = struct {
     }
 };
 
-fn parseJsonValueCancellable(
+pub fn parseJsonValueCancellable(
     alloc: std.mem.Allocator,
     body: []const u8,
     deadline_ns: ?u64,
@@ -9051,12 +9051,15 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
             std.mem.eql(u8, key, "_exclusion_query_json")) and
             entry.value_ptr.* == .string)
         {
-            var internal = std.json.parseFromSlice(
-                std.json.Value,
+            var internal = parseJsonValueCancellable(
                 alloc,
                 entry.value_ptr.*.string,
-                .{},
-            ) catch return error.InvalidQueryRequest;
+                deadline_ns,
+                cancellation,
+            ) catch |err| switch (err) {
+                error.Cancelled, error.Timeout => return err,
+                else => return error.InvalidQueryRequest,
+            };
             defer internal.deinit();
             try ensureQueryDeadline(deadline_ns);
             var active = std.StringHashMapUnmanaged(void).empty;
@@ -9071,7 +9074,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
                 &budget,
             );
             defer db_mod.types.deinitJsonValue(alloc, &expanded);
-            const expanded_json = try std.json.Stringify.valueAlloc(alloc, expanded, .{});
+            const expanded_json = try jsonStringifyAlloc(alloc, expanded);
             budget.consumeNode(1) catch |err| {
                 alloc.free(expanded_json);
                 return err;
@@ -9100,10 +9103,10 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
 
     var out_value: std.json.Value = .{ .object = out };
     defer db_mod.types.deinitJsonValue(alloc, &out_value);
-    try ensureQueryDeadline(deadline_ns);
-    const encoded = try std.json.Stringify.valueAlloc(alloc, out_value, .{});
+    try ensureQueryActive(deadline_ns, cancellation);
+    const encoded = try jsonStringifyAlloc(alloc, out_value);
     errdefer alloc.free(encoded);
-    try ensureQueryDeadline(deadline_ns);
+    try ensureQueryActive(deadline_ns, cancellation);
     if (encoded.len > max_expanded_bytes) {
         alloc.free(encoded);
         return error.InvalidQueryRequest;
