@@ -3107,13 +3107,17 @@ fn tryParseFastDensePublicQueryRequest(
     deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
 ) !?OwnedQueryRequest {
+    var lifecycle = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+    try lifecycle.check();
     var parsed_value = parseJsonValueCancellable(alloc, body, deadline_ns, cancellation) catch |err| switch (err) {
         error.Cancelled, error.Timeout => return err,
         else => return null,
     };
     defer parsed_value.deinit();
+    try lifecycle.check();
     var parsed = ant_json.parseFromValue(FastDensePublicQueryRequest, alloc, parsed_value.value, .{}) catch return null;
     defer parsed.deinit();
+    try lifecycle.check();
 
     const request = parsed.value;
     const embeddings = request.embeddings orelse return null;
@@ -3143,6 +3147,7 @@ fn tryParseFastDensePublicQueryRequest(
         }
         var it = embeddings.map.iterator();
         while (it.next()) |entry| {
+            try lifecycle.poll();
             out[initialized] = try alloc.dupe(u8, entry.key_ptr.*);
             initialized += 1;
         }
@@ -3159,6 +3164,7 @@ fn tryParseFastDensePublicQueryRequest(
     errdefer freeNamedDenseQueries(alloc, dense_queries[0..dense_queries_initialized]);
 
     for (index_names, 0..) |index_name, i| {
+        try lifecycle.poll();
         const embedding = embeddings.map.get(index_name) orelse return error.UnsupportedQueryRequest;
         dense_queries[i] = .{
             .name = try alloc.dupe(u8, index_name),
@@ -3173,6 +3179,7 @@ fn tryParseFastDensePublicQueryRequest(
         };
         dense_queries_initialized += 1;
     }
+    try lifecycle.check();
     req.dense_queries = dense_queries;
 
     return .{
