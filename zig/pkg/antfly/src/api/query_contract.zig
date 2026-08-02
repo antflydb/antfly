@@ -2138,6 +2138,52 @@ fn nextQueryTimeoutToken(
     }
 }
 
+const CancellableJsonReader = struct {
+    io_reader: std.Io.Reader,
+    reader: std.json.Reader,
+    cancellation: ?*const std.atomic.Value(bool),
+
+    pub const NextError = std.json.Reader.NextError || error{Cancelled};
+    pub const AllocError = std.json.Reader.AllocError || error{Cancelled};
+    pub const PeekError = std.json.Reader.PeekError || error{Cancelled};
+
+    fn init(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) @This() {
+        var source: @This() = undefined;
+        source.io_reader = .fixed(body);
+        source.reader = std.json.Reader.init(alloc, &source.io_reader);
+        source.cancellation = cancellation;
+        return source;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.reader.deinit();
+    }
+
+    fn check(self: *const @This()) !void {
+        if (self.cancellation) |signal| if (signal.load(.acquire)) return error.Cancelled;
+    }
+
+    pub fn next(self: *@This()) NextError!std.json.Token {
+        try self.check();
+        return self.reader.next();
+    }
+
+    pub fn nextAllocMax(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        when: std.json.AllocWhen,
+        max_value_len: usize,
+    ) AllocError!std.json.Token {
+        try self.check();
+        return self.reader.nextAllocMax(alloc, when, max_value_len);
+    }
+
+    pub fn peekNextTokenType(self: *@This()) PeekError!std.json.TokenType {
+        try self.check();
+        return self.reader.peekNextTokenType();
+    }
+};
+
 /// Finds the top-level timeout without constructing a request DOM. This runs
 /// before query admission retries, so it must poll peer cancellation while
 /// consuming large bodies.
@@ -2313,7 +2359,7 @@ pub fn parseQueryRequestWithDeadline(
 ) !OwnedQueryRequest {
     if (body.len == 0) return error.InvalidQueryRequest;
     try ensureQueryActive(execution_deadline_ns, cancellation);
-    if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
+    if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body, cancellation)) return error.InvalidQueryRequest;
     try ensureQueryActive(execution_deadline_ns, cancellation);
 
     // Structured named filters stay in compact binding form so the algebraic
@@ -8846,7 +8892,12 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     cancellation: ?*const std.atomic.Value(bool),
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var source = CancellableJsonReader.init(alloc, body, cancellation);
+    defer source.deinit();
+    var parsed = std.json.parseFromTokenSource(std.json.Value, alloc, &source, .{}) catch |err| switch (err) {
+        error.Cancelled => return error.Cancelled,
+        else => return error.InvalidQueryRequest,
+    };
     defer parsed.deinit();
     try ensureQueryActive(deadline_ns, cancellation);
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -8992,12 +9043,60 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     return encoded;
 }
 
-fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    return parsed.value.object.get("identity_read_generation") != null or
-        parsed.value.object.get("allow_doc_identity_reassignment") != null;
+fn queryBodyHasForbiddenDocIdentityControlFields(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    cancellation: ?*const std.atomic.Value(bool),
+) !bool {
+    var scanner = std.json.Scanner.initStreaming(alloc);
+    defer scanner.deinit();
+    var offset: usize = 0;
+    var ended = false;
+    var depth: usize = 0;
+    var started = false;
+    var root_expects_key = false;
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+
+    while (true) {
+        const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, cancellation);
+        switch (token) {
+            .object_begin => {
+                if (!started) {
+                    started = true;
+                    depth = 1;
+                    root_expects_key = true;
+                } else depth += 1;
+            },
+            .array_begin => depth += 1,
+            .object_end, .array_end => {
+                if (depth == 0) return error.InvalidQueryRequest;
+                depth -= 1;
+                if (depth == 1) root_expects_key = true;
+            },
+            .partial_string => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part),
+            .partial_string_escaped_1 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string_escaped_2 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string_escaped_3 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .partial_string_escaped_4 => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part[0..]),
+            .string => |part| {
+                if (depth == 1 and root_expects_key) {
+                    try key.appendSlice(alloc, part);
+                    const forbidden = std.mem.eql(u8, key.items, "identity_read_generation") or
+                        std.mem.eql(u8, key.items, "allow_doc_identity_reassignment");
+                    key.clearRetainingCapacity();
+                    root_expects_key = false;
+                    if (forbidden) return true;
+                } else if (depth == 1) root_expects_key = true;
+            },
+            .number, .null, .true, .false => {
+                if (depth == 1) root_expects_key = true;
+            },
+            .partial_number => {},
+            .end_of_document => return if (started and depth == 0) false else error.InvalidQueryRequest,
+            .allocated_string, .allocated_number => unreachable,
+        }
+    }
 }
 
 fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
