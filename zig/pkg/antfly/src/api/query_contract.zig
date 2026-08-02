@@ -2252,18 +2252,19 @@ fn ensureQueryActive(deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(b
 
 const QueryDeadlinePoller = struct {
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     work_until_check: u8 = 1,
 
     fn poll(self: *@This()) !void {
         self.work_until_check -|= 1;
         if (self.work_until_check != 0) return;
         self.work_until_check = 64;
-        try ensureQueryDeadline(self.deadline_ns);
+        try ensureQueryActive(self.deadline_ns, self.cancellation);
     }
 
     fn check(self: *@This()) !void {
         self.work_until_check = 64;
-        try ensureQueryDeadline(self.deadline_ns);
+        try ensureQueryActive(self.deadline_ns, self.cancellation);
     }
 };
 
@@ -2309,6 +2310,7 @@ pub fn parseQueryRequestWithDeadline(
         alloc,
         body,
         execution_deadline_ns,
+        cancellation,
     );
     defer if (expanded_binding_body) |owned| alloc.free(owned);
     const effective_body = expanded_binding_body orelse body;
@@ -8138,6 +8140,7 @@ const PublicBindingExpansionBudget = struct {
     remaining_nodes: usize = public_query_max_tree_nodes,
     remaining_bytes: usize,
     deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     nodes_until_deadline_check: u8 = 1,
 
     fn consumeNode(self: *@This(), depth: usize) !void {
@@ -8148,9 +8151,7 @@ const PublicBindingExpansionBudget = struct {
         self.nodes_until_deadline_check -|= 1;
         if (self.nodes_until_deadline_check == 0) {
             self.nodes_until_deadline_check = 64;
-            if (self.deadline_ns) |deadline_ns| {
-                if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
-            }
+            try ensureQueryActive(self.deadline_ns, self.cancellation);
         }
     }
 
@@ -8774,6 +8775,7 @@ fn maybeExpandPublicDocFilterBindingsAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !?[]u8 {
     if (std.mem.indexOf(u8, body, "\"with\"") == null) return null;
     const max_expanded_bytes = try publicBindingExpansionOutputLimit(body.len);
@@ -8782,6 +8784,7 @@ fn maybeExpandPublicDocFilterBindingsAlloc(
         body,
         max_expanded_bytes,
         deadline_ns,
+        cancellation,
     );
 }
 
@@ -8795,6 +8798,7 @@ fn expandPublicDocFilterBindingsWithLimitAlloc(
         body,
         max_expanded_bytes,
         null,
+        null,
     )) orelse return error.InvalidQueryRequest;
 }
 
@@ -8803,14 +8807,15 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     body: []const u8,
     max_expanded_bytes: usize,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
-    try ensureQueryDeadline(deadline_ns);
+    try ensureQueryActive(deadline_ns, cancellation);
     if (parsed.value != .object) return error.InvalidQueryRequest;
     try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, parsed.value, deadline_ns);
-    try ensureQueryDeadline(deadline_ns);
+    try ensureQueryActive(deadline_ns, cancellation);
     const bindings_value = parsed.value.object.get("with") orelse return null;
     if (bindings_value != .object) return error.InvalidQueryRequest;
     try validatePublicBindingGraphAlloc(alloc, bindings_value.object, deadline_ns);
@@ -8825,6 +8830,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     var requires_expansion = false;
     var text_it = text_bindings.iterator();
     while (text_it.next()) |entry| {
+        try ensureQueryActive(deadline_ns, cancellation);
         if (entry.value_ptr.*) {
             requires_expansion = true;
             break;
@@ -8840,6 +8846,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     var budget = PublicBindingExpansionBudget{
         .remaining_bytes = max_expanded_bytes,
         .deadline_ns = deadline_ns,
+        .cancellation = cancellation,
     };
     try budget.consumeNode(0);
     const retained_binding_count = countStructuredPublicBindings(
@@ -8851,6 +8858,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     try budget.consumeBytes(2 +| if (output_field_count > 0) output_field_count - 1 else 0);
     var root_it = parsed.value.object.iterator();
     while (root_it.next()) |entry| {
+        try ensureQueryActive(deadline_ns, cancellation);
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "with") and retained_binding_count == 0) continue;
         try budget.consumeBytes(try jsonStringEncodedLengthUpperBound(key));
@@ -10217,6 +10225,15 @@ test "api query contract expansion budget checks its absolute deadline" {
         .deadline_ns = 0,
     };
     try std.testing.expectError(error.Timeout, budget.consumeNode(0));
+}
+
+test "api query contract expansion budget observes cancellation" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    var budget = PublicBindingExpansionBudget{
+        .remaining_bytes = 128,
+        .cancellation = &cancelled,
+    };
+    try std.testing.expectError(error.Cancelled, budget.consumeNode(0));
 }
 
 test "api query contract final binding validation observes caller deadline" {
