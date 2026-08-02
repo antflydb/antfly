@@ -2116,10 +2116,11 @@ fn nextQueryTimeoutToken(
     body: []const u8,
     offset: *usize,
     ended: *bool,
+    deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
 ) !std.json.Token {
     while (true) {
-        if (cancellation) |signal| if (signal.load(.acquire)) return error.Cancelled;
+        try ensureQueryActive(deadline_ns, cancellation);
         return scanner.next() catch |err| switch (err) {
             error.BufferUnderrun => {
                 if (ended.*) return error.InvalidQueryRequest;
@@ -2141,16 +2142,18 @@ fn nextQueryTimeoutToken(
 const CancellableJsonReader = struct {
     io_reader: std.Io.Reader,
     reader: std.json.Reader,
+    deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
 
-    pub const NextError = std.json.Reader.NextError || error{Cancelled};
-    pub const AllocError = std.json.Reader.AllocError || error{Cancelled};
-    pub const PeekError = std.json.Reader.PeekError || error{Cancelled};
+    pub const NextError = std.json.Reader.NextError || error{ Cancelled, Timeout };
+    pub const AllocError = std.json.Reader.AllocError || error{ Cancelled, Timeout };
+    pub const PeekError = std.json.Reader.PeekError || error{ Cancelled, Timeout };
 
-    fn init(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) @This() {
+    fn init(alloc: std.mem.Allocator, body: []const u8, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) @This() {
         var source: @This() = undefined;
         source.io_reader = .fixed(body);
         source.reader = std.json.Reader.init(alloc, &source.io_reader);
+        source.deadline_ns = deadline_ns;
         source.cancellation = cancellation;
         return source;
     }
@@ -2160,7 +2163,7 @@ const CancellableJsonReader = struct {
     }
 
     fn check(self: *const @This()) !void {
-        if (self.cancellation) |signal| if (signal.load(.acquire)) return error.Cancelled;
+        try ensureQueryActive(self.deadline_ns, self.cancellation);
     }
 
     pub fn next(self: *@This()) NextError!std.json.Token {
@@ -2200,7 +2203,7 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation:
     defer key.deinit(alloc);
 
     while (true) {
-        const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, cancellation);
+        const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, null, cancellation);
         switch (token) {
             .object_begin => {
                 if (!started) {
@@ -2359,7 +2362,7 @@ pub fn parseQueryRequestWithDeadline(
 ) !OwnedQueryRequest {
     if (body.len == 0) return error.InvalidQueryRequest;
     try ensureQueryActive(execution_deadline_ns, cancellation);
-    if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body, cancellation)) return error.InvalidQueryRequest;
+    if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body, execution_deadline_ns, cancellation, false)) return error.InvalidQueryRequest;
     try ensureQueryActive(execution_deadline_ns, cancellation);
 
     // Structured named filters stay in compact binding form so the algebraic
@@ -2521,7 +2524,7 @@ pub fn parsePublicQueryRequestWithDeadline(
     cancellation: ?*const std.atomic.Value(bool),
 ) !OwnedQueryRequest {
     try ensureQueryActive(execution_deadline_ns, cancellation);
-    if (try queryBodyHasForbiddenPublicDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
+    if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body, execution_deadline_ns, cancellation, true)) return error.InvalidQueryRequest;
     try ensureQueryActive(execution_deadline_ns, cancellation);
     return try parseQueryRequestWithDeadline(
         alloc,
@@ -8892,7 +8895,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     cancellation: ?*const std.atomic.Value(bool),
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var source = CancellableJsonReader.init(alloc, body, cancellation);
+    var source = CancellableJsonReader.init(alloc, body, deadline_ns, cancellation);
     defer source.deinit();
     var parsed = std.json.parseFromTokenSource(std.json.Value, alloc, &source, .{}) catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,
@@ -9046,7 +9049,9 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
 fn queryBodyHasForbiddenDocIdentityControlFields(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
     cancellation: ?*const std.atomic.Value(bool),
+    reject_internal_shard_fields: bool,
 ) !bool {
     var scanner = std.json.Scanner.initStreaming(alloc);
     defer scanner.deinit();
@@ -9059,7 +9064,7 @@ fn queryBodyHasForbiddenDocIdentityControlFields(
     defer key.deinit(alloc);
 
     while (true) {
-        const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, cancellation);
+        const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, deadline_ns, cancellation);
         switch (token) {
             .object_begin => {
                 if (!started) {
@@ -9083,7 +9088,8 @@ fn queryBodyHasForbiddenDocIdentityControlFields(
                 if (depth == 1 and root_expects_key) {
                     try key.appendSlice(alloc, part);
                     const forbidden = std.mem.eql(u8, key.items, "identity_read_generation") or
-                        std.mem.eql(u8, key.items, "allow_doc_identity_reassignment");
+                        std.mem.eql(u8, key.items, "allow_doc_identity_reassignment") or
+                        (reject_internal_shard_fields and isInternalShardFieldName(key.items));
                     key.clearRetainingCapacity();
                     root_expects_key = false;
                     if (forbidden) return true;
@@ -9149,7 +9155,7 @@ fn queryBodyForGeneratedContractAlloc(
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
-fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
+fn isInternalShardFieldName(name: []const u8) bool {
     const internal_fields = [_][]const u8{
         "_distributed_text_stats",
         "native_doc_id_constraints",
@@ -9162,7 +9168,15 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
         "_exclude_doc_ids",
     };
     inline for (internal_fields) |field| {
-        if (object.get(field) != null) return true;
+        if (std.mem.eql(u8, name, field)) return true;
+    }
+    return false;
+}
+
+fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (isInternalShardFieldName(entry.key_ptr.*)) return true;
     }
     return false;
 }
