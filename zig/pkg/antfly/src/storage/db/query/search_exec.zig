@@ -2977,6 +2977,9 @@ fn logExactSortBudgetRejection(
 }
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
@@ -12888,6 +12891,7 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
+            .cancellation = req.cancellation,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
@@ -13768,6 +13772,7 @@ pub fn searchSparse(
     executor: SparseSearchExecutor,
 ) !types.SearchResult {
     resetLastSortRejectionDiagnostic();
+    try checkSearchRequestDeadline(req);
     try rejectApproximateSortPageOptions(req);
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or req.profile;
@@ -13836,7 +13841,9 @@ pub fn searchSparse(
         .exclude_doc_ids = native_constraints.exclude_doc_ids,
         .filter_doc_nums = native_constraints.filter_doc_nums,
         .exclude_doc_nums = native_constraints.exclude_doc_nums,
+        .cancellation = req.cancellation,
     });
+    try checkSearchRequestDeadline(req);
     if (bench_query_profile) index_search_ns = platform_time.monotonicNs() - index_search_start_ns;
     defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
 
@@ -25374,6 +25381,107 @@ test "match_all rejects expired execution deadline" {
         .limit = 10,
         .execution_deadline_ns = platform_time.monotonicNs(),
     }, testMatchAllExecutor(&ctx)));
+}
+
+test "match_all aborts the real search execution path when request cancellation is signaled" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    var cancellation = std.atomic.Value(bool).init(true);
+
+    try std.testing.expectError(error.Cancelled, searchMatchAll(alloc, .{
+        .include_stored = false,
+        .limit = 10,
+        .cancellation = &cancellation,
+    }, testMatchAllExecutor(&ctx)));
+}
+
+test "match_all primary scan aborts promptly when cancellation arrives mid-flight" {
+    const Harness = struct {
+        alloc: Allocator,
+        reached_checkpoint: std.atomic.Value(bool) = .init(false),
+        release_checkpoint: std.atomic.Value(bool) = .init(false),
+
+        fn scanUnexpected(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scan(
+            ctx: ?*anyopaque,
+            _: []const u8,
+            _: []const u8,
+            _: docstore_mod.DocStore.ScanOptions,
+            scan_ctx: ?*anyopaque,
+            callback: docstore_mod.DocStore.ScanWithContextCallback,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            for (0..2048) |i| {
+                var id_buf: [32]u8 = undefined;
+                const id = try std.fmt.bufPrint(&id_buf, "doc:{d:0>8}", .{i});
+                const key = try internal_keys.documentKeyAlloc(self.alloc, id);
+                defer self.alloc.free(key);
+                if (i == 1023) {
+                    self.reached_checkpoint.store(true, .release);
+                    while (!self.release_checkpoint.load(.acquire)) std.Thread.yield() catch {};
+                }
+                if (try callback(scan_ctx, key, "{}") == .stop) return;
+            }
+        }
+
+        fn isExpired(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+    };
+    const Worker = struct {
+        harness: *Harness,
+        cancellation: *std.atomic.Value(bool),
+        observed_cancel: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var candidates = collectMatchAllCandidatesWithOptions(std.heap.page_allocator, .{
+                .cancellation = self.cancellation,
+            }, .{
+                .ctx = self.harness,
+                .scan_store_range = Harness.scanUnexpected,
+                .scan_store_range_with_context = Harness.scan,
+                .is_expired_key = Harness.isExpired,
+            }, .{}) catch |err| {
+                if (err == error.Cancelled) self.observed_cancel.store(true, .release);
+                return;
+            };
+            candidates.deinit(std.heap.page_allocator);
+        }
+    };
+
+    var harness = Harness{ .alloc = std.heap.page_allocator };
+    var cancellation = std.atomic.Value(bool).init(false);
+    var worker = Worker{ .harness = &harness, .cancellation = &cancellation };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        harness.release_checkpoint.store(true, .release);
+        thread.join();
+    };
+
+    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer wait_io.deinit();
+    for (0..2_000) |_| {
+        if (harness.reached_checkpoint.load(.acquire)) break;
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(harness.reached_checkpoint.load(.acquire));
+    cancellation.store(true, .release);
+    harness.release_checkpoint.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(worker.observed_cancel.load(.acquire));
 }
 
 test "match_all applies stored pattern filters before paging" {

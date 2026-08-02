@@ -1267,6 +1267,9 @@ pub const SearchRequest = struct {
     graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
+    /// Borrowed listener lifecycle signal. It is request-local and must never
+    /// be retained by asynchronous work after query execution returns.
+    cancellation: ?*const std.atomic.Value(bool) = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
 };

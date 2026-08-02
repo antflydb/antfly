@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
@@ -181,6 +182,8 @@ const ResolvedPaths = struct {
 const StandaloneHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
     unified_api_ready: *const std.atomic.Value(bool),
+    handler: *const AntflyApiHandler,
+    unified_lifecycle: *UnifiedServerLifecycle,
 
     fn readiness(self: *StandaloneHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -211,6 +214,33 @@ const StandaloneHealthSource = struct {
         const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
         var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
         try data_health.metricsWriter().writeMetrics(writer);
+
+        const query = self.handler.query_admission.stats();
+        const query_body = self.handler.query_body_admission.stats();
+        const handler = self.handler.runtimeStats();
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", query.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", query.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", query.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", query.rejected_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", query_body.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", query_body.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", query_body.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", query_body.rejected_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public queries rejected because peer observation could not be scheduled", handler.cancellation_watcher_start_failures_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public query peer disconnects propagated to cancellation", handler.peer_disconnect_cancellations_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public queries cancelled after peer observation failed", handler.peer_observer_failures_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public query sockets currently watched for disconnect", handler.active_peer_observers);
+
+        if (self.unified_lifecycle.runtimeStats()) |http| {
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_limit", "gauge", "Maximum concurrent public HTTP connections", http.max_connections);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_in_use_bytes", "gauge", "HTTP request-body bytes admitted across HTTP/1 and HTTP/2", http.body_buffer_in_use_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_peak_bytes", "gauge", "Peak admitted HTTP request-body bytes since process start", http.body_buffer_peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_rejected_total", "counter", "HTTP request bodies rejected by aggregate memory admission", http.body_buffer_rejected_total);
+        }
     }
 };
 
@@ -266,6 +296,13 @@ const UnifiedServerLifecycle = struct {
 
     fn runtimeFailure(self: *UnifiedServerLifecycle) ?anyerror {
         return if (self.state.load(.acquire) == .failed) self.failure else null;
+    }
+
+    fn runtimeStats(self: *UnifiedServerLifecycle) ?httpx.Server.RuntimeStats {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const server = self.server orelse return null;
+        return server.runtimeStats();
     }
 
     fn stop(self: *UnifiedServerLifecycle) void {
@@ -1595,6 +1632,8 @@ pub fn runFromIterator(
     // ---------------------------------------------------------------
 
     var handler = AntflyApiHandler{ .api_server = api_server };
+    try handler.initRuntime(alloc);
+    defer handler.deinitRuntime();
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
@@ -1603,9 +1642,12 @@ pub fn runFromIterator(
     var public_listener_lease = try PublicListenerLease.acquire(alloc, bind_port);
     defer public_listener_lease.deinit();
 
+    var unified_lifecycle = UnifiedServerLifecycle{};
     var standalone_health = StandaloneHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
+        .handler = &handler,
+        .unified_lifecycle = &unified_lifecycle,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
@@ -1625,9 +1667,10 @@ pub fn runFromIterator(
     };
     defer if (health_server) |hs| hs.deinit();
 
-    var unified_lifecycle = UnifiedServerLifecycle{};
+    const public_io = node_backend_runtime.ptr().io() orelse return error.BackendRuntimeUnavailable;
     const thread = std.Thread.spawn(.{}, serveUnified, .{
         alloc,
+        public_io,
         bind_host,
         bind_port,
         &handler,
@@ -2315,6 +2358,7 @@ fn decodeLocalGenerateDataUri(
 
 fn serveUnified(
     alloc: std.mem.Allocator,
+    io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
@@ -2323,7 +2367,7 @@ fn serveUnified(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready, lifecycle) catch |err| {
+    serveUnifiedInner(alloc, io, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready, lifecycle) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2335,6 +2379,7 @@ fn serveUnified(
 
 fn serveUnifiedInner(
     alloc: std.mem.Allocator,
+    io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
@@ -2343,10 +2388,7 @@ fn serveUnifiedInner(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
+    var server = httpx.Server.initWithConfig(alloc, io, publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
     lifecycle.attach(&server);
     defer lifecycle.detach(&server);
@@ -2398,12 +2440,43 @@ fn serveUnifiedInner(
     try server.listen();
 }
 
+const public_http_connection_ceiling: u32 = 256;
+
+fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
+    // Public inbound sockets may use at most one quarter of the process FD
+    // budget. Storage files, Raft, metadata, outbound providers, logs, and an
+    // operator shell retain the rest even when the deployment lowers RLIMIT.
+    const proportional_limit = @max(@as(u64, 1), fd_soft_limit / 4);
+    return @intCast(@min(proportional_limit, public_http_connection_ceiling));
+}
+
+fn configuredPublicHttpConnectionLimit() u32 {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return public_http_connection_ceiling;
+    const limit = std.posix.getrlimit(.NOFILE) catch return public_http_connection_ceiling;
+    if (limit.cur == std.math.maxInt(@TypeOf(limit.cur))) return public_http_connection_ceiling;
+    return publicHttpConnectionLimitForFdSoftLimit(@intCast(limit.cur));
+}
+
 fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
     return .{
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
+        // Four maximum-sized public requests may complete while excess uploads
+        // are shed before allocator pressure becomes systemic.
+        .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
+        // Query execution admits 32 requests. Apply the same bound while H1
+        // bodies are still streaming so the remaining public connections can
+        // service health, control, and recovery traffic.
+        .max_h1_inflight_bodies = 32,
         .request_timeout_ms = 300_000,
+        // Keep a large process-wide FD reserve for storage, Raft, outbound
+        // clients, and diagnostics. This prevents the historical 1,000-socket
+        // cliff under the common 1,024 descriptor soft limit.
+        .max_connections = configuredPublicHttpConnectionLimit(),
+        .accept_error_backoff_initial_ms = 5,
+        .accept_error_backoff_max_ms = 1_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
         // std.Io currently maps this to SO_REUSEADDR + SO_REUSEPORT on POSIX.
         // The standalone listener lease supplies exclusivity while preserving
@@ -5280,6 +5353,15 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
+    try std.testing.expect(cfg.max_connections >= 1);
+    try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
+    try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
+    try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);
+    try std.testing.expectEqual(@as(u32, 256), publicHttpConnectionLimitForFdSoftLimit(1024));
+    try std.testing.expectEqual(@as(u32, 128), publicHttpConnectionLimitForFdSoftLimit(512));
+    try std.testing.expectEqual(@as(u32, 32), publicHttpConnectionLimitForFdSoftLimit(128));
+    try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
 }
 
 test "standalone Lite transaction sessions survive file reopen" {

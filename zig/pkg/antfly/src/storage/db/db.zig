@@ -71003,6 +71003,115 @@ test "db one real delete keeps filtered full text on complement path across rest
     }
 }
 
+fn expectHighFrequencyKeywordRecall(db: *DB, alloc: Allocator) !void {
+    var published = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .query = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 5_000,
+    });
+    defer published.deinit();
+    try std.testing.expectEqual(@as(u32, 4_237), published.total_hits);
+    try std.testing.expectEqual(@as(usize, 4_237), published.hits.len);
+
+    var draft = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .query = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"draft\"}}",
+        .limit = 5_000,
+    });
+    defer draft.deinit();
+    try std.testing.expectEqual(@as(u32, 763), draft.total_hits);
+    try std.testing.expectEqual(@as(usize, 763), draft.hits.len);
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .query = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .limit = 5_000,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 5_000), unfiltered.total_hits);
+    try std.testing.expectEqual(@as(usize, 5_000), unfiltered.hits.len);
+}
+
+test "db production ingest preserves high-frequency keyword recall across clean restarts" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{
+        \\  "default_type": "product",
+        \\  "document_schemas": {
+        \\    "product": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": true,
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text"]},
+        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        // Production fixture loading reaches the table in many API-sized
+        // batches, not as one already-materialized segment. Exercise segment
+        // publication/merge state throughout the high-frequency transition.
+        const batch_size = 100;
+        var batch_start: usize = 0;
+        while (batch_start < 5_000) : (batch_start += batch_size) {
+            const batch_len = @min(batch_size, 5_000 - batch_start);
+            const writes = try alloc.alloc(types.BatchWrite, batch_len);
+            defer {
+                for (writes) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                alloc.free(writes);
+            }
+            for (writes, 0..) |*write, offset| {
+                const i = batch_start + offset;
+                const state = if (i < 4_237) "published" else "draft";
+                write.* = .{
+                    .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                    .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"Catalog document {d}\",\"state\":\"{s}\"}}", .{ i, state }),
+                };
+            }
+            try db.batch(.{ .writes = writes, .sync_level = .full_index });
+        }
+        try expectHighFrequencyKeywordRecall(&db, alloc);
+    }
+
+    // Exercise the same catalog/schema/index reload used by a clean service
+    // restart. No re-upsert or write-side repair is allowed between checks.
+    for (0..2) |_| {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        try expectHighFrequencyKeywordRecall(&reopened, alloc);
+    }
+}
+
 test "db versioned full text indexes reload matching schema mappings after reopen" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");

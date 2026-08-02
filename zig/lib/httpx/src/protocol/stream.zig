@@ -17,6 +17,7 @@ const Io = std.Io;
 
 const http = @import("http.zig");
 const hpack = @import("hpack.zig");
+const SharedBodyBudget = @import("body_budget.zig").SharedBodyBudget;
 
 /// Overflow-guarded window delta addition per RFC 7540 §6.9.1.
 fn addWindowDelta(current: i32, delta: i32) error{FlowControlError}!i32 {
@@ -58,6 +59,9 @@ pub const Stream = struct {
     id: u31,
     state: StreamState = .idle,
     priority: StreamPriority = .{},
+    /// Raised when the peer cancels this stream. Server request contexts borrow
+    /// this signal so application work can release its own admission promptly.
+    cancellation: std.atomic.Value(bool) = .init(false),
 
     /// Local send window (how much we can send).
     send_window: i32 = 65535,
@@ -110,6 +114,11 @@ pub const Stream = struct {
     /// Per-stream body ceiling. Null inherits the connection-wide ceiling.
     max_data_size: ?usize = null,
 
+    /// Bytes charged to the server's aggregate H2 mailbox budget. The stream
+    /// owns this reservation until removal, including error paths.
+    data_budget: ?*SharedBodyBudget = null,
+    data_budget_reserved: usize = 0,
+
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_window_update: u32 = 0,
 
@@ -124,6 +133,9 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
+        if (self.data_budget) |budget| budget.release(self.data_budget_reserved);
+        self.data_budget = null;
+        self.data_budget_reserved = 0;
         self.data_buf.deinit(allocator);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);
@@ -143,6 +155,16 @@ pub const Stream = struct {
             .open, .half_closed_local => true,
             else => false,
         };
+    }
+
+    /// Returns an error that must prevent local response writes. Aggregate
+    /// request-body admission is an inbound terminal error, but the server
+    /// must still be able to send its explicit 429 response before resetting
+    /// the remote half of the stream. Peer resets and protocol errors remain
+    /// hard write barriers.
+    pub fn responseWriteError(self: *const Self) ?anyerror {
+        const err = self.stream_error orelse return null;
+        return if (err == error.BodyCapacityExceeded) null else err;
     }
 
     /// Transitions state after sending END_STREAM.

@@ -13,6 +13,7 @@
 // limitations.
 
 pub const http_common = @import("http_common.zig");
+pub const peer_disconnect_observer = @import("peer_disconnect_observer.zig");
 pub const std_http_executor = @import("std_http_executor.zig");
 pub const std_http_listener = @import("std_http_listener.zig");
 
@@ -49,4 +50,5 @@ test "common http module compiles" {
     _ = default_body_read_timeout_ms;
     _ = default_header_read_timeout_ms;
     _ = default_max_request_bytes;
+    _ = peer_disconnect_observer.Observer;
 }
