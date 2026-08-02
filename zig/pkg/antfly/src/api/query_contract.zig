@@ -2405,6 +2405,7 @@ pub fn parseQueryRequestWithDeadline(
         effective_body,
         req.limit,
         execution_deadline_ns,
+        cancellation,
     );
     try validatePublicDocFilterRootRefsAlloc(
         alloc,
@@ -2412,6 +2413,7 @@ pub fn parseQueryRequestWithDeadline(
         req.filter_query_json,
         req.exclusion_query_json,
         execution_deadline_ns,
+        cancellation,
     );
     try ensureQueryActive(execution_deadline_ns, cancellation);
 
@@ -5801,13 +5803,14 @@ fn validatePublicQueryTraversalBudgetAlloc(
     alloc: std.mem.Allocator,
     root: std.json.Value,
 ) !void {
-    return validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, root, null);
+    return validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, root, null, null);
 }
 
 fn validatePublicQueryTraversalBudgetWithDeadlineAlloc(
     alloc: std.mem.Allocator,
     root: std.json.Value,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !void {
     var pending = std.ArrayListUnmanaged(PublicQueryTraversalEntry).empty;
     defer pending.deinit(alloc);
@@ -5816,7 +5819,7 @@ fn validatePublicQueryTraversalBudgetWithDeadlineAlloc(
     var visited: usize = 0;
     while (pending.pop()) |entry| {
         visited += 1;
-        if (visited & 63 == 0) try ensureQueryDeadline(deadline_ns);
+        if (visited & 63 == 0) try ensureQueryActive(deadline_ns, cancellation);
         if (visited > public_query_max_tree_nodes or
             entry.depth > public_query_max_tree_depth)
         {
@@ -8425,10 +8428,11 @@ fn validatePublicBindingGraphValueAlloc(
     states: *std.StringHashMapUnmanaged(PublicBindingVisitState),
     depth: usize,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     visited: *usize,
 ) anyerror!void {
     visited.* += 1;
-    if (visited.* & 63 == 0) try ensureQueryDeadline(deadline_ns);
+    if (visited.* & 63 == 0) try ensureQueryActive(deadline_ns, cancellation);
     if (depth > public_query_max_tree_depth) return error.InvalidQueryRequest;
     if (value == .array) {
         for (value.array.items) |item| {
@@ -8439,6 +8443,7 @@ fn validatePublicBindingGraphValueAlloc(
                 states,
                 depth + 1,
                 deadline_ns,
+                cancellation,
                 visited,
             );
         }
@@ -8455,6 +8460,7 @@ fn validatePublicBindingGraphValueAlloc(
                 states,
                 depth + 1,
                 deadline_ns,
+                cancellation,
                 visited,
             );
             return;
@@ -8480,6 +8486,7 @@ fn validatePublicBindingGraphValueAlloc(
                 states,
                 depth + 1,
                 deadline_ns,
+                cancellation,
                 visited,
             );
         } else if (std.mem.eql(u8, key, "bool") and child == .object) {
@@ -8498,6 +8505,7 @@ fn validatePublicBindingGraphValueAlloc(
                         states,
                         depth + 1,
                         deadline_ns,
+                        cancellation,
                         visited,
                     );
                 }
@@ -8513,10 +8521,11 @@ fn validatePublicBindingGraphNameAlloc(
     states: *std.StringHashMapUnmanaged(PublicBindingVisitState),
     depth: usize,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     visited: *usize,
 ) anyerror!void {
     visited.* += 1;
-    if (visited.* & 63 == 0) try ensureQueryDeadline(deadline_ns);
+    if (visited.* & 63 == 0) try ensureQueryActive(deadline_ns, cancellation);
     if (depth > public_query_max_tree_depth) return error.InvalidQueryRequest;
     if (states.get(name)) |state| {
         if (state == .visiting) return error.InvalidQueryRequest;
@@ -8531,6 +8540,7 @@ fn validatePublicBindingGraphNameAlloc(
         states,
         depth + 1,
         deadline_ns,
+        cancellation,
         visited,
     );
     try states.put(alloc, name, .done);
@@ -8540,6 +8550,7 @@ fn validatePublicBindingGraphAlloc(
     alloc: std.mem.Allocator,
     bindings: std.json.ObjectMap,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !void {
     var states = std.StringHashMapUnmanaged(PublicBindingVisitState).empty;
     defer states.deinit(alloc);
@@ -8554,6 +8565,7 @@ fn validatePublicBindingGraphAlloc(
             &states,
             0,
             deadline_ns,
+            cancellation,
             &visited,
         );
     }
@@ -8566,10 +8578,11 @@ fn publicBindingValueReferencesTextBindingAlloc(
     text_bindings: *std.StringHashMapUnmanaged(bool),
     active: *std.StringHashMapUnmanaged(void),
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     visited: *usize,
 ) anyerror!bool {
     visited.* += 1;
-    if (visited.* & 63 == 0) try ensureQueryDeadline(deadline_ns);
+    if (visited.* & 63 == 0) try ensureQueryActive(deadline_ns, cancellation);
     if (value == .array) {
         for (value.array.items) |item| {
             if (try publicBindingValueReferencesTextBindingAlloc(
@@ -8579,6 +8592,7 @@ fn publicBindingValueReferencesTextBindingAlloc(
                 text_bindings,
                 active,
                 deadline_ns,
+                cancellation,
                 visited,
             )) return true;
         }
@@ -8595,6 +8609,7 @@ fn publicBindingValueReferencesTextBindingAlloc(
                 text_bindings,
                 active,
                 deadline_ns,
+                cancellation,
                 visited,
             );
         }
@@ -8619,6 +8634,7 @@ fn publicBindingValueReferencesTextBindingAlloc(
                 text_bindings,
                 active,
                 deadline_ns,
+                cancellation,
                 visited,
             )) return true;
         } else if (std.mem.eql(u8, key, "bool") and child == .object) {
@@ -8637,6 +8653,7 @@ fn publicBindingValueReferencesTextBindingAlloc(
                         text_bindings,
                         active,
                         deadline_ns,
+                        cancellation,
                         visited,
                     )) return true;
                 }
@@ -8653,10 +8670,11 @@ fn publicBindingRequiresTextAlloc(
     text_bindings: *std.StringHashMapUnmanaged(bool),
     active: *std.StringHashMapUnmanaged(void),
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     visited: *usize,
 ) anyerror!bool {
     visited.* += 1;
-    if (visited.* & 63 == 0) try ensureQueryDeadline(deadline_ns);
+    if (visited.* & 63 == 0) try ensureQueryActive(deadline_ns, cancellation);
     if (text_bindings.get(name)) |requires_text| return requires_text;
     const binding = bindings.get(name) orelse return error.InvalidQueryRequest;
     const active_entry = try active.getOrPut(alloc, name);
@@ -8677,7 +8695,7 @@ fn publicBindingRequiresTextAlloc(
         binding,
         std.math.maxInt(u32),
     );
-    try ensureQueryDeadline(deadline_ns);
+    try ensureQueryActive(deadline_ns, cancellation);
     const directly_requires_text = text_queries.items.len > 0;
     const requires_text = directly_requires_text or
         try publicBindingValueReferencesTextBindingAlloc(
@@ -8687,6 +8705,7 @@ fn publicBindingRequiresTextAlloc(
             text_bindings,
             active,
             deadline_ns,
+            cancellation,
             visited,
         );
     try text_bindings.put(alloc, name, requires_text);
@@ -8697,6 +8716,7 @@ fn classifyPublicTextBindingsAlloc(
     alloc: std.mem.Allocator,
     bindings: std.json.ObjectMap,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !std.StringHashMapUnmanaged(bool) {
     var text_bindings = std.StringHashMapUnmanaged(bool).empty;
     errdefer text_bindings.deinit(alloc);
@@ -8712,6 +8732,7 @@ fn classifyPublicTextBindingsAlloc(
             &text_bindings,
             &active,
             deadline_ns,
+            cancellation,
             &visited,
         );
     }
@@ -8814,16 +8835,17 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     defer parsed.deinit();
     try ensureQueryActive(deadline_ns, cancellation);
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, parsed.value, deadline_ns);
+    try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, parsed.value, deadline_ns, cancellation);
     try ensureQueryActive(deadline_ns, cancellation);
     const bindings_value = parsed.value.object.get("with") orelse return null;
     if (bindings_value != .object) return error.InvalidQueryRequest;
-    try validatePublicBindingGraphAlloc(alloc, bindings_value.object, deadline_ns);
+    try validatePublicBindingGraphAlloc(alloc, bindings_value.object, deadline_ns, cancellation);
     try ensureQueryDeadline(deadline_ns);
     var text_bindings = try classifyPublicTextBindingsAlloc(
         alloc,
         bindings_value.object,
         deadline_ns,
+        cancellation,
     );
     defer text_bindings.deinit(alloc);
     try ensureQueryDeadline(deadline_ns);
@@ -9151,16 +9173,17 @@ fn parsePublicDocFilterBindingsAlloc(
     body: []const u8,
     limit: u32,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) ![]const db_mod.types.NamedDocFilterBinding {
     if (std.mem.indexOf(u8, body, "\"with\"") == null) return &.{};
 
-    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     try deadline.check();
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     try deadline.check();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, parsed.value, deadline_ns);
+    try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, parsed.value, deadline_ns, cancellation);
     try deadline.check();
     const with_value = parsed.value.object.get("with") orelse return &.{};
     if (with_value != .object) return error.InvalidQueryRequest;
@@ -9414,8 +9437,9 @@ fn validatePublicDocFilterRootRefsAlloc(
     filter_query_json: []const u8,
     exclusion_query_json: []const u8,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !void {
-    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     try deadline.check();
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
@@ -10250,6 +10274,7 @@ test "api query contract final binding validation observes caller deadline" {
         ,
             10,
             0,
+            null,
         ),
     );
 }
