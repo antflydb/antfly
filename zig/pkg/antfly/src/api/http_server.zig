@@ -8610,7 +8610,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ![]u8 {
-        const execution_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
+        const execution_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body, null);
         return try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
             source,
@@ -8636,7 +8636,10 @@ pub const ApiHttpServer = struct {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
-        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
+        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body, cancellation) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            else => return error.InvalidQueryRequest,
+        };
         while (true) {
             try ensureRequestActive(cancellation);
             if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;

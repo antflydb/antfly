@@ -2109,18 +2109,106 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
     db_mod.types.freeJsonValues(alloc, @constCast(values));
 }
 
-fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    const value = parsed.value.object.get("timeout_ms") orelse return null;
-    return switch (value) {
-        .null => null,
-        .integer => |v| if (v >= 0) @as(u64, @intCast(v)) else error.InvalidQueryRequest,
-        .float => error.InvalidQueryRequest,
-        .number_string => |v| std.fmt.parseUnsigned(u64, v, 10) catch error.InvalidQueryRequest,
-        else => error.InvalidQueryRequest,
-    };
+const query_timeout_scan_chunk_bytes = 64 * 1024;
+
+fn nextQueryTimeoutToken(
+    scanner: *std.json.Scanner,
+    body: []const u8,
+    offset: *usize,
+    ended: *bool,
+    cancellation: ?*const std.atomic.Value(bool),
+) !std.json.Token {
+    while (true) {
+        if (cancellation) |signal| if (signal.load(.acquire)) return error.Cancelled;
+        return scanner.next() catch |err| switch (err) {
+            error.BufferUnderrun => {
+                if (ended.*) return error.InvalidQueryRequest;
+                if (offset.* == body.len) {
+                    scanner.endInput();
+                    ended.* = true;
+                } else {
+                    const end = @min(body.len, offset.* + query_timeout_scan_chunk_bytes);
+                    scanner.feedInput(body[offset.*..end]);
+                    offset.* = end;
+                }
+                continue;
+            },
+            else => return error.InvalidQueryRequest,
+        };
+    }
+}
+
+/// Finds the top-level timeout without constructing a request DOM. This runs
+/// before query admission retries, so it must poll peer cancellation while
+/// consuming large bodies.
+fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !?u64 {
+    var scanner = std.json.Scanner.initStreaming(alloc);
+    defer scanner.deinit();
+    var offset: usize = 0;
+    var ended = false;
+    var depth: usize = 0;
+    var started = false;
+    var root_expects_key = false;
+    var timeout_value_pending = false;
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+
+    while (true) {
+        const token = try nextQueryTimeoutToken(&scanner, body, &offset, &ended, cancellation);
+        switch (token) {
+            .object_begin => {
+                if (!started) {
+                    started = true;
+                    depth = 1;
+                    root_expects_key = true;
+                } else {
+                    if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                    depth += 1;
+                }
+            },
+            .array_begin => {
+                if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                depth += 1;
+            },
+            .object_end, .array_end => {
+                if (depth == 0) return error.InvalidQueryRequest;
+                depth -= 1;
+                if (depth == 0) root_expects_key = false else if (depth == 1) {
+                    root_expects_key = true;
+                    timeout_value_pending = false;
+                }
+            },
+            .partial_string => |part| if (depth == 1 and root_expects_key) try key.appendSlice(alloc, part),
+            .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
+                if (depth == 1 and root_expects_key) try key.append(alloc, 0);
+            },
+            .string => |part| {
+                if (depth == 1 and root_expects_key) {
+                    try key.appendSlice(alloc, part);
+                    timeout_value_pending = std.mem.eql(u8, key.items, "timeout_ms");
+                    key.clearRetainingCapacity();
+                    root_expects_key = false;
+                } else if (depth == 1 and timeout_value_pending) {
+                    return std.fmt.parseUnsigned(u64, part, 10) catch error.InvalidQueryRequest;
+                } else if (depth == 1) root_expects_key = true;
+            },
+            .partial_number => {},
+            .number => |value| {
+                if (depth == 1 and timeout_value_pending) return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidQueryRequest;
+                if (depth == 1) root_expects_key = true;
+            },
+            .null => {
+                if (depth == 1 and timeout_value_pending) return null;
+                if (depth == 1) root_expects_key = true;
+            },
+            .true, .false => {
+                if (depth == 1 and timeout_value_pending) return error.InvalidQueryRequest;
+                if (depth == 1) root_expects_key = true;
+            },
+            .end_of_document => return if (started and depth == 0) null else error.InvalidQueryRequest,
+            .allocated_string, .allocated_number => unreachable,
+        }
+    }
 }
 
 const QueryBodyContractFields = struct {
@@ -2142,9 +2230,9 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
     };
 }
 
-pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const u8) !?u64 {
+pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const u8, cancellation: ?*const std.atomic.Value(bool)) !?u64 {
     const started_ns = platform_time.monotonicNs();
-    const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return null;
+    const timeout_ms = (try parseQueryTimeoutMs(alloc, body, cancellation)) orelse return null;
     return started_ns +| timeout_ms *| std.time.ns_per_ms;
 }
 
@@ -2184,7 +2272,7 @@ pub fn parseQueryRequest(
     table_name: []const u8,
     body: []const u8,
 ) !OwnedQueryRequest {
-    const execution_deadline_ns = try queryExecutionDeadlineNsFromBody(alloc, body);
+    const execution_deadline_ns = try queryExecutionDeadlineNsFromBody(alloc, body, null);
     return try parseQueryRequestWithDeadline(
         alloc,
         semantic_resolver,
@@ -2347,7 +2435,7 @@ pub fn parsePublicQueryRequest(
     table_name: []const u8,
     body: []const u8,
 ) !OwnedQueryRequest {
-    const execution_deadline_ns = try queryExecutionDeadlineNsFromBody(alloc, body);
+    const execution_deadline_ns = try queryExecutionDeadlineNsFromBody(alloc, body, null);
     return try parsePublicQueryRequestWithDeadline(
         alloc,
         semantic_resolver,
