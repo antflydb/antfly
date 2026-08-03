@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import inspect
 import stat
 import subprocess
@@ -17,6 +18,20 @@ UPSTREAM_COMMIT = "8f3fc399bcc5a00749a62a1565e5c6529f04b574"
 CANONICAL_NORMALIZATION = "unicode_nfc_collapsed_whitespace_casefold/v1"
 CANONICAL_PYTHON_VERSION = (3, 12)
 CANONICAL_UNICODE_VERSION = "15.0.0"
+CANONICAL_GLINER2_VERSION = "1.3.2"
+CANONICAL_ORACLE_PACKAGE_VERSIONS = {
+    "accelerate": "1.14.0",
+    "huggingface-hub": "1.26.0",
+    "numpy": "2.4.2",
+    "peft": "0.20.0",
+    "pydantic": "2.13.4",
+    "requests": "2.34.2",
+    "safetensors": "0.7.0",
+    "tokenizers": "0.22.2",
+    "torch": "2.10.0",
+    "transformers": "5.1.0",
+    "urllib3": "2.7.0",
+}
 FINGERPRINT_ABSENT_MARKER = b"<absent>"
 
 
@@ -64,6 +79,24 @@ def verify_canonical_python_runtime() -> dict[str, str]:
         "python": f"{actual_python[0]}.{actual_python[1]}",
         "unicode": actual_unicode,
     }
+
+
+def verify_canonical_oracle_packages() -> dict[str, str]:
+    """Require the dependency versions used by the frozen Fastino oracle."""
+    actual: dict[str, str] = {}
+    for package in CANONICAL_ORACLE_PACKAGE_VERSIONS:
+        try:
+            actual[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            actual[package] = "<missing>"
+    if actual != CANONICAL_ORACLE_PACKAGE_VERSIONS:
+        mismatches = [
+            f"{package}={actual[package]} (expected {expected})"
+            for package, expected in CANONICAL_ORACLE_PACKAGE_VERSIONS.items()
+            if actual[package] != expected
+        ]
+        raise ValueError("canonical GLiNER2 oracle dependency mismatch: " + ", ".join(mismatches))
+    return actual
 
 
 def directory_fingerprint(directory: Path, entries: Iterable[FingerprintEntry]) -> str:

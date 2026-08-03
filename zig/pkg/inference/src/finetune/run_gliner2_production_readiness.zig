@@ -160,8 +160,8 @@ const Options = struct {
 
 const release_readiness_blockers = [_][]const u8{
     "the required native full-task minima and positive-coverage gate are not configured by this scoped runner",
-    "pinned upstream held-out convergence and result parity are not evaluated",
-    "stock upstream sampling, shuffle, and stochastic dropout result parity are not implemented",
+    "this scoped runner does not evaluate the required five-seed held-out outcome parity study against pinned stock-stochastic Fastino",
+    "Zig SamplingConfig augmentation and model dropout remain disabled and must be accepted only through the audited outcome-parity gate",
     "U+0130 lowercase expansion and normalization-changing Unicode remain unsupported and fail closed",
 };
 

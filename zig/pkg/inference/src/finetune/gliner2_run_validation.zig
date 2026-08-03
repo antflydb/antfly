@@ -20,7 +20,7 @@ const safetensors = @import("../models/safetensors.zig");
 pub const manifest_file_name = "training_manifest.json";
 pub const metrics_file_name = "training_metrics.jsonl";
 pub const adapter_file_suffix = ".bin";
-pub const expected_manifest_schema_version = "gliner2_autodiff_training/v2";
+pub const expected_manifest_schema_version = "gliner2_autodiff_training/v3";
 pub const expected_artifact_family_version = "gliner2_autodiff_adapter/v2";
 const loss_trend_window = 20;
 
@@ -740,6 +740,12 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
         !std.mem.eql(u8, task_head_role, "inference_graph_compatibility_only")) return error.InvalidTrainingManifest;
     const model_dropout = jsonString(obj.get("model_dropout")) orelse return error.InvalidTrainingManifest;
     if (!std.mem.eql(u8, model_dropout, "disabled")) return error.InvalidTrainingManifest;
+    const sampling_config = jsonString(obj.get("sampling_config")) orelse return error.InvalidTrainingManifest;
+    if (!std.mem.eql(u8, sampling_config, "disabled")) return error.InvalidTrainingManifest;
+    const schema_conditioning_policy = jsonString(obj.get("schema_conditioning_policy")) orelse return error.InvalidTrainingManifest;
+    if (!std.mem.eql(u8, schema_conditioning_policy, "deterministic-eval-form")) return error.InvalidTrainingManifest;
+    _ = jsonBool(obj.get("deterministic")) orelse return error.InvalidTrainingManifest;
+    _ = jsonBool(obj.get("train_shuffle")) orelse return error.InvalidTrainingManifest;
 
     const num_classes = jsonUsize(obj.get("num_classes")) orelse return error.InvalidTrainingManifest;
     const hidden_size = jsonUsize(obj.get("hidden_size")) orelse return error.InvalidTrainingManifest;
@@ -749,12 +755,14 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
     const lora_rank = jsonUsize(obj.get("lora_rank")) orelse return error.InvalidTrainingManifest;
     const lora_alpha = jsonF64(obj.get("lora_alpha")) orelse return error.InvalidTrainingManifest;
     const lora_dropout = jsonF64(obj.get("lora_dropout")) orelse 0.0;
+    const span_negative_mask_rate = jsonF64(obj.get("span_negative_mask_rate")) orelse return error.InvalidTrainingManifest;
     const lora_targets = jsonString(obj.get("lora_targets")) orelse return error.InvalidTrainingManifest;
     const resolved_lora_targets_value = obj.get("resolved_lora_targets") orelse return error.InvalidTrainingManifest;
     if (resolved_lora_targets_value != .array) return error.InvalidTrainingManifest;
     const resolved_lora_targets = resolved_lora_targets_value.array.items;
     if (lora_rank == 0 or !std.math.isFinite(lora_alpha) or lora_alpha <= 0) return error.InvalidTrainingManifest;
     if (!std.math.isFinite(lora_dropout) or lora_dropout < 0.0 or lora_dropout >= 1.0) return error.InvalidTrainingManifest;
+    if (!std.math.isFinite(span_negative_mask_rate) or span_negative_mask_rate < 0.0 or span_negative_mask_rate > 1.0) return error.InvalidTrainingManifest;
     if (countCsvTargets(lora_targets) == 0 or hasEmptyCsvTarget(lora_targets)) return error.InvalidTrainingManifest;
     if (resolved_lora_targets.len == 0) return error.InvalidTrainingManifest;
     for (resolved_lora_targets, 0..) |target, idx| {

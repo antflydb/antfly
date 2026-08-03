@@ -10,10 +10,17 @@ from typing import Any
 
 from evaluate_gliner2_full_task import EVALUATION_CONTRACT, REQUIRED_MINIMA
 from evaluate_gliner2_native_release_smoke import NATIVE_EVALUATION_CONTRACT
-from gliner2_release_contract import CANONICAL_NORMALIZATION, CANONICAL_UNICODE_VERSION, UPSTREAM_COMMIT
+from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
+    CANONICAL_NORMALIZATION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
+    CANONICAL_UNICODE_VERSION,
+    UPSTREAM_COMMIT,
+)
 from summarize_gliner2_convergence import (
     EVIDENCE_CONTRACT,
     OUTPUT_CONTRACT,
+    STOCK_STOCHASTIC_TRAINING_POLICY,
     verify_summary_evidence,
 )
 from validate_gliner2_release_data import adapter_bundle_fingerprint
@@ -61,6 +68,8 @@ def build_summary(
         and default_summary.get("oracle_valid_in_every_run") is True
         and isinstance(oracle, dict)
         and oracle.get("commit") == UPSTREAM_COMMIT
+        and oracle.get("gliner2_version") == CANONICAL_GLINER2_VERSION
+        and oracle.get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
     )
 
     quality_ready = bool(
@@ -71,6 +80,8 @@ def build_summary(
         and object_field(quality_report, "inference").get("normalization") == CANONICAL_NORMALIZATION
         and object_field(quality_report, "inference").get("unicode_version") == CANONICAL_UNICODE_VERSION
         and object_field(quality_report, "oracle").get("commit") == UPSTREAM_COMMIT
+        and object_field(quality_report, "oracle").get("gliner2_version") == CANONICAL_GLINER2_VERSION
+        and object_field(quality_report, "oracle").get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
     )
     if quality_rc == 0 and not quality_ready:
         integrity_errors.append("Python-oracle held-out command returned success without a pinned, normalized passing report")
@@ -95,8 +106,11 @@ def build_summary(
         and convergence_report.get("seed_count") == 5
         and object_field(convergence_report, "oracle").get("commit") == UPSTREAM_COMMIT
         and object_field(convergence_report, "oracle").get("checkout") == oracle.get("checkout")
+        and object_field(convergence_report, "oracle").get("gliner2_version") == CANONICAL_GLINER2_VERSION
+        and object_field(convergence_report, "oracle").get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
         and convergence_report.get("normalization") == CANONICAL_NORMALIZATION
         and convergence_report.get("unicode_version") == CANONICAL_UNICODE_VERSION
+        and convergence_report.get("training_policy") == STOCK_STOCHASTIC_TRAINING_POLICY
         and convergence_report.get("thresholds") == {
             "max_mean_deficit": 0.02,
             "max_paired_deficit": 0.05,
@@ -144,7 +158,7 @@ def build_summary(
     if not default_ready:
         blockers.append("deterministic cross-runtime parity/performance gate failed")
     if not oracle_ready:
-        blockers.append("Python oracle checkout/import was not pinned in every comparison run")
+        blockers.append("Python oracle checkout/import/runtime dependencies were not pinned in every comparison run")
     if not quality_ready:
         blockers.append("Python-oracle held-out quality gate failed or did not run")
     if not native_ready:
@@ -175,7 +189,7 @@ def build_summary(
         "policies": {
             "production_implementation": "Zig GLiNER2 finetuning on the Zig Metal kernels/runtime",
             "python_role": "correctness oracle and performance baseline only; not a deployed runtime dependency",
-            "stochastic_training": "paired independent-seed statistical convergence; exact Python RNG-stream equality is not required",
+            "stochastic_training": "Fastino retains pinned upstream sampling, schema conditioning, model dropout, negative masking, and shuffle; Zig records its disabled sampling/model-dropout policy plus enabled epoch shuffle and negative masking; paired independent-seed held-out result parity is required and exact Python RNG-stream equality is not required",
             "unsupported_training_unicode": "fail closed with record/field/code-point context; this is a supported-input boundary, not a readiness blocker",
             "scoring_normalization": CANONICAL_NORMALIZATION,
             "independently_trained_tensor_equality": "diagnostic only; same-artifact round-trip remains strict",

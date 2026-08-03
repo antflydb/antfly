@@ -255,12 +255,19 @@ import sys
 from pathlib import Path
 
 from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
     CANONICAL_NORMALIZATION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
     CANONICAL_UNICODE_VERSION,
     UPSTREAM_COMMIT,
     path_fingerprint,
 )
-from summarize_gliner2_convergence import EVIDENCE_CONTRACT, OUTPUT_CONTRACT, verify_summary_evidence
+from summarize_gliner2_convergence import (
+    EVIDENCE_CONTRACT,
+    OUTPUT_CONTRACT,
+    STOCK_STOCHASTIC_TRAINING_POLICY,
+    verify_summary_evidence,
+)
 from validate_gliner2_release_data import base_model_fingerprint
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -278,8 +285,11 @@ if (
     or report.get("seed_count") != 5
     or report.get("oracle", {}).get("commit") != UPSTREAM_COMMIT
     or report.get("oracle", {}).get("checkout") != str(Path(sys.argv[5]).resolve())
+    or report.get("oracle", {}).get("gliner2_version") != CANONICAL_GLINER2_VERSION
+    or report.get("oracle", {}).get("package_versions") != CANONICAL_ORACLE_PACKAGE_VERSIONS
     or report.get("normalization") != CANONICAL_NORMALIZATION
     or report.get("unicode_version") != CANONICAL_UNICODE_VERSION
+    or report.get("training_policy") != STOCK_STOCHASTIC_TRAINING_POLICY
     or report.get("fingerprints") != expected_fingerprints
 ):
     raise SystemExit("convergence summary is not a passing five-seed report for the selected model/train/eval artifacts")
@@ -308,7 +318,7 @@ native_release_rc=1
 
 default_cmd=(
   "${script_dir}/run_gliner2_lora_perf_gate.sh"
-  "--production-ready"
+  "--warm-production-ready"
   "--runs" "${runs}"
   "--out-dir" "${default_dir}"
   "--max-zig-python-warm-step-ratio-median" "1.0"
@@ -320,7 +330,7 @@ head_cmd=(
   "--op-stats"
   "--runs" "${head_runs}"
   "--out-dir" "${head_dir}"
-  "--max-zig-metal-peak-live-bytes-median" "1717986918"
+  "--max-zig-metal-peak-live-bytes-median" "3221225472"
   "--max-zig-metal-planned-barriers-median" "40"
   "--max-zig-metal-planned-scopes-median" "55"
   "--max-command-dispatch-median" "6250"

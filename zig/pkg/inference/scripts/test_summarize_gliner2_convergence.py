@@ -6,14 +6,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from compare_gliner2_lora_python_zig import COMPARISON_CONTRACT
+from compare_gliner2_lora_python_zig import COMPARISON_CONTRACT, UPSTREAM_SAMPLING_DEFAULTS
 from evaluate_gliner2_full_task import EVALUATION_CONTRACT, REQUIRED_MINIMA
-from gliner2_release_contract import CANONICAL_NORMALIZATION, CANONICAL_UNICODE_VERSION, UPSTREAM_COMMIT
+from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
+    CANONICAL_NORMALIZATION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
+    CANONICAL_UNICODE_VERSION,
+    UPSTREAM_COMMIT,
+)
 from summarize_gliner2_convergence import (
     DERIVED_CONTRACT,
     EVIDENCE_CONTRACT,
     INPUT_CONTRACT,
+    STOCK_STOCHASTIC_TRAINING_POLICY,
     materialize_study,
+    stochastic_comparison_errors,
     summarize,
 )
 from validate_gliner2_release_data import adapter_bundle_fingerprint
@@ -40,6 +48,8 @@ def oracle() -> dict:
         "imported_module": "/oracle/gliner2/model.py",
         "python_version": "3.12.10",
         "unicode_version": CANONICAL_UNICODE_VERSION,
+        "gliner2_version": CANONICAL_GLINER2_VERSION,
+        "package_versions": CANONICAL_ORACLE_PACKAGE_VERSIONS,
     }
 
 
@@ -47,9 +57,17 @@ def passing_payload() -> dict:
     return {
         "contract": DERIVED_CONTRACT,
         "evidence_contract": EVIDENCE_CONTRACT,
-        "oracle": {"commit": UPSTREAM_COMMIT, "checkout": "/oracle"},
+        "oracle": {
+            "commit": UPSTREAM_COMMIT,
+            "checkout": "/oracle",
+            "python_version": "3.12",
+            "unicode_version": CANONICAL_UNICODE_VERSION,
+            "gliner2_version": CANONICAL_GLINER2_VERSION,
+            "package_versions": CANONICAL_ORACLE_PACKAGE_VERSIONS,
+        },
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
+        "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
         "fingerprints": {"base_model": SHA_MODEL, "train_data": SHA_TRAIN, "eval_data": SHA_EVAL},
         "artifact_paths": {"base_model": "/model", "train_data": "/train", "eval_data": "/eval"},
         "minimums": {key: 0.7 for key in REQUIRED_MINIMA},
@@ -79,6 +97,79 @@ def passing_payload() -> dict:
 
 
 class ConvergenceSummaryTest(unittest.TestCase):
+    def test_stock_stochastic_gate_rejects_disabled_sampling_or_runtime_checks(self) -> None:
+        config = {
+            "deterministic": False,
+            "python_sampling_policy": "upstream-default",
+            "python_schema_conditioning_policy": "upstream-training-default",
+            "python_train_shuffle": True,
+            "disable_python_model_dropout": False,
+            "lora_dropout": 0.0,
+            "span_negative_mask_rate": 0.5,
+        }
+        strict_checks = {
+            "requested_step_count_valid": True,
+            "adapter_roundtrip_ok": True,
+            "metal_manifest_backend_is_metal": True,
+            "metal_optimizer_backend_is_metal": True,
+            "metal_device_resident_transfers_zero": True,
+            "metal_finite_step_loss": True,
+            "metal_graph_executor_fallback_reasons_empty": True,
+            "metal_graph_executor_true_host_outputs_zero": True,
+            "metal_interpreter_fallbacks_within_threshold": True,
+        }
+        summary = {"strict_mode": True, "strict_checks": strict_checks}
+        python_result = {"metrics": {
+            "sampling_policy": "upstream-default",
+            "sampling_config": UPSTREAM_SAMPLING_DEFAULTS,
+            "schema_conditioning_policy": "upstream-training-default",
+            "training_deterministic": False,
+            "train_shuffle": True,
+            "configured_dropout_modules": 3,
+            "disabled_dropout_modules": 0,
+        }}
+        zig_result = {"training_manifest": {
+            "deterministic": False,
+            "sampling_config": "disabled",
+            "schema_conditioning_policy": "deterministic-eval-form",
+            "model_dropout": "disabled",
+            "train_shuffle": True,
+            "lora_dropout": 0.0,
+            "span_negative_mask_rate": 0.5,
+        }}
+        self.assertEqual([], stochastic_comparison_errors(config, summary, python_result, zig_result))
+
+        disabled = copy.deepcopy(python_result)
+        disabled["metrics"]["sampling_policy"] = "disabled"
+        self.assertIn("sampling policy", " ".join(
+            stochastic_comparison_errors(config, summary, disabled, zig_result)
+        ))
+        mistyped_sampling = copy.deepcopy(python_result)
+        mistyped_sampling["metrics"]["sampling_config"]["remove_entities_prob"] = False
+        self.assertIn("SamplingConfig differs", " ".join(
+            stochastic_comparison_errors(config, summary, mistyped_sampling, zig_result)
+        ))
+        mistyped_config = copy.deepcopy(config)
+        mistyped_config["lora_dropout"] = False
+        self.assertIn("LoRA dropout", " ".join(
+            stochastic_comparison_errors(mistyped_config, summary, python_result, zig_result)
+        ))
+        pinned_conditioning = copy.deepcopy(python_result)
+        pinned_conditioning["metrics"]["schema_conditioning_policy"] = "deterministic-eval-form"
+        self.assertIn("schema conditioning", " ".join(
+            stochastic_comparison_errors(config, summary, pinned_conditioning, zig_result)
+        ))
+        weakened_zig = copy.deepcopy(zig_result)
+        weakened_zig["training_manifest"]["span_negative_mask_rate"] = 0.0
+        self.assertIn("span_negative_mask_rate", " ".join(
+            stochastic_comparison_errors(config, summary, python_result, weakened_zig)
+        ))
+        failed_runtime = copy.deepcopy(summary)
+        failed_runtime["strict_checks"]["metal_device_resident_transfers_zero"] = False
+        self.assertIn("metal_device_resident_transfers_zero", " ".join(
+            stochastic_comparison_errors(config, failed_runtime, python_result, zig_result)
+        ))
+
     def test_five_seed_quality_and_optimizer_contract_passes(self) -> None:
         result = summarize(passing_payload())
         self.assertTrue(result["pass"], result["failures"])
@@ -163,16 +254,44 @@ class ConvergenceSummaryTest(unittest.TestCase):
                         "zig_objective": "gliner2-total-loss",
                         "zig_lora_only_trainables": True,
                         "deterministic": False,
+                        "python_sampling_policy": "upstream-default",
+                        "python_schema_conditioning_policy": "upstream-training-default",
+                        "python_train_shuffle": True,
+                        "disable_python_model_dropout": False,
+                        "lora_dropout": 0.0,
+                        "span_negative_mask_rate": 0.5,
                         "oracle": verified,
                         "steps": 2,
                     },
-                    "summary": {"requested_step_count": 2, "step_count_valid": True},
+                    "summary": {
+                        "requested_step_count": 2,
+                        "step_count_valid": True,
+                        "strict_mode": True,
+                        "strict_checks": {
+                            "requested_step_count_valid": True,
+                            "adapter_roundtrip_ok": True,
+                            "metal_manifest_backend_is_metal": True,
+                            "metal_optimizer_backend_is_metal": True,
+                            "metal_device_resident_transfers_zero": True,
+                            "metal_finite_step_loss": True,
+                            "metal_graph_executor_fallback_reasons_empty": True,
+                            "metal_graph_executor_true_host_outputs_zero": True,
+                            "metal_interpreter_fallbacks_within_threshold": True,
+                        },
+                    },
                     "python": {
                         "returncode": 0,
                         "metrics": {
                             "total_steps": 2,
                             "train_metrics_history": [{"loss": 2.0}, {"loss": 1.0}],
                             "oracle": oracle(),
+                            "sampling_policy": "upstream-default",
+                            "sampling_config": UPSTREAM_SAMPLING_DEFAULTS,
+                            "schema_conditioning_policy": "upstream-training-default",
+                            "training_deterministic": False,
+                            "train_shuffle": True,
+                            "configured_dropout_modules": 3,
+                            "disabled_dropout_modules": 0,
                         },
                     },
                     "zig": {
@@ -181,6 +300,13 @@ class ConvergenceSummaryTest(unittest.TestCase):
                             "backend": "metal",
                             "objective": "gliner2-total-loss",
                             "lora_only_trainables": True,
+                            "deterministic": False,
+                            "sampling_config": "disabled",
+                            "schema_conditioning_policy": "deterministic-eval-form",
+                            "model_dropout": "disabled",
+                            "train_shuffle": True,
+                            "lora_dropout": 0.0,
+                            "span_negative_mask_rate": 0.5,
                             "optimizer_steps": 2,
                         },
                         "training_metrics": [

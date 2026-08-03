@@ -14,6 +14,41 @@ import benchmark_gliner2_lora_perf as benchmark
 
 
 class BenchmarkGateTest(unittest.TestCase):
+    def test_production_readiness_uses_uninstrumented_warm_gate(self) -> None:
+        wrapper = (
+            Path(__file__).resolve().parent / "run_gliner2_lora_production_readiness.sh"
+        ).read_text(encoding="utf-8")
+        default_block = wrapper.split("default_cmd=(", 1)[1].split(")\nhead_cmd=(", 1)[0]
+        head_block = wrapper.split("head_cmd=(", 1)[1].split(")\nif ", 1)[0]
+        self.assertIn('"--warm-production-ready"', default_block)
+        self.assertNotIn('\n  "--production-ready"\n', default_block)
+        self.assertNotIn('"--op-stats"', default_block)
+        self.assertIn('"--op-stats"', head_block)
+
+    def test_warm_perf_presets_do_not_enable_timing_profilers(self) -> None:
+        wrapper = (Path(__file__).resolve().parent / "run_gliner2_lora_perf_gate.sh").read_text(
+            encoding="utf-8"
+        )
+        warm_block = wrapper.split(
+            "if (( warm_research || warm_production_ready )); then", 1
+        )[1].split("fi", 1)[0]
+        self.assertNotIn("op_stats=1", warm_block)
+        self.assertNotIn("loop_profile=1", warm_block)
+        self.assertNotIn("hazard_profile=1", warm_block)
+        self.assertIn("if (( ! warm_production_ready )); then\n    op_stats=1", wrapper)
+        self.assertIn("max_dot_general_count_median=1102", wrapper)
+        self.assertIn("max_zig_metal_planned_barriers_median=81", wrapper)
+        self.assertIn("max_zig_metal_planned_scopes_median=126", wrapper)
+
+    def test_perf_wrapper_preserves_virtualenv_launcher_symlink(self) -> None:
+        wrapper = (Path(__file__).resolve().parent / "run_gliner2_lora_perf_gate.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("resolve_executable_path()", wrapper)
+        self.assertIn("os.path.abspath(os.path.expanduser(sys.argv[1]))", wrapper)
+        self.assertIn('python_bin="$(resolve_executable_path "${python_bin}")"', wrapper)
+        self.assertNotIn('python_bin="$(resolve_path "${python_bin}")"', wrapper)
+
     def test_run_compare_does_not_reuse_stale_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)

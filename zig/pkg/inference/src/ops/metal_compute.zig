@@ -29202,9 +29202,13 @@ test "metal_compute: scatter add axis0 matches native for embedding-style gradie
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    const value_rows: usize = 64;
-    const out_rows: usize = 11;
-    const dim: usize = 96;
+    // Deliberately cross the kernel's 256-thread row and column tiles. This
+    // catches lost matches at tile boundaries and truncated non-divisible
+    // hidden widths while retaining the duplicate indices seen in embedding
+    // gradients.
+    const value_rows: usize = 257;
+    const out_rows: usize = 17;
+    const dim: usize = 385;
 
     const values = try allocator.alloc(f32, value_rows * dim);
     defer allocator.free(values);

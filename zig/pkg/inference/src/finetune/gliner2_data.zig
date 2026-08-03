@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("../io/compat.zig");
 const upstream_unicode = @import("gliner2_unicode_tables.zig");
 
@@ -2013,10 +2014,18 @@ fn buildUpstreamTaskBatchImpl(
     batch_size: usize,
 ) !EncodedBatch {
     const effective_batch = @min(batch_size, records.len);
-    const max_words_per_sample = max_length;
-    const max_spans = max_words_per_sample * max_span_width;
     const max_schemas = @max(1, maxTaskCount(records[0..effective_batch]));
-    if (max_schemas > max_spans) return error.TooManySchemaTasks;
+    if (max_length == 0 or max_span_width == 0) return error.TooManySchemaTasks;
+    const schema_row_capacity = std.math.mul(usize, max_length, max_span_width) catch
+        return error.TooManySchemaTasks;
+    if (max_schemas > schema_row_capacity) return error.TooManySchemaTasks;
+    const max_words_per_sample = try upstreamBatchWordCapacity(
+        records[0..effective_batch],
+        max_schemas,
+        max_length,
+        max_span_width,
+    );
+    const max_spans = max_words_per_sample * max_span_width;
     const max_schema_specials = num_entity_slots + 1;
 
     var input_ids = try allocator.alloc(i32, effective_batch * max_length);
@@ -2116,7 +2125,8 @@ fn buildUpstreamTaskBatchImpl(
         text_word_counts[b] = @intCast(encode_result.num_words);
         schema_counts[b] = @intCast(encode_result.num_schemas);
 
-        fillUpstreamWordSurfaceFeatures(
+        try fillUpstreamWordSurfaceFeatures(
+            allocator,
             record,
             encode_result.num_words,
             word_lengths[word_offset .. word_offset + max_words_per_sample],
@@ -2171,6 +2181,45 @@ fn buildUpstreamTaskBatchImpl(
     };
 }
 
+/// Fastino pads text-word routing and span work to the longest text in the
+/// current batch, not to the encoder sequence ceiling. Keep a small bounded
+/// set of graph signatures by rounding that count up to a power of two. Schema
+/// objectives are packed into the first span rows, so their count supplies an
+/// independent lower bound even for very short texts.
+fn upstreamBatchWordCapacity(
+    records: []const UpstreamRecord,
+    max_schemas: usize,
+    max_length: usize,
+    max_span_width: usize,
+) !usize {
+    std.debug.assert(max_length > 0 and max_span_width > 0);
+    var required_words = max_schemas / max_span_width + @intFromBool(max_schemas % max_span_width != 0);
+    for (records) |record| {
+        try validateUpstreamLowerableText(record.text);
+        required_words = @max(required_words, upstreamRecordWordCount(record));
+    }
+    required_words = @max(required_words, 1);
+    const bucket = std.math.ceilPowerOfTwo(usize, required_words) catch max_length;
+    return @min(bucket, max_length);
+}
+
+fn upstreamRecordWordCount(record: UpstreamRecord) usize {
+    var count = record.prefix_tokens.len;
+    const needs_period = upstreamTextNeedsTerminalPeriod(record.text);
+    var appended_period_joins_url = false;
+    var text_idx: usize = 0;
+    while (text_idx < record.text.len) {
+        while (text_idx < record.text.len and isUpstreamWhitespaceAt(record.text, text_idx)) : (text_idx = nextCodepointEnd(record.text, text_idx)) {}
+        if (text_idx >= record.text.len) break;
+        const token_start = text_idx;
+        text_idx = nextUpstreamTextTokenEnd(record.text, text_idx);
+        appended_period_joins_url = needs_period and text_idx == record.text.len and
+            (startsWithHttpUrl(record.text, token_start) or startsWithWwwUrl(record.text, token_start));
+        count += 1;
+    }
+    return count + @intFromBool(needs_period and !appended_period_joins_url);
+}
+
 const UpstreamEncodeResult = struct {
     num_words: usize,
     num_schemas: usize,
@@ -2193,7 +2242,13 @@ fn encodeUpstreamRecordInto(
     schema_special_positions: []i32,
     schema_special_counts: []i32,
 ) !UpstreamEncodeResult {
-    try validateUpstreamLowerableText(record.text);
+    var appended_text: ?[]u8 = null;
+    defer if (appended_text) |text| allocator.free(text);
+    if (upstreamTextNeedsTerminalPeriod(record.text)) {
+        appended_text = try std.mem.concat(allocator, u8, &.{ record.text, "." });
+    }
+    const effective_text: []const u8 = appended_text orelse record.text;
+    try validateUpstreamLowerableText(effective_text);
     var pos: usize = 0;
     var schema_idx: usize = 0;
     for (record.tasks) |task| {
@@ -2236,17 +2291,17 @@ fn encodeUpstreamRecordInto(
         if (!appended) return error.UnencodableTextToken;
     }
     var text_idx: usize = 0;
-    while (text_idx < record.text.len) {
-        while (text_idx < record.text.len and isUpstreamWhitespaceAt(record.text, text_idx)) : (text_idx = nextCodepointEnd(record.text, text_idx)) {}
-        if (text_idx >= record.text.len) break;
+    while (text_idx < effective_text.len) {
+        while (text_idx < effective_text.len and isUpstreamWhitespaceAt(effective_text, text_idx)) : (text_idx = nextCodepointEnd(effective_text, text_idx)) {}
+        if (text_idx >= effective_text.len) break;
 
         const token_start = text_idx;
-        text_idx = nextUpstreamTextTokenEnd(record.text, text_idx);
+        text_idx = nextUpstreamTextTokenEnd(effective_text, text_idx);
         const appended = try appendUpstreamTextToken(
             allocator,
             tokenizer,
-            record.text[token_start..text_idx],
-            .{ .text = record.text, .token_start = token_start },
+            effective_text[token_start..text_idx],
+            .{ .text = effective_text, .token_start = token_start },
             input_ids,
             attention_mask,
             words_mask,
@@ -2256,23 +2311,11 @@ fn encodeUpstreamRecordInto(
         );
         if (!appended) return error.UnencodableTextToken;
     }
-
-    const needs_period = record.text.len == 0 or !(record.text[record.text.len - 1] == '.' or record.text[record.text.len - 1] == '!' or record.text[record.text.len - 1] == '?');
-    if (needs_period and !try appendUpstreamTextToken(
-        allocator,
-        tokenizer,
-        ".",
-        .{ .text = ".", .token_start = 0 },
-        input_ids,
-        attention_mask,
-        words_mask,
-        first_token_positions,
-        &pos,
-        &num_words,
-    )) {
-        return error.UnencodableTextToken;
-    }
     return .{ .num_words = num_words, .num_schemas = schema_idx };
+}
+
+fn upstreamTextNeedsTerminalPeriod(text: []const u8) bool {
+    return text.len == 0 or !(text[text.len - 1] == '.' or text[text.len - 1] == '!' or text[text.len - 1] == '?');
 }
 
 const UpstreamLowerContext = struct {
@@ -2755,12 +2798,20 @@ fn loadJsonlFile(
     const reader_buffer = try std.heap.page_allocator.alloc(u8, max_jsonl_line_bytes);
     defer std.heap.page_allocator.free(reader_buffer);
     var reader = file.readerStreaming(io, reader_buffer);
+    var line_number: usize = 0;
     while (try reader.interface.takeDelimiter('\n')) |raw_line| {
+        line_number += 1;
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
         // takeDelimiter reuses its buffer, so parsed strings must be copied into the arena.
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, line, .{ .allocate = .alloc_always });
-        try appendValue(allocator, parsed, out);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, line, .{ .allocate = .alloc_always }) catch |err| {
+            if (!builtin.is_test) std.debug.print("GLiNER2 JSONL parse failed at {s}:{d}: {s}\n", .{ path, line_number, @errorName(err) });
+            return err;
+        };
+        appendValue(allocator, parsed, out) catch |err| {
+            if (!builtin.is_test) std.debug.print("GLiNER2 dataset record rejected at {s}:{d}: {s}\n", .{ path, line_number, @errorName(err) });
+            return err;
+        };
     }
 }
 
@@ -3830,31 +3881,35 @@ fn fillWordSurfaceFeatures(
 }
 
 fn fillUpstreamWordSurfaceFeatures(
+    allocator: std.mem.Allocator,
     record: UpstreamRecord,
     num_words: usize,
     word_lengths: []f32,
     word_has_digit: []f32,
     word_is_title: []f32,
     word_is_all_caps: []f32,
-) void {
+) !void {
     var idx: usize = 0;
     for (record.prefix_tokens) |token| {
         if (idx >= num_words or idx >= word_lengths.len) return;
         fillOneWordSurfaceFeature(token, idx, word_lengths, word_has_digit, word_is_title, word_is_all_caps);
         idx += 1;
     }
+    var appended_text: ?[]u8 = null;
+    defer if (appended_text) |text| allocator.free(text);
+    if (upstreamTextNeedsTerminalPeriod(record.text)) {
+        appended_text = try std.mem.concat(allocator, u8, &.{ record.text, "." });
+    }
+    const effective_text: []const u8 = appended_text orelse record.text;
     var text_idx: usize = 0;
-    while (text_idx < record.text.len) {
-        while (text_idx < record.text.len and isUpstreamWhitespaceAt(record.text, text_idx)) : (text_idx = nextCodepointEnd(record.text, text_idx)) {}
-        if (text_idx >= record.text.len) break;
+    while (text_idx < effective_text.len) {
+        while (text_idx < effective_text.len and isUpstreamWhitespaceAt(effective_text, text_idx)) : (text_idx = nextCodepointEnd(effective_text, text_idx)) {}
+        if (text_idx >= effective_text.len) break;
         if (idx >= num_words or idx >= word_lengths.len) break;
-        const end = nextUpstreamTextTokenEnd(record.text, text_idx);
-        fillOneWordSurfaceFeature(record.text[text_idx..end], idx, word_lengths, word_has_digit, word_is_title, word_is_all_caps);
+        const end = nextUpstreamTextTokenEnd(effective_text, text_idx);
+        fillOneWordSurfaceFeature(effective_text[text_idx..end], idx, word_lengths, word_has_digit, word_is_title, word_is_all_caps);
         text_idx = end;
         idx += 1;
-    }
-    if (idx < num_words and idx < word_lengths.len) {
-        fillOneWordSurfaceFeature(".", idx, word_lengths, word_has_digit, word_is_title, word_is_all_caps);
     }
 }
 

@@ -22,11 +22,35 @@ from pathlib import Path
 from typing import Any
 
 from gliner2_parity_data import allowed_labels_for_objective, normalize_python_record
-from gliner2_release_contract import CANONICAL_NORMALIZATION, UPSTREAM_COMMIT, verify_upstream_checkout
+from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
+    CANONICAL_NORMALIZATION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
+    UPSTREAM_COMMIT,
+    verify_upstream_checkout,
+)
 from validate_gliner2_release_data import base_model_fingerprint, sha256_file
 
 
-COMPARISON_CONTRACT = "gliner2_python_zig_comparison/v2"
+COMPARISON_CONTRACT = "gliner2_python_zig_comparison/v3"
+
+UPSTREAM_SAMPLING_DEFAULTS: dict[str, bool | float | int] = {
+    "remove_json_structure_prob": 0.2,
+    "shuffle_json_fields": True,
+    "remove_json_field_prob": 0.2,
+    "remove_entities_prob": 0.0,
+    "shuffle_entities": False,
+    "remove_entity_prob": 0.0,
+    "synthetic_entity_label_prob": 0.2,
+    "remove_relations_prob": 0.2,
+    "swap_head_tail_prob": 0.2,
+    "remove_classification_prob": 0.0,
+    "shuffle_classification_labels": True,
+    "remove_classification_label_prob": 0.5,
+    "synthetic_label_prob": 0.5,
+    "include_true_label_prob": 0.5,
+    "max_num_labels": 1000,
+}
 
 
 DEFAULT_PYTHON = "/private/tmp/gliner2-parity-venv/bin/python"
@@ -47,6 +71,19 @@ def inference_dir() -> Path:
 
 def default_train_data() -> Path:
     return inference_dir() / "testdata" / "gliner2_ner_smoke.jsonl"
+
+
+def resolve_python_sampling_policy(deterministic: bool, requested: str) -> str:
+    policy = ("disabled" if deterministic else "upstream-default") if requested == "auto" else requested
+    if deterministic and policy != "disabled":
+        raise ValueError("--deterministic requires --python-sampling-policy disabled")
+    return policy
+
+
+def resolve_python_schema_conditioning_policy(deterministic: bool, no_train_shuffle: bool) -> str:
+    if deterministic:
+        return "deterministic-eval-form"
+    return "ordered-training-form" if no_train_shuffle else "upstream-training-default"
 
 
 def convert_to_python_jsonl(src: Path, dst: Path, allowed_labels: set[str] | None = None) -> dict[str, Any]:
@@ -204,6 +241,11 @@ def oracle_subprocess_env(args: argparse.Namespace) -> dict[str, str]:
         "PYTHONPATH": str(args.upstream_source),
         "GLINER2_ORACLE_SOURCE": str(args.upstream_source),
         "GLINER2_ORACLE_COMMIT": UPSTREAM_COMMIT,
+        "GLINER2_ORACLE_VERSION": CANONICAL_GLINER2_VERSION,
+        "GLINER2_ORACLE_PACKAGE_VERSIONS": json.dumps(
+            CANONICAL_ORACLE_PACKAGE_VERSIONS,
+            sort_keys=True,
+        ),
     }
 
 
@@ -238,6 +280,26 @@ def finite_number(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def format_finite_number(value: Any) -> str:
+    """Format a metric without letting malformed failure evidence crash reporting."""
+    return f"{float(value):.9g}" if finite_number(value) else "unavailable"
+
+
+def within_loss_tolerance(
+    expected: Any,
+    actual: Any,
+    absolute_tolerance: float,
+    relative_tolerance: float,
+) -> tuple[bool, float | None]:
+    """Compare summed losses with an absolute floor and a scale-aware bound."""
+    if not finite_number(expected) or not finite_number(actual):
+        return False, None
+    expected_value = float(expected)
+    actual_value = float(actual)
+    bound = absolute_tolerance + relative_tolerance * max(abs(expected_value), abs(actual_value))
+    return abs(actual_value - expected_value) <= bound, bound
 
 
 def as_float_or_none(value: Any) -> float | None:
@@ -469,7 +531,12 @@ def compare_preprocess_debug_samples(py_samples: list[dict[str, Any]] | None, zi
     return not mismatches, mismatches[:10]
 
 
-def compare_component_losses(py: dict[str, Any] | None, zig: dict[str, Any] | None, tolerance: float) -> tuple[bool, dict[str, Any]]:
+def compare_component_losses(
+    py: dict[str, Any] | None,
+    zig: dict[str, Any] | None,
+    absolute_tolerance: float,
+    relative_tolerance: float,
+) -> tuple[bool, dict[str, Any]]:
     fields = ["classification_loss", "structure_loss", "count_loss", "total_loss"]
     if not py or not zig:
         return False, {"missing": {"python": bool(py), "zig": bool(zig)}}
@@ -487,8 +554,19 @@ def compare_component_losses(py: dict[str, Any] | None, zig: dict[str, Any] | No
             ok = False
             continue
         delta = float(zv) - float(pv)
-        field_ok = abs(delta) <= tolerance
-        deltas[field] = {"python": float(pv), "zig": float(zv), "delta": delta, "ok": field_ok}
+        field_ok, tolerance_bound = within_loss_tolerance(
+            pv,
+            zv,
+            absolute_tolerance,
+            relative_tolerance,
+        )
+        deltas[field] = {
+            "python": float(pv),
+            "zig": float(zv),
+            "delta": delta,
+            "tolerance_bound": tolerance_bound,
+            "ok": field_ok,
+        }
         ok = ok and field_ok
     return ok, deltas
 
@@ -498,7 +576,8 @@ def reconcile_single_component_from_step_loss(
     zig: dict[str, Any] | None,
     zig_step_loss: float | None,
     step_loss_matches: bool,
-    tolerance: float,
+    absolute_tolerance: float,
+    relative_tolerance: float,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if not py or not zig or zig_step_loss is None or not step_loss_matches:
         return zig, None
@@ -513,16 +592,27 @@ def reconcile_single_component_from_step_loss(
         return zig, None
     field = nonzero[0]
     py_total = py.get("total_loss")
-    if not finite_number(py_total) or abs(float(py_total) - float(py[field])) > tolerance:
+    total_matches_component, _ = within_loss_tolerance(
+        py_total,
+        py[field],
+        absolute_tolerance,
+        relative_tolerance,
+    )
+    if not total_matches_component:
         return zig, None
     # Only reconcile away small numerical noise. Substituting the (already-matching)
     # step loss for the component would otherwise make the component-loss check
     # tautological and mask a genuine divergence. Require the independently-reported
     # Zig component to already be within a bounded multiple of the tolerance of
     # Python; a larger gap is a real divergence and must surface as a failure.
-    reconcile_bound = tolerance * 8.0
     zig_field_val = zig.get(field)
-    if not finite_number(zig_field_val) or abs(float(zig_field_val) - float(py[field])) > reconcile_bound:
+    _, reconcile_bound = within_loss_tolerance(
+        py[field],
+        zig_field_val,
+        absolute_tolerance * 8.0,
+        relative_tolerance * 8.0,
+    )
+    if reconcile_bound is None or abs(float(zig_field_val) - float(py[field])) > reconcile_bound:
         return zig, None
     fixed = dict(zig)
     raw = {"component": fixed.get(field), "total_loss": fixed.get("total_loss")}
@@ -1251,7 +1341,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def python_training_script() -> str:
     return r'''
-import argparse, inspect, json, math, os, pathlib, sys, time, types, unicodedata
+import argparse, importlib.metadata, inspect, json, math, os, pathlib, sys, time, types, unicodedata
 import torch
 import torch.nn.functional as F
 import gliner2
@@ -1271,6 +1361,15 @@ oracle_source = pathlib.Path(os.environ["GLINER2_ORACLE_SOURCE"]).resolve()
 imported_gliner2 = pathlib.Path(inspect.getfile(gliner2_model)).resolve()
 if not imported_gliner2.is_relative_to(oracle_source):
     raise RuntimeError(f"GLiNER2 imported from unpinned source: {imported_gliner2}")
+expected_package_versions = json.loads(os.environ["GLINER2_ORACLE_PACKAGE_VERSIONS"])
+package_versions = {name: importlib.metadata.version(name) for name in expected_package_versions}
+if package_versions != expected_package_versions:
+    raise RuntimeError(
+        f"GLiNER2 oracle dependency mismatch: {package_versions} != {expected_package_versions}"
+    )
+gliner2_version = getattr(gliner2, "__version__", None)
+if gliner2_version != os.environ["GLINER2_ORACLE_VERSION"]:
+    raise RuntimeError(f"GLiNER2 oracle version mismatch: {gliner2_version}")
 oracle = {
     "commit": os.environ["GLINER2_ORACLE_COMMIT"],
     "checkout": str(oracle_source),
@@ -1278,7 +1377,8 @@ oracle = {
     "python_version": __import__("platform").python_version(),
     "unicode_version": unicodedata.unidata_version,
     "torch_version": torch.__version__,
-    "gliner2_version": getattr(gliner2, "__version__", None),
+    "gliner2_version": gliner2_version,
+    "package_versions": package_versions,
 }
 
 p = argparse.ArgumentParser()
@@ -1297,6 +1397,8 @@ p.add_argument("--lora-dropout", type=float, required=True)
 p.add_argument("--lora-targets", required=True)
 p.add_argument("--seed", type=int, required=True)
 p.add_argument("--span-negative-mask-rate", type=float, required=True)
+p.add_argument("--sampling-policy", choices=("disabled", "upstream-default"), required=True)
+p.add_argument("--training-deterministic", action="store_true")
 p.add_argument("--disable-model-dropout", action="store_true")
 p.add_argument("--dump-parity", action="store_true")
 p.add_argument("--dump-optimizer-parity", action="store_true")
@@ -1327,6 +1429,15 @@ model.max_width = args.max_span_width
 model.config.max_width = args.max_span_width
 if hasattr(model, "span_rep") and hasattr(model.span_rep, "span_rep_layer") and hasattr(model.span_rep.span_rep_layer, "max_width"):
     model.span_rep.span_rep_layer.max_width = args.max_span_width
+configured_dropout_modules = sum(
+    1
+    for module in model.modules()
+    if (
+        isinstance(module, torch.nn.Dropout) and module.p > 0.0
+    ) or (
+        isinstance(module, torch.nn.MultiheadAttention) and module.dropout > 0.0
+    )
+)
 disabled_dropout_modules = 0
 if args.disable_model_dropout:
     for module in model.modules():
@@ -1363,7 +1474,7 @@ config_kwargs = {
     "num_workers": 0,
     "pin_memory": False,
     "seed": args.seed,
-    "deterministic": True,
+    "deterministic": args.training_deterministic,
     "max_train_samples": args.steps * args.batch_size,
     "use_lora": True,
     "lora_r": args.lora_rank,
@@ -1378,20 +1489,30 @@ trainer = GLiNER2Trainer(model, cfg)
 initial_adapter_dir = out / "initial_adapter"
 save_lora_adapter(trainer.model, initial_adapter_dir)
 sampling = trainer.processor.sampling_config
-sampling.remove_json_structure_prob = 0.0
-sampling.shuffle_json_fields = False
-sampling.remove_json_field_prob = 0.0
-sampling.synthetic_entity_label_prob = 0.0
-sampling.shuffle_entities = False
-sampling.remove_entity_prob = 0.0
-sampling.remove_entities_prob = 0.0
-sampling.remove_relations_prob = 0.0
-sampling.swap_head_tail_prob = 0.0
-sampling.remove_classification_prob = 0.0
-sampling.shuffle_classification_labels = False
-sampling.remove_classification_label_prob = 0.0
-sampling.synthetic_label_prob = 0.0
-sampling.include_true_label_prob = 1.0
+if args.sampling_policy == "disabled":
+    sampling.remove_json_structure_prob = 0.0
+    sampling.shuffle_json_fields = False
+    sampling.remove_json_field_prob = 0.0
+    sampling.synthetic_entity_label_prob = 0.0
+    sampling.shuffle_entities = False
+    sampling.remove_entity_prob = 0.0
+    sampling.remove_entities_prob = 0.0
+    sampling.remove_relations_prob = 0.0
+    sampling.swap_head_tail_prob = 0.0
+    sampling.remove_classification_prob = 0.0
+    sampling.shuffle_classification_labels = False
+    sampling.remove_classification_label_prob = 0.0
+    sampling.synthetic_label_prob = 0.0
+    sampling.include_true_label_prob = 1.0
+sampling_fields = (
+    "remove_json_structure_prob", "shuffle_json_fields", "remove_json_field_prob",
+    "remove_entities_prob", "shuffle_entities", "remove_entity_prob",
+    "synthetic_entity_label_prob", "remove_relations_prob", "swap_head_tail_prob",
+    "remove_classification_prob", "shuffle_classification_labels",
+    "remove_classification_label_prob", "synthetic_label_prob",
+    "include_true_label_prob", "max_num_labels",
+)
+applied_sampling_config = {name: getattr(sampling, name) for name in sampling_fields}
 if args.no_train_shuffle:
     def _build_classification_prefix_ordered(self, schema):
         prefix_tokens = []
@@ -1476,17 +1597,10 @@ if args.no_train_shuffle:
     trainer.processor._infer_from_json = types.MethodType(_infer_from_json_ordered, trainer.processor)
     trainer.processor._build_classification_prefix = types.MethodType(_build_classification_prefix_ordered, trainer.processor)
     trainer.processor._process_json_structures = types.MethodType(_process_json_structures_ordered, trainer.processor)
-# Pin schema-conditioning emission to upstream's deterministic eval-mode
-# semantics: entities/json emit every present [DESCRIPTION] segment
-# ("descriptions" if descs else "none"), classifications emit "both"
-# ([DESCRIPTION] plus [EXAMPLE]/[OUTPUT]), and _transform_schema keeps
-# descriptions/examples in stored order instead of random.shuffle-ing them.
-# The Zig data pipeline always emits exactly that deterministic form; without
-# this pin, training-mode random.choice(example_modes) in upstream
-# _process_entities/_process_classifications (and the desc/example shuffles)
-# diverges on any record carrying label_descriptions/examples/
-# entity_descriptions. Wraps whatever is currently bound, so it composes with
-# the --no-train-shuffle ordered variants above.
+# Deterministic trace parity pins schema-conditioning emission to upstream's
+# eval-mode semantics. Stock-stochastic studies must leave upstream training
+# behavior untouched: random example-mode selection plus description/example
+# shuffles are part of the Fastino training policy being compared.
 def _pin_eval_mode_conditioning(processor, method_name):
     bound = getattr(processor, method_name)
 
@@ -1500,8 +1614,11 @@ def _pin_eval_mode_conditioning(processor, method_name):
 
     setattr(processor, method_name, pinned)
 
-for _conditioning_method in ("_process_json_structures", "_process_entities", "_process_classifications"):
-    _pin_eval_mode_conditioning(trainer.processor, _conditioning_method)
+schema_conditioning_policy = "ordered-training-form" if args.no_train_shuffle else "upstream-training-default"
+if args.training_deterministic:
+    for _conditioning_method in ("_process_json_structures", "_process_entities", "_process_classifications"):
+        _pin_eval_mode_conditioning(trainer.processor, _conditioning_method)
+    schema_conditioning_policy = "deterministic-eval-form"
 # Pin the structure-loss negative masking rate unconditionally. Upstream
 # compute_struct_loss defaults to masking_rate=0.5; without this patch a
 # --span-negative-mask-rate 0 run would still randomly mask negatives on the
@@ -2129,6 +2246,12 @@ payload = {
     "total_parameters": total,
     "torch_version": torch.__version__,
     "oracle": oracle,
+    "sampling_policy": args.sampling_policy,
+    "sampling_config": applied_sampling_config,
+    "schema_conditioning_policy": schema_conditioning_policy,
+    "training_deterministic": args.training_deterministic,
+    "train_shuffle": not args.no_train_shuffle,
+    "configured_dropout_modules": configured_dropout_modules,
     "disabled_dropout_modules": disabled_dropout_modules,
     "initial_adapter_checkpoint": str(initial_adapter_dir / "adapter_weights.safetensors"),
     "span_parity_debug": parity_debug[0] if parity_debug else None,
@@ -2155,7 +2278,7 @@ print("PYTHON_GLINER2_COMPARISON " + json.dumps(payload, sort_keys=True))
 
 def adapter_roundtrip_script() -> str:
     return r'''
-import argparse, inspect, json, math, os, pathlib, random, sys, types, unicodedata
+import argparse, importlib.metadata, inspect, json, math, os, pathlib, random, sys, types, unicodedata
 import torch
 import gliner2
 import gliner2.model as gliner2_model
@@ -2174,6 +2297,15 @@ oracle_source = pathlib.Path(os.environ["GLINER2_ORACLE_SOURCE"]).resolve()
 imported_gliner2 = pathlib.Path(inspect.getfile(gliner2_model)).resolve()
 if not imported_gliner2.is_relative_to(oracle_source):
     raise RuntimeError(f"GLiNER2 imported from unpinned source: {imported_gliner2}")
+expected_package_versions = json.loads(os.environ["GLINER2_ORACLE_PACKAGE_VERSIONS"])
+package_versions = {name: importlib.metadata.version(name) for name in expected_package_versions}
+if package_versions != expected_package_versions:
+    raise RuntimeError(
+        f"GLiNER2 oracle dependency mismatch: {package_versions} != {expected_package_versions}"
+    )
+gliner2_version = getattr(gliner2, "__version__", None)
+if gliner2_version != os.environ["GLINER2_ORACLE_VERSION"]:
+    raise RuntimeError(f"GLiNER2 oracle version mismatch: {gliner2_version}")
 oracle = {
     "commit": os.environ["GLINER2_ORACLE_COMMIT"],
     "checkout": str(oracle_source),
@@ -2181,7 +2313,8 @@ oracle = {
     "python_version": __import__("platform").python_version(),
     "unicode_version": unicodedata.unidata_version,
     "torch_version": torch.__version__,
-    "gliner2_version": getattr(gliner2, "__version__", None),
+    "gliner2_version": gliner2_version,
+    "package_versions": package_versions,
 }
 
 p = argparse.ArgumentParser()
@@ -2624,7 +2757,10 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
         "--lora-targets", args.lora_targets,
         "--seed", str(args.seed),
         "--span-negative-mask-rate", str(args.span_negative_mask_rate),
+        "--sampling-policy", args.python_sampling_policy,
     ]
+    if args.deterministic:
+        cmd.append("--training-deterministic")
     if args.disable_python_model_dropout:
         cmd.append("--disable-model-dropout")
     if args.dump_parity:
@@ -2717,6 +2853,8 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
             "--activation-checkpoint-interval", str(args.activation_checkpoint_interval),
             "--activation-checkpoint-strategy", args.activation_checkpoint_strategy,
         ])
+    if args.structure_span_chunk_samples > 0:
+        cmd.extend(["--structure-span-chunk-samples", str(args.structure_span_chunk_samples)])
     initial_adapter_checkpoint = out_dir / "python" / "initial_adapter" / "adapter_weights.safetensors"
     if initial_adapter_checkpoint.exists():
         cmd.extend(["--initial-adapter-checkpoint", str(initial_adapter_checkpoint)])
@@ -2774,9 +2912,18 @@ def main() -> int:
         action="store_true",
         help="Set Python nn.Dropout modules to p=0 for deterministic objective parity; LoRA dropout remains controlled by --lora-dropout",
     )
+    p.add_argument(
+        "--python-sampling-policy",
+        choices=("auto", "disabled", "upstream-default"),
+        default="auto",
+        help=(
+            "Fastino SamplingConfig policy (default: auto, which disables augmentation for "
+            "deterministic trace parity and retains pinned upstream defaults for stochastic studies)"
+        ),
+    )
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--lora-alpha", type=float, default=32.0)
-    p.add_argument("--lora-dropout", type=float, default=0.1)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument("--lora-targets", default=LORA_TARGETS)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--activation-checkpointing", action="store_true")
@@ -2785,6 +2932,12 @@ def main() -> int:
         "--activation-checkpoint-strategy",
         default="parameters-only",
         choices=["every-n-layers", "attention-outputs", "parameters-only"],
+    )
+    p.add_argument(
+        "--structure-span-chunk-samples",
+        type=int,
+        default=0,
+        help="Split GLiNER2 structure-loss span work into sample chunks on the Zig side (0 disables)",
     )
     p.add_argument("--zig-backend", default="native", choices=["native", "metal", "auto"])
     p.add_argument(
@@ -2821,7 +2974,16 @@ def main() -> int:
         "--loss-parity-tolerance",
         type=float,
         default=1e-4,
-        help="Maximum absolute Python/Zig loss delta for valid loss parity when both sides run",
+        help="Absolute floor for Python/Zig loss parity when both sides run",
+    )
+    p.add_argument(
+        "--loss-parity-relative-tolerance",
+        type=float,
+        default=5e-6,
+        help=(
+            "Relative Python/Zig loss tolerance, combined with --loss-parity-tolerance; "
+            "keeps summed full-task losses scale-invariant across production batch sizes"
+        ),
     )
     p.add_argument(
         "--classification-debug-tolerance",
@@ -2909,8 +3071,11 @@ def main() -> int:
     p.add_argument("--skip-zig", action="store_true")
     p.add_argument("--keep-out-dir", action="store_true")
     args = p.parse_args()
+    if args.structure_span_chunk_samples < 0:
+        p.error("--structure-span-chunk-samples must be non-negative")
     for name in (
         "loss_parity_tolerance",
+        "loss_parity_relative_tolerance",
         "classification_debug_tolerance",
         "adapter_roundtrip_tolerance",
         "adapter_roundtrip_weights_tolerance",
@@ -2922,6 +3087,8 @@ def main() -> int:
         args.classification_debug_tolerance = args.loss_parity_tolerance
     if args.dump_optimizer_parity:
         args.dump_preprocess_parity = True
+    if args.require_full_task_parity and not args.deterministic:
+        p.error("--require-full-task-parity requires --deterministic")
     if args.require_full_task_parity and not args.dump_preprocess_parity:
         # Full-task gating requires the preprocessing/component-loss dumps to
         # actually run; turning them on here keeps the flag self-contained.
@@ -2939,6 +3106,12 @@ def main() -> int:
         if not args.disable_python_model_dropout:
             print("deterministic: enabling --disable-python-model-dropout")
             args.disable_python_model_dropout = True
+    try:
+        args.python_sampling_policy = resolve_python_sampling_policy(
+            args.deterministic, args.python_sampling_policy
+        )
+    except ValueError as exc:
+        p.error(str(exc))
     args.model_dir = args.model_dir.expanduser().resolve()
     args.train_data = args.train_data.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
@@ -2983,7 +3156,7 @@ def main() -> int:
             "oracle": oracle,
             "model_fingerprint_sha256": model_fingerprint,
             "training_data_fingerprint_sha256": train_data_fingerprint,
-            "recipe_contract": "gliner2_python_zig_deterministic_comparison/v1",
+            "recipe_contract": "gliner2_python_zig_comparison_recipe/v2",
             "scoring_normalization": CANONICAL_NORMALIZATION,
             "model_dir": str(args.model_dir),
             "python_model": str(args.python_model),
@@ -3001,6 +3174,11 @@ def main() -> int:
             "span_negative_weight": args.span_negative_weight,
             "span_hard_negative_weight": args.span_hard_negative_weight,
             "span_negative_mask_rate": args.span_negative_mask_rate,
+            "python_sampling_policy": args.python_sampling_policy,
+            "python_schema_conditioning_policy": resolve_python_schema_conditioning_policy(
+                args.deterministic, args.dump_preprocess_parity or args.deterministic
+            ),
+            "python_train_shuffle": not (args.dump_preprocess_parity or args.deterministic),
             "disable_python_model_dropout": args.disable_python_model_dropout,
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
@@ -3016,7 +3194,9 @@ def main() -> int:
             "dump_parity": args.dump_parity,
             "dump_preprocess_parity": args.dump_preprocess_parity,
             "dump_optimizer_parity": args.dump_optimizer_parity,
+            "structure_span_chunk_samples": args.structure_span_chunk_samples,
             "loss_parity_tolerance": args.loss_parity_tolerance,
+            "loss_parity_relative_tolerance": args.loss_parity_relative_tolerance,
             "perf_target_only_python": args.perf_target_only_python,
             "strict": args.strict,
             "require_full_task_parity": args.require_full_task_parity,
@@ -3062,12 +3242,19 @@ def main() -> int:
         py_step_loss = as_float_or_none(py_row.get("loss"))
         zig_step_loss = as_float_or_none(zig_row.get("loss"))
         delta = zig_step_loss - py_step_loss if py_step_loss is not None and zig_step_loss is not None else None
+        step_ok, tolerance_bound = within_loss_tolerance(
+            py_step_loss,
+            zig_step_loss,
+            args.loss_parity_tolerance,
+            args.loss_parity_relative_tolerance,
+        )
         step_loss_deltas.append({
             "step": py_row.get("step", zig_row.get("step")),
             "python": py_step_loss,
             "zig": zig_step_loss,
             "delta": delta,
-            "ok": delta is not None and abs(delta) <= args.loss_parity_tolerance,
+            "tolerance_bound": tolerance_bound,
+            "ok": step_ok,
         })
     step_loss_counts_match = bool(python_step_rows) and len(python_step_rows) == len(zig_step_rows)
     step_loss_parity_matches = step_loss_counts_match and all(row.get("ok") for row in step_loss_deltas)
@@ -3121,8 +3308,14 @@ def main() -> int:
             zig_loss,
             step_loss_parity_matches,
             args.loss_parity_tolerance,
+            args.loss_parity_relative_tolerance,
         )
-    component_loss_matches, component_loss_deltas = compare_component_losses(python_total_components, zig_total_components, args.loss_parity_tolerance)
+    component_loss_matches, component_loss_deltas = compare_component_losses(
+        python_total_components,
+        zig_total_components,
+        args.loss_parity_tolerance,
+        args.loss_parity_relative_tolerance,
+    )
     component_loss_focus = summarize_component_deltas(component_loss_deltas)
     python_classification_debug = report.get("python", {}).get("metrics", {}).get("gliner2_classification_debug")
     zig_classification_debug = report.get("zig", {}).get("metrics", {}).get("gliner2_classification_debug")
@@ -3329,6 +3522,12 @@ def main() -> int:
         objective_parity_warning = "Zig token-classification objective does not match upstream GLiNER2Trainer structure_loss training"
         zig_objective_semantics = "token classification"
     loss_delta = (zig_loss - py_loss) if zig_loss is not None and py_loss is not None else None
+    final_loss_matches, final_loss_tolerance_bound = within_loss_tolerance(
+        py_loss,
+        zig_loss,
+        args.loss_parity_tolerance,
+        args.loss_parity_relative_tolerance,
+    )
     if args.zig_objective == "gliner2-total-loss":
         valid_loss_parity = (
             not args.perf_target_only_python
@@ -3336,8 +3535,7 @@ def main() -> int:
             and preprocess_matches
             and component_loss_matches
             and step_loss_parity_matches
-            and loss_delta is not None
-            and abs(loss_delta) <= args.loss_parity_tolerance
+            and final_loss_matches
         )
     else:
         valid_loss_parity = (
@@ -3345,8 +3543,7 @@ def main() -> int:
             and trainable_parity_warning is None
             and entity_only_structure_parity
             and step_loss_parity_matches
-            and loss_delta is not None
-            and abs(loss_delta) <= args.loss_parity_tolerance
+            and final_loss_matches
         )
     loss_parity_warning = None
     if args.perf_target_only_python:
@@ -3358,9 +3555,16 @@ def main() -> int:
     elif not step_loss_parity_matches:
         step = largest_step_loss_delta.get("step") if largest_step_loss_delta else None
         delta = largest_step_loss_delta.get("delta") if largest_step_loss_delta else None
-        loss_parity_warning = f"Python/Zig per-step loss parity failed at step {step}: delta {delta:.9g} exceeds tolerance {args.loss_parity_tolerance:.9g}"
+        bound = largest_step_loss_delta.get("tolerance_bound") if largest_step_loss_delta else None
+        loss_parity_warning = (
+            f"Python/Zig per-step loss parity failed at step {step}: "
+            f"delta {format_finite_number(delta)} exceeds combined tolerance {format_finite_number(bound)}"
+        )
     elif not valid_loss_parity:
-        loss_parity_warning = f"Python/Zig loss delta {loss_delta:.9g} exceeds tolerance {args.loss_parity_tolerance:.9g} or objective/trainable parity is incomplete"
+        loss_parity_warning = (
+            f"Python/Zig loss delta {format_finite_number(loss_delta)} exceeds combined tolerance "
+            f"{format_finite_number(final_loss_tolerance_bound)} or objective/trainable parity is incomplete"
+        )
     report["summary"] = {
         "oracle": (
             report.get("python", {}).get("metrics", {}).get("oracle")
@@ -3369,6 +3573,13 @@ def main() -> int:
         ),
         "model_fingerprint_sha256": model_fingerprint,
         "training_data_fingerprint_sha256": train_data_fingerprint,
+        "deterministic": args.deterministic,
+        "python_sampling_policy": args.python_sampling_policy,
+        "python_schema_conditioning_policy": resolve_python_schema_conditioning_policy(
+            args.deterministic, args.dump_preprocess_parity or args.deterministic
+        ),
+        "python_model_dropout_policy": "disabled" if args.disable_python_model_dropout else "upstream-default",
+        "python_train_shuffle": not (args.dump_preprocess_parity or args.deterministic),
         "python_returncode": report.get("python", {}).get("returncode"),
         "zig_returncode": report.get("zig", {}).get("returncode"),
         "python_elapsed_seconds": report.get("python", {}).get("elapsed_seconds"),
@@ -3550,6 +3761,7 @@ def main() -> int:
         "zig_final_step_loss": zig_final_step_loss,
         "zig_final_avg_loss": zig_epoch_avg_loss,
         "loss_delta_zig_minus_python": loss_delta,
+        "loss_parity_tolerance_bound": final_loss_tolerance_bound,
         "step_loss_parity_matches": step_loss_parity_matches,
         "step_loss_counts_match": step_loss_counts_match,
         "step_loss_deltas": step_loss_deltas,
@@ -3569,6 +3781,7 @@ def main() -> int:
         "zig_manifest_objective": zig_manifest.get("objective"),
         "metal_readiness": summarize_metal_readiness(args, report, zig_step_rows, zig_manifest),
         "loss_parity_tolerance": args.loss_parity_tolerance,
+        "loss_parity_relative_tolerance": args.loss_parity_relative_tolerance,
         "classification_debug_tolerance": args.classification_debug_tolerance,
         "valid_loss_parity": valid_loss_parity,
         "loss_parity_warning": loss_parity_warning,
@@ -3632,14 +3845,14 @@ def main() -> int:
         and report.get("zig", {}).get("returncode") == 0
     )
     is_total_loss_objective = args.zig_objective == "gliner2-total-loss"
-    component_loss_applicable = both_sides_ran and args.dump_parity and is_total_loss_objective
+    component_loss_applicable = both_sides_ran and args.deterministic and args.dump_parity and is_total_loss_objective
     # The classification debug comparison is meaningful only when the Python
     # side saw classification tasks in the first batch (entity-only fixtures
     # never emit it); the Zig side prints its debug unconditionally.
     classification_debug_applicable = component_loss_applicable and python_classification_debug is not None
-    step_loss_applicable = both_sides_ran and not args.perf_target_only_python
-    preprocess_applicable = both_sides_ran and args.dump_parity
-    full_loss_applicable = both_sides_ran and is_total_loss_objective and not args.perf_target_only_python
+    step_loss_applicable = both_sides_ran and args.deterministic and not args.perf_target_only_python
+    preprocess_applicable = both_sides_ran and args.deterministic and args.dump_parity
+    full_loss_applicable = both_sides_ran and args.deterministic and is_total_loss_objective and not args.perf_target_only_python
     # Same-artifact interchange is a fail-closed contract once both trainers
     # succeed. Independently trained tensor equality is deliberately diagnostic:
     # cancellation-sensitive encoder reductions can change near-zero gradient

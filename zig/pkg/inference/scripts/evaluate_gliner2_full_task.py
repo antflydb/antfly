@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
     CANONICAL_NORMALIZATION,
     CANONICAL_UNICODE_VERSION,
     UPSTREAM_COMMIT,
@@ -21,6 +22,7 @@ from gliner2_release_contract import (
     clean_text as contract_clean_text,
     path_fingerprint,
     verify_import_source,
+    verify_canonical_oracle_packages,
     verify_canonical_python_runtime,
     verify_upstream_checkout,
 )
@@ -603,6 +605,7 @@ def main() -> int:
             raise ValueError("provide --comparison-report or both --model-dir and --adapter-dir")
         minima = parse_minima(args.min_metric)
         normalization_runtime = verify_canonical_python_runtime()
+        package_versions = verify_canonical_oracle_packages()
         oracle = verify_upstream_checkout(args.upstream_source.resolve())
         for name in ("adapter_config.json", "adapter_model.safetensors"):
             if not (args.adapter_dir / name).is_file():
@@ -618,6 +621,10 @@ def main() -> int:
         from peft import PeftModel
 
         imported_from = verify_import_source(GLiNER2, args.upstream_source)
+        if gliner2_version != CANONICAL_GLINER2_VERSION:
+            raise ValueError(
+                f"GLiNER2 source version {gliner2_version} does not match {CANONICAL_GLINER2_VERSION}"
+            )
         torch.manual_seed(0)
         torch.use_deterministic_algorithms(True)
         base = GLiNER2.from_pretrained(str(args.model_dir), map_location="cpu")
@@ -704,6 +711,7 @@ def main() -> int:
                 "python_version": platform.python_version(),
                 "unicode_version": CANONICAL_UNICODE_VERSION,
                 "torch_version": torch.__version__,
+                "package_versions": package_versions,
             },
             # Retain the old report key for readers while making its checkout
             # and imported-module meanings unambiguous in ``oracle`` above.

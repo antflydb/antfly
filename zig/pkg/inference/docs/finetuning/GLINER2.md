@@ -60,6 +60,12 @@ encoder storage still needed by another branch. Donation now uses the last use
 of the entire alias group. The unchanged `1e-3` gradient thresholds pass with
 worst observed relative errors below `4e-6` on the synthetic parity fixture.
 
+The Metal embedding-gradient scatter now scans source-row indices once per
+output-row/hidden-dimension tile and accumulates matches in source order. This
+removes the previous full source-row scan from every output element while
+preserving deterministic native/Metal equality; the focused parity fixture
+crosses both 256-row and 256-column tile boundaries.
+
 For production-length Metal training, the fused DeBERTa attention path is a
 safety requirement. A Metal run with sequence length at least 128 fails before
 training if that path is disabled. Production Metal runs should also use
@@ -183,17 +189,38 @@ gliner2-adapter-dataset`, `finetune adapter materialize gliner2`, and
 
 The frozen oracle is fastino-ai/GLiNER2 commit
 `8f3fc399bcc5a00749a62a1565e5c6529f04b574`, running on Python 3.12 with
-Unicode 15.0. Tooling verifies the checkout commit, cleanliness, and imported
-module path. Model fingerprints cover the ordered required inventory and the
-present/absent state of optional `spm.model`.
+Unicode 15.0 and the exact package versions in
+`scripts/requirements-gliner2-oracle.txt`. Tooling verifies dependency
+versions, checkout commit and cleanliness, and the imported module path in
+every trainer/evaluator report. Model fingerprints cover the ordered required
+inventory and the present/absent state of optional `spm.model`.
+
+Create the default oracle environment from the checked-in lock surface:
+
+```sh
+python3.12 -m venv /private/tmp/gliner2-parity-venv
+/private/tmp/gliner2-parity-venv/bin/pip install \
+  -r scripts/requirements-gliner2-oracle.txt
+```
+
+The Fastino checkout is supplied separately with `--upstream-source`; release
+tools put that clean pinned checkout first on `PYTHONPATH` and reject an import
+from the installed package copy.
 
 Deterministic step/update parity disables stochastic augmentation, shuffle,
 dropout, and negative-mask RNG so intermediate losses, gradients, and updates
 can be compared directly. Normal stochastic training is judged by five paired
-independent seeds: every Zig run must clear the nine quality floors, the mean
-Zig deficit for each metric must be at most 0.02, and no paired deficit may
-exceed 0.05. Exact equality with Python RNG streams is intentionally not part
-of the contract.
+independent seeds. Those Python runs must prove `deterministic=False`, the
+exact Fastino `SamplingConfig` defaults, enabled model dropout, LoRA dropout
+`0.0`, training-mode schema conditioning, shuffled examples, and the default
+`0.5` negative-span mask. Zig manifests must prove the implementation's actual
+policy: disabled SamplingConfig/model dropout, deterministic eval-form schema
+conditioning, enabled epoch shuffle, LoRA dropout `0.0`, and negative-span
+masking at `0.5`. Weakened or deterministic reports are rejected by the
+convergence materializer. Every Zig run must clear the nine quality floors,
+the mean Zig deficit for each metric must be at most 0.02, and no paired
+deficit may exceed 0.05. Zig and Python use independent RNG streams, so exact
+stochastic traces are intentionally not part of the contract.
 
 Both scorers identify exact-match normalization as
 `unicode_nfc_collapsed_whitespace_casefold/v1`. Python implements the complete
@@ -243,6 +270,18 @@ native held-out quality under the same normalization, five-seed convergence,
 and consistent model/train/eval fingerprints. The experimental head-MLP
 fusion gate is reported separately unless explicitly required.
 
+Deterministic summed-loss comparisons use a combined `1e-4` absolute and
+`5e-6` relative tolerance. The absolute floor keeps small component losses
+strict, while the relative term prevents the same floating-point accumulation
+noise from failing only because a production batch contains more summed terms.
+
+The batch-32 Metal profile chunks structure-loss span work in groups of 16
+samples. On the synthetic all-task diagnostic this reduced the device-owned
+tensor peak from about 2.63 GB to 2.41 GB without changing the reported loss,
+while keeping dispatch, barrier, and scope counts inside their production
+ceilings. The release gate uses a 3 GiB peak-live ceiling; this metric is the
+sum of simultaneously live device-owned tensors, not process RSS.
+
 ## Focused verification
 
 ```sh
@@ -260,6 +299,7 @@ cd scripts
 python3.12 -m unittest \
   test_gliner2_release_contract.py \
   test_gliner2_parity_data.py \
+  test_compare_gliner2_contract.py \
   test_benchmark_gliner2_lora_perf.py \
   test_validate_gliner2_release_data.py \
   test_evaluate_gliner2_full_task.py \

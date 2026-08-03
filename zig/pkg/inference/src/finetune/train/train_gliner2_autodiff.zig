@@ -1056,7 +1056,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .max_span_width = opts.max_span_width,
     };
     if (opts.objective == .gliner2_total_loss) {
-        print("  graph shapes: batch-local seq/slots/instances/tasks; cache capacity={d} (active included)\n", .{opts.graph_cache_capacity});
+        print("  graph shapes: batch-local seq/words/slots/instances/tasks; cache capacity={d} (active included)\n", .{opts.graph_cache_capacity});
     }
 
     // ------------------------------------------------------------------
@@ -2483,8 +2483,9 @@ fn writeTrainingManifest(
         .model_dir = opts.model_dir,
         .backend = backend_label,
         .compiled_required = opts.compiled_required,
-        .graph_shape_policy = if (opts.objective == .gliner2_total_loss) "batch-local-v1" else "fixed",
+        .graph_shape_policy = if (opts.objective == .gliner2_total_loss) "batch-local-v2" else "fixed",
         .graph_seq_bucket_multiple = if (opts.objective == .gliner2_total_loss) @as(?u32, 8) else null,
+        .graph_span_word_bucket_policy = if (opts.objective == .gliner2_total_loss) "bounded-next-power-of-two" else null,
         .graph_schema_bucket_policy = if (opts.objective == .gliner2_total_loss) "bounded-next-power-of-two" else null,
         .graph_cache_capacity = graph_cache_stats.capacity,
         .graph_cache_build_reserve_bytes = graph_cache_stats.build_reserve_bytes,
@@ -2538,7 +2539,13 @@ fn writeTrainingManifest(
         .regular_trainable_params = regular_trainable_params,
         .lora_only_trainables = opts.objective == .gliner2_total_loss or opts.lora_only_trainables,
         .deterministic = opts.deterministic,
+        .sampling_config = "disabled",
+        .schema_conditioning_policy = "deterministic-eval-form",
         .model_dropout = "disabled",
+        .train_shuffle = if (opts.objective == .gliner2_total_loss)
+            !opts.dump_span_parity and !opts.deterministic
+        else
+            true,
         .requested_epochs = opts.epochs,
         .epochs = completed_epochs,
         .max_steps = opts.max_steps,
@@ -2577,6 +2584,7 @@ fn writeTrainingManifest(
         .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = opts.span_negative_weight,
         .span_hard_negative_weight = opts.span_hard_negative_weight,
+        .span_negative_mask_rate = opts.span_negative_mask_rate,
         .hidden_size = hidden_size,
         .entity_labels = entity_labels,
         .entity_label_count = entity_labels.len,
@@ -2969,12 +2977,20 @@ fn trainingStateFingerprint(
         .seed = opts.seed,
         .lora_only_trainables = opts.lora_only_trainables,
         .deterministic = opts.deterministic,
+        .sampling_config = "disabled",
+        .schema_conditioning_policy = "deterministic-eval-form",
+        .model_dropout = "disabled",
+        .train_shuffle = if (opts.objective == .gliner2_total_loss)
+            !opts.dump_span_parity and !opts.deterministic
+        else
+            true,
         // This diagnostic suppresses the total-loss epoch shuffle and is
         // therefore part of the training semantics, not just log output.
         .dump_span_parity = opts.dump_span_parity,
         .compiled_required = opts.compiled_required,
-        .graph_shape_policy = if (opts.objective == .gliner2_total_loss) "batch-local-v1" else "fixed",
+        .graph_shape_policy = if (opts.objective == .gliner2_total_loss) "batch-local-v2" else "fixed",
         .graph_seq_bucket_multiple = if (opts.objective == .gliner2_total_loss) @as(u32, 8) else 0,
+        .graph_span_word_bucket_policy = if (opts.objective == .gliner2_total_loss) "bounded-next-power-of-two" else "fixed",
         .graph_schema_bucket_policy = if (opts.objective == .gliner2_total_loss) "bounded-next-power-of-two" else "fixed",
         .graph_cache_capacity = opts.graph_cache_capacity,
         .graph_cache_runtime_input_policy = "active-entry-only",
@@ -6831,7 +6847,8 @@ test "training manifest serializes initial adapter provenance and requested max 
     try std.testing.expectEqual(@as(i64, 7), manifest.get("requested_max_steps").?.integer);
     try std.testing.expectEqual(@as(i64, 2), manifest.get("graph_cache_capacity").?.integer);
     try std.testing.expectEqual(@as(i64, 1), manifest.get("graph_cache_hits").?.integer);
-    try std.testing.expectEqualStrings("batch-local-v1", manifest.get("graph_shape_policy").?.string);
+    try std.testing.expectEqualStrings("batch-local-v2", manifest.get("graph_shape_policy").?.string);
+    try std.testing.expectEqualStrings("bounded-next-power-of-two", manifest.get("graph_span_word_bucket_policy").?.string);
     try std.testing.expectEqualStrings("active-entry-only", manifest.get("graph_cache_runtime_input_policy").?.string);
 
     opts.initial_adapter_checkpoint = null;

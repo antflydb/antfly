@@ -309,24 +309,40 @@ deterministic-core contract. The harness disables Python encoder/count-
 transformer dropout, LoRA dropout, negative-span masking, SamplingConfig data
 augmentation, training-example shuffle, and task/field shuffling, and pins
 example and schema ordering. That is a
-stricter subset than stock upstream `deterministic=True`. Antfly does not yet
-reproduce upstream's sampling augmentations or stochastic model-internal
-dropout masks, so default upstream training-result parity is not claimed.
+stricter subset than stock upstream `deterministic=True` and is used only for
+trace-level loss, gradient, optimizer-state, and update comparisons. The
+five-seed outcome gate uses a separate stock-stochastic contract: Python must
+run with `deterministic=False`, Fastino's exact `SamplingConfig` defaults,
+training-mode schema conditioning, model dropout enabled, LoRA dropout `0.0`,
+shuffled training data, and the default `0.5` negative-span mask. Zig records
+its actual asymmetric policy in every release manifest: SamplingConfig and
+model dropout disabled, deterministic eval-form schema conditioning, epoch
+shuffle enabled, LoRA dropout `0.0`, and negative-span masking at `0.5`. The
+two sides use independent RNG streams and do not claim identical augmentations
+or dropout masks; parity there means held-out result distributions meet the
+paired quality/deficit gates. The convergence materializer verifies both
+policies and rejects deterministic, weakened, or legacy reports.
 Deterministic schema conditioning includes entity and JSON descriptions,
 classification prompts and few-shot examples, and classification label
 descriptions. Their prompt layout and token IDs match the pinned upstream
-processor. The harness pins upstream's stochastic `example_mode` selection
+processor. For deterministic trace runs only, the harness pins upstream's stochastic `example_mode` selection
 (`_process_entities`/`_process_classifications`/`_process_json_structures`)
 and `_transform_schema` description/example shuffles to eval-mode semantics —
 entities/JSON emit every present `[DESCRIPTION]` segment, classifications emit
 `[DESCRIPTION]` plus `[EXAMPLE]`/`[OUTPUT]` — which is exactly the
 deterministic form the Zig data pipeline always emits.
 `gliner2_described_smoke.jsonl` exercises that surface in the full-task parity
-gates. Stock upstream's stochastic conditioning selection remains part of the
-sampling-parity limitation above.
+gates. Stock-stochastic outcome studies leave upstream training-mode
+conditioning untouched and record that fact in their evidence.
 
 Parity review notes (vs the frozen fastino-ai/GLiNER2 oracle
 `8f3fc399bcc5a00749a62a1565e5c6529f04b574`):
+
+- The oracle environment is frozen as well as its source: Python 3.12 / Unicode
+  15 plus every direct numerical/runtime dependency in
+  `scripts/requirements-gliner2-oracle.txt`. Generated trainers, held-out
+  evaluation, repeated performance summaries, convergence evidence, and the
+  final readiness report all reject a missing or mismatched package version.
 
 - LR schedule with `--grad-accum N > 1` now matches upstream: the schedule
   horizon, the warmup, *and* the optimizer-step target all use upstream's
@@ -394,12 +410,17 @@ wrapper now requires exactly five paired independent seeds, all deployment
 floors, at most 0.02 mean Zig metric deficit, and at most 0.05 deficit in any
 paired run.
 
+The production batch-32 profile uses 16-sample structure-loss chunks and gates
+the graph executor's device-owned peak-live metric at 3 GiB. This is distinct
+from process RSS and remains fail-closed on representative release data.
+
 Accepted, deliberately not "fixed":
 
 - FFN GELU uses an erf approximation (Abramowitz–Stegun 7.1.26, ~1.5e-7
-  max per-element error) rather than libm erf. It sits three orders of
-  magnitude inside the 1e-4 loss-parity gate; replacing it would desync the
-  matching Metal kernel implementations and perturb unrelated golden
+  max per-element error) rather than libm erf. Deterministic summed losses use
+  a combined `1e-4` absolute and `5e-6` relative gate so the threshold scales
+  with production-batch loss sums; replacing the approximation would desync
+  the matching Metal kernel implementations and perturb unrelated golden
   baselines.
 - Bitwise trace parity with stock upstream RNG streams (torch shuffle order,
   dropout masks, negative-span masking draws) is out of scope by design; the
@@ -473,6 +494,11 @@ per-record width before graph construction.
 Each shuffled train or eval batch selects bounded local graph axes: sequence
 length uses eight-token buckets, while schema slots, structure instances, and
 task count use next-power-of-two buckets capped by the admitted dataset limits.
+Text-word routing and span grids likewise use the batch's actual Fastino-style
+word count rounded to a bounded power of two, with a floor large enough to pack
+every schema-task row. They no longer allocate `seq_len * max_span_width` rows
+for short texts. This is the `batch-local-v2` manifest policy; release
+validation intentionally rejects pre-v2 shape-policy artifacts.
 A deterministic LRU cache retains at most `--graph-cache-capacity` signatures
 (default 2, maximum 8), shares trainables, Adam state, counters, and RNG across
 them, and releases inactive runtime inputs. Cache policy and build/hit/reuse/

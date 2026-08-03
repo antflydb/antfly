@@ -94,6 +94,28 @@ class ReleaseContractTest(unittest.TestCase):
         ):
             contract.verify_canonical_python_runtime()
 
+    def test_oracle_dependency_versions_are_pinned(self) -> None:
+        versions = dict(contract.CANONICAL_ORACLE_PACKAGE_VERSIONS)
+        requirements = Path(contract.__file__).with_name("requirements-gliner2-oracle.txt")
+        locked = {}
+        for raw_line in requirements.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            package, version = line.split("==", 1)
+            locked[package] = version
+        self.assertEqual(versions, locked)
+
+        with mock.patch.object(contract.importlib.metadata, "version", side_effect=versions.__getitem__):
+            self.assertEqual(versions, contract.verify_canonical_oracle_packages())
+
+        versions["torch"] = "future"
+        with (
+            mock.patch.object(contract.importlib.metadata, "version", side_effect=versions.__getitem__),
+            self.assertRaisesRegex(ValueError, "torch=future"),
+        ):
+            contract.verify_canonical_oracle_packages()
+
 
 if __name__ == "__main__":
     unittest.main()

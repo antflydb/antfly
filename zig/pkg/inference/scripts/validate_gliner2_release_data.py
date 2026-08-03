@@ -166,12 +166,28 @@ def validate_release_artifact_provenance(
     manifest = json_object(adapter_dir / "training_manifest.json", "Zig training manifest")
     adapter_config = json_object(adapter_dir / "adapter_config.json", "PEFT adapter config")
 
-    if manifest.get("schema_version") != "gliner2_autodiff_training/v2":
+    if manifest.get("schema_version") != "gliner2_autodiff_training/v3":
         raise ValueError("release adapter has an unsupported Zig training manifest")
     if manifest.get("objective") != FULL_TASK_OBJECTIVE or manifest.get("lora_only_trainables") is not True:
         raise ValueError("release adapter was not produced by LoRA-only full-task training")
     if str(manifest.get("backend", "")).lower() != "metal" or manifest.get("compiled_required") is not True:
         raise ValueError("release adapter provenance requires Metal training with compiled_required=true")
+    lora_dropout = manifest.get("lora_dropout")
+    span_negative_mask_rate = manifest.get("span_negative_mask_rate")
+    if (
+        manifest.get("deterministic") is not False
+        or manifest.get("sampling_config") != "disabled"
+        or manifest.get("schema_conditioning_policy") != "deterministic-eval-form"
+        or manifest.get("model_dropout") != "disabled"
+        or manifest.get("train_shuffle") is not True
+        or type(lora_dropout) not in (int, float)
+        or not math.isfinite(lora_dropout)
+        or float(lora_dropout) != 0.0
+        or type(span_negative_mask_rate) not in (int, float)
+        or not math.isfinite(span_negative_mask_rate)
+        or float(span_negative_mask_rate) != 0.5
+    ):
+        raise ValueError("release adapter has invalid production training-policy provenance")
     cache_capacity = manifest.get("graph_cache_capacity")
     cache_stat_names = (
         "graph_cache_build_reserve_bytes",
@@ -184,9 +200,10 @@ def validate_release_artifact_provenance(
     )
     cache_stats = {name: manifest.get(name) for name in cache_stat_names}
     if (
-        manifest.get("graph_shape_policy") != "batch-local-v1"
+        manifest.get("graph_shape_policy") != "batch-local-v2"
         or type(manifest.get("graph_seq_bucket_multiple")) is not int
         or manifest.get("graph_seq_bucket_multiple") != 8
+        or manifest.get("graph_span_word_bucket_policy") != "bounded-next-power-of-two"
         or manifest.get("graph_schema_bucket_policy") != "bounded-next-power-of-two"
         or type(cache_capacity) is not int
         or not 1 <= cache_capacity <= 8

@@ -1244,9 +1244,9 @@ test "eval gather honors the index operand" {
     try g.markOutput(gathered);
 
     const ptable = [_]f32{
-        0.0, 1.0, 2.0,
-        3.0, 4.0, 5.0,
-        6.0, 7.0, 8.0,
+        0.0, 1.0,  2.0,
+        3.0, 4.0,  5.0,
+        6.0, 7.0,  8.0,
         9.0, 10.0, 11.0,
     };
     const pidx = [_]f32{ 2.0, 0.0, 2.0 };
@@ -1561,12 +1561,12 @@ test "grad_check gliner2-shaped span/schema gather chain" {
     try g.markOutput(loss);
 
     const phidden = [_]f32{
-        0.10, -0.20, 0.30,
-        0.40, 0.50, -0.60,
-        -0.70, 0.80, 0.90,
-        1.00, -1.10, 1.20,
-        0.05, 0.15, -0.25,
-        -0.35, 0.45, 0.55,
+        0.10,  -0.20, 0.30,
+        0.40,  0.50,  -0.60,
+        -0.70, 0.80,  0.90,
+        1.00,  -1.10, 1.20,
+        0.05,  0.15,  -0.25,
+        -0.35, 0.45,  0.55,
     };
     // Repeated + skipped token rows, as real span data produces.
     const pstart_idx = [_]f32{ 0.0, 2.0, 2.0, 5.0 };

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import copy
 import unittest
 
 from evaluate_gliner2_full_task import EVALUATION_CONTRACT, REQUIRED_MINIMA
 from evaluate_gliner2_native_release_smoke import NATIVE_EVALUATION_CONTRACT
 from finalize_gliner2_readiness import build_summary
-from gliner2_release_contract import CANONICAL_NORMALIZATION, CANONICAL_UNICODE_VERSION, UPSTREAM_COMMIT
-from summarize_gliner2_convergence import EVIDENCE_CONTRACT, OUTPUT_CONTRACT
+from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
+    CANONICAL_NORMALIZATION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
+    CANONICAL_UNICODE_VERSION,
+    UPSTREAM_COMMIT,
+)
+from summarize_gliner2_convergence import (
+    EVIDENCE_CONTRACT,
+    OUTPUT_CONTRACT,
+    STOCK_STOCHASTIC_TRAINING_POLICY,
+)
 
 
 SHA_MODEL = "sha256:" + "1" * 64
@@ -20,6 +31,8 @@ def evidence() -> dict:
         "commit": UPSTREAM_COMMIT,
         "checkout": "/oracle",
         "imported_module": "/oracle/gliner2/model.py",
+        "gliner2_version": CANONICAL_GLINER2_VERSION,
+        "package_versions": CANONICAL_ORACLE_PACKAGE_VERSIONS,
     }
     return {
         "default_summary": {
@@ -59,9 +72,15 @@ def evidence() -> dict:
             "evidence_bound": True,
             "pass": True,
             "seed_count": 5,
-            "oracle": {"commit": UPSTREAM_COMMIT, "checkout": "/oracle"},
+            "oracle": {
+                "commit": UPSTREAM_COMMIT,
+                "checkout": "/oracle",
+                "gliner2_version": CANONICAL_GLINER2_VERSION,
+                "package_versions": CANONICAL_ORACLE_PACKAGE_VERSIONS,
+            },
             "normalization": CANONICAL_NORMALIZATION,
             "unicode_version": CANONICAL_UNICODE_VERSION,
+            "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
             "thresholds": {"max_mean_deficit": 0.02, "max_paired_deficit": 0.05},
             "fingerprints": {"base_model": SHA_MODEL, "train_data": SHA_TRAIN, "eval_data": SHA_EVAL},
             "runs": [{"seed": seed, "pass": True} for seed in range(5)],
@@ -124,6 +143,13 @@ class ReadinessFinalizerTest(unittest.TestCase):
         stale = self.build(convergence_evidence_errors=["comparison report changed"])
         self.assertFalse(stale["production_ready"])
         self.assertFalse(stale["checks"]["convergence_evidence_current"])
+
+    def test_oracle_dependency_drift_blocks_release(self) -> None:
+        default = copy.deepcopy(evidence()["default_summary"])
+        default["oracle"]["package_versions"]["torch"] = "future"
+        result = self.build(default_summary=default)
+        self.assertFalse(result["production_ready"])
+        self.assertFalse(result["checks"]["pinned_python_oracle"])
 
 
 if __name__ == "__main__":

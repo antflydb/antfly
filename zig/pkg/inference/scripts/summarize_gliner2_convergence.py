@@ -19,13 +19,16 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from compare_gliner2_lora_python_zig import COMPARISON_CONTRACT
+from compare_gliner2_lora_python_zig import COMPARISON_CONTRACT, UPSTREAM_SAMPLING_DEFAULTS
 from evaluate_gliner2_full_task import EVALUATION_CONTRACT, REQUIRED_MINIMA
 from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
     CANONICAL_NORMALIZATION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
     CANONICAL_UNICODE_VERSION,
     UPSTREAM_COMMIT,
     path_fingerprint,
+    verify_canonical_oracle_packages,
     verify_canonical_python_runtime,
     verify_upstream_checkout,
 )
@@ -37,10 +40,39 @@ from validate_gliner2_release_data import (
 
 
 INPUT_CONTRACT = "gliner2_python_zig_convergence_evidence_manifest/v2"
-DERIVED_CONTRACT = "gliner2_python_zig_convergence_derived/v2"
-OUTPUT_CONTRACT = "gliner2_python_zig_convergence_summary/v2"
-EVIDENCE_CONTRACT = "gliner2_python_zig_convergence_evidence/v1"
+DERIVED_CONTRACT = "gliner2_python_zig_convergence_derived/v3"
+OUTPUT_CONTRACT = "gliner2_python_zig_convergence_summary/v3"
+EVIDENCE_CONTRACT = "gliner2_python_zig_convergence_evidence/v2"
 SIDES = ("python", "zig")
+STOCK_STOCHASTIC_TRAINING_POLICY = {
+    "parity_kind": "held-out-result",
+    "fastino_sampling_config": "upstream-default",
+    "fastino_schema_conditioning_policy": "upstream-training-default",
+    "fastino_model_dropout": "upstream-default",
+    "fastino_train_shuffle": True,
+    "fastino_training_deterministic": False,
+    "fastino_lora_dropout": 0.0,
+    "fastino_span_negative_mask_rate": 0.5,
+    "zig_sampling_config": "disabled",
+    "zig_schema_conditioning_policy": "deterministic-eval-form",
+    "zig_model_dropout": "disabled",
+    "zig_train_shuffle": True,
+    "zig_training_deterministic": False,
+    "zig_lora_dropout": 0.0,
+    "zig_span_negative_mask_rate": 0.5,
+    "rng_streams": "independent",
+}
+REQUIRED_STOCHASTIC_STRICT_CHECKS = (
+    "requested_step_count_valid",
+    "adapter_roundtrip_ok",
+    "metal_manifest_backend_is_metal",
+    "metal_optimizer_backend_is_metal",
+    "metal_device_resident_transfers_zero",
+    "metal_finite_step_loss",
+    "metal_graph_executor_fallback_reasons_empty",
+    "metal_graph_executor_true_host_outputs_zero",
+    "metal_interpreter_fallbacks_within_threshold",
+)
 
 
 def is_sha256(value: Any) -> bool:
@@ -50,6 +82,24 @@ def is_sha256(value: Any) -> bool:
         and len(value) == 71
         and all(char in "0123456789abcdef" for char in value[7:])
     )
+
+
+def exact_numeric(value: Any, expected: float) -> bool:
+    return (
+        type(value) in (int, float)
+        and math.isfinite(value)
+        and float(value) == expected
+    )
+
+
+def sampling_config_matches(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != set(UPSTREAM_SAMPLING_DEFAULTS):
+        return False
+    for name, expected in UPSTREAM_SAMPLING_DEFAULTS.items():
+        actual = value[name]
+        if type(actual) is not type(expected) or actual != expected:
+            return False
+    return True
 
 
 def json_object(path: Path, label: str) -> dict[str, Any]:
@@ -93,6 +143,8 @@ def oracle_runtime_matches(value: Any, verified: dict[str, str]) -> bool:
         and Path(imported_module).is_relative_to(Path(checkout))
         and str(value.get("python_version", "")).startswith("3.12.")
         and value.get("unicode_version") == CANONICAL_UNICODE_VERSION
+        and value.get("gliner2_version") == CANONICAL_GLINER2_VERSION
+        and value.get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
     )
 
 
@@ -221,6 +273,79 @@ def evaluation_evidence(
     return metrics
 
 
+def stochastic_comparison_errors(
+    config: dict[str, Any],
+    summary: dict[str, Any],
+    python_result: dict[str, Any],
+    zig_result: dict[str, Any],
+) -> list[str]:
+    """Reject deterministic-core or weakened runs from the statistical gate."""
+    errors: list[str] = []
+    if config.get("deterministic") is not False:
+        errors.append("comparison must use --no-deterministic")
+    if config.get("python_sampling_policy") != "upstream-default":
+        errors.append("Fastino SamplingConfig must retain the pinned upstream defaults")
+    if config.get("python_schema_conditioning_policy") != "upstream-training-default":
+        errors.append("Fastino schema conditioning must retain upstream training-mode stochasticity")
+    if config.get("python_train_shuffle") is not True:
+        errors.append("Fastino training-example/task shuffle must remain enabled")
+    if config.get("disable_python_model_dropout") is not False:
+        errors.append("Fastino model dropout must remain enabled")
+    if not exact_numeric(config.get("lora_dropout"), 0.0):
+        errors.append("LoRA dropout must match the pinned Fastino default of 0.0")
+    if not exact_numeric(config.get("span_negative_mask_rate"), 0.5):
+        errors.append("negative-span masking must match the pinned Fastino default of 0.5")
+
+    metrics = python_result.get("metrics")
+    if not isinstance(metrics, dict):
+        errors.append("generated Fastino trainer metrics are missing")
+    else:
+        if metrics.get("sampling_policy") != "upstream-default":
+            errors.append("generated Fastino trainer did not apply the upstream sampling policy")
+        if not sampling_config_matches(metrics.get("sampling_config")):
+            errors.append("generated Fastino trainer SamplingConfig differs from the pinned defaults")
+        if metrics.get("schema_conditioning_policy") != "upstream-training-default":
+            errors.append("generated Fastino trainer did not retain upstream schema conditioning")
+        if metrics.get("training_deterministic") is not False:
+            errors.append("generated Fastino trainer did not retain deterministic=False")
+        if metrics.get("train_shuffle") is not True:
+            errors.append("generated Fastino trainer did not retain shuffle")
+        configured_dropout = metrics.get("configured_dropout_modules")
+        if not isinstance(configured_dropout, int) or isinstance(configured_dropout, bool) or configured_dropout <= 0:
+            errors.append("generated Fastino model did not expose active upstream dropout modules")
+        disabled_dropout = metrics.get("disabled_dropout_modules")
+        if not isinstance(disabled_dropout, int) or isinstance(disabled_dropout, bool) or disabled_dropout != 0:
+            errors.append("generated Fastino trainer disabled one or more model dropout modules")
+
+    manifest = zig_result.get("training_manifest")
+    if not isinstance(manifest, dict):
+        errors.append("generated Zig training manifest is missing")
+    else:
+        expected_zig_policy = {
+            "deterministic": False,
+            "sampling_config": "disabled",
+            "schema_conditioning_policy": "deterministic-eval-form",
+            "model_dropout": "disabled",
+            "train_shuffle": True,
+            "lora_dropout": 0.0,
+            "span_negative_mask_rate": 0.5,
+        }
+        for name, expected in expected_zig_policy.items():
+            if manifest.get(name) != expected or (
+                isinstance(expected, float) and isinstance(manifest.get(name), bool)
+            ):
+                errors.append(f"generated Zig trainer {name} must equal {expected!r}")
+
+    strict_checks = summary.get("strict_checks")
+    if summary.get("strict_mode") is not True or not isinstance(strict_checks, dict):
+        errors.append("comparison must complete with strict runtime/artifact gating enabled")
+    else:
+        failed = [name for name in REQUIRED_STOCHASTIC_STRICT_CHECKS if strict_checks.get(name) is not True]
+        if failed:
+            errors.append("required strict checks did not pass: " + ", ".join(failed))
+    return errors
+
+
 def materialize_study(
     manifest: dict[str, Any],
     *,
@@ -285,10 +410,16 @@ def materialize_study(
             or config.get("zig_backend") != "metal"
             or config.get("zig_objective") != "gliner2-total-loss"
             or config.get("zig_lora_only_trainables") is not True
-            or config.get("deterministic") is not False
             or not oracle_subset_matches(config.get("oracle"), verified_oracle)
         ):
             raise ValueError(f"{label} comparison configuration is not the selected stochastic Metal study")
+        python_result = comparison.get("python")
+        zig_result = comparison.get("zig")
+        if not isinstance(summary, dict) or not isinstance(python_result, dict) or not isinstance(zig_result, dict):
+            raise ValueError(f"{label} comparison report is missing its summary or trainer results")
+        stochastic_errors = stochastic_comparison_errors(config, summary, python_result, zig_result)
+        if stochastic_errors:
+            raise ValueError(f"{label} is not a stock-stochastic Fastino study: {'; '.join(stochastic_errors)}")
         requested_steps = config.get("steps")
         if (
             not isinstance(requested_steps, int)
@@ -355,6 +486,7 @@ def materialize_study(
         "oracle": verified_oracle,
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
+        "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
         "fingerprints": fingerprints,
         "artifact_paths": {
             "base_model": str(model_dir),
@@ -378,6 +510,8 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
         failures.append(f"normalization must be {CANONICAL_NORMALIZATION}")
     if payload.get("unicode_version") != CANONICAL_UNICODE_VERSION:
         failures.append(f"unicode_version must be {CANONICAL_UNICODE_VERSION}")
+    if payload.get("training_policy") != STOCK_STOCHASTIC_TRAINING_POLICY:
+        failures.append("training_policy must retain the pinned Fastino stochastic defaults")
     fingerprints = payload.get("fingerprints")
     if not isinstance(fingerprints, dict):
         fingerprints = {}
@@ -523,13 +657,14 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
         "oracle": upstream,
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
+        "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
         "fingerprints": fingerprints,
         "artifact_paths": payload.get("artifact_paths"),
         "seed_count": len(runs),
         "minimums": minimums,
         "thresholds": {"max_mean_deficit": 0.02, "max_paired_deficit": 0.05},
         "loss_curve_policy": "all values finite; final loss no greater than max(2x initial, initial+1)",
-        "stochastic_policy": "paired independent seeds; exact Python RNG-stream equality is not required",
+        "stochastic_policy": "pinned Fastino stochastic defaults; paired independent seeds; exact Python RNG-stream equality is not required",
         "runs": run_results,
         "metrics": metric_results,
     }
@@ -537,7 +672,7 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
 
 PROJECTION_KEYS = (
     "contract", "evidence_contract", "evidence_bound", "pass", "failures", "oracle",
-    "normalization", "unicode_version", "fingerprints", "artifact_paths", "seed_count",
+    "normalization", "unicode_version", "training_policy", "fingerprints", "artifact_paths", "seed_count",
     "minimums", "thresholds", "loss_curve_policy", "stochastic_policy", "runs", "metrics",
 )
 
@@ -570,8 +705,15 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
         fingerprints["eval_data"] = path_fingerprint(paths["eval_data"])
         if any(fingerprints[name] != artifacts[name].get("fingerprint") for name in fingerprints):
             raise ValueError("convergence source artifact fingerprint changed")
-        verify_canonical_python_runtime()
-        oracle = verify_upstream_checkout(Path(upstream_source).resolve())
+        runtime = verify_canonical_python_runtime()
+        package_versions = verify_canonical_oracle_packages()
+        oracle = {
+            **verify_upstream_checkout(Path(upstream_source).resolve()),
+            "python_version": runtime["python"],
+            "unicode_version": runtime["unicode"],
+            "gliner2_version": CANONICAL_GLINER2_VERSION,
+            "package_versions": package_versions,
+        }
         manifest = json_object(manifest_path, "convergence evidence manifest")
         derived = materialize_study(
             manifest,
@@ -608,9 +750,16 @@ def main() -> int:
     eval_data = args.eval_data.expanduser().resolve()
     upstream_source = args.upstream_source.expanduser().resolve()
     try:
-        verify_canonical_python_runtime()
+        runtime = verify_canonical_python_runtime()
+        package_versions = verify_canonical_oracle_packages()
         manifest = json_object(args.input, "convergence evidence manifest")
-        oracle = verify_upstream_checkout(upstream_source)
+        oracle = {
+            **verify_upstream_checkout(upstream_source),
+            "python_version": runtime["python"],
+            "unicode_version": runtime["unicode"],
+            "gliner2_version": CANONICAL_GLINER2_VERSION,
+            "package_versions": package_versions,
+        }
         fingerprints = {
             "base_model": base_model_fingerprint(model_dir),
             "train_data": path_fingerprint(train_data),

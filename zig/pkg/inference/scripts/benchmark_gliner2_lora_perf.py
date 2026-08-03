@@ -14,7 +14,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from gliner2_release_contract import CANONICAL_UNICODE_VERSION, UPSTREAM_COMMIT
+from gliner2_release_contract import (
+    CANONICAL_GLINER2_VERSION,
+    CANONICAL_ORACLE_PACKAGE_VERSIONS,
+    CANONICAL_UNICODE_VERSION,
+    UPSTREAM_COMMIT,
+)
 
 
 def script_dir() -> Path:
@@ -528,6 +533,8 @@ def main() -> int:
         and oracle.get("commit") == UPSTREAM_COMMIT
         and str(oracle.get("python_version", "")).startswith("3.12.")
         and oracle.get("unicode_version") == CANONICAL_UNICODE_VERSION
+        and oracle.get("gliner2_version") == CANONICAL_GLINER2_VERSION
+        and oracle.get("package_versions") == CANONICAL_ORACLE_PACKAGE_VERSIONS
         and isinstance(oracle.get("checkout"), str)
         and isinstance(oracle.get("imported_module"), str)
     ]
@@ -541,7 +548,9 @@ def main() -> int:
         )
     )
     if python_oracle_expected and summary["oracle_valid_in_every_run"] is not True:
-        failures.append(f"Python oracle was not pinned to {UPSTREAM_COMMIT} in every run")
+        failures.append(
+            f"Python oracle source/runtime was not pinned to {UPSTREAM_COMMIT} and the canonical dependency set in every run"
+        )
     for fingerprint_key in ("model_fingerprint_sha256", "training_data_fingerprint_sha256"):
         values = [run["summary"].get(fingerprint_key) for run in successful]
         valid_values = [

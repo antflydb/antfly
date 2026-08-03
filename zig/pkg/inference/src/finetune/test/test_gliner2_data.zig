@@ -912,6 +912,62 @@ test "task supervision fails closed when schema rows exceed span rows" {
     );
 }
 
+test "upstream span grids bucket actual text words instead of sequence capacity" {
+    const allocator = std.testing.allocator;
+    const entity_task = gliner2_data.UpstreamTask{
+        .kind = .entities,
+        .name = "entities",
+        .schema_fields = &.{"thing"},
+    };
+    const record = gliner2_data.UpstreamRecord{
+        .text = "one two three.",
+        .tasks = &.{entity_task},
+    };
+    var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+    var batch = try gliner2_data.buildUpstreamTaskBatchWithLocalSlots(
+        allocator,
+        &tokenizer,
+        &.{record},
+        1,
+        256,
+        2,
+        1,
+    );
+    defer batch.deinit();
+
+    try std.testing.expectEqual(@as(i32, 4), batch.text_word_counts[0]);
+    try std.testing.expectEqual(@as(usize, 4), batch.max_words_per_sample);
+    try std.testing.expectEqual(@as(usize, 8), batch.max_spans);
+}
+
+test "upstream span word buckets retain rows for every schema task" {
+    const allocator = std.testing.allocator;
+    const tasks = [_]gliner2_data.UpstreamTask{
+        .{ .kind = .classifications, .name = "first", .labels = &.{"yes"} },
+        .{ .kind = .classifications, .name = "second", .labels = &.{"yes"} },
+        .{ .kind = .classifications, .name = "third", .labels = &.{"yes"} },
+    };
+    const record = gliner2_data.UpstreamRecord{ .text = ".", .tasks = &tasks };
+    var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+    var batch = try gliner2_data.buildUpstreamTaskBatchWithLocalSlots(
+        allocator,
+        &tokenizer,
+        &.{record},
+        3,
+        128,
+        1,
+        1,
+    );
+    defer batch.deinit();
+
+    try std.testing.expectEqual(@as(i32, 1), batch.text_word_counts[0]);
+    try std.testing.expectEqual(@as(usize, 3), batch.max_schemas);
+    try std.testing.expectEqual(@as(usize, 4), batch.max_words_per_sample);
+    try std.testing.expectEqual(@as(usize, 4), batch.max_spans);
+}
+
 test "GLiNER2 negative fixture is explicit and unresolved annotations fail" {
     const allocator = std.testing.allocator;
 
@@ -977,6 +1033,35 @@ test "GLiNER2 upstream data labels every mention and appends terminal punctuatio
         positives += 1;
     };
     try std.testing.expectEqual(@as(usize, 2), positives);
+}
+
+test "GLiNER2 terminal punctuation joins a final URL before word splitting" {
+    const allocator = std.testing.allocator;
+    const task = gliner2_data.UpstreamTask{
+        .kind = .entities,
+        .name = "entities",
+        .schema_fields = &.{"site"},
+    };
+    const record = gliner2_data.UpstreamRecord{
+        .text = "Visit www.example.com",
+        .tasks = &.{task},
+    };
+    var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+    var batch = try gliner2_data.buildUpstreamTaskBatchWithLocalSlots(
+        allocator,
+        &tokenizer,
+        &.{record},
+        1,
+        128,
+        2,
+        1,
+    );
+    defer batch.deinit();
+
+    try std.testing.expectEqual(@as(i32, 2), batch.text_word_counts[0]);
+    try std.testing.expectEqual(@as(usize, 2), batch.max_words_per_sample);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), batch.word_lengths[1], 1e-6);
 }
 
 test "GLiNER2 upstream entity decoding preserves punctuation-aware boundaries" {

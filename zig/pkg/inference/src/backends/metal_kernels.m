@@ -4880,10 +4880,15 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint kk = 0u; kk < p.k; ++kk) { float r = p.rhs_contract_axis == 0u ? rhs[rhs_base + kk * p.n + col] : rhs[rhs_base + col * p.k + kk]; acc += lhs[lhs_base + row * p.k + kk] * r; }\n"
            "    output[gid] = acc;\n"
            "}\n"
-           "kernel void termite_scatter_add_axis0_f32(device const float *values [[buffer(0)]], device const float *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_scatter_add_axis0_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.out_rows * p.dim; if (gid >= total || p.dim == 0u) return; uint out_row = gid / p.dim; uint col = gid - out_row * p.dim; float acc = 0.0f;\n"
-           "    for (uint row = 0u; row < p.value_rows; ++row) { uint target = uint(rint(indices[row])); if (target == out_row) acc += values[row * p.dim + col]; }\n"
-           "    output[gid] = acc;\n"
+           "kernel void termite_scatter_add_axis0_f32(device const float *values [[buffer(0)]], device const float *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_scatter_add_axis0_f32_params &p [[buffer(3)]], threadgroup uint *matches [[threadgroup(0)]], uint lid [[thread_index_in_threadgroup]], uint2 tpg [[threads_per_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+           "    uint out_row = group.x; uint col = group.y * tpg.x + lid; if (out_row >= p.out_rows || p.dim == 0u) return; float acc = 0.0f;\n"
+           "    for (uint tile = 0u; tile < p.value_rows; tile += tpg.x) {\n"
+           "        if (lid == 0u) { uint count = 0u; uint end = min(tile + tpg.x, p.value_rows); for (uint row = tile; row < end; ++row) { uint target = uint(rint(indices[row])); if (target == out_row) matches[1u + count++] = row; } matches[0] = count; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (col < p.dim) { uint count = matches[0]; for (uint match = 0u; match < count; ++match) acc += values[matches[1u + match] * p.dim + col]; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    if (col < p.dim) output[out_row * p.dim + col] = acc;\n"
            "}\n"
            "kernel void termite_conv1d_f32(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_conv1d_f32_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.batch * p.out_channels * p.out_time; if (gid >= total) return; uint t = gid % p.out_time; uint tmp = gid / p.out_time; uint oc = tmp % p.out_channels; uint b = tmp / p.out_channels; float acc = p.has_bias != 0u ? bias[oc] : 0.0f;\n"
@@ -27822,8 +27827,12 @@ int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
         [encoder setBuffer:indices_buffer offset:indices_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->scatter_add_axis0_f32_pipeline, total), 1, 1)];
+        NSUInteger thread_width = runtime->scatter_add_axis0_f32_pipeline.maxTotalThreadsPerThreadgroup;
+        if (thread_width == 0u || thread_width > 256u) thread_width = 256u;
+        if (thread_width > dim) thread_width = dim;
+        [encoder setThreadgroupMemoryLength:(thread_width + 1u) * sizeof(uint32_t) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(out_rows, (dim + thread_width - 1u) / thread_width, 1)
+           threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }

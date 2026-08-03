@@ -137,13 +137,20 @@ class ReleaseDataValidationTest(unittest.TestCase):
             }
             (adapter_dir / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
             manifest = {
-                "schema_version": "gliner2_autodiff_training/v2",
+                "schema_version": "gliner2_autodiff_training/v3",
                 "backend": "Metal",
                 "compiled_required": True,
                 "objective": "gliner2-total-loss",
                 "lora_only_trainables": True,
-                "graph_shape_policy": "batch-local-v1",
+                "deterministic": False,
+                "sampling_config": "disabled",
+                "schema_conditioning_policy": "deterministic-eval-form",
+                "model_dropout": "disabled",
+                "train_shuffle": True,
+                "span_negative_mask_rate": 0.5,
+                "graph_shape_policy": "batch-local-v2",
                 "graph_seq_bucket_multiple": 8,
+                "graph_span_word_bucket_policy": "bounded-next-power-of-two",
                 "graph_schema_bucket_policy": "bounded-next-power-of-two",
                 "graph_cache_capacity": 2,
                 "graph_cache_build_reserve_bytes": 1024,
@@ -227,6 +234,24 @@ class ReleaseDataValidationTest(unittest.TestCase):
                         validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
                     manifest[key] = original
 
+            bad_training_policy_values = (
+                ("deterministic", True),
+                ("sampling_config", "upstream-default"),
+                ("schema_conditioning_policy", "upstream-training-default"),
+                ("model_dropout", "upstream-default"),
+                ("train_shuffle", False),
+                ("lora_dropout", 0.1),
+                ("span_negative_mask_rate", 0.0),
+            )
+            for key, bad_value in bad_training_policy_values:
+                with self.subTest(training_policy_field=key, bad_value=bad_value):
+                    original = manifest[key]
+                    manifest[key] = bad_value
+                    (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "training-policy provenance"):
+                        validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+                    manifest[key] = original
+
             bad_step_values = (
                 ("optimizer_backend", "host"),
                 ("device_resident_transfer_count", 1),
@@ -251,6 +276,7 @@ class ReleaseDataValidationTest(unittest.TestCase):
             bad_shape_cache_values = (
                 ("graph_shape_policy", "dataset-global"),
                 ("graph_seq_bucket_multiple", 7),
+                ("graph_span_word_bucket_policy", "fixed"),
                 ("graph_schema_bucket_policy", "fixed"),
                 ("graph_cache_capacity", 0),
                 ("graph_cache_capacity", 9),
