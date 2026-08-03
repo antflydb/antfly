@@ -4219,6 +4219,37 @@ export interface components {
             read_snapshot_mutable_rotation_bytes?: number;
             /** Format: uint64 */
             wal_retained_bytes?: number;
+            /** @description Whether WAL checkpoint maintenance is pending. */
+            wal_checkpoint_pending?: boolean;
+            /** @description Whether WAL hard-limit admission is currently blocked. */
+            wal_pressure_blocked?: boolean;
+            /** @description Representative reason for the earliest pending WAL checkpoint retry. */
+            wal_checkpoint_retry_reason?: string;
+            /**
+             * Format: uint64
+             * @description Consecutive failures for the representative WAL checkpoint retry.
+             */
+            wal_checkpoint_retry_attempts?: number;
+            /**
+             * Format: uint64
+             * @description Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+             */
+            wal_checkpoint_retry_delay_ns?: number;
+            /**
+             * Format: uint64
+             * @description Logical bytes in immutable memtables awaiting run publication.
+             */
+            active_immutable_logical_bytes?: number;
+            /**
+             * Format: uint64
+             * @description Logical bytes in runs awaiting durable manifest publication.
+             */
+            unpublished_wal_logical_bytes?: number;
+            /**
+             * Format: uint64
+             * @description Largest logical batch awaiting durable manifest publication.
+             */
+            unpublished_wal_max_batch_logical_bytes?: number;
             /** Format: uint64 */
             compaction_backlog_bytes?: number;
             /** Format: uint64 */
@@ -4337,7 +4368,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$addToSet" | "$max";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$addToSet" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -7417,7 +7448,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
@@ -11659,7 +11690,11 @@ export interface components {
         };
         /** @description Typed options passed to the model's chat template. */
         InferenceGenerateChatTemplateKwargs: {
-            /** @description Controls templates that support an `enable_thinking` variable. False asks the template to open a public/final response channel directly. Omitted preserves the model template's default behavior. */
+            /**
+             * @description Controls templates that support an `enable_thinking` variable. False asks the
+             *     template to open a public/final response channel directly. Omitted preserves the
+             *     model template's default behavior.
+             */
             enable_thinking?: boolean;
         };
         InferenceGenerateRequest: {

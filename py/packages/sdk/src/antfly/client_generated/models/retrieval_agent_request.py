@@ -33,6 +33,10 @@ class RetrievalAgentRequest:
     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
     call, using the queries to determine available tables and indexes.
 
+    Authenticated row filters are enforced on every initial and generated
+    operation in both modes, including scans, aggregates, and graph/tree
+    traversal. They cannot be replaced or weakened by model tool arguments.
+
         Attributes:
             query (str): User's natural language query Example: How do I configure OAuth?.
             queries (list[RetrievalQueryRequest]): Queries to execute. Each query carries its own table via the
@@ -40,6 +44,13 @@ class RetrievalAgentRequest:
 
                 In pipeline mode (max_internal_iterations=0), these are executed directly.
                 In agentic mode, these declare which table and indexes are available.
+
+                `filter_query` and `exclusion_query` are mandatory table predicates
+                for retrieval-agent execution. Predicates declared by any query for
+                a table are conjoined (or unioned for exclusions) and applied to
+                every initial query, generated refinement, probe, aggregation,
+                graph/tree traversal, root scan, and follow-up for that table.
+                They cannot be weakened by generated operations.
                  Example: [{'table': 'docs', 'semantic_search': 'How do I configure OAuth?', 'indexes': ['doc_embeddings'],
                 'limit': 10}].
             messages (list[ChatMessage] | Unset): Optional conversational context for the current turn. Decisions remain the
@@ -47,11 +58,13 @@ class RetrievalAgentRequest:
             agent_knowledge (str | Unset): Domain-specific knowledge to include in the agent's system prompt.
                 Useful for providing context about the document collection.
                  Example: This collection contains API documentation for the Acme product suite..
-            accumulated_filters (list[FilterSpec] | Unset): Pre-applied filters from prior interactions. These are applied
+            accumulated_filters (list[FilterSpec] | Unset): Mandatory filters from prior interactions. These are converted
                 to
-                all search tool invocations.
-            session_id (str | Unset): Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back
-                to the client but does not imply server-side session persistence.
+                structured Antfly predicates and applied to every table and every
+                search tool invocation, including generated follow-ups, graph/tree
+                traversal, aggregations, and root scans.
+            session_id (str | Unset): Correlation identifier for a bounded agent interaction. This is echoed back to the
+                client and does not imply server-side session persistence.
             decisions (list[AgentDecision] | Unset): Structured answers provided by the user as part of client-carried
                 continuation.
             interactive (bool | Unset): If true, the agent may return clarification questions when needed. Default: True.

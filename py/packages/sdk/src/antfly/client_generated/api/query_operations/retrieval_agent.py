@@ -109,6 +109,10 @@ def sync_detailed(
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
             call, using the queries to determine available tables and indexes.
 
+            Authenticated row filters are enforced on every initial and generated
+            operation in both modes, including scans, aggregates, and graph/tree
+            traversal. They cannot be replaced or weakened by model tool arguments.
+
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
@@ -178,6 +182,10 @@ def sync(
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
             call, using the queries to determine available tables and indexes.
 
+            Authenticated row filters are enforced on every initial and generated
+            operation in both modes, including scans, aggregates, and graph/tree
+            traversal. They cannot be replaced or weakened by model tool arguments.
+
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
@@ -241,6 +249,10 @@ async def asyncio_detailed(
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
             call, using the queries to determine available tables and indexes.
+
+            Authenticated row filters are enforced on every initial and generated
+            operation in both modes, including scans, aggregates, and graph/tree
+            traversal. They cannot be replaced or weakened by model tool arguments.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -308,6 +320,10 @@ async def asyncio(
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
             call, using the queries to determine available tables and indexes.
+
+            Authenticated row filters are enforced on every initial and generated
+            operation in both modes, including scans, aggregates, and graph/tree
+            traversal. They cannot be replaced or weakened by model tool arguments.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
