@@ -33,6 +33,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
+const graph_mod = @import("../graph/graph.zig");
 const range_state_mod = @import("../storage/db/range_state.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
@@ -4585,12 +4586,27 @@ pub const BoundTableWriteSource = struct {
             .deletes = table.deletes,
             .transforms = table.transforms,
             .predicates = table.predicates,
-        }) catch |err| switch (err) {
-            error.VersionConflict, error.IntentConflict => {
-                db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
-                return .{ .conflict = boundConflict(table, err) };
-            },
-            else => return err,
+        }) catch |err| {
+            // A begun local transaction must reach a terminal state on every
+            // rejected write. In particular, graph transform validation is
+            // performed by DB.writeTransaction after begin, so returning the
+            // validation error without aborting would strand its transaction.
+            db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch |abort_err| {
+                std.log.err("failed to abort rejected bound transaction write_err={s} abort_err={s}", .{
+                    @errorName(err),
+                    @errorName(abort_err),
+                });
+                return abort_err;
+            };
+            switch (err) {
+                error.VersionConflict, error.IntentConflict => return .{ .conflict = boundConflict(table, err) },
+                error.InvalidBatchRequest,
+                error.InvalidArgument,
+                error.InvalidGraphEdges,
+                error.UnsupportedTransformOperation,
+                => return error.InvalidBatchRequest,
+                else => return err,
+            }
         };
         try db.resolveTransactionIntents(txn_id, .committed, commit_version);
         return .{ .committed = .{ .participant_count = 1 } };
@@ -24765,6 +24781,44 @@ test "bound table write source rejects invalid commit transforms against persist
             },
         }},
     }}, .write));
+}
+
+test "bound table write source aborts graph transform transaction on validation failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-graph-transform-txn", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\"}]}}}" }},
+        .sync_level = .full_index,
+    });
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    const txn_id = try distributed_txn.parseTxnIdHex("102132435465768798a9bacbdcedfe0f");
+    try std.testing.expectError(error.InvalidBatchRequest, source.source().commitTransactionWithId(
+        alloc,
+        txn_id,
+        20_000,
+        &.{.{
+            .table_name = "docs",
+            .transforms = &.{.{
+                .key = "a",
+                .operations = &.{.{ .op = .set, .path = "$._edges.graph.FRIEND", .value_json = "[]" }},
+            }},
+        }},
+        .full_index,
+    ));
+    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(txn_id));
+
+    const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("b", edges[0].target);
 }
 
 test "bound table write source rejects invalid txn prepare writes against persisted schema" {
