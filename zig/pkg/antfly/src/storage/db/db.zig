@@ -15186,11 +15186,11 @@ pub const DB = struct {
         docs: []const introducer_mod.TextDocument,
     ) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const chunk_limit = if (self.text_merge_runtime) |runtime| runtime.producerSegmentChunkLimit() else std.math.maxInt(usize);
+        const reservation_limit = if (self.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var segment_count: usize = 0;
         var start: usize = 0;
         while (start < docs.len) {
-            const end = start + @min(chunk_limit, docs.len - start);
+            const end = textKernelPublicationChunkEnd(self.core.index_manager, docs, start, reservation_limit);
             const chunk = docs[start..end];
             {
                 var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
@@ -15211,6 +15211,30 @@ pub const DB = struct {
             start = end;
         }
         return segment_count;
+    }
+
+    fn textKernelPublicationChunkEnd(
+        index_manager: *index_manager_mod.IndexManager,
+        docs: []const introducer_mod.TextDocument,
+        start: usize,
+        reservation_limit: usize,
+    ) usize {
+        if (reservation_limit == std.math.maxInt(usize)) return docs.len;
+        const remaining_estimate = index_manager.estimateTextKernelPublication(docs[start..]);
+        if (remaining_estimate.segment_count <= reservation_limit) return docs.len;
+
+        var low = start + 1;
+        var high = docs.len;
+        while (low < high) {
+            const mid = low + (high - low + 1) / 2;
+            const estimate = index_manager.estimateTextKernelPublication(docs[start..mid]);
+            if (estimate.segment_count <= reservation_limit) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return low;
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
@@ -32877,11 +32901,20 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         defer collected.deinit();
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
 
-        const chunk_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentChunkLimit() else std.math.maxInt(usize);
+        const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var write_start: usize = 0;
         var applied_first_chunk = false;
         while (!applied_first_chunk or write_start < collected.writes.items.len) {
-            const write_end = write_start + @min(chunk_limit, collected.writes.items.len - write_start);
+            const write_end = if (write_start == collected.writes.items.len)
+                write_start
+            else
+                try textBatchPublicationChunkEnd(
+                    ctx.index_manager,
+                    index_ref.name,
+                    collected.writes.items,
+                    write_start,
+                    reservation_limit,
+                );
             const write_chunk = collected.writes.items[write_start..write_end];
             {
                 var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
@@ -33119,6 +33152,31 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
         },
     }
+}
+
+fn textBatchPublicationChunkEnd(
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    writes: []const types.BatchWrite,
+    start: usize,
+    reservation_limit: usize,
+) !usize {
+    if (reservation_limit == std.math.maxInt(usize)) return writes.len;
+    const remaining_estimate = try index_manager.estimateTextBatchPublicationByName(index_name, writes[start..]);
+    if (remaining_estimate.segment_count <= reservation_limit) return writes.len;
+
+    var low = start + 1;
+    var high = writes.len;
+    while (low < high) {
+        const mid = low + (high - low + 1) / 2;
+        const estimate = try index_manager.estimateTextBatchPublicationByName(index_name, writes[start..mid]);
+        if (estimate.segment_count <= reservation_limit) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return low;
 }
 
 fn batchHasEmbeddingArtifactForManagedIndex(
@@ -70108,8 +70166,15 @@ test "db delete full text index drains active merge before closing generation" {
     defer db.close();
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    // Prevent the fast maintenance worker from consuming every candidate
+    // before the blocking hook is installed. This also makes the test
+    // independent of scheduler speed and host load.
+    try std.testing.expect(runtime.pause());
+
     try db.beginBulkIngestSession();
-    errdefer db.abortBulkIngestSession();
+    var bulk_session_active = true;
+    defer if (bulk_session_active) db.abortBulkIngestSession();
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
@@ -70121,6 +70186,10 @@ test "db delete full text index drains active merge before closing generation" {
         });
     }
 
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_session_active = false;
+    try std.testing.expect(db.pendingWorkStats().text_merge.pending_segments > 0);
+
     text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
     text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
     text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
@@ -70130,15 +70199,15 @@ test "db delete full text index drains active merge before closing generation" {
         text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
         text_merge_runtime_mod.test_stop_entered.store(false, .release);
     }
-    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    try runtime.resumeAfterPause();
 
     var merge_started = false;
-    for (0..200_000) |_| {
+    for (0..5_000) |_| {
         if (text_merge_runtime_mod.test_task_begin_entered.load(.acquire)) {
             merge_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        try db.async_context.io.?.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!merge_started) return error.TestTimeout;
 
@@ -70166,12 +70235,12 @@ test "db delete full text index drains active merge before closing generation" {
     };
 
     var stop_entered = false;
-    for (0..200_000) |_| {
+    for (0..5_000) |_| {
         if (text_merge_runtime_mod.test_stop_entered.load(.acquire)) {
             stop_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        try db.async_context.io.?.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!stop_entered) return error.TestTimeout;
 
@@ -70887,6 +70956,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var first_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 80);
     try std.testing.expectError(error.TextMergeBackpressureTimeout, admission_runtime.acquireProducerPermit("ft_v1", 1, 30));
     first_permit.release();
+    try std.testing.expectEqual(@as(usize, 0), admission_runtime.producer_segment_reservations_by_index.count());
 
     // Admission sleeps on a release epoch rather than rescanning the complete
     // segment catalog at a fixed polling interval.
@@ -71120,7 +71190,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     try std.testing.expectEqual(@as(u64, 24), text_index.snapshot().liveDocCount());
 }
 
-test "db text kernel chunks publications below hard segment admission limit" {
+test "db text kernel admits natural segments below hard segment limit" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -71141,7 +71211,7 @@ test "db text kernel chunks publications below hard segment admission limit" {
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
     const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 2), runtime.producerSegmentChunkLimit());
+    try std.testing.expectEqual(@as(usize, 2), runtime.producerSegmentReservationLimit());
     try std.testing.expect(runtime.pause());
 
     const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "bounded publication" }};
@@ -71152,13 +71222,13 @@ test "db text kernel chunks publications below hard segment admission limit" {
         .{ .id = "doc:3", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 4 },
         .{ .id = "doc:4", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 5 },
     };
-    try std.testing.expectEqual(@as(usize, 3), try db.indexTextKernelDocuments("ft_v1", &docs));
+    try std.testing.expectEqual(@as(usize, 1), try db.indexTextKernelDocuments("ft_v1", &docs));
     const stats = db.core.index_manager.textMergeStatsSnapshotForIndex("ft_v1");
-    try std.testing.expectEqual(@as(u64, 3), stats.active_segments);
+    try std.testing.expectEqual(@as(u64, 1), stats.active_segments);
     try std.testing.expect(stats.active_segments <= 4);
 }
 
-test "db derived text replay chunks publications below hard segment admission limit" {
+test "db derived text replay admits natural segments below hard segment limit" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -71194,6 +71264,7 @@ test "db derived text replay chunks publications below hard segment admission li
     });
 
     const stats = db.core.index_manager.textMergeStatsSnapshotForIndex("ft_v1");
+    try std.testing.expectEqual(@as(u64, 1), stats.active_segments);
     try std.testing.expect(stats.active_segments <= 4);
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",

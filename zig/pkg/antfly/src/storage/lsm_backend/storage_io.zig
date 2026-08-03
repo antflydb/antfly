@@ -313,7 +313,21 @@ pub fn openNativePathLockFile(
     path: []const u8,
     options: NativePathLockFileOptions,
 ) !NativePathLockFile {
-    return try openNativePathLockFileWithCache(allocator, path, options, processNativeFdCache());
+    return try openNativePathLockFileWithPool(allocator, path, options, null);
+}
+
+pub fn openNativePathLockFileWithPool(
+    allocator: Allocator,
+    path: []const u8,
+    options: NativePathLockFileOptions,
+    pool: ?*NativeStoragePool,
+) !NativePathLockFile {
+    return try openNativePathLockFileWithCache(
+        allocator,
+        path,
+        options,
+        if (pool) |configured| configured.fd_cache else processNativeFdCache(),
+    );
 }
 
 fn openNativePathLockFileWithCache(
@@ -364,7 +378,17 @@ pub fn acquireNativePathLock(
     mode: NativePathLockMode,
     options: NativePathLockOptions,
 ) !NativePathLock {
-    var lock_file = try openNativePathLockFile(allocator, path, .{ .create_if_missing = true });
+    return try acquireNativePathLockWithPool(allocator, path, mode, options, null);
+}
+
+pub fn acquireNativePathLockWithPool(
+    allocator: Allocator,
+    path: []const u8,
+    mode: NativePathLockMode,
+    options: NativePathLockOptions,
+    pool: ?*NativeStoragePool,
+) !NativePathLock {
+    var lock_file = try openNativePathLockFileWithPool(allocator, path, .{ .create_if_missing = true }, pool);
     errdefer lock_file.close();
 
     if (options.nonblocking) {
@@ -3363,6 +3387,38 @@ test "persistent path lock exhaustion fails without waiting" {
     const stats = pool.snapshotStats();
     try std.testing.expectEqual(@as(usize, 0), stats.fd_admission_waiters);
     try std.testing.expectEqual(@as(u64, 1), stats.fd_persistent_admission_failures);
+}
+
+test "persistent path locks honor an explicitly configured pool" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
+    var first_buf: [256]u8 = undefined;
+    const first_path = try std.fmt.bufPrint(&first_buf, "/tmp/antfly-storage-configured-lock-pool-{d}-first", .{nonce});
+    defer deleteFilePathPosix(first_path) catch {};
+    var second_buf: [256]u8 = undefined;
+    const second_path = try std.fmt.bufPrint(&second_buf, "/tmp/antfly-storage-configured-lock-pool-{d}-second", .{nonce});
+    defer deleteFilePathPosix(second_path) catch {};
+
+    var first = try openNativePathLockFileWithPool(
+        std.testing.allocator,
+        first_path,
+        .{ .create_if_missing = true },
+        &pool,
+    );
+    defer first.close();
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_persistent_descriptors);
+    try std.testing.expectError(
+        error.PersistentDescriptorAdmissionExhausted,
+        openNativePathLockFileWithPool(
+            std.testing.allocator,
+            second_path,
+            .{ .create_if_missing = true },
+            &pool,
+        ),
+    );
 }
 
 test "persistent locks consume reserved headroom without stranding transient capacity" {

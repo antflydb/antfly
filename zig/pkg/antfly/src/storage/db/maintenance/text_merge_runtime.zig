@@ -114,7 +114,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{};
     }
 
-    pub fn producerSegmentChunkLimit(_: *const @This()) usize {
+    pub fn producerSegmentReservationLimit(_: *const @This()) usize {
         return std.math.maxInt(usize);
     }
 
@@ -180,9 +180,15 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             std.debug.assert(runtime.producer_segment_reservations >= self.segment_count);
             std.debug.assert(runtime.producer_byte_reservations >= self.byte_count);
             if (self.segment_count > 0) {
-                const reserved = runtime.producer_segment_reservations_by_index.getPtr(self.index_name.?) orelse unreachable;
+                const index_name = self.index_name.?;
+                const reserved = runtime.producer_segment_reservations_by_index.getPtr(index_name) orelse unreachable;
                 std.debug.assert(reserved.* >= self.segment_count);
                 reserved.* -= self.segment_count;
+                if (reserved.* == 0) {
+                    const removed = runtime.producer_segment_reservations_by_index.fetchRemove(index_name) orelse unreachable;
+                    runtime.alloc.free(@constCast(removed.key));
+                    self.index_name = null;
+                }
             }
             runtime.producer_segment_reservations -= self.segment_count;
             runtime.producer_byte_reservations -= self.byte_count;
@@ -231,7 +237,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     /// Bound a single publication below the configured high watermark while
     /// retaining the configured low-watermark space for the live index
     /// baseline. Callers chunk larger batches at this boundary.
-    pub fn producerSegmentChunkLimit(self: *const TextMergeRuntime) usize {
+    pub fn producerSegmentReservationLimit(self: *const TextMergeRuntime) usize {
         const high = self.config.max_pending_segments;
         if (!self.config.enabled or high == 0) return std.math.maxInt(usize);
         const retained_baseline = @min(self.config.resume_pending_segments, high - 1);

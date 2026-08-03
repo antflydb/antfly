@@ -162,6 +162,25 @@ var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
 var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
+var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
+
+fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
+    if (!builtin.is_test) return false;
+    var remaining = test_writer_open_persistent_descriptor_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_writer_open_persistent_descriptor_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |observed| {
+            remaining = observed;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 
@@ -2708,6 +2727,50 @@ pub const ProvisionedTableWriteCache = struct {
         self.removeDbEntriesForTable(table_name);
         var removed = self.table_metadata.orderedRemove(0);
         removed.deinit(self.alloc);
+    }
+
+    /// Retire one cache-resident table that can immediately release persistent
+    /// descriptors. The source state mutex prevents new leases while the
+    /// candidate is selected; the lifecycle mutex makes the active-lease check
+    /// race-free with outstanding lease releases.
+    fn evictOneInactiveTableForDescriptorPressureLocked(
+        self: *ProvisionedTableWriteCache,
+        excluded_table_name: []const u8,
+    ) !bool {
+        var metadata_index: usize = 0;
+        while (metadata_index < self.table_metadata.items.len) : (metadata_index += 1) {
+            const table_name = self.table_metadata.items[metadata_index].table_name;
+            if (std.mem.eql(u8, table_name, excluded_table_name)) continue;
+            if (self.bulkIngestSessionActiveForTable(table_name)) continue;
+
+            var has_entry = false;
+            var inactive = true;
+            lockAtomic(&self.entry_lifecycle_mutex);
+            for (self.entries.items) |entry| {
+                if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+                has_entry = true;
+                if (entry.active_leases != 0 or
+                    entry.bulk_ingest_session_open or
+                    entry.auto_bulk_ingest_session_open or
+                    entry.auto_bulk_ingest_finishing)
+                {
+                    inactive = false;
+                    break;
+                }
+            }
+            self.entry_lifecycle_mutex.unlock();
+            if (!has_entry or !inactive) continue;
+
+            // Reserve before the eviction hook publishes cache invalidations.
+            // Once this succeeds, retirement and queueing are allocation-free.
+            try self.reserveDbEntryRetirementsForTableLocked(table_name);
+            if (self.table_eviction_hook) |hook| hook.notify(self, table_name);
+            try self.retireDbEntriesForTableLocked(table_name);
+            var removed = self.table_metadata.orderedRemove(metadata_index);
+            removed.deinit(self.alloc);
+            return true;
+        }
+        return false;
     }
 
     fn notifyTableEvictions(self: *ProvisionedTableWriteCache) void {
@@ -6711,7 +6774,11 @@ pub const ProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         const deadline_ns = platform_time.monotonicNs() +| replicated_apply_writer_open_timeout_ns;
         while (true) {
-            const cached = cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, mode) catch |err| switch (err) {
+            const open_result: anyerror!ProvisionedTableWriteCache.CachedDb = if (consumeTestWriterOpenPersistentDescriptorFailure())
+                error.PersistentDescriptorAdmissionExhausted
+            else
+                cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, mode);
+            const cached = open_result catch |err| switch (err) {
                 error.LsmRootWriterAlreadyOpen => {
                     const cache_pending = cache.hasPendingCloseForGroupTableLocked(group_id, table_name);
                     const startup_cache = self.startup_write_cache;
@@ -6734,12 +6801,21 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 },
                 error.PersistentDescriptorAdmissionExhausted => {
-                    self.local_db_mutex.unlock();
-                    if (platform_time.monotonicNs() >= deadline_ns) {
-                        lockAtomic(&self.local_db_mutex);
-                        return err;
+                    var evicted_cache: ?*ProvisionedTableWriteCache = null;
+                    if (try cache.evictOneInactiveTableForDescriptorPressureLocked(table_name)) {
+                        evicted_cache = cache;
+                    } else if (self.startup_write_cache) |startup| {
+                        if (startup != cache and
+                            try startup.evictOneInactiveTableForDescriptorPressureLocked(table_name))
+                        {
+                            evicted_cache = startup;
+                        }
                     }
-                    sleepNs(replicated_apply_writer_open_retry_ns);
+                    const victim_cache = evicted_cache orelse return err;
+                    self.local_db_mutex.unlock();
+                    // DB.close synchronously releases persistent lock permits;
+                    // retry only after the selected victim is fully closed.
+                    victim_cache.drainPendingCloses();
                     lockAtomic(&self.local_db_mutex);
                     continue;
                 },
@@ -22559,6 +22635,78 @@ test "writer cache eviction retires dirty ownership after the last cache owner" 
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
     try std.testing.expectEqual(@as(u64, 9), read_cache.table_epochs.get("docs").?);
+}
+
+test "descriptor pressure evicts an inactive writer cache before retrying open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/descriptor-pressure-cache", .{tmp.sub_path});
+    defer alloc.free(root);
+    const victim_path = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+    defer alloc.free(victim_path);
+    const active_path = try std.fmt.allocPrint(alloc, "{s}/group-7002", .{root});
+    defer alloc.free(active_path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "victim", .indexes_json = tables_api.default_indexes_json },
+                    .{ .table_id = 8, .name = "active", .indexes_json = tables_api.default_indexes_json },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                    .{ .group_id = 7002, .table_id = 8, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var cache = ProvisionedTableWriteCache.init(alloc);
+    defer cache.deinit();
+    var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &cache;
+
+    var victim = try cache.getOrOpenLocked(victim_path, Catalog.iface(), 7001, 1, "victim");
+    victim.deinit(alloc);
+
+    test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
+    defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
+    lockAtomic(&source.local_db_mutex);
+    var active = source.getOrOpenCachedDbModeAlreadyLocked(&cache, active_path, 7002, 1, "active", .default_async) catch |err| {
+        source.local_db_mutex.unlock();
+        return err;
+    };
+    source.local_db_mutex.unlock();
+    defer active.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqualStrings("active", cache.entries.items[0].table_name);
+    try std.testing.expectEqual(@as(usize, 0), cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
+
+    try std.testing.expect(!(try cache.evictOneInactiveTableForDescriptorPressureLocked("unrelated")));
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
 }
 
 test "forwarded write sources use the local writer owner dirty lifecycle" {
