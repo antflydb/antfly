@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             else => {
                 fail_count += 1;
                 std.debug.print("FAIL ({t})\n", .{err});
-                if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace);
+                if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
             },
         }
 

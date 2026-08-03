@@ -586,12 +586,13 @@ pub const GlinerAutodiffCtx = struct {
             // it explicit (rather than passing `null`) leaves the hook in place
             // should this layout ever gain a real per-sample active-field block
             // like the total-loss layout's `gliner2TotalLossActiveFieldsOffset`.
-            const compact_active_mask_2d = try bld.gather(
-                mask,
-                first_span_rows_i64,
-                Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }),
+            const compact_active_mask_buf = try bld.graph.allocator.alloc(f32, compact_schema_rows);
+            defer bld.graph.allocator.free(compact_active_mask_buf);
+            @memset(compact_active_mask_buf, 1.0);
+            const compact_active_mask = try bld.tensorConst(
+                compact_active_mask_buf,
+                Shape.init(.f32, &.{@intCast(compact_schema_rows)}),
             );
-            const compact_active_mask = try bld.reshape(compact_active_mask_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
             const count_state_idx_i64 = if (has_schema_count_idx) count_idx: {
                 const count_idx_2d = try bld.sliceLastDim(targets, @intCast(count_idx_offset), @intCast(count_idx_offset + E));
                 const compact_count_idx_2d = try bld.gather(

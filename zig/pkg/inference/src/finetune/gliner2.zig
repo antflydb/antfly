@@ -2546,6 +2546,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
         .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
         .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
         .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
         .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
     });
 
@@ -2553,7 +2554,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     defer allocator.free(out_dir);
     var bootstrap = try bootstrapLoRABundle(allocator, root, out_dir, .{ .rank = 8, .alpha = 16 });
     defer freeBootstrapSummary(allocator, &bootstrap);
-    try std.testing.expectEqual(@as(usize, 2), bootstrap.resolved_tensors.len);
+    try std.testing.expectEqual(@as(usize, 3), bootstrap.resolved_tensors.len);
 
     var bundle = try loadLoRABundle(allocator, root, out_dir);
     defer bundle.deinit();
@@ -2579,10 +2580,10 @@ test "gliner2 bootstrap and inspect lora bundle" {
 
     var inspect = try inspectLoRABundle(allocator, root, out_dir);
     defer freeLoRABundleInspectionSummary(allocator, &inspect);
-    try std.testing.expectEqual(@as(usize, 2), inspect.resolved_tensor_count);
+    try std.testing.expectEqual(@as(usize, 3), inspect.resolved_tensor_count);
     try std.testing.expectEqual(@as(?usize, 8), inspect.lora_rank);
-    try std.testing.expectEqual(@as(usize, 2), inspect.dora_magnitude_tensor_count);
-    try std.testing.expectEqual(@as(usize, 256), inspect.dora_magnitude_parameter_count);
+    try std.testing.expectEqual(@as(usize, 3), inspect.dora_magnitude_tensor_count);
+    try std.testing.expectEqual(@as(usize, 384), inspect.dora_magnitude_parameter_count);
     try std.testing.expectEqual(@as(?bool, true), inspect.use_dora);
     try std.testing.expect(inspect.cleanup_head_present);
 
@@ -2591,7 +2592,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     var materialize = try materializeMergedModel(allocator, root, out_dir, materialized_dir);
     defer freeMaterializeSummary(allocator, &materialize);
     try std.testing.expect(materialize.copied_cleanup_head);
-    try std.testing.expectEqual(@as(usize, 2), materialize.merged_dora_tensor_count);
+    try std.testing.expectEqual(@as(usize, 3), materialize.merged_dora_tensor_count);
     try std.testing.expectEqual(@as(usize, 2), materialize.attached_task_head_tensor_count);
     try std.testing.expectError(error.OutputDirectoryAlreadyExists, materializeMergedModel(allocator, root, out_dir, materialized_dir));
 
