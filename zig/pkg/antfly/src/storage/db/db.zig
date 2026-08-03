@@ -877,6 +877,12 @@ var test_quarantine_publication_fence_entered: std.atomic.Value(bool) = .init(fa
 var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
 var test_match_all_ordinal_lookup_entered: std.atomic.Value(bool) = .init(false);
 var test_release_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+const PublishedDenseCatalogLookupTestHook = struct {
+    io: std.Io,
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+};
+var test_published_dense_catalog_lookup_hook: ?*PublishedDenseCatalogLookupTestHook = null;
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
@@ -19987,7 +19993,7 @@ pub const DB = struct {
         var generation_ns: u64 = 0;
         var lock_wait_ns: u64 = 0;
         var locked_search_ns: u64 = 0;
-        if (self.canUsePublishedDenseSearch(req) and self.beginPublishedDenseSearch()) {
+        if (self.tryBeginPublishedDenseSearch(req)) {
             defer self.endPublishedDenseSearch();
             const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
@@ -20978,7 +20984,7 @@ pub const DB = struct {
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (self.canUsePublishedDenseSearch(req) and self.beginPublishedDenseSearch()) {
+        if (self.tryBeginPublishedDenseSearch(req)) {
             defer self.endPublishedDenseSearch();
             return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
         }
@@ -21662,7 +21668,7 @@ pub const DB = struct {
         return self.core.denseIndex(index_name);
     }
 
-    fn canUsePublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
+    fn publishedDenseRequestEligible(req: types.SearchRequest) bool {
         if (req.graph_queries.len != 0) return false;
         if (req.full_text != null or req.sparse != null) return false;
         if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
@@ -21671,9 +21677,32 @@ pub const DB = struct {
         if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
         if (req.resolved_doc_filter != null) return false;
         if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
-        if (!(req.dense != null or req.query == .dense_knn)) return false;
-        const entry = self.core.denseIndex(req.index_name) orelse return false;
-        return !entry.index.hasExternalVectorLoader();
+        return req.dense != null or req.query == .dense_knn;
+    }
+
+    /// Registers with the catalog publication barrier before touching the
+    /// inline dense-index array. A successful return transfers one published
+    /// search lease to the caller, which must call endPublishedDenseSearch.
+    fn tryBeginPublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
+        if (!publishedDenseRequestEligible(req)) return false;
+        if (!self.beginPublishedDenseSearch()) return false;
+
+        if (builtin.is_test) {
+            if (test_published_dense_catalog_lookup_hook) |hook| {
+                hook.entered.set(hook.io);
+                hook.release.waitUncancelable(hook.io);
+            }
+        }
+
+        const entry = self.core.denseIndex(req.index_name) orelse {
+            self.endPublishedDenseSearch();
+            return false;
+        };
+        if (entry.index.hasExternalVectorLoader()) {
+            self.endPublishedDenseSearch();
+            return false;
+        }
+        return true;
     }
 
     fn beginPublishedDenseSearch(self: *DB) bool {
@@ -41916,6 +41945,114 @@ test "db index catalog barrier and apply acquisition honor activation deadline" 
     try std.testing.expect(!db.lockApplyUntil(monotonicTimeNs() + std.time.ns_per_ms));
 }
 
+test "db dense fast path registers before catalog lookup during index deletion" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var lookup_hook = PublishedDenseCatalogLookupTestHook{ .io = io };
+    test_published_dense_catalog_lookup_hook = &lookup_hook;
+    defer {
+        lookup_hook.release.set(io);
+        test_published_dense_catalog_lookup_hook = null;
+    }
+
+    const Searcher = struct {
+        db: *DB,
+        completed: std.atomic.Value(bool) = .init(false),
+        total_hits: u32 = 0,
+        err: ?anyerror = null,
+
+        fn run(searcher: *@This()) void {
+            var result = searcher.db.search(std.heap.smp_allocator, .{
+                .index_name = "dv_v1",
+                .limit = 1,
+                .include_stored = false,
+                .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+            }) catch |err| {
+                searcher.err = err;
+                searcher.completed.store(true, .release);
+                return;
+            };
+            defer result.deinit();
+            searcher.total_hits = result.total_hits;
+            searcher.completed.store(true, .release);
+        }
+    };
+    var searcher = Searcher{ .db = &db };
+    var search_future = try io.concurrent(Searcher.run, .{&searcher});
+    var search_pending = true;
+    defer if (search_pending) {
+        lookup_hook.release.set(io);
+        _ = search_future.await(io);
+    };
+
+    lookup_hook.entered.waitUncancelable(io);
+    try std.testing.expectEqual(@as(u32, 1), db.published_dense_searches.load(.acquire));
+
+    const Deleter = struct {
+        db: *DB,
+        completed: std.atomic.Value(bool) = .init(false),
+        removed: bool = false,
+        err: ?anyerror = null,
+
+        fn run(deleter: *@This()) void {
+            deleter.removed = deleter.db.deleteIndex("dv_v1") catch |err| {
+                deleter.err = err;
+                deleter.completed.store(true, .release);
+                return;
+            };
+            deleter.completed.store(true, .release);
+        }
+    };
+    var deleter = Deleter{ .db = &db };
+    var delete_future = try io.concurrent(Deleter.run, .{&deleter});
+    var delete_pending = true;
+    defer if (delete_pending) {
+        lookup_hook.release.set(io);
+        _ = delete_future.await(io);
+    };
+
+    var barrier_entered = false;
+    for (0..500) |_| {
+        if (db.index_catalog_barriers.load(.acquire) != 0) {
+            barrier_entered = true;
+            break;
+        }
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!barrier_entered) return error.TestTimeout;
+    // The deletion must wait for the already-registered lookup rather than
+    // moving or freeing the dense entry underneath it.
+    try std.testing.expect(!searcher.completed.load(.acquire));
+    try std.testing.expect(!deleter.completed.load(.acquire));
+
+    lookup_hook.release.set(io);
+    _ = search_future.await(io);
+    search_pending = false;
+    _ = delete_future.await(io);
+    delete_pending = false;
+
+    if (searcher.err) |err| return err;
+    if (deleter.err) |err| return err;
+    try std.testing.expectEqual(@as(u32, 0), searcher.total_hits);
+    try std.testing.expect(deleter.removed);
+    try std.testing.expect(!db.hasIndex("dv_v1"));
+}
+
 test "db dense index stores stable vector ids with ordinal filter mappings" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -41960,7 +42097,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
     include = .all;
     defer filter.deinit(alloc);
 
-    try std.testing.expect(!db.canUsePublishedDenseSearch(.{
+    try std.testing.expect(!DB.publishedDenseRequestEligible(.{
         .index_name = "dv_v1",
         .limit = 1,
         .include_stored = false,
