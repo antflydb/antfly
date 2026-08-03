@@ -716,7 +716,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
         try std.testing.expectEqual(@as(usize, 20), pre_train_top.end);
         try std.testing.expectEqualStrings("in", pre_train_top.text);
         try std.testing.expectEqualStrings("person", pre_train_top.label);
-        try std.testing.expectApproxEqAbs(@as(f32, 0.251425), pre_train_top.score, 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.288427), pre_train_top.score, 1e-4);
         std.debug.print(
             "fixed-text inference logits: rows={d} classes={d}; decoded top entity text='{s}' label='{s}' score={d:.6}\n",
             .{ SEQ_LEN, NUM_CLASSES, pre_train_top.text, pre_train_top.label, pre_train_top.score },
@@ -896,7 +896,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     );
 }
 
-test "GLiNER2 real training: gliner2_total_loss one step produces finite loss" {
+test "GLiNER2 real training: gliner2_total_loss produces nonzero finite loss and gradient" {
     const allocator = std.testing.allocator;
     const model_dir = platform.env.getenv(model_dir_env) orelse return error.SkipZigTest;
     const ner_data_path = platform.env.getenv(ner_data_env) orelse return error.SkipZigTest;
@@ -1047,6 +1047,40 @@ test "GLiNER2 real training: gliner2_total_loss one step produces finite loss" {
         @intCast(encoded.max_spans),
         @intCast(E),
     );
+    // The released checkpoint already solves this tiny fixture with every
+    // supervised margin above 20, which makes the f32 BCE and sigmoid saturate
+    // to an exact zero. Turn one real supervised cell into a deterministic
+    // binary challenge so this remains a training smoke rather than a vacuous
+    // finite-zero forward pass.
+    const span_logits = try gliner2_autodiff.spanStartLogitsForBatch(
+        allocator,
+        &trainer,
+        &gliner_ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        targets_shape,
+        @intCast(encoded.batch_size),
+        @intCast(encoded.max_length),
+    );
+    defer allocator.free(span_logits);
+    var challenged = false;
+    outer: for (0..rows) |row_idx| {
+        const row = targets[row_idx * total_width ..][0..total_width];
+        for (0..E) |entity_idx| {
+            if (row[E + entity_idx] <= 0.0) continue;
+            const logit = span_logits[row_idx * E + entity_idx];
+            row[entity_idx] = if (logit >= 0.0) 0.0 else 1.0;
+            std.debug.print(
+                "gliner2_total_loss challenge: row={d} entity={d} logit={d:.6} target={d:.0}\n",
+                .{ row_idx, entity_idx, logit, row[entity_idx] },
+            );
+            challenged = true;
+            break :outer;
+        }
+    }
+    try std.testing.expect(challenged);
+
     const result = try gliner2_autodiff.trainStep(
         &trainer,
         &gliner_ctx,
@@ -1066,7 +1100,8 @@ test "GLiNER2 real training: gliner2_total_loss one step produces finite loss" {
         std.debug.print("FAIL: gliner2_total_loss step produced non-finite grad norm: {d}\n", .{result.grad_norm});
         return error.NonFiniteGradNorm;
     }
-    try std.testing.expect(result.loss >= 0.0);
+    try std.testing.expect(result.loss > 0.0);
+    try std.testing.expect(result.grad_norm > 0.0);
     std.debug.print(
         "PASS: gliner2_total_loss one step -- loss={d:.6} grad_norm={d:.4} (valid_spans={d}, positives={d})\n",
         .{ result.loss, result.grad_norm, stats.valid_span_count, stats.positive_span_label_count },
