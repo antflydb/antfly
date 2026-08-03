@@ -951,15 +951,27 @@ class CandidateParityTest(unittest.TestCase):
 
     def test_controlled_release_build_pins_binary_and_build_flags(self):
         with tempfile.TemporaryDirectory() as temporary:
+            canonical_binary = (SCRIPTS.parent / "zig-out/bin/antfly-inference").resolve()
             args = argparse.Namespace(
-                binary=SCRIPTS.parent / "zig-out/bin/antfly-inference",
+                binary=canonical_binary,
                 output_dir=pathlib.Path(temporary),
                 timeout_sec=123,
             )
+            real_is_file = pathlib.Path.is_file
+
+            def controlled_build_output_exists(path: pathlib.Path) -> bool:
+                if path.resolve() == canonical_binary:
+                    return True
+                return real_is_file(path)
+
             with mock.patch(
                 "validate_gemma4_cuda_candidate._run_logged_in_directory",
                 return_value=(0, "ok"),
-            ) as run:
+            ) as run, mock.patch.object(
+                pathlib.Path,
+                "is_file",
+                controlled_build_output_exists,
+            ):
                 result = run_controlled_release_build(args)
             self.assertTrue(result["passed"])
             command = run.call_args.args[0]
@@ -973,6 +985,34 @@ class CandidateParityTest(unittest.TestCase):
             result = run_controlled_release_build(args)
             self.assertFalse(result["passed"])
             self.assertTrue(any("binary must be" in error for error in result["errors"]))
+
+    def test_controlled_release_build_rejects_missing_output_binary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            canonical_binary = (SCRIPTS.parent / "zig-out/bin/antfly-inference").resolve()
+            args = argparse.Namespace(
+                binary=canonical_binary,
+                output_dir=pathlib.Path(temporary),
+                timeout_sec=123,
+            )
+            real_is_file = pathlib.Path.is_file
+
+            def controlled_build_output_is_missing(path: pathlib.Path) -> bool:
+                if path.resolve() == canonical_binary:
+                    return False
+                return real_is_file(path)
+
+            with mock.patch(
+                "validate_gemma4_cuda_candidate._run_logged_in_directory",
+                return_value=(0, "ok"),
+            ), mock.patch.object(
+                pathlib.Path,
+                "is_file",
+                controlled_build_output_is_missing,
+            ):
+                result = run_controlled_release_build(args)
+
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("did not produce" in error for error in result["errors"]))
 
     def test_build_commands_receive_build_timeout_not_run_timeout(self):
         provenance = strict_provenance_fixture()
