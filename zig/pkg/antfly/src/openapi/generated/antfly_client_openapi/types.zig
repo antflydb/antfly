@@ -4531,6 +4531,8 @@ pub const InferenceEmbeddingItemError = struct {
     retryable: bool,
     /// HTTP-style status classification for this item
     status: i64,
+    /// Minimum retry delay in milliseconds for a retryable transient failure
+    retry_after_ms: ?i64 = null,
 };
 
 /// A single embedding result

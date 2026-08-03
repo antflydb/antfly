@@ -11175,11 +11175,13 @@ export interface components {
              * @description Pipeline stage that classified the failure
              * @enum {string}
              */
-            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "model_admission" | "inference";
             /** @description Whether retrying the same item may succeed */
             retryable: boolean;
             /** @description HTTP-style status classification for this item */
             status: number;
+            /** @description Minimum retry delay in milliseconds for a retryable transient failure */
+            retry_after_ms?: number | null;
         };
         /** @description Counts for per-item embedding responses */
         InferenceEmbeddingBatchSummary: {
@@ -16141,6 +16143,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankMultimodalPrompts: {
@@ -16192,6 +16195,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankPrompts: {
@@ -16243,15 +16247,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reranking service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateContent: {
@@ -16307,15 +16303,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateBatchContent: {
@@ -16358,15 +16346,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chatCompletions: {
@@ -16422,15 +16402,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rewriteText: {
@@ -16482,15 +16454,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     readImages: {
@@ -16542,15 +16506,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reader service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     transcribeAudio: {
@@ -16602,15 +16558,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Transcription service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     extract: {
@@ -16662,15 +16610,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Extraction service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listModels: {

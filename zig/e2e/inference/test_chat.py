@@ -20,8 +20,11 @@ import pytest
 from .models import default_generator_model_name
 
 pytestmark = pytest.mark.model_integration
-CHAT_SMOKE_PROMPT = "Say hello briefly"
-CHAT_SMOKE_MAX_TOKENS = 16
+# Qwen3 honors /no_think while other chat models treat it as a harmless direct
+# instruction. This keeps the smoke test fast while requiring the public answer
+# channel to produce user-visible content.
+CHAT_SMOKE_PROMPT = "/no_think\nReply with one short greeting."
+CHAT_SMOKE_MAX_TOKENS = 64
 
 
 def _first_generator_model(api):
@@ -48,14 +51,7 @@ def test_chat_basic(api):
     assert isinstance(message.get("content"), str), resp
     usage = resp.get("usage")
     assert isinstance(usage, dict), resp
-    # Channel-aware reasoning models intentionally withhold analysis tokens.
-    # An empty public answer is valid only when generation exhausted the
-    # requested budget before reaching the final channel.
-    choice = resp["choices"][0]
-    assert message["content"].strip() or (
-        choice.get("finish_reason") == "length"
-        and usage.get("completion_tokens") == CHAT_SMOKE_MAX_TOKENS
-    ), resp
+    assert message["content"].strip(), resp
 
 
 @pytest.mark.streaming
@@ -85,4 +81,4 @@ def test_chat_streaming(api):
         "length",
         "tool_calls",
     ), events[-1]
-    assert content.strip() or finish_reason == "length", events
+    assert content.strip(), events
