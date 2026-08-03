@@ -21,7 +21,7 @@ from .models import default_generator_model_name
 
 pytestmark = pytest.mark.model_integration
 CHAT_SMOKE_PROMPT = "Say hello briefly"
-CHAT_SMOKE_MAX_TOKENS = 64
+CHAT_SMOKE_MAX_TOKENS = 16
 
 
 def _first_generator_model(api):

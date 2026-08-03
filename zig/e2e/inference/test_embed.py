@@ -31,6 +31,7 @@ from .helpers import (
     cosine_similarity,
     l2_norm,
     make_clip_contract_png_uri,
+    make_shape_png_uri,
     make_solid_png_uri,
     make_text_png_uri,
     make_spoken_wav_uri,
@@ -425,35 +426,55 @@ def test_clipclap_modalities_share_projection_dim(api):
 
 @pytest.mark.multimodal
 def test_clipclap_text_image_alignment(api):
-    """ClipClap should preserve aggregate cross-modal retrieval alignment."""
-    white_uri = make_solid_png_uri(255, 255, 255)
-    black_uri = make_solid_png_uri(0, 0, 0)
+    """ClipClap should preserve semantic cross-modal retrieval alignment."""
+    fixtures = [
+        (
+            "a red circle on a white background",
+            make_shape_png_uri("circle", (220, 20, 20)),
+        ),
+        (
+            "a blue square on a white background",
+            make_shape_png_uri("square", (20, 60, 220)),
+        ),
+        (
+            "a green triangle on a white background",
+            make_shape_png_uri("triangle", (20, 170, 50)),
+        ),
+    ]
     text_embeddings = api.embed(
-        ["a white image", "a black image"],
+        [caption for caption, _ in fixtures],
         model=CLIPCLAP_MODEL,
     )["data"]
     image_embeddings = api.embed(
-        [_image_part(white_uri), _image_part(black_uri)],
+        [_image_part(uri) for _, uri in fixtures],
         model=CLIPCLAP_MODEL,
     )["data"]
-    white_text, black_text = [item["embedding"] for item in text_embeddings]
-    white_image, black_image = [item["embedding"] for item in image_embeddings]
+    text_vectors = [item["embedding"] for item in text_embeddings]
+    image_vectors = [item["embedding"] for item in image_embeddings]
 
-    assert len(white_text) == len(black_text) == len(white_image) == len(black_image) == 512
-    for embedding in (white_text, black_text, white_image, black_image):
+    for embedding in (*text_vectors, *image_vectors):
+        assert len(embedding) == 512
         assert all(math.isfinite(value) for value in embedding)
         assert abs(l2_norm(embedding) - 1.0) < 1e-4
-    assert cosine_similarity(white_image, black_image) < 0.999
 
-    matched = (
-        cosine_similarity(white_text, white_image)
-        + cosine_similarity(black_text, black_image)
-    ) / 2
-    mismatched = (
-        cosine_similarity(white_text, black_image)
-        + cosine_similarity(black_text, white_image)
-    ) / 2
-    assert matched > mismatched, {
-        "matched_similarity": matched,
-        "mismatched_similarity": mismatched,
+    scores = [
+        [cosine_similarity(text, image) for image in image_vectors]
+        for text in text_vectors
+    ]
+    positives = [scores[i][i] for i in range(len(fixtures))]
+    negatives = [
+        scores[i][j]
+        for i in range(len(fixtures))
+        for j in range(len(fixtures))
+        if i != j
+    ]
+    retrieval_hits = sum(
+        max(range(len(fixtures)), key=scores[i].__getitem__) == i
+        for i in range(len(fixtures))
+    )
+    margin = sum(positives) / len(positives) - sum(negatives) / len(negatives)
+    assert retrieval_hits >= 2, {"scores": scores, "retrieval_hits": retrieval_hits}
+    assert margin >= 0.01, {
+        "scores": scores,
+        "alignment_margin": margin,
     }

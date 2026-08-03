@@ -139,6 +139,7 @@ def test_text_generation_defaults_share_one_model():
 
 
 def test_multimodal_model_selection_rejects_text_only_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL", raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
     model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
     model_dir.mkdir(parents=True)

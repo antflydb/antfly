@@ -1673,11 +1673,14 @@ pub const Node = struct {
         const model = model_handle.get();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        var asset_lease = model.acquireEmbeddingAssetLease(false);
+        defer asset_lease.release();
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var pipeline = model.embeddingPipeline(allocator);
         const vectors = try pipeline.embed(texts);
+        asset_lease.release();
         errdefer freeDirectDenseVectors(allocator, vectors);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return vectors;
@@ -2055,6 +2058,8 @@ pub const Node = struct {
                 allocator.free(sparse);
             }
         } else {
+            var asset_lease = model.acquireEmbeddingAssetLease(false);
+            defer asset_lease.release();
             try model.ensureEmbeddingAssets(true, false, false);
             var pipeline = model.embeddingPipeline(allocator);
             const embeddings = try pipeline.embed(&texts);
@@ -2152,12 +2157,12 @@ pub const Node = struct {
         defer parsed.deinit(allocator);
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
 
-        model.lockEmbeddingAssets();
-        defer model.unlockEmbeddingAssets();
-        try ensureInitialDenseEmbeddingAssetsLocked(model, &parsed);
+        var asset_lease = model.acquireEmbeddingAssetLease(parsed.audio.items.len > 0);
+        defer asset_lease.release();
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var pipeline = model.embeddingPipeline(allocator);
+        var pipeline = try prepareInitialDenseEmbeddingPipeline(model, allocator, &parsed);
         const vectors = try embedDenseInputs(allocator, &pipeline, &parsed, model);
+        asset_lease.release();
         errdefer freeDirectDenseVectors(allocator, vectors);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return vectors;
@@ -2766,12 +2771,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
         }
 
-        model.lockEmbeddingAssets();
-        defer model.unlockEmbeddingAssets();
-        ensureInitialDenseEmbeddingAssetsLocked(model, &inputs) catch |err|
+        var asset_lease = model.acquireEmbeddingAssetLease(inputs.audio.items.len > 0);
+        defer asset_lease.release();
+        var pipeline = prepareInitialDenseEmbeddingPipeline(model, ctx.allocator, &inputs) catch |err|
             return inferenceFailureResponse(ctx, err);
-
-        var pipeline = model.embeddingPipeline(ctx.allocator);
         applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, request) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -2796,6 +2799,7 @@ pub const Node = struct {
                         .message = failure.message,
                     });
                 };
+                asset_lease.release();
                 logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
                 defer {
                     for (embeddings) |e| ctx.allocator.free(e);
@@ -2818,6 +2822,7 @@ pub const Node = struct {
             },
             .per_item => {
                 var partial = try embedDenseInputsPartial(ctx.allocator, &pipeline, &inputs, model);
+                asset_lease.release();
                 logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
                 defer partial.deinit(ctx.allocator);
                 const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, prompt_tokens) catch |err| switch (err) {
@@ -9494,33 +9499,45 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
     };
 }
 
-fn ensureInitialDenseEmbeddingAssetsLocked(
+fn prepareInitialDenseEmbeddingPipeline(
     model: *model_manager_mod.LoadedModel,
+    allocator: std.mem.Allocator,
     inputs: *const ParsedDenseEmbedInputs,
-) !void {
+) !embedding_mod.EmbeddingPipeline {
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
     if (inputs.audio.items.len > 0) {
         // Audio is deliberately the only optional phase admitted up front.
         // Text/image assets are admitted after the audio outputs are copied.
         try model.ensureAudioEmbeddingAssetsLocked();
-        return;
+    } else {
+        try model.ensurePrimaryEmbeddingAssetsLocked(
+            inputs.texts.items.len > 0,
+            inputs.images.items.len > 0,
+        );
     }
-    try model.ensurePrimaryEmbeddingAssetsLocked(
-        inputs.texts.items.len > 0,
-        inputs.images.items.len > 0,
-    );
+    return model.embeddingPipelineLocked(allocator);
 }
 
-fn admitPrimaryDenseEmbeddingAssetsAfterAudioLocked(
+fn admitPrimaryDenseEmbeddingAssetsAfterAudio(
     model: *model_manager_mod.LoadedModel,
     pipeline: *embedding_mod.EmbeddingPipeline,
     inputs: *const ParsedDenseEmbedInputs,
 ) !void {
     if (inputs.texts.items.len == 0 and inputs.images.items.len == 0) return;
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
     try model.ensurePrimaryEmbeddingAssetsLocked(
         inputs.texts.items.len > 0,
         inputs.images.items.len > 0,
     );
     model.bindEmbeddingPipelineAssetsLocked(pipeline);
+}
+
+fn releaseAudioDenseEmbeddingAssets(model: *model_manager_mod.LoadedModel) void {
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+    model.releaseAudioEmbeddingAssetsLocked();
 }
 
 fn embedDenseInputs(
@@ -9545,7 +9562,7 @@ fn embedDenseInputs(
     // release them, and only then admit reusable text/image sidecars.
     if (inputs.audio.items.len > 0) {
         {
-            defer model.releaseAudioEmbeddingAssetsLocked();
+            defer releaseAudioDenseEmbeddingAssets(model);
             const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
             defer allocator.free(audio_inputs);
             for (inputs.audio.items, 0..) |item, i| {
@@ -9564,7 +9581,7 @@ fn embedDenseInputs(
                 filled[item.index] = true;
             }
         }
-        try admitPrimaryDenseEmbeddingAssetsAfterAudioLocked(model, pipeline, inputs);
+        try admitPrimaryDenseEmbeddingAssetsAfterAudio(model, pipeline, inputs);
     }
 
     if (inputs.texts.items.len > 0) {
@@ -9623,7 +9640,7 @@ fn embedDenseInputsPartial(
 
     if (inputs.audio.items.len > 0) {
         {
-            defer model.releaseAudioEmbeddingAssetsLocked();
+            defer releaseAudioDenseEmbeddingAssets(model);
             const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
             defer allocator.free(audio_inputs);
             for (inputs.audio.items, 0..) |item, i| {
@@ -9642,7 +9659,7 @@ fn embedDenseInputsPartial(
                 try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
             }
         }
-        try admitPrimaryDenseEmbeddingAssetsAfterAudioLocked(model, pipeline, inputs);
+        try admitPrimaryDenseEmbeddingAssetsAfterAudio(model, pipeline, inputs);
     }
 
     if (inputs.texts.items.len > 0) {
