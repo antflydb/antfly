@@ -2144,6 +2144,19 @@ pub const PersistentIndex = struct {
             self.alloc.free(prepared_segments);
         }
 
+        const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
+        defer self.alloc.free(replacements);
+        for (prepared_segments, 0..) |*segment, i| {
+            replacements[i] = .{
+                .id = segment.id,
+                .data = segment.data,
+                .deleted = if (replacement_deleted) |deleted|
+                    if (deleted[i]) |*bitmap| bitmap else null
+                else
+                    null,
+            };
+        }
+
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
 
@@ -2155,6 +2168,9 @@ pub const PersistentIndex = struct {
                 return false;
             }
         }
+
+        var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, replacements);
+        defer writer_publication.abort();
 
         for (old_seg_ids) |old_id| {
             const old_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, old_id));
@@ -2186,19 +2202,7 @@ pub const PersistentIndex = struct {
         }
         try txn.commit();
 
-        var replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
-        defer self.alloc.free(replacements);
-        for (prepared_segments, 0..) |*segment, i| {
-            replacements[i] = .{
-                .id = segment.id,
-                .data = segment.data,
-                .deleted = if (replacement_deleted) |deleted|
-                    if (deleted[i]) |*bitmap| bitmap else null
-                else
-                    null,
-            };
-        }
-        try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
+        writer_publication.publish();
         published_to_writer = true;
         return true;
     }
@@ -2494,6 +2498,9 @@ pub const PersistentIndex = struct {
             }
         }
 
+        var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, replacements);
+        defer writer_publication.abort();
+
         for (segment_bytes_list, 0..) |segment_bytes, i| {
             const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_ids[i]));
             if (self.segment_files == null) try txn.put(.segments, &new_seg_key, segment_bytes);
@@ -2528,7 +2535,7 @@ pub const PersistentIndex = struct {
         }
         try txn.commit();
 
-        try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
+        writer_publication.publish();
         published_to_writer = true;
         return true;
     }

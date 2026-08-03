@@ -1098,15 +1098,107 @@ pub const IndexManager = struct {
     };
 
     pub const TextMergeResult = struct {
+        const OutputLocation = struct {
+            segment: u32,
+            doc: u32,
+        };
+
+        const OrdinalLocation = struct {
+            identity: u32,
+            location: OutputLocation,
+        };
+
+        const IdLocation = struct {
+            identity: []const u8,
+            location: OutputLocation,
+        };
+
         segments: [][]u8 = &.{},
         prepared_segments: []persistent_mod.PreparedMergeSegment = &.{},
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
+        output_ordinals: []OrdinalLocation = &.{},
+        output_ids: []IdLocation = &.{},
         elapsed_ns: u64 = 0,
         /// Peak bytes allocated through the merge task allocator. File-backed
         /// and heap-backed builders both run through this allocator.
         peak_task_alloc_bytes: u64 = 0,
 
+        fn buildPublicationLookup(self: *TextMergeResult, alloc: Allocator) !void {
+            var ordinals = std.ArrayListUnmanaged(OrdinalLocation).empty;
+            defer ordinals.deinit(alloc);
+            var ids = std.ArrayListUnmanaged(IdLocation).empty;
+            defer ids.deinit(alloc);
+            const output_count = if (self.prepared_segments.len > 0) self.prepared_segments.len else self.segments.len;
+            for (0..output_count) |output_idx| {
+                const bytes = if (self.prepared_segments.len > 0)
+                    self.prepared_segments[output_idx].data.bytes()
+                else
+                    self.segments[output_idx];
+                var reader = try segment_mod.SegmentReader.init(alloc, bytes);
+                defer reader.deinit();
+                for (0..reader.doc_count) |doc_idx| {
+                    const doc_id: u32 = @intCast(doc_idx);
+                    const location: OutputLocation = .{ .segment = @intCast(output_idx), .doc = doc_id };
+                    if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        try ordinals.append(alloc, .{ .identity = ordinal, .location = location });
+                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                        try ids.append(alloc, .{ .identity = stored.id, .location = location });
+                    } else {
+                        return error.MissingMergeDocumentIdentity;
+                    }
+                }
+            }
+            std.mem.sort(OrdinalLocation, ordinals.items, {}, struct {
+                fn lessThan(_: void, lhs: OrdinalLocation, rhs: OrdinalLocation) bool {
+                    return lhs.identity < rhs.identity;
+                }
+            }.lessThan);
+            std.mem.sort(IdLocation, ids.items, {}, struct {
+                fn lessThan(_: void, lhs: IdLocation, rhs: IdLocation) bool {
+                    return std.mem.order(u8, lhs.identity, rhs.identity) == .lt;
+                }
+            }.lessThan);
+            if (ordinals.items.len > 1) {
+                for (ordinals.items[1..], ordinals.items[0 .. ordinals.items.len - 1]) |current, previous| {
+                    if (current.identity == previous.identity) return error.DuplicateMergeDocumentIdentity;
+                }
+            }
+            if (ids.items.len > 1) {
+                for (ids.items[1..], ids.items[0 .. ids.items.len - 1]) |current, previous| {
+                    if (std.mem.eql(u8, current.identity, previous.identity)) return error.DuplicateMergeDocumentIdentity;
+                }
+            }
+            self.output_ordinals = try ordinals.toOwnedSlice(alloc);
+            self.output_ids = try ids.toOwnedSlice(alloc);
+        }
+
+        fn outputForOrdinal(self: *const TextMergeResult, identity: u32) ?OutputLocation {
+            var low: usize = 0;
+            var high = self.output_ordinals.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                const item = self.output_ordinals[mid];
+                if (item.identity < identity) low = mid + 1 else high = mid;
+            }
+            if (low < self.output_ordinals.len and self.output_ordinals[low].identity == identity) return self.output_ordinals[low].location;
+            return null;
+        }
+
+        fn outputForId(self: *const TextMergeResult, identity: []const u8) ?OutputLocation {
+            var low: usize = 0;
+            var high = self.output_ids.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                const item = self.output_ids[mid];
+                if (std.mem.order(u8, item.identity, identity) == .lt) low = mid + 1 else high = mid;
+            }
+            if (low < self.output_ids.len and std.mem.eql(u8, self.output_ids[low].identity, identity)) return self.output_ids[low].location;
+            return null;
+        }
+
         pub fn deinit(self: *TextMergeResult, alloc: Allocator) void {
+            if (self.output_ordinals.len > 0) alloc.free(self.output_ordinals);
+            if (self.output_ids.len > 0) alloc.free(self.output_ids);
             merger_mod.freeMergedSegments(alloc, self.segments);
             if (self.prepared_segments.len > 0) {
                 if (self.prepared_owner) |owner| {
@@ -5099,6 +5191,19 @@ pub const IndexManager = struct {
         return @intCast(self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len);
     }
 
+    pub fn fullTextTargetCount(self: *const IndexManager, index_names: []const []const u8) u64 {
+        if (index_names.len == 0) return @intCast(self.text_indexes.items.len);
+        var target_count: u64 = 0;
+        for (self.text_indexes.items) |entry| {
+            for (index_names) |name| {
+                if (!std.mem.eql(u8, entry.config.name, name)) continue;
+                target_count += 1;
+                break;
+            }
+        }
+        return target_count;
+    }
+
     pub fn listIndexesPublic(self: *const IndexManager, alloc: Allocator) ![]types.IndexConfig {
         const total = self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len;
         const out = try alloc.alloc(types.IndexConfig, total);
@@ -7372,6 +7477,22 @@ pub const IndexManager = struct {
             start = split.end;
         }
         try self.finalizeTextBatchMutations(entry, .{ .defer_text_compaction = true }, .{ .indexed_any = true });
+        return segment_count;
+    }
+
+    pub fn estimateTextKernelSegmentCount(_: *IndexManager, docs: []const introducer_mod.TextDocument) usize {
+        if (docs.len == 0) return 0;
+        const target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes());
+        const target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes());
+        var segment_count: usize = 0;
+        var start: usize = 0;
+        while (start < docs.len) : (segment_count += 1) {
+            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
+                .target_build_memory_bytes = target_build_memory_bytes,
+                .target_segment_bytes = target_segment_bytes,
+            });
+            start = split.end;
+        }
         return segment_count;
     }
 
@@ -9982,12 +10103,15 @@ pub const IndexManager = struct {
             logTextMergeTaskMemory("after_build", task, output_bytes);
             task.discardSourceCleanPages();
             logTextMergeTaskMemory("after_source_discard", task, output_bytes);
-            return .{
+            var result = TextMergeResult{
                 .prepared_segments = prepared,
                 .prepared_owner = task.persistent,
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
                 .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
             };
+            errdefer result.deinit(alloc);
+            try result.buildPublicationLookup(alloc);
+            return result;
         } else |err| switch (err) {
             error.EmptySegment => return .{
                 .segments = &.{},
@@ -10020,11 +10144,14 @@ pub const IndexManager = struct {
         var output_bytes: u64 = 0;
         for (merged) |segment| output_bytes +|= @intCast(segment.len);
         logTextMergeTaskMemory("after_heap_build", task, output_bytes);
-        return .{
+        var result = TextMergeResult{
             .segments = merged,
             .elapsed_ns = platform_time.monotonicNs() -| started_ns,
             .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
         };
+        errdefer result.deinit(alloc);
+        try result.buildPublicationLookup(alloc);
+        return result;
     }
 
     fn logTextMergeTaskMemory(label: []const u8, task: *const TextMergeTask, output_bytes: u64) void {
@@ -10347,11 +10474,6 @@ pub const IndexManager = struct {
             self.alloc.free(output_deleted);
         }
 
-        var late_ordinals = std.AutoHashMapUnmanaged(u32, void).empty;
-        defer late_ordinals.deinit(self.alloc);
-        var late_ids = std.StringHashMapUnmanaged(void).empty;
-        defer late_ids.deinit(self.alloc);
-
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
         for (task.source, task.merge_indices) |source, source_idx| {
@@ -10386,37 +10508,19 @@ pub const IndexManager = struct {
                         }
                         if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
 
-                        var has_identity = false;
-                        if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal| {
-                            try late_ordinals.put(self.alloc, ordinal, {});
-                            has_identity = true;
-                        }
-                        if (try frozen_seg.reader.storedDoc(doc_id)) |stored| {
-                            try late_ids.put(self.alloc, stored.id, {});
-                            has_identity = true;
-                        }
-                        if (!has_identity) return error.MissingMergeDocumentIdentity;
+                        const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
+                            result.outputForOrdinal(ordinal)
+                        else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
+                            result.outputForId(stored.id)
+                        else
+                            null;
+                        const output = location orelse return error.MissingMergeDocumentIdentity;
+                        if (output.segment >= output_deleted.len) return error.InvalidSegment;
+                        const output_idx: usize = @intCast(output.segment);
+                        if (output_deleted[output_idx] == null) output_deleted[output_idx] = roaring.RoaringBitmap.init(self.alloc);
+                        try output_deleted[output_idx].?.add(output.doc);
                     }
                 }
-            }
-        }
-
-        if (late_ordinals.count() == 0 and late_ids.count() == 0) return .{
-            .source_current = true,
-            .bitmaps = output_deleted,
-        };
-
-        if (result.prepared_segments.len > 0) {
-            for (result.prepared_segments, 0..) |*prepared, output_idx| {
-                var reader = try segment_mod.SegmentReader.init(self.alloc, prepared.data.bytes());
-                defer reader.deinit();
-                try self.markTextMergePublicationDeletes(&reader, &late_ordinals, &late_ids, &output_deleted[output_idx]);
-            }
-        } else {
-            for (result.segments, 0..) |segment_bytes, output_idx| {
-                var reader = try segment_mod.SegmentReader.init(self.alloc, segment_bytes);
-                defer reader.deinit();
-                try self.markTextMergePublicationDeletes(&reader, &late_ordinals, &late_ids, &output_deleted[output_idx]);
             }
         }
 
@@ -10424,30 +10528,6 @@ pub const IndexManager = struct {
             .source_current = true,
             .bitmaps = output_deleted,
         };
-    }
-
-    fn markTextMergePublicationDeletes(
-        self: *IndexManager,
-        reader: *const segment_mod.SegmentReader,
-        late_ordinals: *const std.AutoHashMapUnmanaged(u32, void),
-        late_ids: *const std.StringHashMapUnmanaged(void),
-        output_deleted: *?roaring.RoaringBitmap,
-    ) !void {
-        for (0..reader.doc_count) |doc_id_usize| {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            var deleted = false;
-            if (try reader.docOrdinal(doc_id)) |ordinal| {
-                deleted = late_ordinals.contains(ordinal);
-            }
-            if (!deleted) {
-                if (try reader.storedDoc(doc_id)) |stored| {
-                    deleted = late_ids.contains(stored.id);
-                }
-            }
-            if (!deleted) continue;
-            if (output_deleted.* == null) output_deleted.* = roaring.RoaringBitmap.init(self.alloc);
-            try output_deleted.*.?.add(doc_id);
-        }
     }
 
     fn findSegmentById(snap: *const index_mod.IndexSnapshot, id: u64) ?*const index_mod.SegmentEntry {

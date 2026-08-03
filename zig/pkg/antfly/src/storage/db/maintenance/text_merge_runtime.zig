@@ -112,6 +112,14 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return .not_needed;
     }
 
+    pub const ProducerPermit = struct {
+        pub fn release(_: *@This()) void {}
+    };
+
+    pub fn acquireProducerPermit(_: *@This(), _: u64) !ProducerPermit {
+        return .{};
+    }
+
     pub fn stats(self: *@This()) types.TextMergeStats {
         return self.statsAssumeApplyLockHeld();
     }
@@ -141,7 +149,27 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     backpressure_ns: u64 = 0,
     backpressure_timeouts: u64 = 0,
     backpressure_failures: u64 = 0,
+    producer_reservations: u64 = 0,
     future: ?Io.Future(void) = null,
+
+    pub const ProducerPermit = struct {
+        runtime: *TextMergeRuntime,
+        segment_count: u64,
+        active: bool = true,
+
+        pub fn release(self: *ProducerPermit) void {
+            if (!self.active) return;
+            self.active = false;
+            const runtime = self.runtime;
+            const io = runtime.io_impl.?.io();
+            runtime.mutex.lockUncancelable(io);
+            std.debug.assert(runtime.producer_reservations >= self.segment_count);
+            runtime.producer_reservations -= self.segment_count;
+            runtime.notified = true;
+            runtime.cond.broadcast(io);
+            runtime.mutex.unlock(io);
+        }
+    };
 
     pub fn init(
         alloc: Allocator,
@@ -335,50 +363,82 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             self.backpressure_events += 1;
         }
         defer self.recordBackpressureElapsed(started_ns);
+        self.notify();
         while (!isShutdown(self) and !self.backpressureDrained()) {
             if (self.backpressureExpired(started_ns)) {
                 self.recordBackpressureTerminal(.timed_out);
                 return .timed_out;
             }
-            var step: usize = 0;
-            var made_progress = false;
-            while (step < self.config.backpressure_merge_steps) : (step += 1) {
-                const ran = self.runOnce() catch |err| {
-                    if (builtin.os.tag != .freestanding) {
-                        std.log.err("foreground text merge backpressure failed: {s}", .{@errorName(err)});
-                    }
-                    self.recordBackpressureTerminal(.merge_failed);
-                    return .merge_failed;
-                };
-                if (!ran) {
-                    if (self.backpressureBlockedByQuarantine()) {
-                        self.recordBackpressureTerminal(.merge_failed);
-                        return .merge_failed;
-                    }
-                    break;
-                }
-                made_progress = true;
-                if (self.backpressureDrained()) break;
-                if (self.backpressureExpired(started_ns)) {
-                    self.recordBackpressureTerminal(.timed_out);
-                    return .timed_out;
-                }
+            if (self.backpressureBlockedByQuarantine()) {
+                self.recordBackpressureTerminal(.merge_failed);
+                return .merge_failed;
             }
             if (self.backpressureDrained()) break;
-            // A background task may own the only admissible source set. Wait
-            // without holding DB/index locks, then re-check the low watermark.
-            // This converts segment debt into write-side backpressure instead
-            // of allowing unbounded query fan-out.
-            if (!made_progress or self.config.backpressure_sleep_ms > 0) {
-                if (!self.sleepBackpressure(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
-                    if (isShutdown(self)) return .shutdown;
-                    self.recordBackpressureTerminal(.timed_out);
-                    return .timed_out;
-                }
+            // Merge execution stays on the background runtime. Producer
+            // deadlines therefore cover the entire wait even when a merge
+            // itself takes longer than the configured maximum.
+            if (!self.sleepBackpressure(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+                if (isShutdown(self)) return .shutdown;
+                self.recordBackpressureTerminal(.timed_out);
+                return .timed_out;
             }
         }
         if (isShutdown(self)) return .shutdown;
         return .drained;
+    }
+
+    /// Reserve segment publication capacity before any writer makes a new
+    /// segment visible. Concurrent producers are included in the bound, so
+    /// the configured high watermark is an admission limit rather than a
+    /// best-effort cleanup trigger.
+    pub fn acquireProducerPermit(self: *TextMergeRuntime, segment_count: u64) !ProducerPermit {
+        if (segment_count == 0 or !self.config.enabled or self.workDeferred() or self.config.max_pending_segments == 0) {
+            return .{ .runtime = self, .segment_count = 0, .active = false };
+        }
+        if (segment_count > self.config.max_pending_segments) return error.TextMergeAdmissionRequestTooLarge;
+
+        const started_ns = self.backpressureNowNs();
+        var recorded_wait = false;
+        defer if (recorded_wait) self.recordBackpressureElapsed(started_ns);
+        self.notify();
+        while (true) {
+            if (self.backpressureExpired(started_ns)) {
+                self.recordBackpressureTerminal(.timed_out);
+                return error.TextMergeBackpressureTimeout;
+            }
+            if (self.backpressureBlockedByQuarantine()) {
+                self.recordBackpressureTerminal(.merge_failed);
+                return error.TextMergeBackpressureUnavailable;
+            }
+
+            lockApplyShared(self.apply_mutex);
+            const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
+            self.apply_mutex.unlockShared();
+
+            const io = self.io_impl.?.io();
+            self.mutex.lockUncancelable(io);
+            if (self.shutdown) {
+                self.mutex.unlock(io);
+                return error.TextMergeRuntimeShutdown;
+            }
+            const reserved_total = std.math.add(u64, self.producer_reservations, segment_count) catch std.math.maxInt(u64);
+            const admitted_total = std.math.add(u64, stats_snapshot.pending_segments, reserved_total) catch std.math.maxInt(u64);
+            const bytes_admissible = self.config.max_pending_bytes == 0 or stats_snapshot.pending_bytes < self.config.max_pending_bytes;
+            if (admitted_total <= self.config.max_pending_segments and bytes_admissible) {
+                self.producer_reservations = reserved_total;
+                self.mutex.unlock(io);
+                return .{ .runtime = self, .segment_count = segment_count };
+            }
+            if (!recorded_wait) {
+                self.backpressure_events += 1;
+                recorded_wait = true;
+            }
+            self.mutex.unlock(io);
+            if (!self.sleepBackpressure(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+                self.recordBackpressureTerminal(.timed_out);
+                return error.TextMergeBackpressureTimeout;
+            }
+        }
     }
 
     fn recordBackpressureElapsed(self: *TextMergeRuntime, started_ns: u64) void {

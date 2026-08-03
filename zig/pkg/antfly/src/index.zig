@@ -1000,6 +1000,54 @@ pub const IndexWriter = struct {
     mapped_residency_next_check_ns: std.atomic.Value(u64),
     mapped_residency_evictions: u64,
 
+    /// A completely allocated replacement snapshot held behind the writer
+    /// mutex. Persistent stores prepare this before committing their metadata
+    /// transaction, making publication after durable commit infallible.
+    pub const PreparedSegmentReplacement = struct {
+        writer: *IndexWriter,
+        snapshot: *IndexSnapshot,
+        retired: []SegmentEntry,
+        carried_count: usize,
+        next_segment_id: u64,
+        active: bool = true,
+
+        pub fn publish(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(self.active);
+            const writer = self.writer;
+            const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
+
+            for (self.snapshot.segments[0..self.carried_count]) |*seg| seg.retain();
+            for (self.retired) |*seg| {
+                seg.data.madviseDiscardCleanPages();
+                seg.shared.retired_cleanup = writer.retired_segment_cleanup;
+            }
+            if (self.retired.len > 0) writer.alloc.free(self.retired);
+
+            writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
+            writer.next_epoch += 1;
+            writer.publishSnapshot(self.snapshot);
+            old.release();
+            writer.mu.unlock();
+            self.active = false;
+        }
+
+        pub fn abort(self: *PreparedSegmentReplacement) void {
+            if (!self.active) return;
+            const writer = self.writer;
+            for (self.snapshot.segments[self.carried_count..]) |*seg| {
+                seg.reader.deinit();
+                if (seg.shared.deleted) |*deleted| deleted.deinit();
+                writer.alloc.destroy(seg.shared);
+            }
+            writer.alloc.free(self.snapshot.segments);
+            self.snapshot.global_total_field_len.deinit(writer.alloc);
+            writer.alloc.destroy(self.snapshot);
+            if (self.retired.len > 0) writer.alloc.free(self.retired);
+            writer.mu.unlock();
+            self.active = false;
+        }
+    };
+
     pub fn lockMutex(self: *IndexWriter) void {
         while (!self.mu.tryLock()) {
             spinOrYield();
@@ -1276,21 +1324,8 @@ pub const IndexWriter = struct {
     /// their shared cells with the retired cleanup and frees the staging
     /// slice. On error the caller still owns everything it staged.
     fn rebuildSnapshot(self: *IndexWriter, new_segments: []SegmentEntry, carried_count: usize, retired: []SegmentEntry) !void {
-        var global_field_lens = std.StringHashMapUnmanaged(u64).empty;
+        var global_field_lens = try self.buildGlobalFieldLens(new_segments);
         errdefer global_field_lens.deinit(self.alloc);
-        for (new_segments) |*seg| {
-            for (seg.reader.fields) |*fi| {
-                for (fi.sections) |*si| {
-                    if (si.section_type == .inverted_text) {
-                        const sec_data = seg.reader.data[@intCast(si.offset)..][0..@intCast(si.length)];
-                        const inv = inverted.InvertedIndexReader.init(self.alloc, sec_data) catch continue;
-                        const gop = try global_field_lens.getOrPut(self.alloc, fi.name);
-                        if (!gop.found_existing) gop.value_ptr.* = 0;
-                        gop.value_ptr.* += inv.total_field_len;
-                    }
-                }
-            }
-        }
         // Keep active mmap-backed segments warm once they are published. The
         // cleanup path below still drops retired source pages before those old
         // mappings are released.
@@ -1329,6 +1364,24 @@ pub const IndexWriter = struct {
 
         // Release writer's reference to old snapshot.
         old.release();
+    }
+
+    fn buildGlobalFieldLens(self: *IndexWriter, segments: []SegmentEntry) !std.StringHashMapUnmanaged(u64) {
+        var global_field_lens = std.StringHashMapUnmanaged(u64).empty;
+        errdefer global_field_lens.deinit(self.alloc);
+        for (segments) |*seg| {
+            for (seg.reader.fields) |*fi| {
+                for (fi.sections) |*si| {
+                    if (si.section_type != .inverted_text) continue;
+                    const sec_data = seg.reader.data[@intCast(si.offset)..][0..@intCast(si.length)];
+                    const inv = inverted.InvertedIndexReader.init(self.alloc, sec_data) catch continue;
+                    const gop = try global_field_lens.getOrPut(self.alloc, fi.name);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += inv.total_field_len;
+                }
+            }
+        }
+        return global_field_lens;
     }
 
     fn cloneGlobalFieldLens(alloc: Allocator, src: std.StringHashMapUnmanaged(u64)) !std.StringHashMapUnmanaged(u64) {
@@ -1491,8 +1544,17 @@ pub const IndexWriter = struct {
             return;
         }
 
+        var prepared = try self.prepareSegmentsManyData(old_ids, replacements);
+        prepared.publish();
+    }
+
+    /// Stage every fallible allocation needed to replace segments while
+    /// holding the writer serialization mutex. Callers must publish or abort.
+    pub fn prepareSegmentsManyData(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
+        if (replacements.len == 0) return error.EmptySegmentReplacement;
+
         self.lockMutex();
-        defer self.mu.unlock();
+        errdefer self.mu.unlock();
 
         const replacement_readers = try self.alloc.alloc(segment_mod.SegmentReader, replacements.len);
         var replacement_readers_initialized: usize = 0;
@@ -1576,11 +1638,37 @@ pub const IndexWriter = struct {
             cells_created += 1;
             shared_initialized = true;
             idx += 1;
-            if (replacement.id >= self.next_segment_id) self.next_segment_id = replacement.id + 1;
         }
 
-        try self.rebuildSnapshot(new_segments, keep_count, retired);
+        var global_field_lens = try self.buildGlobalFieldLens(new_segments);
+        errdefer global_field_lens.deinit(self.alloc);
+        const new_snap = try self.alloc.create(IndexSnapshot);
+        new_snap.* = .{
+            .alloc = self.alloc,
+            .ref_count = 1,
+            .epoch = self.next_epoch,
+            .segments = new_segments,
+            .global_total_field_len = global_field_lens,
+            .term_doc_freq_cache_mu = .unlocked,
+            .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_hits = 0,
+            .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
+        };
         replacement_readers_initialized = 0;
+        cells_created = 0;
+        var next_segment_id = self.next_segment_id;
+        for (replacements) |replacement| {
+            if (replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
+        }
+        return .{
+            .writer = self,
+            .snapshot = new_snap,
+            .retired = retired,
+            .carried_count = keep_count,
+            .next_segment_id = next_segment_id,
+        };
     }
 
     /// Atomically remove one or more segments without replacement.

@@ -708,21 +708,22 @@ const FdCache = if (!supports_posix_fd_cache)
             return .{};
         }
 
-        pub fn readRangeAlloc(_: *FdCache, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+        pub fn readRangeAlloc(_: *FdCache, _: u64, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
             return error.UnsupportedNativeStorageRuntime;
         }
 
-        pub fn fileSize(_: *FdCache, _: []const u8) !u64 {
+        pub fn fileSize(_: *FdCache, _: u64, _: []const u8) !u64 {
             return error.UnsupportedNativeStorageRuntime;
         }
 
-        pub fn readTrailerAlloc(_: *FdCache, _: Allocator, _: []const u8, _: usize) !FileTrailer {
+        pub fn readTrailerAlloc(_: *FdCache, _: u64, _: Allocator, _: []const u8, _: usize) !FileTrailer {
             return error.UnsupportedNativeStorageRuntime;
         }
 
-        pub fn invalidatePath(_: *FdCache, _: []const u8) void {}
-        pub fn invalidateTree(_: *FdCache, _: []const u8) void {}
-        pub fn invalidateRename(_: *FdCache, _: []const u8, _: []const u8) void {}
+        pub fn invalidatePath(_: *FdCache, _: u64, _: []const u8) void {}
+        pub fn invalidateTree(_: *FdCache, _: u64, _: []const u8) void {}
+        pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
+        pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
         pub fn reserveDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
         pub fn tryReserveDescriptors(_: *FdCache, _: std.Io, _: usize) !bool {
             return true;
@@ -735,6 +736,7 @@ else
         const BucketMap = std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(*Entry));
 
         const Entry = struct {
+            namespace: u64,
             path_hash: u64,
             path: [:0]u8,
             fd: std.posix.fd_t,
@@ -758,6 +760,12 @@ else
             lru_tail: ?*Entry = null,
         };
 
+        const AdmissionWaiter = struct {
+            previous: ?*AdmissionWaiter = null,
+            next: ?*AdmissionWaiter = null,
+            count: usize,
+        };
+
         allocator: Allocator,
         shards: []Shard,
         capacity: usize,
@@ -767,6 +775,8 @@ else
         admission_waits: CounterU64 = .init(0),
         admission_mutex: std.Io.Mutex = .init,
         admission_changed: std.Io.Condition = .init,
+        admission_head: ?*AdmissionWaiter = null,
+        admission_tail: ?*AdmissionWaiter = null,
         access_clock: CounterU64 = .init(0),
         evict_cursor: std.atomic.Value(usize) = .init(0),
         evict_mutex: std.atomic.Mutex = .unlocked,
@@ -811,8 +821,8 @@ else
             };
         }
 
-        fn readRangeAlloc(self: *FdCache, io: std.Io, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-            const entry = try self.retain(io, path);
+        fn readRangeAlloc(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+            const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
 
             const out = try allocator.alloc(u8, len);
@@ -821,26 +831,26 @@ else
             return out;
         }
 
-        fn readRangeInto(self: *FdCache, io: std.Io, path: []const u8, offset: u64, out: []u8) !void {
-            const entry = try self.retain(io, path);
+        fn readRangeInto(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8) !void {
+            const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
             try readAllAtOffset(entry.fd, out, offset);
         }
 
-        fn readRangeAtMostInto(self: *FdCache, io: std.Io, path: []const u8, offset: u64, out: []u8) !usize {
-            const entry = try self.retain(io, path);
+        fn readRangeAtMostInto(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8) !usize {
+            const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
             return try readAtMostAtOffset(entry.fd, out, offset);
         }
 
-        fn fileSize(self: *FdCache, io: std.Io, path: []const u8) !u64 {
-            const entry = try self.retain(io, path);
+        fn fileSize(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !u64 {
+            const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
             return try fileSizeFromFd(entry.fd);
         }
 
-        fn readTrailerAlloc(self: *FdCache, io: std.Io, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
-            const entry = try self.retain(io, path);
+        fn readTrailerAlloc(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
+            const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
 
             const size = try fileSizeFromFd(entry.fd);
@@ -852,8 +862,8 @@ else
             return .{ .bytes = out, .file_size = size };
         }
 
-        fn invalidatePath(self: *FdCache, path: []const u8) void {
-            const path_hash = hashPath(path);
+        fn invalidatePath(self: *FdCache, namespace: u64, path: []const u8) void {
+            const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
             const locked = lockAtomic(&shard.mutex);
             defer if (locked) shard.mutex.unlock();
@@ -861,7 +871,7 @@ else
             var matched_any = false;
             if (shard.entries.getPtr(path_hash)) |bucket| {
                 for (bucket.items) |entry| {
-                    if (!std.mem.eql(u8, entry.path, path)) continue;
+                    if (entry.namespace != namespace or !std.mem.eql(u8, entry.path, path)) continue;
                     entry.invalidated = true;
                     matched_any = true;
                 }
@@ -869,20 +879,20 @@ else
 
             if (!matched_any) return;
 
-            while (self.findInvalidatedEntryLocked(shard, path_hash, path)) |entry| {
+            while (self.findInvalidatedEntryLocked(shard, namespace, path_hash, path)) |entry| {
                 if (entry.ref_count != 0) break;
                 self.removeEntryLocked(shard, entry);
             }
         }
 
-        fn invalidateTree(self: *FdCache, path: []const u8) void {
+        fn invalidateTree(self: *FdCache, namespace: u64, path: []const u8) void {
             for (self.shards) |*shard| {
                 const locked = lockAtomic(&shard.mutex);
 
                 var current = shard.lru_head;
                 while (current) |entry| {
                     const next = entry.lru_next;
-                    if (pathContains(path, entry.path)) {
+                    if (entry.namespace == namespace and pathContains(path, entry.path)) {
                         entry.invalidated = true;
                         if (entry.ref_count == 0) self.removeEntryLocked(shard, entry);
                     }
@@ -892,19 +902,35 @@ else
             }
         }
 
-        fn invalidateRename(self: *FdCache, old_path: []const u8, new_path: []const u8) void {
-            self.invalidatePath(old_path);
-            self.invalidatePath(new_path);
+        fn invalidateRename(self: *FdCache, namespace: u64, old_path: []const u8, new_path: []const u8) void {
+            self.invalidatePath(namespace, old_path);
+            self.invalidatePath(namespace, new_path);
         }
 
-        fn retain(self: *FdCache, io: std.Io, path: []const u8) !*Entry {
-            const path_hash = hashPath(path);
+        fn invalidateNamespace(self: *FdCache, namespace: u64) void {
+            for (self.shards) |*shard| {
+                const locked = lockAtomic(&shard.mutex);
+                var current = shard.lru_head;
+                while (current) |entry| {
+                    const next = entry.lru_next;
+                    if (entry.namespace == namespace) {
+                        entry.invalidated = true;
+                        if (entry.ref_count == 0) self.removeEntryLocked(shard, entry);
+                    }
+                    current = next;
+                }
+                if (locked) shard.mutex.unlock();
+            }
+        }
+
+        fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
+            const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
             {
                 const locked = lockAtomic(&shard.mutex);
                 defer if (locked) shard.mutex.unlock();
 
-                if (self.findEntryLocked(shard, path_hash, path)) |entry| {
+                if (self.findEntryLocked(shard, namespace, path_hash, path)) |entry| {
                     entry.ref_count += 1;
                     entry.last_access = self.nextAccessLocked();
                     self.touchEntryLocked(shard, entry);
@@ -928,6 +954,7 @@ else
             const entry = try self.allocator.create(Entry);
             errdefer self.allocator.destroy(entry);
             entry.* = .{
+                .namespace = namespace,
                 .path_hash = path_hash,
                 .path = owned_path,
                 .fd = fd,
@@ -939,7 +966,7 @@ else
                 const locked = lockAtomic(&shard.mutex);
                 errdefer if (locked) shard.mutex.unlock();
 
-                if (self.findEntryLocked(shard, path_hash, owned_path)) |existing| {
+                if (self.findEntryLocked(shard, namespace, path_hash, owned_path)) |existing| {
                     existing.ref_count += 1;
                     existing.last_access = self.nextAccessLocked();
                     self.touchEntryLocked(shard, existing);
@@ -992,30 +1019,30 @@ else
             if (count > self.capacity) return error.DescriptorAdmissionCapacityTooSmall;
             self.admission_mutex.lockUncancelable(io);
             defer self.admission_mutex.unlock(io);
+
+            if (self.admission_head == null and self.makeCapacityAvailable(count)) {
+                _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+                return;
+            }
+
+            var waiter = AdmissionWaiter{ .count = count };
+            self.enqueueAdmissionWaiter(&waiter);
+            _ = self.admission_waiters.fetchAdd(1, .acq_rel);
+            _ = self.admission_waits.fetchAdd(1, .monotonic);
+            errdefer {
+                self.removeAdmissionWaiter(&waiter);
+                _ = self.admission_waiters.fetchSub(1, .acq_rel);
+                self.admission_changed.broadcast(io);
+            }
             while (true) {
-                const available_at = self.capacity - count;
-                if (self.admitted_descriptors.load(.acquire) <= available_at) {
+                if (self.admission_head == &waiter and self.makeCapacityAvailable(count)) {
+                    self.removeAdmissionWaiter(&waiter);
+                    _ = self.admission_waiters.fetchSub(1, .acq_rel);
                     _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+                    self.admission_changed.broadcast(io);
                     return;
                 }
-                // Register before the final eviction scan. A cache lease may
-                // become idle between the capacity check and this point; the
-                // scan observes it, while later releases see the waiter and
-                // must reclaim/signal before we park. Since signalers take the
-                // admission mutex, a notification cannot pass the condition
-                // wait's atomic unlock-and-park boundary.
-                _ = self.admission_waiters.fetchAdd(1, .acq_rel);
-                while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
-                if (self.admitted_descriptors.load(.acquire) <= available_at) {
-                    _ = self.admission_waiters.fetchSub(1, .acq_rel);
-                    continue;
-                }
-                _ = self.admission_waits.fetchAdd(1, .monotonic);
-                self.admission_changed.wait(io, &self.admission_mutex) catch |err| {
-                    _ = self.admission_waiters.fetchSub(1, .acq_rel);
-                    return err;
-                };
-                _ = self.admission_waiters.fetchSub(1, .acq_rel);
+                try self.admission_changed.wait(io, &self.admission_mutex);
             }
         }
 
@@ -1025,11 +1052,32 @@ else
             self.admission_mutex.lockUncancelable(io);
             defer self.admission_mutex.unlock(io);
 
-            const available_at = self.capacity - count;
-            while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
-            if (self.admitted_descriptors.load(.acquire) > available_at) return false;
+            // Do not let opportunistic callers bypass an older weighted
+            // request. FIFO admission lets capacity accumulate for multi-fd
+            // filesystem operations under a steady stream of one-fd reads.
+            if (self.admission_head != null or !self.makeCapacityAvailable(count)) return false;
             _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
             return true;
+        }
+
+        fn makeCapacityAvailable(self: *FdCache, count: usize) bool {
+            const available_at = self.capacity - count;
+            while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
+            return self.admitted_descriptors.load(.acquire) <= available_at;
+        }
+
+        fn enqueueAdmissionWaiter(self: *FdCache, waiter: *AdmissionWaiter) void {
+            waiter.previous = self.admission_tail;
+            waiter.next = null;
+            if (self.admission_tail) |tail| tail.next = waiter else self.admission_head = waiter;
+            self.admission_tail = waiter;
+        }
+
+        fn removeAdmissionWaiter(self: *FdCache, waiter: *AdmissionWaiter) void {
+            if (waiter.previous) |previous| previous.next = waiter.next else self.admission_head = waiter.next;
+            if (waiter.next) |next| next.previous = waiter.previous else self.admission_tail = waiter.previous;
+            waiter.previous = null;
+            waiter.next = null;
         }
 
         fn releaseDescriptors(self: *FdCache, io: std.Io, count: usize) void {
@@ -1045,10 +1093,8 @@ else
             // cannot lose progress.
             if (self.admission_waiters.load(.acquire) == 0) return;
             self.admission_mutex.lockUncancelable(io);
-            // Requests have different weights (for example one descriptor for
-            // a cached read and two for create-via-parent). Wake all waiters so
-            // an admissible smaller request can make progress when the first
-            // waiter still does not fit.
+            // Requests have different weights. The FIFO head is the only
+            // request allowed to claim newly available capacity.
             self.admission_changed.broadcast(io);
             self.admission_mutex.unlock(io);
         }
@@ -1073,26 +1119,26 @@ else
             return false;
         }
 
-        fn findEntryLocked(self: *FdCache, shard: *Shard, path_hash: u64, path: []const u8) ?*Entry {
+        fn findEntryLocked(self: *FdCache, shard: *Shard, namespace: u64, path_hash: u64, path: []const u8) ?*Entry {
             _ = self;
             const bucket = shard.entries.getPtr(path_hash) orelse return null;
             var i = bucket.items.len;
             while (i > 0) {
                 i -= 1;
                 const entry = bucket.items[i];
-                if (!entry.invalidated and std.mem.eql(u8, entry.path, path)) return entry;
+                if (!entry.invalidated and entry.namespace == namespace and std.mem.eql(u8, entry.path, path)) return entry;
             }
             return null;
         }
 
-        fn findInvalidatedEntryLocked(self: *FdCache, shard: *Shard, path_hash: u64, path: []const u8) ?*Entry {
+        fn findInvalidatedEntryLocked(self: *FdCache, shard: *Shard, namespace: u64, path_hash: u64, path: []const u8) ?*Entry {
             _ = self;
             const bucket = shard.entries.getPtr(path_hash) orelse return null;
             var i = bucket.items.len;
             while (i > 0) {
                 i -= 1;
                 const entry = bucket.items[i];
-                if (entry.invalidated and std.mem.eql(u8, entry.path, path)) return entry;
+                if (entry.invalidated and entry.namespace == namespace and std.mem.eql(u8, entry.path, path)) return entry;
             }
             return null;
         }
@@ -1162,6 +1208,7 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
+var native_storage_cache_namespace: std.atomic.Value(u64) = .init(1);
 
 fn processNativeFdCache() *FdCache {
     const locked = lockAtomic(&process_native_storage_pool_mutex);
@@ -1218,6 +1265,7 @@ const NativeStorageState = struct {
     threaded: std.Io.Threaded,
     local_fd_cache: ?FdCache,
     shared_fd_cache: ?*FdCache,
+    cache_namespace: u64,
 
     fn create(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !*NativeStorageState {
         if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
@@ -1234,6 +1282,7 @@ const NativeStorageState = struct {
         else
             null;
         state.shared_fd_cache = if (pool) |shared| shared.fd_cache else null;
+        state.cache_namespace = native_storage_cache_namespace.fetchAdd(1, .monotonic);
         return state;
     }
 
@@ -1296,23 +1345,32 @@ const NativeStorageState = struct {
 
     fn release(self: *NativeStorageState) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        if (self.local_fd_cache) |*cache| cache.deinit();
+        if (self.local_fd_cache) |*cache| {
+            cache.deinit();
+        } else if (self.shared_fd_cache) |cache| {
+            // Cached descriptors are shared for aggregate eviction, but file
+            // identity is scoped to this storage generation. Invalidate the
+            // namespace before destroying the I/O runtime so a restore or
+            // reopen at the same pathname can never observe the old inode.
+            cache.invalidateNamespace(self.cache_namespace);
+            cache.signalAdmissionChanged(self.threaded.io());
+        }
         self.threaded.deinit();
         self.refs.store(0, .release);
     }
 
     fn invalidatePath(self: *NativeStorageState, path: []const u8) void {
-        self.fdCache().invalidatePath(path);
+        self.fdCache().invalidatePath(self.cache_namespace, path);
         self.fdCache().signalAdmissionChanged(self.threaded.io());
     }
 
     fn invalidateRename(self: *NativeStorageState, old_path: []const u8, new_path: []const u8) void {
-        self.fdCache().invalidateRename(old_path, new_path);
+        self.fdCache().invalidateRename(self.cache_namespace, old_path, new_path);
         self.fdCache().signalAdmissionChanged(self.threaded.io());
     }
 
     fn invalidateTree(self: *NativeStorageState, path: []const u8) void {
-        self.fdCache().invalidateTree(path);
+        self.fdCache().invalidateTree(self.cache_namespace, path);
         self.fdCache().signalAdmissionChanged(self.threaded.io());
     }
 };
@@ -1388,7 +1446,7 @@ else
 
         fn read(self: *NativeRangeReadFuture) ![]u8 {
             if (comptime supports_posix_fd_cache) {
-                return try self.state.fdCache().readRangeAlloc(self.io, self.allocator, self.path, self.offset, self.len);
+                return try self.state.fdCache().readRangeAlloc(self.state.cache_namespace, self.io, self.allocator, self.path, self.offset, self.len);
             }
             return try readFileRangeWithIo(self.io, self.allocator, self.path, self.offset, self.len);
         }
@@ -1543,7 +1601,7 @@ else blk: {
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
                     defer state.release();
-                    return try state.fdCache().readRangeAlloc(state.threaded.io(), allocator, path, offset, len);
+                    return try state.fdCache().readRangeAlloc(state.cache_namespace, state.threaded.io(), allocator, path, offset, len);
                 }
                 return switch (self.runtime) {
                     .threaded => |*threaded| try readFileRangeWithIo(threaded.io(), allocator, path, offset, len),
@@ -1565,7 +1623,7 @@ else blk: {
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
                     defer state.release();
-                    return try state.fdCache().readRangeInto(state.threaded.io(), path, offset, out);
+                    return try state.fdCache().readRangeInto(state.cache_namespace, state.threaded.io(), path, offset, out);
                 }
                 return switch (self.runtime) {
                     .threaded => |*threaded| try readFileRangeWithIoInto(threaded.io(), path, offset, out),
@@ -1578,7 +1636,7 @@ else blk: {
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
                     defer state.release();
-                    return try state.fdCache().readRangeAtMostInto(state.threaded.io(), path, offset, out);
+                    return try state.fdCache().readRangeAtMostInto(state.cache_namespace, state.threaded.io(), path, offset, out);
                 }
                 return switch (self.runtime) {
                     .threaded => |*threaded| try readFileRangeWithIoAtMostInto(threaded.io(), path, offset, out),
@@ -1591,7 +1649,7 @@ else blk: {
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
                     defer state.release();
-                    return try state.fdCache().fileSize(state.threaded.io(), path);
+                    return try state.fdCache().fileSize(state.cache_namespace, state.threaded.io(), path);
                 }
                 return switch (self.runtime) {
                     .threaded => |*threaded| try fileSizeWithIo(threaded.io(), path),
@@ -1604,7 +1662,7 @@ else blk: {
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
                     defer state.release();
-                    return try state.fdCache().readTrailerAlloc(state.threaded.io(), allocator, path, len);
+                    return try state.fdCache().readTrailerAlloc(state.cache_namespace, state.threaded.io(), allocator, path, len);
                 }
                 return switch (self.runtime) {
                     .threaded => |*threaded| try readFileTrailerWithIo(threaded.io(), allocator, path, len),
@@ -1769,7 +1827,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeAlloc(retained.threaded.io(), allocator, path, offset, len);
+                return try retained.fdCache().readRangeAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, offset, len);
             }
             return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
         }
@@ -1788,7 +1846,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeInto(retained.threaded.io(), path, offset, out);
+                return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
             }
             return try readFileRangeWithIoInto(retained.threaded.io(), path, offset, out);
         }
@@ -1798,7 +1856,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeAtMostInto(retained.threaded.io(), path, offset, out);
+                return try retained.fdCache().readRangeAtMostInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
             }
             return try readFileRangeWithIoAtMostInto(retained.threaded.io(), path, offset, out);
         }
@@ -1808,7 +1866,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().fileSize(retained.threaded.io(), path);
+                return try retained.fdCache().fileSize(retained.cache_namespace, retained.threaded.io(), path);
             }
             return try fileSizeWithIo(retained.threaded.io(), path);
         }
@@ -1818,7 +1876,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readTrailerAlloc(retained.threaded.io(), allocator, path, len);
+                return try retained.fdCache().readTrailerAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, len);
             }
             return try readFileTrailerWithIo(retained.threaded.io(), allocator, path, len);
         }
@@ -2817,6 +2875,10 @@ fn hashPath(path: []const u8) u64 {
     return std.hash.Wyhash.hash(0x6d3b7a1db6f9c24f, path);
 }
 
+fn namespacedPathHash(namespace: u64, path: []const u8) u64 {
+    return std.hash.Wyhash.hash(namespace ^ 0x6d3b7a1db6f9c24f, path);
+}
+
 test "host storage delegates through callbacks" {
     var backing = MemoryStorage.init(std.testing.allocator);
     defer backing.deinit();
@@ -3214,6 +3276,7 @@ test "shared native fd cache blocks before opening more than 64 files across sto
 
     const Worker = struct {
         cache: *FdCache,
+        namespace: u64,
         io: std.Io,
         path: []const u8,
         release_all: *std.atomic.Value(bool),
@@ -3221,7 +3284,7 @@ test "shared native fd cache blocks before opening more than 64 files across sto
         failures: *std.atomic.Value(usize),
 
         fn run(self: *@This()) void {
-            const entry = self.cache.retain(self.io, self.path) catch {
+            const entry = self.cache.retain(self.namespace, self.io, self.path) catch {
                 _ = self.failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -3246,6 +3309,7 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     for (0..worker_count) |i| {
         workers[i] = .{
             .cache = stores[i % store_count].state.fdCache(),
+            .namespace = stores[i % store_count].state.cache_namespace,
             .io = io_impl.io(),
             .path = paths[i][0..path_lens[i]],
             .release_all = &release_all,
@@ -3272,6 +3336,76 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     threads_started = 0;
     try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
     try std.testing.expect(pool.snapshotStats().fd_cache_entries <= capacity);
+}
+
+test "weighted native fd admission preserves FIFO progress" {
+    if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 3);
+    defer pool.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try pool.fd_cache.reserveDescriptors(io, 3);
+    var held_descriptors: usize = 3;
+    defer pool.fd_cache.releaseDescriptors(io, held_descriptors);
+
+    const Worker = struct {
+        cache: *FdCache,
+        io: std.Io,
+        count: usize,
+        acquired: *std.atomic.Value(bool),
+        release_gate: ?*const std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            self.cache.reserveDescriptors(self.io, self.count) catch return;
+            self.acquired.store(true, .release);
+            if (self.release_gate) |gate| {
+                while (!gate.load(.acquire)) std.Thread.yield() catch {};
+            }
+            self.cache.releaseDescriptors(self.io, self.count);
+        }
+    };
+
+    var large_acquired = std.atomic.Value(bool).init(false);
+    var small_acquired = std.atomic.Value(bool).init(false);
+    var release_large = std.atomic.Value(bool).init(false);
+    var large = Worker{
+        .cache = pool.fd_cache,
+        .io = io,
+        .count = 2,
+        .acquired = &large_acquired,
+        .release_gate = &release_large,
+    };
+    const large_thread = try std.Thread.spawn(.{}, Worker.run, .{&large});
+    defer large_thread.join();
+    while (pool.snapshotStats().fd_admission_waiters < 1) std.Thread.yield() catch {};
+
+    var small = Worker{
+        .cache = pool.fd_cache,
+        .io = io,
+        .count = 1,
+        .acquired = &small_acquired,
+        .release_gate = null,
+    };
+    const small_thread = try std.Thread.spawn(.{}, Worker.run, .{&small});
+    defer small_thread.join();
+    while (pool.snapshotStats().fd_admission_waiters < 2) std.Thread.yield() catch {};
+
+    // One released descriptor would admit the younger one-fd request, but it
+    // must remain queued so capacity can accumulate for the older request.
+    pool.fd_cache.releaseDescriptors(io, 1);
+    held_descriptors -= 1;
+    for (0..1_000) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!large_acquired.load(.acquire));
+    try std.testing.expect(!small_acquired.load(.acquire));
+
+    pool.fd_cache.releaseDescriptors(io, 1);
+    held_descriptors -= 1;
+    while (!large_acquired.load(.acquire)) std.Thread.yield() catch {};
+    try std.testing.expect(!small_acquired.load(.acquire));
+    release_large.store(true, .release);
+    while (!small_acquired.load(.acquire)) std.Thread.yield() catch {};
 }
 
 test "shared native fd admission wait is cancellation aware" {

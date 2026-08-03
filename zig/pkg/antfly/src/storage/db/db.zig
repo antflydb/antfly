@@ -15178,6 +15178,12 @@ pub const DB = struct {
         docs: []const introducer_mod.TextDocument,
     ) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+        if (self.text_merge_runtime) |runtime| {
+            const estimated_segments = self.core.index_manager.estimateTextKernelSegmentCount(docs);
+            merge_permit = try runtime.acquireProducerPermit(@intCast(estimated_segments));
+        }
+        defer if (merge_permit) |*permit| permit.release();
         lockApply(self);
         const segment_count = self.core.index_manager.indexTextKernelDocuments(index_name, docs) catch |err| {
             self.core.unlockApply();
@@ -15186,7 +15192,6 @@ pub const DB = struct {
         self.core.unlockApply();
         if (self.text_merge_runtime) |runtime| {
             runtime.notify();
-            _ = runtime.applyBackpressure();
         }
         return segment_count;
     }
@@ -31499,23 +31504,35 @@ fn applyDerivedBatch(self: *DB, batch: derived_types.DerivedBatch) !void {
 }
 
 fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
+    var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+    if (self.text_merge_runtime) |runtime| {
+        if (!self.async_context.text_merge_deferred.load(.acquire)) {
+            merge_permit = try runtime.acquireProducerPermit(self.core.index_manager.fullTextTargetCount(&.{}));
+        }
+    }
+    defer if (merge_permit) |*permit| permit.release();
     var ctx = self.batchContext();
     try applyDerivedBatchContextProfiled(&ctx, batch, profile);
     if (self.text_merge_runtime) |runtime| {
         if (self.async_context.text_merge_deferred.load(.acquire)) return;
         runtime.notify();
-        _ = runtime.applyBackpressure();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
+    var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+    if (self.text_merge_runtime) |runtime| {
+        if (!self.async_context.text_merge_deferred.load(.acquire)) {
+            merge_permit = try runtime.acquireProducerPermit(self.core.index_manager.fullTextTargetCount(index_names));
+        }
+    }
+    defer if (merge_permit) |*permit| permit.release();
     var ctx = self.batchContext();
     try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
     if (self.text_merge_runtime) |runtime| {
         if (self.async_context.text_merge_deferred.load(.acquire)) return;
         runtime.notify();
-        _ = runtime.applyBackpressure();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
@@ -32784,6 +32801,11 @@ fn filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(
 }
 
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
+    var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+    if (index_ref.kind == .full_text and !ctx.text_merge_deferred.load(.acquire)) {
+        if (ctx.text_merge_runtime) |runtime| merge_permit = try runtime.acquireProducerPermit(1);
+    }
+    defer if (merge_permit) |*permit| permit.release();
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     switch (index_ref.kind) {
@@ -37038,7 +37060,6 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     if (index_ref.kind == .full_text) if (ctx.text_merge_runtime) |runtime| {
         if (ctx.text_merge_deferred.load(.acquire)) return true;
         runtime.notify();
-        _ = runtime.applyBackpressure();
     };
     if (index_ref.kind == .sparse_vector) if (ctx.sparse_compaction_runtime) |runtime| {
         runtime.notify();
@@ -70507,9 +70528,11 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             .backpressure_max_wait_ms = 3,
         },
     );
+    try bounded_runtime.start();
     const bounded_outcome = bounded_runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.timed_out, bounded_outcome);
-    try std.testing.expectEqual(@as(u64, 1), bounded_runtime.stats().backpressure_timeouts);
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, bounded_runtime.acquireProducerPermit(1));
+    try std.testing.expectEqual(@as(u64, 2), bounded_runtime.stats().backpressure_timeouts);
     bounded_runtime.deinit();
 
     resources.index_manager.cancelTextMergeTask(&held_task);
@@ -70531,6 +70554,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         },
     );
     defer runtime.deinit();
+    try runtime.start();
 
     const outcome = runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
