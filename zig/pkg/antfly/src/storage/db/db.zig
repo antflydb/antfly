@@ -877,6 +877,12 @@ var test_quarantine_publication_fence_entered: std.atomic.Value(bool) = .init(fa
 var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
 var test_match_all_ordinal_lookup_entered: std.atomic.Value(bool) = .init(false);
 var test_release_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+const PublishedDenseCatalogLookupTestHook = struct {
+    io: std.Io,
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+};
+var test_published_dense_catalog_lookup_hook: ?*PublishedDenseCatalogLookupTestHook = null;
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
@@ -3000,7 +3006,11 @@ pub const DB = struct {
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
-    index_catalog_barriers: std.atomic.Value(u32) = .init(0),
+    /// High bit closes lock-free dense admission; the remaining bits count
+    /// readers that hold an inline-catalog generation alive. Keeping both in
+    /// one atomic gives reader admission and catalog closure a single
+    /// modification order on weak-memory targets.
+    published_dense_admission: std.atomic.Value(u32) = .init(0),
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
@@ -3008,7 +3018,6 @@ pub const DB = struct {
     managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
-    published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
@@ -19987,26 +19996,10 @@ pub const DB = struct {
         var generation_ns: u64 = 0;
         var lock_wait_ns: u64 = 0;
         var locked_search_ns: u64 = 0;
-        if (self.canUsePublishedDenseSearch(req) and self.beginPublishedDenseSearch()) {
-            defer self.endPublishedDenseSearch();
-            const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
-            if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
-            const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
-            if (bench_profile) {
-                locked_search_ns = platform_time.monotonicNs() - search_start_ns;
-                std.log.info(
-                    "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
-                );
-            }
-            return result;
-        }
         const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        lockApplyShared(self);
+        const search_access = self.beginDenseSearchAccess(req);
         if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
-        defer self.core.unlockApplyShared();
+        defer self.endDenseSearchAccess(search_access);
         const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
@@ -20016,7 +20009,7 @@ pub const DB = struct {
             locked_search_ns = platform_time.monotonicNs() - search_start_ns;
             std.log.info(
                 "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, search_access == .published },
             );
         }
         return result;
@@ -20978,15 +20971,9 @@ pub const DB = struct {
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (self.canUsePublishedDenseSearch(req) and self.beginPublishedDenseSearch()) {
-            defer self.endPublishedDenseSearch();
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
-        }
-        {
-            lockApplyShared(self);
-            defer self.core.unlockApplyShared();
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
-        }
+        const search_access = self.beginDenseSearchAccess(req);
+        defer self.endDenseSearchAccess(search_access);
+        return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
     }
 
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
@@ -21662,7 +21649,7 @@ pub const DB = struct {
         return self.core.denseIndex(index_name);
     }
 
-    fn canUsePublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
+    fn publishedDenseRequestEligible(req: types.SearchRequest) bool {
         if (req.graph_queries.len != 0) return false;
         if (req.full_text != null or req.sparse != null) return false;
         if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
@@ -21671,31 +21658,94 @@ pub const DB = struct {
         if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
         if (req.resolved_doc_filter != null) return false;
         if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
-        if (!(req.dense != null or req.query == .dense_knn)) return false;
-        const entry = self.core.denseIndex(req.index_name) orelse return false;
-        return !entry.index.hasExternalVectorLoader();
+        return req.dense != null or req.query == .dense_knn;
     }
 
-    fn beginPublishedDenseSearch(self: *DB) bool {
-        if (self.index_catalog_barriers.load(.acquire) != 0) return false;
-        _ = self.published_dense_searches.fetchAdd(1, .acq_rel);
-        if (self.index_catalog_barriers.load(.acquire) != 0) {
-            _ = self.published_dense_searches.fetchSub(1, .acq_rel);
-            return false;
+    const DenseSearchAccess = enum {
+        published,
+        apply_shared,
+    };
+
+    /// Selects and acquires the complete synchronization mode for one search.
+    /// When published-dense preflight discovers that the request needs the
+    /// apply lock, acquire that lock before releasing the catalog lease. This
+    /// closes the handoff gap in which a concurrent structural mutation could
+    /// delete the entry between the preflight lookup and the locked fallback.
+    fn beginDenseSearchAccess(self: *DB, req: types.SearchRequest) DenseSearchAccess {
+        if (!publishedDenseRequestEligible(req) or !self.beginPublishedDenseSearch()) {
+            lockApplyShared(self);
+            return .apply_shared;
         }
-        return true;
+
+        if (builtin.is_test) {
+            if (test_published_dense_catalog_lookup_hook) |hook| {
+                hook.entered.set(hook.io);
+                hook.release.waitUncancelable(hook.io);
+            }
+        }
+
+        const entry = self.core.denseIndex(req.index_name) orelse {
+            lockApplyShared(self);
+            self.endPublishedDenseSearch();
+            return .apply_shared;
+        };
+        if (entry.index.hasExternalVectorLoader()) {
+            lockApplyShared(self);
+            self.endPublishedDenseSearch();
+            return .apply_shared;
+        }
+        return .published;
+    }
+
+    fn endDenseSearchAccess(self: *DB, access: DenseSearchAccess) void {
+        switch (access) {
+            .published => self.endPublishedDenseSearch(),
+            .apply_shared => self.core.unlockApplyShared(),
+        }
+    }
+
+    const published_dense_catalog_closed: u32 = @as(u32, 1) << 31;
+    const published_dense_reader_mask: u32 = published_dense_catalog_closed - 1;
+
+    fn beginPublishedDenseSearch(self: *DB) bool {
+        var observed = self.published_dense_admission.load(.monotonic);
+        while (true) {
+            if (observed & published_dense_catalog_closed != 0) return false;
+            // Check and increment in one CAS so concurrent readers at the
+            // representable limit cannot carry into the catalog-closed bit.
+            // Falling back to the apply lock is safe at saturation.
+            if (observed & published_dense_reader_mask == published_dense_reader_mask) return false;
+            if (self.published_dense_admission.cmpxchgWeak(
+                observed,
+                observed + 1,
+                .acquire,
+                .monotonic,
+            )) |actual| {
+                observed = actual;
+                continue;
+            }
+            return true;
+        }
     }
 
     fn endPublishedDenseSearch(self: *DB) void {
-        _ = self.published_dense_searches.fetchSub(1, .acq_rel);
+        const previous = self.published_dense_admission.fetchSub(1, .release);
+        std.debug.assert(previous & published_dense_reader_mask != 0);
     }
 
     fn beginIndexCatalogBarrierUntil(self: *DB, deadline_ns: u64) bool {
-        _ = self.index_catalog_barriers.fetchAdd(1, .acq_rel);
+        // Structural catalog writers are serialized by
+        // index_structural_mutation_mutex. The bit and reader count share one
+        // modification order: a reader is either counted before this RMW, or
+        // observes the bit and falls back before touching the inline catalog.
+        const previous = self.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+        if (previous & published_dense_catalog_closed != 0) return false;
+
         var spins: usize = 0;
-        while (self.published_dense_searches.load(.acquire) != 0) : (spins += 1) {
+        while (self.published_dense_admission.load(.acquire) & published_dense_reader_mask != 0) : (spins += 1) {
             if (monotonicTimeNs() >= deadline_ns) {
-                _ = self.index_catalog_barriers.fetchSub(1, .acq_rel);
+                const timed_out = self.published_dense_admission.fetchAnd(published_dense_reader_mask, .release);
+                std.debug.assert(timed_out & published_dense_catalog_closed != 0);
                 return false;
             }
             if (spins < 64) {
@@ -21708,7 +21758,17 @@ pub const DB = struct {
     }
 
     fn endIndexCatalogBarrier(self: *DB) void {
-        _ = self.index_catalog_barriers.fetchSub(1, .acq_rel);
+        const previous = self.published_dense_admission.fetchAnd(published_dense_reader_mask, .release);
+        std.debug.assert(previous & published_dense_catalog_closed != 0);
+        std.debug.assert(previous & published_dense_reader_mask == 0);
+    }
+
+    fn publishedDenseSearchCount(self: *const DB) u32 {
+        return self.published_dense_admission.load(.acquire) & published_dense_reader_mask;
+    }
+
+    fn indexCatalogBarrierActive(self: *const DB) bool {
+        return self.published_dense_admission.load(.acquire) & published_dense_catalog_closed != 0;
     }
 
     fn lockApplyUntil(self: *DB, deadline_ns: u64) bool {
@@ -41894,6 +41954,9 @@ test "db index catalog barrier disables published dense fast path" {
 
     try std.testing.expect(db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
     defer db.endIndexCatalogBarrier();
+    // A competing writer must not acquire ownership or clear the first
+    // writer's closed bit.
+    try std.testing.expect(!db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
     try std.testing.expect(!db.beginPublishedDenseSearch());
 }
 
@@ -41908,12 +41971,174 @@ test "db index catalog barrier and apply acquisition honor activation deadline" 
 
     try std.testing.expect(db.beginPublishedDenseSearch());
     try std.testing.expect(!db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_ms));
-    try std.testing.expectEqual(@as(u32, 0), db.index_catalog_barriers.load(.acquire));
+    try std.testing.expect(!db.indexCatalogBarrierActive());
+    try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    db.endPublishedDenseSearch();
     db.endPublishedDenseSearch();
 
     db.core.lockApplyExclusive();
     defer db.core.unlockApplyExclusive();
     try std.testing.expect(!db.lockApplyUntil(monotonicTimeNs() + std.time.ns_per_ms));
+}
+
+test "db published dense admission cannot overflow into catalog closure" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    db.published_dense_admission.store(DB.published_dense_reader_mask - 1, .monotonic);
+    defer db.published_dense_admission.store(0, .monotonic);
+
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    try std.testing.expectEqual(DB.published_dense_reader_mask, db.published_dense_admission.load(.monotonic));
+    try std.testing.expect(!db.beginPublishedDenseSearch());
+    try std.testing.expectEqual(DB.published_dense_reader_mask, db.published_dense_admission.load(.monotonic));
+}
+
+test "db dense fast path registers before catalog lookup during index deletion" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const wait_timeout_ns = 5 * std.time.ns_per_s;
+    const EventWaiter = struct {
+        fn wait(runtime_io: std.Io, event: *std.Io.Event, timeout_ns: u64) !void {
+            const deadline_ns = monotonicTimeNs() +| timeout_ns;
+            while (!event.isSet()) {
+                const now_ns = monotonicTimeNs();
+                if (now_ns >= deadline_ns) return error.TestTimeout;
+                event.waitTimeout(runtime_io, .{ .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(@as(i96, deadline_ns - now_ns)),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    // Event waits permit spurious wakeups. Preserve the single
+                    // absolute deadline rather than treating one as a failure.
+                    error.Timeout => continue,
+                    error.Canceled => return error.Canceled,
+                };
+            }
+        }
+    };
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    // Keep this fixture limited to the catalog-admission race under test.
+    // Autonomous index and maintenance workers can legitimately retire an
+    // empty index before the hook is reached, turning this into an unrelated
+    // and intermittent IndexNotFound test failure.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var lookup_hook = PublishedDenseCatalogLookupTestHook{ .io = io };
+    test_published_dense_catalog_lookup_hook = &lookup_hook;
+    defer {
+        lookup_hook.release.set(io);
+        test_published_dense_catalog_lookup_hook = null;
+    }
+
+    const Searcher = struct {
+        db: *DB,
+        io: std.Io,
+        completed: std.Io.Event = .unset,
+        total_hits: u32 = 0,
+        err: ?anyerror = null,
+
+        fn run(searcher: *@This()) void {
+            defer searcher.completed.set(searcher.io);
+            var result = searcher.db.search(std.heap.smp_allocator, .{
+                .index_name = "dv_v1",
+                .limit = 1,
+                .include_stored = false,
+                .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+            }) catch |err| {
+                searcher.err = err;
+                return;
+            };
+            defer result.deinit();
+            searcher.total_hits = result.total_hits;
+        }
+    };
+    var searcher = Searcher{ .db = &db, .io = io };
+    var search_future = try io.concurrent(Searcher.run, .{&searcher});
+    var search_pending = true;
+    defer if (search_pending) {
+        lookup_hook.release.set(io);
+        EventWaiter.wait(io, &searcher.completed, wait_timeout_ns) catch @panic("dense catalog lookup test search did not stop");
+        _ = search_future.await(io);
+    };
+
+    try EventWaiter.wait(io, &lookup_hook.entered, wait_timeout_ns);
+    try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+
+    const Deleter = struct {
+        db: *DB,
+        io: std.Io,
+        completed: std.Io.Event = .unset,
+        removed: bool = false,
+        err: ?anyerror = null,
+
+        fn run(deleter: *@This()) void {
+            defer deleter.completed.set(deleter.io);
+            deleter.removed = deleter.db.deleteIndex("dv_v1") catch |err| {
+                deleter.err = err;
+                return;
+            };
+        }
+    };
+    var deleter = Deleter{ .db = &db, .io = io };
+    var delete_future = try io.concurrent(Deleter.run, .{&deleter});
+    var delete_pending = true;
+    defer if (delete_pending) {
+        lookup_hook.release.set(io);
+        EventWaiter.wait(io, &deleter.completed, wait_timeout_ns) catch @panic("dense catalog lookup test deletion did not stop");
+        _ = delete_future.await(io);
+    };
+
+    var barrier_entered = false;
+    const barrier_deadline_ns = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (monotonicTimeNs() < barrier_deadline_ns) {
+        if (db.indexCatalogBarrierActive()) {
+            barrier_entered = true;
+            break;
+        }
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!barrier_entered) return error.TestTimeout;
+    // The deletion must wait for the already-registered lookup rather than
+    // moving or freeing the dense entry underneath it.
+    try std.testing.expect(!searcher.completed.isSet());
+    try std.testing.expect(!deleter.completed.isSet());
+
+    lookup_hook.release.set(io);
+    try EventWaiter.wait(io, &searcher.completed, wait_timeout_ns);
+    try EventWaiter.wait(io, &deleter.completed, wait_timeout_ns);
+    _ = search_future.await(io);
+    search_pending = false;
+    _ = delete_future.await(io);
+    delete_pending = false;
+
+    if (searcher.err) |err| return err;
+    if (deleter.err) |err| return err;
+    try std.testing.expectEqual(@as(u32, 0), searcher.total_hits);
+    try std.testing.expect(deleter.removed);
+    try std.testing.expect(!db.hasIndex("dv_v1"));
 }
 
 test "db dense index stores stable vector ids with ordinal filter mappings" {
@@ -41960,7 +42185,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
     include = .all;
     defer filter.deinit(alloc);
 
-    try std.testing.expect(!db.canUsePublishedDenseSearch(.{
+    try std.testing.expect(!DB.publishedDenseRequestEligible(.{
         .index_name = "dv_v1",
         .limit = 1,
         .include_stored = false,
