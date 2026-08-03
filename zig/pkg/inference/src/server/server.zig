@@ -1123,6 +1123,36 @@ fn rejectDisallowedModel(
     }
 }
 
+const transient_capacity_retry_after_seconds = "1";
+const transient_capacity_retry_after_ms = 1000;
+
+fn transientCapacityFailureResponse(
+    ctx: *httpx.Context,
+    code: []const u8,
+    message: []const u8,
+    reason: []const u8,
+) !httpx.Response {
+    // Retry-After is expressed in seconds by HTTP. The millisecond field keeps
+    // SDK clients from having to parse headers and makes retryability explicit.
+    try ctx.setHeader("Retry-After", transient_capacity_retry_after_seconds);
+    return ctx.status(503).json(.{
+        .@"error" = code,
+        .message = message,
+        .reason = reason,
+        .retryable = true,
+        .retry_after_ms = transient_capacity_retry_after_ms,
+    });
+}
+
+fn modelResourceBusyResponse(ctx: *httpx.Context) !httpx.Response {
+    return transientCapacityFailureResponse(
+        ctx,
+        "MODEL_RESOURCE_BUSY",
+        "insufficient inference capacity is currently available",
+        "inference_capacity",
+    );
+}
+
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
         error.UnknownModelCompatibility => ctx.status(400).json(.{
@@ -1137,10 +1167,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "model resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
-            .@"error" = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-        }),
+        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -1154,10 +1181,7 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
-            .@"error" = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-        }),
+        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "INFERENCE_FAILED",
             .message = @errorName(err),
@@ -2556,10 +2580,12 @@ pub const Node = struct {
             self.metrics.incError();
             self.metrics.recordQueueRejection(requested_units);
             self.updateQueueMetrics();
-            const resp = try ctx.status(503).json(.{
-                .@"error" = "SERVICE_UNAVAILABLE",
-                .message = "server at capacity, try again later",
-            });
+            const resp = try transientCapacityFailureResponse(
+                ctx,
+                "SERVICE_UNAVAILABLE",
+                "server at capacity, try again later",
+                "request_queue",
+            );
             return resp;
         };
         self.updateQueueMetrics();
@@ -3867,10 +3893,7 @@ pub const Node = struct {
                 .@"error" = "MODEL_RESOURCE_LIMIT",
                 .message = "request exceeds the configured inference resource budget",
             }),
-            error.ResourceTemporarilyUnavailable => return ctx.status(503).json(.{
-                .@"error" = "MODEL_RESOURCE_BUSY",
-                .message = "insufficient inference capacity is currently available",
-            }),
+            error.ResourceTemporarilyUnavailable => return modelResourceBusyResponse(ctx),
         };
         defer admission_lease.release();
 
