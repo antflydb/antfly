@@ -42010,7 +42010,16 @@ test "db dense fast path registers before catalog lookup during index deletion" 
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    // Keep this fixture limited to the catalog-admission race under test.
+    // Autonomous index and maintenance workers can legitimately retire an
+    // empty index before the hook is reached, turning this into an unrelated
+    // and intermittent IndexNotFound test failure.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer db.close();
     try db.addIndex(.{
         .name = "dv_v1",
