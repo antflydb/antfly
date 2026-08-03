@@ -2154,7 +2154,7 @@ pub const Node = struct {
 
         model.lockEmbeddingAssets();
         defer model.unlockEmbeddingAssets();
-        try model.ensureEmbeddingAssetsLocked(parsed.texts.items.len > 0, parsed.images.items.len > 0, parsed.audio.items.len > 0);
+        try ensureInitialDenseEmbeddingAssetsLocked(model, &parsed);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         var pipeline = model.embeddingPipeline(allocator);
         const vectors = try embedDenseInputs(allocator, &pipeline, &parsed, model);
@@ -2768,11 +2768,7 @@ pub const Node = struct {
 
         model.lockEmbeddingAssets();
         defer model.unlockEmbeddingAssets();
-        model.ensureEmbeddingAssetsLocked(
-            inputs.texts.items.len > 0,
-            inputs.images.items.len > 0,
-            inputs.audio.items.len > 0,
-        ) catch |err|
+        ensureInitialDenseEmbeddingAssetsLocked(model, &inputs) catch |err|
             return inferenceFailureResponse(ctx, err);
 
         var pipeline = model.embeddingPipeline(ctx.allocator);
@@ -9498,6 +9494,35 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
     };
 }
 
+fn ensureInitialDenseEmbeddingAssetsLocked(
+    model: *model_manager_mod.LoadedModel,
+    inputs: *const ParsedDenseEmbedInputs,
+) !void {
+    if (inputs.audio.items.len > 0) {
+        // Audio is deliberately the only optional phase admitted up front.
+        // Text/image assets are admitted after the audio outputs are copied.
+        try model.ensureAudioEmbeddingAssetsLocked();
+        return;
+    }
+    try model.ensurePrimaryEmbeddingAssetsLocked(
+        inputs.texts.items.len > 0,
+        inputs.images.items.len > 0,
+    );
+}
+
+fn admitPrimaryDenseEmbeddingAssetsAfterAudioLocked(
+    model: *model_manager_mod.LoadedModel,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    inputs: *const ParsedDenseEmbedInputs,
+) !void {
+    if (inputs.texts.items.len == 0 and inputs.images.items.len == 0) return;
+    try model.ensurePrimaryEmbeddingAssetsLocked(
+        inputs.texts.items.len > 0,
+        inputs.images.items.len > 0,
+    );
+    model.bindEmbeddingPipelineAssetsLocked(pipeline);
+}
+
 fn embedDenseInputs(
     allocator: std.mem.Allocator,
     pipeline: *embedding_mod.EmbeddingPipeline,
@@ -9516,28 +9541,30 @@ fn embedDenseInputs(
         }
     }
 
-    // Run the optional audio branch first, then release it before admitting
-    // primary CLIP text/image work. Outputs are owned copies and remain valid.
-    if (inputs.audio.items.len > 0) audio_branch: {
-        defer model.releaseAudioEmbeddingAssetsLocked();
-        const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
-        defer allocator.free(audio_inputs);
-        for (inputs.audio.items, 0..) |item, i| {
-            audio_inputs[i] = .{
-                .bytes = item.bytes,
-                .decode_options = .{
-                    .mime_hint = item.mime_type,
-                },
-            };
-        }
+    // Materialize the audio outputs while its ephemeral sidecars are resident,
+    // release them, and only then admit reusable text/image sidecars.
+    if (inputs.audio.items.len > 0) {
+        {
+            defer model.releaseAudioEmbeddingAssetsLocked();
+            const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
+            defer allocator.free(audio_inputs);
+            for (inputs.audio.items, 0..) |item, i| {
+                audio_inputs[i] = .{
+                    .bytes = item.bytes,
+                    .decode_options = .{
+                        .mime_hint = item.mime_type,
+                    },
+                };
+            }
 
-        const audio_embeddings = try pipeline.embedEncodedAudio(audio_inputs);
-        defer allocator.free(audio_embeddings);
-        for (inputs.audio.items, 0..) |item, i| {
-            embeddings[item.index] = audio_embeddings[i];
-            filled[item.index] = true;
+            const audio_embeddings = try pipeline.embedEncodedAudio(audio_inputs);
+            defer allocator.free(audio_embeddings);
+            for (inputs.audio.items, 0..) |item, i| {
+                embeddings[item.index] = audio_embeddings[i];
+                filled[item.index] = true;
+            }
         }
-        break :audio_branch;
+        try admitPrimaryDenseEmbeddingAssetsAfterAudioLocked(model, pipeline, inputs);
     }
 
     if (inputs.texts.items.len > 0) {
@@ -9594,26 +9621,28 @@ fn embedDenseInputsPartial(
     errdefer errors.deinit(allocator);
     try errors.appendSlice(allocator, inputs.parse_errors.items);
 
-    if (inputs.audio.items.len > 0) audio_branch: {
-        defer model.releaseAudioEmbeddingAssetsLocked();
-        const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
-        defer allocator.free(audio_inputs);
-        for (inputs.audio.items, 0..) |item, i| {
-            audio_inputs[i] = .{
-                .bytes = item.bytes,
-                .decode_options = .{ .mime_hint = item.mime_type },
-            };
-        }
-
-        if (pipeline.embedEncodedAudio(audio_inputs)) |embeddings| {
-            defer allocator.free(embeddings);
+    if (inputs.audio.items.len > 0) {
+        {
+            defer model.releaseAudioEmbeddingAssetsLocked();
+            const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
+            defer allocator.free(audio_inputs);
             for (inputs.audio.items, 0..) |item, i| {
-                result.embeddings[item.index] = embeddings[i];
+                audio_inputs[i] = .{
+                    .bytes = item.bytes,
+                    .decode_options = .{ .mime_hint = item.mime_type },
+                };
             }
-        } else |_| {
-            try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
+
+            if (pipeline.embedEncodedAudio(audio_inputs)) |embeddings| {
+                defer allocator.free(embeddings);
+                for (inputs.audio.items, 0..) |item, i| {
+                    result.embeddings[item.index] = embeddings[i];
+                }
+            } else |_| {
+                try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
+            }
         }
-        break :audio_branch;
+        try admitPrimaryDenseEmbeddingAssetsAfterAudioLocked(model, pipeline, inputs);
     }
 
     if (inputs.texts.items.len > 0) {

@@ -243,7 +243,7 @@ GENERATOR_MODELS = [
 
 DEFAULT_GENERATOR_MODEL = "unsloth/Qwen3-1.7B-GGUF"
 DEFAULT_TOOL_GENERATOR_MODEL = DEFAULT_GENERATOR_MODEL
-DEFAULT_MULTIMODAL_GENERATOR_MODEL = DEFAULT_GENERATOR_MODEL
+DEFAULT_MULTIMODAL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 
 CURATED_MODELS = [
     *EMBEDDER_MODELS,
@@ -657,6 +657,8 @@ def find_multimodal_generator_model_name(available_generators: set[str] | None =
                 return model_name
 
     if available_generators is not None:
+        # The curated fallback is capability-reviewed and remains usable when
+        # a GGUF package does not carry Hugging Face processor metadata.
         if DEFAULT_MULTIMODAL_GENERATOR_MODEL in available_generators:
             return DEFAULT_MULTIMODAL_GENERATOR_MODEL
         return None

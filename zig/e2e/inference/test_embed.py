@@ -424,22 +424,36 @@ def test_clipclap_modalities_share_projection_dim(api):
 
 
 @pytest.mark.multimodal
-def test_clipclap_text_image_embeddings_are_well_formed(api):
-    """ClipClap text and image branches should share a normalized embedding space."""
+def test_clipclap_text_image_alignment(api):
+    """ClipClap should preserve aggregate cross-modal retrieval alignment."""
     white_uri = make_solid_png_uri(255, 255, 255)
     black_uri = make_solid_png_uri(0, 0, 0)
-    white_text = api.embed("a white image", model=CLIPCLAP_MODEL)["data"][0]["embedding"]
-    white_image = api.embed(
-        [_image_part(white_uri)],
+    text_embeddings = api.embed(
+        ["a white image", "a black image"],
         model=CLIPCLAP_MODEL,
-    )["data"][0]["embedding"]
-    black_image = api.embed(
-        [_image_part(black_uri)],
+    )["data"]
+    image_embeddings = api.embed(
+        [_image_part(white_uri), _image_part(black_uri)],
         model=CLIPCLAP_MODEL,
-    )["data"][0]["embedding"]
+    )["data"]
+    white_text, black_text = [item["embedding"] for item in text_embeddings]
+    white_image, black_image = [item["embedding"] for item in image_embeddings]
 
-    assert len(white_text) == len(white_image) == len(black_image) == 512
-    for embedding in (white_text, white_image, black_image):
+    assert len(white_text) == len(black_text) == len(white_image) == len(black_image) == 512
+    for embedding in (white_text, black_text, white_image, black_image):
         assert all(math.isfinite(value) for value in embedding)
         assert abs(l2_norm(embedding) - 1.0) < 1e-4
     assert cosine_similarity(white_image, black_image) < 0.999
+
+    matched = (
+        cosine_similarity(white_text, white_image)
+        + cosine_similarity(black_text, black_image)
+    ) / 2
+    mismatched = (
+        cosine_similarity(white_text, black_image)
+        + cosine_similarity(black_text, white_image)
+    ) / 2
+    assert matched > mismatched, {
+        "matched_similarity": matched,
+        "mismatched_similarity": mismatched,
+    }

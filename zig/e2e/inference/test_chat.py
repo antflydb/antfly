@@ -20,6 +20,8 @@ import pytest
 from .models import default_generator_model_name
 
 pytestmark = pytest.mark.model_integration
+CHAT_SMOKE_PROMPT = "Say hello briefly"
+CHAT_SMOKE_MAX_TOKENS = 64
 
 
 def _first_generator_model(api):
@@ -34,24 +36,35 @@ def _first_generator_model(api):
 def test_chat_basic(api):
     model = _first_generator_model(api)
     resp = api.chat(
-        [{"role": "user", "content": "Say hello briefly"}],
+        [{"role": "user", "content": CHAT_SMOKE_PROMPT}],
         model=model,
-        max_tokens=16,
+        max_tokens=CHAT_SMOKE_MAX_TOKENS,
     )
     assert isinstance(resp.get("id"), str) and resp["id"].startswith("chatcmpl-"), resp
     assert resp.get("object") == "chat.completion", resp
     assert isinstance(resp.get("created"), int), resp
-    assert resp.get("choices", [{}])[0].get("message", {}).get("role") == "assistant", resp
-    assert isinstance(resp.get("usage"), dict), resp
+    message = resp.get("choices", [{}])[0].get("message", {})
+    assert message.get("role") == "assistant", resp
+    assert isinstance(message.get("content"), str), resp
+    usage = resp.get("usage")
+    assert isinstance(usage, dict), resp
+    # Channel-aware reasoning models intentionally withhold analysis tokens.
+    # An empty public answer is valid only when generation exhausted the
+    # requested budget before reaching the final channel.
+    choice = resp["choices"][0]
+    assert message["content"].strip() or (
+        choice.get("finish_reason") == "length"
+        and usage.get("completion_tokens") == CHAT_SMOKE_MAX_TOKENS
+    ), resp
 
 
 @pytest.mark.streaming
 def test_chat_streaming(api):
     model = _first_generator_model(api)
     r = api.chat(
-        [{"role": "user", "content": "Say hello briefly"}],
+        [{"role": "user", "content": CHAT_SMOKE_PROMPT}],
         model=model,
-        max_tokens=16,
+        max_tokens=CHAT_SMOKE_MAX_TOKENS,
         stream=True,
     )
     body = r.text
@@ -62,10 +75,14 @@ def test_chat_streaming(api):
 
     events = [json.loads(line) for line in data_lines[:-1]]
     assert events[0].get("choices", [{}])[0].get("delta", {}).get("role") == "assistant", events[0]
-    # A reasoning model can consume a small max_tokens budget without emitting
-    # visible content. The streaming contract still requires a terminal chunk.
-    assert events[-1].get("choices", [{}])[0].get("finish_reason") in (
+    content = "".join(
+        event.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+        for event in events[1:]
+    )
+    finish_reason = events[-1].get("choices", [{}])[0].get("finish_reason")
+    assert finish_reason in (
         "stop",
         "length",
         "tool_calls",
     ), events[-1]
+    assert content.strip() or finish_reason == "length", events

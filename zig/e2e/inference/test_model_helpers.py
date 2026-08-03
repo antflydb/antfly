@@ -133,9 +133,19 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
     assert qwen.pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
 
 
-def test_generation_defaults_share_one_model():
+def test_text_generation_defaults_share_one_model():
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_TOOL_GENERATOR_MODEL
-    assert DEFAULT_GENERATOR_MODEL == DEFAULT_MULTIMODAL_GENERATOR_MODEL
+    assert DEFAULT_MULTIMODAL_GENERATOR_MODEL == "ggml-org/gemma-4-e2b-it-gguf"
+
+
+def test_multimodal_model_selection_rejects_text_only_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"architectures": ["Qwen3ForCausalLM"]}))
+
+    assert models.find_multimodal_generator_model_name({DEFAULT_GENERATOR_MODEL}) is None
+    assert models.find_multimodal_generator_model_name({DEFAULT_MULTIMODAL_GENERATOR_MODEL}) == DEFAULT_MULTIMODAL_GENERATOR_MODEL
 
 
 def test_explicit_large_generator_is_bootstrapped(monkeypatch):

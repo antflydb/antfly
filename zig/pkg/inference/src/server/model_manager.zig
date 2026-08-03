@@ -1928,9 +1928,9 @@ pub const LoadedModel = struct {
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
         path: ?[]const u8,
-    ) !void {
-        if (slot.* != null) return;
-        const session_path = path orelse return;
+    ) !bool {
+        if (slot.* != null) return false;
+        const session_path = path orelse return false;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
         const strict_backend = [_]backends.BackendType{if (shared_ctx) |shared|
             shared.backendType()
@@ -1945,6 +1945,7 @@ pub const LoadedModel = struct {
         lease_slot.* = loaded.resource_lease;
         loaded.owns_session = false;
         loaded.resource_lease = null;
+        return true;
     }
 
     fn releaseOptionalSession(
@@ -1971,7 +1972,7 @@ pub const LoadedModel = struct {
     pub fn ensureVisionSession(self: *LoadedModel) !void {
         self.lockEmbeddingAssets();
         defer self.unlockEmbeddingAssets();
-        try self.ensureOptionalSession(
+        _ = try self.ensureOptionalSession(
             &self.vision_session,
             &self.vision_resource_lease,
             self.manifest.visual_model_path,
@@ -1985,37 +1986,68 @@ pub const LoadedModel = struct {
     }
 
     pub fn ensureEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
+        try self.ensurePrimaryEmbeddingAssetsLocked(include_text, include_image);
+        if (include_audio) try self.ensureAudioEmbeddingAssetsLocked();
+    }
+
+    /// Admit the reusable text/image sidecars transactionally. A failed
+    /// multi-session admission releases only sessions acquired by this call,
+    /// preserving already-warm assets for concurrent request efficiency.
+    pub fn ensurePrimaryEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool) !void {
+        var acquired_text_projection = false;
+        var acquired_vision = false;
+        var acquired_visual_projection = false;
+        errdefer {
+            if (acquired_visual_projection) releaseOptionalSession(
+                &self.visual_projection,
+                &self.visual_projection_resource_lease,
+            );
+            if (acquired_vision) releaseOptionalSession(
+                &self.vision_session,
+                &self.vision_resource_lease,
+            );
+            if (acquired_text_projection) releaseOptionalSession(
+                &self.text_projection,
+                &self.text_projection_resource_lease,
+            );
+        }
+
         if (include_text) {
-            try self.ensureOptionalSession(
+            acquired_text_projection = try self.ensureOptionalSession(
                 &self.text_projection,
                 &self.text_projection_resource_lease,
                 self.manifest.text_projection_path,
             );
         }
         if (include_image) {
-            try self.ensureOptionalSession(
+            acquired_vision = try self.ensureOptionalSession(
                 &self.vision_session,
                 &self.vision_resource_lease,
                 self.manifest.visual_model_path,
             );
-            try self.ensureOptionalSession(
+            acquired_visual_projection = try self.ensureOptionalSession(
                 &self.visual_projection,
                 &self.visual_projection_resource_lease,
                 self.manifest.visual_projection_path,
             );
         }
-        if (include_audio) {
-            try self.ensureOptionalSession(
-                &self.audio_session,
-                &self.audio_resource_lease,
-                self.manifest.audio_model_path,
-            );
-            try self.ensureOptionalSession(
-                &self.audio_projection,
-                &self.audio_projection_resource_lease,
-                self.manifest.audio_projection_path,
-            );
-        }
+    }
+
+    /// Admit the ephemeral audio sidecars as one phase. Any partial admission
+    /// is rolled back immediately so a failed request cannot strand a lease
+    /// and prevent subsequent text/image work from making progress.
+    pub fn ensureAudioEmbeddingAssetsLocked(self: *LoadedModel) !void {
+        errdefer self.releaseAudioEmbeddingAssetsLocked();
+        _ = try self.ensureOptionalSession(
+            &self.audio_session,
+            &self.audio_resource_lease,
+            self.manifest.audio_model_path,
+        );
+        _ = try self.ensureOptionalSession(
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+            self.manifest.audio_projection_path,
+        );
     }
 
     /// Release the lazily loaded audio branch after its outputs have been
@@ -2023,12 +2055,12 @@ pub const LoadedModel = struct {
     /// without counting an idle CLAP session against the same host budget.
     pub fn releaseAudioEmbeddingAssetsLocked(self: *LoadedModel) void {
         releaseOptionalSession(
-            &self.audio_session,
-            &self.audio_resource_lease,
-        );
-        releaseOptionalSession(
             &self.audio_projection,
             &self.audio_projection_resource_lease,
+        );
+        releaseOptionalSession(
+            &self.audio_session,
+            &self.audio_resource_lease,
         );
     }
 
@@ -2053,10 +2085,22 @@ pub const LoadedModel = struct {
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;
             if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
-        } else if (self.vision_session) |vs| {
-            if (session_factory.getClipConfig(vs)) |cfg| {
-                pipeline.config.image_size = cfg.image_size;
-                if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
+        }
+        self.bindEmbeddingPipelineAssetsLocked(&pipeline);
+        pipeline.resident_projection_stats = &self.resident_projection_stats;
+        pipeline.execution_lock = self.embeddingExecutionLock();
+        return pipeline;
+    }
+
+    /// Refresh the borrowed optional-session handles after a phased admission.
+    /// Callers must hold embedding_session_lock for the pipeline's full use.
+    pub fn bindEmbeddingPipelineAssetsLocked(self: *LoadedModel, pipeline: *EmbeddingPipeline) void {
+        if (session_factory.getClipConfig(self.session) == null) {
+            if (self.vision_session) |vs| {
+                if (session_factory.getClipConfig(vs)) |cfg| {
+                    pipeline.config.image_size = cfg.image_size;
+                    if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
+                }
             }
         }
         pipeline.vision_session = self.vision_session;
@@ -2064,9 +2108,6 @@ pub const LoadedModel = struct {
         pipeline.text_projection = self.text_projection;
         pipeline.visual_projection = self.visual_projection;
         pipeline.audio_projection = self.audio_projection;
-        pipeline.resident_projection_stats = &self.resident_projection_stats;
-        pipeline.execution_lock = self.embeddingExecutionLock();
-        return pipeline;
     }
 
     pub fn embeddingExecutionLock(self: *LoadedModel) ?*std.atomic.Mutex {
