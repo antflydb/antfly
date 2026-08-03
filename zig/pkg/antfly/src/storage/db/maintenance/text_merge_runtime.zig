@@ -37,6 +37,7 @@ pub var test_block_after_task_begin: std.atomic.Value(bool) = .init(false);
 pub var test_task_begin_entered: std.atomic.Value(bool) = .init(false);
 pub var test_release_after_task_begin: std.atomic.Value(bool) = .init(false);
 pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
+pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
@@ -65,6 +66,20 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stop(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn pause(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn resumeAfterPause(_: *@This()) !void {}
+
+    pub fn ensureRunning(_: *@This()) !bool {
+        return true;
+    }
+
+    pub fn isStarted(_: *const @This()) bool {
         return false;
     }
 
@@ -102,6 +117,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    desired_running: bool = false,
+    paused: bool = false,
     shutdown: bool = false,
     notified: bool = false,
     backpressure_events: u64 = 0,
@@ -137,14 +154,9 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
-        if (self.future != null) return;
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
-        self.mutex.lockUncancelable(io);
-        self.shutdown = false;
-        self.notified = true;
-        self.mutex.unlock(io);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.desired_running = true;
+        self.paused = false;
+        try self.startLocked();
     }
 
     /// Gracefully drains the active merge, if any, and stops the worker.
@@ -154,6 +166,64 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        self.desired_running = false;
+        self.paused = true;
+        return self.stopLocked();
+    }
+
+    /// Temporarily prevents worker publication while preserving the desired
+    /// running state. A failed resume can therefore be retried safely without
+    /// racing a later structural catalog mutation.
+    pub fn pause(self: *TextMergeRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.paused = true;
+        const desired = self.desired_running;
+        _ = self.stopLocked();
+        return desired;
+    }
+
+    pub fn resumeAfterPause(self: *TextMergeRuntime) !void {
+        if (!self.config.enabled) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.paused = false;
+        if (self.desired_running) try self.startLocked();
+    }
+
+    /// Used by the DB restart supervisor. False means a structural mutation
+    /// currently owns the pause; true means the runtime is running or no
+    /// longer desires a worker.
+    pub fn ensureRunning(self: *TextMergeRuntime) !bool {
+        if (!self.config.enabled) return true;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (!self.desired_running) return true;
+        if (self.paused) return false;
+        try self.startLocked();
+        return true;
+    }
+
+    pub fn isStarted(self: *TextMergeRuntime) bool {
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        return self.future != null;
+    }
+
+    fn startLocked(self: *TextMergeRuntime) !void {
+        if (self.future != null or self.paused or !self.desired_running) return;
+        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        const io = io_impl.io();
+        if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
+        self.mutex.lockUncancelable(io);
+        self.shutdown = false;
+        self.notified = true;
+        self.mutex.unlock(io);
+        self.future = try io.concurrent(workerMain, .{self});
+    }
+
+    fn stopLocked(self: *TextMergeRuntime) bool {
         const io_impl = self.io_impl orelse return false;
         const io = io_impl.io();
         if (self.future == null) return false;
@@ -358,6 +428,23 @@ fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
+
+fn consumeTestStartFailure() bool {
+    var remaining = test_start_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_start_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |actual| {
+            remaining = actual;
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 fn lockApplyShared(lock: *apply_rw_lock_mod.ApplyRwLock) void {

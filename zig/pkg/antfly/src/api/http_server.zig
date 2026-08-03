@@ -4745,7 +4745,11 @@ pub const ApiHttpServer = struct {
                 const distributed_tables = try commit_req.distributedTables(self.alloc);
                 defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
                 self.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.InvalidBatchRequest,
+                    error.InvalidArgument,
+                    error.InvalidGraphEdges,
+                    error.UnsupportedTransformOperation,
+                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
                     else => return err,
                 };
                 if (try self.validateCommitReadSet(commit_req)) |conflict| {
@@ -4761,7 +4765,11 @@ pub const ApiHttpServer = struct {
                 }
 
                 const outcome = (source.commitTransaction(self.alloc, distributed_tables, commit_req.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.InvalidBatchRequest,
+                    error.InvalidArgument,
+                    error.InvalidGraphEdges,
+                    error.UnsupportedTransformOperation,
+                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
                     error.TopologyChanged => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -5094,7 +5102,17 @@ pub const ApiHttpServer = struct {
                 }
 
                 const outcome = (source.commitTransactionWithId(self.alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.InvalidBatchRequest,
+                    error.InvalidArgument,
+                    error.InvalidGraphEdges,
+                    error.UnsupportedTransformOperation,
+                    => {
+                        // The participant has terminally aborted a transaction
+                        // that reached write validation; do not retain a local
+                        // session that can no longer be committed with its ID.
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        return try textResponse(self.alloc, 400, "invalid transaction commit request");
+                    },
                     error.TopologyChanged => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -24171,6 +24189,26 @@ test "api http graph push preserves projected edges across restart" {
             defer invalid_resp.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
         }
+
+        const invalid_txn_batch = try test_contract_helpers.normalizeBatchRequest(alloc,
+            \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"title","value":"must-not-commit"},{"op":"$set","path":"$._edges.graph.FRIEND","value":[]}]}],"sync_level":"full_index"}
+        );
+        defer alloc.free(invalid_txn_batch);
+        const invalid_txn_body = try test_contract_helpers.encodeTransactionCommitRequest(
+            alloc,
+            &.{},
+            &.{.{ .table_name = "docs", .batch_json = invalid_txn_batch }},
+            "full_index",
+        );
+        defer alloc.free(invalid_txn_body);
+        var invalid_txn_resp = try server.handle(.{
+            .method = .POST,
+            .uri = routes.Routes.transactions_commit,
+            .content_type = "application/json",
+            .body = invalid_txn_body,
+        });
+        defer invalid_txn_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid_txn_resp.status);
 
         const stored = (try db.get(alloc, "a")) orelse return error.TestExpectedEqual;
         defer alloc.free(stored);

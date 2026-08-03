@@ -706,7 +706,9 @@ const AsyncContext = struct {
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     target_advance_repair_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
+    text_merge_restart_state: std.atomic.Value(u8) = .init(0),
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+    sparse_compaction_restart_state: std.atomic.Value(u8) = .init(0),
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     repair_options: types.ArtifactRepairRunOptions = .{},
@@ -6432,6 +6434,125 @@ pub const DB = struct {
         };
     }
 
+    const MaintenanceRuntimeKind = enum {
+        text_merge,
+        sparse_compaction,
+    };
+
+    fn maintenanceRestartState(ctx: *AsyncContext, kind: MaintenanceRuntimeKind) *std.atomic.Value(u8) {
+        return switch (kind) {
+            .text_merge => &ctx.text_merge_restart_state,
+            .sparse_compaction => &ctx.sparse_compaction_restart_state,
+        };
+    }
+
+    fn ensureMaintenanceRuntimeRunning(ctx: *AsyncContext, kind: MaintenanceRuntimeKind) !bool {
+        return switch (kind) {
+            .text_merge => if (ctx.text_merge_runtime) |runtime| try runtime.ensureRunning() else true,
+            .sparse_compaction => if (ctx.sparse_compaction_runtime) |runtime| try runtime.ensureRunning() else true,
+        };
+    }
+
+    const MaintenanceRestartWork = struct {
+        ctx: *AsyncContext,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+        kind: MaintenanceRuntimeKind,
+
+        const retry_initial_ms: i64 = 25;
+        const retry_max_ms: i64 = 1000;
+        const retries_per_job: usize = 8;
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            const restart_state = maintenanceRestartState(work.ctx, work.kind);
+            var retries: usize = 0;
+            while (true) {
+                if (work.ctx.background_closing.load(.acquire)) {
+                    restart_state.store(0, .release);
+                    return;
+                }
+
+                var start_error: ?anyerror = null;
+                const running = ensureMaintenanceRuntimeRunning(work.ctx, work.kind) catch |err| blk: {
+                    start_error = err;
+                    break :blk false;
+                };
+                if (running) {
+                    if (restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
+                    if (restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
+                        retries = 0;
+                        continue;
+                    }
+                    return;
+                }
+
+                retries += 1;
+                if (start_error) |err| {
+                    if (retries == 1 or std.math.isPowerOfTwo(retries)) {
+                        std.log.warn("{s} runtime restart retry attempt={} err={s}", .{
+                            @tagName(work.kind),
+                            retries,
+                            @errorName(err),
+                        });
+                    }
+                }
+                // A paused runtime is owned by a subsequent structural
+                // mutation. Wait without starting it behind that mutation.
+                if (work.ctx.io) |io| {
+                    const shift: u6 = @intCast(@min(retries - 1, 5));
+                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
+                    io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                } else {
+                    restart_state.store(0, .release);
+                    return error.MaintenanceRuntimeUnavailable;
+                }
+                if (retries >= retries_per_job) {
+                    // Yield the shared durable lane during persistent failure;
+                    // the desired-running bit makes resubmission idempotent.
+                    restart_state.store(0, .release);
+                    scheduleMaintenanceRestartContext(work.ctx, work.lane, work.owner_id, work.kind);
+                    return;
+                }
+            }
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            std.heap.page_allocator.destroy(work);
+        }
+    };
+
+    fn scheduleMaintenanceRestartContext(
+        ctx: *AsyncContext,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+        kind: MaintenanceRuntimeKind,
+    ) void {
+        if (ctx.background_closing.load(.acquire)) return;
+        const restart_state = maintenanceRestartState(ctx, kind);
+        if (restart_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            _ = restart_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+            return;
+        }
+        const work = std.heap.page_allocator.create(MaintenanceRestartWork) catch {
+            restart_state.store(0, .release);
+            return;
+        };
+        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id, .kind = kind };
+        lane.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = MaintenanceRestartWork.run,
+            .deinit = MaintenanceRestartWork.deinit,
+        }) catch |err| {
+            std.heap.page_allocator.destroy(work);
+            restart_state.store(0, .release);
+            std.log.warn("{s} runtime restart was not scheduled err={s}", .{ @tagName(kind), @errorName(err) });
+        };
+    }
+
     fn quiesceEnrichmentForStructuralMutation(self: *DB) bool {
         const desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
         lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
@@ -6444,28 +6565,40 @@ pub const DB = struct {
 
     fn quiesceTextMergeForStructuralMutation(self: *DB) bool {
         const runtime = self.text_merge_runtime orelse return false;
-        return runtime.stop();
+        return runtime.pause();
     }
 
     fn quiesceSparseCompactionForStructuralMutation(self: *DB) bool {
         const runtime = self.sparse_compaction_runtime orelse return false;
-        return runtime.stop();
+        return runtime.pause();
     }
 
     fn restartTextMergeAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
         const runtime = self.text_merge_runtime orelse return;
-        runtime.start() catch |err| {
+        runtime.resumeAfterPause() catch |err| {
             // Index catalog durability is already decided at this point.
             // Queries and foreground indexing remain available; surface the
             // maintenance degradation without misreporting the mutation.
             std.log.err("failed to restart text merge runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            scheduleMaintenanceRestartContext(
+                self.async_context,
+                self.backend_runtime.durable_jobs,
+                self.repair_cleanup_owner_id,
+                .text_merge,
+            );
         };
     }
 
     fn restartSparseCompactionAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
         const runtime = self.sparse_compaction_runtime orelse return;
-        runtime.start() catch |err| {
+        runtime.resumeAfterPause() catch |err| {
             std.log.err("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            scheduleMaintenanceRestartContext(
+                self.async_context,
+                self.backend_runtime.durable_jobs,
+                self.repair_cleanup_owner_id,
+                .sparse_compaction,
+            );
         };
     }
 
@@ -6475,8 +6608,15 @@ pub const DB = struct {
         index_name: []const u8,
         restart_text_merge: bool,
         restart_sparse_compaction: bool,
-        catalog_barrier_held: bool = true,
+        catalog_barrier_held: bool = false,
         active: bool = true,
+
+        fn acquireCatalogBarrierUntil(self: *@This(), deadline_ns: u64) bool {
+            std.debug.assert(self.active and !self.catalog_barrier_held);
+            if (!self.db.beginIndexCatalogBarrierUntil(deadline_ns)) return false;
+            self.catalog_barrier_held = true;
+            return true;
+        }
 
         fn releaseCatalogBarrier(self: *@This()) void {
             if (!self.catalog_barrier_held) return;
@@ -6548,23 +6688,17 @@ pub const DB = struct {
         operation: []const u8,
         index_name: []const u8,
     ) IndexStructuralMutationGuard {
-        return self.beginIndexStructuralMutationUntil(operation, index_name, std.math.maxInt(u64)) orelse unreachable;
+        var guard = self.beginDrainedIndexStructuralMutation(operation, index_name);
+        if (!guard.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
+        return guard;
     }
 
-    fn beginIndexStructuralMutationUntil(
+    fn beginDrainedIndexStructuralMutation(
         self: *DB,
         operation: []const u8,
         index_name: []const u8,
-        deadline_ns: u64,
-    ) ?IndexStructuralMutationGuard {
+    ) IndexStructuralMutationGuard {
         lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
-        // Published dense searches intentionally bypass the apply lock. Raise
-        // their catalog barrier before draining maintenance so no lock-free
-        // reader can retain a pointer across an inline-array reallocation.
-        if (!self.beginIndexCatalogBarrierUntil(deadline_ns)) {
-            self.index_structural_mutation_mutex.unlock();
-            return null;
-        }
         return .{
             .db = self,
             .operation = operation,
@@ -11898,17 +12032,20 @@ pub const DB = struct {
         );
         if (ready_sequence != converged_sequence) return error.IndexGenerationManifestMismatch;
         try checkArtifactRepairActivationOwner(options);
-        const activation_started_ns = monotonicTimeNs();
-        const activation_deadline_ns = activation_started_ns +| max_activation_pause_ns;
         // Final publication detaches and later destroys the active inline
-        // generation. Drain maintenance before taking the apply lock so a
-        // task cannot retain a pointer into that generation across the swap.
-        var structural_guard = self.beginIndexStructuralMutationUntil(
+        // generation. Drain maintenance before starting the bounded reader
+        // pause: this work has no catalog effect and may wait for an active
+        // merge or compaction whose duration is not part of query downtime.
+        var structural_guard = self.beginDrainedIndexStructuralMutation(
             "index repair activation",
             cfg.name,
-            activation_deadline_ns,
-        ) orelse return error.ShadowIndexCatchUpIncomplete;
+        );
         defer structural_guard.deinit();
+        const activation_started_ns = monotonicTimeNs();
+        const activation_deadline_ns = activation_started_ns +| max_activation_pause_ns;
+        if (!structural_guard.acquireCatalogBarrierUntil(activation_deadline_ns)) {
+            return error.ShadowIndexCatchUpIncomplete;
+        }
         var unpublished_replacement: ?index_manager_mod.IndexManager.DetachedIndex = null;
         defer if (unpublished_replacement) |*replacement| {
             shadow_manager.destroyDetachedReplacementIndex(replacement);
@@ -69787,6 +69924,50 @@ test "db delete full text index drains active merge before closing generation" {
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
     }));
+}
+
+test "db structural mutation autonomously retries transient maintenance restart failures" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{ .enabled = true, .idle_interval_ms = 10_000, .error_interval_ms = 10_000 },
+        .sparse_compaction = .{ .enabled = true, .idle_interval_ms = 10_000, .error_interval_ms = 10_000 },
+    });
+    defer db.close();
+    const text_runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    const sparse_runtime = db.sparse_compaction_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(text_runtime.isStarted());
+    try std.testing.expect(sparse_runtime.isStarted());
+
+    // Inject only the first post-drain spawn in each runtime. The structural
+    // mutation remains successful, and the durable supervisor must restore
+    // both workers without another foreground mutation.
+    text_merge_runtime_mod.test_start_failures_remaining.store(1, .release);
+    sparse_compaction_runtime_mod.test_start_failures_remaining.store(1, .release);
+    defer {
+        text_merge_runtime_mod.test_start_failures_remaining.store(0, .release);
+        sparse_compaction_runtime_mod.test_start_failures_remaining.store(0, .release);
+    }
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+
+    var recovered = false;
+    for (0..500) |_| {
+        if (text_runtime.isStarted() and
+            sparse_runtime.isStarted() and
+            db.async_context.text_merge_restart_state.load(.acquire) == 0 and
+            db.async_context.sparse_compaction_restart_state.load(.acquire) == 0)
+        {
+            recovered = true;
+            break;
+        }
+        try db.async_context.io.?.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(recovered);
+    try std.testing.expectEqual(@as(u32, 0), text_merge_runtime_mod.test_start_failures_remaining.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), sparse_compaction_runtime_mod.test_start_failures_remaining.load(.acquire));
 }
 
 test "db post-delete filter reader does not deadlock behind queued cleanup writer" {
