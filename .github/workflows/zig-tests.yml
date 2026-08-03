@@ -785,20 +785,8 @@ jobs:
           echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
-      - name: Run Antfly full E2E
-        id: antfly_full_e2e
-        continue-on-error: true
-        working-directory: zig
-        env:
-          ANTFLY_BIN: ./zig-out/bin/antfly
-          ANTFLY_LSM_OPEN_DEBUG: "1"
-        run: |
-          chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
-
       - name: Run Antfly inference full E2E
         id: inference_full_e2e
-        if: always()
         continue-on-error: true
         working-directory: zig
         env:
@@ -809,8 +797,24 @@ jobs:
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
           ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
-          ANTFLY_INFERENCE_SERVER_CONFIG: e2e/inference/ci-server.json
-        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+        run: |
+          chmod +x ./zig-out/bin/antfly
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+
+      # Run the non-inference suite second so large model imports see the
+      # runner's maximum available memory after the build has exited.
+      - name: Run Antfly full E2E
+        id: antfly_full_e2e
+        if: always()
+        continue-on-error: true
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_LSM_OPEN_DEBUG: "1"
+        run: |
+          chmod +x ./zig-out/bin/antfly
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
 
       - name: Report full E2E result
         if: always()

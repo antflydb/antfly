@@ -25,8 +25,8 @@ Usage:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
     ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
 
-    # Optional inference server configuration:
-    ANTFLY_INFERENCE_SERVER_CONFIG=/path/to/config.json uv run --project e2e/inference pytest e2e/inference
+    # Optional inference server model-cache limit:
+    ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
@@ -104,7 +104,7 @@ class InferenceServer:
         ml_path: str,
         host: str,
         port: int,
-        config_path: str | None = None,
+        max_loaded_models: str | None = None,
     ):
         self.url = f"http://{host}:{port}"
         self.output = tempfile.TemporaryFile(mode="w+b")
@@ -120,7 +120,11 @@ class InferenceServer:
                 models_path,
                 "--ml-dir",
                 ml_path,
-                *(["--config", config_path] if config_path else []),
+                *(
+                    ["--max-loaded-models", max_loaded_models]
+                    if max_loaded_models is not None
+                    else []
+                ),
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
@@ -177,7 +181,7 @@ def base_url():
         ml_path,
         "127.0.0.1",
         port,
-        config_path=env_first("ANTFLY_INFERENCE_SERVER_CONFIG"),
+        max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
     )
     yield server.url
     server.stop()
