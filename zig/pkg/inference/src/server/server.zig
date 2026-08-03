@@ -9534,6 +9534,34 @@ fn admitPrimaryDenseEmbeddingAssetsAfterAudio(
     model.bindEmbeddingPipelineAssetsLocked(pipeline);
 }
 
+const PartialPrimaryDenseEmbeddingAdmission = struct {
+    text_error: ?anyerror = null,
+    image_error: ?anyerror = null,
+};
+
+fn admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(
+    model: *model_manager_mod.LoadedModel,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    inputs: *const ParsedDenseEmbedInputs,
+) PartialPrimaryDenseEmbeddingAdmission {
+    var admission = PartialPrimaryDenseEmbeddingAdmission{};
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+
+    if (inputs.texts.items.len > 0) {
+        model.ensurePrimaryEmbeddingAssetsLocked(true, false) catch |err| {
+            admission.text_error = err;
+        };
+    }
+    if (inputs.images.items.len > 0) {
+        model.ensurePrimaryEmbeddingAssetsLocked(false, true) catch |err| {
+            admission.image_error = err;
+        };
+    }
+    model.bindEmbeddingPipelineAssetsLocked(pipeline);
+    return admission;
+}
+
 fn releaseAudioDenseEmbeddingAssets(model: *model_manager_mod.LoadedModel) void {
     model.lockEmbeddingAssets();
     defer model.unlockEmbeddingAssets();
@@ -9623,21 +9651,14 @@ fn embedDenseInputsPartial(
     inputs: *const ParsedDenseEmbedInputs,
     model: *model_manager_mod.LoadedModel,
 ) !DenseEmbedPartialResult {
-    const partial_embeddings = try allocator.alloc(?[]f32, inputs.total_count);
-    errdefer allocator.free(partial_embeddings);
-    const empty_errors = try allocator.alloc(EmbedItemError, 0);
-
-    var result = DenseEmbedPartialResult{
-        .embeddings = partial_embeddings,
-        .errors = empty_errors,
-    };
-    @memset(result.embeddings, null);
+    var result = try initDenseEmbedPartialResult(allocator, inputs.total_count);
     errdefer result.deinit(allocator);
 
     var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
     errdefer errors.deinit(allocator);
     try errors.appendSlice(allocator, inputs.parse_errors.items);
 
+    var primary_admission = PartialPrimaryDenseEmbeddingAdmission{};
     if (inputs.audio.items.len > 0) {
         {
             defer releaseAudioDenseEmbeddingAssets(model);
@@ -9659,10 +9680,16 @@ fn embedDenseInputsPartial(
                 try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
             }
         }
-        try admitPrimaryDenseEmbeddingAssetsAfterAudio(model, pipeline, inputs);
+        primary_admission = admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(model, pipeline, inputs);
+        if (primary_admission.text_error) |err| {
+            try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.texts.items, err, "model_admission");
+        }
+        if (primary_admission.image_error) |err| {
+            try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.images.items, err, "model_admission");
+        }
     }
 
-    if (inputs.texts.items.len > 0) {
+    if (primary_admission.text_error == null and inputs.texts.items.len > 0) {
         const texts = try allocator.alloc([]const u8, inputs.texts.items.len);
         defer allocator.free(texts);
         for (inputs.texts.items, 0..) |item, i| texts[i] = item.text;
@@ -9677,7 +9704,7 @@ fn embedDenseInputsPartial(
         }
     }
 
-    if (inputs.images.items.len > 0) {
+    if (primary_admission.image_error == null and inputs.images.items.len > 0) {
         const images = try allocator.alloc([]const u8, inputs.images.items.len);
         defer allocator.free(images);
         for (inputs.images.items, 0..) |item, i| images[i] = item.bytes;
@@ -9711,6 +9738,29 @@ fn embedDenseInputsPartial(
     allocator.free(result.errors);
     result.errors = owned_errors;
     return result;
+}
+
+fn initDenseEmbedPartialResult(allocator: std.mem.Allocator, total_count: usize) !DenseEmbedPartialResult {
+    const embeddings = try allocator.alloc(?[]f32, total_count);
+    errdefer allocator.free(embeddings);
+    const errors = try allocator.alloc(EmbedItemError, 0);
+    @memset(embeddings, null);
+    return .{
+        .embeddings = embeddings,
+        .errors = errors,
+    };
+}
+
+fn appendDenseEmbeddingItemErrors(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayListUnmanaged(EmbedItemError),
+    items: anytype,
+    err: anyerror,
+    stage: []const u8,
+) !void {
+    for (items) |item| {
+        try errors.append(allocator, embedItemFailure(item.index, err, stage));
+    }
 }
 
 fn embedTextInputsIndividually(
@@ -10094,6 +10144,60 @@ test "Antfly inference per-item dense parser records invalid media and keeps sib
     try std.testing.expectEqualStrings("INVALID_MEDIA", inputs.parse_errors.items[0].code);
     try std.testing.expectEqualStrings("parse", inputs.parse_errors.items[0].stage);
     try std.testing.expectEqual(false, inputs.parse_errors.items[0].retryable);
+}
+
+test "dense partial result cleanup owns every allocation exactly once" {
+    const Probe = struct {
+        fn failAfterPopulating(allocator: std.mem.Allocator) !void {
+            var result = try initDenseEmbedPartialResult(allocator, 2);
+            errdefer result.deinit(allocator);
+            result.embeddings[0] = try allocator.dupe(f32, &.{ 1.0, 2.0 });
+            return error.InjectedFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFailure, Probe.failAfterPopulating(std.testing.allocator));
+}
+
+test "primary embedding admission failures are recorded per affected item" {
+    const allocator = std.testing.allocator;
+    const texts = [_]ParsedTextEmbedInput{
+        .{ .index = 1, .text = "first" },
+        .{ .index = 3, .text = "second" },
+    };
+    var image_bytes = [_]u8{ 1, 2, 3 };
+    const images = [_]ParsedBinaryEmbedInput{
+        .{ .index = 4, .bytes = &image_bytes, .mime_type = "image/png" },
+    };
+    var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
+    defer errors.deinit(allocator);
+
+    try appendDenseEmbeddingItemErrors(
+        allocator,
+        &errors,
+        &texts,
+        error.ResourceTemporarilyUnavailable,
+        "model_admission",
+    );
+    try appendDenseEmbeddingItemErrors(
+        allocator,
+        &errors,
+        &images,
+        error.ResourceLimitExceeded,
+        "model_admission",
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), errors.items.len);
+    try std.testing.expectEqual(@as(i64, 1), errors.items[0].index);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", errors.items[0].code);
+    try std.testing.expectEqual(@as(u16, 503), errors.items[0].status);
+    try std.testing.expect(errors.items[0].retryable);
+    try std.testing.expectEqual(@as(i64, 3), errors.items[1].index);
+    try std.testing.expectEqualStrings("model_admission", errors.items[1].stage);
+    try std.testing.expectEqual(@as(i64, 4), errors.items[2].index);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", errors.items[2].code);
+    try std.testing.expectEqual(@as(u16, 400), errors.items[2].status);
+    try std.testing.expect(!errors.items[2].retryable);
 }
 
 fn expectJsonNumber(expected: f64, value: std.json.Value) !void {

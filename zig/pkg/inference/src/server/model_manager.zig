@@ -2189,8 +2189,9 @@ pub const LoadedModel = struct {
         return pipeline;
     }
 
-    /// Refresh the borrowed optional-session handles after a phased admission.
-    /// Callers must hold embedding_session_lock for the pipeline's full use.
+    /// Refresh borrowed optional-session handles after a phased admission.
+    /// Callers hold embedding_session_lock while rebinding and retain an
+    /// embedding asset lease for the pipeline's full use.
     pub fn bindEmbeddingPipelineAssetsLocked(self: *LoadedModel, pipeline: *EmbeddingPipeline) void {
         if (session_factory.getClipConfig(self.session) == null) {
             if (self.vision_session) |vs| {
@@ -2404,6 +2405,76 @@ test "embedding asset gate admits concurrent readers and excludes writers" {
     lease.release();
     try std.testing.expect(gate.tryLockExclusive());
     gate.unlockExclusive();
+}
+
+test "embedding asset gate blocks late readers behind a queued writer" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding)
+        return error.SkipZigTest;
+
+    const Writer = struct {
+        gate: *EmbeddingAssetGate,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.gate.lockExclusive();
+            self.acquired.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            self.gate.unlockExclusive();
+        }
+    };
+
+    var gate = EmbeddingAssetGate{};
+    gate.lockShared();
+    var shared_held = true;
+    defer if (shared_held) gate.unlockShared();
+
+    var writer = Writer{ .gate = &gate };
+    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        if (shared_held) {
+            gate.unlockShared();
+            shared_held = false;
+        }
+        writer.release.store(true, .release);
+        writer_thread.join();
+    };
+
+    var writer_queued = false;
+    for (0..200_000) |_| {
+        if (!gate.tryLockShared()) {
+            writer_queued = true;
+            break;
+        }
+        gate.unlockShared();
+        std.Thread.yield() catch {};
+    }
+    if (!writer_queued) return error.TestTimeout;
+
+    // Once the writer owns the reader gate, a newly arriving reader cannot
+    // join the active reader cohort and bypass it.
+    try std.testing.expect(!gate.tryLockShared());
+    gate.unlockShared();
+    shared_held = false;
+
+    var writer_acquired = false;
+    for (0..200_000) |_| {
+        if (writer.acquired.load(.acquire)) {
+            writer_acquired = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!writer_acquired) return error.TestTimeout;
+    try std.testing.expect(!gate.tryLockShared());
+
+    writer.release.store(true, .release);
+    writer_thread.join();
+    writer_joined = true;
+
+    try std.testing.expect(gate.tryLockShared());
+    gate.unlockShared();
 }
 
 test "embedding asset rollback closes only newly acquired primary sessions" {
