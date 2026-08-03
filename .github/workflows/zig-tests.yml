@@ -794,7 +794,7 @@ jobs:
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           # Use one model for ordinary, tool-calling, and multimodal generation
           # so the ReleaseSafe suite does not retain competing generator sessions.
-          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
+          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: unsloth/Qwen3-1.7B-GGUF
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
           ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"

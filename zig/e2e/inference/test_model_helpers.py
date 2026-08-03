@@ -127,6 +127,11 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
 
     assert gemma.pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0"
 
+    monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "unsloth/Qwen3-1.7B-GGUF")
+    specs = _env_model_specs()
+    qwen = next(spec for spec in specs if spec.repo == "unsloth/Qwen3-1.7B-GGUF")
+    assert qwen.pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
+
 
 def test_generation_defaults_share_one_model():
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_TOOL_GENERATOR_MODEL
@@ -147,3 +152,4 @@ def test_explicit_large_generator_is_bootstrapped(monkeypatch):
 
     assert bootstrap_models_for_listing(listing)
     assert [spec.repo for spec in pulled] == [DEFAULT_GENERATOR_MODEL]
+    assert pulled[0].pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"

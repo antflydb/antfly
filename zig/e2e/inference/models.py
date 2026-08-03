@@ -229,6 +229,7 @@ GENERATOR_MODELS = [
         name="Qwen3-1.7B-GGUF",
         repo="unsloth/Qwen3-1.7B-GGUF",
         task="generators",
+        variant="gguf:Q4_K_M",
         large=True,
     ),
     ModelSpec(
@@ -240,7 +241,7 @@ GENERATOR_MODELS = [
 ]
 
 
-DEFAULT_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
+DEFAULT_GENERATOR_MODEL = "unsloth/Qwen3-1.7B-GGUF"
 DEFAULT_TOOL_GENERATOR_MODEL = DEFAULT_GENERATOR_MODEL
 DEFAULT_MULTIMODAL_GENERATOR_MODEL = DEFAULT_GENERATOR_MODEL
 

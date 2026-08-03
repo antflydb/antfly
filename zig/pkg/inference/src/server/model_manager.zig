@@ -1943,9 +1943,30 @@ pub const LoadedModel = struct {
         loaded.resource_lease = null;
     }
 
-    pub fn ensureVisionSession(self: *LoadedModel) !void {
+    fn releaseOptionalSession(
+        slot: *?backends.Session,
+        lease_slot: *?runtime.tier.memory.AdmissionLease,
+    ) void {
+        if (slot.*) |session| session.close();
+        slot.* = null;
+        if (lease_slot.*) |*lease| lease.release();
+        lease_slot.* = null;
+    }
+
+    /// Serialize optional embedding-session lifetime with execution. Composite
+    /// models can otherwise retain a CLAP sidecar while a CLIP request is
+    /// admitted, even though the two branches execute sequentially.
+    pub fn lockEmbeddingAssets(self: *LoadedModel) void {
         spinLock(&self.embedding_session_lock);
-        defer self.embedding_session_lock.unlock();
+    }
+
+    pub fn unlockEmbeddingAssets(self: *LoadedModel) void {
+        self.embedding_session_lock.unlock();
+    }
+
+    pub fn ensureVisionSession(self: *LoadedModel) !void {
+        self.lockEmbeddingAssets();
+        defer self.unlockEmbeddingAssets();
         try self.ensureOptionalSession(
             &self.vision_session,
             &self.vision_resource_lease,
@@ -1954,9 +1975,12 @@ pub const LoadedModel = struct {
     }
 
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
-        spinLock(&self.embedding_session_lock);
-        defer self.embedding_session_lock.unlock();
+        self.lockEmbeddingAssets();
+        defer self.unlockEmbeddingAssets();
+        try self.ensureEmbeddingAssetsLocked(include_text, include_image, include_audio);
+    }
 
+    pub fn ensureEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         if (include_text) {
             try self.ensureOptionalSession(
                 &self.text_projection,
@@ -1988,6 +2012,20 @@ pub const LoadedModel = struct {
                 self.manifest.audio_projection_path,
             );
         }
+    }
+
+    /// Release the lazily loaded audio branch after its outputs have been
+    /// materialized. The primary CLIP session can then admit text/image work
+    /// without counting an idle CLAP session against the same host budget.
+    pub fn releaseAudioEmbeddingAssetsLocked(self: *LoadedModel) void {
+        releaseOptionalSession(
+            &self.audio_session,
+            &self.audio_resource_lease,
+        );
+        releaseOptionalSession(
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+        );
     }
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
