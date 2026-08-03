@@ -21708,19 +21708,24 @@ pub const DB = struct {
     const published_dense_reader_mask: u32 = published_dense_catalog_closed - 1;
 
     fn beginPublishedDenseSearch(self: *DB) bool {
-        const observed = self.published_dense_admission.load(.monotonic);
-        if (observed & published_dense_catalog_closed != 0) return false;
-        // Falling back to the apply lock is safe and preferable to wrapping
-        // the reader count into the catalog-closed bit.
-        if (observed & published_dense_reader_mask == published_dense_reader_mask) return false;
-
-        const previous = self.published_dense_admission.fetchAdd(1, .acquire);
-        if (previous & published_dense_catalog_closed != 0) {
-            _ = self.published_dense_admission.fetchSub(1, .release);
-            return false;
+        var observed = self.published_dense_admission.load(.monotonic);
+        while (true) {
+            if (observed & published_dense_catalog_closed != 0) return false;
+            // Check and increment in one CAS so concurrent readers at the
+            // representable limit cannot carry into the catalog-closed bit.
+            // Falling back to the apply lock is safe at saturation.
+            if (observed & published_dense_reader_mask == published_dense_reader_mask) return false;
+            if (self.published_dense_admission.cmpxchgWeak(
+                observed,
+                observed + 1,
+                .acquire,
+                .monotonic,
+            )) |actual| {
+                observed = actual;
+                continue;
+            }
+            return true;
         }
-        std.debug.assert(previous & published_dense_reader_mask != published_dense_reader_mask);
-        return true;
     }
 
     fn endPublishedDenseSearch(self: *DB) void {
@@ -41975,6 +41980,24 @@ test "db index catalog barrier and apply acquisition honor activation deadline" 
     db.core.lockApplyExclusive();
     defer db.core.unlockApplyExclusive();
     try std.testing.expect(!db.lockApplyUntil(monotonicTimeNs() + std.time.ns_per_ms));
+}
+
+test "db published dense admission cannot overflow into catalog closure" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    db.published_dense_admission.store(DB.published_dense_reader_mask - 1, .monotonic);
+    defer db.published_dense_admission.store(0, .monotonic);
+
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    try std.testing.expectEqual(DB.published_dense_reader_mask, db.published_dense_admission.load(.monotonic));
+    try std.testing.expect(!db.beginPublishedDenseSearch());
+    try std.testing.expectEqual(DB.published_dense_reader_mask, db.published_dense_admission.load(.monotonic));
 }
 
 test "db dense fast path registers before catalog lookup during index deletion" {
