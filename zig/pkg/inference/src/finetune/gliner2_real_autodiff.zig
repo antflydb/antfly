@@ -688,33 +688,6 @@ pub const GlinerAutodiffCtx = struct {
         };
     }
 
-    fn buildSpanStartLossChunkedBySample(
-        self: *GlinerAutodiffCtx,
-        bld: *Builder,
-        hidden: NodeId,
-        targets: NodeId,
-        chunk_samples: u32,
-    ) !NodeId {
-        // Sample chunking is DISABLED for the single-instance legacy structure loss
-        // because it produces out-of-bounds gathers / wrong gradients. Each chunk's
-        // buildSpanStartLossForBatch rebuilds a chunk-local projected_span
-        // ([chunk_rows, H]) and count-GRU-state table ([20*chunk_batch*E, H]) indexed
-        // 0..chunk_rows-1, but the packed target columns carry GLOBAL indices:
-        // row_idx = sample*max_spans + span and count_idx = count_state*batch_size*E +
-        // sample*E + entity (see fill in train_gliner2_autodiff.zig). For any chunk
-        // past the first (sample_start > 0) those indices exceed the chunk-local
-        // tables → native IndexOutOfBounds (training aborts) / Metal reads garbage
-        // (silently wrong loss + gradients). Re-enabling requires re-basing the
-        // row_idx and count_idx columns of chunk_targets to chunk-local values
-        // (subtract sample_start*max_spans from row_idx; recompute count_idx with the
-        // chunk batch stride) before calling buildSpanStartLossForBatch. Until that is
-        // implemented and validated, fall back to the correct full-batch path. The
-        // per-instance path (structure_max_instances > 1) is matmul-based and remains
-        // chunk-safe (see buildGliner2PerInstanceStructureLoss).
-        _ = chunk_samples;
-        return self.buildSpanStartLoss(bld, hidden, targets);
-    }
-
     fn buildGliner2TotalLoss(
         self: *GlinerAutodiffCtx,
         bld: *Builder,
@@ -1584,21 +1557,6 @@ fn layerNormNamed(
     return bld.layerNorm(input, gamma, beta, dim, 1e-5);
 }
 
-fn linearNoBiasNamed(
-    bld: *Builder,
-    input: NodeId,
-    name: []const u8,
-    rows: u32,
-    in_dim: u32,
-    out_dim: u32,
-) !NodeId {
-    const w = try bld.parameter(
-        name,
-        Shape.init(.f32, &.{ @intCast(out_dim), @intCast(in_dim) }),
-    );
-    return bld.linearNoBias(input, w, rows, in_dim, out_dim);
-}
-
 fn linearNamed(
     bld: *Builder,
     input: NodeId,
@@ -1924,43 +1882,6 @@ pub fn gliner2ClassificationLogitsForBatch(
     );
     try trainer.ensureGraphBuilt(trainer_input);
     const logits_node = ctx.gliner2_classification_logits orelse return error.MissingGliner2ClassificationLossNode;
-    return evalSpanStartNodeForBatch(
-        allocator,
-        trainer,
-        ctx,
-        input_ids,
-        attention_mask,
-        targets,
-        targets_shape,
-        batch,
-        seq_len,
-        logits_node,
-    );
-}
-
-pub fn gliner2CountLogitsForBatch(
-    allocator: std.mem.Allocator,
-    trainer: *real_autodiff.RealAutodiffTrainer,
-    ctx: *GlinerAutodiffCtx,
-    input_ids: []const i64,
-    attention_mask: []const f32,
-    targets: []const f32,
-    targets_shape: Shape,
-    batch: u32,
-    seq_len: u32,
-) ![]f32 {
-    if (ctx.config.objective != .gliner2_total_loss) return error.InvalidGlinerObjective;
-    const trainer_input = makeTrainerInput(
-        ctx,
-        input_ids,
-        attention_mask,
-        targets,
-        targets_shape,
-        batch,
-        seq_len,
-    );
-    try trainer.ensureGraphBuilt(trainer_input);
-    const logits_node = ctx.gliner2_count_logits orelse return error.MissingGliner2CountLogitsNode;
     return evalSpanStartNodeForBatch(
         allocator,
         trainer,

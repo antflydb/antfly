@@ -2016,22 +2016,6 @@ pub const RealAutodiffTrainer = struct {
         self.device_optimizer_transfers += 1;
     }
 
-    fn accumulateDeviceGradient(
-        self: *RealAutodiffTrainer,
-        slot: *ParamSlot,
-        grad: []const f32,
-        scale: f32,
-        first: bool,
-    ) !void {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-        const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-        const metal = try self.metalCompute();
-        const grad_ct = try metal.trainingUploadF32(grad, slot.dims);
-        defer self.compute_backend.free(grad_ct);
-        try metal.trainingAccumulateF32(device.grad_accum, grad_ct, slot.weights.len, scale, first);
-        self.device_optimizer_transfers += 1;
-    }
-
     fn accumulateDeviceGradientCt(
         self: *RealAutodiffTrainer,
         slot: *ParamSlot,

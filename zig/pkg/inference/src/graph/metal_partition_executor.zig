@@ -9414,41 +9414,6 @@ fn traceDecomposedLayerNormDecline(reason: []const u8, producer_id: NodeId, deta
     return null;
 }
 
-fn traceDecomposedLayerNormConsumers(
-    graph: *const Graph,
-    producer_id: NodeId,
-    reachable: []const bool,
-    skipped_nodes: []const bool,
-) void {
-    if (!traceDebertaEncoderLoraLayerMatchingEnabled()) return;
-    var node_id: NodeId = 0;
-    while (node_id < graph.nodeCount()) : (node_id += 1) {
-        const node = graph.node(node_id);
-        var consumes = false;
-        for (node.getInputs()) |input_id| {
-            if (input_id == producer_id) {
-                consumes = true;
-                break;
-            }
-        }
-        if (!consumes) continue;
-        std.debug.print(
-            "deberta_encoder_lora_layer_match: decomposed_consumer producer={d} node={d} op={s} reachable={} skipped={} inputs={d} rank={d} dim0={d} dim1={d}\n",
-            .{
-                producer_id,
-                node_id,
-                @tagName(std.meta.activeTag(node.op)),
-                isReachableUnskippedNode(reachable, skipped_nodes, node_id),
-                node_id < skipped_nodes.len and skipped_nodes[@intCast(node_id)],
-                node.num_inputs,
-                node.output_shape.rank(),
-                shapeDimForNodeOr(graph, node_id, 0, -1),
-                shapeDimForNodeOr(graph, node_id, 1, -1),
-            },
-        );
-    }
-}
-
 const OpTag = std.meta.Tag(@TypeOf(@as(*const Graph, undefined).node(0).op));
 
 const BinaryParamConsumer = struct {
@@ -9506,24 +9471,6 @@ fn matchLayerNormScale(
     return null;
 }
 
-fn firstUnaryConsumerByTag(
-    graph: *const Graph,
-    producer_id: NodeId,
-    reachable: []const bool,
-    skipped_nodes: []const bool,
-    tag: OpTag,
-) ?NodeId {
-    var node_id: NodeId = 0;
-    while (node_id < graph.nodeCount()) : (node_id += 1) {
-        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
-        const node = graph.node(node_id);
-        if (std.meta.activeTag(node.op) != tag) continue;
-        if (node.num_inputs < 1 or node.inputs[0] != producer_id) continue;
-        return node_id;
-    }
-    return null;
-}
-
 fn isUnaryConsumerByTag(
     graph: *const Graph,
     node_id: NodeId,
@@ -9566,49 +9513,6 @@ fn normalizedLayerNormOutputCandidate(
     return found;
 }
 
-fn singleUnaryConsumerByTag(
-    graph: *const Graph,
-    producer_id: NodeId,
-    reachable: []const bool,
-    skipped_nodes: []const bool,
-    tag: OpTag,
-) ?NodeId {
-    var found: ?NodeId = null;
-    var node_id: NodeId = 0;
-    while (node_id < graph.nodeCount()) : (node_id += 1) {
-        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
-        const node = graph.node(node_id);
-        if (std.meta.activeTag(node.op) != tag) continue;
-        if (node.num_inputs < 1 or node.inputs[0] != producer_id) continue;
-        if (found != null) return null;
-        found = node_id;
-    }
-    return found;
-}
-
-fn binaryConsumerForPair(
-    graph: *const Graph,
-    lhs_id: NodeId,
-    rhs_id: NodeId,
-    reachable: []const bool,
-    skipped_nodes: []const bool,
-    tag: OpTag,
-) ?NodeId {
-    var found: ?NodeId = null;
-    var node_id: NodeId = 0;
-    while (node_id < graph.nodeCount()) : (node_id += 1) {
-        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
-        const node = graph.node(node_id);
-        if (std.meta.activeTag(node.op) != tag or node.num_inputs < 2) continue;
-        const exact = node.inputs[0] == lhs_id and node.inputs[1] == rhs_id;
-        const commuted = tag != .sub and node.inputs[0] == rhs_id and node.inputs[1] == lhs_id;
-        if (!exact and !commuted) continue;
-        if (found != null) return null;
-        found = node_id;
-    }
-    return found;
-}
-
 fn isBinaryConsumerForPair(
     graph: *const Graph,
     node_id: NodeId,
@@ -9624,29 +9528,6 @@ fn isBinaryConsumerForPair(
     const exact = node.inputs[0] == lhs_id and node.inputs[1] == rhs_id;
     const commuted = tag != .sub and node.inputs[0] == rhs_id and node.inputs[1] == lhs_id;
     return exact or commuted;
-}
-
-fn addConsumerWithScalar(
-    graph: *const Graph,
-    producer_id: NodeId,
-    reachable: []const bool,
-    skipped_nodes: []const bool,
-) ?NodeId {
-    var found: ?NodeId = null;
-    var node_id: NodeId = 0;
-    while (node_id < graph.nodeCount()) : (node_id += 1) {
-        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
-        const node = graph.node(node_id);
-        if (std.meta.activeTag(node.op) != .add or node.num_inputs < 2) continue;
-        if (node.inputs[0] == producer_id) {
-            if (scalarConstantF32(graph, node.inputs[1]) == null) continue;
-        } else if (node.inputs[1] == producer_id) {
-            if (scalarConstantF32(graph, node.inputs[0]) == null) continue;
-        } else continue;
-        if (found != null) return null;
-        found = node_id;
-    }
-    return found;
 }
 
 fn isAddConsumerWithScalar(
@@ -9805,18 +9686,6 @@ fn traceLayerNormConsumerSecondHop(
             },
         );
     }
-}
-
-fn previousDebertaAttentionRegion(regions: []const RuntimeRegion, node_pos: usize) ?DebertaAttentionPattern {
-    var pos = node_pos;
-    while (pos > 0) {
-        pos -= 1;
-        switch (regions[pos]) {
-            .deberta_attention => |pattern| return pattern,
-            else => {},
-        }
-    }
-    return null;
 }
 
 fn isDebertaOutputLayerNormName(name: []const u8) bool {
@@ -16109,19 +15978,6 @@ fn shapesEqual(lhs: ml.graph.Shape, rhs: ml.graph.Shape) bool {
         if (lhs.dims[idx] != rhs.dims[idx]) return false;
     }
     return true;
-}
-
-fn executeRuntimePlainAdd(
-    cb: *const ComputeBackend,
-    values: []?CT,
-    inputs: []const NodeId,
-) !?CT {
-    const lhs = valueFor(values, inputs[0]) orelse return null;
-    const rhs = valueFor(values, inputs[1]) orelse return null;
-    return cb.add(lhs, rhs) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-        else => return err,
-    };
 }
 
 fn executeRuntimeSoftmax(

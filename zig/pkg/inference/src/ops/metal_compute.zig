@@ -3866,14 +3866,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(device_tensor);
     }
 
-    pub fn trainingRetainedCopy(self: *MetalCompute, tensor: CT) !CT {
-        const buf = toBuf(tensor);
-        const metal_tensor = buf.metal_tensor orelse return error.UnsupportedTensorType;
-        var retained = try metal_tensor.retainedCopy();
-        errdefer retained.deinit();
-        return self.ctFromOwnedMetalTensor(retained);
-    }
-
     pub fn trainingAccumulateF32(
         self: *MetalCompute,
         accum: CT,
@@ -21231,15 +21223,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return std.meta.eql(active_key, key);
         }
         return false;
-    }
-
-    fn linearSlotPreparedForDenseFrame(
-        self: *MetalCompute,
-        slot: usize,
-        in_dim: usize,
-        out_dim: usize,
-    ) bool {
-        return (self.preparedLinearMatmulFormatForLinearSlot(slot, in_dim, out_dim) orelse return false) == .f32;
     }
 
     fn linearSlotPreparedForDebertaFrame(

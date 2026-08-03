@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import textwrap
 import time
 from pathlib import Path
@@ -84,27 +83,6 @@ def resolve_python_schema_conditioning_policy(deterministic: bool, no_train_shuf
     if deterministic:
         return "deterministic-eval-form"
     return "ordered-training-form" if no_train_shuffle else "upstream-training-default"
-
-
-def convert_to_python_jsonl(src: Path, dst: Path, allowed_labels: set[str] | None = None) -> dict[str, Any]:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    examples = 0
-    mentions = 0
-    task_counts = {"classifications": 0, "json_structures": 0, "relations": 0}
-    labels: set[str] = set()
-    with src.open("r", encoding="utf-8") as fin, dst.open("w", encoding="utf-8") as fout:
-        for line in fin:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            normalized, counts, record_labels = normalize_python_record(record, allowed_labels)
-            mentions += counts["entity_mentions"]
-            for key in task_counts:
-                task_counts[key] += counts[key]
-            labels.update(record_labels)
-            fout.write(json.dumps(normalized, ensure_ascii=False) + "\n")
-            examples += 1
-    return {"examples": examples, "mentions": mentions, "labels": sorted(labels), **task_counts, "path": str(dst)}
 
 
 def summarize_python_jsonl(src: Path, allowed_labels: set[str] | None = None) -> dict[str, Any]:
