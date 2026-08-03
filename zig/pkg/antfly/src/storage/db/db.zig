@@ -19996,26 +19996,10 @@ pub const DB = struct {
         var generation_ns: u64 = 0;
         var lock_wait_ns: u64 = 0;
         var locked_search_ns: u64 = 0;
-        if (self.tryBeginPublishedDenseSearch(req)) {
-            defer self.endPublishedDenseSearch();
-            const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
-            if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
-            const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
-            if (bench_profile) {
-                locked_search_ns = platform_time.monotonicNs() - search_start_ns;
-                std.log.info(
-                    "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
-                );
-            }
-            return result;
-        }
         const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        lockApplyShared(self);
+        const search_access = self.beginDenseSearchAccess(req);
         if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
-        defer self.core.unlockApplyShared();
+        defer self.endDenseSearchAccess(search_access);
         const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
@@ -20025,7 +20009,7 @@ pub const DB = struct {
             locked_search_ns = platform_time.monotonicNs() - search_start_ns;
             std.log.info(
                 "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, search_access == .published },
             );
         }
         return result;
@@ -20987,15 +20971,9 @@ pub const DB = struct {
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (self.tryBeginPublishedDenseSearch(req)) {
-            defer self.endPublishedDenseSearch();
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
-        }
-        {
-            lockApplyShared(self);
-            defer self.core.unlockApplyShared();
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
-        }
+        const search_access = self.beginDenseSearchAccess(req);
+        defer self.endDenseSearchAccess(search_access);
+        return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
     }
 
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
@@ -21683,12 +21661,21 @@ pub const DB = struct {
         return req.dense != null or req.query == .dense_knn;
     }
 
-    /// Registers with the catalog publication barrier before touching the
-    /// inline dense-index array. A successful return transfers one published
-    /// search lease to the caller, which must call endPublishedDenseSearch.
-    fn tryBeginPublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
-        if (!publishedDenseRequestEligible(req)) return false;
-        if (!self.beginPublishedDenseSearch()) return false;
+    const DenseSearchAccess = enum {
+        published,
+        apply_shared,
+    };
+
+    /// Selects and acquires the complete synchronization mode for one search.
+    /// When published-dense preflight discovers that the request needs the
+    /// apply lock, acquire that lock before releasing the catalog lease. This
+    /// closes the handoff gap in which a concurrent structural mutation could
+    /// delete the entry between the preflight lookup and the locked fallback.
+    fn beginDenseSearchAccess(self: *DB, req: types.SearchRequest) DenseSearchAccess {
+        if (!publishedDenseRequestEligible(req) or !self.beginPublishedDenseSearch()) {
+            lockApplyShared(self);
+            return .apply_shared;
+        }
 
         if (builtin.is_test) {
             if (test_published_dense_catalog_lookup_hook) |hook| {
@@ -21698,14 +21685,23 @@ pub const DB = struct {
         }
 
         const entry = self.core.denseIndex(req.index_name) orelse {
+            lockApplyShared(self);
             self.endPublishedDenseSearch();
-            return false;
+            return .apply_shared;
         };
         if (entry.index.hasExternalVectorLoader()) {
+            lockApplyShared(self);
             self.endPublishedDenseSearch();
-            return false;
+            return .apply_shared;
         }
-        return true;
+        return .published;
+    }
+
+    fn endDenseSearchAccess(self: *DB, access: DenseSearchAccess) void {
+        switch (access) {
+            .published => self.endPublishedDenseSearch(),
+            .apply_shared => self.core.unlockApplyShared(),
+        }
     }
 
     const published_dense_catalog_closed: u32 = @as(u32, 1) << 31;
