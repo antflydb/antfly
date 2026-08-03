@@ -1709,6 +1709,7 @@ pub const Node = struct {
             .session = model.session,
             .tok = model.getTokenizer(),
             .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+            .execution_lock = model.embeddingExecutionLock(),
         };
         return try pipeline.embed(texts);
     }
@@ -2046,6 +2047,7 @@ pub const Node = struct {
                 .session = model.session,
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                .execution_lock = model.embeddingExecutionLock(),
             };
             const sparse = try pipeline.embed(&texts);
             defer {
@@ -2733,6 +2735,7 @@ pub const Node = struct {
                 .session = model.session,
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                .execution_lock = model.embeddingExecutionLock(),
             };
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);

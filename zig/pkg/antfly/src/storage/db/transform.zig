@@ -52,7 +52,7 @@ pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTran
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
     switch (op) {
-        .set, .set_on_insert, .unset, .inc, .add_to_set, .max => {},
+        .set, .set_on_insert, .unset, .inc, .push, .add_to_set, .max => {},
         else => return error.UnsupportedTransformOperation,
     }
 }
@@ -151,7 +151,7 @@ fn prepareTransformOp(
         .unset => {
             if (op.value_json != null) return error.InvalidArgument;
         },
-        .set, .set_on_insert, .add_to_set => {
+        .set, .set_on_insert, .push, .add_to_set => {
             const value_json = op.value_json orelse return error.InvalidArgument;
             var parsed = std.json.parseFromSlice(
                 std.json.Value,
@@ -207,6 +207,10 @@ fn applyPreparedTransformOp(
         },
         .unset => removeNestedValue(alloc, &root.object, path),
         .inc => try applyNumericOp(alloc, &root.object, path, try op.number(), .add),
+        .push => {
+            var value = try op.takeJson();
+            try pushPreparedValue(alloc, &root.object, path, &value);
+        },
         .add_to_set => {
             var value = try op.takeJson();
             try addPreparedValueToSet(alloc, &root.object, path, &value);
@@ -214,6 +218,31 @@ fn applyPreparedTransformOp(
         .max => try applyNumericOp(alloc, &root.object, path, try op.number(), .max),
         else => return error.UnsupportedTransformOperation,
     }
+}
+
+fn pushPreparedValue(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    parts: []const []const u8,
+    value: *std.json.Value,
+) !void {
+    errdefer freeJsonValue(alloc, value);
+    if (parts.len == 0) return error.InvalidArgument;
+    if (getNestedValue(obj, parts)) |existing| {
+        if (existing.* != .array) return error.InvalidArgument;
+        try existing.array.append(value.*);
+        value.* = .null;
+        return;
+    }
+
+    var arr = std.json.Array.init(alloc);
+    errdefer {
+        for (arr.items) |*item| freeJsonValue(alloc, item);
+        arr.deinit();
+    }
+    try arr.append(value.*);
+    value.* = .null;
+    try setNestedValue(alloc, obj, parts, .{ .array = arr });
 }
 
 const NormalizedJsonPath = struct {
@@ -247,6 +276,29 @@ fn normalizeJsonPath(path: []const u8) !NormalizedJsonPath {
     }
     if (parts.len != count) return error.InvalidArgument;
     return parts;
+}
+
+pub const GraphProjectionPath = struct {
+    index_name: []const u8,
+    edge_type: []const u8,
+};
+
+/// Recognizes the logical graph-array paths exposed by document transforms.
+///
+/// `_edges` is projected out of the primary document and stored as graph edge
+/// artifacts. Callers must therefore apply append-like operations as graph
+/// deltas instead of resolving them against the stripped primary JSON. Any
+/// other path rooted at `_edges` is rejected: resolving it as ordinary JSON
+/// would silently reinterpret a partial projection as the complete edge set.
+pub fn graphProjectionPath(path: []const u8) !?GraphProjectionPath {
+    const normalized = try normalizeJsonPath(path);
+    const parts = normalized.slice();
+    if (parts.len == 0 or !std.mem.eql(u8, parts[0], "_edges")) return null;
+    if (parts.len != 3) return error.InvalidArgument;
+    return .{
+        .index_name = parts[1],
+        .edge_type = parts[2],
+    };
 }
 
 const NumericTransform = enum { add, max };
@@ -483,7 +535,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-test "resolve document transform supports set setOnInsert max inc and addToSet" {
+test "resolve document transform supports set setOnInsert max inc push and addToSet" {
     const alloc = std.testing.allocator;
 
     const transform: types.DocumentTransform = .{
@@ -494,6 +546,7 @@ test "resolve document transform supports set setOnInsert max inc and addToSet" 
             .{ .op = .max, .path = "version", .value_json = "10" },
             .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
             .{ .op = .inc, .path = "views", .value_json = "2" },
+            .{ .op = .push, .path = "events", .value_json = "{\"type\":\"published\"}" },
             .{ .op = .add_to_set, .path = "tags", .value_json = "\"zig\"" },
         },
     };
@@ -512,6 +565,28 @@ test "resolve document transform supports set setOnInsert max inc and addToSet" 
     try std.testing.expectEqualStrings("updated", parsed.value.object.get("status").?.string);
     try std.testing.expect(parsed.value.object.get("owner") == null);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("events").?.array.items.len);
+    try std.testing.expectEqualStrings("published", parsed.value.object.get("events").?.array.items[0].object.get("type").?.string);
+}
+
+test "push appends to existing arrays and rejects non-array targets" {
+    const alloc = std.testing.allocator;
+    const operations = [_]types.TransformOp{
+        .{ .op = .push, .path = "edges", .value_json = "\"doc:b\"" },
+    };
+    const transform: types.DocumentTransform = .{ .key = "doc:a", .operations = &operations };
+
+    const resolved = (try resolveDocumentTransform(alloc, "{\"edges\":[\"doc:z\"]}", transform)).?;
+    defer alloc.free(resolved);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("edges").?.array.items.len);
+    try std.testing.expectEqualStrings("doc:b", parsed.value.object.get("edges").?.array.items[1].string);
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(alloc, "{\"edges\":\"doc:z\"}", transform),
+    );
 }
 
 test "resolve document transform applies setOnInsert only when upsert inserts" {
@@ -552,7 +627,7 @@ test "resolve document transform skips missing document without upsert" {
 test "unsupported transforms fail atomically instead of reporting success" {
     const alloc = std.testing.allocator;
     const unsupported = [_]types.TransformOpType{
-        .push, .pull, .pop, .mul, .min, .current_date, .rename,
+        .pull, .pop, .mul, .min, .current_date, .rename,
     };
     for (unsupported) |op| {
         const operations = [_]types.TransformOp{
@@ -569,17 +644,14 @@ test "unsupported transforms fail atomically instead of reporting success" {
     }
 }
 
-test "unsupported transform on a missing document is rejected before no-op resolution" {
+test "supported transform on a missing document remains a no-op without upsert" {
     const operations = [_]types.TransformOp{
         .{ .op = .push, .path = "tags", .value_json = "\"new\"" },
     };
-    try std.testing.expectError(
-        error.UnsupportedTransformOperation,
-        resolveDocumentTransform(std.testing.allocator, null, .{
-            .key = "doc:missing",
-            .operations = &operations,
-        }),
-    );
+    try std.testing.expect((try resolveDocumentTransform(std.testing.allocator, null, .{
+        .key = "doc:missing",
+        .operations = &operations,
+    })) == null);
 }
 
 test "invalid transform shape is rejected before missing-document no-op resolution" {

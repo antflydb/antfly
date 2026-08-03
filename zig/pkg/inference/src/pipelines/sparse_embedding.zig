@@ -26,6 +26,7 @@
 // Matches Go inference's lib/pipelines/sparse_embedding.go.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const embedding_mod = @import("embedding.zig");
@@ -66,11 +67,17 @@ pub const SparseEmbeddingPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: SparseEmbeddingConfig,
+    /// Optional owner-provided gate for stateful backend sessions.
+    execution_lock: ?*std.atomic.Mutex = null,
 
     /// Generate sparse embeddings for a batch of texts.
     /// Caller owns the returned SparseVectors and must call deinit on each.
     pub fn embed(self: *SparseEmbeddingPipeline, texts: []const []const u8) ![]SparseVector {
         if (texts.len == 0) return try self.allocator.alloc(SparseVector, 0);
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
         if (embedding_mod.textSessionBatchPlan(self.session, texts.len)) |plan| {
             return self.embedWithBatchPlan(texts, plan);
         }

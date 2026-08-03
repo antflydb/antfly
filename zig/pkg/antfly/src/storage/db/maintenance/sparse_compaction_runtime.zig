@@ -28,6 +28,8 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
+pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
+
 pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
 
@@ -49,6 +51,24 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         if (self.config.enabled) return error.UnsupportedPlatform;
     }
 
+    pub fn stop(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn pause(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn resumeAfterPause(_: *@This()) !void {}
+
+    pub fn ensureRunning(_: *@This()) !bool {
+        return true;
+    }
+
+    pub fn isStarted(_: *const @This()) bool {
+        return false;
+    }
+
     pub fn notify(self: *@This()) void {
         _ = self;
     }
@@ -65,6 +85,9 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     config: Config,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    desired_running: bool = false,
+    paused: bool = false,
     shutdown: bool = false,
     notified: bool = false,
     future: ?Io.Future(void) = null,
@@ -88,24 +111,88 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 
     pub fn deinit(self: *SparseCompactionRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.notified = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        _ = self.stop();
         self.* = undefined;
     }
 
     pub fn start(self: *SparseCompactionRuntime) !void {
         if (!self.config.enabled) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.desired_running = true;
+        self.paused = false;
+        try self.startLocked();
+    }
+
+    pub fn stop(self: *SparseCompactionRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.desired_running = false;
+        self.paused = true;
+        return self.stopLocked();
+    }
+
+    pub fn pause(self: *SparseCompactionRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.paused = true;
+        const desired = self.desired_running;
+        _ = self.stopLocked();
+        return desired;
+    }
+
+    pub fn resumeAfterPause(self: *SparseCompactionRuntime) !void {
+        if (!self.config.enabled) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.paused = false;
+        if (self.desired_running) try self.startLocked();
+    }
+
+    pub fn ensureRunning(self: *SparseCompactionRuntime) !bool {
+        if (!self.config.enabled) return true;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (!self.desired_running) return true;
+        if (self.paused) return false;
+        try self.startLocked();
+        return true;
+    }
+
+    pub fn isStarted(self: *SparseCompactionRuntime) bool {
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        return self.future != null;
+    }
+
+    fn startLocked(self: *SparseCompactionRuntime) !void {
+        if (self.future != null or self.paused or !self.desired_running) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        self.future = try io_impl.io().concurrent(workerMain, .{self});
+        const io = io_impl.io();
+        if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
+        self.mutex.lockUncancelable(io);
+        self.shutdown = false;
+        self.notified = true;
+        self.mutex.unlock(io);
+        self.future = try io.concurrent(workerMain, .{self});
+    }
+
+    fn stopLocked(self: *SparseCompactionRuntime) bool {
+        const io_impl = self.io_impl orelse return false;
+        const io = io_impl.io();
+        if (self.future == null) return false;
+
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        self.notified = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+
+        _ = self.future.?.await(io);
+        self.future = null;
+        return true;
     }
 
     pub fn notify(self: *SparseCompactionRuntime) void {
@@ -139,7 +226,9 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         };
         defer result.deinit(work_alloc);
 
-        if (!lockApplyExclusiveBackoff(self)) return false;
+        // A started task must retire before structural mutation can close its
+        // generation. The stopper waits without holding the apply lock.
+        lockApplyExclusive(self.apply_mutex);
         defer self.apply_mutex.unlockExclusive();
         _ = try self.index_manager.finishSparseCompactionTask(&task, &result);
         return true;
@@ -212,4 +301,29 @@ fn lockApplyExclusiveBackoff(runtime: *SparseCompactionRuntime) bool {
         sleepMs(runtime, 1);
     }
     return true;
+}
+
+fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
+    lock.lockExclusive();
+}
+
+fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
+
+fn consumeTestStartFailure() bool {
+    var remaining = test_start_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_start_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |actual| {
+            remaining = actual;
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
