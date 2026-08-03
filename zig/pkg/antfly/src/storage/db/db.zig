@@ -70591,6 +70591,9 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     const after = runtime.stats();
     try std.testing.expect(after.pending_segments <= 4);
+    const active_text_index = resources.index_manager.textIndex("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, @intCast(active_text_index.snapshot().segments.len)), after.active_segments);
+    try std.testing.expectEqual(after.active_segments, after.max_active_segments_per_index);
     try std.testing.expectEqual(@as(u64, 1), after.backpressure_events);
     try std.testing.expect(after.merge_input_segments_total >= 10);
 
@@ -70649,6 +70652,139 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     waiter_joined = true;
     try std.testing.expect(waiter.acquired.load(.acquire));
     try std.testing.expect(!waiter.failed.load(.acquire));
+
+    // Weighted FIFO admission prevents a younger small publication from
+    // overtaking an older catch-up batch, even when the small request would fit
+    // in the currently available capacity.
+    var fair_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 100,
+            .resume_pending_segments = 50,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 2_000,
+        },
+    );
+    defer fair_runtime.deinit();
+    var blocking_permit = try fair_runtime.acquireProducerPermit(80, 0);
+    var blocking_active = true;
+    defer if (blocking_active) blocking_permit.release();
+
+    const FairWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        segment_count: u64,
+        acquired: *std.atomic.Value(bool),
+        release_gate: ?*const std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit(self.segment_count, 0) catch return;
+            self.acquired.store(true, .release);
+            if (self.release_gate) |gate| {
+                while (!gate.load(.acquire)) std.Thread.yield() catch {};
+            }
+            permit.release();
+        }
+    };
+    var large_acquired = std.atomic.Value(bool).init(false);
+    var small_acquired = std.atomic.Value(bool).init(false);
+    var release_large = std.atomic.Value(bool).init(false);
+    const fair_events_before = fair_runtime.stats().backpressure_events;
+    var large_waiter = FairWaiter{
+        .runtime = &fair_runtime,
+        .segment_count = 95,
+        .acquired = &large_acquired,
+        .release_gate = &release_large,
+    };
+    const large_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&large_waiter});
+    var large_joined = false;
+    defer if (!large_joined) {
+        if (blocking_active) {
+            blocking_permit.release();
+            blocking_active = false;
+        }
+        release_large.store(true, .release);
+        large_thread.join();
+    };
+    const large_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 1);
+
+    var small_waiter = FairWaiter{
+        .runtime = &fair_runtime,
+        .segment_count = 10,
+        .acquired = &small_acquired,
+        .release_gate = null,
+    };
+    const small_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&small_waiter});
+    var small_joined = false;
+    defer if (!small_joined) {
+        if (blocking_active) {
+            blocking_permit.release();
+            blocking_active = false;
+        }
+        release_large.store(true, .release);
+        small_thread.join();
+    };
+    const small_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 2);
+    try std.testing.expect(!small_acquired.load(.acquire));
+
+    blocking_permit.release();
+    blocking_active = false;
+    const fair_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(large_acquired.load(.acquire));
+    try std.testing.expect(!small_acquired.load(.acquire));
+    release_large.store(true, .release);
+    large_thread.join();
+    large_joined = true;
+    small_thread.join();
+    small_joined = true;
+    try std.testing.expect(small_acquired.load(.acquire));
+
+    // Runtime cancellation is not a capacity timeout and must leave the FIFO
+    // queue usable by subsequent producers.
+    var cancel_blocker = try fair_runtime.acquireProducerPermit(80, 0);
+    var cancel_blocker_active = true;
+    defer if (cancel_blocker_active) cancel_blocker.release();
+    const CancelWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        outcome: *std.atomic.Value(u8),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit(30, 0) catch |err| {
+                self.outcome.store(if (err == error.Canceled) 1 else 2, .release);
+                return;
+            };
+            permit.release();
+            self.outcome.store(3, .release);
+        }
+    };
+    var cancel_outcome = std.atomic.Value(u8).init(0);
+    var cancel_waiter = CancelWaiter{ .runtime = &fair_runtime, .outcome = &cancel_outcome };
+    const cancel_events_before = fair_runtime.stats().backpressure_events;
+    const timeouts_before = fair_runtime.stats().backpressure_timeouts;
+    const fair_io = db.backend_runtime.io_impl.?.io();
+    var cancel_group: std.Io.Group = .init;
+    try cancel_group.concurrent(fair_io, CancelWaiter.run, .{&cancel_waiter});
+    var cancel_group_active = true;
+    defer if (cancel_group_active) cancel_group.cancel(fair_io);
+    const cancel_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events > cancel_events_before);
+    cancel_group.cancel(fair_io);
+    cancel_group_active = false;
+    try std.testing.expectEqual(@as(u8, 1), cancel_outcome.load(.acquire));
+    try std.testing.expectEqual(timeouts_before, fair_runtime.stats().backpressure_timeouts);
+    cancel_blocker.release();
+    cancel_blocker_active = false;
+    var post_cancel_permit = try fair_runtime.acquireProducerPermit(1, 0);
+    post_cancel_permit.release();
 
     // One indivisible publication larger than either watermark is admitted
     // exclusively once existing debt and reservations are empty.

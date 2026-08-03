@@ -3059,9 +3059,12 @@ pub const IndexManager = struct {
     fn accumulateNativeStorageStats(stats: *lsm_backend_mod.NativeStorageStats, entry: lsm_backend_mod.NativeStorageStats) void {
         stats.fd_cache_entries = @max(stats.fd_cache_entries, entry.fd_cache_entries);
         stats.fd_admitted_descriptors = @max(stats.fd_admitted_descriptors, entry.fd_admitted_descriptors);
+        stats.fd_persistent_descriptors = @max(stats.fd_persistent_descriptors, entry.fd_persistent_descriptors);
         stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry.fd_admission_capacity);
+        stats.fd_persistent_reserve = @max(stats.fd_persistent_reserve, entry.fd_persistent_reserve);
         stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry.fd_admission_waiters);
         stats.fd_admission_waits = @max(stats.fd_admission_waits, entry.fd_admission_waits);
+        stats.fd_persistent_admission_failures = @max(stats.fd_persistent_admission_failures, entry.fd_persistent_admission_failures);
     }
 
     pub fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
@@ -7608,9 +7611,12 @@ pub const IndexManager = struct {
         };
 
         for (self.text_indexes.items) |*entry| {
+            const snap = entry.persistent.snapshot();
+            stats.active_indexes += 1;
+            stats.active_segments +|= snap.segments.len;
+            stats.max_active_segments_per_index = @max(stats.max_active_segments_per_index, snap.segments.len);
             if (!entry.compaction_pending) continue;
             stats.pending_indexes += 1;
-            const snap = entry.persistent.snapshot();
             stats.pending_segments += snap.segments.len;
             for (snap.segments) |seg| {
                 const segment_bytes: u64 = @intCast(seg.data.bytes().len);
@@ -7664,9 +7670,12 @@ pub const IndexManager = struct {
         };
 
         const entry = self.textIndexEntry(index_name) orelse return stats;
+        const snap = entry.persistent.snapshot();
+        stats.active_indexes = 1;
+        stats.active_segments = snap.segments.len;
+        stats.max_active_segments_per_index = snap.segments.len;
         if (entry.compaction_pending) {
             stats.pending_indexes = 1;
-            const snap = entry.persistent.snapshot();
             stats.pending_segments = snap.segments.len;
             for (snap.segments) |seg| {
                 const segment_bytes: u64 = @intCast(seg.data.bytes().len);

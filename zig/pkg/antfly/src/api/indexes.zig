@@ -1681,6 +1681,9 @@ fn projectionCheckpointStatusRank(status: []const u8) u8 {
 }
 
 fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.TextMergeStats) void {
+    dst.active_indexes += src.active_indexes;
+    dst.active_segments += src.active_segments;
+    dst.max_active_segments_per_index = @max(dst.max_active_segments_per_index, src.max_active_segments_per_index);
     dst.pending_indexes += src.pending_indexes;
     dst.pending_segments += src.pending_segments;
     dst.pending_bytes += src.pending_bytes;
@@ -3314,7 +3317,11 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
 
 fn appendTextMergeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), stats: db_mod.types.TextMergeStats) !void {
     try out.append(alloc, '{');
-    try out.appendSlice(alloc, "\"pending_segments\":");
+    try out.appendSlice(alloc, "\"active_segments\":");
+    try appendIntValue(alloc, out, stats.active_segments);
+    try out.appendSlice(alloc, ",\"max_active_segments_per_index\":");
+    try appendIntValue(alloc, out, stats.max_active_segments_per_index);
+    try out.appendSlice(alloc, ",\"pending_segments\":");
     try appendIntValue(alloc, out, stats.pending_segments);
     try out.appendSlice(alloc, ",\"pending_bytes\":");
     try appendIntValue(alloc, out, stats.pending_bytes);

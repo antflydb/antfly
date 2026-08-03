@@ -42,6 +42,7 @@ pub const BackpressureOutcome = enum {
     not_needed,
     drained,
     shutdown,
+    canceled,
     timed_out,
     merge_failed,
 };
@@ -125,6 +126,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         };
     }
 } else struct {
+    const ProducerAdmissionWaiter = struct {
+        previous: ?*ProducerAdmissionWaiter = null,
+        next: ?*ProducerAdmissionWaiter = null,
+        enqueued: bool = false,
+    };
+
     alloc: Allocator,
     io_impl: ?*Io.Threaded,
     index_manager: *index_manager_mod.IndexManager,
@@ -145,6 +152,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     producer_byte_reservations: u64 = 0,
     producer_release_epoch: u64 = 0,
     producer_wait_epoch: std.atomic.Value(u32) = .init(0),
+    producer_admission_head: ?*ProducerAdmissionWaiter = null,
+    producer_admission_tail: ?*ProducerAdmissionWaiter = null,
     admission_closed: bool = false,
     future: ?Io.Future(void) = null,
 
@@ -385,7 +394,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             // Merge execution stays on the background runtime. Producer
             // deadlines therefore cover the entire wait even when a merge
             // itself takes longer than the configured maximum.
-            if (!self.waitForProducerAdmissionChange(wait_epoch, started_ns)) {
+            const admission_changed = self.waitForProducerAdmissionChange(wait_epoch, started_ns) catch |err| switch (err) {
+                error.Canceled => return .canceled,
+            };
+            if (!admission_changed) {
                 if (isShutdown(self)) return .shutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return .timed_out;
@@ -408,6 +420,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
         const started_ns = self.backpressureNowNs();
         var recorded_wait = false;
+        var waiter: ProducerAdmissionWaiter = .{};
+        defer self.removeProducerAdmissionWaiter(&waiter);
         defer if (recorded_wait) self.recordBackpressureElapsed(started_ns);
         self.notify();
         while (true) {
@@ -425,6 +439,26 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             if (self.admission_closed) {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
+            }
+            // Once contention exists, only the FIFO head may inspect and claim
+            // capacity. This prevents a stream of small publications from
+            // repeatedly overtaking an older, larger catch-up batch.
+            if ((waiter.enqueued and self.producer_admission_head != &waiter) or
+                (!waiter.enqueued and self.producer_admission_head != null))
+            {
+                if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
+                if (!recorded_wait) {
+                    self.backpressure_events += 1;
+                    recorded_wait = true;
+                }
+                const wait_epoch = self.producer_wait_epoch.load(.acquire);
+                self.mutex.unlock(io);
+                if (!try self.waitForProducerAdmissionChange(wait_epoch, started_ns)) {
+                    if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
+                    self.recordBackpressureTerminal(.timed_out);
+                    return error.TextMergeBackpressureTimeout;
+                }
+                continue;
             }
             const snapshot_epoch = self.producer_release_epoch;
             const snapshot_wait_epoch = self.producer_wait_epoch.load(.acquire);
@@ -457,22 +491,54 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
             if ((request_oversized and no_existing_debt) or (!request_oversized and segments_admissible and bytes_admissible)) {
+                const admitted_from_queue = waiter.enqueued;
+                if (admitted_from_queue) self.removeProducerAdmissionWaiterLocked(&waiter);
                 self.producer_segment_reservations = reserved_segments;
                 self.producer_byte_reservations = reserved_bytes;
                 self.mutex.unlock(io);
+                if (admitted_from_queue) self.signalProducerAdmissionChanged();
                 return .{ .runtime = self, .segment_count = segment_count, .byte_count = byte_count };
             }
+            if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
             if (!recorded_wait) {
                 self.backpressure_events += 1;
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
-            if (!self.waitForProducerAdmissionChange(snapshot_wait_epoch, started_ns)) {
+            if (!try self.waitForProducerAdmissionChange(snapshot_wait_epoch, started_ns)) {
                 if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
             }
         }
+    }
+
+    fn enqueueProducerAdmissionWaiter(self: *TextMergeRuntime, waiter: *ProducerAdmissionWaiter) void {
+        std.debug.assert(!waiter.enqueued);
+        waiter.previous = self.producer_admission_tail;
+        waiter.next = null;
+        waiter.enqueued = true;
+        if (self.producer_admission_tail) |tail| tail.next = waiter else self.producer_admission_head = waiter;
+        self.producer_admission_tail = waiter;
+    }
+
+    fn removeProducerAdmissionWaiterLocked(self: *TextMergeRuntime, waiter: *ProducerAdmissionWaiter) void {
+        if (!waiter.enqueued) return;
+        if (waiter.previous) |previous| previous.next = waiter.next else self.producer_admission_head = waiter.next;
+        if (waiter.next) |next| next.previous = waiter.previous else self.producer_admission_tail = waiter.previous;
+        waiter.previous = null;
+        waiter.next = null;
+        waiter.enqueued = false;
+    }
+
+    fn removeProducerAdmissionWaiter(self: *TextMergeRuntime, waiter: *ProducerAdmissionWaiter) void {
+        if (!waiter.enqueued) return;
+        const io = self.io_impl.?.io();
+        self.mutex.lockUncancelable(io);
+        const was_head = self.producer_admission_head == waiter;
+        self.removeProducerAdmissionWaiterLocked(waiter);
+        self.mutex.unlock(io);
+        if (was_head) self.signalProducerAdmissionChanged();
     }
 
     fn setAdmissionClosedLocked(self: *TextMergeRuntime, closed: bool) void {
@@ -520,13 +586,13 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
     }
 
-    fn waitForProducerAdmissionChange(self: *TextMergeRuntime, observed_epoch: u32, started_ns: u64) bool {
+    fn waitForProducerAdmissionChange(self: *TextMergeRuntime, observed_epoch: u32, started_ns: u64) !bool {
         if (self.isAdmissionClosed() or self.backpressureExpired(started_ns)) return false;
         const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
         const elapsed_ns = self.backpressureNowNs() -| started_ns;
         if (elapsed_ns >= max_wait_ns) return false;
         const io = self.io_impl.?.io();
-        std.Io.futexWaitTimeout(
+        try std.Io.futexWaitTimeout(
             io,
             u32,
             &self.producer_wait_epoch.raw,
@@ -535,9 +601,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 .clock = .awake,
                 .raw = .fromNanoseconds(@intCast(max_wait_ns - elapsed_ns)),
             } },
-        ) catch |err| switch (err) {
-            error.Canceled => return false,
-        };
+        );
         return !self.isAdmissionClosed() and !self.backpressureExpired(started_ns);
     }
 
