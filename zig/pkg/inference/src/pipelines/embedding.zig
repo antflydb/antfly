@@ -164,6 +164,10 @@ pub const EmbeddingPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: EmbeddingConfig,
+    /// Optional owner-provided gate for stateful backend sessions. Metal and
+    /// CUDA sessions share mutable backend state across request pipelines and
+    /// must not execute overlapping forward passes.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional vision encoder session for CLIP/SigLIP multimodal embedding.
     vision_session: ?backends.Session = null,
     /// Optional audio encoder session for CLAP multimodal embedding.
@@ -214,6 +218,8 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         const text_session = self.textEncodingSession();
         if (textSessionBatchPlan(text_session, texts.len)) |plan| {
             return try self.embedWithBatchPlan(texts, plan);
@@ -543,6 +549,8 @@ pub const EmbeddingPipeline = struct {
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         return self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
                 return self.embedImagesIndividually(images);
@@ -786,12 +794,24 @@ pub const EmbeddingPipeline = struct {
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         return self.embedAudioPcmBatch(audio_clips) catch |err| {
             if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
                 return self.embedAudioPcmIndividually(audio_clips);
             }
             return err;
         };
+    }
+
+    fn lockExecution(self: *EmbeddingPipeline) void {
+        const mutex = self.execution_lock orelse return;
+        platform.sync.lockYielding(mutex);
+    }
+
+    fn unlockExecution(self: *EmbeddingPipeline) void {
+        const mutex = self.execution_lock orelse return;
+        mutex.unlock();
     }
 
     fn embedAudioPcmBatch(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
@@ -2060,6 +2080,24 @@ fn selectProjectedOutput(outputs: []Tensor, expected_dim: usize, expected_batch:
         }
     }
     return null;
+}
+
+test "embedding execution gate owns the supplied mutex" {
+    var gate: std.atomic.Mutex = .unlocked;
+    var pipeline = EmbeddingPipeline{
+        .allocator = undefined,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+        .execution_lock = &gate,
+    };
+
+    pipeline.lockExecution();
+    try std.testing.expect(!gate.tryLock());
+    pipeline.unlockExecution();
+
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 }
 
 test "projectEmbeddings runs projection as a single batch" {

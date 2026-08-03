@@ -1851,6 +1851,10 @@ pub const LoadedModel = struct {
     native_generate_lock: std.atomic.Mutex = .unlocked,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
+    /// Stateful GPU embedding sessions share mutable weight-store and command
+    /// state. Cold-load waiters are released together, so serialize their
+    /// forward passes without constraining thread-safe CPU sessions.
+    embedding_run_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
@@ -2023,7 +2027,13 @@ pub const LoadedModel = struct {
         pipeline.visual_projection = self.visual_projection;
         pipeline.audio_projection = self.audio_projection;
         pipeline.resident_projection_stats = &self.resident_projection_stats;
+        pipeline.execution_lock = self.embeddingExecutionLock();
         return pipeline;
+    }
+
+    pub fn embeddingExecutionLock(self: *LoadedModel) ?*std.atomic.Mutex {
+        if (!embeddingBackendNeedsRunLock(self.session.backend())) return null;
+        return &self.embedding_run_lock;
     }
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
@@ -2190,6 +2200,18 @@ pub const LoadedModel = struct {
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
         (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+}
+
+fn embeddingBackendNeedsRunLock(backend: backends.BackendType) bool {
+    return backend.usesGpuHostedSession();
+}
+
+test "embedding run gate is limited to stateful GPU backends" {
+    try std.testing.expect(embeddingBackendNeedsRunLock(.metal));
+    try std.testing.expect(embeddingBackendNeedsRunLock(.cuda));
+    try std.testing.expect(!embeddingBackendNeedsRunLock(.native));
+    try std.testing.expect(!embeddingBackendNeedsRunLock(.onnx));
+    try std.testing.expect(!embeddingBackendNeedsRunLock(.wasm));
 }
 
 fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) bool {
