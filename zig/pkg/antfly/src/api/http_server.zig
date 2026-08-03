@@ -45,6 +45,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const storage_schema = @import("../storage/schema.zig");
@@ -8550,7 +8551,11 @@ pub const ApiHttpServer = struct {
             },
         };
         _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidBatchRequest,
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress, error.ResourceBudgetExceeded => return error.Backpressured,
@@ -24083,6 +24088,110 @@ test "api http server serves table batch transforms" {
     const stored = parsed_stored.value;
     try std.testing.expectEqualStrings("updated", stored.status);
     try std.testing.expectEqual(@as(i64, 3), stored.version);
+}
+
+test "api http graph push preserves projected edges across restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-push-restart", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
+        var create_req = tables_api.CreateTableRequest{
+            .indexes_json = try alloc.dupe(u8, "{\"graph\":{\"type\":\"graph\"}}"),
+        };
+        defer create_req.deinit(alloc);
+        _ = try table_source.source().createTable(alloc, "docs", create_req);
+
+        var source = FakeSource{};
+        var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+
+        const insert_body = try test_contract_helpers.normalizeBatchRequest(alloc,
+            \\{"inserts":{"a":{"title":"A","_edges":{"graph":{"FRIEND":[{"target":"b","weight":2,"metadata":{"since":2024}}]}}},"b":{"title":"B"},"c":{"title":"C"}},"sync_level":"full_index"}
+        );
+        defer alloc.free(insert_body);
+        var insert_resp = try server.handle(.{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = insert_body,
+        });
+        defer insert_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
+
+        const transform_body = try test_contract_helpers.normalizeBatchRequest(alloc,
+            \\{"transforms":[{"key":"a","operations":[{"op":"$push","path":"$._edges.graph.FRIEND","value":{"target":"c","weight":3}}]}],"sync_level":"full_index"}
+        );
+        defer alloc.free(transform_body);
+        var transform_resp = try server.handle(.{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = transform_body,
+        });
+        defer transform_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), transform_resp.status);
+
+        const invalid_transforms = [_][]const u8{
+            \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"title","value":"must-not-commit"},{"op":"$set","path":"$._edges.graph.FRIEND","value":[]}]}],"sync_level":"full_index"}
+            ,
+            \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"title","value":"must-not-commit"},{"op":"$inc","path":"$._edges.graph.FRIEND","value":1}]}],"sync_level":"full_index"}
+            ,
+            \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"title","value":"must-not-commit"},{"op":"$push","path":"$._edges.graph.FRIEND","value":{"weight":4}}]}],"sync_level":"full_index"}
+            ,
+            \\{"transforms":[{"key":"a","operations":[{"op":"$set","path":"title","value":"must-not-commit"},{"op":"$push","path":"$._edges.graph","value":{"target":"d"}}]}],"sync_level":"full_index"}
+            ,
+        };
+        for (invalid_transforms) |invalid_body_json| {
+            const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, invalid_body_json);
+            defer alloc.free(invalid_body);
+            var invalid_resp = try server.handle(.{
+                .method = .POST,
+                .uri = "/tables/docs/batch",
+                .content_type = "application/json",
+                .body = invalid_body,
+            });
+            defer invalid_resp.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+        }
+
+        const stored = (try db.get(alloc, "a")) orelse return error.TestExpectedEqual;
+        defer alloc.free(stored);
+        try std.testing.expect(std.mem.indexOf(u8, stored, "must-not-commit") == null);
+        const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+
+    var reopened = try db_mod.DB.open(alloc, path, .{});
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 2), reopened_edges.len);
+    var saw_b = false;
+    var saw_c = false;
+    for (reopened_edges) |edge| {
+        if (std.mem.eql(u8, edge.target, "b")) saw_b = true;
+        if (std.mem.eql(u8, edge.target, "c")) saw_c = true;
+    }
+    try std.testing.expect(saw_b and saw_c);
 }
 
 test "api http server updates local table schema through bound write source" {

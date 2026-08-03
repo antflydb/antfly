@@ -36,6 +36,7 @@ pub const Config = struct {
 pub var test_block_after_task_begin: std.atomic.Value(bool) = .init(false);
 pub var test_task_begin_entered: std.atomic.Value(bool) = .init(false);
 pub var test_release_after_task_begin: std.atomic.Value(bool) = .init(false);
+pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
 
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
@@ -156,6 +157,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const io_impl = self.io_impl orelse return false;
         const io = io_impl.io();
         if (self.future == null) return false;
+        if (builtin.is_test) test_stop_entered.store(true, .release);
 
         self.mutex.lockUncancelable(io);
         self.shutdown = true;

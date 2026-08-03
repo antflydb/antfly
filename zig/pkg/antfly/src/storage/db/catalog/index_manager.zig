@@ -2393,6 +2393,24 @@ pub const IndexManager = struct {
         remaining: usize = 0,
     };
 
+    /// DB-owned service fence for publishing a newly opened quarantined
+    /// index. Opening and backfill happen outside this fence; only the final
+    /// catalog commit excludes readers that borrow pointers into inline index
+    /// arrays.
+    pub const CatalogPublicationFence = struct {
+        ptr: *anyopaque,
+        lock_fn: *const fn (*anyopaque) void,
+        unlock_fn: *const fn (*anyopaque) void,
+
+        fn lock(self: @This()) void {
+            self.lock_fn(self.ptr);
+        }
+
+        fn unlock(self: @This()) void {
+            self.unlock_fn(self.ptr);
+        }
+    };
+
     /// Re-attempts opening quarantined indexes whose backoff deadline has
     /// passed (all of them when `force` is set). A successful open registers
     /// the runtime index, removes the quarantined config from the
@@ -2401,7 +2419,13 @@ pub const IndexManager = struct {
     /// recorded error and pushes the next attempt out exponentially
     /// (30s..10min). `remaining` is the quarantine count after this pass,
     /// read under the catalog lock so callers can stop polling at zero.
-    pub fn retryFailedIndexLoads(self: *IndexManager, store: anytype, now_ns: u64, force: bool) !QuarantineRetryResult {
+    pub fn retryFailedIndexLoads(
+        self: *IndexManager,
+        store: anytype,
+        now_ns: u64,
+        force: bool,
+        publication_fence: CatalogPublicationFence,
+    ) !QuarantineRetryResult {
         const RetryTask = struct {
             name: []u8,
             cfg: types.IndexConfig,
@@ -2481,64 +2505,73 @@ pub const IndexManager = struct {
                 continue;
             };
 
-            self.catalog_mutex.lockExclusive();
-            if (self.failed_index_loads.get(task.name) == null) {
-                self.completeIndexLoadNoLock(task.name);
-                self.catalog_mutex.unlockExclusive();
-                opened.deinit(self);
-                continue;
-            }
-            var remove_idx: ?usize = null;
-            for (self.status_only_index_configs, 0..) |old_cfg, i| {
-                if (std.mem.eql(u8, old_cfg.name, task.name)) {
-                    remove_idx = i;
-                    break;
+            {
+                // Lock order is structural/service fence -> catalog. The DB
+                // fence drains maintenance and takes apply exclusive, matching
+                // every other live index publication. Keep slow open/backfill
+                // work above this scope so recovery does not stall queries.
+                publication_fence.lock();
+                defer publication_fence.unlock();
+
+                self.catalog_mutex.lockExclusive();
+                if (self.failed_index_loads.get(task.name) == null) {
+                    self.completeIndexLoadNoLock(task.name);
+                    self.catalog_mutex.unlockExclusive();
+                    opened.deinit(self);
+                    continue;
                 }
-            }
-            if (remove_idx == null) {
-                self.completeIndexLoadNoLock(task.name);
-                self.dropFailedIndexLoad(task.name);
-                self.catalog_mutex.unlockExclusive();
-                opened.deinit(self);
-                continue;
-            }
-            // Pre-allocate the shrunken status-only list so registration and
-            // de-quarantine commit together once the open has succeeded.
-            const old = self.status_only_index_configs;
-            const replacement: []types.IndexConfig = if (old.len <= 1)
-                &.{}
-            else
-                self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                var remove_idx: ?usize = null;
+                for (self.status_only_index_configs, 0..) |old_cfg, i| {
+                    if (std.mem.eql(u8, old_cfg.name, task.name)) {
+                        remove_idx = i;
+                        break;
+                    }
+                }
+                if (remove_idx == null) {
+                    self.completeIndexLoadNoLock(task.name);
+                    self.dropFailedIndexLoad(task.name);
+                    self.catalog_mutex.unlockExclusive();
+                    opened.deinit(self);
+                    continue;
+                }
+                // Pre-allocate the shrunken status-only list so registration
+                // and de-quarantine commit together once the open succeeded.
+                const old = self.status_only_index_configs;
+                const replacement: []types.IndexConfig = if (old.len <= 1)
+                    &.{}
+                else
+                    self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                        self.completeIndexLoadNoLock(task.name);
+                        self.catalog_mutex.unlockExclusive();
+                        opened.deinit(self);
+                        return err;
+                    };
+                self.appendOpenedIndex(opened) catch |err| {
+                    if (replacement.len > 0) self.alloc.free(replacement);
                     self.completeIndexLoadNoLock(task.name);
                     self.catalog_mutex.unlockExclusive();
                     opened.deinit(self);
                     return err;
                 };
-            self.appendOpenedIndex(opened) catch |err| {
-                if (replacement.len > 0) self.alloc.free(replacement);
                 self.completeIndexLoadNoLock(task.name);
-                self.catalog_mutex.unlockExclusive();
-                opened.deinit(self);
-                return err;
-            };
-            self.completeIndexLoadNoLock(task.name);
-            var wi: usize = 0;
-            for (old, 0..) |old_cfg, i| {
-                if (i == remove_idx.?) {
-                    var removed = old_cfg;
-                    removed.deinit(self.alloc);
-                    continue;
+                var wi: usize = 0;
+                for (old, 0..) |old_cfg, i| {
+                    if (i == remove_idx.?) {
+                        var removed = old_cfg;
+                        removed.deinit(self.alloc);
+                        continue;
+                    }
+                    replacement[wi] = old_cfg;
+                    wi += 1;
                 }
-                replacement[wi] = old_cfg;
-                wi += 1;
+                if (old.len > 0) self.alloc.free(old);
+                self.status_only_index_configs = replacement;
+                // Log before dropFailedIndexLoad frees the `name` key buffer.
+                std.log.info("quarantined index recovered name={s} kind={s}", .{ task.name, @tagName(task.cfg.kind) });
+                self.dropFailedIndexLoad(task.name);
+                self.catalog_mutex.unlockExclusive();
+                recovered += 1;
             }
-            if (old.len > 0) self.alloc.free(old);
-            self.status_only_index_configs = replacement;
-            // Log before dropFailedIndexLoad frees the `name` key buffer.
-            std.log.info("quarantined index recovered name={s} kind={s}", .{ task.name, @tagName(task.cfg.kind) });
-            self.dropFailedIndexLoad(task.name);
-            self.catalog_mutex.unlockExclusive();
-            recovered += 1;
         }
 
         self.catalog_mutex.lockExclusive();

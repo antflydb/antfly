@@ -871,6 +871,10 @@ const graph_repair_rebuild_batch_size: usize = 2048;
 var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
+var test_quarantine_publication_fence_entered: std.atomic.Value(bool) = .init(false);
+var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+var test_match_all_ordinal_lookup_entered: std.atomic.Value(bool) = .init(false);
+var test_release_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
@@ -2994,7 +2998,7 @@ pub const DB = struct {
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
-    index_repair_barriers: std.atomic.Value(u32) = .init(0),
+    index_catalog_barriers: std.atomic.Value(u32) = .init(0),
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
@@ -6462,6 +6466,111 @@ pub const DB = struct {
         const runtime = self.sparse_compaction_runtime orelse return;
         runtime.start() catch |err| {
             std.log.err("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+        };
+    }
+
+    const IndexStructuralMutationGuard = struct {
+        db: *DB,
+        operation: []const u8,
+        index_name: []const u8,
+        restart_text_merge: bool,
+        restart_sparse_compaction: bool,
+        catalog_barrier_held: bool = true,
+        active: bool = true,
+
+        fn releaseCatalogBarrier(self: *@This()) void {
+            if (!self.catalog_barrier_held) return;
+            self.db.endIndexCatalogBarrier();
+            self.catalog_barrier_held = false;
+        }
+
+        fn release(self: *@This()) void {
+            if (!self.active) return;
+            // The catalog is stable once the caller releases apply exclusive;
+            // let lock-free dense searches resume before runtime startup work.
+            self.releaseCatalogBarrier();
+            // Restart while serialization is still held: another structural
+            // mutation must not stop a runtime between this restart and the
+            // corresponding unlock.
+            if (self.restart_sparse_compaction) {
+                self.db.restartSparseCompactionAfterStructuralMutation(self.operation, self.index_name);
+            }
+            if (self.restart_text_merge) {
+                self.db.restartTextMergeAfterStructuralMutation(self.operation, self.index_name);
+            }
+            self.db.index_structural_mutation_mutex.unlock();
+            self.active = false;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.release();
+        }
+    };
+
+    const QuarantineIndexPublicationFence = struct {
+        db: *DB,
+        structural_guard: ?IndexStructuralMutationGuard = null,
+        apply_locked: bool = false,
+
+        fn iface(self: *@This()) index_manager_mod.IndexManager.CatalogPublicationFence {
+            return .{
+                .ptr = self,
+                .lock_fn = lockOpaque,
+                .unlock_fn = unlockOpaque,
+            };
+        }
+
+        fn lockOpaque(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.structural_guard == null and !self.apply_locked);
+            self.structural_guard = self.db.beginIndexStructuralMutation("quarantined index publication", "*");
+            if (builtin.is_test) test_quarantine_publication_fence_entered.store(true, .release);
+            lockApply(self.db);
+            self.apply_locked = true;
+        }
+
+        fn unlockOpaque(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.apply_locked and self.structural_guard != null);
+            self.db.core.unlockApply();
+            self.apply_locked = false;
+            self.structural_guard.?.release();
+            self.structural_guard = null;
+        }
+    };
+
+    /// Serializes every live index-catalog publication and drains background
+    /// tasks that borrow inline index generations. Callers must acquire this
+    /// before the DB apply lock; active tasks retire under that lock while the
+    /// guard waits for their workers to stop.
+    fn beginIndexStructuralMutation(
+        self: *DB,
+        operation: []const u8,
+        index_name: []const u8,
+    ) IndexStructuralMutationGuard {
+        return self.beginIndexStructuralMutationUntil(operation, index_name, std.math.maxInt(u64)) orelse unreachable;
+    }
+
+    fn beginIndexStructuralMutationUntil(
+        self: *DB,
+        operation: []const u8,
+        index_name: []const u8,
+        deadline_ns: u64,
+    ) ?IndexStructuralMutationGuard {
+        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
+        // Published dense searches intentionally bypass the apply lock. Raise
+        // their catalog barrier before draining maintenance so no lock-free
+        // reader can retain a pointer across an inline-array reallocation.
+        if (!self.beginIndexCatalogBarrierUntil(deadline_ns)) {
+            self.index_structural_mutation_mutex.unlock();
+            return null;
+        }
+        return .{
+            .db = self,
+            .operation = operation,
+            .index_name = index_name,
+            .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
+            .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
         };
     }
 
@@ -10104,11 +10213,17 @@ pub const DB = struct {
         if (!entry.intent.previous_pointer_captured) return false;
         const candidate = entry.intent.candidate_relative_path orelse return false;
         if (!try self.core.index_manager.isRepairCandidateActive(entry.intent.index_name, candidate)) return false;
-        try self.core.index_manager.restoreActiveIndexRootPointer(
-            entry.intent.index_name,
-            candidate,
-            entry.intent.previous_active_relative_path,
-        );
+        {
+            var structural_guard = self.beginIndexStructuralMutation("index repair rollback", entry.intent.index_name);
+            defer structural_guard.deinit();
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.core.index_manager.restoreActiveIndexRootPointer(
+                entry.intent.index_name,
+                candidate,
+                entry.intent.previous_active_relative_path,
+            );
+        }
         _ = try self.retryQuarantinedIndexLoads(true);
         try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
         return true;
@@ -11686,7 +11801,6 @@ pub const DB = struct {
             .target_sequence = self.core.nextDerivedSequence(),
         });
 
-        const use_dense_search_barrier = cfg.kind == .dense_vector;
         if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .waiting_for_convergence,
             .candidate_applied_sequence = converged_sequence,
@@ -11786,6 +11900,15 @@ pub const DB = struct {
         try checkArtifactRepairActivationOwner(options);
         const activation_started_ns = monotonicTimeNs();
         const activation_deadline_ns = activation_started_ns +| max_activation_pause_ns;
+        // Final publication detaches and later destroys the active inline
+        // generation. Drain maintenance before taking the apply lock so a
+        // task cannot retain a pointer into that generation across the swap.
+        var structural_guard = self.beginIndexStructuralMutationUntil(
+            "index repair activation",
+            cfg.name,
+            activation_deadline_ns,
+        ) orelse return error.ShadowIndexCatchUpIncomplete;
+        defer structural_guard.deinit();
         var unpublished_replacement: ?index_manager_mod.IndexManager.DetachedIndex = null;
         defer if (unpublished_replacement) |*replacement| {
             shadow_manager.destroyDetachedReplacementIndex(replacement);
@@ -11800,15 +11923,6 @@ pub const DB = struct {
                 manager.recordIndexRepairActivation(monotonicTimeNs() -| activation_started_ns, max_activation_pause_ns);
             }
         };
-        var repair_barrier_held = false;
-        if (use_dense_search_barrier) {
-            if (!self.beginIndexRepairBarrierUntil(activation_deadline_ns)) {
-                return error.ShadowIndexCatchUpIncomplete;
-            }
-            repair_barrier_held = true;
-        }
-        defer if (repair_barrier_held) self.endIndexRepairBarrier();
-
         try checkArtifactRepairCancelled(options);
         if (!self.lockApplyUntil(activation_deadline_ns)) return error.ShadowIndexCatchUpIncomplete;
         var apply_lock_held = true;
@@ -11938,18 +12052,15 @@ pub const DB = struct {
         });
 
         // The pointer and clean checkpoint are now ordered before any later
-        // foreground apply. Release write and dense-search fencing before
-        // operator hooks, intent cleanup, and generation garbage collection.
-        // Capture the actual service pause before releasing either fence.
+        // foreground apply. Release the write fence before operator hooks,
+        // intent cleanup, and generation garbage collection. Capture the
+        // actual service pause before releasing it.
         // Generation teardown and other post-commit work are measured
         // separately and cannot produce false pause-budget alarms.
         const activation_pause_ns = monotonicTimeNs() -| activation_started_ns;
         self.core.unlockApply();
         apply_lock_held = false;
-        if (repair_barrier_held) {
-            self.endIndexRepairBarrier();
-            repair_barrier_held = false;
-        }
+        structural_guard.releaseCatalogBarrier();
         if (retired_generation) |*retired| {
             self.core.index_manager.destroyDetachedReplacementIndex(retired);
             retired_generation = null;
@@ -11958,6 +12069,7 @@ pub const DB = struct {
             shadow_manager.deinit();
             shadow_manager_open = false;
         }
+        structural_guard.release();
         if (self.core.index_manager.resource_manager) |manager| {
             manager.recordIndexRepairActivation(activation_pause_ns, max_activation_pause_ns);
         }
@@ -14188,17 +14300,13 @@ pub const DB = struct {
 
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
-        defer self.index_structural_mutation_mutex.unlock();
+        var structural_guard = self.beginIndexStructuralMutation("index creation", cfg.name);
+        defer structural_guard.deinit();
         // Generated artifact namespaces can be shared across differently named
         // indexes. Cleanup is durable and owner-driven; never turn index
         // admission into an unbounded corpus scan. Metadata reconciliation can
         // retry after the conflicting generation's tombstone is retired.
         try self.rejectConflictingRetiredIndexCleanupForAdmission(cfg);
-        const restart_text_merge = self.quiesceTextMergeForStructuralMutation();
-        defer if (restart_text_merge) self.restartTextMergeAfterStructuralMutation("index creation", cfg.name);
-        const restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation();
-        defer if (restart_sparse_compaction) self.restartSparseCompactionAfterStructuralMutation("index creation", cfg.name);
         const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         var enrichment_restarted = false;
         errdefer if (restart_enrichment and !enrichment_restarted) {
@@ -15459,12 +15567,8 @@ pub const DB = struct {
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
-        defer self.index_structural_mutation_mutex.unlock();
-        const restart_text_merge = self.quiesceTextMergeForStructuralMutation();
-        defer if (restart_text_merge) self.restartTextMergeAfterStructuralMutation("index deletion", name);
-        const restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation();
-        defer if (restart_sparse_compaction) self.restartSparseCompactionAfterStructuralMutation("index deletion", name);
+        var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
+        defer structural_guard.deinit();
         const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         const removed = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("failed index deletion", name) catch |restart_err| {
@@ -15905,7 +16009,13 @@ pub const DB = struct {
     /// the initial load, so a recovered full-text/sparse/graph index resumes
     /// its persisted rebuild state and catches up before registering.
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
-        return try self.core.index_manager.retryFailedIndexLoads(self.core.store, monotonicTimeNs(), force);
+        var publication_fence = QuarantineIndexPublicationFence{ .db = self };
+        return try self.core.index_manager.retryFailedIndexLoads(
+            self.core.store,
+            monotonicTimeNs(),
+            force,
+            publication_fence.iface(),
+        );
     }
 
     fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {
@@ -21430,9 +21540,9 @@ pub const DB = struct {
     }
 
     fn beginPublishedDenseSearch(self: *DB) bool {
-        if (self.index_repair_barriers.load(.acquire) != 0) return false;
+        if (self.index_catalog_barriers.load(.acquire) != 0) return false;
         _ = self.published_dense_searches.fetchAdd(1, .acq_rel);
-        if (self.index_repair_barriers.load(.acquire) != 0) {
+        if (self.index_catalog_barriers.load(.acquire) != 0) {
             _ = self.published_dense_searches.fetchSub(1, .acq_rel);
             return false;
         }
@@ -21443,12 +21553,12 @@ pub const DB = struct {
         _ = self.published_dense_searches.fetchSub(1, .acq_rel);
     }
 
-    fn beginIndexRepairBarrierUntil(self: *DB, deadline_ns: u64) bool {
-        _ = self.index_repair_barriers.fetchAdd(1, .acq_rel);
+    fn beginIndexCatalogBarrierUntil(self: *DB, deadline_ns: u64) bool {
+        _ = self.index_catalog_barriers.fetchAdd(1, .acq_rel);
         var spins: usize = 0;
         while (self.published_dense_searches.load(.acquire) != 0) : (spins += 1) {
             if (monotonicTimeNs() >= deadline_ns) {
-                _ = self.index_repair_barriers.fetchSub(1, .acq_rel);
+                _ = self.index_catalog_barriers.fetchSub(1, .acq_rel);
                 return false;
             }
             if (spins < 64) {
@@ -21460,8 +21570,8 @@ pub const DB = struct {
         return true;
     }
 
-    fn endIndexRepairBarrier(self: *DB) void {
-        _ = self.index_repair_barriers.fetchSub(1, .acq_rel);
+    fn endIndexCatalogBarrier(self: *DB) void {
+        _ = self.index_catalog_barriers.fetchSub(1, .acq_rel);
     }
 
     fn lockApplyUntil(self: *DB, deadline_ns: u64) bool {
@@ -21586,7 +21696,10 @@ pub const DB = struct {
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
+            // searchMatchAll is entered under the outer DB apply lease. The
+            // lock is not reentrant once an exclusive writer closes its reader
+            // gate, so callbacks in this call tree must use lock-assuming APIs.
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         }, options);
     }
 
@@ -21604,20 +21717,10 @@ pub const DB = struct {
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
+            // See collectSearchMatchAllCandidatesCallback: the caller owns the
+            // apply lease for the full streaming traversal.
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         }, options, consumer_ctx, consumer);
-    }
-
-    fn lookupLiveDocOrdinalCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        doc_id: []const u8,
-        generation: ?u64,
-    ) anyerror!?doc_set.DocOrdinal {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
 
     fn lookupLiveDocOrdinalNoLockCallback(
@@ -21627,6 +21730,10 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (builtin.is_test and test_block_match_all_ordinal_lookup.load(.acquire)) {
+            test_match_all_ordinal_lookup_entered.store(true, .release);
+            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.Thread.yield() catch {};
+        }
         return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
 
@@ -41636,7 +41743,7 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
 }
 
-test "db index repair barrier disables published dense fast path" {
+test "db index catalog barrier disables published dense fast path" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -41648,12 +41755,12 @@ test "db index repair barrier disables published dense fast path" {
     try std.testing.expect(db.beginPublishedDenseSearch());
     db.endPublishedDenseSearch();
 
-    try std.testing.expect(db.beginIndexRepairBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
-    defer db.endIndexRepairBarrier();
+    try std.testing.expect(db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
+    defer db.endIndexCatalogBarrier();
     try std.testing.expect(!db.beginPublishedDenseSearch());
 }
 
-test "db index repair barrier and apply acquisition honor activation deadline" {
+test "db index catalog barrier and apply acquisition honor activation deadline" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -41663,8 +41770,8 @@ test "db index repair barrier and apply acquisition honor activation deadline" {
     defer db.close();
 
     try std.testing.expect(db.beginPublishedDenseSearch());
-    try std.testing.expect(!db.beginIndexRepairBarrierUntil(monotonicTimeNs() + std.time.ns_per_ms));
-    try std.testing.expectEqual(@as(u32, 0), db.index_repair_barriers.load(.acquire));
+    try std.testing.expect(!db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(u32, 0), db.index_catalog_barriers.load(.acquire));
     db.endPublishedDenseSearch();
 
     db.core.lockApplyExclusive();
@@ -52494,8 +52601,51 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     }
 
     // Forced retry recovers the index in-process — no reopen, no
-    // drop+recreate — resuming the persisted rebuild state.
-    const result = try db.retryQuarantinedIndexLoads(true);
+    // drop+recreate — resuming the persisted rebuild state. Hold a simulated
+    // query lease across the final publication and prove recovery waits for
+    // it rather than reallocating the inline catalog beneath a reader.
+    const RetryState = struct {
+        db: *DB,
+        result: ?index_manager_mod.IndexManager.QuarantineRetryResult = null,
+        err: ?anyerror = null,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(state: *@This()) void {
+            state.result = state.db.retryQuarantinedIndexLoads(true) catch |err| {
+                state.err = err;
+                state.completed.store(true, .release);
+                return;
+            };
+            state.completed.store(true, .release);
+        }
+    };
+    test_quarantine_publication_fence_entered.store(false, .release);
+    defer test_quarantine_publication_fence_entered.store(false, .release);
+    lockApplyShared(&db);
+    var apply_shared_held = true;
+    var retry_state = RetryState{ .db = &db };
+    var retry_thread = try std.Thread.spawn(.{}, RetryState.run, .{&retry_state});
+    var retry_thread_joined = false;
+    defer {
+        if (apply_shared_held) db.core.unlockApplyShared();
+        if (!retry_thread_joined) retry_thread.join();
+    }
+
+    const publication_deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
+    while (!test_quarantine_publication_fence_entered.load(.acquire) and monotonicTimeNs() < publication_deadline) {
+        sleepNs(100 * std.time.ns_per_us);
+    }
+    const publication_fence_entered = test_quarantine_publication_fence_entered.load(.acquire);
+    const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
+    db.core.unlockApplyShared();
+    apply_shared_held = false;
+    retry_thread.join();
+    retry_thread_joined = true;
+
+    try std.testing.expect(publication_fence_entered);
+    try std.testing.expect(publication_waited_for_reader);
+    if (retry_state.err) |err| return err;
+    const result = retry_state.result orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), result.recovered);
     try std.testing.expectEqual(@as(usize, 0), result.remaining);
     try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
@@ -69568,9 +69718,11 @@ test "db delete full text index drains active merge before closing generation" {
     text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
     text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
     text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
+    text_merge_runtime_mod.test_stop_entered.store(false, .release);
     defer {
         text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
         text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+        text_merge_runtime_mod.test_stop_entered.store(false, .release);
     }
     try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
 
@@ -69607,9 +69759,19 @@ test "db delete full text index drains active merge before closing generation" {
         delete_thread.join();
     };
 
-    // Deletion must wait for the task that borrowed the index runtime; it may
-    // not acknowledge catalog removal and close storage underneath that task.
-    for (0..512) |_| std.Thread.yield() catch {};
+    var stop_entered = false;
+    for (0..200_000) |_| {
+        if (text_merge_runtime_mod.test_stop_entered.load(.acquire)) {
+            stop_entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!stop_entered) return error.TestTimeout;
+
+    // The delete thread is now inside the maintenance stopper. It must wait
+    // for the task that borrowed the index generation rather than acknowledge
+    // removal and close storage underneath that task.
     try std.testing.expect(!deletion.completed.load(.acquire));
 
     text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
@@ -69625,6 +69787,133 @@ test "db delete full text index drains active merge before closing generation" {
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
     }));
+}
+
+test "db post-delete filter reader does not deadlock behind queued cleanup writer" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const doc_count: u32 = 40;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var initial = try DB.open(alloc, std.mem.span(path), .{});
+        defer initial.close();
+        try initial.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |write| alloc.free(@constCast(write.key));
+            writes.deinit(alloc);
+        }
+        for (0..doc_count) |i| try writes.append(alloc, .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .value = "{\"state\":\"published\",\"title\":\"catalog item\"}",
+        });
+        try initial.batch(.{ .writes = writes.items, .sync_level = .full_index });
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    {
+        var warm = try db.search(alloc, .{
+            .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+            .limit = doc_count,
+        });
+        defer warm.deinit();
+        try std.testing.expectEqual(doc_count, warm.total_hits);
+    }
+    try std.testing.expect(try db.deleteIndex("ft_v1"));
+
+    test_block_match_all_ordinal_lookup.store(true, .release);
+    test_match_all_ordinal_lookup_entered.store(false, .release);
+    test_release_match_all_ordinal_lookup.store(false, .release);
+    defer {
+        test_release_match_all_ordinal_lookup.store(true, .release);
+        test_block_match_all_ordinal_lookup.store(false, .release);
+        test_match_all_ordinal_lookup_entered.store(false, .release);
+    }
+
+    const Reader = struct {
+        db: *DB,
+        total_hits: u32 = 0,
+        completed: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(reader: *@This()) void {
+            var result = reader.db.search(std.heap.smp_allocator, .{
+                .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+                .limit = doc_count,
+            }) catch |err| {
+                reader.err = err;
+                reader.completed.store(true, .release);
+                return;
+            };
+            defer result.deinit();
+            reader.total_hits = result.total_hits;
+            reader.completed.store(true, .release);
+        }
+    };
+    var reader = Reader{ .db = &db };
+    var reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        test_release_match_all_ordinal_lookup.store(true, .release);
+        reader_thread.join();
+    };
+    var lookup_entered = false;
+    for (0..200_000) |_| {
+        if (test_match_all_ordinal_lookup_entered.load(.acquire)) {
+            lookup_entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!lookup_entered) return error.TestTimeout;
+
+    const Writer = struct {
+        db: *DB,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(writer: *@This()) void {
+            lockApply(writer.db);
+            writer.db.core.unlockApply();
+            writer.completed.store(true, .release);
+        }
+    };
+    var writer = Writer{ .db = &db };
+    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        test_release_match_all_ordinal_lookup.store(true, .release);
+        writer_thread.join();
+    };
+
+    // Wait until a cleanup-style writer owns the reader gate and is blocked on
+    // the outer query lease. A recursive shared acquisition from the ordinal
+    // callback would now deadlock: it cannot cross the gate, while the writer
+    // cannot pass the lease held by that same query.
+    var writer_queued = false;
+    for (0..200_000) |_| {
+        if (!db.core.tryLockApplyShared()) {
+            writer_queued = true;
+            break;
+        }
+        db.core.unlockApplyShared();
+        std.Thread.yield() catch {};
+    }
+    if (!writer_queued) return error.TestTimeout;
+    try std.testing.expect(!reader.completed.load(.acquire));
+    try std.testing.expect(!writer.completed.load(.acquire));
+
+    test_release_match_all_ordinal_lookup.store(true, .release);
+    reader_thread.join();
+    reader_joined = true;
+    writer_thread.join();
+    writer_joined = true;
+    if (reader.err) |err| return err;
+    try std.testing.expectEqual(doc_count, reader.total_hits);
+    try std.testing.expect(writer.completed.load(.acquire));
 }
 
 test "db delete index persists across reopen with durable lsm primary backend" {
