@@ -607,7 +607,7 @@ test "parameters-only checkpointing marks roots and loss only" {
     var bld = Builder.init(&g);
 
     const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
-    const c = try bld.constant("scale", Shape.init(.f32, &.{1}), &.{2.0});
+    const c = try bld.tensorConst(&.{2.0}, Shape.init(.f32, &.{1}));
     const w = try bld.parameter("w", Shape.init(.f32, &.{ 4, 4 }));
     const y = try bld.linearNoBias(x, w, 2, 4, 4);
     const scaled = try bld.mul(y, c);

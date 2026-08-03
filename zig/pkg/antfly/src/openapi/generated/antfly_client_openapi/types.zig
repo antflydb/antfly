@@ -5727,6 +5727,22 @@ pub const LsmStorageStatus = struct {
     read_snapshot_mutable_rotation_count: ?i64 = null,
     read_snapshot_mutable_rotation_bytes: ?i64 = null,
     wal_retained_bytes: ?i64 = null,
+    /// Whether WAL checkpoint maintenance is pending.
+    wal_checkpoint_pending: ?bool = null,
+    /// Whether WAL hard-limit admission is currently blocked.
+    wal_pressure_blocked: ?bool = null,
+    /// Representative reason for the earliest pending WAL checkpoint retry.
+    wal_checkpoint_retry_reason: ?[]const u8 = null,
+    /// Consecutive failures for the representative WAL checkpoint retry.
+    wal_checkpoint_retry_attempts: ?i64 = null,
+    /// Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+    wal_checkpoint_retry_delay_ns: ?i64 = null,
+    /// Logical bytes in immutable memtables awaiting run publication.
+    active_immutable_logical_bytes: ?i64 = null,
+    /// Logical bytes in runs awaiting durable manifest publication.
+    unpublished_wal_logical_bytes: ?i64 = null,
+    /// Largest logical batch awaiting durable manifest publication.
+    unpublished_wal_max_batch_logical_bytes: ?i64 = null,
     compaction_backlog_bytes: ?i64 = null,
     active_readers: ?i64 = null,
     active_readers_bound_read_txn: ?i64 = null,
@@ -6881,7 +6897,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -8273,6 +8289,7 @@ pub const TransformOpType = enum {
     @"$set_on_insert",
     @"$unset",
     @"$inc",
+    @"$push",
     @"$add_to_set",
     @"$max",
 
@@ -8282,6 +8299,7 @@ pub const TransformOpType = enum {
             .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
+            .@"$push" => "$push",
             .@"$add_to_set" => "$addToSet",
             .@"$max" => "$max",
         };
@@ -8298,6 +8316,7 @@ pub const TransformOpType = enum {
             .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
+            .{ "$push", .@"$push" },
             .{ "$addToSet", .@"$add_to_set" },
             .{ "$max", .@"$max" },
         });

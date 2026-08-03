@@ -198,9 +198,10 @@ RECOGNIZER_MODELS = [
 
 READER_MODELS = [
     ModelSpec(
-        name="trocr-base-printed",
-        repo="Xenova/trocr-base-printed",
+        name="florence-2-base",
+        repo="antflydb/florence-2-base",
         task="readers",
+        variant="gguf:Q4_K",
     ),
 ]
 
@@ -267,7 +268,7 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/classify": ("cross-encoder/nli-distilroberta-base", "classifiers"),
     "/ai/v1/recognize": ("fastino/gliner2-base-v1", "recognizers"),
     "/ai/v1/extract": ("fastino/gliner2-base-v1", "recognizers"),
-    "/ai/v1/read": ("Xenova/trocr-base-printed", "readers"),
+    "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
     "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),
 }
 
@@ -300,6 +301,7 @@ GENERATOR_ENV_VARS = (
 )
 
 READER_ENV_VARS = (
+    "ANTFLY_INFERENCE_FLORENCE_MODEL",
     "ANTFLY_INFERENCE_TROCR_MODEL",
     "ANTFLY_INFERENCE_DONUT_MODEL",
     "ANTFLY_INFERENCE_MULTISTAGE_READER_MODEL",
@@ -716,7 +718,9 @@ def _env_model_specs() -> list[ModelSpec]:
         if key in seen:
             continue
         seen.add(key)
-        specs.append(_dynamic_spec(value, "generators"))
+        spec = spec_for_name(value, "generators")
+        if spec is not None:
+            specs.append(spec)
 
     for env_name in READER_ENV_VARS:
         value = os.environ.get(env_name, "").strip()
@@ -726,7 +730,9 @@ def _env_model_specs() -> list[ModelSpec]:
         if key in seen:
             continue
         seen.add(key)
-        specs.append(_dynamic_spec(value, "readers"))
+        spec = spec_for_name(value, "readers")
+        if spec is not None:
+            specs.append(spec)
 
     return specs
 

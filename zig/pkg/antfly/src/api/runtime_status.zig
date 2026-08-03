@@ -928,6 +928,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     var merged = try placeholder.clone(alloc);
     errdefer merged.deinit(alloc);
 
+    merged.stats.storage_change_token = previous.stats.storage_change_token;
     merged.stats.source_doc_count = previous.stats.source_doc_count;
     merged.stats.doc_count = previous.stats.doc_count;
     merged.stats.enrichment = previous.stats.enrichment;
@@ -1449,6 +1450,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     return .{
+        .storage_change_token = stats.storage_change_token,
         .source_doc_count = stats.source_doc_count,
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,

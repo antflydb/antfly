@@ -1037,6 +1037,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupGraphExpandWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupGraphExpandWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1053,10 +1065,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -1070,6 +1085,18 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupGraphHydrateWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupGraphHydrateWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -1087,10 +1114,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -1104,6 +1134,18 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupGraphEdgesWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupGraphEdgesWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -1121,10 +1163,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -2153,6 +2198,7 @@ pub const ApiHttpClient = struct {
             200 => return try self.alloc.dupe(u8, resp.body),
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2704,7 +2750,7 @@ test "api http client bounds transition control RPCs" {
     ));
 }
 
-test "api http client forwards distributed join budgets and maps remote timeout" {
+test "api http client forwards internal query controls and maps remote timeout" {
     const TimeoutExecutor = struct {
         calls: usize = 0,
 
@@ -2720,6 +2766,9 @@ test "api http client forwards distributed join budgets and maps remote timeout"
             self.calls += 1;
             try std.testing.expectEqual(@as(u32, 37), req.timeout_ms.?);
             try std.testing.expectEqual(http_common.Method.POST, req.method);
+            if (std.mem.indexOf(u8, req.uri, "/graph-") != null) {
+                try std.testing.expect(req.cancellation != null);
+            }
             return .{
                 .status = 408,
                 .body = try alloc.dupe(u8, "query timeout"),
@@ -2734,7 +2783,11 @@ test "api http client forwards distributed join budgets and maps remote timeout"
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
-    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    var cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(error.Timeout, client.fetchGroupGraphExpandWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupGraphHydrateWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupGraphEdgesWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
+    try std.testing.expectEqual(@as(usize, 7), executor.calls);
 }
 
 test "api http client encodes table name for repair cancel callback" {

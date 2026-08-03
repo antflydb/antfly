@@ -117,6 +117,9 @@ fn aggregationFullResultBudget() u32 {
 }
 
 fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    if (req.cancellation) |value| {
+        if (value.load(.acquire)) return error.Cancelled;
+    }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
@@ -5545,6 +5548,8 @@ fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
+        .execution_deadline_ns = distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .cancellation = req.cancellation,
     };
 }
 
@@ -13713,7 +13718,18 @@ fn graphExpandRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphExpandRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupGraphExpand(base_uri, group_id, table_name, body);
+    var cancellation = if (req.cancellation) |signal|
+        http_common.RequestCancellation{ .borrowed = signal }
+    else
+        null;
+    var result = try client.fetchGroupGraphExpandWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        req.timeout_ms,
+        if (cancellation != null) &cancellation.? else null,
+    );
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphExpandResponse(alloc, result.body);
 }
@@ -13729,7 +13745,18 @@ fn graphHydrateRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphHydrateRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupGraphHydrate(base_uri, group_id, table_name, body);
+    var cancellation = if (req.cancellation) |signal|
+        http_common.RequestCancellation{ .borrowed = signal }
+    else
+        null;
+    var result = try client.fetchGroupGraphHydrateWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        req.timeout_ms,
+        if (cancellation != null) &cancellation.? else null,
+    );
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphHydrateResponse(alloc, result.body);
 }
@@ -13745,7 +13772,18 @@ fn graphEdgesRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupGraphEdges(base_uri, group_id, table_name, body);
+    var cancellation = if (req.cancellation) |signal|
+        http_common.RequestCancellation{ .borrowed = signal }
+    else
+        null;
+    var result = try client.fetchGroupGraphEdgesWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        req.timeout_ms,
+        if (cancellation != null) &cancellation.? else null,
+    );
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphEdgesResponse(alloc, result.body);
 }

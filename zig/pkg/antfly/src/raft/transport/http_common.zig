@@ -14,6 +14,8 @@
 
 const common = @import("../../common/http/http_common.zig");
 
+pub const RequestCancellation = common.RequestCancellation;
+
 pub const Header = common.Header;
 pub const HttpRequest = common.HttpRequest;
 pub const HttpResponse = common.HttpResponse;

@@ -65,6 +65,8 @@ pub const QueryParams = struct {
     offset: usize = 0,
     order_by: []SortField = &.{},
     execution_deadline_ns: ?u64 = null,
+    /// Borrowed from the HTTP request; never retained by a source.
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn deinit(self: *QueryParams, alloc: Allocator) void {
         alloc.free(self.table);
@@ -97,6 +99,8 @@ pub const AggregateParams = struct {
     columns: []Column = &.{},
     aggregations: []NamedAggregation = &.{},
     execution_deadline_ns: ?u64 = null,
+    /// Borrowed from the HTTP request; never retained by a source.
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn deinit(self: *AggregateParams, alloc: Allocator) void {
         alloc.free(self.table);

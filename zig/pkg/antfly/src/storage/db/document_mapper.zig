@@ -3286,6 +3286,11 @@ test "document mapper emits schema-driven search_as_you_type variants" {
                     },
                     .{
                         .path = "name",
+                        .emitted_name = "name._root_prefix",
+                        .analyzer = "search_as_you_type_root_prefix",
+                    },
+                    .{
+                        .path = "name",
                         .emitted_name = "name._2gram",
                         .analyzer = "search_as_you_type_2gram",
                     },
@@ -3314,6 +3319,8 @@ test "document mapper emits schema-driven search_as_you_type variants" {
 
     try std.testing.expect((try reader.invertedIndex("name")) != null);
     try std.testing.expect((try reader.invertedIndex("name.keyword")) != null);
+    const root_prefix = (try reader.invertedIndex("name._root_prefix")) orelse return error.TestExpectedEqual;
+    try std.testing.expect(root_prefix.lookup("smartphon") != null);
     try std.testing.expect((try reader.invertedIndex("name._2gram")) != null);
     try std.testing.expect((try reader.invertedIndex("name._3gram")) != null);
     try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);

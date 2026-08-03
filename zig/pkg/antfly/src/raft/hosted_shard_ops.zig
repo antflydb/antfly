@@ -476,7 +476,16 @@ pub const HostedShardDbAdapter = struct {
         var tried_node_ids = std.ArrayListUnmanaged(u64).empty;
         defer tried_node_ids.deinit(self.alloc);
 
-        if (try self.fetchMedianKeyFromResolvedRoute(alloc, group_id, .prefer_leader, &tried_node_ids)) |median_key| {
+        const preferred_median_key = self.fetchMedianKeyFromResolvedRoute(
+            alloc,
+            group_id,
+            .prefer_leader,
+            &tried_node_ids,
+        ) catch |err| preferred: {
+            if (!isLeaderRediscoveryError(err)) return err;
+            break :preferred null;
+        };
+        if (preferred_median_key) |median_key| {
             return median_key;
         }
 
@@ -499,7 +508,11 @@ pub const HostedShardDbAdapter = struct {
         if (self.router.localStatus(group_id) == .active and !containsNodeId(tried_node_ids.items, local_node_id)) {
             try tried_node_ids.append(self.alloc, local_node_id);
             if (self.local_db) |local_db| {
-                if (try local_db.fetchMedianKey(alloc, group_id)) |median_key| return median_key;
+                const local_median_key = local_db.fetchMedianKey(alloc, group_id) catch |err| local: {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    break :local null;
+                };
+                if (local_median_key) |median_key| return median_key;
             }
         }
 
@@ -514,7 +527,11 @@ pub const HostedShardDbAdapter = struct {
             defer self.alloc.free(base_uri);
             saw_candidate = true;
             var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
-            if (try client.fetchGroupDbMedianKey(base_uri, group_id)) |median_key| return median_key;
+            const candidate_median_key = client.fetchGroupDbMedianKey(base_uri, group_id) catch |err| {
+                if (isLeaderRediscoveryError(err)) continue;
+                return err;
+            };
+            if (candidate_median_key) |median_key| return median_key;
         }
 
         return if (saw_candidate) null else error.UnknownGroup;
@@ -974,4 +991,85 @@ test "hosted shard db adapter routes median key to remote leader" {
     defer std.testing.allocator.free(median_key);
     try std.testing.expectEqualStrings("doc:m", median_key);
     try std.testing.expectError(error.UnsupportedOperation, hosted.adapter().schemaIndexReady(std.testing.allocator, "docs", 88, 2, 1));
+}
+
+test "hosted shard db adapter rediscovers median key after stale leader route" {
+    const raft_host = @import("host.zig");
+
+    const FakeRouter = struct {
+        fn iface(self: *@This()) api_table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const FakeExecutor = struct {
+        stale_status: u16,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, req.uri, "node-1") != null) {
+                return .{ .status = self.stale_status, .body = try alloc.dupe(u8, "unavailable") };
+            }
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "node-2") != null);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"median_key\":\"doc:m\"}") };
+        }
+    };
+
+    for ([_]u16{ 404, 503 }) |stale_status| {
+        var router = FakeRouter{};
+        var executor = FakeExecutor{ .stale_status = stale_status };
+        var hosted = HostedShardDbAdapter.init(
+            std.testing.allocator,
+            undefined,
+            router.iface(),
+            executor.executor(),
+            null,
+        );
+
+        const median_key = (try hosted.adapter().fetchMedianKey(std.testing.allocator, 88)).?;
+        defer std.testing.allocator.free(median_key);
+        try std.testing.expectEqualStrings("doc:m", median_key);
+        try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    }
 }

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for canonical /api/extract entity and relation extraction.
+"""Tests for canonical /ai/v1/recognize entity and relation extraction.
 
 Matches Go antfly's gliner_test.go patterns.
 GLiNER models use zero-shot NER with user-specified entity labels.
@@ -111,7 +111,7 @@ def test_recognize_with_resolver(api):
 
 
 def test_recognize_rebel_relations(api):
-    """REBEL-style recognizers should return relation edges through /api/extract."""
+    """REBEL-style recognizers should return relation edges through /ai/v1/recognize."""
     try:
         resp = api.recognize(
             text=["Barack Obama was born in Hawaii and worked for the United States government."],
@@ -126,7 +126,7 @@ def test_recognize_rebel_relations(api):
 
 
 def test_recognize_native_safetensors_bert_token_classifier(api):
-    """Native WordPiece recognizers should return non-empty spans through /api/extract."""
+    """Native WordPiece recognizers should return non-empty spans through /ai/v1/recognize."""
     recognizers = api.models().get("recognizers", {})
     if NATIVE_BERT_NER_MODEL not in recognizers:
         pytest.skip(f"No local recognizer model is available for {NATIVE_BERT_NER_MODEL}")

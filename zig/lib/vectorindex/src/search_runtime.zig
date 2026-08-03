@@ -234,6 +234,54 @@ pub fn exactDistancesToStoredVectors(
     }
 }
 
+/// Request-path variant. Keep cancellation latency bounded even when a leaf
+/// or rerank window is large; maintenance/debug callers retain the vectorized
+/// helper above.
+pub fn exactDistancesToStoredVectorsCancellable(
+    metric: types.HBCConfig,
+    query: []const f32,
+    query_measure: f32,
+    candidates: []const []const f32,
+    distances: []f32,
+    cancellation: ?*const std.atomic.Value(bool),
+) !void {
+    return exactDistancesToStoredVectorsWithCancellationCheck(
+        metric,
+        query,
+        query_measure,
+        candidates,
+        distances,
+        AtomicCancellationCheck{ .signal = cancellation },
+    );
+}
+
+const exact_distance_cancellation_stride = 64;
+
+const AtomicCancellationCheck = struct {
+    signal: ?*const std.atomic.Value(bool),
+
+    inline fn check(self: @This()) !void {
+        if (self.signal) |signal| {
+            if (signal.load(.acquire)) return error.Cancelled;
+        }
+    }
+};
+
+fn exactDistancesToStoredVectorsWithCancellationCheck(
+    metric: types.HBCConfig,
+    query: []const f32,
+    query_measure: f32,
+    candidates: []const []const f32,
+    distances: []f32,
+    cancellation_check: anytype,
+) !void {
+    std.debug.assert(candidates.len <= distances.len);
+    for (candidates, 0..) |candidate, i| {
+        if (i % exact_distance_cancellation_stride == 0) try cancellation_check.check();
+        distances[i] = exactDistanceToStoredVector(metric, query, query_measure, candidate);
+    }
+}
+
 test "exact cosine distance includes candidate norm" {
     const metric = types.HBCConfig{ .dims = 2, .metric = .cosine };
     const query = [_]f32{ 1.0, 0.0 };
@@ -256,4 +304,57 @@ test "exact cosine distance includes candidate norm" {
     exactDistancesToStoredVectors(metric, &query, query_measure, &.{ &same_direction_large, &orthogonal }, &distances);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), distances[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), distances[1], 1e-6);
+}
+
+test "cancellable exact distances honor preexisting cancellation" {
+    const metric = types.HBCConfig{ .dims = 2, .metric = .l2_squared };
+    const query = [_]f32{ 0.0, 0.0 };
+    const candidate = [_]f32{ 1.0, 1.0 };
+    var candidates: [128][]const f32 = undefined;
+    for (&candidates) |*slot| slot.* = &candidate;
+    var distances: [128]f32 = undefined;
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        exactDistancesToStoredVectorsCancellable(metric, &query, 0, &candidates, &distances, &cancelled),
+    );
+}
+
+test "cancellable exact distances stop at a mid-batch checkpoint" {
+    const CancelAtSecondCheckpoint = struct {
+        calls: usize = 0,
+
+        fn check(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == 2) return error.Cancelled;
+        }
+    };
+
+    const metric = types.HBCConfig{ .dims = 2, .metric = .l2_squared };
+    const query = [_]f32{ 0.0, 0.0 };
+    const candidate = [_]f32{ 1.0, 1.0 };
+    var candidates: [exact_distance_cancellation_stride * 2][]const f32 = undefined;
+    for (&candidates) |*slot| slot.* = &candidate;
+    var distances: [candidates.len]f32 = undefined;
+    @memset(&distances, std.math.nan(f32));
+    var cancellation_check = CancelAtSecondCheckpoint{};
+
+    try std.testing.expectError(
+        error.Cancelled,
+        exactDistancesToStoredVectorsWithCancellationCheck(
+            metric,
+            &query,
+            0,
+            &candidates,
+            &distances,
+            &cancellation_check,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), cancellation_check.calls);
+    for (distances[0..exact_distance_cancellation_stride]) |distance| {
+        try std.testing.expectEqual(@as(f32, 2.0), distance);
+    }
+    for (distances[exact_distance_cancellation_stride..]) |distance| {
+        try std.testing.expect(std.math.isNan(distance));
+    }
 }

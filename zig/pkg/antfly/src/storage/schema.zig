@@ -253,8 +253,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     const num_templates = readU32(data, &pos);
     const templates = try alloc.alloc(DynamicTemplate, num_templates);
+    var templates_initialized: usize = 0;
     errdefer {
-        for (templates[0..num_templates]) |t| {
+        for (templates[0..templates_initialized]) |t| {
             alloc.free(t.name);
             if (t.match_pattern) |p| alloc.free(p);
             if (t.unmatch_pattern) |p| alloc.free(p);
@@ -338,6 +339,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .analyzer = analyzer,
             },
         };
+        templates_initialized += 1;
     }
 
     const full_text_documents: []FullTextDocument = if (fmt_version >= 2) blk: {
@@ -1522,6 +1524,35 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(loaded.index_sort[0].desc);
     try std.testing.expectEqualStrings("_id", loaded.index_sort[1].field);
     try std.testing.expect(!loaded.index_sort[1].desc);
+}
+
+test "schema deserialization cleans only initialized dynamic templates on allocation failure" {
+    const alloc = std.testing.allocator;
+    const templates = [_]DynamicTemplate{
+        .{
+            .name = "first",
+            .match_pattern = "first_*",
+            .path_match = "meta.first.*",
+            .mapping = .{ .analyzer = "keyword" },
+        },
+        .{
+            .name = "second",
+            .unmatch_pattern = "private_*",
+            .path_unmatch = "meta.private.*",
+            .match_mapping_type = "string",
+            .mapping = .{ .analyzer = "standard" },
+        },
+    };
+    const encoded = try serializeSchema(alloc, .{ .dynamic_templates = &templates });
+    defer alloc.free(encoded);
+
+    const Runner = struct {
+        fn run(failing_alloc: Allocator, data: []const u8) !void {
+            const schema = try deserializeSchema(failing_alloc, data);
+            defer freeSchema(failing_alloc, schema);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{encoded});
 }
 
 test "schema save/load via DocStore" {

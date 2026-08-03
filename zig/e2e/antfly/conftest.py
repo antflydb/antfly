@@ -1778,16 +1778,22 @@ def stateful_api(request: pytest.FixtureRequest):
                 return {}
             return response.json()
 
+        @property
+        def supports_restart(self) -> bool:
+            """Whether this fixture owns a server with a restart lifecycle."""
+            return self._server is not None and callable(getattr(self._server, "restart", None))
+
         def restart_server(self) -> None:
             server = self._server
-            if server is None or not hasattr(server, "restart"):
-                raise AssertionError("restart is only available for locally managed stateful servers")
+            if not self.supports_restart:
+                raise RuntimeError("restart is only available for locally managed stateful servers")
+            assert server is not None
             with self._request_lock:
                 self.s.close()
                 server.restart()
                 if not wait_for_server(self.url, timeout=20):
                     logs = server.debug_logs().strip()
-                    raise AssertionError(f"stateful server failed to restart at {self.url}\n{logs}")
+                    raise RuntimeError(f"stateful server failed to restart at {self.url}\n{logs}")
                 new_session = requests.Session()
                 new_session.headers["Content-Type"] = "application/json"
                 new_session.headers["Connection"] = "close"

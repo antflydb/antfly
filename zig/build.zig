@@ -2510,6 +2510,12 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const httpx_transport_regression_tests = b.addTest(.{
+        .root_module = httpx_mod,
+        .filters = &.{"H2 response serialization strips connection-specific headers"},
+    });
+    const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
+
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/json_helpers.zig"),
         .target = target,
@@ -3122,6 +3128,13 @@ pub fn build(b: *std.Build) void {
         "postgres libpq permit saturation preserves zero-connection pools",
         "postgres libpq async reader services input while flushing and between results",
         "postgres libpq async reader rejects and clears additional results",
+        "postgres libpq async reader observes cancellation after bounded wait before consuming input",
+        "postgres libpq async reader returns cancelled before waiting or consuming input",
+        "postgres libpq result decoding observes cancellation at periodic checkpoints",
+        "postgres libpq global permit wait observes cancellation without a deadline",
+        "postgres libpq pool wait observes cancellation without a deadline",
+        "postgres libpq cancellation during connect polling closes the fresh connection",
+        "managed embedder cancels an in-flight remote embedding request",
         "postgres libpq created replication snapshot cloning is allocation-failure safe",
         "postgres libpq weighted FIFO preserves a queued two-permit cutover",
         "postgres libpq timed out weighted head hands released capacity to follower",
@@ -3435,6 +3448,7 @@ pub fn build(b: *std.Build) void {
         "managed host service preserves leader-routed observation roles from transition ops",
         "managed host service seeds queued transitions from projected metadata store",
         "raft runtime cadence validates independent intervals",
+        "hosted shard db adapter rediscovers median key after stale leader route",
         "shard operation adapter metadata runtime dispatches actions",
         "transition destination requires a stable healthy voter set",
         "transition retry jitter is bounded and desynchronizes services",
@@ -3730,6 +3744,7 @@ pub fn build(b: *std.Build) void {
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
+        "runtime status disk scan retries only when maintenance invalidates its group",
         "data runtime stamps one producer generation on every reported group",
         "data runtime live writer source follows raft apply ownership",
         "placement topology promotes cutover-ready learners to voters",
@@ -4464,6 +4479,10 @@ pub fn build(b: *std.Build) void {
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
         "httpx antfly scan honors optional body and documented bad requests",
+        "httpx query admission rejects saturated queries without blocking control routes",
+        "httpx query admission releases a cancelled query slot",
+        "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
+        "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
         "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",
@@ -4814,6 +4833,7 @@ pub fn build(b: *std.Build) void {
             "enrichment worker chunk cache keys preserve embedded separators",
             "search request text stats keys preserve embedded separators",
             "merge distributed background text stats keys preserve embedded separators",
+            "significant_terms local background stats use postings without stored index source",
             "graph edge local read rejects stale identity namespace",
             "dense metadata keys preserve embedded index separators",
             "dense metadata lookups read legacy textual rows",
@@ -5952,6 +5972,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
+    unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
@@ -6371,6 +6392,31 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_db_unit_tests.addArgs(args);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    // Release-blocker regressions must run in the PR/base unit gate. Keep this
+    // as a focused artifact so CI does not need to run the entire DB suite.
+    const release_blocker_regression_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+            "db one real delete keeps filtered full text on complement path across restart",
+            "db production ingest preserves high-frequency keyword recall across clean restarts",
+            "non-visible doc set complements visibility per generation",
+            "built-in exact dense scorer filters metadata before vector reads",
+            "sorted unique vector id subtraction handles sparse and dense exclusions",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_release_blocker_regression_tests = addFilteredTestRunArtifact(b, release_blocker_regression_tests);
+    const release_blocker_regression_step = b.step(
+        "release-blocker-regression-test",
+        "Run selective ANN and post-delete full-text release-blocker regressions",
+    );
+    release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
+    unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
 
     const db_restore_identity_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -7265,6 +7311,15 @@ pub fn build(b: *std.Build) void {
             "streaming phrase scorer matches randomized positional reference",
             "phrase filter exact adjacency",
             "phrase filter with slop",
+            "prefix filter seeks late range in large term dictionary",
+            "prefix filter uses a materialized companion with old-segment fallback",
+            "exact inclusive term range preserves prefix constant scores",
+            "multi_match bool_prefix preserves root semantics and bounds shingle prefixes",
+            "segment term statistics stay immutable while tombstones mask hits",
+            "retained snapshots share tombstones and immutable BM25 statistics",
+            "concurrent searches safely observe in-place deletion publication",
+            "resolved ordinal filters subtract non-visible complement without live probes",
+            "db one real delete keeps filtered full text on complement path across restart",
             "PostingsIterator positional seek decodes only selected records",
             "PostingsIterator deferred positional seek decodes only accepted candidates",
             "PostingsIterator streams deferred grouped positions without scratch arrays",
@@ -7304,7 +7359,6 @@ pub fn build(b: *std.Build) void {
             "bool fallback applies native doc number constraints",
             "db text kernel search matches projected search without stored bodies",
             "split preserves postings when text segments omit source bodies",
-            "background text stats use postings when segment source is omitted",
             "text score query exposes score top k sort profile",
         },
         .test_runner = .{
