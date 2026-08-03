@@ -32,7 +32,6 @@ pub const Config = struct {
     max_pending_segments: u64 = 64,
     resume_pending_segments: u64 = 32,
     max_pending_bytes: u64 = 256 * 1024 * 1024,
-    backpressure_sleep_ms: u64 = 1,
     // Bound producer latency when a source is corrupt, quarantined, or owned
     // by a stuck worker. FD admission remains the final safety boundary.
     backpressure_max_wait_ms: u64 = 5_000,
@@ -55,20 +54,15 @@ pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
-    defer_flag: ?*const std.atomic.Value(bool),
 
     pub fn init(
         _: Allocator,
         _: *index_manager_mod.IndexManager,
         _: *apply_rw_lock_mod.ApplyRwLock,
-        defer_flag: ?*const std.atomic.Value(bool),
         _: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !@This() {
-        return .{
-            .config = config,
-            .defer_flag = defer_flag,
-        };
+        return .{ .config = config };
     }
 
     pub fn deinit(self: *@This()) void {
@@ -135,7 +129,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     io_impl: ?*Io.Threaded,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
-    defer_flag: ?*const std.atomic.Value(bool),
     config: Config,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -151,6 +144,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     producer_segment_reservations: u64 = 0,
     producer_byte_reservations: u64 = 0,
     producer_release_epoch: u64 = 0,
+    producer_wait_epoch: std.atomic.Value(u32) = .init(0),
     admission_closed: bool = false,
     future: ?Io.Future(void) = null,
 
@@ -176,6 +170,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             runtime.notified = true;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
+            runtime.signalProducerAdmissionChanged();
         }
     };
 
@@ -183,7 +178,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         alloc: Allocator,
         index_manager: *index_manager_mod.IndexManager,
         apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
-        defer_flag: ?*const std.atomic.Value(bool),
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !TextMergeRuntime {
@@ -200,7 +194,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             .io_impl = io_impl,
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
-            .defer_flag = defer_flag,
             .config = config,
         };
     }
@@ -313,7 +306,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn runOnce(self: *TextMergeRuntime) !bool {
-        if (self.workDeferred()) return false;
         var maybe_task: ?index_manager_mod.IndexManager.TextMergeTask = null;
         if (!self.apply_mutex.tryLockExclusive()) return false;
         maybe_task = self.index_manager.beginTextMergeTask() catch |err| {
@@ -340,26 +332,30 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             if (err == error.ResourceBudgetExceeded) {
                 self.index_manager.cancelTextMergeTask(&task);
                 self.apply_mutex.unlockExclusive();
+                self.signalProducerAdmissionChanged();
                 return false;
             }
             self.index_manager.noteTextMergeFailure(&task, err);
             self.apply_mutex.unlockExclusive();
+            self.signalProducerAdmissionChanged();
             return err;
         };
         defer result.deinit(work_alloc);
 
         lockApplyExclusive(self.apply_mutex);
-        defer self.apply_mutex.unlockExclusive();
         _ = self.index_manager.finishTextMergeTask(&task, &result) catch |err| {
             self.index_manager.noteTextMergeFailure(&task, err);
+            self.apply_mutex.unlockExclusive();
+            self.signalProducerAdmissionChanged();
             return err;
         };
+        self.apply_mutex.unlockExclusive();
+        self.signalProducerAdmissionChanged();
         return true;
     }
 
     pub fn applyBackpressure(self: *TextMergeRuntime) BackpressureOutcome {
         if (!self.config.enabled) return .not_needed;
-        if (self.workDeferred()) return .not_needed;
         if (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0) return .not_needed;
         if (!self.backpressureNeeded()) return .not_needed;
 
@@ -374,7 +370,9 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         defer self.recordBackpressureElapsed(started_ns);
         self.notify();
-        while (!isShutdown(self) and !self.backpressureDrained()) {
+        while (!isShutdown(self)) {
+            const wait_epoch = self.producer_wait_epoch.load(.acquire);
+            if (self.backpressureDrained()) break;
             if (self.backpressureExpired(started_ns)) {
                 self.recordBackpressureTerminal(.timed_out);
                 return .timed_out;
@@ -387,7 +385,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             // Merge execution stays on the background runtime. Producer
             // deadlines therefore cover the entire wait even when a merge
             // itself takes longer than the configured maximum.
-            if (!self.sleepBackpressure(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+            if (!self.waitForProducerAdmissionChange(wait_epoch, started_ns)) {
                 if (isShutdown(self)) return .shutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return .timed_out;
@@ -402,7 +400,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     /// the configured high watermark is an admission limit rather than a
     /// best-effort cleanup trigger.
     pub fn acquireProducerPermit(self: *TextMergeRuntime, segment_count: u64, byte_count: u64) !ProducerPermit {
-        if ((segment_count == 0 and byte_count == 0) or !self.config.enabled or self.workDeferred() or
+        if ((segment_count == 0 and byte_count == 0) or !self.config.enabled or
             (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0))
         {
             return .{ .runtime = self, .segment_count = 0, .byte_count = 0, .active = false };
@@ -429,6 +427,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 return error.TextMergeRuntimeShutdown;
             }
             const snapshot_epoch = self.producer_release_epoch;
+            const snapshot_wait_epoch = self.producer_wait_epoch.load(.acquire);
             self.mutex.unlock(io);
 
             lockApplyShared(self.apply_mutex);
@@ -440,7 +439,9 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
-            if (snapshot_epoch != self.producer_release_epoch) {
+            if (snapshot_epoch != self.producer_release_epoch or
+                snapshot_wait_epoch != self.producer_wait_epoch.load(.acquire))
+            {
                 self.mutex.unlock(io);
                 continue;
             }
@@ -466,7 +467,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
-            if (!self.sleepProducerAdmission(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+            if (!self.waitForProducerAdmissionChange(snapshot_wait_epoch, started_ns)) {
                 if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
@@ -481,6 +482,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.admission_closed = closed;
         self.cond.broadcast(io);
         self.mutex.unlock(io);
+        self.signalProducerAdmissionChanged();
     }
 
     fn recordBackpressureElapsed(self: *TextMergeRuntime, started_ns: u64) void {
@@ -518,26 +520,32 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
     }
 
-    fn sleepBackpressure(self: *TextMergeRuntime, started_ns: u64, requested_ms: u64) bool {
-        var remaining_ms = requested_ms;
-        while (remaining_ms > 0) {
-            if (isShutdown(self) or self.backpressureExpired(started_ns)) return false;
-            const slice_ms: u64 = @min(remaining_ms, 10);
-            self.config.clock.sleepMs(slice_ms);
-            remaining_ms -= slice_ms;
-        }
-        return !self.backpressureExpired(started_ns);
+    fn waitForProducerAdmissionChange(self: *TextMergeRuntime, observed_epoch: u32, started_ns: u64) bool {
+        if (self.isAdmissionClosed() or self.backpressureExpired(started_ns)) return false;
+        const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        const elapsed_ns = self.backpressureNowNs() -| started_ns;
+        if (elapsed_ns >= max_wait_ns) return false;
+        const io = self.io_impl.?.io();
+        std.Io.futexWaitTimeout(
+            io,
+            u32,
+            &self.producer_wait_epoch.raw,
+            observed_epoch,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@intCast(max_wait_ns - elapsed_ns)),
+            } },
+        ) catch |err| switch (err) {
+            error.Canceled => return false,
+        };
+        return !self.isAdmissionClosed() and !self.backpressureExpired(started_ns);
     }
 
-    fn sleepProducerAdmission(self: *TextMergeRuntime, started_ns: u64, requested_ms: u64) bool {
-        var remaining_ms = requested_ms;
-        while (remaining_ms > 0) {
-            if (self.isAdmissionClosed() or self.backpressureExpired(started_ns)) return false;
-            const slice_ms: u64 = @min(remaining_ms, 10);
-            self.config.clock.sleepMs(slice_ms);
-            remaining_ms -= slice_ms;
-        }
-        return !self.isAdmissionClosed() and !self.backpressureExpired(started_ns);
+    fn signalProducerAdmissionChanged(self: *TextMergeRuntime) void {
+        const io_impl = self.io_impl orelse return;
+        const io = io_impl.io();
+        _ = self.producer_wait_epoch.fetchAdd(1, .release);
+        std.Io.futexWake(io, u32, &self.producer_wait_epoch.raw, std.math.maxInt(u32));
     }
 
     fn isAdmissionClosed(self: *TextMergeRuntime) bool {
@@ -578,7 +586,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn backpressureNeeded(self: *TextMergeRuntime) bool {
-        if (self.workDeferred()) return false;
         lockApplyShared(self.apply_mutex);
         const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
         self.apply_mutex.unlockShared();
@@ -587,7 +594,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn backpressureDrained(self: *TextMergeRuntime) bool {
-        if (self.workDeferred()) return true;
         lockApplyShared(self.apply_mutex);
         const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
         self.apply_mutex.unlockShared();
@@ -603,11 +609,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.apply_mutex.unlockShared();
         return stats_snapshot.pending_segments > 0 and
             stats_snapshot.quarantined_segments >= stats_snapshot.pending_segments;
-    }
-
-    fn workDeferred(self: *const TextMergeRuntime) bool {
-        const flag = self.defer_flag orelse return false;
-        return flag.load(.acquire);
     }
 };
 

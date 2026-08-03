@@ -412,11 +412,6 @@ const TextBatchMutationStats = struct {
 pub const TextPublicationEstimate = struct {
     segment_count: u64 = 0,
     byte_count: u64 = 0,
-
-    fn add(self: *TextPublicationEstimate, other: TextPublicationEstimate) void {
-        self.segment_count +|= other.segment_count;
-        self.byte_count +|= other.byte_count;
-    }
 };
 
 const ForceTextCompactMode = enum {
@@ -7540,10 +7535,12 @@ pub const IndexManager = struct {
         return estimateProjectedTextPublication(docs);
     }
 
-    /// Compute the exact segment split count and a conservative byte upper
-    /// bound using the same projection and splitting rules as publication.
-    /// This performs JSON projection but not tokenization or segment building,
-    /// keeping admission substantially cheaper than the admitted work.
+    /// Compute an allocation-free upper bound before producer admission. One
+    /// source document can create at most one segment, so the consumed document
+    /// count strictly bounds publication fan-out. The byte estimate includes
+    /// expansion and per-document headroom; the hard segment watermark remains
+    /// the primary query-fanout bound. JSON parsing, field projection,
+    /// tokenization, and segment construction all happen once after admission.
     pub fn estimateTextBatchPublicationByName(
         self: *IndexManager,
         index_name: []const u8,
@@ -7552,44 +7549,21 @@ pub const IndexManager = struct {
         if (writes.len == 0) return .{};
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
 
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        var docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
-        defer docs.deinit(arena);
+        var source_bytes: u64 = 0;
+        var document_count: u64 = 0;
         for (writes) |write| {
             if (!self.keyInRange(write.key)) continue;
             if (!try textIndexShouldConsumeDoc(self, entry, write.key)) continue;
-            try docs.append(arena, .{
-                .key = write.key,
-                .value = write.value,
-                .doc_ordinal = null,
-            });
+            document_count +|= 1;
+            source_bytes +|= @intCast(write.key.len);
+            source_bytes +|= @intCast(write.value.len);
         }
-        if (docs.items.len == 0) return .{};
-
-        const source_target_bytes = textProjectionSourceBuildTargetBytes();
-        var estimate = TextPublicationEstimate{};
-        var source_start: usize = 0;
-        while (source_start < docs.items.len) {
-            const source_end = splitMapperDocsEnd(docs.items, source_start, source_target_bytes);
-            const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
-                arena,
-                docs.items[source_start..source_end],
-                try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null),
-            );
-            const projection = try mapper.buildTextProjectionBatchFromSource(
-                arena,
-                source_batch.docs,
-                entry.text_analysis,
-                entry.runtime_schema,
-                null,
-            );
-            estimate.add(estimateProjectedTextPublication(projection.docs));
-            source_start = source_end;
-        }
-        return estimate;
+        if (document_count == 0) return .{};
+        const expanded_bytes = std.math.mul(u64, source_bytes, 4) catch std.math.maxInt(u64);
+        const per_doc_headroom = std.math.mul(u64, document_count, 4 * 1024) catch std.math.maxInt(u64);
+        var byte_count = std.math.add(u64, expanded_bytes, per_doc_headroom) catch std.math.maxInt(u64);
+        byte_count = std.math.add(u64, byte_count, 64 * 1024) catch std.math.maxInt(u64);
+        return .{ .segment_count = document_count, .byte_count = byte_count };
     }
 
     pub fn drainScheduledTextMerges(self: *IndexManager) !void {

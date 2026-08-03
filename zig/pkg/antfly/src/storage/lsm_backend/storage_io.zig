@@ -310,12 +310,24 @@ pub fn openNativePathLockFile(
     path: []const u8,
     options: NativePathLockFileOptions,
 ) !NativePathLockFile {
+    return try openNativePathLockFileWithCache(allocator, path, options, processNativeFdCache());
+}
+
+fn openNativePathLockFileWithCache(
+    allocator: Allocator,
+    path: []const u8,
+    options: NativePathLockFileOptions,
+    fd_cache: *FdCache,
+) !NativePathLockFile {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     errdefer io_impl.deinit();
 
-    const fd_cache = processNativeFdCache();
     const open_descriptor_count = createPathDescriptorCount(path);
-    if (!try fd_cache.tryReserveDescriptors(io_impl.io(), open_descriptor_count)) return error.NativeStorageDescriptorBudgetExceeded;
+    // Path locks are part of the same process descriptor domain as cached LSM
+    // reads and transient writes. Join the FIFO admission queue instead of
+    // failing a table open or restore merely because all leases are briefly
+    // pinned; Condition.wait keeps this cancellation-aware.
+    try fd_cache.reserveDescriptors(io_impl.io(), open_descriptor_count);
     var reserved_descriptor_count = open_descriptor_count;
     errdefer fd_cache.releaseDescriptors(io_impl.io(), reserved_descriptor_count);
 
@@ -725,9 +737,6 @@ const FdCache = if (!supports_posix_fd_cache)
         pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
         pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
         pub fn reserveDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
-        pub fn tryReserveDescriptors(_: *FdCache, _: std.Io, _: usize) !bool {
-            return true;
-        }
         pub fn releaseDescriptors(_: *FdCache, _: std.Io, _: usize) void {}
         pub fn signalAdmissionChanged(_: *FdCache, _: std.Io) void {}
     }
@@ -1044,20 +1053,6 @@ else
                 }
                 try self.admission_changed.wait(io, &self.admission_mutex);
             }
-        }
-
-        fn tryReserveDescriptors(self: *FdCache, io: std.Io, count: usize) !bool {
-            if (count == 0) return true;
-            if (count > self.capacity) return error.DescriptorAdmissionCapacityTooSmall;
-            self.admission_mutex.lockUncancelable(io);
-            defer self.admission_mutex.unlock(io);
-
-            // Do not let opportunistic callers bypass an older weighted
-            // request. FIFO admission lets capacity accumulate for multi-fd
-            // filesystem operations under a steady stream of one-fd reads.
-            if (self.admission_head != null or !self.makeCapacityAvailable(count)) return false;
-            _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
-            return true;
         }
 
         fn makeCapacityAvailable(self: *FdCache, count: usize) bool {
@@ -3241,6 +3236,78 @@ test "transient native writes wait before opening at descriptor capacity" {
     permit_active = false;
     thread.join();
     thread_joined = true;
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "native path lock file waits for descriptor admission" {
+    if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    try pool.fd_cache.reserveDescriptors(io, 2);
+    var held_descriptors: usize = 2;
+    defer pool.fd_cache.releaseDescriptors(io, held_descriptors);
+
+    const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-path-lock-admission-{d}", .{nonce});
+    defer deleteFilePathPosix(path) catch {};
+
+    const Worker = struct {
+        path: []const u8,
+        cache: *FdCache,
+        opened: *std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var lock_file = openNativePathLockFileWithCache(
+                std.heap.page_allocator,
+                self.path,
+                .{ .create_if_missing = true },
+                self.cache,
+            ) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            defer lock_file.close();
+            self.opened.store(true, .release);
+        }
+    };
+    var opened = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    var worker = Worker{
+        .path = path,
+        .cache = pool.fd_cache,
+        .opened = &opened,
+        .failed = &failed,
+    };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        pool.fd_cache.releaseDescriptors(io, held_descriptors);
+        held_descriptors = 0;
+        thread.join();
+    };
+
+    var spins: usize = 0;
+    while (pool.snapshotStats().fd_admission_waiters == 0 and spins < 100_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admission_waiters);
+    try std.testing.expect(!opened.load(.acquire));
+    try std.testing.expect(!failed.load(.acquire));
+
+    pool.fd_cache.releaseDescriptors(io, held_descriptors);
+    held_descriptors = 0;
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expect(opened.load(.acquire));
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
 }

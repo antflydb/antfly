@@ -3987,7 +3987,6 @@ pub const DB = struct {
             self.runtime_alloc,
             resources.index_manager,
             resources.apply_mutex,
-            &self.async_context.text_merge_deferred,
             self.backend_runtime,
             cfg,
         );
@@ -31478,7 +31477,6 @@ fn applyDerivedBatchToIndexReplayContext(
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
-        .text_merge_deferred = .init(if (ctx.async_context) |active| active.text_merge_deferred.load(.acquire) else false),
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
@@ -31509,7 +31507,6 @@ fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profi
     var ctx = self.batchContext();
     try applyDerivedBatchContextProfiled(&ctx, batch, profile);
     if (self.text_merge_runtime) |runtime| {
-        if (self.async_context.text_merge_deferred.load(.acquire)) return;
         runtime.notify();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
@@ -31519,7 +31516,6 @@ fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch
     var ctx = self.batchContext();
     try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
     if (self.text_merge_runtime) |runtime| {
-        if (self.async_context.text_merge_deferred.load(.acquire)) return;
         runtime.notify();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
@@ -31556,7 +31552,6 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
                 .apply_mutex = ctx.apply_mutex,
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
                 .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
-                .text_merge_deferred = .init(if (ctx.async_context) |active| active.text_merge_deferred.load(.acquire) else false),
             };
             try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile);
             const index_sync_start_ns = monotonicTimeNs();
@@ -31901,7 +31896,6 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .text_merge_runtime = self.text_merge_runtime,
-        .text_merge_deferred = .init(self.async_context.text_merge_deferred.load(.acquire)),
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
 }
@@ -32815,11 +32809,9 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
 
         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
-        if (!ctx.text_merge_deferred.load(.acquire)) {
-            if (ctx.text_merge_runtime) |runtime| {
-                const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, collected.writes.items);
-                merge_permit = try runtime.acquireProducerPermit(estimate.segment_count, estimate.byte_count);
-            }
+        if (ctx.text_merge_runtime) |runtime| {
+            const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, collected.writes.items);
+            merge_permit = try runtime.acquireProducerPermit(estimate.segment_count, estimate.byte_count);
         }
         defer if (merge_permit) |*permit| permit.release();
 
@@ -37084,7 +37076,6 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
         });
     }
     if (index_ref.kind == .full_text) if (ctx.text_merge_runtime) |runtime| {
-        if (ctx.text_merge_deferred.load(.acquire)) return true;
         runtime.notify();
     };
     if (index_ref.kind == .sparse_vector) if (ctx.sparse_compaction_runtime) |runtime| {
@@ -70543,7 +70534,6 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         alloc,
         resources.index_manager,
         resources.apply_mutex,
-        null,
         db.backend_runtime,
         .{
             .enabled = true,
@@ -70564,7 +70554,6 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         alloc,
         resources.index_manager,
         resources.apply_mutex,
-        null,
         db.backend_runtime,
         .{
             .enabled = true,
@@ -70586,7 +70575,6 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         alloc,
         resources.index_manager,
         resources.apply_mutex,
-        null,
         db.backend_runtime,
         .{
             .enabled = true,
@@ -70610,14 +70598,13 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         alloc,
         resources.index_manager,
         resources.apply_mutex,
-        null,
         db.backend_runtime,
         .{
             .enabled = true,
             .max_pending_segments = 8,
             .resume_pending_segments = 4,
             .max_pending_bytes = 100,
-            .backpressure_max_wait_ms = 3,
+            .backpressure_max_wait_ms = 100,
         },
     );
     defer admission_runtime.deinit();
@@ -70626,6 +70613,42 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var first_permit = try admission_runtime.acquireProducerPermit(1, 80);
     try std.testing.expectError(error.TextMergeBackpressureTimeout, admission_runtime.acquireProducerPermit(1, 30));
     first_permit.release();
+
+    // Admission sleeps on a release epoch rather than rescanning the complete
+    // segment catalog at a fixed polling interval.
+    var held_permit = try admission_runtime.acquireProducerPermit(1, 80);
+    const Waiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        acquired: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit(1, 30) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.acquired.store(true, .release);
+            permit.release();
+        }
+    };
+    var waiter = Waiter{ .runtime = &admission_runtime };
+    const events_before = admission_runtime.stats().backpressure_events;
+    var waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var waiter_joined = false;
+    defer if (!waiter_joined) {
+        held_permit.release();
+        waiter_thread.join();
+    };
+    const waiter_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (admission_runtime.stats().backpressure_events == events_before and monotonicTimeNs() < waiter_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(admission_runtime.stats().backpressure_events > events_before);
+    held_permit.release();
+    waiter_thread.join();
+    waiter_joined = true;
+    try std.testing.expect(waiter.acquired.load(.acquire));
+    try std.testing.expect(!waiter.failed.load(.acquire));
 
     // One indivisible publication larger than either watermark is admitted
     // exclusively once existing debt and reservations are empty.
@@ -75777,7 +75800,7 @@ test "db dense auto bulk replays packed external embedding strings" {
     try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
 }
 
-test "db bulk ingest full_text sync defers text merge work until finish" {
+test "db bulk ingest keeps full text merge maintenance live" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -75799,6 +75822,11 @@ test "db bulk ingest full_text sync defers text merge work until finish" {
         .config_json = "{}",
     });
 
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    // Keep background execution deterministic; runOnce below proves that the
+    // dense bulk deferral flag no longer suppresses text maintenance.
+    try std.testing.expect(runtime.pause());
+
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
@@ -75818,8 +75846,8 @@ test "db bulk ingest full_text sync defers text merge work until finish" {
     try std.testing.expect(before.pending_segments > 0);
     try std.testing.expect(db.async_context.text_merge_deferred.load(.acquire));
 
-    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
-    try std.testing.expect(!(try runtime.runOnce()));
+    try std.testing.expect(try runtime.runOnce());
+    try runtime.resumeAfterPause();
 
     try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
     try std.testing.expect(!db.async_context.text_merge_deferred.load(.acquire));
