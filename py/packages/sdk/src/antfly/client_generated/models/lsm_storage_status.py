@@ -52,6 +52,16 @@ class LsmStorageStatus:
         read_snapshot_mutable_rotation_count (int | Unset):
         read_snapshot_mutable_rotation_bytes (int | Unset):
         wal_retained_bytes (int | Unset):
+        wal_checkpoint_pending (bool | Unset): Whether WAL checkpoint maintenance is pending.
+        wal_pressure_blocked (bool | Unset): Whether WAL hard-limit admission is currently blocked.
+        wal_checkpoint_retry_reason (str | Unset): Representative reason for the earliest pending WAL checkpoint retry.
+        wal_checkpoint_retry_attempts (int | Unset): Consecutive failures for the representative WAL checkpoint retry.
+        wal_checkpoint_retry_delay_ns (int | Unset): Nanoseconds until the earliest WAL checkpoint retry; zero means due
+            now.
+        active_immutable_logical_bytes (int | Unset): Logical bytes in immutable memtables awaiting run publication.
+        unpublished_wal_logical_bytes (int | Unset): Logical bytes in runs awaiting durable manifest publication.
+        unpublished_wal_max_batch_logical_bytes (int | Unset): Largest logical batch awaiting durable manifest
+            publication.
         compaction_backlog_bytes (int | Unset):
         active_readers (int | Unset):
         active_readers_bound_read_txn (int | Unset):
@@ -140,6 +150,14 @@ class LsmStorageStatus:
     read_snapshot_mutable_rotation_count: int | Unset = UNSET
     read_snapshot_mutable_rotation_bytes: int | Unset = UNSET
     wal_retained_bytes: int | Unset = UNSET
+    wal_checkpoint_pending: bool | Unset = UNSET
+    wal_pressure_blocked: bool | Unset = UNSET
+    wal_checkpoint_retry_reason: str | Unset = UNSET
+    wal_checkpoint_retry_attempts: int | Unset = UNSET
+    wal_checkpoint_retry_delay_ns: int | Unset = UNSET
+    active_immutable_logical_bytes: int | Unset = UNSET
+    unpublished_wal_logical_bytes: int | Unset = UNSET
+    unpublished_wal_max_batch_logical_bytes: int | Unset = UNSET
     compaction_backlog_bytes: int | Unset = UNSET
     active_readers: int | Unset = UNSET
     active_readers_bound_read_txn: int | Unset = UNSET
@@ -264,6 +282,22 @@ class LsmStorageStatus:
         read_snapshot_mutable_rotation_bytes = self.read_snapshot_mutable_rotation_bytes
 
         wal_retained_bytes = self.wal_retained_bytes
+
+        wal_checkpoint_pending = self.wal_checkpoint_pending
+
+        wal_pressure_blocked = self.wal_pressure_blocked
+
+        wal_checkpoint_retry_reason = self.wal_checkpoint_retry_reason
+
+        wal_checkpoint_retry_attempts = self.wal_checkpoint_retry_attempts
+
+        wal_checkpoint_retry_delay_ns = self.wal_checkpoint_retry_delay_ns
+
+        active_immutable_logical_bytes = self.active_immutable_logical_bytes
+
+        unpublished_wal_logical_bytes = self.unpublished_wal_logical_bytes
+
+        unpublished_wal_max_batch_logical_bytes = self.unpublished_wal_max_batch_logical_bytes
 
         compaction_backlog_bytes = self.compaction_backlog_bytes
 
@@ -440,6 +474,22 @@ class LsmStorageStatus:
             field_dict["read_snapshot_mutable_rotation_bytes"] = read_snapshot_mutable_rotation_bytes
         if wal_retained_bytes is not UNSET:
             field_dict["wal_retained_bytes"] = wal_retained_bytes
+        if wal_checkpoint_pending is not UNSET:
+            field_dict["wal_checkpoint_pending"] = wal_checkpoint_pending
+        if wal_pressure_blocked is not UNSET:
+            field_dict["wal_pressure_blocked"] = wal_pressure_blocked
+        if wal_checkpoint_retry_reason is not UNSET:
+            field_dict["wal_checkpoint_retry_reason"] = wal_checkpoint_retry_reason
+        if wal_checkpoint_retry_attempts is not UNSET:
+            field_dict["wal_checkpoint_retry_attempts"] = wal_checkpoint_retry_attempts
+        if wal_checkpoint_retry_delay_ns is not UNSET:
+            field_dict["wal_checkpoint_retry_delay_ns"] = wal_checkpoint_retry_delay_ns
+        if active_immutable_logical_bytes is not UNSET:
+            field_dict["active_immutable_logical_bytes"] = active_immutable_logical_bytes
+        if unpublished_wal_logical_bytes is not UNSET:
+            field_dict["unpublished_wal_logical_bytes"] = unpublished_wal_logical_bytes
+        if unpublished_wal_max_batch_logical_bytes is not UNSET:
+            field_dict["unpublished_wal_max_batch_logical_bytes"] = unpublished_wal_max_batch_logical_bytes
         if compaction_backlog_bytes is not UNSET:
             field_dict["compaction_backlog_bytes"] = compaction_backlog_bytes
         if active_readers is not UNSET:
@@ -626,6 +676,22 @@ class LsmStorageStatus:
 
         wal_retained_bytes = d.pop("wal_retained_bytes", UNSET)
 
+        wal_checkpoint_pending = d.pop("wal_checkpoint_pending", UNSET)
+
+        wal_pressure_blocked = d.pop("wal_pressure_blocked", UNSET)
+
+        wal_checkpoint_retry_reason = d.pop("wal_checkpoint_retry_reason", UNSET)
+
+        wal_checkpoint_retry_attempts = d.pop("wal_checkpoint_retry_attempts", UNSET)
+
+        wal_checkpoint_retry_delay_ns = d.pop("wal_checkpoint_retry_delay_ns", UNSET)
+
+        active_immutable_logical_bytes = d.pop("active_immutable_logical_bytes", UNSET)
+
+        unpublished_wal_logical_bytes = d.pop("unpublished_wal_logical_bytes", UNSET)
+
+        unpublished_wal_max_batch_logical_bytes = d.pop("unpublished_wal_max_batch_logical_bytes", UNSET)
+
         compaction_backlog_bytes = d.pop("compaction_backlog_bytes", UNSET)
 
         active_readers = d.pop("active_readers", UNSET)
@@ -769,6 +835,14 @@ class LsmStorageStatus:
             read_snapshot_mutable_rotation_count=read_snapshot_mutable_rotation_count,
             read_snapshot_mutable_rotation_bytes=read_snapshot_mutable_rotation_bytes,
             wal_retained_bytes=wal_retained_bytes,
+            wal_checkpoint_pending=wal_checkpoint_pending,
+            wal_pressure_blocked=wal_pressure_blocked,
+            wal_checkpoint_retry_reason=wal_checkpoint_retry_reason,
+            wal_checkpoint_retry_attempts=wal_checkpoint_retry_attempts,
+            wal_checkpoint_retry_delay_ns=wal_checkpoint_retry_delay_ns,
+            active_immutable_logical_bytes=active_immutable_logical_bytes,
+            unpublished_wal_logical_bytes=unpublished_wal_logical_bytes,
+            unpublished_wal_max_batch_logical_bytes=unpublished_wal_max_batch_logical_bytes,
             compaction_backlog_bytes=compaction_backlog_bytes,
             active_readers=active_readers,
             active_readers_bound_read_txn=active_readers_bound_read_txn,

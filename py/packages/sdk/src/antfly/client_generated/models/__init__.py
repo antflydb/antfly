@@ -319,6 +319,7 @@ from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
 from .inference_error import InferenceError
+from .inference_error_reason import InferenceErrorReason
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
@@ -992,6 +993,7 @@ __all__ = (
     "InferenceEmbedResponse",
     "InferenceEmbedResponseObject",
     "InferenceError",
+    "InferenceErrorReason",
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",

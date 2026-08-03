@@ -8438,6 +8438,51 @@ test "read queue units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
 }
 
+test "transient capacity response exposes retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/embeddings");
+    defer request.deinit();
+
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelResourceBusyResponse(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(
+        transient_capacity_retry_after_seconds,
+        response.header("Retry-After").?,
+    );
+
+    const RetryBody = struct {
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        retryable: bool,
+        retry_after_ms: i64,
+    };
+    var parsed = try std.json.parseFromSlice(
+        RetryBody,
+        allocator,
+        response.body.?,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", parsed.value.@"error");
+    try std.testing.expectEqualStrings(
+        "insufficient inference capacity is currently available",
+        parsed.value.message,
+    );
+    try std.testing.expectEqualStrings("inference_capacity", parsed.value.reason);
+    try std.testing.expect(parsed.value.retryable);
+    try std.testing.expectEqual(
+        @as(i64, transient_capacity_retry_after_ms),
+        parsed.value.retry_after_ms,
+    );
+}
+
 test "registerRoutesOn prefixes embed aliases and metrics route" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();

@@ -4552,8 +4552,16 @@ pub const InferenceEmbeddingUsage = struct {
 };
 
 pub const InferenceError = struct {
-    /// Error message
+    /// Stable machine-readable error code
     @"error": []const u8,
+    /// Human-readable error description
+    message: ?[]const u8 = null,
+    /// Machine-readable capacity source when the failure is retryable
+    reason: ?[]const u8 = null,
+    /// Whether retrying the same request may succeed
+    retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: ?i64 = null,
 };
 
 /// Reason why generation stopped

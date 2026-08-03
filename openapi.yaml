@@ -6094,6 +6094,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
         '500':
           description: Internal server error
           content:
@@ -6892,6 +6894,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
         '500':
           description: Internal server error
           content:
@@ -20210,7 +20214,23 @@ components:
       properties:
         error:
           type: string
-          description: Error message
+          description: Stable machine-readable error code
+        message:
+          type: string
+          description: Human-readable error description
+        reason:
+          type: string
+          description: Machine-readable capacity source when the failure is retryable
+          enum:
+            - inference_capacity
+            - request_queue
+        retryable:
+          type: boolean
+          description: Whether retrying the same request may succeed
+        retry_after_ms:
+          type: integer
+          minimum: 0
+          description: Minimum retry delay in milliseconds
     InferencePredictRequest:
       type: object
       required:
@@ -22937,6 +22957,18 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    TransientCapacity:
+      description: Inference capacity is temporarily unavailable
+      headers:
+        Retry-After:
+          description: Minimum number of seconds clients should wait before retrying
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InferenceError'
 x-tagGroups:
   - name: Antfly
     tags:
