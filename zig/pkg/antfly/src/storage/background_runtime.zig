@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
+const storage_io = @import("lsm_backend/storage_io.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -198,6 +199,7 @@ pub const BackendRuntime = struct {
     next_owner_id: AtomicU64,
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
+    native_storage_pool: *storage_io.NativeStoragePool,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -216,12 +218,18 @@ pub const BackendRuntime = struct {
         const retired_generation_cleanup_owner_id: u64 = 1;
         try owner_registry.register(retired_generation_cleanup_owner_id);
 
+        const native_storage_pool = try alloc.create(storage_io.NativeStoragePool);
+        errdefer alloc.destroy(native_storage_pool);
+        native_storage_pool.* = storage_io.NativeStoragePool.init(alloc);
+        errdefer native_storage_pool.deinit();
+
         var runtime = BackendRuntime{
             .alloc = alloc,
             .backend = config.backend,
             .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
+            .native_storage_pool = native_storage_pool,
             .durable_jobs = undefined,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
@@ -279,6 +287,8 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
             self.io_impl = null;
         }
+        self.native_storage_pool.deinit();
+        self.alloc.destroy(self.native_storage_pool);
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
         self.* = undefined;
@@ -287,6 +297,14 @@ pub const BackendRuntime = struct {
     pub fn io(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
+    }
+
+    pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
+        return self.native_storage_pool;
+    }
+
+    pub fn snapshotNativeStorageStats(self: *const BackendRuntime) storage_io.NativeStorageStats {
+        return self.native_storage_pool.snapshotStats();
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {

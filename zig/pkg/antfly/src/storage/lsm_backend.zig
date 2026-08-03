@@ -355,6 +355,7 @@ pub const Options = struct {
     compaction_scratch_retained_cap_bytes: usize = 4 * 1024 * 1024,
     io_runtime: storage_io.RuntimeKind = .threaded,
     read_runtime: ?storage_io.ReadRuntime = null,
+    native_storage_pool: ?*storage_io.NativeStoragePool = null,
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
     local_block_cache_enabled: bool = true,

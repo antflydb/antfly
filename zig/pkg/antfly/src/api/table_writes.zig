@@ -9538,8 +9538,11 @@ pub const ProvisionedTableWriteSource = struct {
         for (cache.entries.items) |entry| {
             const entry_stats = entry.db.trySnapshotLsmNativeStorageStats() orelse continue;
             observed = true;
-            stats.fd_cache_entries +|= entry_stats.fd_cache_entries;
-            stats.fd_cache_capacity +|= entry_stats.fd_cache_capacity;
+            stats.fd_cache_entries = @max(stats.fd_cache_entries, entry_stats.fd_cache_entries);
+            stats.fd_admitted_descriptors = @max(stats.fd_admitted_descriptors, entry_stats.fd_admitted_descriptors);
+            stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry_stats.fd_admission_capacity);
+            stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry_stats.fd_admission_waiters);
+            stats.fd_admission_waits = @max(stats.fd_admission_waits, entry_stats.fd_admission_waits);
         }
         if (!observed) return null;
         return stats;

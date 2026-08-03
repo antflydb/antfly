@@ -1871,6 +1871,8 @@ pub const TextMergeStats = struct {
     deferred_for_pressure: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
+    backpressure_timeouts: u64 = 0,
+    backpressure_failures: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
 };
@@ -1906,6 +1908,8 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
+    dst.backpressure_timeouts +|= src.backpressure_timeouts;
+    dst.backpressure_failures +|= src.backpressure_failures;
     dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
     dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
 }

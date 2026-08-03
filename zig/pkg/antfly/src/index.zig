@@ -275,6 +275,10 @@ pub const SegmentEntry = struct {
 pub const ReplacementSegmentData = struct {
     id: u64,
     data: SegmentData,
+    /// Optional tombstones to install in the same snapshot publication as
+    /// the replacement data. The caller retains ownership; IndexWriter clones
+    /// the bitmap into the replacement SegmentShared cell.
+    deleted: ?*const roaring.RoaringBitmap = null,
 };
 
 pub const RetiredSegmentCleanup = struct {
@@ -1546,10 +1550,22 @@ pub const IndexWriter = struct {
 
         var cells_created: usize = 0;
         errdefer for (new_segments[keep_count .. keep_count + cells_created]) |*seg| {
+            if (seg.shared.deleted) |*deleted| deleted.deinit();
             self.alloc.destroy(seg.shared);
         };
         for (replacements, 0..) |replacement, i| {
             const shared = try SegmentEntry.createShared(self.alloc, replacement.data);
+            var shared_initialized = false;
+            errdefer if (!shared_initialized) {
+                if (shared.deleted) |*deleted| deleted.deinit();
+                self.alloc.destroy(shared);
+            };
+            if (replacement.deleted) |deleted| {
+                if (!deleted.isEmpty()) {
+                    shared.deleted = try deleted.clone(self.alloc);
+                    shared.deleted_count.store(@intCast(deleted.cardinality()), .release);
+                }
+            }
             new_segments[idx] = .{
                 .id = replacement.id,
                 .data = replacement.data,
@@ -1558,6 +1574,7 @@ pub const IndexWriter = struct {
                 .shared = shared,
             };
             cells_created += 1;
+            shared_initialized = true;
             idx += 1;
             if (replacement.id >= self.next_segment_id) self.next_segment_id = replacement.id + 1;
         }

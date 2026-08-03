@@ -263,6 +263,7 @@ const SegmentFileStore = struct {
         storage: ?storage_io.Storage,
         create_if_missing: bool,
         io_runtime: storage_io.RuntimeKind,
+        native_storage_pool: ?*storage_io.NativeStoragePool,
     ) !SegmentFileStore {
         const owned_root = try allocator.dupe(u8, root_dir);
         errdefer allocator.free(owned_root);
@@ -285,7 +286,7 @@ const SegmentFileStore = struct {
 
         const owner = try allocator.create(storage_io.NativeStorage);
         errdefer allocator.destroy(owner);
-        owner.* = try storage_io.NativeStorage.init(allocator, io_runtime);
+        owner.* = try storage_io.NativeStorage.initWithPool(allocator, io_runtime, native_storage_pool);
         errdefer owner.deinit();
         if (create_if_missing) {
             try owner.storage().createDirPath(owned_root);
@@ -313,6 +314,13 @@ const SegmentFileStore = struct {
         return try std.fmt.allocPrint(self.allocator, "{s}/{d}.seg", .{ self.root_dir, seg_id });
     }
 
+    fn mapFile(self: *SegmentFileStore, path: []const u8) ![]align(std.heap.page_size_min) u8 {
+        const owner = self.storage_owner orelse return error.Unsupported;
+        var permit = try owner.acquireFdPermit();
+        defer permit.release();
+        return try mapSegmentFile(path);
+    }
+
     fn publish(self: *SegmentFileStore, seg_id: u64, bytes: []const u8) !index_mod.SegmentData {
         const path = try self.pathAlloc(seg_id);
         defer self.allocator.free(path);
@@ -333,14 +341,14 @@ const SegmentFileStore = struct {
         if (self.storage_owner == null) {
             return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
         }
-        return .fromMapped(try mapSegmentFile(path));
+        return .fromMapped(try self.mapFile(path));
     }
 
     fn mapPublished(self: *SegmentFileStore, seg_id: u64) !index_mod.SegmentData {
         if (self.storage_owner == null) return error.Unsupported;
         const path = try self.pathAlloc(seg_id);
         defer self.allocator.free(path);
-        return .fromMapped(try mapSegmentFile(path));
+        return .fromMapped(try self.mapFile(path));
     }
 
     fn delete(self: *SegmentFileStore, seg_id: u64) void {
@@ -1029,6 +1037,7 @@ pub const PersistentIndex = struct {
                 opts.main_lsm_storage,
                 !opts.read_only,
                 opts.main_lsm_options.io_runtime,
+                opts.main_lsm_options.native_storage_pool,
             );
         }
         errdefer if (segment_files) |*store| store.close();
@@ -1101,7 +1110,7 @@ pub const PersistentIndex = struct {
                     const segment_path = try store.pathAlloc(seg_id);
                     defer store.allocator.free(segment_path);
                     if (store.storage_owner != null) {
-                        break :blk index_mod.SegmentData.fromMapped(mapSegmentFile(segment_path) catch |err| switch (err) {
+                        break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
                             error.FileNotFound => {
                                 try stale_active_ids.append(alloc, seg_id);
                                 continue;
@@ -1529,7 +1538,7 @@ pub const PersistentIndex = struct {
         if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
 
         const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var segment_data: ?index_mod.SegmentData = .fromMapped(mapSegmentFile(path) catch |err| {
+        var segment_data: ?index_mod.SegmentData = .fromMapped(store.mapFile(path) catch |err| {
             if (builtin.os.tag != .freestanding) std.log.err("text segment map failed: {s}", .{@errorName(err)});
             return err;
         });
@@ -1960,6 +1969,17 @@ pub const PersistentIndex = struct {
     /// Consumes segment_bytes_list and every segment buffer regardless of
     /// whether the replacement is applied.
     pub fn replaceSegmentsIfActiveManyOwned(self: *PersistentIndex, old_seg_ids: []const u64, segment_bytes_list: [][]u8) !bool {
+        return try self.replaceSegmentsIfActiveManyOwnedWithDeletes(old_seg_ids, segment_bytes_list, null);
+    }
+
+    /// Publish merged heap-backed segments while atomically carrying forward
+    /// tombstones that arrived after the merge task froze its source view.
+    pub fn replaceSegmentsIfActiveManyOwnedWithDeletes(
+        self: *PersistentIndex,
+        old_seg_ids: []const u64,
+        segment_bytes_list: [][]u8,
+        replacement_deleted: ?[]const ?roaring.RoaringBitmap,
+    ) !bool {
         if (old_seg_ids.len == 0) {
             freeOwnedSegmentList(self.alloc, segment_bytes_list);
             return false;
@@ -1967,12 +1987,18 @@ pub const PersistentIndex = struct {
         if (segment_bytes_list.len == 0) {
             return try self.removeSegmentsIfActive(old_seg_ids);
         }
+        if (replacement_deleted) |deleted| {
+            if (deleted.len != segment_bytes_list.len) {
+                freeOwnedSegmentList(self.alloc, segment_bytes_list);
+                return error.InvalidDeletionSnapshot;
+            }
+        }
         self.lockStorage();
         defer self.unlockStorage();
 
         const new_seg_ids = try self.reserveSegmentIds(segment_bytes_list.len);
         defer self.alloc.free(new_seg_ids);
-        return try self.replaceSegmentsWithReservedIdsOwned(old_seg_ids, new_seg_ids, segment_bytes_list, true);
+        return try self.replaceSegmentsWithReservedIdsOwned(old_seg_ids, new_seg_ids, segment_bytes_list, replacement_deleted, true);
     }
 
     pub fn prepareMergedSegmentToFile(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, segment_indices: []const usize) ![]PreparedMergeSegment {
@@ -2073,6 +2099,17 @@ pub const PersistentIndex = struct {
     }
 
     pub fn replaceSegmentsIfActiveManyPrepared(self: *PersistentIndex, old_seg_ids: []const u64, prepared_segments: []PreparedMergeSegment) !bool {
+        return try self.replaceSegmentsIfActiveManyPreparedWithDeletes(old_seg_ids, prepared_segments, null);
+    }
+
+    /// Publish prepared file-backed segments and their deletion bitmaps in the
+    /// same durable transaction and volatile snapshot replacement.
+    pub fn replaceSegmentsIfActiveManyPreparedWithDeletes(
+        self: *PersistentIndex,
+        old_seg_ids: []const u64,
+        prepared_segments: []PreparedMergeSegment,
+        replacement_deleted: ?[]const ?roaring.RoaringBitmap,
+    ) !bool {
         if (old_seg_ids.len == 0) {
             self.discardPreparedMergeSegments(prepared_segments);
             return false;
@@ -2080,6 +2117,12 @@ pub const PersistentIndex = struct {
         if (prepared_segments.len == 0) {
             self.alloc.free(prepared_segments);
             return try self.removeSegmentsIfActive(old_seg_ids);
+        }
+        if (replacement_deleted) |deleted| {
+            if (deleted.len != prepared_segments.len) {
+                self.discardPreparedMergeSegments(prepared_segments);
+                return error.InvalidDeletionSnapshot;
+            }
         }
 
         self.lockStorage();
@@ -2127,9 +2170,19 @@ pub const PersistentIndex = struct {
             try self.deleteSegmentRange(&txn, old_id);
         }
 
-        for (prepared_segments) |*segment| {
+        for (prepared_segments, 0..) |*segment, i| {
             try self.saveSegmentRange(&txn, segment.id, segment.key_range);
             try self.updateActiveSegments(&txn, segment.id, .add);
+            if (replacement_deleted) |deleted| {
+                if (deleted[i]) |*bitmap| {
+                    if (!bitmap.isEmpty()) {
+                        const bitmap_bytes = try bitmap.toBytes(self.alloc);
+                        defer self.alloc.free(bitmap_bytes);
+                        const segment_key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
+                        try txn.put(.deletions, &segment_key, bitmap_bytes);
+                    }
+                }
+            }
         }
         try txn.commit();
 
@@ -2139,6 +2192,10 @@ pub const PersistentIndex = struct {
             replacements[i] = .{
                 .id = segment.id,
                 .data = segment.data,
+                .deleted = if (replacement_deleted) |deleted|
+                    if (deleted[i]) |*bitmap| bitmap else null
+                else
+                    null,
             };
         }
         try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
@@ -2378,10 +2435,14 @@ pub const PersistentIndex = struct {
         old_seg_ids: []const u64,
         new_seg_ids: []const u64,
         segment_bytes_list: [][]u8,
+        replacement_deleted: ?[]const ?roaring.RoaringBitmap,
         require_active: bool,
     ) !bool {
         std.debug.assert(new_seg_ids.len == segment_bytes_list.len);
         defer freeOwnedSegmentList(self.alloc, segment_bytes_list);
+        if (replacement_deleted) |deleted| {
+            if (deleted.len != segment_bytes_list.len) return error.InvalidDeletionSnapshot;
+        }
 
         var key_ranges = try self.alloc.alloc(SegmentKeyRange, segment_bytes_list.len);
         var key_ranges_initialized: usize = 0;
@@ -2411,6 +2472,10 @@ pub const PersistentIndex = struct {
             replacements[i] = .{
                 .id = new_seg_ids[i],
                 .data = try self.materializeSegmentData(new_seg_ids[i], segment_bytes),
+                .deleted = if (replacement_deleted) |deleted|
+                    if (deleted[i]) |*bitmap| bitmap else null
+                else
+                    null,
             };
             replacements_initialized += 1;
         }
@@ -2432,6 +2497,15 @@ pub const PersistentIndex = struct {
         for (segment_bytes_list, 0..) |segment_bytes, i| {
             const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_ids[i]));
             if (self.segment_files == null) try txn.put(.segments, &new_seg_key, segment_bytes);
+            if (replacement_deleted) |deleted| {
+                if (deleted[i]) |*bitmap| {
+                    if (!bitmap.isEmpty()) {
+                        const bitmap_bytes = try bitmap.toBytes(self.alloc);
+                        defer self.alloc.free(bitmap_bytes);
+                        try txn.put(.deletions, &new_seg_key, bitmap_bytes);
+                    }
+                }
+            }
         }
 
         for (old_seg_ids) |old_id| {
@@ -3183,6 +3257,53 @@ test "persistent index replaceSegmentsIfActiveManyOwned publishes bounded merge 
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
     try std.testing.expectEqualStrings("doc:a", ranges[0].min_doc_key);
     try std.testing.expectEqualStrings("doc:z", ranges[1].min_doc_key);
+}
+
+test "persistent merge replacement carries deletion bitmap across reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+
+        const seg_a = try buildSimpleSegment(alloc, "doc:a", "alpha");
+        defer alloc.free(seg_a);
+        try pi.indexSegment(seg_a);
+
+        const seg_b = try buildSimpleSegment(alloc, "doc:b", "beta");
+        defer alloc.free(seg_b);
+        try pi.indexSegment(seg_b);
+
+        const replacements = try alloc.alloc([]u8, 1);
+        replacements[0] = try buildMultiDocSegment(alloc, &.{
+            .{ .doc_id = "doc:a", .term = "alpha" },
+            .{ .doc_id = "doc:b", .term = "beta" },
+        });
+        var deleted = roaring.RoaringBitmap.init(alloc);
+        defer deleted.deinit();
+        try deleted.add(1);
+        const replacement_deleted = [_]?roaring.RoaringBitmap{deleted};
+
+        try std.testing.expect(try pi.replaceSegmentsIfActiveManyOwnedWithDeletes(
+            &.{ 1, 2 },
+            replacements,
+            &replacement_deleted,
+        ));
+        try std.testing.expectEqual(@as(u64, 1), pi.snapshot().liveDocCount());
+    }
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+
+        const snap = pi.snapshot();
+        try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
+        try std.testing.expectEqual(@as(u64, 1), snap.liveDocCount());
+        try std.testing.expect(snap.segments[0].shared.deleted.?.contains(1));
+    }
 }
 
 test "persistent index open prunes stale active segment references" {

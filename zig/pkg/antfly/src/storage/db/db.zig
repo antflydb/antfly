@@ -2841,6 +2841,7 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
 }
 
 fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
+    if (options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
     if (options.read_runtime != null) return;
     if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
 }
@@ -4607,27 +4608,11 @@ pub const DB = struct {
     }
 
     pub fn snapshotLsmNativeStorageStats(self: *DB) lsm_backend_mod.NativeStorageStats {
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return self.snapshotLsmNativeStorageStatsLocked();
+        return self.backend_runtime.snapshotNativeStorageStats();
     }
 
     pub fn trySnapshotLsmNativeStorageStats(self: *DB) ?lsm_backend_mod.NativeStorageStats {
-        if (!self.core.tryLockApplyShared()) return null;
-        defer self.core.unlockApplyShared();
-        return self.snapshotLsmNativeStorageStatsLocked();
-    }
-
-    fn snapshotLsmNativeStorageStatsLocked(self: *DB) lsm_backend_mod.NativeStorageStats {
-        var native_storage_stats = lsm_backend_mod.NativeStorageStats{};
-        if (self.core.primary_store_owner.snapshotLsmNativeStorageStats()) |primary_stats| {
-            native_storage_stats.fd_cache_entries +|= primary_stats.fd_cache_entries;
-            native_storage_stats.fd_cache_capacity +|= primary_stats.fd_cache_capacity;
-        }
-        const index_stats = self.core.index_manager.snapshotLsmNativeStorageStats();
-        native_storage_stats.fd_cache_entries +|= index_stats.fd_cache_entries;
-        native_storage_stats.fd_cache_capacity +|= index_stats.fd_cache_capacity;
-        return native_storage_stats;
+        return self.backend_runtime.snapshotNativeStorageStats();
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
@@ -15201,7 +15186,7 @@ pub const DB = struct {
         self.core.unlockApply();
         if (self.text_merge_runtime) |runtime| {
             runtime.notify();
-            runtime.applyBackpressure();
+            _ = runtime.applyBackpressure();
         }
         return segment_count;
     }
@@ -31519,7 +31504,7 @@ fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profi
     if (self.text_merge_runtime) |runtime| {
         if (self.async_context.text_merge_deferred.load(.acquire)) return;
         runtime.notify();
-        runtime.applyBackpressure();
+        _ = runtime.applyBackpressure();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
@@ -31530,7 +31515,7 @@ fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch
     if (self.text_merge_runtime) |runtime| {
         if (self.async_context.text_merge_deferred.load(.acquire)) return;
         runtime.notify();
-        runtime.applyBackpressure();
+        _ = runtime.applyBackpressure();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
@@ -37053,7 +37038,7 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     if (index_ref.kind == .full_text) if (ctx.text_merge_runtime) |runtime| {
         if (ctx.text_merge_deferred.load(.acquire)) return true;
         runtime.notify();
-        runtime.applyBackpressure();
+        _ = runtime.applyBackpressure();
     };
     if (index_ref.kind == .sparse_vector) if (ctx.sparse_compaction_runtime) |runtime| {
         runtime.notify();
@@ -70457,6 +70442,106 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u32, 12), result.total_hits);
+}
+
+test "db text merge backpressure drains sustained segment debt to low watermark" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    // Build the backlog without an automatic merge worker so the admission
+    // boundary and producer assistance are deterministic.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    for (0..24) |i| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc:{d}", .{i});
+        var stored_buf: [96]u8 = undefined;
+        const stored = try std.fmt.bufPrint(&stored_buf, "{{\"body\":\"common token {d}\"}}", .{i});
+        var body_buf: [48]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "common token {d}", .{i});
+        const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = body }};
+        const docs = [_]introducer_mod.TextDocument{.{
+            .id = id,
+            .stored_data = stored,
+            .text_fields = &fields,
+            .doc_ordinal = @intCast(i + 1),
+        }};
+        _ = try db.indexTextKernelDocuments("ft_v1", &docs);
+    }
+
+    const before = db.core.index_manager.textMergeStatsSnapshot();
+    try std.testing.expect(before.pending_segments > 8);
+
+    const resources = db.core.batchExecutionResources();
+    var held_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    var held_task_active = true;
+    defer if (held_task_active) {
+        resources.index_manager.cancelTextMergeTask(&held_task);
+        held_task.deinit(resources.index_manager.alloc);
+    };
+
+    var bounded_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        null,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 8,
+            .resume_pending_segments = 4,
+            .max_pending_bytes = 0,
+            .backpressure_merge_steps = 1,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    const bounded_outcome = bounded_runtime.applyBackpressure();
+    try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.timed_out, bounded_outcome);
+    try std.testing.expectEqual(@as(u64, 1), bounded_runtime.stats().backpressure_timeouts);
+    bounded_runtime.deinit();
+
+    resources.index_manager.cancelTextMergeTask(&held_task);
+    held_task.deinit(resources.index_manager.alloc);
+    held_task_active = false;
+
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        null,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 8,
+            .resume_pending_segments = 4,
+            .max_pending_bytes = 0,
+            .backpressure_merge_steps = 1,
+        },
+    );
+    defer runtime.deinit();
+
+    const outcome = runtime.applyBackpressure();
+    try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
+
+    const after = runtime.stats();
+    try std.testing.expect(after.pending_segments <= 4);
+    try std.testing.expectEqual(@as(u64, 1), after.backpressure_events);
+    try std.testing.expect(after.merge_input_segments_total >= 10);
+
+    const text_index = db.core.index_manager.textIndex("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 24), text_index.snapshot().liveDocCount());
 }
 
 test "db runUntilIdle drains scheduled text merges without index workers" {

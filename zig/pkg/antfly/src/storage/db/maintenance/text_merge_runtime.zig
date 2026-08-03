@@ -26,11 +26,26 @@ pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,
     idle_interval_ms: u64 = 50,
     error_interval_ms: u64 = 250,
-    max_pending_segments: u64 = 512,
+    // The policy's steady state is ten segments. Start producer assistance
+    // before query fan-out grows into visible tail latency; the independent
+    // storage FD admission domain protects descriptor safety.
+    max_pending_segments: u64 = 64,
+    resume_pending_segments: u64 = 32,
     max_pending_bytes: u64 = 256 * 1024 * 1024,
     backpressure_merge_steps: usize = 1,
-    backpressure_sleep_ms: u64 = 0,
+    backpressure_sleep_ms: u64 = 1,
+    // Bound producer latency when a source is corrupt, quarantined, or owned
+    // by a stuck worker. FD admission remains the final safety boundary.
+    backpressure_max_wait_ms: u64 = 5_000,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
+};
+
+pub const BackpressureOutcome = enum {
+    not_needed,
+    drained,
+    shutdown,
+    timed_out,
+    merge_failed,
 };
 
 pub var test_block_after_task_begin: std.atomic.Value(bool) = .init(false);
@@ -92,8 +107,9 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return false;
     }
 
-    pub fn applyBackpressure(self: *@This()) void {
+    pub fn applyBackpressure(self: *@This()) BackpressureOutcome {
         _ = self;
+        return .not_needed;
     }
 
     pub fn stats(self: *@This()) types.TextMergeStats {
@@ -123,6 +139,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     notified: bool = false,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
+    backpressure_timeouts: u64 = 0,
+    backpressure_failures: u64 = 0,
     future: ?Io.Future(void) = null,
 
     pub fn init(
@@ -135,6 +153,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     ) !TextMergeRuntime {
         const io_impl = backend_runtime.io_impl;
         if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
+        if (config.enabled and
+            (config.max_pending_segments != 0 or config.max_pending_bytes != 0) and
+            (config.backpressure_merge_steps == 0 or config.backpressure_max_wait_ms == 0))
+        {
+            return error.InvalidTextMergeBackpressureConfig;
+        }
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
@@ -295,27 +319,112 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return true;
     }
 
-    pub fn applyBackpressure(self: *TextMergeRuntime) void {
-        if (!self.config.enabled) return;
-        if (self.workDeferred()) return;
-        if (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0) return;
-        if (!self.backpressureNeeded()) return;
+    pub fn applyBackpressure(self: *TextMergeRuntime) BackpressureOutcome {
+        if (!self.config.enabled) return .not_needed;
+        if (self.workDeferred()) return .not_needed;
+        if (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0) return .not_needed;
+        if (!self.backpressureNeeded()) return .not_needed;
 
-        const started_ns = self.config.clock.nowRealtimeNs();
-        if (self.config.backpressure_sleep_ms > 0) {
-            sleepMs(self, self.config.backpressure_sleep_ms);
-        }
-        const elapsed_ns = self.config.clock.nowRealtimeNs() -| started_ns;
+        const started_ns = self.backpressureNowNs();
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
             self.backpressure_events += 1;
-            self.backpressure_ns += elapsed_ns;
             self.mutex.unlock(io);
         } else {
             self.backpressure_events += 1;
+        }
+        defer self.recordBackpressureElapsed(started_ns);
+        while (!isShutdown(self) and !self.backpressureDrained()) {
+            if (self.backpressureExpired(started_ns)) {
+                self.recordBackpressureTerminal(.timed_out);
+                return .timed_out;
+            }
+            var step: usize = 0;
+            var made_progress = false;
+            while (step < self.config.backpressure_merge_steps) : (step += 1) {
+                const ran = self.runOnce() catch |err| {
+                    if (builtin.os.tag != .freestanding) {
+                        std.log.err("foreground text merge backpressure failed: {s}", .{@errorName(err)});
+                    }
+                    self.recordBackpressureTerminal(.merge_failed);
+                    return .merge_failed;
+                };
+                if (!ran) {
+                    if (self.backpressureBlockedByQuarantine()) {
+                        self.recordBackpressureTerminal(.merge_failed);
+                        return .merge_failed;
+                    }
+                    break;
+                }
+                made_progress = true;
+                if (self.backpressureDrained()) break;
+                if (self.backpressureExpired(started_ns)) {
+                    self.recordBackpressureTerminal(.timed_out);
+                    return .timed_out;
+                }
+            }
+            if (self.backpressureDrained()) break;
+            // A background task may own the only admissible source set. Wait
+            // without holding DB/index locks, then re-check the low watermark.
+            // This converts segment debt into write-side backpressure instead
+            // of allowing unbounded query fan-out.
+            if (!made_progress or self.config.backpressure_sleep_ms > 0) {
+                if (!self.sleepBackpressure(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+                    if (isShutdown(self)) return .shutdown;
+                    self.recordBackpressureTerminal(.timed_out);
+                    return .timed_out;
+                }
+            }
+        }
+        if (isShutdown(self)) return .shutdown;
+        return .drained;
+    }
+
+    fn recordBackpressureElapsed(self: *TextMergeRuntime, started_ns: u64) void {
+        const elapsed_ns = self.backpressureNowNs() -| started_ns;
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            self.backpressure_ns += elapsed_ns;
+            self.mutex.unlock(io);
+        } else {
             self.backpressure_ns += elapsed_ns;
         }
+    }
+
+    fn recordBackpressureTerminal(self: *TextMergeRuntime, outcome: BackpressureOutcome) void {
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (outcome == .timed_out) self.backpressure_timeouts += 1;
+            if (outcome == .merge_failed) self.backpressure_failures += 1;
+        } else {
+            if (outcome == .timed_out) self.backpressure_timeouts += 1;
+            if (outcome == .merge_failed) self.backpressure_failures += 1;
+        }
+    }
+
+    fn backpressureExpired(self: *TextMergeRuntime, started_ns: u64) bool {
+        const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        return self.backpressureNowNs() -| started_ns >= max_wait_ns;
+    }
+
+    fn backpressureNowNs(self: *TextMergeRuntime) u64 {
+        const io = self.io_impl.?.io();
+        return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
+    }
+
+    fn sleepBackpressure(self: *TextMergeRuntime, started_ns: u64, requested_ms: u64) bool {
+        var remaining_ms = requested_ms;
+        while (remaining_ms > 0) {
+            if (isShutdown(self) or self.backpressureExpired(started_ns)) return false;
+            const slice_ms: u64 = @min(remaining_ms, 10);
+            self.config.clock.sleepMs(slice_ms);
+            remaining_ms -= slice_ms;
+        }
+        return !self.backpressureExpired(started_ns);
     }
 
     pub fn stats(self: *TextMergeRuntime) types.TextMergeStats {
@@ -332,12 +441,16 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             self.mutex.lockUncancelable(io);
             const events = self.backpressure_events;
             const ns = self.backpressure_ns;
+            const timeouts = self.backpressure_timeouts;
+            const failures = self.backpressure_failures;
             self.mutex.unlock(io);
-            break :blk .{ events, ns };
-        } else .{ self.backpressure_events, self.backpressure_ns };
+            break :blk .{ events, ns, timeouts, failures };
+        } else .{ self.backpressure_events, self.backpressure_ns, self.backpressure_timeouts, self.backpressure_failures };
         snapshot.enabled = self.config.enabled;
         snapshot.backpressure_events = backpressure[0];
         snapshot.backpressure_ns = backpressure[1];
+        snapshot.backpressure_timeouts = backpressure[2];
+        snapshot.backpressure_failures = backpressure[3];
         snapshot.max_pending_segments = self.config.max_pending_segments;
         snapshot.max_pending_bytes = self.config.max_pending_bytes;
         return snapshot;
@@ -350,6 +463,25 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.apply_mutex.unlockShared();
         return (self.config.max_pending_segments > 0 and stats_snapshot.pending_segments > self.config.max_pending_segments) or
             (self.config.max_pending_bytes > 0 and stats_snapshot.pending_bytes > self.config.max_pending_bytes);
+    }
+
+    fn backpressureDrained(self: *TextMergeRuntime) bool {
+        if (self.workDeferred()) return true;
+        lockApplyShared(self.apply_mutex);
+        const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
+        self.apply_mutex.unlockShared();
+        const segment_low = @min(self.config.resume_pending_segments, self.config.max_pending_segments);
+        const bytes_low = self.config.max_pending_bytes / 2;
+        return (self.config.max_pending_segments == 0 or stats_snapshot.pending_segments <= segment_low) and
+            (self.config.max_pending_bytes == 0 or stats_snapshot.pending_bytes <= bytes_low);
+    }
+
+    fn backpressureBlockedByQuarantine(self: *TextMergeRuntime) bool {
+        lockApplyShared(self.apply_mutex);
+        const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
+        self.apply_mutex.unlockShared();
+        return stats_snapshot.pending_segments > 0 and
+            stats_snapshot.quarantined_segments >= stats_snapshot.pending_segments;
     }
 
     fn workDeferred(self: *const TextMergeRuntime) bool {

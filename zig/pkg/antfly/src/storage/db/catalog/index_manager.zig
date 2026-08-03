@@ -1122,6 +1122,19 @@ pub const IndexManager = struct {
         }
     };
 
+    const TextMergePublicationDeletes = struct {
+        source_current: bool,
+        bitmaps: []?roaring.RoaringBitmap,
+
+        fn deinit(self: *TextMergePublicationDeletes, alloc: Allocator) void {
+            for (self.bitmaps) |*maybe_deleted| {
+                if (maybe_deleted.*) |*deleted| deleted.deinit();
+            }
+            alloc.free(self.bitmaps);
+            self.* = undefined;
+        }
+    };
+
     const TextMergeResultOutputStats = struct {
         segments: u64 = 0,
         bytes: u64 = 0,
@@ -2876,17 +2889,23 @@ pub const IndexManager = struct {
         var stats = lsm_backend_mod.NativeStorageStats{};
         for (self.text_indexes.items) |*entry| {
             if (entry.persistent.snapshotLsmNativeStorageStats()) |entry_stats| {
-                stats.fd_cache_entries +|= entry_stats.fd_cache_entries;
-                stats.fd_cache_capacity +|= entry_stats.fd_cache_capacity;
+                accumulateNativeStorageStats(&stats, entry_stats);
             }
         }
         for (self.dense_indexes.items) |*entry| {
             if (entry.index.snapshotLsmNativeStorageStats()) |entry_stats| {
-                stats.fd_cache_entries +|= entry_stats.fd_cache_entries;
-                stats.fd_cache_capacity +|= entry_stats.fd_cache_capacity;
+                accumulateNativeStorageStats(&stats, entry_stats);
             }
         }
         return stats;
+    }
+
+    fn accumulateNativeStorageStats(stats: *lsm_backend_mod.NativeStorageStats, entry: lsm_backend_mod.NativeStorageStats) void {
+        stats.fd_cache_entries = @max(stats.fd_cache_entries, entry.fd_cache_entries);
+        stats.fd_admitted_descriptors = @max(stats.fd_admitted_descriptors, entry.fd_admitted_descriptors);
+        stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry.fd_admission_capacity);
+        stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry.fd_admission_waiters);
+        stats.fd_admission_waits = @max(stats.fd_admission_waits, entry.fd_admission_waits);
     }
 
     pub fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
@@ -10052,7 +10071,9 @@ pub const IndexManager = struct {
         lockAtomicWithBackoff(entry.apply_mutex);
         var index_apply_locked = true;
         defer if (index_apply_locked) entry.apply_mutex.unlock();
-        if (!try self.textMergeSourceStillCurrent(entry, task)) {
+        var publication_deletes = try self.textMergePublicationDeletes(entry, task, result);
+        defer publication_deletes.deinit(self.alloc);
+        if (!publication_deletes.source_current) {
             entry.apply_mutex.unlock();
             index_apply_locked = false;
             self.text_merge_scheduler.skipped_stale_merges += 1;
@@ -10068,7 +10089,7 @@ pub const IndexManager = struct {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
             result.prepared_owner = null;
-            break :blk entry.persistent.replaceSegmentsIfActiveManyPrepared(old_ids, prepared_segments) catch |err| switch (err) {
+            break :blk entry.persistent.replaceSegmentsIfActiveManyPreparedWithDeletes(old_ids, prepared_segments, publication_deletes.bitmaps) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 else => {
                     if (builtin.os.tag != .freestanding) {
@@ -10080,7 +10101,7 @@ pub const IndexManager = struct {
         } else blk: {
             const segments = result.segments;
             result.segments = &.{};
-            break :blk entry.persistent.replaceSegmentsIfActiveManyOwned(old_ids, segments) catch |err| switch (err) {
+            break :blk entry.persistent.replaceSegmentsIfActiveManyOwnedWithDeletes(old_ids, segments, publication_deletes.bitmaps) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 else => {
                     if (builtin.os.tag != .freestanding) {
@@ -10307,23 +10328,126 @@ pub const IndexManager = struct {
         };
     }
 
-    fn textMergeSourceStillCurrent(_: *IndexManager, entry: *TextIndex, task: *const TextMergeTask) !bool {
+    /// Reconcile deletion-only source changes into the merge output. Segment
+    /// replacement is still stale, but monotonic tombstones no longer force a
+    /// completed merge to be discarded and retried under sustained mutation.
+    fn textMergePublicationDeletes(
+        self: *IndexManager,
+        entry: *TextIndex,
+        task: *const TextMergeTask,
+        result: *const TextMergeResult,
+    ) !TextMergePublicationDeletes {
+        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else result.segments.len;
+        const output_deleted = try self.alloc.alloc(?roaring.RoaringBitmap, output_count);
+        @memset(output_deleted, null);
+        errdefer {
+            for (output_deleted) |*maybe_deleted| {
+                if (maybe_deleted.*) |*deleted| deleted.deinit();
+            }
+            self.alloc.free(output_deleted);
+        }
+
+        var late_ordinals = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer late_ordinals.deinit(self.alloc);
+        var late_ids = std.StringHashMapUnmanaged(void).empty;
+        defer late_ids.deinit(self.alloc);
+
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
-        for (task.source) |source| {
-            const seg = findSegmentById(snap, source.id) orelse return false;
+        for (task.source, task.merge_indices) |source, source_idx| {
+            const seg = findSegmentById(snap, source.id) orelse return .{
+                .source_current = false,
+                .bitmaps = output_deleted,
+            };
+            const frozen_seg = &task.snapshot.segments[source_idx];
             {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
+
                 if (source.deleted) |expected| {
-                    const current_deleted = seg.shared.deleted orelse return false;
-                    if (!current_deleted.eql(&expected)) return false;
-                } else if (seg.shared.deleted != null) {
-                    return false;
+                    var expected_iter = expected.iterator();
+                    while (expected_iter.next()) |doc_id| {
+                        const current = seg.shared.deleted orelse return .{
+                            .source_current = false,
+                            .bitmaps = output_deleted,
+                        };
+                        if (!current.contains(doc_id)) return .{
+                            .source_current = false,
+                            .bitmaps = output_deleted,
+                        };
+                    }
+                }
+
+                if (seg.shared.deleted) |current| {
+                    var current_iter = current.iterator();
+                    while (current_iter.next()) |doc_id| {
+                        if (source.deleted) |expected| {
+                            if (expected.contains(doc_id)) continue;
+                        }
+                        if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
+
+                        var has_identity = false;
+                        if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal| {
+                            try late_ordinals.put(self.alloc, ordinal, {});
+                            has_identity = true;
+                        }
+                        if (try frozen_seg.reader.storedDoc(doc_id)) |stored| {
+                            try late_ids.put(self.alloc, stored.id, {});
+                            has_identity = true;
+                        }
+                        if (!has_identity) return error.MissingMergeDocumentIdentity;
+                    }
                 }
             }
         }
-        return true;
+
+        if (late_ordinals.count() == 0 and late_ids.count() == 0) return .{
+            .source_current = true,
+            .bitmaps = output_deleted,
+        };
+
+        if (result.prepared_segments.len > 0) {
+            for (result.prepared_segments, 0..) |*prepared, output_idx| {
+                var reader = try segment_mod.SegmentReader.init(self.alloc, prepared.data.bytes());
+                defer reader.deinit();
+                try self.markTextMergePublicationDeletes(&reader, &late_ordinals, &late_ids, &output_deleted[output_idx]);
+            }
+        } else {
+            for (result.segments, 0..) |segment_bytes, output_idx| {
+                var reader = try segment_mod.SegmentReader.init(self.alloc, segment_bytes);
+                defer reader.deinit();
+                try self.markTextMergePublicationDeletes(&reader, &late_ordinals, &late_ids, &output_deleted[output_idx]);
+            }
+        }
+
+        return .{
+            .source_current = true,
+            .bitmaps = output_deleted,
+        };
+    }
+
+    fn markTextMergePublicationDeletes(
+        self: *IndexManager,
+        reader: *const segment_mod.SegmentReader,
+        late_ordinals: *const std.AutoHashMapUnmanaged(u32, void),
+        late_ids: *const std.StringHashMapUnmanaged(void),
+        output_deleted: *?roaring.RoaringBitmap,
+    ) !void {
+        for (0..reader.doc_count) |doc_id_usize| {
+            const doc_id: u32 = @intCast(doc_id_usize);
+            var deleted = false;
+            if (try reader.docOrdinal(doc_id)) |ordinal| {
+                deleted = late_ordinals.contains(ordinal);
+            }
+            if (!deleted) {
+                if (try reader.storedDoc(doc_id)) |stored| {
+                    deleted = late_ids.contains(stored.id);
+                }
+            }
+            if (!deleted) continue;
+            if (output_deleted.* == null) output_deleted.* = roaring.RoaringBitmap.init(self.alloc);
+            try output_deleted.*.?.add(doc_id);
+        }
     }
 
     fn findSegmentById(snap: *const index_mod.IndexSnapshot, id: u64) ?*const index_mod.SegmentEntry {
@@ -23084,7 +23208,7 @@ test "dense HBC batchInsertWithMetadata works after text batch setup" {
     try std.testing.expectEqual(@as(u64, 16), entry.index.stats().active_count);
 }
 
-test "text merge task skips stale source after concurrent delete" {
+test "text merge task carries concurrent deletes into publication" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -23165,18 +23289,21 @@ test "text merge task skips stale source after concurrent delete" {
         defer reader.deinit();
         merged_docs += reader.doc_count;
     }
-    // The build ran after the live bitmap changed, but it consumed the frozen
-    // task view. Publication must reject that now-stale view below.
+    // The unlocked build consumed the frozen view. Publication must transfer
+    // the later tombstone into the replacement rather than reject the useful
+    // merge and retry forever under sustained mutation.
     try std.testing.expectEqual(frozen_live_docs, merged_docs);
     const applied = try manager.finishTextMergeTask(&task, &result);
-    try std.testing.expect(!applied);
-    const stale_stats = manager.textMergeStats();
-    try std.testing.expectEqual(@as(u64, 0), stale_stats.in_flight_merges);
-    try std.testing.expectEqual(@as(u64, 0), stale_stats.in_flight_segments);
-    try std.testing.expectEqual(@as(u64, 1), stale_stats.skipped_stale_merges);
+    try std.testing.expect(applied);
+    const merge_stats = manager.textMergeStats();
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_segments);
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.skipped_stale_merges);
+    try std.testing.expectEqual(@as(u64, 1), merge_stats.completed_merges);
 
-    try std.testing.expect(text_entry.compaction_pending);
-    try std.testing.expect(text_entry.persistent.snapshot().segments.len >= 12);
+    const published = text_entry.persistent.snapshot();
+    try std.testing.expect(published.segments.len < 12);
+    try std.testing.expectEqual(@as(u64, 11), published.liveDocCount());
 }
 
 test "text merge task retires all-deleted file-backed inputs" {

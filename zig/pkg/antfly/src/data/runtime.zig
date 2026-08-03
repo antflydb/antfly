@@ -1583,6 +1583,8 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_deferred_for_pressure_total", "counter", "Cached write full-text merge attempts deferred for resource pressure", stats.deferred_for_pressure);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_events_total", "counter", "Cached write full-text merge backpressure events", stats.backpressure_events);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_ns_total", "counter", "Nanoseconds spent under full-text merge backpressure", stats.backpressure_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_timeouts_total", "counter", "Full-text merge backpressure deadlines reached", stats.backpressure_timeouts);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_failures_total", "counter", "Full-text merge backpressure attempts terminated by a merge failure", stats.backpressure_failures);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_pending_segments", "gauge", "Maximum pending full-text segments observed by merge scheduling", stats.max_pending_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_pending_bytes", "gauge", "Maximum pending full-text segment bytes observed by merge scheduling", stats.max_pending_bytes);
 }
@@ -1898,7 +1900,13 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
 fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.NativeStorageStats) !void {
     const value = stats orelse lsm_backend_mod.NativeStorageStats{};
     try health_metrics.appendPromMetric(writer, "antfly_lsm_native_fd_cache_entries", "gauge", "Native LSM storage file descriptors currently retained in the storage IO cache", @intCast(value.fd_cache_entries));
-    try health_metrics.appendPromMetric(writer, "antfly_lsm_native_fd_cache_capacity", "gauge", "Maximum native LSM storage file descriptors retained in the storage IO cache", @intCast(value.fd_cache_capacity));
+    // Preserve the original capacity series for dashboards while publishing
+    // storage-wide names for the admission domain shared by LSM and mmap.
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_native_fd_cache_capacity", "gauge", "Shared native storage descriptor admission capacity", @intCast(value.fd_admission_capacity));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admitted", "gauge", "Native storage descriptors holding admission permits, including cached, transient, and lock files", @intCast(value.fd_admitted_descriptors));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admission_capacity", "gauge", "Maximum native storage descriptors admitted across cached, transient, and lock-file opens", @intCast(value.fd_admission_capacity));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admission_waiters", "gauge", "Native storage operations waiting for descriptor admission", @intCast(value.fd_admission_waiters));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admission_waits_total", "counter", "Native storage descriptor admission waits", value.fd_admission_waits);
 }
 
 fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.Stats) !void {
@@ -21194,10 +21202,20 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_waits_total{kind=\"run_table_block\"}") != null);
 
     writer = .fixed(&writer_buf);
-    try writeLsmNativeStorageMetrics(&writer, .{ .fd_cache_entries = 7, .fd_cache_capacity = 1024 });
+    try writeLsmNativeStorageMetrics(&writer, .{
+        .fd_cache_entries = 7,
+        .fd_admitted_descriptors = 9,
+        .fd_admission_capacity = 1024,
+        .fd_admission_waiters = 3,
+        .fd_admission_waits = 11,
+    });
     const native_storage_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_lsm_native_fd_cache_entries 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admitted 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_lsm_native_fd_cache_capacity 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admission_capacity 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admission_waiters 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admission_waits_total 11") != null);
 
     writer = .fixed(&writer_buf);
     try writeProcessMemoryMetrics(&writer, .{
