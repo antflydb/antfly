@@ -6541,7 +6541,10 @@ pub fn build(b: *std.Build) void {
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
     });
-    const run_sparse_unit_tests = b.addRunArtifact(sparse_unit_tests);
+    // This aggregate exercises long-running storage lifecycle tests. Use the
+    // simple runner so failures retain per-test/cleanup attribution instead of
+    // collapsing into an opaque test-server process exit.
+    const run_sparse_unit_tests = addFilteredTestRunArtifact(b, sparse_unit_tests);
 
     const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
     sparse_test_step.dependOn(&run_sparse_unit_tests.step);
