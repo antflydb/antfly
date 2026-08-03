@@ -6087,16 +6087,16 @@ pub const Node = struct {
         };
         defer ctx.allocator.free(results);
 
-        var input_obj: std.json.ObjectMap = .empty;
-        defer input_obj.deinit(ctx.allocator);
-        try input_obj.put(ctx.allocator, "image_path", .{ .string = body.image_path });
-        try input_obj.put(ctx.allocator, "num_tokens", .{ .integer = @intCast(num_tokens) });
+        var input_obj: std.json.ObjectMap = .init(ctx.allocator);
+        defer input_obj.deinit();
+        try input_obj.put("image_path", .{ .string = body.image_path });
+        try input_obj.put("num_tokens", .{ .integer = @intCast(num_tokens) });
 
-        var best_obj: std.json.ObjectMap = .empty;
-        defer best_obj.deinit(ctx.allocator);
+        var best_obj: std.json.ObjectMap = .init(ctx.allocator);
+        defer best_obj.deinit();
         const best_value: ?std.json.Value = if (results.len > 0) blk: {
-            try best_obj.put(ctx.allocator, "label", .{ .string = results[0].label });
-            try best_obj.put(ctx.allocator, "score", .{ .float = results[0].score });
+            try best_obj.put("label", .{ .string = results[0].label });
+            try best_obj.put("score", .{ .float = results[0].score });
             break :blk .{ .object = best_obj };
         } else null;
 
@@ -6215,7 +6215,7 @@ pub const Node = struct {
         var best_objs = std.ArrayListUnmanaged(*std.json.ObjectMap).empty;
         defer {
             for (best_objs.items) |o| {
-                o.deinit(ctx.allocator);
+                o.deinit();
                 ctx.allocator.destroy(o);
             }
             best_objs.deinit(ctx.allocator);
@@ -6238,10 +6238,10 @@ pub const Node = struct {
 
             const best_value: ?std.json.Value = if (pred.best) |best| blk: {
                 const obj = try ctx.allocator.create(std.json.ObjectMap);
-                obj.* = .empty;
+                obj.* = .init(ctx.allocator);
                 try best_objs.append(ctx.allocator, obj);
-                try obj.put(ctx.allocator, "label", .{ .string = best.label });
-                try obj.put(ctx.allocator, "score", .{ .float = best.score });
+                try obj.put("label", .{ .string = best.label });
+                try obj.put("score", .{ .float = best.score });
                 break :blk .{ .object = obj.* };
             } else null;
 
@@ -7354,10 +7354,10 @@ fn buildExtractionResponse(
         for (result.structures) |structure| {
             const instances = try alloc.alloc(std.json.Value, structure.instances.len);
             for (structure.instances, 0..) |instance, instance_index| {
-                var instance_obj: std.json.ObjectMap = .empty;
-                try instance_obj.ensureTotalCapacity(alloc, instance.fields.len);
+                var instance_obj: std.json.ObjectMap = .init(alloc);
+                try instance_obj.ensureTotalCapacity(instance.fields.len);
                 for (instance.fields) |field| {
-                    try instance_obj.put(alloc, field.name, try extractedFieldToValue(alloc, field.value));
+                    try instance_obj.put(field.name, try extractedFieldToValue(alloc, field.value));
                 }
                 instances[instance_index] = .{ .object = instance_obj };
             }
@@ -7394,10 +7394,10 @@ fn extractionResponseJsonAlloc(
         for (result.structures) |structure| {
             const instances = try alloc.alloc(std.json.Value, structure.instances.len);
             for (structure.instances, 0..) |instance, instance_index| {
-                var instance_obj: std.json.ObjectMap = .empty;
-                try instance_obj.ensureTotalCapacity(alloc, instance.fields.len);
+                var instance_obj: std.json.ObjectMap = .init(alloc);
+                try instance_obj.ensureTotalCapacity(instance.fields.len);
                 for (instance.fields) |field| {
-                    try instance_obj.put(alloc, field.name, try extractedFieldToValue(alloc, field.value));
+                    try instance_obj.put(field.name, try extractedFieldToValue(alloc, field.value));
                 }
                 instances[instance_index] = .{ .object = instance_obj };
             }
@@ -7423,10 +7423,10 @@ fn readerFieldsJsonAlloc(allocator: std.mem.Allocator, fields: []const readers_m
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var obj: std.json.ObjectMap = .empty;
-    try obj.ensureTotalCapacity(alloc, fields.len);
+    var obj: std.json.ObjectMap = .init(alloc);
+    try obj.ensureTotalCapacity(fields.len);
     for (fields) |field| {
-        try obj.put(alloc, field.name, .{ .string = field.value });
+        try obj.put(field.name, .{ .string = field.value });
     }
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
 }
@@ -7439,15 +7439,15 @@ fn readerRegionsJsonAlloc(allocator: std.mem.Allocator, regions: []const readers
     var arr = std.json.Array.init(alloc);
     try arr.ensureTotalCapacity(regions.len);
     for (regions) |region| {
-        var obj: std.json.ObjectMap = .empty;
-        try obj.ensureTotalCapacity(alloc, 4);
-        try obj.put(alloc, "text", .{ .string = region.text });
+        var obj: std.json.ObjectMap = .init(alloc);
+        try obj.ensureTotalCapacity(4);
+        try obj.put("text", .{ .string = region.text });
         var bbox = std.json.Array.init(alloc);
         try bbox.ensureTotalCapacity(region.bbox.len);
         for (region.bbox) |coord| bbox.appendAssumeCapacity(.{ .float = coord });
-        try obj.put(alloc, "bbox", .{ .array = bbox });
-        if (region.confidence) |confidence| try obj.put(alloc, "confidence", .{ .float = confidence });
-        if (region.label) |label| try obj.put(alloc, "label", .{ .string = label });
+        try obj.put("bbox", .{ .array = bbox });
+        if (region.confidence) |confidence| try obj.put("confidence", .{ .float = confidence });
+        if (region.label) |label| try obj.put("label", .{ .string = label });
         arr.appendAssumeCapacity(.{ .object = obj });
     }
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = arr }, .{});
@@ -7656,8 +7656,8 @@ fn extractedFieldValueToValue(
     alloc: std.mem.Allocator,
     value: extraction_mod.ExtractedFieldValue,
 ) !std.json.Value {
-    var obj: std.json.ObjectMap = .empty;
-    try obj.ensureTotalCapacity(alloc, 4);
+    var obj: std.json.ObjectMap = .init(alloc);
+    try obj.ensureTotalCapacity(4);
     obj.putAssumeCapacity("value", .{ .string = value.value });
     if (value.score) |score| obj.putAssumeCapacity("score", .{ .float = score });
     if (value.start) |start| obj.putAssumeCapacity("start", .{ .integer = @intCast(start) });
@@ -7957,6 +7957,7 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
     try appendPromMetric(writer, "inference_graph_executor_planned_operator_dispatches_total", "counter", "Total graph executor planned operator dispatches", stats.planned_operator_dispatches);
     try appendPromMetric(writer, "inference_graph_executor_interpreter_fallbacks_total", "counter", "Total graph executor interpreter fallback partitions", stats.interpreter_fallbacks);
     try appendPromMetric(writer, "inference_graph_executor_device_resident_outputs_total", "counter", "Total graph executor device-resident outputs", stats.device_resident_outputs);
+    try appendPromMetric(writer, "inference_graph_executor_device_resident_parameter_outputs_total", "counter", "Total graph executor device-resident parameter outputs", stats.device_resident_parameter_outputs);
     try appendPromMetric(writer, "inference_graph_executor_host_materialized_outputs_total", "counter", "Total graph executor host-materialized outputs", stats.host_materialized_outputs);
     try appendPromMetric(writer, "inference_graph_executor_boundary_output_materializations_total", "counter", "Total graph executor boundary output materializations", stats.boundary_output_materializations);
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_slots_reserved_total", "counter", "Total graph executor planned buffer slots reserved", stats.graph_plan_slots_reserved);
@@ -9811,9 +9812,9 @@ fn buildEmbedSparseResponse(
         try values.ensureTotalCapacity(sv.values.len);
         for (sv.values) |val| values.appendAssumeCapacity(.{ .float = val });
 
-        var obj: std.json.ObjectMap = .empty;
-        try obj.put(arena, "indices", .{ .array = indices });
-        try obj.put(arena, "values", .{ .array = values });
+        var obj: std.json.ObjectMap = .init(arena);
+        try obj.put("indices", .{ .array = indices });
+        try obj.put("values", .{ .array = values });
 
         data[i] = .{
             .object = "embedding",

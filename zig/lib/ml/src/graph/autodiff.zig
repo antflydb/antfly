@@ -18,10 +18,10 @@
 // of the loss with respect to requested parameter nodes by walking the
 // graph backward and applying VJP (vector-Jacobian product) rules.
 //
-// Fused ops are lowered to primitives first (via lower.zig), so VJPs
-// only need to be defined for ~25 primitive ops. This follows GoMLX's
-// pattern: fused ops carry a vjp_alternate decomposed subgraph, and
-// differentiation operates on the primitive form.
+// Most fused ops are lowered to primitives first (via lower.zig), so VJPs
+// can be defined against a compact primitive surface. Some hot training
+// ops stay fused and carry hand-written VJPs when preserving fused semantics
+// avoids expensive decomposed backward graphs.
 //
 // Usage:
 //   var result = try gradient(allocator, &graph, loss_id, &.{param_a, param_b});
@@ -72,7 +72,7 @@ pub const GradientResult = struct {
 
 /// Compute gradients of a scalar loss with respect to parameter nodes.
 ///
-/// 1. Lowers fused ops to primitives via vjp_alternate.
+/// 1. Lowers most fused ops to primitives via vjp_alternate.
 /// 2. Walks backward from loss, applying VJP rules to accumulate adjoints.
 /// 3. Returns gradient NodeIds for each requested parameter.
 ///
@@ -168,8 +168,6 @@ fn applyVjp(
     adjoints: []NodeId,
 ) !void {
     const ins = n.getInputs();
-    _ = node_id;
-
     switch (n.op) {
         // ── No gradient ──────────────────────────────────────────────
         .parameter, .constant => {},
@@ -237,6 +235,42 @@ fn applyVjp(
             // Put tensor-shaped operand first for correct output shape.
             const grad = try b.mul(exp_val, two_over_sqrt_pi);
             try accumulate(b, adjoints, ins[0], try b.mul(adj, grad));
+        },
+
+        .fused_gelu => {
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_gelu_backward = {} },
+                .output_shape = n.output_shape,
+                .inputs = .{ ins[0], adj, null_node, null_node },
+                .num_inputs = 2,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        .fused_gelu_exact => {
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_gelu_exact_backward = {} },
+                .output_shape = n.output_shape,
+                .inputs = .{ ins[0], adj, null_node, null_node },
+                .num_inputs = 2,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        .fused_softmax => {
+            // For y = softmax(x), dL/dx = y * (dL/dy - sum(dL/dy * y)).
+            // Keeping this fused avoids routing attention gradients through
+            // the reduce_max stabilization subgraph used by the forward
+            // decomposition.
+            const y = node_id;
+            const rank = n.output_shape.rank();
+            const last_axis: u8 = @intCast(rank - 1);
+            const adj_times_y = try b.mul(adj, y);
+            const dot = try b.reduceSum(adj_times_y, &.{last_axis});
+            const dot_shape = b.graph.node(dot).output_shape;
+            const dot_bc = try broadcastToShape(b, dot, dot_shape, n.output_shape, &.{last_axis});
+            const centered = try b.sub(adj, dot_bc);
+            try accumulate(b, adjoints, ins[0], try b.mul(y, centered));
         },
 
         .abs => {
@@ -618,12 +652,99 @@ fn applyVjp(
             // cos/sin are treated as frozen position embeddings; no grad.
         },
 
+        // ── Fused disentangled attention (hand-written VJP) ──────────
+        // Forward inputs: ins[0]=qkv_packed [3*B*S, H], ins[1]=qr_kr_packed
+        // [2*num_rel, H], ins[2]=attn_bias. The backward op recomputes the
+        // softmax and emits packed grads [dQ;dK;dV;dQ_r;dK_r] =
+        // [3*B*S + 2*num_rel, H]; two row-slices feed the packed-input
+        // adjoints, and the upstream concat VJPs split those into the real
+        // q/k/v/q_r/k_r gradients.
+        .fused_disentangled_attention => |attrs| {
+            const bs: i64 = @intCast(@as(usize, attrs.batch) * @as(usize, attrs.seq_len));
+            const num_rel: i64 = @intCast(2 * @as(usize, attrs.seq_len) - 1);
+            const hh: i64 = @intCast(@as(usize, attrs.num_heads) * @as(usize, attrs.head_dim));
+            const dtype = g.node(ins[0]).output_shape.dtype;
+
+            const grad_packed = try b.graph.addNode(.{
+                .op = .{ .fused_disentangled_attention_backward = attrs },
+                .output_shape = Shape.init(dtype, &.{ 3 * bs + 2 * num_rel, hh }),
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+
+            const d_qkv = try sliceRows(b, grad_packed, 0, 3 * bs, hh, dtype);
+            const d_qr_kr = try sliceRows(b, grad_packed, 3 * bs, 3 * bs + 2 * num_rel, hh, dtype);
+            try accumulate(b, adjoints, ins[0], d_qkv);
+            try accumulate(b, adjoints, ins[1], d_qr_kr);
+            // attn_bias (ins[2]) is a frozen padding mask — no gradient.
+        },
+
+        .fused_layer_norm => |attrs| {
+            // Only reached when the fused op survived lowering (the
+            // `fuse_layer_norm_backward` builder flag was on, so it carries no
+            // vjp_alternate). Backward yields gradients for input, gamma, beta.
+            const in_shape = g.node(ins[0]).output_shape;
+            const dtype = in_shape.dtype;
+            const dim: i64 = @intCast(attrs.dim);
+            const rank = in_shape.rank();
+            var rows: i64 = 1;
+            for (0..rank - 1) |ax| rows *= in_shape.dim(@intCast(ax));
+
+            const grad_packed = try b.graph.addNode(.{
+                .op = .{ .fused_layer_norm_backward = attrs },
+                .output_shape = Shape.init(dtype, &.{ rows + 2, dim }),
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+
+            const d_input_2d = try sliceRows(b, grad_packed, 0, rows, dim, dtype);
+            const d_input = if (rank == 2) d_input_2d else try b.reshape(d_input_2d, in_shape);
+            const d_gamma_row = try sliceRows(b, grad_packed, rows, rows + 1, dim, dtype);
+            const d_gamma = try b.reshape(d_gamma_row, g.node(ins[1]).output_shape);
+            const d_beta_row = try sliceRows(b, grad_packed, rows + 1, rows + 2, dim, dtype);
+            const d_beta = try b.reshape(d_beta_row, g.node(ins[2]).output_shape);
+            try accumulate(b, adjoints, ins[0], d_input);
+            try accumulate(b, adjoints, ins[1], d_gamma);
+            try accumulate(b, adjoints, ins[2], d_beta);
+        },
+
+        .fused_masked_bce_with_logits_loss => |attrs| {
+            const grad_logits = try b.graph.addNode(.{
+                .op = .{ .fused_masked_bce_with_logits_backward = attrs },
+                .output_shape = g.node(ins[0]).output_shape,
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad_logits);
+        },
+
         // ── Fused ops should not appear after lowering ───────────────
         else => {
             // Fused ops should have been lowered. If we hit one, it had
             // no vjp_alternate — no gradient can flow through it.
         },
     }
+}
+
+/// Slice rows [start, end) of a 2-D [N, cols] tensor (axis-0 slice).
+fn sliceRows(b: *Builder, input: NodeId, start: i64, end: i64, cols: i64, dtype: shape_mod.DType) !NodeId {
+    var attrs = node_mod.SliceAttrs{};
+    attrs.num_axes = 2;
+    attrs.starts[0] = start;
+    attrs.starts[1] = 0;
+    attrs.limits[0] = end;
+    attrs.limits[1] = cols;
+    attrs.strides[0] = 1;
+    attrs.strides[1] = 1;
+    return b.graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(dtype, &.{ end - start, cols }),
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 /// Emit a 3D batched matmul: C[b] = A[b] @ B[b] with batch dim 0,
@@ -874,6 +995,53 @@ test "gradient of mul" {
     try std.testing.expect(result.param_grads[1] != null_node);
 }
 
+test "gradient of fused gelu emits fused backward op" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 3 }));
+    const activated = try bld.gelu(x);
+    const loss = try bld.reduceSum(activated, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    const grad = result.param_grads[0];
+    try std.testing.expect(grad != null_node);
+    try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .fused_gelu_backward), std.meta.activeTag(result.graph.node(grad).op));
+}
+
+test "gradient of fused exact gelu emits exact fused backward op" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 3 }));
+    const activated = try bld.geluExact(x);
+    const loss = try bld.reduceSum(activated, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    var saw_exact_forward = false;
+    var saw_exact_backward = false;
+    for (0..result.graph.nodeCount()) |node_index| {
+        switch (result.graph.node(@intCast(node_index)).op) {
+            .fused_gelu_exact => saw_exact_forward = true,
+            .fused_gelu_exact_backward => saw_exact_backward = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_exact_forward);
+    try std.testing.expect(saw_exact_backward);
+    try std.testing.expect(result.param_grads[0] != null_node);
+}
+
 test "gradient of 2d slice pads adjoint to input shape" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -984,6 +1152,29 @@ test "gradient through fused gelu (lowered)" {
     defer result.deinit();
 
     try std.testing.expect(result.param_grads[0] != null_node);
+}
+
+test "gradient through fused masked BCE uses custom backward" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const logits = try bld.parameter("logits", Shape.init(.f32, &.{ 2, 3 }));
+    const labels = try bld.parameter("labels", Shape.init(.f32, &.{ 2, 3 }));
+    const mask = try bld.parameter("mask", Shape.init(.f32, &.{ 2, 3 }));
+    const loss = try bld.maskedBceWithLogitsLoss(logits, labels, mask, .{
+        .positive_weight = 2.0,
+        .negative_weight = 0.5,
+        .reduction = .mean,
+    });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{logits});
+    defer result.deinit();
+
+    try std.testing.expect(result.param_grads[0] != null_node);
+    try std.testing.expectEqual(.fused_masked_bce_with_logits_backward, std.meta.activeTag(result.graph.node(result.param_grads[0]).op));
 }
 
 test "gradient through fused linear (lowered)" {

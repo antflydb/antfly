@@ -41,25 +41,33 @@ const Options = struct {
     entity_types_csv: []const u8,
 
     epochs: []const u8 = "5",
-    batch_size: []const u8 = "1",
+    batch_size: []const u8 = "2",
     max_examples: []const u8 = "100",
     seq_len: []const u8 = "256",
-    learning_rate: []const u8 = "1e-3",
+    learning_rate: []const u8 = "5e-4",
     lora_rank: []const u8 = "16",
     lora_alpha: []const u8 = "32",
-    objective: []const u8 = "span-start",
-    max_span_width: []const u8 = "4",
+    lora_dropout: []const u8 = "0",
+    lora_only_trainables: bool = true,
+    objective: []const u8 = "gliner2-total-loss",
+    max_span_width: []const u8 = "8",
     span_loss: []const u8 = "bce",
-    span_positive_weight: []const u8 = "32",
+    span_loss_reduction: []const u8 = "sum",
+    span_positive_weight: []const u8 = "1",
     span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: []const u8 = "1",
     span_hard_negative_weight: []const u8 = "1",
+    span_negative_mask_rate: []const u8 = "0.5",
     max_grad_norm: []const u8 = "1.0",
     grad_accum: []const u8 = "1",
     seed: []const u8 = "42",
     backend: []const u8 = "auto",
     compiled_required: bool = false,
-    production_metal_gate: bool = false,
+    activation_checkpointing: bool = false,
+    activation_checkpoint_interval: []const u8 = "1",
+    activation_checkpoint_strategy: []const u8 = "every-n-layers",
+    structure_span_chunk_samples: []const u8 = "0",
+    entity_metal_readiness: bool = false,
     num_classes_override: ?[]const u8 = null,
 
     min_train_examples: usize = 100,
@@ -80,6 +88,36 @@ const Options = struct {
     max_device_trainable_transfer_count: ?u64 = null,
     max_device_resident_transfer_count: ?u64 = null,
     min_device_trainable_bytes: ?usize = null,
+    max_metal_tensor_device_owned_peak_live_bytes: ?u64 = null,
+    max_metal_runtime_total_bytes: ?u64 = null,
+    max_metal_eager_arena_peak_bytes: ?u64 = null,
+    max_metal_eager_arena_spill_bytes: ?u64 = null,
+    max_metal_chunk_local_output_peak_bytes: ?u64 = null,
+    max_metal_chunk_local_output_spill_bytes: ?u64 = null,
+    max_metal_chunk_local_output_unconsumed_hints: ?u64 = null,
+    min_metal_chunk_local_output_consumed_hints: ?u64 = null,
+    min_metal_runtime_reuse_hit_count: ?u64 = null,
+    max_graph_command_dispatch_count: ?u64 = null,
+    max_graph_host_output_count: ?u64 = null,
+    max_metal_frame_gpu_ms: ?f64 = null,
+    max_metal_last_frame_compute_encoder_count: ?u64 = null,
+    min_metal_frame_chunk_boundary_count: ?u64 = null,
+    min_metal_frame_chunk_promoted_value_count: ?u64 = null,
+    min_metal_frame_chunk_swept_value_count: ?u64 = null,
+    min_graph_runtime_region_dispatch_count: ?u64 = null,
+    max_graph_runtime_region_fallback_count: ?u64 = null,
+    min_graph_runtime_region_elided_node_count: ?u64 = null,
+    min_metal_deberta_ffn_forward_region_count: ?u64 = null,
+    min_metal_deberta_encoder_lora_layer_region_count: ?u64 = null,
+    min_metal_deberta_encoder_lora_residual_layernorm_region_count: ?u64 = null,
+    max_metal_deberta_encoder_lora_layer_scaffold_count: ?u64 = null,
+    max_metal_deberta_encoder_lora_layer_fallback_count: ?u64 = null,
+    min_metal_deberta_attention_flash_call_count: ?u64 = null,
+    max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
+    min_metal_deberta_encoder_layer_success_count: ?u64 = null,
+    min_metal_deberta_ffn_fused_call_count: ?u64 = null,
+    max_metal_deberta_ffn_fused_fallback_count: ?u64 = null,
+    max_runtime_frame_ineligible_missing_model_metadata: ?u64 = null,
     require_loss_decrease: bool = true,
 
     eval_text: ?[]const u8 = null,
@@ -120,6 +158,13 @@ const Options = struct {
     dry_run: bool = false,
 };
 
+const release_readiness_blockers = [_][]const u8{
+    "the required native full-task minima and positive-coverage gate are not configured by this scoped runner",
+    "this scoped runner does not evaluate the required five-seed held-out outcome parity study against pinned stock-stochastic Fastino",
+    "Zig SamplingConfig augmentation and model dropout remain disabled and must be accepted only through the audited outcome-parity gate",
+    "U+0130 lowercase expansion and normalization-changing Unicode remain unsupported and fail closed",
+};
+
 const ReadinessGateSummary = struct {
     model_dir: []const u8,
     train_data: []const u8,
@@ -136,7 +181,10 @@ const ReadinessGateSummary = struct {
     quality_summary_path: ?[]const u8,
     quality_thresholds_path: ?[]const u8,
     materialized_dir: ?[]const u8,
-    status: []const u8 = "passed",
+    scope: []const u8 = "native_entity_training_and_reload",
+    status: []const u8 = "scoped_checks_passed",
+    production_ready: bool = false,
+    production_readiness_blockers: []const []const u8 = &release_readiness_blockers,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -163,6 +211,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     defer train_loaded.deinit();
     var eval_loaded = try gliner2_data.loadExamples(allocator, opts.eval_data, null);
     defer eval_loaded.deinit();
+    try validateDatasetSeparation(allocator, train_loaded.examples, eval_loaded.examples);
 
     const seq_len = try std.fmt.parseUnsigned(usize, opts.seq_len, 10);
     const max_span_width = try std.fmt.parseUnsigned(usize, opts.max_span_width, 10);
@@ -217,6 +266,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     const train_args = [_][]const u8{
         "--model-dir",                 opts.model_dir,
         "--train-data",                opts.train_data,
+        "--eval-data",                 opts.eval_data,
         "--out-dir",                   opts.out_dir,
         "--epochs",                    opts.epochs,
         "--batch-size",                opts.batch_size,
@@ -227,11 +277,14 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         "--learning-rate",             opts.learning_rate,
         "--lora-rank",                 opts.lora_rank,
         "--lora-alpha",                opts.lora_alpha,
+        "--lora-dropout",              opts.lora_dropout,
         "--objective",                 opts.objective,
         "--max-span-width",            opts.max_span_width,
         "--span-loss",                 opts.span_loss,
+        "--span-loss-reduction",       opts.span_loss_reduction,
         "--span-positive-weight",      opts.span_positive_weight,
         "--span-hard-negative-weight", opts.span_hard_negative_weight,
+        "--span-negative-mask-rate",   opts.span_negative_mask_rate,
         "--max-grad-norm",             opts.max_grad_norm,
         "--grad-accum",                opts.grad_accum,
         "--seed",                      opts.seed,
@@ -242,7 +295,20 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     try train_args_list.appendSlice(allocator, &train_args);
     if (opts.span_label_positive_weights) |value| try train_args_list.appendSlice(allocator, &.{ "--span-label-positive-weights", value });
     try train_args_list.appendSlice(allocator, &.{ "--span-negative-weight", opts.span_negative_weight });
+    if (opts.lora_only_trainables) try train_args_list.append(allocator, "--lora-only-trainables");
     if (opts.compiled_required) try train_args_list.append(allocator, "--compiled-required");
+    if (opts.activation_checkpointing) {
+        try train_args_list.appendSlice(allocator, &.{
+            "--activation-checkpointing",
+            "--activation-checkpoint-interval",
+            opts.activation_checkpoint_interval,
+            "--activation-checkpoint-strategy",
+            opts.activation_checkpoint_strategy,
+        });
+    }
+    if (!std.mem.eql(u8, opts.structure_span_chunk_samples, "0")) {
+        try train_args_list.appendSlice(allocator, &.{ "--structure-span-chunk-samples", opts.structure_span_chunk_samples });
+    }
     try runCommand(init, allocator, "train-gliner2-autodiff", train_gliner2_autodiff.main, train_args_list.items);
 
     const metal_required = std.mem.eql(u8, opts.backend, "metal");
@@ -263,6 +329,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
             "Metal"
         else
             null,
+        .require_objective = opts.objective,
         .require_optimizer_backend = if (metal_required)
             "metal"
         else
@@ -270,6 +337,36 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .max_device_trainable_transfer_count = opts.max_device_trainable_transfer_count orelse opts.max_device_resident_transfer_count,
         .max_device_resident_transfer_count = opts.max_device_resident_transfer_count,
         .min_device_trainable_bytes = min_device_trainable_bytes,
+        .max_metal_tensor_device_owned_peak_live_bytes = opts.max_metal_tensor_device_owned_peak_live_bytes,
+        .max_metal_runtime_total_bytes = opts.max_metal_runtime_total_bytes,
+        .max_metal_eager_arena_peak_bytes = opts.max_metal_eager_arena_peak_bytes,
+        .max_metal_eager_arena_spill_bytes = opts.max_metal_eager_arena_spill_bytes,
+        .max_metal_chunk_local_output_peak_bytes = opts.max_metal_chunk_local_output_peak_bytes,
+        .max_metal_chunk_local_output_spill_bytes = opts.max_metal_chunk_local_output_spill_bytes,
+        .max_metal_chunk_local_output_unconsumed_hints = opts.max_metal_chunk_local_output_unconsumed_hints,
+        .min_metal_chunk_local_output_consumed_hints = opts.min_metal_chunk_local_output_consumed_hints,
+        .min_metal_runtime_reuse_hit_count = opts.min_metal_runtime_reuse_hit_count,
+        .max_graph_command_dispatch_count = opts.max_graph_command_dispatch_count,
+        .max_graph_host_output_count = opts.max_graph_host_output_count,
+        .max_metal_frame_gpu_ms = opts.max_metal_frame_gpu_ms,
+        .max_metal_last_frame_compute_encoder_count = opts.max_metal_last_frame_compute_encoder_count,
+        .min_metal_frame_chunk_boundary_count = opts.min_metal_frame_chunk_boundary_count,
+        .min_metal_frame_chunk_promoted_value_count = opts.min_metal_frame_chunk_promoted_value_count,
+        .min_metal_frame_chunk_swept_value_count = opts.min_metal_frame_chunk_swept_value_count,
+        .min_graph_runtime_region_dispatch_count = opts.min_graph_runtime_region_dispatch_count,
+        .max_graph_runtime_region_fallback_count = opts.max_graph_runtime_region_fallback_count,
+        .min_graph_runtime_region_elided_node_count = opts.min_graph_runtime_region_elided_node_count,
+        .min_metal_deberta_ffn_forward_region_count = opts.min_metal_deberta_ffn_forward_region_count,
+        .min_metal_deberta_encoder_lora_layer_region_count = opts.min_metal_deberta_encoder_lora_layer_region_count,
+        .min_metal_deberta_encoder_lora_residual_layernorm_region_count = opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        .max_metal_deberta_encoder_lora_layer_scaffold_count = opts.max_metal_deberta_encoder_lora_layer_scaffold_count,
+        .max_metal_deberta_encoder_lora_layer_fallback_count = opts.max_metal_deberta_encoder_lora_layer_fallback_count,
+        .min_metal_deberta_attention_flash_call_count = opts.min_metal_deberta_attention_flash_call_count,
+        .max_metal_deberta_attention_gemm_fallback_count = opts.max_metal_deberta_attention_gemm_fallback_count,
+        .min_metal_deberta_encoder_layer_success_count = opts.min_metal_deberta_encoder_layer_success_count,
+        .min_metal_deberta_ffn_fused_call_count = opts.min_metal_deberta_ffn_fused_call_count,
+        .max_metal_deberta_ffn_fused_fallback_count = opts.max_metal_deberta_ffn_fused_fallback_count,
+        .max_runtime_frame_ineligible_missing_model_metadata = opts.max_runtime_frame_ineligible_missing_model_metadata,
     });
     errdefer validation.freeRunValidationSummary(allocator, &run_summary);
 
@@ -495,27 +592,114 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
     var buf: [4096]u8 = undefined;
     var writer = stdout.writer(init.io, &buf);
     try writer.interface.print(
-        \\gliner2_production_readiness_dry_run: true
+        \\gliner2_entity_training_readiness_dry_run: true
         \\model_dir: {s}
         \\train_data: {s}
         \\eval_data: {s}
         \\out_dir: {s}
         \\entity_types: {s}
         \\objective: {s}
-        \\production_metal_gate: {}        \\backend: {s}
+        \\entity_metal_readiness: {}
+        \\backend: {s}
         \\compiled_required: {}
+        \\activation_checkpointing: {}
+        \\activation_checkpoint_interval: {s}
+        \\activation_checkpoint_strategy: {s}
+        \\structure_span_chunk_samples: {s}
         \\max_examples: {s}
         \\seq_len: {s}
         \\batch_size: {s}
+        \\lora_rank: {s}
+        \\lora_alpha: {s}
+        \\lora_dropout: {s}
+        \\lora_only_trainables: {}
         \\span_loss: {s}
+        \\span_loss_reduction: {s}
         \\span_positive_weight: {s}
         \\span_label_positive_weights: {?s}
         \\span_negative_weight: {s}
         \\span_hard_negative_weight: {s}
+        \\span_negative_mask_rate: {s}
         \\max_avg_step_wall_ms: {?d}
         \\max_device_trainable_transfer_count: {?}
         \\max_device_resident_transfer_count: {?}
         \\min_device_trainable_bytes: {?}
+        \\
+    , .{
+        opts.model_dir,
+        opts.train_data,
+        opts.eval_data,
+        opts.out_dir,
+        opts.entity_types_csv,
+        opts.objective,
+        opts.entity_metal_readiness,
+        opts.backend,
+        opts.compiled_required,
+        opts.activation_checkpointing,
+        opts.activation_checkpoint_interval,
+        opts.activation_checkpoint_strategy,
+        opts.structure_span_chunk_samples,
+        opts.max_examples,
+        opts.seq_len,
+        opts.batch_size,
+        opts.lora_rank,
+        opts.lora_alpha,
+        opts.lora_dropout,
+        opts.lora_only_trainables,
+        opts.span_loss,
+        opts.span_loss_reduction,
+        opts.span_positive_weight,
+        opts.span_label_positive_weights,
+        opts.span_negative_weight,
+        opts.span_hard_negative_weight,
+        opts.span_negative_mask_rate,
+        opts.max_avg_step_wall_ms,
+        opts.max_device_trainable_transfer_count,
+        opts.max_device_resident_transfer_count,
+        opts.min_device_trainable_bytes,
+    });
+    try writer.interface.print(
+        \\max_metal_tensor_device_owned_peak_live_bytes: {?}
+        \\max_metal_runtime_total_bytes: {?}
+        \\max_metal_eager_arena_peak_bytes: {?}
+        \\max_metal_eager_arena_spill_bytes: {?}
+        \\max_metal_chunk_local_output_peak_bytes: {?}
+        \\max_metal_chunk_local_output_spill_bytes: {?}
+        \\max_metal_chunk_local_output_unconsumed_hints: {?}
+        \\min_metal_chunk_local_output_consumed_hints: {?}
+        \\min_metal_runtime_reuse_hit_count: {?}
+        \\max_graph_command_dispatch_count: {?}
+        \\max_metal_frame_gpu_ms: {?}
+    , .{
+        opts.max_metal_tensor_device_owned_peak_live_bytes,
+        opts.max_metal_runtime_total_bytes,
+        opts.max_metal_eager_arena_peak_bytes,
+        opts.max_metal_eager_arena_spill_bytes,
+        opts.max_metal_chunk_local_output_peak_bytes,
+        opts.max_metal_chunk_local_output_spill_bytes,
+        opts.max_metal_chunk_local_output_unconsumed_hints,
+        opts.min_metal_chunk_local_output_consumed_hints,
+        opts.min_metal_runtime_reuse_hit_count,
+        opts.max_graph_command_dispatch_count,
+        opts.max_metal_frame_gpu_ms,
+    });
+    try writer.interface.print(
+        \\max_metal_last_frame_compute_encoder_count: {?}
+        \\min_metal_frame_chunk_boundary_count: {?}
+        \\min_metal_frame_chunk_promoted_value_count: {?}
+        \\min_metal_frame_chunk_swept_value_count: {?}
+        \\min_graph_runtime_region_dispatch_count: {?}
+        \\max_graph_runtime_region_fallback_count: {?}
+        \\min_graph_runtime_region_elided_node_count: {?}
+        \\min_metal_deberta_ffn_forward_region_count: {?}
+        \\min_metal_deberta_encoder_lora_layer_region_count: {?}
+        \\min_metal_deberta_encoder_lora_residual_layernorm_region_count: {?}
+        \\max_metal_deberta_encoder_lora_layer_scaffold_count: {?}
+        \\max_metal_deberta_encoder_lora_layer_fallback_count: {?}
+        \\min_metal_deberta_attention_flash_call_count: {?}
+        \\max_metal_deberta_attention_gemm_fallback_count: {?}
+        \\min_metal_deberta_ffn_fused_call_count: {?}
+        \\max_metal_deberta_ffn_fused_fallback_count: {?}
         \\semantic_golden_count: {}
         \\quality_eval: {}
         \\quality_max_examples: {?s}
@@ -525,27 +709,22 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\semantic_eval_required: {}
         \\
     , .{
-        opts.model_dir,
-        opts.train_data,
-        opts.eval_data,
-        opts.out_dir,
-        opts.entity_types_csv,
-        opts.objective,
-        opts.production_metal_gate,
-        opts.backend,
-        opts.compiled_required,
-        opts.max_examples,
-        opts.seq_len,
-        opts.batch_size,
-        opts.span_loss,
-        opts.span_positive_weight,
-        opts.span_label_positive_weights,
-        opts.span_negative_weight,
-        opts.span_hard_negative_weight,
-        opts.max_avg_step_wall_ms,
-        opts.max_device_trainable_transfer_count,
-        opts.max_device_resident_transfer_count,
-        opts.min_device_trainable_bytes,
+        opts.max_metal_last_frame_compute_encoder_count,
+        opts.min_metal_frame_chunk_boundary_count,
+        opts.min_metal_frame_chunk_promoted_value_count,
+        opts.min_metal_frame_chunk_swept_value_count,
+        opts.min_graph_runtime_region_dispatch_count,
+        opts.max_graph_runtime_region_fallback_count,
+        opts.min_graph_runtime_region_elided_node_count,
+        opts.min_metal_deberta_ffn_forward_region_count,
+        opts.min_metal_deberta_encoder_lora_layer_region_count,
+        opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        opts.max_metal_deberta_encoder_lora_layer_scaffold_count,
+        opts.max_metal_deberta_encoder_lora_layer_fallback_count,
+        opts.min_metal_deberta_attention_flash_call_count,
+        opts.max_metal_deberta_attention_gemm_fallback_count,
+        opts.min_metal_deberta_ffn_fused_call_count,
+        opts.max_metal_deberta_ffn_fused_fallback_count,
         opts.semantic_golden_count,
         opts.quality_eval,
         opts.quality_max_examples,
@@ -596,12 +775,20 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.lora_rank = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--lora-alpha")) {
             opts.lora_alpha = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--lora-dropout")) {
+            opts.lora_dropout = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--lora-only-trainables")) {
+            opts.lora_only_trainables = true;
+        } else if (std.mem.eql(u8, arg, "--train-regular-head")) {
+            opts.lora_only_trainables = false;
         } else if (std.mem.eql(u8, arg, "--objective")) {
             opts.objective = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-span-width")) {
             opts.max_span_width = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-loss")) {
             opts.span_loss = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--span-loss-reduction")) {
+            opts.span_loss_reduction = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-positive-weight")) {
             opts.span_positive_weight = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-label-positive-weights")) {
@@ -610,6 +797,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.span_negative_weight = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-hard-negative-weight")) {
             opts.span_hard_negative_weight = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--span-negative-mask-rate")) {
+            opts.span_negative_mask_rate = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-grad-norm")) {
             opts.max_grad_norm = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--grad-accum")) {
@@ -620,8 +809,19 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.backend = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--compiled-required")) {
             opts.compiled_required = true;
+        } else if (std.mem.eql(u8, arg, "--activation-checkpointing")) {
+            opts.activation_checkpointing = true;
+        } else if (std.mem.eql(u8, arg, "--activation-checkpoint-interval")) {
+            opts.activation_checkpoint_interval = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--activation-checkpoint-strategy")) {
+            opts.activation_checkpoint_strategy = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--structure-span-chunk-samples")) {
+            opts.structure_span_chunk_samples = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--entity-metal-readiness")) {
+            applyEntityMetalReadinessDefaults(&opts);
         } else if (std.mem.eql(u8, arg, "--production-metal-gate")) {
-            applyProductionMetalGateDefaults(&opts);
+            std.debug.print("warning: --production-metal-gate is deprecated; this scoped entity gate never reports production_ready=true; use --entity-metal-readiness\n", .{});
+            applyEntityMetalReadinessDefaults(&opts);
         } else if (std.mem.eql(u8, arg, "--num-classes")) {
             opts.num_classes_override = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--min-train-examples")) {
@@ -659,6 +859,66 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             if (opts.max_device_trainable_transfer_count == null) opts.max_device_trainable_transfer_count = opts.max_device_resident_transfer_count;
         } else if (std.mem.eql(u8, arg, "--min-device-trainable-bytes")) {
             opts.min_device_trainable_bytes = try parseUsizeArg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-tensor-device-owned-peak-live-bytes")) {
+            opts.max_metal_tensor_device_owned_peak_live_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-runtime-total-bytes")) {
+            opts.max_metal_runtime_total_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-eager-arena-peak-bytes")) {
+            opts.max_metal_eager_arena_peak_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-eager-arena-spill-bytes")) {
+            opts.max_metal_eager_arena_spill_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-chunk-local-output-peak-bytes")) {
+            opts.max_metal_chunk_local_output_peak_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-chunk-local-output-spill-bytes")) {
+            opts.max_metal_chunk_local_output_spill_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-chunk-local-output-unconsumed-hints")) {
+            opts.max_metal_chunk_local_output_unconsumed_hints = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-chunk-local-output-consumed-hints")) {
+            opts.min_metal_chunk_local_output_consumed_hints = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-runtime-reuse-hit-count")) {
+            opts.min_metal_runtime_reuse_hit_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-graph-command-dispatch-count")) {
+            opts.max_graph_command_dispatch_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-graph-host-output-count")) {
+            opts.max_graph_host_output_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-frame-gpu-ms")) {
+            opts.max_metal_frame_gpu_ms = try parseF64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-last-frame-compute-encoder-count")) {
+            opts.max_metal_last_frame_compute_encoder_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-frame-chunk-boundary-count")) {
+            opts.min_metal_frame_chunk_boundary_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-frame-chunk-promoted-value-count")) {
+            opts.min_metal_frame_chunk_promoted_value_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-frame-chunk-swept-value-count")) {
+            opts.min_metal_frame_chunk_swept_value_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-graph-runtime-region-dispatch-count")) {
+            opts.min_graph_runtime_region_dispatch_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-graph-runtime-region-fallback-count")) {
+            opts.max_graph_runtime_region_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-graph-runtime-region-elided-node-count")) {
+            opts.min_graph_runtime_region_elided_node_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-ffn-forward-region-count")) {
+            opts.min_metal_deberta_ffn_forward_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-lora-layer-region-count")) {
+            opts.min_metal_deberta_encoder_lora_layer_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-lora-residual-layernorm-region-count")) {
+            opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-scaffold-count")) {
+            opts.max_metal_deberta_encoder_lora_layer_scaffold_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-fallback-count")) {
+            opts.max_metal_deberta_encoder_lora_layer_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-attention-flash-call-count")) {
+            opts.min_metal_deberta_attention_flash_call_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-attention-gemm-fallback-count")) {
+            opts.max_metal_deberta_attention_gemm_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-layer-success-count")) {
+            opts.min_metal_deberta_encoder_layer_success_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-ffn-fused-call-count")) {
+            opts.min_metal_deberta_ffn_fused_call_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-ffn-fused-fallback-count")) {
+            opts.max_metal_deberta_ffn_fused_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-runtime-frame-ineligible-missing-model-metadata")) {
+            opts.max_runtime_frame_ineligible_missing_model_metadata = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--allow-flat-loss")) {
             opts.require_loss_decrease = false;
         } else if (std.mem.eql(u8, arg, "--eval-text")) {
@@ -700,6 +960,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.semantic_require_entitylike_span = true;
         } else if (std.mem.eql(u8, arg, "--quality-eval")) {
             opts.quality_eval = true;
+        } else if (std.mem.eql(u8, arg, "--skip-quality-eval")) {
+            opts.quality_eval = false;
         } else if (std.mem.eql(u8, arg, "--quality-max-examples")) {
             opts.quality_max_examples = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--quality-min-prediction-score")) {
@@ -749,15 +1011,21 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
     return opts;
 }
 
-fn applyProductionMetalGateDefaults(opts: *Options) void {
-    opts.production_metal_gate = true;
+fn applyEntityMetalReadinessDefaults(opts: *Options) void {
+    opts.entity_metal_readiness = true;
+    opts.objective = "gliner2-total-loss";
     opts.epochs = "1";
     opts.batch_size = "1";
     opts.max_examples = "200";
     opts.seq_len = "32";
     opts.span_loss = "bce";
+    opts.span_loss_reduction = "sum";
     opts.backend = "metal";
     opts.compiled_required = true;
+    opts.activation_checkpointing = true;
+    opts.activation_checkpoint_interval = "1";
+    opts.activation_checkpoint_strategy = "parameters-only";
+    opts.structure_span_chunk_samples = "8";
     opts.min_train_examples = 200;
     opts.min_eval_examples = 200;
     opts.min_total_entities = 100;
@@ -813,10 +1081,11 @@ fn usageError() error{InvalidArguments} {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: gliner2-production-readiness <model_dir> <train_jsonl_or_dir> <eval_jsonl_or_dir> <out_dir> <entity_types_csv> [options]
+        \\usage: gliner2-entity-training-readiness <model_dir> <train_jsonl_or_dir> <eval_jsonl_or_dir> <out_dir> <entity_types_csv> [options]
         \\
-        \\Runs the production-readiness gate:
-        \\  dataset readiness -> train-gliner2-autodiff -> validate run artifacts -> inspect bundle -> semantic eval -> optional materialization.
+        \\Runs scoped native entity-training checks:
+        \\  dataset readiness -> train-gliner2-autodiff -> validate run artifacts -> inspect bundle -> entity eval -> optional materialization.
+        \\This command never reports production_ready=true; use run_gliner2_lora_production_readiness.sh for the full release gate.
         \\
         \\Required semantic options unless --skip-semantic-eval is set:
         \\  --eval-text TEXT
@@ -834,6 +1103,7 @@ fn printUsage() void {
         \\  --semantic-best-label-per-span-start
         \\  --semantic-require-entitylike-span
         \\  --quality-eval
+        \\  --skip-quality-eval
         \\  --quality-max-examples N
         \\  --quality-min-prediction-score FLOAT
         \\  --quality-label-thresholds label=FLOAT[,label=FLOAT...]
@@ -852,24 +1122,42 @@ fn printUsage() void {
         \\  --min-entity-f1 FLOAT
         \\
         \\Common options:
-        \\  --objective token|span-start      Training/eval objective (default: span-start)
+        \\  --objective token|span-start|gliner2-total-loss
+        \\                                    Training/eval objective (default: gliner2-total-loss)
         \\  --epochs N                       Training epochs (default: 5)
         \\  --max-examples N                 Training cap (default: 100)
         \\  --seq-len N                      Sequence length (default: 256)
-        \\  --batch-size N                   Batch size (default: 1)
-        \\  --learning-rate FLOAT            Learning rate (default: 1e-3)
+        \\  --batch-size N                   Batch size (default: 2)
+        \\  --learning-rate FLOAT            Learning rate (default: 5e-4)
+        \\  --lora-rank N                    LoRA rank (default: 16)
+        \\  --lora-alpha FLOAT               LoRA alpha (default: 32)
+        \\  --lora-dropout FLOAT             LoRA dropout (default: 0)
+        \\  --lora-only-trainables           Freeze regular task-head params (default)
+        \\  --train-regular-head             Train regular task-head params too
         \\  --span-loss bce|mse              Span-start label loss (default: bce)
-        \\  --span-positive-weight FLOAT     Positive span-label loss weight (default: 32)
+        \\  --span-loss-reduction mean|sum   Span-start reduction (default: sum)
+        \\  --span-positive-weight FLOAT     Positive span-label loss weight (default: 1)
         \\  --span-label-positive-weights CSV Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight FLOAT     Negative span-label loss weight (default: 1)
         \\  --span-hard-negative-weight FLOAT Extra negative weight for spans overlapping gold entities (default: 1)
+        \\  --span-negative-mask-rate FLOAT  Random negative-label masking rate (default: 0.5)
         \\  --backend auto|metal|native  Training backend (default: auto)
         \\  --compiled-required              Fail if requested compiled backend falls back
-        \\  --production-metal-gate          Canonical 200-step resident Metal gate
+        \\  --activation-checkpointing       Recompute non-checkpoint activations during backward
+        \\  --activation-checkpoint-interval N
+        \\                                    Save every Nth checkpoint boundary (default: 1)
+        \\  --activation-checkpoint-strategy NAME
+        \\                                    every-n-layers, attention-outputs, or parameters-only
+        \\                                    (default: every-n-layers)
+        \\  --structure-span-chunk-samples N
+        \\                                    Chunk GLiNER2 structure loss by whole-sample groups
+        \\                                    (Metal gate default: 8)
+        \\  --entity-metal-readiness         Scoped 200-step resident Metal entity preset
+        \\  --production-metal-gate          Deprecated alias for --entity-metal-readiness
         \\  --materialized-dir DIR           Also materialize merged model artifacts
         \\  --dry-run                        Print the gate shape without touching model/data files
         \\
-        \\Production threshold options:
+        \\Scoped entity-readiness threshold options:
         \\  --min-train-examples N
         \\  --min-eval-examples N
         \\  --min-total-entities N
@@ -886,20 +1174,138 @@ fn printUsage() void {
         \\  --max-device-trainable-transfer-count N
         \\  --max-device-resident-transfer-count N
         \\  --min-device-trainable-bytes N
+        \\  --max-metal-tensor-device-owned-peak-live-bytes N
+        \\  --max-metal-runtime-total-bytes N
+        \\  --max-metal-eager-arena-peak-bytes N
+        \\  --max-metal-eager-arena-spill-bytes N
+        \\  --max-metal-chunk-local-output-peak-bytes N
+        \\  --max-metal-chunk-local-output-spill-bytes N
+        \\  --max-metal-chunk-local-output-unconsumed-hints N
+        \\  --min-metal-chunk-local-output-consumed-hints N
+        \\  --min-metal-runtime-reuse-hit-count N
+        \\  --max-graph-command-dispatch-count N
+        \\  --max-graph-host-output-count N
+        \\  --max-metal-frame-gpu-ms FLOAT
+        \\  --max-metal-last-frame-compute-encoder-count N
+        \\  --min-metal-frame-chunk-boundary-count N
+        \\  --min-metal-frame-chunk-promoted-value-count N
+        \\  --min-metal-frame-chunk-swept-value-count N
+        \\  --min-graph-runtime-region-dispatch-count N
+        \\  --max-graph-runtime-region-fallback-count N
+        \\  --min-graph-runtime-region-elided-node-count N
+        \\  --min-metal-deberta-ffn-forward-region-count N
+        \\  --min-metal-deberta-encoder-lora-layer-region-count N
+        \\  --min-metal-deberta-encoder-lora-residual-layernorm-region-count N
+        \\  --max-metal-deberta-encoder-lora-layer-scaffold-count N
+        \\  --max-metal-deberta-encoder-lora-layer-fallback-count N
+        \\  --min-metal-deberta-attention-flash-call-count N
+        \\  --max-metal-deberta-attention-gemm-fallback-count N
+        \\  --min-metal-deberta-encoder-layer-success-count N
+        \\  --min-metal-deberta-ffn-fused-call-count N
+        \\  --max-metal-deberta-ffn-fused-fallback-count N
+        \\  --max-runtime-frame-ineligible-missing-model-metadata N
         \\
     , .{});
 }
 
-test "production Metal gate defaults include shaped quality eval" {
-    var opts = Options{};
-    applyProductionMetalGateDefaults(&opts);
+test "entity Metal readiness defaults include shaped quality eval" {
+    var opts = Options{
+        .model_dir = "model",
+        .train_data = "train.jsonl",
+        .eval_data = "eval.jsonl",
+        .out_dir = "out",
+        .entity_types_csv = "person,organization,location",
+    };
+    applyEntityMetalReadinessDefaults(&opts);
 
-    try std.testing.expect(opts.production_metal_gate);
+    try std.testing.expect(opts.entity_metal_readiness);
+    try std.testing.expectEqualStrings("gliner2-total-loss", opts.objective);
     try std.testing.expectEqualStrings("metal", opts.backend);
     try std.testing.expect(opts.compiled_required);
+    try std.testing.expect(opts.activation_checkpointing);
+    try std.testing.expectEqualStrings("parameters-only", opts.activation_checkpoint_strategy);
+    try std.testing.expectEqualStrings("8", opts.structure_span_chunk_samples);
+    try std.testing.expectEqualStrings("sum", opts.span_loss_reduction);
     try std.testing.expect(opts.quality_eval);
     try std.testing.expectEqualStrings("25", opts.quality_max_examples.?);
     try std.testing.expectEqualStrings("0.15", opts.min_entity_f1.?);
     try std.testing.expect(opts.semantic_require_entitylike_span);
     try std.testing.expect(opts.quality_require_entitylike_span);
+}
+
+fn validateDatasetSeparation(
+    allocator: std.mem.Allocator,
+    train_examples: []const gliner2_data.Example,
+    eval_examples: []const gliner2_data.Example,
+) !void {
+    var train_texts = std.StringHashMap(void).init(allocator);
+    defer train_texts.deinit();
+    var owned_texts = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_texts.items) |text| allocator.free(text);
+        owned_texts.deinit(allocator);
+    }
+    for (train_examples) |example| {
+        const normalized = try normalizeDatasetText(allocator, example.text);
+        owned_texts.append(allocator, normalized) catch |err| {
+            allocator.free(normalized);
+            return err;
+        };
+        const entry = try train_texts.getOrPut(normalized);
+        if (entry.found_existing) {
+            _ = owned_texts.pop();
+            allocator.free(normalized);
+            return error.DuplicateTrainingExample;
+        }
+    }
+
+    var eval_texts = std.StringHashMap(void).init(allocator);
+    defer eval_texts.deinit();
+    for (eval_examples) |example| {
+        const normalized = try normalizeDatasetText(allocator, example.text);
+        if (train_texts.contains(normalized)) {
+            allocator.free(normalized);
+            return error.TrainEvalDatasetOverlap;
+        }
+        owned_texts.append(allocator, normalized) catch |err| {
+            allocator.free(normalized);
+            return err;
+        };
+        const entry = try eval_texts.getOrPut(normalized);
+        if (entry.found_existing) {
+            _ = owned_texts.pop();
+            allocator.free(normalized);
+            return error.DuplicateEvalExample;
+        }
+    }
+}
+
+fn normalizeDatasetText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var pending_space = false;
+    for (text) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            pending_space = out.items.len > 0;
+        } else {
+            if (pending_space) try out.append(allocator, ' ');
+            try out.append(allocator, byte);
+            pending_space = false;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "release data rejects repeated and overlapping text" {
+    const allocator = std.testing.allocator;
+    const a = gliner2_data.Example{ .text = "alpha", .entities = &.{} };
+    const b = gliner2_data.Example{ .text = "beta", .entities = &.{} };
+
+    try validateDatasetSeparation(allocator, &.{ a, b }, &.{.{ .text = "gamma", .entities = &.{} }});
+    try std.testing.expectError(error.DuplicateTrainingExample, validateDatasetSeparation(allocator, &.{ a, a }, &.{b}));
+    try std.testing.expectError(error.TrainEvalDatasetOverlap, validateDatasetSeparation(allocator, &.{a}, &.{a}));
+    try std.testing.expectError(
+        error.TrainEvalDatasetOverlap,
+        validateDatasetSeparation(allocator, &.{.{ .text = "alpha  beta", .entities = &.{} }}, &.{.{ .text = " alpha\nbeta ", .entities = &.{} }}),
+    );
 }

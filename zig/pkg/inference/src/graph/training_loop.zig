@@ -427,15 +427,17 @@ pub const TrainingLoop = struct {
         self.optimizer_state.step_count += 1;
         const current_lr = self.config.lr_schedule.lr(self.optimizer_state.step_count);
         const needs_v = optimizerNeedsVariance(self.config.optimizer);
-        for (flat_state.layouts) |layout| {
-            const param = flat_state.params[layout.param_offset .. layout.param_offset + layout.len];
-            const grad = flat_state.grads[layout.grad_offset .. layout.grad_offset + layout.len];
-            const m = flat_state.m[layout.m_offset .. layout.m_offset + layout.len];
-            const v = if (needs_v)
-                flat_state.v[layout.v_offset .. layout.v_offset + layout.len]
-            else
-                flat_state.v[0..0];
-            optimizers.stepSlices(self.config.optimizer, self.optimizer_state.step_count, current_lr, param, grad, m, v);
+        if (flat_state.total_param_elements > 0) {
+            const v = if (needs_v) flat_state.v else flat_state.v[0..0];
+            optimizers.stepSlices(
+                self.config.optimizer,
+                self.optimizer_state.step_count,
+                current_lr,
+                flat_state.params,
+                flat_state.grads,
+                flat_state.m,
+                v,
+            );
         }
         self.last_step_metrics.optimizer_ns = elapsedNs(optimizer_start);
 
@@ -578,6 +580,12 @@ pub const TrainingLoop = struct {
                 ps_gop.value_ptr.* = .{
                     .m = m,
                     .v = v,
+                    // Seed the per-param step count from the restored global step
+                    // (read at the top of this function). optimizers.step() bumps
+                    // ps.step_count and uses it for Adam bias correction; without
+                    // this seed, resume would restart bias correction at t=1 and
+                    // mis-scale the first ~tens of updates.
+                    .step_count = self.optimizer_state.step_count,
                     .allocator = self.allocator,
                 };
             }

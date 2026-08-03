@@ -2446,6 +2446,24 @@ pub const WasmCompute = struct {
     /// DeBERTa disentangled attention with relative position encoding.
     /// Three score components: content-content (Q·K), content-position (Q·K_r),
     /// and position-content (Q_r·K), scaled by 1/sqrt(head_dim * 3).
+    fn disentangledRelativeAttentionBackwardOp(
+        ctx: *anyopaque,
+        Q_ct: CT,
+        K_ct: CT,
+        V_ct: CT,
+        Q_r_ct: CT,
+        K_r_ct: CT,
+        mask: []const i64,
+        dO_ct: CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        _ = .{ ctx, Q_ct, K_ct, V_ct, Q_r_ct, K_r_ct, mask, dO_ct, batch, seq_len, num_heads, head_dim };
+        return error.UnsupportedOperation;
+    }
+
     fn disentangledRelativeAttentionOp(
         ctx: *anyopaque,
         Q_ct: CT,
@@ -4995,6 +5013,7 @@ pub const WasmCompute = struct {
         .crossAttention = crossAttentionOp,
         .relativePositionBias = relativePositionBiasOp,
         .disentangledRelativeAttention = disentangledRelativeAttentionOp,
+        .disentangledRelativeAttentionBackward = disentangledRelativeAttentionBackwardOp,
         .windowedSelfAttention = windowedSelfAttentionOp,
         .channelSelfAttention = channelSelfAttentionOp,
         .tokenGridConv2d = tokenGridConv2dOp,

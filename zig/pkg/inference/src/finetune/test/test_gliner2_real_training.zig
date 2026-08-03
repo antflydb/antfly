@@ -429,8 +429,14 @@ fn collectRegularTrainableParams(
 ) ![]gliner2_bundle.AutodiffAdapterParam {
     const params = try allocator.alloc(gliner2_bundle.AutodiffAdapterParam, trainer.regular_params.items.len);
     for (trainer.regular_params.items, 0..) |slot, idx| {
+        const export_name: []const u8 = if (std.mem.eql(u8, slot.name, "task_classifier.weight"))
+            "classifier.weight"
+        else if (std.mem.eql(u8, slot.name, "task_classifier.bias"))
+            "classifier.bias"
+        else
+            slot.name;
         params[idx] = .{
-            .name = slot.name,
+            .name = export_name,
             .dims = slot.dims,
             .weights = slot.weights,
         };
@@ -470,11 +476,11 @@ fn loadTaskHeadIntoTrainer(
     trainer: *real_autodiff.RealAutodiffTrainer,
 ) !void {
     for (trainer.regular_params.items) |*slot| {
-        if (std.mem.eql(u8, slot.name, "classifier.weight")) {
+        if (std.mem.eql(u8, slot.name, "task_classifier.weight")) {
             if (slot.weights.len != head.weight.len) return error.TaskHeadShapeMismatch;
             @memcpy(slot.weights, head.weight);
             @memset(slot.grad_accum, 0.0);
-        } else if (std.mem.eql(u8, slot.name, "classifier.bias")) {
+        } else if (std.mem.eql(u8, slot.name, "task_classifier.bias")) {
             if (slot.weights.len != head.bias.len) return error.TaskHeadShapeMismatch;
             @memcpy(slot.weights, head.bias);
             @memset(slot.grad_accum, 0.0);
@@ -483,27 +489,7 @@ fn loadTaskHeadIntoTrainer(
 }
 
 fn autodiffSlotNameToPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    if (std.mem.endsWith(u8, name, ".lora_A")) {
-        const base = name[0 .. name.len - ".lora_A".len];
-        return autodiffBaseToPeftName(allocator, tensorBaseName(base), "lora_A");
-    }
-    if (std.mem.endsWith(u8, name, ".lora_B")) {
-        const base = name[0 .. name.len - ".lora_B".len];
-        return autodiffBaseToPeftName(allocator, tensorBaseName(base), "lora_B");
-    }
-    return error.InvalidAutodiffAdapterName;
-}
-
-fn autodiffBaseToPeftName(allocator: std.mem.Allocator, base_no_weight: []const u8, adapter_name: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, base_no_weight, "encoder.layer.")) {
-        return std.fmt.allocPrint(allocator, "encoder.{s}.{s}.weight", .{ base_no_weight, adapter_name });
-    }
-    return std.fmt.allocPrint(allocator, "{s}.{s}.weight", .{ base_no_weight, adapter_name });
-}
-
-fn tensorBaseName(tensor_name: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, tensor_name, ".weight")) return tensor_name[0 .. tensor_name.len - ".weight".len];
-    return tensor_name;
+    return gliner2_bundle.autodiffParamNameToPeftName(allocator, name);
 }
 
 // ── The test ────────────────────────────────────────────────────────────
@@ -591,25 +577,25 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
         var prng = std.Random.DefaultPrng.init(12345);
         const rng = prng.random();
 
-        // classifier.weight [C, H]
+        // task_classifier.weight [C, H]
         {
             const n_elems: usize = @intCast(C * H);
             const data = try allocator.alloc(f32, n_elems);
             defer allocator.free(data);
             const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(n_elems)));
             for (data) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * scale;
-            const name = try allocator.dupe(u8, "classifier.weight");
+            const name = try allocator.dupe(u8, "task_classifier.weight");
             try owned_names.append(allocator, name);
             const tensor = try Tensor.initFloat32(allocator, name, &.{ C, H }, data);
             try weight_store.resident_weights.put(allocator, name, LoadedWeight{ .tensor = tensor });
         }
-        // classifier.bias [C]
+        // task_classifier.bias [C]
         {
             const n_elems: usize = @intCast(C);
             const data = try allocator.alloc(f32, n_elems);
             defer allocator.free(data);
             @memset(data, 0.0);
-            const name = try allocator.dupe(u8, "classifier.bias");
+            const name = try allocator.dupe(u8, "task_classifier.bias");
             try owned_names.append(allocator, name);
             const tensor = try Tensor.initFloat32(allocator, name, &.{C}, data);
             try weight_store.resident_weights.put(allocator, name, LoadedWeight{ .tensor = tensor });
@@ -699,7 +685,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     });
 
     const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
-    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    const regular_trainable_params = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -812,7 +798,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     try std.testing.expectEqual(@as(usize, 2), trainer.regular_params.items.len);
     var classifier_bias_updated = false;
     for (trainer.regular_params.items) |slot| {
-        if (!std.mem.eql(u8, slot.name, "classifier.bias")) continue;
+        if (!std.mem.eql(u8, slot.name, "task_classifier.bias")) continue;
         for (slot.weights) |w| {
             if (w != 0.0) {
                 classifier_bias_updated = true;
@@ -851,6 +837,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
             model_dir,
             8,
             16.0,
+            0.0,
             &lora_targets,
             adapter_params,
         );
@@ -906,5 +893,182 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     std.debug.print(
         "PASS: GLiNER2 real training -- {d} steps, loss {d:.6} -> {d:.6}, LoRA B weights and classifier bias updated\n",
         .{ NUM_STEPS, losses[0], losses[NUM_STEPS - 1] },
+    );
+}
+
+test "GLiNER2 real training: gliner2_total_loss one step produces finite loss" {
+    const allocator = std.testing.allocator;
+    const model_dir = platform.env.getenv(model_dir_env) orelse return error.SkipZigTest;
+    const ner_data_path = platform.env.getenv(ner_data_env) orelse return error.SkipZigTest;
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
+
+    // ── Load full GLiNER2 checkpoint (encoder + span_rep/classifier/count
+    // heads) with `encoder.` prefix stripping ──────────────────────────────
+    var weight_store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    var owned_names = std.ArrayListUnmanaged([]const u8).empty;
+    defer owned_names.deinit(allocator);
+    defer {
+        var it = weight_store.resident_weights.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit();
+        weight_store.resident_weights.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+    }
+
+    const source_ptr = SafetensorsSource.initAbsolute(allocator, safetensors_path) catch |err| {
+        std.debug.print("SKIP: could not open safetensors file at {s}: {}\n", .{ safetensors_path, err });
+        return;
+    };
+    var ws = source_ptr.weightSource();
+    defer ws.deinit();
+    const hf_names = try ws.listNames(allocator);
+    defer allocator.free(hf_names);
+    for (hf_names) |hf_name| {
+        var lw = ws.getTensor(hf_name) catch continue;
+        const owned_name = try allocator.dupe(u8, stripEncoderPrefix(hf_name));
+        try owned_names.append(allocator, owned_name);
+        lw.tensor.name = owned_name;
+        try weight_store.resident_weights.put(allocator, owned_name, lw);
+    }
+
+    var native = NativeCompute.init(allocator, &weight_store, null);
+    var cb = native.computeBackend();
+
+    // ── Upstream-format records + entity vocab + HF tokenizer ─────────────
+    var records_loaded = gliner2_data.loadTrainingRecords(allocator, ner_data_path, null) catch |err| {
+        std.debug.print("SKIP: could not load upstream training records from {s}: {}\n", .{ ner_data_path, err });
+        return;
+    };
+    defer records_loaded.deinit();
+    if (records_loaded.records.len == 0) {
+        std.debug.print("SKIP: no upstream training records loaded\n", .{});
+        return;
+    }
+    const batch_count: usize = @min(records_loaded.records.len, 2);
+    const records = records_loaded.records[0..batch_count];
+
+    const entity_types = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, records, null);
+    defer {
+        for (entity_types) |label| allocator.free(label);
+        allocator.free(entity_types);
+    }
+    if (entity_types.len == 0) return error.SkipZigTest;
+    const num_classes: u32 = @intCast(entity_types.len + 1);
+
+    var tokenizer = try gliner2_data.Tokenizer.initGLiNER2HF(allocator, model_dir);
+    defer tokenizer.deinit(allocator);
+
+    const seq_len: u32 = SEQ_LEN;
+    const max_span_width: u32 = 4;
+    var encoded = try gliner2_data.buildUpstreamTaskBatch(
+        allocator,
+        &tokenizer,
+        records,
+        entity_types,
+        seq_len,
+        max_span_width,
+        batch_count,
+    );
+    defer encoded.deinit();
+
+    // ── Pack gliner2-total-loss targets: span/structure section via the
+    // public span filler, classification/count sections left masked-out so
+    // they contribute zero loss. This exercises the full total-loss graph
+    // (structure + classification + count nodes) end-to-end. ───────────────
+    const E = encoded.num_entity_types;
+    const span_width = gliner2_autodiff.spanStartTargetWidth(E);
+    const total_width = gliner2_autodiff.gliner2TotalLossTargetWidth(E);
+    const rows = encoded.batch_size * encoded.max_spans;
+
+    const span_targets = try allocator.alloc(f32, rows * span_width);
+    defer allocator.free(span_targets);
+    const stats = try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatch(&encoded, span_targets);
+    try std.testing.expect(stats.valid_span_count > 0);
+
+    const targets = try allocator.alloc(f32, rows * total_width);
+    defer allocator.free(targets);
+    const active_fields_offset = gliner2_autodiff.gliner2TotalLossActiveFieldsOffset(E, 1);
+    @memset(targets, 0.0);
+    for (0..rows) |row_idx| {
+        const row = targets[row_idx * total_width ..][0..total_width];
+        @memcpy(row[0..span_width], span_targets[row_idx * span_width ..][0..span_width]);
+        // The count-embed active mask lives in its own block and is deliberately
+        // not derived from the span mask: this packer scores every entity type.
+        @memset(row[active_fields_offset..][0..E], 1.0);
+    }
+
+    var input_ids = try allocator.alloc(i64, encoded.batch_size * encoded.max_length);
+    defer allocator.free(input_ids);
+    var attention_mask = try allocator.alloc(f32, encoded.batch_size * encoded.max_length);
+    defer allocator.free(attention_mask);
+    for (0..encoded.batch_size * encoded.max_length) |i| {
+        input_ids[i] = encoded.input_ids[i];
+        attention_mask[i] = @floatFromInt(encoded.attention_mask[i]);
+    }
+
+    // ── Trainer (LoRA-only, mirrors upstream GLiNER2 LoRA freezing) ───────
+    var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
+        .graph_config = graph_config,
+        .num_classes = num_classes,
+        .objective = .gliner2_total_loss,
+        .span_start_loss = .bce,
+        .span_start_loss_reduction = .sum,
+        .span_start_positive_weight = 1.0,
+        .span_start_negative_weight = 1.0,
+    });
+    const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
+    var trainer = try real_autodiff.RealAutodiffTrainer.init(
+        allocator,
+        &cb,
+        .{
+            .lora = .{
+                .rank = 4,
+                .alpha = 8.0,
+                .target_patterns = &lora_targets,
+            },
+            .lr_schedule = .{ .constant = 1e-3 },
+            .max_grad_norm = 1.0,
+            .grad_accum_steps = 1,
+            .lora_a_init_std = 0.02,
+            .hidden_size_hint = graph_config.hidden_size,
+            .num_layers_hint = graph_config.num_hidden_layers,
+            .seed = 42,
+            .regular_trainable_params = &.{},
+        },
+    );
+    defer trainer.deinit();
+
+    const targets_shape = gliner2_autodiff.gliner2TotalLossTargetsShape(
+        @intCast(encoded.batch_size),
+        @intCast(encoded.max_spans),
+        @intCast(E),
+    );
+    const result = try gliner2_autodiff.trainStep(
+        &trainer,
+        &gliner_ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        targets_shape,
+        @intCast(encoded.batch_size),
+        @intCast(encoded.max_length),
+    );
+
+    if (!std.math.isFinite(result.loss)) {
+        std.debug.print("FAIL: gliner2_total_loss step produced non-finite loss: {d}\n", .{result.loss});
+        return error.NonFiniteLoss;
+    }
+    if (!std.math.isFinite(result.grad_norm)) {
+        std.debug.print("FAIL: gliner2_total_loss step produced non-finite grad norm: {d}\n", .{result.grad_norm});
+        return error.NonFiniteGradNorm;
+    }
+    try std.testing.expect(result.loss >= 0.0);
+    std.debug.print(
+        "PASS: gliner2_total_loss one step -- loss={d:.6} grad_norm={d:.4} (valid_spans={d}, positives={d})\n",
+        .{ result.loss, result.grad_norm, stats.valid_span_count, stats.positive_span_label_count },
     );
 }

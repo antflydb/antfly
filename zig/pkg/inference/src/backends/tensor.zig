@@ -66,6 +66,7 @@ pub const Tensor = struct {
     pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -81,6 +82,7 @@ pub const Tensor = struct {
     pub fn initInt64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i64) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -96,6 +98,7 @@ pub const Tensor = struct {
     pub fn initInt8(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i8) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -111,6 +114,7 @@ pub const Tensor = struct {
     pub fn initInt16(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i16) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -126,6 +130,7 @@ pub const Tensor = struct {
     pub fn initFloat64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f64) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -140,6 +145,7 @@ pub const Tensor = struct {
 
     pub fn initBool(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const u8) !Tensor {
         const owned_bytes = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,

@@ -160,6 +160,64 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
+  gliner2-contract-tests:
+    name: gliner2 finetuning contracts
+    needs: changes
+    if: needs.changes.outputs.zig_tests == 'true' && github.event_name != 'schedule'
+    runs-on: arc-antfly-standard
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up pinned Python oracle runtime
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run GLiNER2 oracle and release-contract tests
+        working-directory: zig/pkg/inference/scripts
+        run: |
+          set -euo pipefail
+          python3 -m unittest \
+            test_gliner2_release_contract.py \
+            test_gliner2_parity_data.py \
+            test_compare_gliner2_contract.py \
+            test_benchmark_gliner2_lora_perf.py \
+            test_validate_gliner2_release_data.py \
+            test_evaluate_gliner2_full_task.py \
+            test_evaluate_gliner2_native_release_smoke.py \
+            test_summarize_gliner2_convergence.py \
+            test_finalize_gliner2_readiness.py
+
+      - name: Check GLiNER2 release wrappers
+        working-directory: zig/pkg/inference
+        run: bash -n scripts/run_gliner2_lora_perf_gate.sh scripts/run_gliner2_lora_production_readiness.sh
+
+  gliner2-metal-parity:
+    name: gliner2 native-metal gradient parity
+    needs: changes
+    if: needs.changes.outputs.zig_tests == 'true' && github.event_name != 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Require GLiNER2 native-Metal gradient parity
+        working-directory: zig/pkg/inference
+        env:
+          TERMITE_REQUIRE_METAL_TESTS: "1"
+        run: zig build test-gliner2-backend-grad-parity -Dmetal=true -Doptimize=ReleaseSafe
+
   backup-s3-integration:
     name: backup-s3-integration
     needs: changes

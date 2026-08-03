@@ -40,6 +40,7 @@ pub const codecs = @import("codecs/codecs.zig");
 pub const compiled_artifact = @import("compiled_artifact.zig");
 pub const graph = @import("graph/root.zig");
 pub const architectures = struct {
+    pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
 };
 pub const finetune = @import("finetune/root.zig");

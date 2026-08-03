@@ -113,8 +113,17 @@ fn evalNode(
 
     switch (n.op) {
         .constant => |attrs| {
-            const data = graph.constantData(attrs.data_offset, attrs.data_len);
-            return allocator.dupe(f32, data);
+            // Decode by dtype. The pool stores raw bytes, so reading an
+            // `.i64` index constant as f32 (what this used to do) yields
+            // garbage — and index constants are exactly what feeds the
+            // gather / scatter_add operands.
+            const dtype = n.output_shape.dtype;
+            if (dtype == .f32) {
+                return allocator.dupe(f32, graph.constantData(attrs.data_offset, attrs.data_len));
+            }
+            const view = try graph.constantDataAsF32(allocator, dtype, attrs.data_offset, attrs.data_len);
+            if (view.owned) |owned| return owned;
+            return allocator.dupe(f32, view.data);
         },
 
         .neg => {
@@ -346,29 +355,95 @@ fn evalNode(
             return out;
         },
 
-        .gather => {
-            // Simplified: gather rows from table using indices
+        .slice => |attrs| {
+            const a = getVal(node_vals, ins[0]);
+            const in_shape = graph.node(ins[0]).output_shape;
+            if (try tensor_eval.evalSlice(f32, allocator, a, in_shape, n.output_shape, attrs)) |out| {
+                return out;
+            }
+            return error.UnsupportedSlice;
+        },
+
+        .concat_prim => |attrs| {
+            const a = getVal(node_vals, ins[0]);
+            const bb = getVal(node_vals, ins[1]);
+            const a_shape = graph.node(ins[0]).output_shape;
+            const b_shape = graph.node(ins[1]).output_shape;
+            if (try tensor_eval.evalConcat(f32, allocator, a, a_shape, bb, b_shape, n.output_shape, attrs)) |out| {
+                return out;
+            }
+            return error.UnsupportedConcat;
+        },
+
+        .gather => |attrs| {
             const table = getVal(node_vals, ins[0]);
-            const out = try allocator.alloc(f32, out_elems);
-            // For gradient checking, just copy table data
-            for (out, 0..) |*o, i| {
-                o.* = if (i < table.len) table[i] else 0;
-            }
-            return out;
+            const indices = getVal(node_vals, ins[1]);
+            return evalGatherRef(
+                allocator,
+                table,
+                graph.node(ins[0]).output_shape,
+                indices,
+                graph.node(ins[1]).output_shape,
+                attrs.axis,
+                n.output_shape,
+            );
         },
 
-        .scatter_add => {
-            const vals = getVal(node_vals, ins[0]);
-            const out = try allocator.alloc(f32, out_elems);
-            @memset(out, 0);
-            for (0..@min(vals.len, out_elems)) |i| {
-                out[i] += vals[i];
+        .scatter_add => |attrs| {
+            // Two shapes of this op live in the IR:
+            //
+            //   3-input `Builder.scatterAdd(dest, values, indices, axis)`
+            //     — output starts as a copy of `dest`.
+            //   2-input autodiff form `scatter_add(adj, indices)` emitted
+            //     by the `.gather` VJP — output starts at zero.
+            //
+            // Both are handled by `interpreter.zig`'s `.scatter_add`
+            // dispatch, so the reference evaluator handles both too.
+            if (n.num_inputs == 2) {
+                const values = getVal(node_vals, ins[0]);
+                const indices = getVal(node_vals, ins[1]);
+                return evalScatterAddRef(
+                    allocator,
+                    null,
+                    values,
+                    graph.node(ins[0]).output_shape,
+                    indices,
+                    graph.node(ins[1]).output_shape,
+                    attrs.axis,
+                    n.output_shape,
+                );
             }
-            return out;
+            if (n.num_inputs != 3) return error.UnsupportedScatterAddArity;
+            const dest = getVal(node_vals, ins[0]);
+            const values = getVal(node_vals, ins[1]);
+            const indices = getVal(node_vals, ins[2]);
+            return evalScatterAddRef(
+                allocator,
+                dest,
+                values,
+                graph.node(ins[1]).output_shape,
+                indices,
+                graph.node(ins[2]).output_shape,
+                attrs.axis,
+                n.output_shape,
+            );
         },
 
-        .convert_dtype => {
-            return allocator.dupe(f32, getVal(node_vals, ins[0]));
+        .convert_dtype => |attrs| {
+            // The executors model every tensor as an f32 buffer, so a
+            // dtype conversion is a value-domain operation here, not a
+            // bit-level one. Converting to an integer dtype rounds so
+            // that downstream index consumers see exact integers —
+            // matching `interpreter.zig`'s `.convert_dtype` handler.
+            const src = getVal(node_vals, ins[0]);
+            const out = try allocator.dupe(f32, src);
+            switch (attrs.target) {
+                .i64, .i32, .u8, .bool_ => {
+                    for (out) |*v| v.* = @round(v.*);
+                },
+                else => {},
+            }
+            return out;
         },
 
         .fused_rope => |attrs| {
@@ -429,6 +504,172 @@ fn evalNode(
             return out;
         },
     }
+}
+
+// ── gather / scatter_add reference semantics ──────────────────────────
+//
+// These mirror what the graph executors actually compute, so that a
+// finite-difference check that runs over a graph containing gather /
+// scatter_add validates against the real forward instead of a stub.
+//
+// Authoritative implementations this was written against:
+//
+//   gather      `pkg/inference/src/ops/native_compute.zig:primGatherOp`
+//               (the axis-generic strided path), the equivalent
+//               `metal_compute.zig:primGatherOp` axis-0 2-D path, and
+//               the constant-folding twin `passes/const_fold.zig:foldGather`.
+//               Semantics are ONNX `Gather`:
+//                 out[outer, k, inner] = table[outer, indices[k], inner]
+//               with output shape
+//                 table.dims[0..axis] ++ indices.dims ++ table.dims[axis+1..]
+//               Negative indices wrap (`idx += axis_extent`); anything
+//               still out of range is an error.
+//
+//   scatter_add `pkg/inference/src/ops/native_compute.zig:primScatterAddOp`,
+//               `metal_compute.zig:primScatterAddOp` (kernel
+//               `termite_scatter_add_axis0_f32` in metal_kernels.m) and
+//               the host fallback `graph/interpreter.zig:executeScatterAdd`.
+//               Semantics:
+//                 out[outer, indices[k], inner] += values[outer, k, inner]
+//               Output shape is the destination shape. Duplicate indices
+//               accumulate. Unlike gather, no backend wraps negative
+//               indices for scatter_add, so a negative index is an error
+//               here rather than a wrap.
+//
+// Anything outside those contracts fails loudly: a reference forward
+// that silently returns something plausible is worse than no check.
+
+const AxisSplit = struct {
+    outer: usize,
+    axis_size: usize,
+    inner: usize,
+
+    fn total(self: AxisSplit) usize {
+        return self.outer * self.axis_size * self.inner;
+    }
+};
+
+/// Split a static shape into (product of dims before `axis`, dim at
+/// `axis`, product of dims after `axis`).
+fn splitAroundAxis(shape: Shape, axis: u8) !AxisSplit {
+    const rank = shape.rank();
+    if (axis >= rank) return error.IndexAxisOutOfRange;
+    var outer: usize = 1;
+    for (0..axis) |k| {
+        const d = shape.dim(@intCast(k));
+        if (d <= 0) return error.DynamicShapeUnsupported;
+        outer *= @intCast(d);
+    }
+    const axis_dim = shape.dim(axis);
+    if (axis_dim <= 0) return error.DynamicShapeUnsupported;
+    var inner: usize = 1;
+    for ((axis + 1)..rank) |k| {
+        const d = shape.dim(@intCast(k));
+        if (d <= 0) return error.DynamicShapeUnsupported;
+        inner *= @intCast(d);
+    }
+    return .{ .outer = outer, .axis_size = @intCast(axis_dim), .inner = inner };
+}
+
+/// Index tensors travel through this evaluator as f32 (every executor
+/// models tensors as f32 buffers). Require an exact integer: the
+/// backends disagree on how to coerce a non-integral index (native
+/// truncates via `@intFromFloat`, the Metal kernel uses `rint`, the
+/// interpreter host path uses `@round`), so a fractional index has no
+/// single right answer and must not be silently resolved.
+fn indexValue(raw: f32) !i64 {
+    if (!std.math.isFinite(raw)) return error.NonIntegerIndex;
+    const rounded = @round(raw);
+    if (@abs(raw - rounded) > 1e-3) return error.NonIntegerIndex;
+    return @intFromFloat(rounded);
+}
+
+/// Element count of an index operand, cross-checked against the data.
+fn indexCount(idx_shape: Shape, indices: []const f32) !usize {
+    const declared = tensor_eval.staticElements(idx_shape) orelse indices.len;
+    if (declared != indices.len) return error.IndexShapeMismatch;
+    return declared;
+}
+
+fn evalGatherRef(
+    allocator: std.mem.Allocator,
+    table: []const f32,
+    table_shape: Shape,
+    indices: []const f32,
+    idx_shape: Shape,
+    axis: u8,
+    out_shape: Shape,
+) ![]f32 {
+    const split = try splitAroundAxis(table_shape, axis);
+    if (table.len != split.total()) return error.GatherTableShapeMismatch;
+    const idx_count = try indexCount(idx_shape, indices);
+
+    const out_elems = tensor_eval.staticElements(out_shape) orelse return error.DynamicShapeUnsupported;
+    if (out_elems != split.outer * idx_count * split.inner) return error.GatherOutputShapeMismatch;
+
+    const out = try allocator.alloc(f32, out_elems);
+    errdefer allocator.free(out);
+
+    const axis_size_i64: i64 = @intCast(split.axis_size);
+    for (0..idx_count) |k| {
+        var row = try indexValue(indices[k]);
+        if (row < 0) row += axis_size_i64; // ONNX negative-index wrap
+        if (row < 0 or row >= axis_size_i64) return error.GatherIndexOutOfRange;
+        const src_row: usize = @intCast(row);
+        for (0..split.outer) |o| {
+            const src = (o * split.axis_size + src_row) * split.inner;
+            const dst = (o * idx_count + k) * split.inner;
+            @memcpy(out[dst..][0..split.inner], table[src..][0..split.inner]);
+        }
+    }
+    return out;
+}
+
+fn evalScatterAddRef(
+    allocator: std.mem.Allocator,
+    dest: ?[]const f32,
+    values: []const f32,
+    values_shape: Shape,
+    indices: []const f32,
+    idx_shape: Shape,
+    axis: u8,
+    out_shape: Shape,
+) ![]f32 {
+    const split = try splitAroundAxis(out_shape, axis);
+    const out_elems = tensor_eval.staticElements(out_shape) orelse return error.DynamicShapeUnsupported;
+    if (out_elems != split.total()) return error.ScatterOutputShapeMismatch;
+    const idx_count = try indexCount(idx_shape, indices);
+
+    if (tensor_eval.staticElements(values_shape)) |declared_values| {
+        if (declared_values != values.len) return error.ScatterValuesShapeMismatch;
+    }
+    if (values.len != split.outer * idx_count * split.inner) return error.ScatterValuesShapeMismatch;
+
+    const out = try allocator.alloc(f32, out_elems);
+    errdefer allocator.free(out);
+    if (dest) |d| {
+        if (d.len != out_elems) return error.ScatterDestShapeMismatch;
+        @memcpy(out, d);
+    } else {
+        @memset(out, 0);
+    }
+
+    const axis_size_i64: i64 = @intCast(split.axis_size);
+    for (0..idx_count) |k| {
+        const row = try indexValue(indices[k]);
+        // No negative-index wrap: no backend implements one for
+        // scatter_add (native traps / errors, the Metal kernel silently
+        // drops the row, the interpreter host path returns
+        // IndexOutOfBounds), so there is no agreed behaviour to model.
+        if (row < 0 or row >= axis_size_i64) return error.ScatterIndexOutOfRange;
+        const dst_row: usize = @intCast(row);
+        for (0..split.outer) |o| {
+            const src = (o * idx_count + k) * split.inner;
+            const dst = (o * split.axis_size + dst_row) * split.inner;
+            for (0..split.inner) |i| out[dst + i] += values[src + i];
+        }
+    }
+    return out;
 }
 
 const BinaryOpKind = enum { add_op, mul_op, sub_op, div_op, less_than_op };
@@ -986,6 +1227,374 @@ test "gradient through sdpa + linear chain" {
         1e-3,
     );
     try std.testing.expect(max_err < 0.05); // slightly looser tolerance for deep chain
+}
+
+// ── gather / scatter_add ───────────────────────────────────────────────
+
+test "eval gather honors the index operand" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // table [4, 3] gathered by indices [3] = {2, 0, 2} → [3, 3].
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 4, 3 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{3}));
+    const gathered = try b.gather(table, idx, Shape.init(.f32, &.{ 3, 3 }));
+    try g.markOutput(gathered);
+
+    const ptable = [_]f32{
+        0.0, 1.0,  2.0,
+        3.0, 4.0,  5.0,
+        6.0, 7.0,  8.0,
+        9.0, 10.0, 11.0,
+    };
+    const pidx = [_]f32{ 2.0, 0.0, 2.0 };
+
+    var result = try eval(allocator, &g, &.{ &ptable, &pidx });
+    defer result.deinit();
+
+    const expected = [_]f32{
+        6.0, 7.0, 8.0,
+        0.0, 1.0, 2.0,
+        6.0, 7.0, 8.0,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, result.values[0]);
+}
+
+test "eval gather wraps negative indices" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 3, 2 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{2}));
+    const gathered = try b.gather(table, idx, Shape.init(.f32, &.{ 2, 2 }));
+    try g.markOutput(gathered);
+
+    const ptable = [_]f32{ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    const pidx = [_]f32{ -1.0, -3.0 }; // → rows 2 and 0
+
+    var result = try eval(allocator, &g, &.{ &ptable, &pidx });
+    defer result.deinit();
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 4.0, 5.0, 0.0, 1.0 }, result.values[0]);
+}
+
+test "eval gather rejects an out-of-range index" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 3, 2 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{2}));
+    const gathered = try b.gather(table, idx, Shape.init(.f32, &.{ 2, 2 }));
+    try g.markOutput(gathered);
+
+    const ptable = [_]f32{ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    const pidx = [_]f32{ 0.0, 3.0 };
+
+    try std.testing.expectError(
+        error.GatherIndexOutOfRange,
+        eval(allocator, &g, &.{ &ptable, &pidx }),
+    );
+}
+
+test "eval gather along axis 1" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // table [2, 3] gathered along axis 1 by indices [2] = {2, 1} → [2, 2].
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 2, 3 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{2}));
+    const gathered = try g.addNode(.{
+        .op = .{ .gather = .{ .axis = 1 } },
+        .output_shape = Shape.init(.f32, &.{ 2, 2 }),
+        .inputs = .{ table, idx, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(gathered);
+
+    const ptable = [_]f32{ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    const pidx = [_]f32{ 2.0, 1.0 };
+
+    var result = try eval(allocator, &g, &.{ &ptable, &pidx });
+    defer result.deinit();
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2.0, 1.0, 5.0, 4.0 }, result.values[0]);
+}
+
+test "eval scatter_add accumulates duplicate indices" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // 3-input builder form: out = dest, then out[idx[k], :] += values[k, :].
+    const dest = try b.parameter("dest", Shape.init(.f32, &.{ 3, 2 }));
+    const values = try b.parameter("values", Shape.init(.f32, &.{ 4, 2 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{4}));
+    const out = try b.scatterAdd(dest, values, idx, 0);
+    try g.markOutput(out);
+
+    const pdest = [_]f32{ 100.0, 200.0, 300.0, 400.0, 500.0, 600.0 };
+    const pvalues = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const pidx = [_]f32{ 1.0, 0.0, 1.0, 1.0 };
+
+    var result = try eval(allocator, &g, &.{ &pdest, &pvalues, &pidx });
+    defer result.deinit();
+
+    // row0 += values[1] = (3,4); row1 += values[0]+values[2]+values[3] = (13,16)
+    const expected = [_]f32{
+        103.0, 204.0,
+        313.0, 416.0,
+        500.0, 600.0,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, result.values[0]);
+}
+
+test "eval scatter_add two-input autodiff form starts from zero" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // The form the `.gather` VJP emits: scatter_add(adjoint, indices)
+    // with the table shape as the output shape and an implicit zero dest.
+    const values = try b.parameter("values", Shape.init(.f32, &.{ 3, 2 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{3}));
+    const out = try g.addNode(.{
+        .op = .{ .scatter_add = .{ .axis = 0 } },
+        .output_shape = Shape.init(.f32, &.{ 3, 2 }),
+        .inputs = .{ values, idx, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    const pvalues = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+    const pidx = [_]f32{ 2.0, 2.0, 0.0 };
+
+    var result = try eval(allocator, &g, &.{ &pvalues, &pidx });
+    defer result.deinit();
+
+    const expected = [_]f32{
+        5.0, 6.0, // row0 ← values[2]
+        0.0, 0.0, // row1 untouched
+        4.0, 6.0, // row2 ← values[0] + values[1]
+    };
+    try std.testing.expectEqualSlices(f32, &expected, result.values[0]);
+}
+
+test "eval scatter_add rejects a negative index" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const values = try b.parameter("values", Shape.init(.f32, &.{ 2, 2 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{2}));
+    const out = try g.addNode(.{
+        .op = .{ .scatter_add = .{ .axis = 0 } },
+        .output_shape = Shape.init(.f32, &.{ 3, 2 }),
+        .inputs = .{ values, idx, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    const pvalues = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const pidx = [_]f32{ 0.0, -1.0 };
+
+    try std.testing.expectError(
+        error.ScatterIndexOutOfRange,
+        eval(allocator, &g, &.{ &pvalues, &pidx }),
+    );
+}
+
+test "grad_check gather with repeated rows" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // loss = sum(gather(table, idx) * w). Row 2 is gathered twice and
+    // row 1 never, so a stub forward (or a scatter_add VJP that ignores
+    // the indices) produces a visibly different gradient.
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 4, 3 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{3}));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 3, 3 }));
+    const gathered = try b.gather(table, idx, Shape.init(.f32, &.{ 3, 3 }));
+    const product = try b.mul(gathered, w);
+    const loss = try b.reduceSum(product, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    const ptable = [_]f32{
+        0.1, 0.2, 0.3,
+        0.4, 0.5, 0.6,
+        0.7, 0.8, 0.9,
+        1.0, 1.1, 1.2,
+    };
+    const pidx = [_]f32{ 2.0, 0.0, 2.0 };
+    const pw = [_]f32{
+        1.0, 2.0, 3.0,
+        4.0, 5.0, 6.0,
+        7.0, 8.0, 9.0,
+    };
+
+    // Analytic expectation, independent of autodiff:
+    //   d loss / d table[r, c] = sum_{k: idx[k] == r} w[k, c]
+    var ad_result = try autodiff_mod.gradient(allocator, &g, loss, &.{table});
+    defer ad_result.deinit();
+    const grad_id = ad_result.param_grads[0];
+    try std.testing.expect(grad_id != null_node);
+    try ad_result.graph.outputs.append(allocator, grad_id);
+    var analytic_eval = try eval(allocator, &ad_result.graph, &.{ &ptable, &pidx, &pw });
+    defer analytic_eval.deinit();
+    const analytic = analytic_eval.values[analytic_eval.values.len - 1];
+    const expected_grad = [_]f32{
+        4.0, 5.0, 6.0, // row0 ← w[1]
+        0.0, 0.0, 0.0, // row1 never gathered
+        8.0, 10.0, 12.0, // row2 ← w[0] + w[2]
+        0.0, 0.0, 0.0, // row3 never gathered
+    };
+    try std.testing.expectEqualSlices(f32, &expected_grad, analytic);
+
+    const max_err = try checkGradients(allocator, &g, loss, &.{table}, &.{ &ptable, &pidx, &pw }, 1e-3);
+    try std.testing.expect(max_err < tolerance);
+}
+
+test "grad_check scatter_add with duplicate indices" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    // loss = sum(scatter_add(values, idx) * w), autodiff two-input form.
+    // Index 1 receives three rows, index 2 none.
+    const values = try b.parameter("values", Shape.init(.f32, &.{ 4, 2 }));
+    const idx = try b.parameter("idx", Shape.init(.i64, &.{4}));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 3, 2 }));
+    const scattered = try g.addNode(.{
+        .op = .{ .scatter_add = .{ .axis = 0 } },
+        .output_shape = Shape.init(.f32, &.{ 3, 2 }),
+        .inputs = .{ values, idx, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const product = try b.mul(scattered, w);
+    const loss = try b.reduceSum(product, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    const pvalues = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    const pidx = [_]f32{ 1.0, 0.0, 1.0, 1.0 };
+    const pw = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+
+    // d loss / d values[k, c] = w[idx[k], c]
+    var ad_result = try autodiff_mod.gradient(allocator, &g, loss, &.{values});
+    defer ad_result.deinit();
+    const grad_id = ad_result.param_grads[0];
+    try std.testing.expect(grad_id != null_node);
+    try ad_result.graph.outputs.append(allocator, grad_id);
+    var analytic_eval = try eval(allocator, &ad_result.graph, &.{ &pvalues, &pidx, &pw });
+    defer analytic_eval.deinit();
+    const analytic = analytic_eval.values[analytic_eval.values.len - 1];
+    const expected_grad = [_]f32{
+        3.0, 4.0, // ← w[1]
+        1.0, 2.0, // ← w[0]
+        3.0, 4.0, // ← w[1]
+        3.0, 4.0, // ← w[1]
+    };
+    try std.testing.expectEqualSlices(f32, &expected_grad, analytic);
+
+    const max_err = try checkGradients(allocator, &g, loss, &.{values}, &.{ &pvalues, &pidx, &pw }, 1e-3);
+    try std.testing.expect(max_err < tolerance);
+}
+
+test "grad_check gliner2-shaped span/schema gather chain" {
+    // Mirrors the gather topology of the GLiNER2 schema-conditioned
+    // structure loss (gliner2_real_autodiff.zig:519-624):
+    //
+    //   start_hidden   = gather(hidden_flat, start_idx)            [S, H]
+    //   compact_schema = gather(schema_idx_2d, first_span_rows)    [B, E]
+    //   schema_hidden  = gather(hidden_flat, compact_schema_flat)  [B*E, H]
+    //   repeated_span  = gather(start_hidden, row_idx)             [S*E, H]
+    //   schema_proj    = gather(schema_hidden, schema_repeat_rows) [S*E, H]
+    //   logits         = sum_h(repeated_span * schema_proj)
+    //
+    // Every gather feeds a scatter_add on the backward pass, two of them
+    // with duplicate indices, and `hidden_flat` is reached through two
+    // independent gather chains, so its adjoint is an accumulation of
+    // two scatter_adds.
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const T = 6; // tokens
+    const H = 3; // hidden
+    const S = 4; // span rows
+    const E = 2; // entity types
+    const B = 2; // samples (2 spans per sample)
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{ T, H }));
+    const start_idx = try b.parameter("start_idx", Shape.init(.i64, &.{S}));
+    const schema_idx_2d = try b.parameter("schema_idx_2d", Shape.init(.f32, &.{ S, E }));
+    const first_span_rows = try b.parameter("first_span_rows", Shape.init(.i64, &.{B}));
+    const row_idx = try b.parameter("row_idx", Shape.init(.i64, &.{S * E}));
+    const schema_repeat_rows = try b.parameter("schema_repeat_rows", Shape.init(.i64, &.{S * E}));
+
+    const start_hidden = try b.gather(hidden, start_idx, Shape.init(.f32, &.{ S, H }));
+
+    const compact_schema_2d = try b.gather(schema_idx_2d, first_span_rows, Shape.init(.f32, &.{ B, E }));
+    const compact_schema_flat = try b.reshape(compact_schema_2d, Shape.init(.f32, &.{B * E}));
+    const compact_schema_i64 = try b.convertDtype(compact_schema_flat, .i64);
+    const schema_hidden = try b.gather(hidden, compact_schema_i64, Shape.init(.f32, &.{ B * E, H }));
+
+    const repeated_span = try b.gather(start_hidden, row_idx, Shape.init(.f32, &.{ S * E, H }));
+    const schema_proj = try b.gather(schema_hidden, schema_repeat_rows, Shape.init(.f32, &.{ S * E, H }));
+
+    const span_schema_product = try b.mul(repeated_span, schema_proj);
+    const logits = try b.reduceSum(span_schema_product, &.{1});
+    const loss = try b.reduceSum(logits, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    const phidden = [_]f32{
+        0.10,  -0.20, 0.30,
+        0.40,  0.50,  -0.60,
+        -0.70, 0.80,  0.90,
+        1.00,  -1.10, 1.20,
+        0.05,  0.15,  -0.25,
+        -0.35, 0.45,  0.55,
+    };
+    // Repeated + skipped token rows, as real span data produces.
+    const pstart_idx = [_]f32{ 0.0, 2.0, 2.0, 5.0 };
+    // Per-span schema token positions; only the first span row of each
+    // sample is read (rows 0 and 2 here).
+    const pschema_idx_2d = [_]f32{
+        1.0, 3.0,
+        9.0, 9.0, // never read
+        4.0, 1.0,
+        9.0, 9.0, // never read
+    };
+    const pfirst_span_rows = [_]f32{ 0.0, 2.0 };
+    // span row for each (span, entity) pair
+    const prow_idx = [_]f32{ 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0 };
+    // (sample * E + entity) for each (span, entity) pair
+    const pschema_repeat_rows = [_]f32{ 0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 3.0 };
+
+    const params = [_][]const f32{
+        &phidden,
+        &pstart_idx,
+        &pschema_idx_2d,
+        &pfirst_span_rows,
+        &prow_idx,
+        &pschema_repeat_rows,
+    };
+
+    const max_err = try checkGradients(allocator, &g, loss, &.{hidden}, &params, 1e-3);
+    try std.testing.expect(max_err < tolerance);
 }
 
 test "grad_check fused_rope half-swap rotation" {
