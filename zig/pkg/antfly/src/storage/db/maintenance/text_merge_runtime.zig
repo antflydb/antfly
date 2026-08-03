@@ -32,7 +32,6 @@ pub const Config = struct {
     max_pending_segments: u64 = 64,
     resume_pending_segments: u64 = 32,
     max_pending_bytes: u64 = 256 * 1024 * 1024,
-    backpressure_merge_steps: usize = 1,
     backpressure_sleep_ms: u64 = 1,
     // Bound producer latency when a source is corrupt, quarantined, or owned
     // by a stuck worker. FD admission remains the final safety boundary.
@@ -116,7 +115,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         pub fn release(_: *@This()) void {}
     };
 
-    pub fn acquireProducerPermit(_: *@This(), _: u64) !ProducerPermit {
+    pub fn acquireProducerPermit(_: *@This(), _: u64, _: u64) !ProducerPermit {
         return .{};
     }
 
@@ -149,12 +148,16 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     backpressure_ns: u64 = 0,
     backpressure_timeouts: u64 = 0,
     backpressure_failures: u64 = 0,
-    producer_reservations: u64 = 0,
+    producer_segment_reservations: u64 = 0,
+    producer_byte_reservations: u64 = 0,
+    producer_release_epoch: u64 = 0,
+    admission_closed: bool = false,
     future: ?Io.Future(void) = null,
 
     pub const ProducerPermit = struct {
         runtime: *TextMergeRuntime,
         segment_count: u64,
+        byte_count: u64,
         active: bool = true,
 
         pub fn release(self: *ProducerPermit) void {
@@ -163,8 +166,13 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             const runtime = self.runtime;
             const io = runtime.io_impl.?.io();
             runtime.mutex.lockUncancelable(io);
-            std.debug.assert(runtime.producer_reservations >= self.segment_count);
-            runtime.producer_reservations -= self.segment_count;
+            std.debug.assert(runtime.producer_segment_reservations >= self.segment_count);
+            std.debug.assert(runtime.producer_byte_reservations >= self.byte_count);
+            runtime.producer_segment_reservations -= self.segment_count;
+            runtime.producer_byte_reservations -= self.byte_count;
+            // Publication completes before release. Advancing the epoch makes
+            // an acquirer retry if its debt snapshot straddled this handoff.
+            runtime.producer_release_epoch +%= 1;
             runtime.notified = true;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
@@ -183,7 +191,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
         if (config.enabled and
             (config.max_pending_segments != 0 or config.max_pending_bytes != 0) and
-            (config.backpressure_merge_steps == 0 or config.backpressure_max_wait_ms == 0))
+            config.backpressure_max_wait_ms == 0)
         {
             return error.InvalidTextMergeBackpressureConfig;
         }
@@ -208,6 +216,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         defer self.lifecycle_mutex.unlock();
         self.desired_running = true;
         self.paused = false;
+        self.setAdmissionClosedLocked(false);
         try self.startLocked();
     }
 
@@ -220,6 +229,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         defer self.lifecycle_mutex.unlock();
         self.desired_running = false;
         self.paused = true;
+        self.setAdmissionClosedLocked(true);
         return self.stopLocked();
     }
 
@@ -391,11 +401,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     /// segment visible. Concurrent producers are included in the bound, so
     /// the configured high watermark is an admission limit rather than a
     /// best-effort cleanup trigger.
-    pub fn acquireProducerPermit(self: *TextMergeRuntime, segment_count: u64) !ProducerPermit {
-        if (segment_count == 0 or !self.config.enabled or self.workDeferred() or self.config.max_pending_segments == 0) {
-            return .{ .runtime = self, .segment_count = 0, .active = false };
+    pub fn acquireProducerPermit(self: *TextMergeRuntime, segment_count: u64, byte_count: u64) !ProducerPermit {
+        if ((segment_count == 0 and byte_count == 0) or !self.config.enabled or self.workDeferred() or
+            (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0))
+        {
+            return .{ .runtime = self, .segment_count = 0, .byte_count = 0, .active = false };
         }
-        if (segment_count > self.config.max_pending_segments) return error.TextMergeAdmissionRequestTooLarge;
 
         const started_ns = self.backpressureNowNs();
         var recorded_wait = false;
@@ -411,34 +422,65 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 return error.TextMergeBackpressureUnavailable;
             }
 
+            const io = self.io_impl.?.io();
+            self.mutex.lockUncancelable(io);
+            if (self.admission_closed) {
+                self.mutex.unlock(io);
+                return error.TextMergeRuntimeShutdown;
+            }
+            const snapshot_epoch = self.producer_release_epoch;
+            self.mutex.unlock(io);
+
             lockApplyShared(self.apply_mutex);
             const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
             self.apply_mutex.unlockShared();
 
-            const io = self.io_impl.?.io();
             self.mutex.lockUncancelable(io);
-            if (self.shutdown) {
+            if (self.admission_closed) {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
-            const reserved_total = std.math.add(u64, self.producer_reservations, segment_count) catch std.math.maxInt(u64);
-            const admitted_total = std.math.add(u64, stats_snapshot.pending_segments, reserved_total) catch std.math.maxInt(u64);
-            const bytes_admissible = self.config.max_pending_bytes == 0 or stats_snapshot.pending_bytes < self.config.max_pending_bytes;
-            if (admitted_total <= self.config.max_pending_segments and bytes_admissible) {
-                self.producer_reservations = reserved_total;
+            if (snapshot_epoch != self.producer_release_epoch) {
                 self.mutex.unlock(io);
-                return .{ .runtime = self, .segment_count = segment_count };
+                continue;
+            }
+            const reserved_segments = std.math.add(u64, self.producer_segment_reservations, segment_count) catch std.math.maxInt(u64);
+            const reserved_bytes = std.math.add(u64, self.producer_byte_reservations, byte_count) catch std.math.maxInt(u64);
+            const admitted_segments = std.math.add(u64, stats_snapshot.pending_segments, reserved_segments) catch std.math.maxInt(u64);
+            const admitted_bytes = std.math.add(u64, stats_snapshot.pending_bytes, reserved_bytes) catch std.math.maxInt(u64);
+            const request_oversized =
+                (self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments) or
+                (self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes);
+            const no_existing_debt = stats_snapshot.pending_segments == 0 and stats_snapshot.pending_bytes == 0 and
+                self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
+            const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
+            const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
+            if ((request_oversized and no_existing_debt) or (!request_oversized and segments_admissible and bytes_admissible)) {
+                self.producer_segment_reservations = reserved_segments;
+                self.producer_byte_reservations = reserved_bytes;
+                self.mutex.unlock(io);
+                return .{ .runtime = self, .segment_count = segment_count, .byte_count = byte_count };
             }
             if (!recorded_wait) {
                 self.backpressure_events += 1;
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
-            if (!self.sleepBackpressure(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+            if (!self.sleepProducerAdmission(started_ns, @max(@as(u64, 1), self.config.backpressure_sleep_ms))) {
+                if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
             }
         }
+    }
+
+    fn setAdmissionClosedLocked(self: *TextMergeRuntime, closed: bool) void {
+        const io_impl = self.io_impl orelse return;
+        const io = io_impl.io();
+        self.mutex.lockUncancelable(io);
+        self.admission_closed = closed;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
     }
 
     fn recordBackpressureElapsed(self: *TextMergeRuntime, started_ns: u64) void {
@@ -485,6 +527,25 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             remaining_ms -= slice_ms;
         }
         return !self.backpressureExpired(started_ns);
+    }
+
+    fn sleepProducerAdmission(self: *TextMergeRuntime, started_ns: u64, requested_ms: u64) bool {
+        var remaining_ms = requested_ms;
+        while (remaining_ms > 0) {
+            if (self.isAdmissionClosed() or self.backpressureExpired(started_ns)) return false;
+            const slice_ms: u64 = @min(remaining_ms, 10);
+            self.config.clock.sleepMs(slice_ms);
+            remaining_ms -= slice_ms;
+        }
+        return !self.isAdmissionClosed() and !self.backpressureExpired(started_ns);
+    }
+
+    fn isAdmissionClosed(self: *TextMergeRuntime) bool {
+        const io_impl = self.io_impl orelse return self.admission_closed;
+        const io = io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.admission_closed;
     }
 
     pub fn stats(self: *TextMergeRuntime) types.TextMergeStats {

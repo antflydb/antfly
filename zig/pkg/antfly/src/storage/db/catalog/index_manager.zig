@@ -409,6 +409,16 @@ const TextBatchMutationStats = struct {
     }
 };
 
+pub const TextPublicationEstimate = struct {
+    segment_count: u64 = 0,
+    byte_count: u64 = 0,
+
+    fn add(self: *TextPublicationEstimate, other: TextPublicationEstimate) void {
+        self.segment_count +|= other.segment_count;
+        self.byte_count +|= other.byte_count;
+    }
+};
+
 const ForceTextCompactMode = enum {
     force,
     best_effort,
@@ -1103,32 +1113,67 @@ pub const IndexManager = struct {
             doc: u32,
         };
 
-        const OrdinalLocation = struct {
+        const OrdinalSlot = struct {
             identity: u32,
             location: OutputLocation,
+            occupied: bool = false,
         };
 
-        const IdLocation = struct {
+        const IdSlot = struct {
+            hash: u64,
             identity: []const u8,
             location: OutputLocation,
+            occupied: bool = false,
         };
 
         segments: [][]u8 = &.{},
         prepared_segments: []persistent_mod.PreparedMergeSegment = &.{},
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
-        output_ordinals: []OrdinalLocation = &.{},
-        output_ids: []IdLocation = &.{},
+        output_ordinals: []OrdinalSlot = &.{},
+        output_ids: []IdSlot = &.{},
         elapsed_ns: u64 = 0,
         /// Peak bytes allocated through the merge task allocator. File-backed
         /// and heap-backed builders both run through this allocator.
         peak_task_alloc_bytes: u64 = 0,
 
+        // Lookup storage is allocated through the task's tracking wrapper.
+        // That wrapper delegates raw allocations unchanged to the backing
+        // allocator, so detached result ownership is released through `alloc`
+        // in deinit after the stack-scoped tracker has recorded its peak.
         fn buildPublicationLookup(self: *TextMergeResult, alloc: Allocator) !void {
-            var ordinals = std.ArrayListUnmanaged(OrdinalLocation).empty;
-            defer ordinals.deinit(alloc);
-            var ids = std.ArrayListUnmanaged(IdLocation).empty;
-            defer ids.deinit(alloc);
             const output_count = if (self.prepared_segments.len > 0) self.prepared_segments.len else self.segments.len;
+            var ordinal_count: usize = 0;
+            var id_count: usize = 0;
+            for (0..output_count) |output_idx| {
+                const bytes = if (self.prepared_segments.len > 0)
+                    self.prepared_segments[output_idx].data.bytes()
+                else
+                    self.segments[output_idx];
+                var reader = try segment_mod.SegmentReader.init(alloc, bytes);
+                defer reader.deinit();
+                for (0..reader.doc_count) |doc_idx| {
+                    const doc_id: u32 = @intCast(doc_idx);
+                    if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        _ = ordinal;
+                        ordinal_count += 1;
+                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                        _ = stored;
+                        id_count += 1;
+                    } else {
+                        return error.MissingMergeDocumentIdentity;
+                    }
+                }
+            }
+
+            const ordinal_capacity = try publicationLookupCapacity(ordinal_count);
+            const id_capacity = try publicationLookupCapacity(id_count);
+            const ordinals = try alloc.alloc(OrdinalSlot, ordinal_capacity);
+            errdefer if (ordinals.len > 0) alloc.free(ordinals);
+            for (ordinals) |*slot| slot.occupied = false;
+            const ids = try alloc.alloc(IdSlot, id_capacity);
+            errdefer if (ids.len > 0) alloc.free(ids);
+            for (ids) |*slot| slot.occupied = false;
+
             for (0..output_count) |output_idx| {
                 const bytes = if (self.prepared_segments.len > 0)
                     self.prepared_segments[output_idx].data.bytes()
@@ -1140,60 +1185,84 @@ pub const IndexManager = struct {
                     const doc_id: u32 = @intCast(doc_idx);
                     const location: OutputLocation = .{ .segment = @intCast(output_idx), .doc = doc_id };
                     if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        try ordinals.append(alloc, .{ .identity = ordinal, .location = location });
+                        try insertOrdinal(ordinals, ordinal, location);
                     } else if (try reader.storedDoc(doc_id)) |stored| {
-                        try ids.append(alloc, .{ .identity = stored.id, .location = location });
-                    } else {
-                        return error.MissingMergeDocumentIdentity;
-                    }
+                        try insertId(ids, stored.id, location);
+                    } else unreachable;
                 }
             }
-            std.mem.sort(OrdinalLocation, ordinals.items, {}, struct {
-                fn lessThan(_: void, lhs: OrdinalLocation, rhs: OrdinalLocation) bool {
-                    return lhs.identity < rhs.identity;
-                }
-            }.lessThan);
-            std.mem.sort(IdLocation, ids.items, {}, struct {
-                fn lessThan(_: void, lhs: IdLocation, rhs: IdLocation) bool {
-                    return std.mem.order(u8, lhs.identity, rhs.identity) == .lt;
-                }
-            }.lessThan);
-            if (ordinals.items.len > 1) {
-                for (ordinals.items[1..], ordinals.items[0 .. ordinals.items.len - 1]) |current, previous| {
-                    if (current.identity == previous.identity) return error.DuplicateMergeDocumentIdentity;
-                }
-            }
-            if (ids.items.len > 1) {
-                for (ids.items[1..], ids.items[0 .. ids.items.len - 1]) |current, previous| {
-                    if (std.mem.eql(u8, current.identity, previous.identity)) return error.DuplicateMergeDocumentIdentity;
-                }
-            }
-            self.output_ordinals = try ordinals.toOwnedSlice(alloc);
-            self.output_ids = try ids.toOwnedSlice(alloc);
+            self.output_ordinals = ordinals;
+            self.output_ids = ids;
         }
 
         fn outputForOrdinal(self: *const TextMergeResult, identity: u32) ?OutputLocation {
-            var low: usize = 0;
-            var high = self.output_ordinals.len;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                const item = self.output_ordinals[mid];
-                if (item.identity < identity) low = mid + 1 else high = mid;
+            if (self.output_ordinals.len == 0) return null;
+            var index = ordinalHash(identity) & (self.output_ordinals.len - 1);
+            for (0..self.output_ordinals.len) |_| {
+                const slot = self.output_ordinals[index];
+                if (!slot.occupied) return null;
+                if (slot.identity == identity) return slot.location;
+                index = (index + 1) & (self.output_ordinals.len - 1);
             }
-            if (low < self.output_ordinals.len and self.output_ordinals[low].identity == identity) return self.output_ordinals[low].location;
             return null;
         }
 
         fn outputForId(self: *const TextMergeResult, identity: []const u8) ?OutputLocation {
-            var low: usize = 0;
-            var high = self.output_ids.len;
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                const item = self.output_ids[mid];
-                if (std.mem.order(u8, item.identity, identity) == .lt) low = mid + 1 else high = mid;
+            if (self.output_ids.len == 0) return null;
+            const hash = std.hash.Wyhash.hash(0, identity);
+            var index: usize = @intCast(hash & @as(u64, @intCast(self.output_ids.len - 1)));
+            for (0..self.output_ids.len) |_| {
+                const slot = self.output_ids[index];
+                if (!slot.occupied) return null;
+                if (slot.hash == hash and std.mem.eql(u8, slot.identity, identity)) return slot.location;
+                index = (index + 1) & (self.output_ids.len - 1);
             }
-            if (low < self.output_ids.len and std.mem.eql(u8, self.output_ids[low].identity, identity)) return self.output_ids[low].location;
             return null;
+        }
+
+        fn publicationLookupCapacity(entry_count: usize) !usize {
+            if (entry_count == 0) return 0;
+            const doubled = try std.math.mul(usize, entry_count, 2);
+            return try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 2), doubled));
+        }
+
+        fn ordinalHash(identity: u32) usize {
+            var value: u64 = identity;
+            value ^= value >> 16;
+            value *%= 0x7feb352d;
+            value ^= value >> 15;
+            value *%= 0x846ca68b;
+            value ^= value >> 16;
+            return @intCast(value);
+        }
+
+        fn insertOrdinal(slots: []OrdinalSlot, identity: u32, location: OutputLocation) !void {
+            var index = ordinalHash(identity) & (slots.len - 1);
+            for (0..slots.len) |_| {
+                const slot = &slots[index];
+                if (!slot.occupied) {
+                    slot.* = .{ .identity = identity, .location = location, .occupied = true };
+                    return;
+                }
+                if (slot.identity == identity) return error.DuplicateMergeDocumentIdentity;
+                index = (index + 1) & (slots.len - 1);
+            }
+            return error.MergePublicationLookupFull;
+        }
+
+        fn insertId(slots: []IdSlot, identity: []const u8, location: OutputLocation) !void {
+            const hash = std.hash.Wyhash.hash(0, identity);
+            var index: usize = @intCast(hash & @as(u64, @intCast(slots.len - 1)));
+            for (0..slots.len) |_| {
+                const slot = &slots[index];
+                if (!slot.occupied) {
+                    slot.* = .{ .hash = hash, .identity = identity, .location = location, .occupied = true };
+                    return;
+                }
+                if (slot.hash == hash and std.mem.eql(u8, slot.identity, identity)) return error.DuplicateMergeDocumentIdentity;
+                index = (index + 1) & (slots.len - 1);
+            }
+            return error.MergePublicationLookupFull;
         }
 
         pub fn deinit(self: *TextMergeResult, alloc: Allocator) void {
@@ -5191,19 +5260,6 @@ pub const IndexManager = struct {
         return @intCast(self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len);
     }
 
-    pub fn fullTextTargetCount(self: *const IndexManager, index_names: []const []const u8) u64 {
-        if (index_names.len == 0) return @intCast(self.text_indexes.items.len);
-        var target_count: u64 = 0;
-        for (self.text_indexes.items) |entry| {
-            for (index_names) |name| {
-                if (!std.mem.eql(u8, entry.config.name, name)) continue;
-                target_count += 1;
-                break;
-            }
-        }
-        return target_count;
-    }
-
     pub fn listIndexesPublic(self: *const IndexManager, alloc: Allocator) ![]types.IndexConfig {
         const total = self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len;
         const out = try alloc.alloc(types.IndexConfig, total);
@@ -7480,20 +7536,60 @@ pub const IndexManager = struct {
         return segment_count;
     }
 
-    pub fn estimateTextKernelSegmentCount(_: *IndexManager, docs: []const introducer_mod.TextDocument) usize {
-        if (docs.len == 0) return 0;
-        const target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes());
-        const target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes());
-        var segment_count: usize = 0;
-        var start: usize = 0;
-        while (start < docs.len) : (segment_count += 1) {
-            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
-                .target_build_memory_bytes = target_build_memory_bytes,
-                .target_segment_bytes = target_segment_bytes,
+    pub fn estimateTextKernelPublication(_: *IndexManager, docs: []const introducer_mod.TextDocument) TextPublicationEstimate {
+        return estimateProjectedTextPublication(docs);
+    }
+
+    /// Compute the exact segment split count and a conservative byte upper
+    /// bound using the same projection and splitting rules as publication.
+    /// This performs JSON projection but not tokenization or segment building,
+    /// keeping admission substantially cheaper than the admitted work.
+    pub fn estimateTextBatchPublicationByName(
+        self: *IndexManager,
+        index_name: []const u8,
+        writes: []const types.BatchWrite,
+    ) !TextPublicationEstimate {
+        if (writes.len == 0) return .{};
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
+        defer docs.deinit(arena);
+        for (writes) |write| {
+            if (!self.keyInRange(write.key)) continue;
+            if (!try textIndexShouldConsumeDoc(self, entry, write.key)) continue;
+            try docs.append(arena, .{
+                .key = write.key,
+                .value = write.value,
+                .doc_ordinal = null,
             });
-            start = split.end;
         }
-        return segment_count;
+        if (docs.items.len == 0) return .{};
+
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        var estimate = TextPublicationEstimate{};
+        var source_start: usize = 0;
+        while (source_start < docs.items.len) {
+            const source_end = splitMapperDocsEnd(docs.items, source_start, source_target_bytes);
+            const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
+                arena,
+                docs.items[source_start..source_end],
+                try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null),
+            );
+            const projection = try mapper.buildTextProjectionBatchFromSource(
+                arena,
+                source_batch.docs,
+                entry.text_analysis,
+                entry.runtime_schema,
+                null,
+            );
+            estimate.add(estimateProjectedTextPublication(projection.docs));
+            source_start = source_end;
+        }
+        return estimate;
     }
 
     pub fn drainScheduledTextMerges(self: *IndexManager) !void {
@@ -10110,7 +10206,11 @@ pub const IndexManager = struct {
                 .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
             };
             errdefer result.deinit(alloc);
-            try result.buildPublicationLookup(alloc);
+            result.buildPublicationLookup(task_alloc) catch |err| {
+                if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
             return result;
         } else |err| switch (err) {
             error.EmptySegment => return .{
@@ -10150,7 +10250,11 @@ pub const IndexManager = struct {
             .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
         };
         errdefer result.deinit(alloc);
-        try result.buildPublicationLookup(alloc);
+        result.buildPublicationLookup(task_alloc) catch |err| {
+            if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
+            return err;
+        };
+        result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
         return result;
     }
 
@@ -10431,7 +10535,10 @@ pub const IndexManager = struct {
         // charging every serialized postings and positions byte rejected work
         // that never becomes resident. Keep generous capacity/headroom factors
         // here and enforce the reservation with the bounded task allocator.
-        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
+        // Include the fixed-capacity publication identity table. Ordinal-backed
+        // documents use 32 bytes at the table's <= 50% load factor; retain more
+        // headroom for the less common string-identity fallback.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 224 else 160;
         var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
@@ -11425,6 +11532,24 @@ pub const IndexManager = struct {
 
     fn estimatedMapperDocBytes(doc: mapper.MapperDoc) usize {
         return @sizeOf(mapper.MapperDoc) + doc.key.len + doc.value.len;
+    }
+
+    fn estimateProjectedTextPublication(docs: []const introducer_mod.TextDocument) TextPublicationEstimate {
+        if (docs.len == 0) return .{};
+        const target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes());
+        const target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes());
+        var estimate = TextPublicationEstimate{};
+        var start: usize = 0;
+        while (start < docs.len) {
+            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
+                .target_build_memory_bytes = target_build_memory_bytes,
+                .target_segment_bytes = target_segment_bytes,
+            });
+            estimate.segment_count +|= 1;
+            estimate.byte_count +|= @max(split.estimated_build_bytes, split.estimated_segment_bytes) +| 64 * 1024;
+            start = split.end;
+        }
+        return estimate;
     }
 
     fn splitMapperDocsEnd(docs: []const mapper.MapperDoc, start: usize, target_bytes: usize) usize {
@@ -18034,8 +18159,18 @@ const IndexManagerSimRuntime = struct {
         runtime.dest_manager_open = true;
         errdefer if (runtime.dest_manager_open) runtime.dest_manager.deinit();
 
-        try runtime.source_manager.addAllNoBackfill(&runtime.source_store, &.{indexManagerSimTextConfig()});
-        try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
+        // Replay verification intentionally opens the same paths more than
+        // once. Load the durable catalog first so an existing generation keeps
+        // its coverage identity and projection provenance; only seed a truly
+        // fresh path.
+        try runtime.source_manager.load(&runtime.source_store);
+        if (runtime.source_manager.get(index_manager_sim_index_name) == null) {
+            try runtime.source_manager.addAllNoBackfill(&runtime.source_store, &.{indexManagerSimTextConfig()});
+        }
+        try runtime.dest_manager.load(&runtime.dest_store);
+        if (runtime.dest_manager.get(index_manager_sim_index_name) == null) {
+            try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
+        }
         runtime.updateRanges();
         return runtime;
     }

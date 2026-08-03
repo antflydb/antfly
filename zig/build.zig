@@ -3640,7 +3640,7 @@ pub fn build(b: *std.Build) void {
         .filters = selectTestFilters(b, &.{
             "storage.db.db.test.",
             "unsupported transforms fail atomically instead of reporting success",
-            "unsupported transform on a missing document is rejected before no-op resolution",
+            "supported transform on a missing document remains a no-op without upsert",
             "io threaded applied callback observes published watermark outside runtime lock",
         }),
         .test_runner = .{

@@ -15180,8 +15180,8 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
         if (self.text_merge_runtime) |runtime| {
-            const estimated_segments = self.core.index_manager.estimateTextKernelSegmentCount(docs);
-            merge_permit = try runtime.acquireProducerPermit(@intCast(estimated_segments));
+            const estimate = self.core.index_manager.estimateTextKernelPublication(docs);
+            merge_permit = try runtime.acquireProducerPermit(estimate.segment_count, estimate.byte_count);
         }
         defer if (merge_permit) |*permit| permit.release();
         lockApply(self);
@@ -31477,6 +31477,8 @@ fn applyDerivedBatchToIndexReplayContext(
         .apply_mutex = ctx.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
+        .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
+        .text_merge_deferred = .init(if (ctx.async_context) |active| active.text_merge_deferred.load(.acquire) else false),
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
@@ -31504,13 +31506,6 @@ fn applyDerivedBatch(self: *DB, batch: derived_types.DerivedBatch) !void {
 }
 
 fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
-    var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
-    if (self.text_merge_runtime) |runtime| {
-        if (!self.async_context.text_merge_deferred.load(.acquire)) {
-            merge_permit = try runtime.acquireProducerPermit(self.core.index_manager.fullTextTargetCount(&.{}));
-        }
-    }
-    defer if (merge_permit) |*permit| permit.release();
     var ctx = self.batchContext();
     try applyDerivedBatchContextProfiled(&ctx, batch, profile);
     if (self.text_merge_runtime) |runtime| {
@@ -31521,13 +31516,6 @@ fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profi
 }
 
 fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
-    var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
-    if (self.text_merge_runtime) |runtime| {
-        if (!self.async_context.text_merge_deferred.load(.acquire)) {
-            merge_permit = try runtime.acquireProducerPermit(self.core.index_manager.fullTextTargetCount(index_names));
-        }
-    }
-    defer if (merge_permit) |*permit| permit.release();
     var ctx = self.batchContext();
     try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
     if (self.text_merge_runtime) |runtime| {
@@ -31567,6 +31555,8 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
                 .index_manager = ctx.index_manager,
                 .apply_mutex = ctx.apply_mutex,
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+                .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
+                .text_merge_deferred = .init(if (ctx.async_context) |active| active.text_merge_deferred.load(.acquire) else false),
             };
             try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile);
             const index_sync_start_ns = monotonicTimeNs();
@@ -31910,6 +31900,8 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .text_merge_runtime = self.text_merge_runtime,
+        .text_merge_deferred = .init(self.async_context.text_merge_deferred.load(.acquire)),
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
 }
@@ -32801,38 +32793,53 @@ fn filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(
 }
 
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
-    var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
-    if (index_ref.kind == .full_text and !ctx.text_merge_deferred.load(.acquire)) {
-        if (ctx.text_merge_runtime) |runtime| merge_permit = try runtime.acquireProducerPermit(1);
+    if (index_ref.kind == .full_text) {
+        const apply_start_ns = monotonicTimeNs();
+        const text_replay_options: index_manager_mod.IndexBatchOptions = .{
+            .compact_text = false,
+            .compact_text_segment_threshold = null,
+            .defer_text_compaction = true,
+        };
+        const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
+        defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+        var collected = try collectTextDocumentWritesForIndex(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            batch.documents,
+            index_ref.name,
+            ctx.index_manager.byte_range,
+            .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
+        );
+        defer collected.deinit();
+        if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+
+        var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+        if (!ctx.text_merge_deferred.load(.acquire)) {
+            if (ctx.text_merge_runtime) |runtime| {
+                const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, collected.writes.items);
+                merge_permit = try runtime.acquireProducerPermit(estimate.segment_count, estimate.byte_count);
+            }
+        }
+        defer if (merge_permit) |*permit| permit.release();
+
+        var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+        defer index_apply_guard.unlock();
+        try ctx.index_manager.applyTextBatchByNameWithOptions(
+            ctx.store,
+            index_ref.name,
+            delete_keys,
+            collected.writes.items,
+            text_replay_options,
+        );
+        if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
+        return;
     }
-    defer if (merge_permit) |*permit| permit.release();
+
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     switch (index_ref.kind) {
-        .full_text => {
-            const apply_start_ns = monotonicTimeNs();
-            const text_replay_options: index_manager_mod.IndexBatchOptions = .{
-                .compact_text = false,
-                .compact_text_segment_threshold = null,
-                .defer_text_compaction = true,
-            };
-            const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
-            defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
-
-            const missing_required = try applyTextDocumentsForIndex(
-                ctx.alloc,
-                ctx.store,
-                ctx.index_manager,
-                batch.documents,
-                index_ref.name,
-                ctx.index_manager.byte_range,
-                delete_keys,
-                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
-                text_replay_options,
-            );
-            if (missing_required != 0) return error.ReplayDocumentNotVisible;
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
-        },
+        .full_text => unreachable,
         .dense_vector => {
             const dense_apply_start_ns = monotonicTimeNs();
             const dense_finish_options = denseCatchUpFinishOptions();
@@ -33804,17 +33811,29 @@ fn attachInlineUpsertDocumentValues(
     }
 }
 
-fn applyTextDocumentsForIndex(
+const CollectedTextDocumentWrites = struct {
+    alloc: Allocator,
+    writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    owned_values: std.ArrayListUnmanaged([]u8) = .empty,
+    missing_required: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        for (self.owned_values.items) |value| self.alloc.free(value);
+        self.owned_values.deinit(self.alloc);
+        self.writes.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+fn collectTextDocumentWritesForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_manager: *index_manager_mod.IndexManager,
     documents: []const derived_types.DerivedDocument,
     index_name: []const u8,
     byte_range: types.ByteRange,
-    delete_keys: []const []const u8,
     opts: CollectTextDocumentWritesOptions,
-    index_opts: index_manager_mod.IndexBatchOptions,
-) !usize {
+) !CollectedTextDocumentWrites {
     const chunk_name = index_manager.textChunkName(index_name);
     const PendingTextWrite = struct {
         doc_key: []const u8,
@@ -33828,8 +33847,8 @@ fn applyTextDocumentsForIndex(
         pending.deinit(alloc);
     }
 
-    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    defer writes.deinit(alloc);
+    var result = CollectedTextDocumentWrites{ .alloc = alloc };
+    errdefer result.deinit();
 
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
@@ -33841,7 +33860,7 @@ fn applyTextDocumentsForIndex(
         if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
         if (trust_inline and doc.cleaned_value != null) {
-            try writes.append(alloc, .{
+            try result.writes.append(alloc, .{
                 .key = doc.key,
                 .value = doc.cleaned_value.?,
             });
@@ -33854,15 +33873,10 @@ fn applyTextDocumentsForIndex(
         });
     }
 
-    if (pending.items.len == 0) {
-        try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
-        return 0;
-    }
+    if (pending.items.len == 0) return result;
 
     var txn = try store.beginProbeTxn();
     defer txn.abort();
-    var missing_required: usize = 0;
-
     const SortContext = struct {};
     std.mem.sort(PendingTextWrite, pending.items, SortContext{}, struct {
         fn lessThan(_: SortContext, lhs: PendingTextWrite, rhs: PendingTextWrite) bool {
@@ -33884,18 +33898,30 @@ fn applyTextDocumentsForIndex(
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
             if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
-            missing_required += 1;
+            result.missing_required += 1;
             continue;
         };
-        try writes.append(alloc, .{
+        const stable_value = if (read_values[i] != null) blk: {
+            const owned = try alloc.dupe(u8, value);
+            result.owned_values.append(alloc, owned) catch |err| {
+                alloc.free(owned);
+                return err;
+            };
+            break :blk owned;
+        } else value;
+        result.writes.append(alloc, .{
             .key = item.doc_key,
-            .value = value,
-        });
+            .value = stable_value,
+        }) catch |err| {
+            if (read_values[i] != null) {
+                const owned = result.owned_values.pop().?;
+                alloc.free(owned);
+            }
+            return err;
+        };
     }
 
-    if (missing_required != 0) return missing_required;
-    try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
-    return missing_required;
+    return result;
 }
 
 fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []const u8, is_chunk_index: bool) bool {
@@ -70524,16 +70550,33 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             .max_pending_segments = 8,
             .resume_pending_segments = 4,
             .max_pending_bytes = 0,
-            .backpressure_merge_steps = 1,
             .backpressure_max_wait_ms = 3,
         },
     );
     try bounded_runtime.start();
     const bounded_outcome = bounded_runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.timed_out, bounded_outcome);
-    try std.testing.expectError(error.TextMergeBackpressureTimeout, bounded_runtime.acquireProducerPermit(1));
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, bounded_runtime.acquireProducerPermit(1, 1));
     try std.testing.expectEqual(@as(u64, 2), bounded_runtime.stats().backpressure_timeouts);
     bounded_runtime.deinit();
+
+    var byte_only_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        null,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 0,
+            .resume_pending_segments = 0,
+            .max_pending_bytes = 1,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    try byte_only_runtime.start();
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit(0, 1));
+    byte_only_runtime.deinit();
 
     resources.index_manager.cancelTextMergeTask(&held_task);
     held_task.deinit(resources.index_manager.alloc);
@@ -70550,7 +70593,6 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             .max_pending_segments = 8,
             .resume_pending_segments = 4,
             .max_pending_bytes = 0,
-            .backpressure_merge_steps = 1,
         },
     );
     defer runtime.deinit();
@@ -70563,6 +70605,39 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     try std.testing.expect(after.pending_segments <= 4);
     try std.testing.expectEqual(@as(u64, 1), after.backpressure_events);
     try std.testing.expect(after.merge_input_segments_total >= 10);
+
+    var admission_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        null,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 8,
+            .resume_pending_segments = 4,
+            .max_pending_bytes = 100,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer admission_runtime.deinit();
+    try admission_runtime.start();
+
+    var first_permit = try admission_runtime.acquireProducerPermit(1, 80);
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, admission_runtime.acquireProducerPermit(1, 30));
+    first_permit.release();
+
+    // One indivisible publication larger than either watermark is admitted
+    // exclusively once existing debt and reservations are empty.
+    var oversized_permit = try admission_runtime.acquireProducerPermit(9, 200);
+    oversized_permit.release();
+
+    // Pausing the background worker for a structural mutation must not poison
+    // foreground admission while capacity is available.
+    try std.testing.expect(admission_runtime.pause());
+    var paused_permit = try admission_runtime.acquireProducerPermit(1, 10);
+    paused_permit.release();
+    try admission_runtime.resumeAfterPause();
 
     const text_index = db.core.index_manager.textIndex("ft_v1") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 24), text_index.snapshot().liveDocCount());
