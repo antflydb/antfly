@@ -234,6 +234,30 @@ func TestClient_Embed_TransientCapacityError(t *testing.T) {
 	assert.True(t, capacityErr.Temporary())
 }
 
+func TestClient_Embed_NonRetryableCapacityBodyIsNotTemporary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":          "MODEL_RESOURCE_BUSY",
+			"message":        "request cannot be retried",
+			"reason":         "inference_capacity",
+			"retryable":      false,
+			"retry_after_ms": 1000,
+		})
+	}))
+	defer server.Close()
+
+	inferenceClient, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+
+	_, err = inferenceClient.Embed(context.Background(), "busy-model", []string{"hello"})
+	require.Error(t, err)
+	var capacityErr *InferenceCapacityError
+	assert.False(t, errors.As(err, &capacityErr))
+	assert.Contains(t, err.Error(), "service unavailable")
+}
+
 func TestClient_Chunk(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/ai/v1/chunk", r.URL.Path)

@@ -122,7 +122,8 @@ func inferenceCapacityError(body *oapi.TransientCapacity) error {
 	reason := string(body.Reason)
 	retryAfterMs := int64(body.RetryAfterMs)
 	const maxDurationMillis = int64((1<<63 - 1) / int64(time.Millisecond))
-	if body.Message == "" ||
+	if !bool(body.Retryable) ||
+		body.Message == "" ||
 		(reason != "inference_capacity" && reason != "request_queue") ||
 		retryAfterMs <= 0 || retryAfterMs > maxDurationMillis {
 		// Preserve compatibility with older servers that returned an untyped 503.
