@@ -9715,6 +9715,7 @@ pub const ApiHttpServer = struct {
                 _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                     error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                    error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
                     else => {
                         std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
                         return error.InternalFailure;

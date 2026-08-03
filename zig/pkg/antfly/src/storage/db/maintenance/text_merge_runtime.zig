@@ -114,6 +114,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{};
     }
 
+    pub fn producerSegmentChunkLimit(_: *const @This()) usize {
+        return std.math.maxInt(usize);
+    }
+
     pub fn stats(self: *@This()) types.TextMergeStats {
         return self.statsAssumeApplyLockHeld();
     }
@@ -129,6 +133,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     const ProducerAdmissionWaiter = struct {
         previous: ?*ProducerAdmissionWaiter = null,
         next: ?*ProducerAdmissionWaiter = null,
+        index_name: []const u8,
+        waiting_for_bytes: bool = false,
         enqueued: bool = false,
     };
 
@@ -149,6 +155,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     backpressure_timeouts: u64 = 0,
     backpressure_failures: u64 = 0,
     producer_segment_reservations: u64 = 0,
+    producer_segment_reservations_by_index: std.StringHashMapUnmanaged(u64) = .empty,
     producer_byte_reservations: u64 = 0,
     producer_release_epoch: u64 = 0,
     producer_wait_epoch: std.atomic.Value(u32) = .init(0),
@@ -159,6 +166,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub const ProducerPermit = struct {
         runtime: *TextMergeRuntime,
+        index_name: ?[]const u8,
         segment_count: u64,
         byte_count: u64,
         active: bool = true,
@@ -171,6 +179,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             runtime.mutex.lockUncancelable(io);
             std.debug.assert(runtime.producer_segment_reservations >= self.segment_count);
             std.debug.assert(runtime.producer_byte_reservations >= self.byte_count);
+            if (self.segment_count > 0) {
+                const reserved = runtime.producer_segment_reservations_by_index.getPtr(self.index_name.?) orelse unreachable;
+                std.debug.assert(reserved.* >= self.segment_count);
+                reserved.* -= self.segment_count;
+            }
             runtime.producer_segment_reservations -= self.segment_count;
             runtime.producer_byte_reservations -= self.byte_count;
             // Publication completes before release. Advancing the epoch makes
@@ -209,7 +222,21 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *TextMergeRuntime) void {
         _ = self.stop();
+        var reservation_keys = self.producer_segment_reservations_by_index.keyIterator();
+        while (reservation_keys.next()) |key| self.alloc.free(@constCast(key.*));
+        self.producer_segment_reservations_by_index.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Bound a single publication below the configured high watermark while
+    /// retaining the configured low-watermark space for the live index
+    /// baseline. Callers chunk larger batches at this boundary.
+    pub fn producerSegmentChunkLimit(self: *const TextMergeRuntime) usize {
+        const high = self.config.max_pending_segments;
+        if (!self.config.enabled or high == 0) return std.math.maxInt(usize);
+        const retained_baseline = @min(self.config.resume_pending_segments, high - 1);
+        const limit = high - retained_baseline;
+        return std.math.cast(usize, limit) orelse std.math.maxInt(usize);
     }
 
     pub fn start(self: *TextMergeRuntime) !void {
@@ -420,12 +447,14 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         if ((segment_count == 0 and byte_count == 0) or !self.config.enabled or
             (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0))
         {
-            return .{ .runtime = self, .segment_count = 0, .byte_count = 0, .active = false };
+            return .{ .runtime = self, .index_name = null, .segment_count = 0, .byte_count = 0, .active = false };
         }
+        if (self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments)
+            return error.TextPublicationExceedsSegmentLimit;
 
         const started_ns = self.backpressureNowNs();
         var recorded_wait = false;
-        var waiter: ProducerAdmissionWaiter = .{};
+        var waiter = ProducerAdmissionWaiter{ .index_name = index_name };
         defer self.removeProducerAdmissionWaiter(&waiter);
         defer if (recorded_wait) self.recordBackpressureElapsed(started_ns);
         self.notify();
@@ -445,12 +474,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.unlock(io);
                 return error.TextMergeRuntimeShutdown;
             }
-            // Once contention exists, only the FIFO head may inspect and claim
-            // capacity. This prevents a stream of small publications from
-            // repeatedly overtaking an older, larger catch-up batch.
-            if ((waiter.enqueued and self.producer_admission_head != &waiter) or
-                (!waiter.enqueued and self.producer_admission_head != null))
-            {
+            // Preserve weighted FIFO within one index and for callers already
+            // blocked on the shared byte budget. A segment-blocked producer on
+            // index A must not stall independent index B.
+            if (self.hasEarlierProducerAdmissionConflict(&waiter)) {
                 if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
                 if (!recorded_wait) {
                     self.backpressure_events += 1;
@@ -485,31 +512,42 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.unlock(io);
                 continue;
             }
+            const index_segment_reservations = self.producer_segment_reservations_by_index.get(index_name) orelse 0;
+            const reserved_index_segments = std.math.add(u64, index_segment_reservations, segment_count) catch std.math.maxInt(u64);
             const reserved_segments = std.math.add(u64, self.producer_segment_reservations, segment_count) catch std.math.maxInt(u64);
             const reserved_bytes = std.math.add(u64, self.producer_byte_reservations, byte_count) catch std.math.maxInt(u64);
-            // Query fan-out is determined by every live segment of the target
-            // index, not merely indexes already marked for compaction. Global
-            // in-flight reservations remain conservative across indexes and
-            // avoid allocation or name ownership on this hot path.
-            const admitted_segments = std.math.add(u64, active_segments, reserved_segments) catch std.math.maxInt(u64);
+            // Query fan-out is determined by every live segment and in-flight
+            // publication for this index. Bytes remain process-global because
+            // they protect shared memory and storage resources.
+            const admitted_segments = std.math.add(u64, active_segments, reserved_index_segments) catch std.math.maxInt(u64);
             const admitted_bytes = std.math.add(u64, stats_snapshot.pending_bytes, reserved_bytes) catch std.math.maxInt(u64);
-            const request_oversized =
-                (self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments) or
-                (self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes);
+            const request_oversized_bytes = self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes;
             const no_existing_debt = stats_snapshot.pending_segments == 0 and stats_snapshot.pending_bytes == 0 and
                 self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
             const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
-            if ((request_oversized and no_existing_debt) or (!request_oversized and segments_admissible and bytes_admissible)) {
+            if (segments_admissible and ((request_oversized_bytes and no_existing_debt) or (!request_oversized_bytes and bytes_admissible))) {
+                const owned_index_name = if (segment_count > 0)
+                    self.ensureProducerReservationIndexLocked(index_name) catch |err| {
+                        self.mutex.unlock(io);
+                        return err;
+                    }
+                else
+                    null;
                 const admitted_from_queue = waiter.enqueued;
                 if (admitted_from_queue) self.removeProducerAdmissionWaiterLocked(&waiter);
+                if (owned_index_name) |name| {
+                    const value = self.producer_segment_reservations_by_index.getPtr(name) orelse unreachable;
+                    value.* = reserved_index_segments;
+                }
                 self.producer_segment_reservations = reserved_segments;
                 self.producer_byte_reservations = reserved_bytes;
                 self.mutex.unlock(io);
                 if (admitted_from_queue) self.signalProducerAdmissionChanged();
-                return .{ .runtime = self, .segment_count = segment_count, .byte_count = byte_count };
+                return .{ .runtime = self, .index_name = owned_index_name, .segment_count = segment_count, .byte_count = byte_count };
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
+            waiter.waiting_for_bytes = segments_admissible;
             if (!recorded_wait) {
                 self.backpressure_events += 1;
                 recorded_wait = true;
@@ -521,6 +559,23 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 return error.TextMergeBackpressureTimeout;
             }
         }
+    }
+
+    fn hasEarlierProducerAdmissionConflict(self: *TextMergeRuntime, waiter: *const ProducerAdmissionWaiter) bool {
+        var current = self.producer_admission_head;
+        while (current) |queued| : (current = queued.next) {
+            if (queued == waiter) return false;
+            if (queued.waiting_for_bytes or std.mem.eql(u8, queued.index_name, waiter.index_name)) return true;
+        }
+        return false;
+    }
+
+    fn ensureProducerReservationIndexLocked(self: *TextMergeRuntime, index_name: []const u8) ![]const u8 {
+        if (self.producer_segment_reservations_by_index.getKey(index_name)) |owned| return owned;
+        const owned = try self.alloc.dupe(u8, index_name);
+        errdefer self.alloc.free(owned);
+        try self.producer_segment_reservations_by_index.put(self.alloc, owned, 0);
+        return owned;
     }
 
     fn enqueueProducerAdmissionWaiter(self: *TextMergeRuntime, waiter: *ProducerAdmissionWaiter) void {

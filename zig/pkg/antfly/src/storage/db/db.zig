@@ -15177,20 +15177,29 @@ pub const DB = struct {
         docs: []const introducer_mod.TextDocument,
     ) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
-        if (self.text_merge_runtime) |runtime| {
-            const estimate = self.core.index_manager.estimateTextKernelPublication(docs);
-            merge_permit = try runtime.acquireProducerPermit(index_name, estimate.segment_count, estimate.byte_count);
-        }
-        defer if (merge_permit) |*permit| permit.release();
-        lockApply(self);
-        const segment_count = self.core.index_manager.indexTextKernelDocuments(index_name, docs) catch |err| {
-            self.core.unlockApply();
-            return err;
-        };
-        self.core.unlockApply();
-        if (self.text_merge_runtime) |runtime| {
-            runtime.notify();
+        const chunk_limit = if (self.text_merge_runtime) |runtime| runtime.producerSegmentChunkLimit() else std.math.maxInt(usize);
+        var segment_count: usize = 0;
+        var start: usize = 0;
+        while (start < docs.len) {
+            const end = start + @min(chunk_limit, docs.len - start);
+            const chunk = docs[start..end];
+            {
+                var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+                if (self.text_merge_runtime) |runtime| {
+                    const estimate = self.core.index_manager.estimateTextKernelPublication(chunk);
+                    merge_permit = try runtime.acquireProducerPermit(index_name, estimate.segment_count, estimate.byte_count);
+                }
+                defer if (merge_permit) |*permit| permit.release();
+                lockApply(self);
+                const published = self.core.index_manager.indexTextKernelDocuments(index_name, chunk) catch |err| {
+                    self.core.unlockApply();
+                    return err;
+                };
+                self.core.unlockApply();
+                segment_count += published;
+                if (self.text_merge_runtime) |runtime| runtime.notify();
+            }
+            start = end;
         }
         return segment_count;
     }
@@ -32808,22 +32817,34 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         defer collected.deinit();
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
 
-        var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
-        if (ctx.text_merge_runtime) |runtime| {
-            const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, collected.writes.items);
-            merge_permit = try runtime.acquireProducerPermit(index_ref.name, estimate.segment_count, estimate.byte_count);
-        }
-        defer if (merge_permit) |*permit| permit.release();
+        const chunk_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentChunkLimit() else std.math.maxInt(usize);
+        var write_start: usize = 0;
+        var applied_first_chunk = false;
+        while (!applied_first_chunk or write_start < collected.writes.items.len) {
+            const write_end = write_start + @min(chunk_limit, collected.writes.items.len - write_start);
+            const write_chunk = collected.writes.items[write_start..write_end];
+            {
+                var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+                if (ctx.text_merge_runtime) |runtime| {
+                    const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, write_chunk);
+                    merge_permit = try runtime.acquireProducerPermit(index_ref.name, estimate.segment_count, estimate.byte_count);
+                }
+                defer if (merge_permit) |*permit| permit.release();
 
-        var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
-        defer index_apply_guard.unlock();
-        try ctx.index_manager.applyTextBatchByNameWithOptions(
-            ctx.store,
-            index_ref.name,
-            delete_keys,
-            collected.writes.items,
-            text_replay_options,
-        );
+                var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+                defer index_apply_guard.unlock();
+                try ctx.index_manager.applyTextBatchByNameWithOptions(
+                    ctx.store,
+                    index_ref.name,
+                    if (applied_first_chunk) &.{} else delete_keys,
+                    write_chunk,
+                    text_replay_options,
+                );
+                if (ctx.text_merge_runtime) |runtime| runtime.notify();
+            }
+            applied_first_chunk = true;
+            write_start = write_end;
+        }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
         return;
     }
@@ -70695,6 +70716,40 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         },
     );
     defer fair_runtime.deinit();
+
+    // An older waiter blocked only on index A's segment ceiling must not
+    // become a global queue head that stalls independent index B.
+    var cross_index_blocker = try fair_runtime.acquireProducerPermit("admission-a", 100, 0);
+    var cross_index_acquired = std.atomic.Value(bool).init(false);
+    const CrossIndexWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        acquired: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit("admission-a", 1, 0) catch return;
+            self.acquired.store(true, .release);
+            permit.release();
+        }
+    };
+    var cross_index_waiter = CrossIndexWaiter{ .runtime = &fair_runtime, .acquired = &cross_index_acquired };
+    const cross_events_before = fair_runtime.stats().backpressure_events;
+    const cross_index_thread = try std.Thread.spawn(.{}, CrossIndexWaiter.run, .{&cross_index_waiter});
+    var cross_index_joined = false;
+    defer if (!cross_index_joined) {
+        cross_index_blocker.release();
+        cross_index_thread.join();
+    };
+    const cross_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events > cross_events_before);
+    var independent_index_permit = try fair_runtime.acquireProducerPermit("admission-b", 100, 0);
+    independent_index_permit.release();
+    try std.testing.expect(!cross_index_acquired.load(.acquire));
+    cross_index_blocker.release();
+    cross_index_thread.join();
+    cross_index_joined = true;
+    try std.testing.expect(cross_index_acquired.load(.acquire));
+
     var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
     var blocking_active = true;
     defer if (blocking_active) blocking_permit.release();
@@ -70811,10 +70866,23 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var post_cancel_permit = try fair_runtime.acquireProducerPermit("admission-test", 1, 0);
     post_cancel_permit.release();
 
-    // One indivisible publication larger than either watermark is admitted
-    // exclusively once existing debt and reservations are empty.
-    var oversized_permit = try admission_runtime.acquireProducerPermit("ft_v1", 9, 200);
-    oversized_permit.release();
+    // Segment reservations are isolated by index, while the byte budget stays
+    // shared. A large publication cannot create cross-index head-of-line
+    // blocking for query-fanout capacity.
+    var index_a_permit = try fair_runtime.acquireProducerPermit("admission-a", 95, 0);
+    var index_b_permit = try fair_runtime.acquireProducerPermit("admission-b", 95, 0);
+    index_b_permit.release();
+    index_a_permit.release();
+
+    // Segment publications must be chunked by callers and can never bypass
+    // the hard fanout limit. A byte-oversized indivisible chunk may still make
+    // exclusive progress when its segment reservation is within the limit.
+    try std.testing.expectError(
+        error.TextPublicationExceedsSegmentLimit,
+        admission_runtime.acquireProducerPermit("ft_v1", 9, 0),
+    );
+    var oversized_byte_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 200);
+    oversized_byte_permit.release();
 
     // Pausing the background worker for a structural mutation must not poison
     // foreground admission while capacity is available.
@@ -70825,6 +70893,90 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     const text_index = db.core.index_manager.textIndex("ft_v1") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 24), text_index.snapshot().liveDocCount());
+}
+
+test "db text kernel chunks publications below hard segment admission limit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 10_000,
+            .error_interval_ms = 10_000,
+            .max_pending_segments = 4,
+            .resume_pending_segments = 2,
+            .max_pending_bytes = 0,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), runtime.producerSegmentChunkLimit());
+    try std.testing.expect(runtime.pause());
+
+    const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "bounded publication" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{ .id = "doc:0", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 1 },
+        .{ .id = "doc:1", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 2 },
+        .{ .id = "doc:2", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 3 },
+        .{ .id = "doc:3", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 4 },
+        .{ .id = "doc:4", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 5 },
+    };
+    try std.testing.expectEqual(@as(usize, 3), try db.indexTextKernelDocuments("ft_v1", &docs));
+    const stats = db.core.index_manager.textMergeStatsSnapshotForIndex("ft_v1");
+    try std.testing.expectEqual(@as(u64, 3), stats.active_segments);
+    try std.testing.expect(stats.active_segments <= 4);
+}
+
+test "db derived text replay chunks publications below hard segment admission limit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 10_000,
+            .error_interval_ms = 10_000,
+            .max_pending_segments = 4,
+            .resume_pending_segments = 2,
+            .max_pending_bytes = 0,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(runtime.pause());
+    defer runtime.resumeAfterPause() catch {};
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:0", .value = "{\"body\":\"bounded publication zero\"}" },
+            .{ .key = "doc:1", .value = "{\"body\":\"bounded publication one\"}" },
+            .{ .key = "doc:2", .value = "{\"body\":\"bounded publication two\"}" },
+            .{ .key = "doc:3", .value = "{\"body\":\"bounded publication three\"}" },
+            .{ .key = "doc:4", .value = "{\"body\":\"bounded publication four\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const stats = db.core.index_manager.textMergeStatsSnapshotForIndex("ft_v1");
+    try std.testing.expect(stats.active_segments <= 4);
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "bounded" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 5), result.total_hits);
 }
 
 test "db runUntilIdle drains scheduled text merges without index workers" {
