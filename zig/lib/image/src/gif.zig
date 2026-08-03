@@ -89,6 +89,19 @@ const Parser = struct {
 };
 
 pub fn decodeFramesAlloc(alloc: Allocator, gif_bytes: []const u8) ![]Frame {
+    return decodeFramesAllocLimited(alloc, gif_bytes, null);
+}
+
+/// Decode only the first rendered frame. Inference consumes a still image, so
+/// retaining every animation frame only multiplies untrusted working memory.
+pub fn decodeFirstFrameAlloc(alloc: Allocator, gif_bytes: []const u8) !Frame {
+    const frames = try decodeFramesAllocLimited(alloc, gif_bytes, 1);
+    defer alloc.free(frames);
+    if (frames.len == 0) return error.GifDecodeFailed;
+    return frames[0];
+}
+
+fn decodeFramesAllocLimited(alloc: Allocator, gif_bytes: []const u8, max_frames: ?usize) ![]Frame {
     var parser = Parser{ .bytes = gif_bytes };
 
     const header = try parser.readSlice(6);
@@ -189,6 +202,10 @@ pub fn decodeFramesAlloc(alloc: Allocator, gif_bytes: []const u8) ![]Frame {
                     .height = screen_height,
                     .delay_ms = gce.delay_ms,
                 });
+
+                if (max_frames) |limit| {
+                    if (frames.items.len >= limit) break;
+                }
 
                 try applyDisposal(canvas, previous_canvas, screen_width, screen_height, descriptor, gce, background_rgba);
                 gce = .{};

@@ -6,6 +6,8 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 T = TypeVar("T", bound="InferenceError")
 
 
@@ -13,14 +15,22 @@ T = TypeVar("T", bound="InferenceError")
 class InferenceError:
     """
     Attributes:
-        error (str): Error message
+        error (str): Machine-readable code or concise error message
+        message (str | Unset): Human-readable error detail
+        retryable (bool | Unset): Whether retrying the request may succeed
     """
 
     error: str
+    message: str | Unset = UNSET
+    retryable: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         error = self.error
+
+        message = self.message
+
+        retryable = self.retryable
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -29,6 +39,10 @@ class InferenceError:
                 "error": error,
             }
         )
+        if message is not UNSET:
+            field_dict["message"] = message
+        if retryable is not UNSET:
+            field_dict["retryable"] = retryable
 
         return field_dict
 
@@ -37,8 +51,14 @@ class InferenceError:
         d = dict(src_dict)
         error = d.pop("error")
 
+        message = d.pop("message", UNSET)
+
+        retryable = d.pop("retryable", UNSET)
+
         inference_error = cls(
             error=error,
+            message=message,
+            retryable=retryable,
         )
 
         inference_error.additional_properties = d

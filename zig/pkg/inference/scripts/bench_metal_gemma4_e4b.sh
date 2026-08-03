@@ -169,6 +169,43 @@ if [[ "${ANTFLY_INFERENCE_GEMMA4_E4B_REQUIRE_FULL_TOKENS:-0}" != "0" ]]; then
   export ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOKENS="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOKENS:-${ANTFLY_INFERENCE_GEMMA4_BENCH_MAX_TOKENS:-128}}"
 fi
 
+macos_free_speculative_mb() {
+  local stats page_size pages
+  stats="$(vm_stat 2>/dev/null)" || return 1
+  page_size="$(awk '/page size of/ { print $8; exit }' <<<"$stats")"
+  pages="$(awk '
+    /Pages free:/ { gsub(/\./, "", $3); free = $3 }
+    /Pages speculative:/ { gsub(/\./, "", $3); speculative = $3 }
+    END { print free + speculative }
+  ' <<<"$stats")"
+  if [[ -z "$page_size" || -z "$pages" ]]; then
+    return 1
+  fi
+  echo $((pages * page_size / 1024 / 1024))
+}
+
+macos_pressure_available_mb() {
+  local stats total_bytes free_pct
+  stats="$(memory_pressure -Q 2>/dev/null)" || return 1
+  total_bytes="$(awk '/The system has/ { print $4; exit }' <<<"$stats")"
+  free_pct="$(awk '/System-wide memory free percentage:/ { gsub(/%/, "", $5); print $5; exit }' <<<"$stats")"
+  if [[ -z "$total_bytes" || -z "$free_pct" ]]; then
+    return 1
+  fi
+  echo $((total_bytes * free_pct / 100 / 1024 / 1024))
+}
+
+MIN_FREE_MB="${ANTFLY_INFERENCE_GEMMA4_E4B_MIN_FREE_MB:-1024}"
+if [[ "$MIN_FREE_MB" != "0" ]]; then
+  free_mb="$(macos_pressure_available_mb || macos_free_speculative_mb || true)"
+  if [[ -n "$free_mb" && "$free_mb" -lt "$MIN_FREE_MB" ]]; then
+    echo "Gemma4 E4B Metal bench refused: available memory ${free_mb} MiB below ${MIN_FREE_MB} MiB" >&2
+    echo "set ANTFLY_INFERENCE_GEMMA4_E4B_MIN_FREE_MB=0 to force the run" >&2
+    memory_pressure -Q >&2 2>/dev/null || true
+    exit 2
+  fi
+fi
+
 FAST_RESIDENCY="${ANTFLY_INFERENCE_GEMMA4_E4B_FAST_RESIDENCY:-1}"
 if [[ "$FAST_RESIDENCY" != "0" ]]; then
   export TERMITE_METAL_DISABLE_GEMMA4_E4B_FAST_RESIDENCY="${TERMITE_METAL_DISABLE_GEMMA4_E4B_FAST_RESIDENCY:-0}"
@@ -177,11 +214,8 @@ if [[ "$FAST_RESIDENCY" != "0" ]]; then
     export ANTFLY_INFERENCE_GEMMA4_MIN_Q6_REDUCE_IN_F16="${ANTFLY_INFERENCE_GEMMA4_MIN_Q6_REDUCE_IN_F16:-0}"
   fi
   export ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_TOKENS="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_TOKENS:-16 64}"
-  if [[ "$IS_QAT" == "1" ]]; then
-    export ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S:-10}"
-  else
-    export ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S:-10}"
-  fi
+  export ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_READY_POLLS="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_READY_POLLS:-3600}"
+  export ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S:-10}"
 else
   export TERMITE_METAL_DISABLE_GEMMA4_E4B_FAST_RESIDENCY=1
   if [[ "$IS_QAT" == "0" ]]; then

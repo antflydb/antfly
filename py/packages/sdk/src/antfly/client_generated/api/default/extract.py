@@ -43,15 +43,35 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 403:
+        response_403 = InferenceError.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
+
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 502:
+        response_502 = InferenceError.from_dict(response.json())
+
+        return response_502
 
     if response.status_code == 503:
         response_503 = InferenceError.from_dict(response.json())
@@ -87,6 +107,10 @@ def sync_detailed(
     text/document classification, token classification, and structured
     document extraction.
 
+    Image-backed extraction uses the same byte-reserving and image-count-weighted
+    admission policy as `/read`, before model resolution or download. Text-only
+    extraction consumes one admission unit.
+
     Args:
         body (ExtractionRequest):
 
@@ -121,6 +145,10 @@ def sync(
     text/document classification, token classification, and structured
     document extraction.
 
+    Image-backed extraction uses the same byte-reserving and image-count-weighted
+    admission policy as `/read`, before model resolution or download. Text-only
+    extraction consumes one admission unit.
+
     Args:
         body (ExtractionRequest):
 
@@ -149,6 +177,10 @@ async def asyncio_detailed(
     canonical public API for named entity recognition, relation extraction,
     text/document classification, token classification, and structured
     document extraction.
+
+    Image-backed extraction uses the same byte-reserving and image-count-weighted
+    admission policy as `/read`, before model resolution or download. Text-only
+    extraction consumes one admission unit.
 
     Args:
         body (ExtractionRequest):
@@ -181,6 +213,10 @@ async def asyncio(
     canonical public API for named entity recognition, relation extraction,
     text/document classification, token classification, and structured
     document extraction.
+
+    Image-backed extraction uses the same byte-reserving and image-count-weighted
+    admission policy as `/read`, before model resolution or download. Text-only
+    extraction consumes one admission unit.
 
     Args:
         body (ExtractionRequest):

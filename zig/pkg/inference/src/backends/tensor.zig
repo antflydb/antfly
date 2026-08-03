@@ -63,93 +63,50 @@ pub const Tensor = struct {
     mmap_source_bytes: ?[]const u8 = null,
     lifetime: ?Lifetime = null,
 
-    pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
-        const bytes = std.mem.sliceAsBytes(data);
-        const owned_bytes = try allocator.dupe(u8, bytes);
+    fn initOwned(
+        comptime T: type,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        shape: []const i64,
+        data: []const T,
+        dtype: DType,
+    ) !Tensor {
+        const owned_bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(data));
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
-            .dtype = .f32,
+            .dtype = dtype,
             .shape = owned_shape,
             .name = name,
             .allocator = allocator,
             .owns_data = true,
             .owns_shape = true,
         };
+    }
+
+    pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
+        return initOwned(f32, allocator, name, shape, data, .f32);
     }
 
     pub fn initInt64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i64) !Tensor {
-        const bytes = std.mem.sliceAsBytes(data);
-        const owned_bytes = try allocator.dupe(u8, bytes);
-        const owned_shape = try allocator.dupe(i64, shape);
-        return .{
-            .data = owned_bytes,
-            .dtype = .i64,
-            .shape = owned_shape,
-            .name = name,
-            .allocator = allocator,
-            .owns_data = true,
-            .owns_shape = true,
-        };
+        return initOwned(i64, allocator, name, shape, data, .i64);
     }
 
     pub fn initInt8(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i8) !Tensor {
-        const bytes = std.mem.sliceAsBytes(data);
-        const owned_bytes = try allocator.dupe(u8, bytes);
-        const owned_shape = try allocator.dupe(i64, shape);
-        return .{
-            .data = owned_bytes,
-            .dtype = .i8,
-            .shape = owned_shape,
-            .name = name,
-            .allocator = allocator,
-            .owns_data = true,
-            .owns_shape = true,
-        };
+        return initOwned(i8, allocator, name, shape, data, .i8);
     }
 
     pub fn initInt16(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i16) !Tensor {
-        const bytes = std.mem.sliceAsBytes(data);
-        const owned_bytes = try allocator.dupe(u8, bytes);
-        const owned_shape = try allocator.dupe(i64, shape);
-        return .{
-            .data = owned_bytes,
-            .dtype = .i16,
-            .shape = owned_shape,
-            .name = name,
-            .allocator = allocator,
-            .owns_data = true,
-            .owns_shape = true,
-        };
+        return initOwned(i16, allocator, name, shape, data, .i16);
     }
 
     pub fn initFloat64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f64) !Tensor {
-        const bytes = std.mem.sliceAsBytes(data);
-        const owned_bytes = try allocator.dupe(u8, bytes);
-        const owned_shape = try allocator.dupe(i64, shape);
-        return .{
-            .data = owned_bytes,
-            .dtype = .f64,
-            .shape = owned_shape,
-            .name = name,
-            .allocator = allocator,
-            .owns_data = true,
-            .owns_shape = true,
-        };
+        return initOwned(f64, allocator, name, shape, data, .f64);
     }
 
     pub fn initBool(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const u8) !Tensor {
-        const owned_bytes = try allocator.dupe(u8, data);
-        const owned_shape = try allocator.dupe(i64, shape);
-        return .{
-            .data = owned_bytes,
-            .dtype = .bool_,
-            .shape = owned_shape,
-            .name = name,
-            .allocator = allocator,
-            .owns_data = true,
-            .owns_shape = true,
-        };
+        return initOwned(u8, allocator, name, shape, data, .bool_);
     }
 
     pub fn asFloat32(self: *const Tensor) []const f32 {
@@ -224,6 +181,18 @@ test "tensor f32 round-trip" {
     const slice = t.asFloat32();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), slice[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), slice[3], 1e-6);
+}
+
+test "tensor constructor frees copied data when shape allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const data = [_]f32{ 1.0, 2.0 };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Tensor.initFloat32(failing.allocator(), "test", &.{2}, &data),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "tensor scalar dtype sizes" {

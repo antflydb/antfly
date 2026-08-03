@@ -5,11 +5,15 @@ on:
     branches: [main]
     paths:
       - "ts/**"
+      - "openapi.yaml"
+      - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "ts/**"
+      - "openapi.yaml"
+      - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
 
 concurrency:

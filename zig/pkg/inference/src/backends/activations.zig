@@ -357,31 +357,56 @@ pub fn argmax(data: []const f32) usize {
 }
 
 /// Top-k filtering: zero out everything below the k-th largest probability, then renormalize.
+/// Single pass over the vector with a size-k min-heap (O(len·log k)). The
+/// previous implementation rescanned the full vector once per kept value
+/// (O(k·len)), which cost ~100ms per sampled token on a 262k-entry vocabulary
+/// and made sampled decoding ~15x slower than greedy.
 pub fn topK(probs: []f32, k: usize, allocator: std.mem.Allocator) void {
-    if (k >= probs.len) return;
+    if (k == 0 or k >= probs.len) return;
 
-    // Copy and partial-sort to find the k-th largest value.
-    // Use a scratch buffer so we don't disturb the original until we threshold.
-    const scratch = allocator.alloc(f32, probs.len) catch {
+    // Min-heap of the k largest values seen so far; heap[0] is the running
+    // k-th largest, so most elements cost a single compare.
+    const heap = allocator.alloc(f32, k) catch {
         // Fallback: greedy keep-top-k without allocation
         topKScalar(probs, k);
         return;
     };
-    defer allocator.free(scratch);
-    @memcpy(scratch, probs);
-
-    // Partial sort: repeatedly find max and zero to get the k-th value.
-    var threshold: f32 = 0.0;
-    for (0..k) |_| {
-        const m = vectorMax(scratch);
-        if (m <= 0 or m == -std.math.inf(f32)) break;
-        threshold = m;
-        // Zero out all instances of max so next iteration finds the next value
-        replaceVal(scratch, m, 0.0);
+    defer allocator.free(heap);
+    var size: usize = 0;
+    for (probs) |v| {
+        if (size < k) {
+            heap[size] = v;
+            size += 1;
+            if (size == k) {
+                var i = k / 2;
+                while (i > 0) {
+                    i -= 1;
+                    siftDownMin(heap[0..k], i);
+                }
+            }
+        } else if (v > heap[0]) {
+            heap[0] = v;
+            siftDownMin(heap[0..k], 0);
+        }
     }
 
-    // Threshold + renormalize
-    thresholdAndNormalize(probs, threshold);
+    // Threshold + renormalize. Ties at the k-th value are all kept, matching
+    // the previous distinct-value semantics at the boundary.
+    thresholdAndNormalize(probs, heap[0]);
+}
+
+fn siftDownMin(heap: []f32, start: usize) void {
+    var i = start;
+    while (true) {
+        const left = 2 * i + 1;
+        const right = left + 1;
+        var smallest = i;
+        if (left < heap.len and heap[left] < heap[smallest]) smallest = left;
+        if (right < heap.len and heap[right] < heap[smallest]) smallest = right;
+        if (smallest == i) return;
+        std.mem.swap(f32, &heap[i], &heap[smallest]);
+        i = smallest;
+    }
 }
 
 /// Scalar fallback for topK when allocation fails.
@@ -407,28 +432,40 @@ fn topKScalar(probs: []f32, k: usize) void {
 
 /// Top-p (nucleus) filtering: keep the smallest set of tokens whose cumulative
 /// probability >= p, zero out the rest, then renormalize.
+/// Gathers the positive candidates once and sorts them descending; after
+/// top-k filtering at most k survive, so the sort is tiny. The previous
+/// implementation rescanned the full vector once per distinct kept value.
 pub fn topP(probs: []f32, p: f32, allocator: std.mem.Allocator) void {
     if (p >= 1.0) return;
 
-    // Work on a scratch copy to walk from largest to smallest
-    const scratch = allocator.alloc(f32, probs.len) catch {
+    var nonzero: usize = 0;
+    for (probs) |v| {
+        if (v > 0) nonzero += 1;
+    }
+    if (nonzero == 0) return;
+
+    const scratch = allocator.alloc(f32, nonzero) catch {
         topPScalar(probs, p);
         return;
     };
     defer allocator.free(scratch);
-    @memcpy(scratch, probs);
+    var idx: usize = 0;
+    for (probs) |v| {
+        if (v > 0) {
+            scratch[idx] = v;
+            idx += 1;
+        }
+    }
+    std.mem.sort(f32, scratch, {}, std.sort.desc(f32));
 
     var cumsum: f32 = 0.0;
-    var cutoff: f32 = 0.0;
-
-    while (cumsum < p) {
-        const m = vectorMax(scratch);
-        if (m <= 0 or m == -std.math.inf(f32)) break;
-        cutoff = m;
-        // Sum all instances of this value
-        cumsum += sumEqual(scratch, m);
-        // Zero them out so next iteration finds the next largest
-        replaceVal(scratch, m, 0.0);
+    var cutoff: f32 = scratch[scratch.len - 1];
+    for (scratch) |v| {
+        cumsum += v;
+        if (cumsum >= p) {
+            cutoff = v;
+            break;
+        }
     }
 
     thresholdAndNormalize(probs, cutoff);
@@ -483,39 +520,6 @@ pub fn sampleFromProbs(probs: []const f32) usize {
 }
 
 // --- Vectorized helpers for sampling ---
-
-/// Replace all occurrences of `val` with `replacement`.
-fn replaceVal(data: []f32, val: f32, replacement: f32) void {
-    const val_vec: F32xN = @splat(val);
-    const rep_vec: F32xN = @splat(replacement);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        const mask = v == val_vec;
-        data[i..][0..VEC_LEN].* = @select(f32, mask, rep_vec, v);
-    }
-    while (i < data.len) : (i += 1) {
-        if (data[i] == val) data[i] = replacement;
-    }
-}
-
-/// Sum all elements equal to `val`.
-fn sumEqual(data: []const f32, val: f32) f32 {
-    const val_vec: F32xN = @splat(val);
-    const zero_vec: F32xN = @splat(0.0);
-    var acc: F32xN = @splat(0.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        const mask = v == val_vec;
-        acc += @select(f32, mask, v, zero_vec);
-    }
-    var sum = @reduce(.Add, acc);
-    while (i < data.len) : (i += 1) {
-        if (data[i] == val) sum += data[i];
-    }
-    return sum;
-}
 
 /// Zero values below `threshold`, then renormalize so sum = 1.
 fn thresholdAndNormalize(data: []f32, threshold: f32) void {
@@ -915,6 +919,57 @@ test "topP basic" {
     var sum: f32 = 0.0;
     for (probs) |v| sum += v;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+}
+
+test "topK heap selection matches scalar fallback on a large distribution" {
+    const allocator = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    var heap_probs: [4096]f32 = undefined;
+    for (&heap_probs) |*v| v.* = rng.random().float(f32);
+    var sum: f32 = 0.0;
+    for (heap_probs) |v| sum += v;
+    for (&heap_probs) |*v| v.* /= sum;
+    var scalar_probs = heap_probs;
+
+    topK(&heap_probs, 64, allocator);
+    topKScalar(&scalar_probs, 64);
+
+    var kept: usize = 0;
+    for (heap_probs, scalar_probs) |a, b| {
+        try std.testing.expectApproxEqAbs(b, a, 1e-6);
+        if (a > 0) kept += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), kept);
+}
+
+test "topK keeps boundary ties" {
+    const allocator = std.testing.allocator;
+    var probs = [_]f32{ 0.3, 0.2, 0.2, 0.2, 0.1 };
+    topK(&probs, 2, allocator);
+    // The k-th largest value (0.2) ties across three entries; all are kept.
+    try std.testing.expect(probs[0] > 0);
+    try std.testing.expect(probs[1] > 0);
+    try std.testing.expect(probs[2] > 0);
+    try std.testing.expect(probs[3] > 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probs[4], 1e-6);
+}
+
+test "topP candidate gather matches scalar fallback" {
+    const allocator = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(0xcafe);
+    var gathered: [1024]f32 = undefined;
+    for (&gathered) |*v| v.* = rng.random().float(f32);
+    var sum: f32 = 0.0;
+    for (gathered) |v| sum += v;
+    for (&gathered) |*v| v.* /= sum;
+    var scalar = gathered;
+
+    topP(&gathered, 0.9, allocator);
+    topPScalar(&scalar, 0.9);
+
+    for (gathered, scalar) |a, b| {
+        try std.testing.expectApproxEqAbs(b, a, 1e-6);
+    }
 }
 
 test "sampleFromProbs distribution" {

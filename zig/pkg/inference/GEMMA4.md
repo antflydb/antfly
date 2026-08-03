@@ -26,13 +26,148 @@ antfly inference generate /path/to/google/gemma-4-E2B-it \
   "Explain speculative decoding in one paragraph." \
   --draft-model /path/to/google/gemma-4-E2B-it-assistant \
   --speculative-k 4 \
+  --speculation-policy auto \
+  --speculation-calibration positive \
   --backend metal \
   --print-timing
 ```
 
+Calibrated auto policy requires `--speculation-calibration positive`; CLI
+calibration otherwise defaults to `none`, which does not activate Gemma 4 MTP
+auto mode. Metal auto policy is also runtime-default-off; set
+`ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1` to evaluate it. The inherited adaptive
+cap (`k=2`) and acceptance threshold remain unchanged.
+
+Branch-added Metal MTP accelerators remain explicit rollout opt-ins until
+current model-level token-parity and runtime evidence is checked in:
+
+- `ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1` and
+  `ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION=1` enable deferred
+  correction/bonus materialization and target-activation reuse.
+- `ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1` enables Metal bonus-token acceptance;
+  CUDA and native retain their inherited default.
+- `TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME=1` enables the prepared
+  verify-tail LM-head/argmax frame.
+- `TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME=1` enables direct
+  donated-KV slot attention on the draft frame. The inherited
+  `TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION=1` remains the master rollback.
+- `TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE=1` and
+  `TERMITE_METAL_ENABLE_SMALL_ROWS_NORM_REDUCE=1` enable the small-row MTP
+  verify kernels. Their corresponding `DISABLE_` variables override opt-ins.
+- `TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_SMALL_BATCH=1` enables the
+  rows-2-to-8 shared-read gate/up kernel; its `DISABLE_` variable overrides it.
+- `ANTFLY_GEMMA4_MTP_ENABLE_METAL_PREFILL_HIDDEN_CAPTURE=1` enables the
+  prepared-tail prefill/hidden-state handoff; its `DISABLE_` variable overrides
+  it.
+
+The hand-written Metal chunked flash-prefill path is enabled with
+`TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION=1`; its contiguous direct K/V load
+requires `TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD=1`. Both passed the E4B
+long-prompt token gate, but remain opt-in because the Metal runtime switch is
+process-wide rather than scoped to the loaded model. Their matching `DISABLE_`
+variables remain rollback overrides.
+
+The baseline M4 Metal path also has three independently reversible policies:
+
+- Sliding-window attention clamps the generated flash kernel's K/V scan to the
+  live window by default. `TERMITE_METAL_DISABLE_SWA_SCAN_CLAMP=1` restores the
+  full logical-history scan. The choice is captured once when each Metal
+  runtime is created, so concurrent model runtimes cannot race on policy state.
+- Prepared single-token decode frames use retained-reference command buffers
+  on qualified Apple M4 devices. `TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME=1`
+  restores the diagnostic-safe command-buffer path, and
+  `TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS=1` forces that path whenever
+  profiling or debugging requires it.
+- Q4_0 row-one matvec dispatch selects a device/shape-qualified threadgroup
+  portfolio. `TERMITE_METAL_Q4_0_MMV_VARIANT=auto|legacy|nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4`
+  provides deterministic qualification overrides, while
+  `TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO=1` is the master rollback to the
+  legacy selector.
+
+Singleton intermediate Gemma 4 prefill chunks use the planned Metal frame by
+default. `TERMITE_METAL_DISABLE_SINGLETON_SCHEDULED_PREFILL_FRAME=1` restores
+the scheduled mixed-context path for diagnosis. Final logits and MTP hidden
+capture never use the planned intermediate-chunk frame.
+
+`TERMITE_METAL_ENABLE_SPLIT_SWA_KV_RING=1` stores Gemma 4 sliding-attention
+layers in a fixed Metal ring while global-attention layers retain full KV
+history. The ring is disabled for prompt-cache requests, cache compaction, and
+non-paged attention; `TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING=1` is the master
+rollback while the long-context rollout gate remains experimental.
+
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
 enabled for multimodal prompts or the ONNX direct path.
+
+## Chat REPL
+
+`antfly inference chat` is the ollama-style interactive path: it resolves a
+friendly model name, pulls the model from HuggingFace when missing, loads it,
+and starts a multi-turn REPL:
+
+```sh
+antfly inference chat gemma4-e2b
+```
+
+`gemma4-e2b` and `gemma4-e4b` (plus `gemma-4-*` and `*-it` spellings) resolve
+to Google's official QAT conversions `google/gemma-4-*-it-qat-q4_0-gguf` — the
+checkpoints production workflows already run on; any `owner/name[:variant]`
+reference or local model directory also works. The REPL
+supports `/set`, `/show`, `/clear`, `"""` multi-line input, and Ctrl-C to stop
+a response without leaving the chat (see `antfly inference chat --help`).
+
+Chat can keep the model's `PromptPrefixCache` active across turns with a fresh
+paged decode state per turn (`--prompt-cache`), so turn N+1 only prefills the
+previous reply plus the new user message; the per-turn footer reports the
+reused prefix as `N cached`. The flag is **opt-in and currently experimental**:
+attaching a cached prefix reproducibly degrades the attached tokens' KV on
+metal (temp-0 A/B: the model loses early-prompt context and asks clarifying
+questions instead of answering) and can hang generation on the native backend.
+Suspected area: block-hash cache entries carry per-block
+`storage_block_id: ?KvBlockId` while only the simple-mode attach re-attaches
+retained storage blocks (`attachSequenceWithRetainedBlocks`,
+`runtime/kv/prompt_cache.zig`). Until that attach path is fixed, chat defaults
+to full re-prefill each turn. Chat is target-only generation: no MTP assistant is pulled or used
+because speculative decoding disables prompt-prefix reuse (the
+`!use_speculative` eligibility gate in `pipelines/generation.zig`) and forfeits
+the multi-turn TTFT win. Use `generate --draft-model` for the speculative path.
+
+### Sampling performance and temperature
+
+Sampled decoding (temperature > 0, chat's default is 0.7) runs through the
+backend-owned sampled decoder frame
+(`decoder_gated_runtime.forwardSampledToken`: device-resident Gumbel/top-k
+sampling with a prepared sampled tail), the same fused frame family as greedy
+decoding. Reference numbers on an M4 Pro with the E2B QAT q4_0 checkpoint:
+~52 tok/s sampled, ~80 tok/s greedy. Before this wiring, non-greedy configs
+fell off the fused frame onto the per-op eager path (~5 tok/s), and the host
+sampler's top-k/top-p were O(k·vocab) rescans — both are fixed, so do not
+"optimize" chat by forcing temperature 0 for speed.
+
+One temperature note for the QAT checkpoints: at temperature >= 0.7 the model
+sometimes spends its whole turn in the thought channel and ends without a
+public reply (chat prints an explicit notice instead of a blank response);
+temperature 0-0.3 transitions to the public answer reliably.
+
+### Channel transition conventions
+
+The final-channel projection accepts two observed checkpoint conventions for
+the thought→public transition:
+
+1. The explicit `<|channel>final\n<channel|>` header (Harmony style). When a
+   stream contains this header anywhere, it wins and streaming emits deltas
+   live from the header onward.
+2. A bare `<channel|>` that closes the prompt-opened private channel with no
+   replacement header — the GGUF conversions (Google QAT and ggml-org) emit
+   only this form. It is accepted **only when no explicit header exists in the
+   stream** (`bareChannelCloseRange` in `pipelines/generation.zig`), so a
+   bare close inside a header-emitting stream cannot leak private content.
+   Streaming cannot look ahead for the header-absence proof, so bare-close
+   streams surface their text once at end of turn via `GenerationResult.text`
+   rather than token-by-token; the CLI and chat REPL both print that fallback.
+
+Explicitly opened non-final channels stay private under both conventions, and
+a stream with no recognized transition still projects to empty output.
 
 ## Google Gemma 4 MTP Design
 
@@ -241,6 +376,70 @@ official safetensors assistant and the local GGUF target, quantization effects i
 the target, or a still-missing detail in the clustered output head.
 
 ### CUDA Branch Status
+
+CUDA MTP remains experimental. Its diagnostics are not a production-readiness
+certification and are not a paired llama.cpp comparison; no throughput result
+from that path should be described as superiority over llama.cpp. The CUDA
+release contract covers target-only Gemma 4 QAT, while strict MTP certification
+and promotion remain follow-up work.
+
+Update 2026-07-13 on branch `codex/quant-kernel-metal-compiler`: the quant
+kernel compiler ships 5 promoted generated CUDA Q4_0 artifacts as runtime
+opt-ins for the Gemma4 QAT path (`antfly_q4_0_mmv_f32_v1`,
+`antfly_q4_0_mm_f32_v1`,
+`antfly_q4_0_pair_mmv_f32_v1`, plus the q8_1/DP4A pair
+`antfly_q4_0_pair_activation_q8_1_mmv_v1` and
+`antfly_q4_0_down_q8_1_mmv_v1` inside the opt-in
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` tuned path).
+Measured on E2B QAT (`gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf`, 128 tokens,
+NVIDIA L4) versus the handwritten routes: prefill 150 ms vs 200 ms
+(about -25%), decode about +2.4%, bit-identical output, zero fallbacks.
+Measured on E4B QAT in the tuned llama.cpp pair-harness config: E2E median
+8197 ms vs 8370 ms with the q8_1 kernels disabled (about -2.1%), decode 63.4
+vs about 61.5 tok/s; the paired margin vs llama.cpp roughly halved. Launch
+counts appear in `--print-timing`/`--json-timing` as
+`cuda_q4_0_generated_counts:`. Enable one route at a time with
+`ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_{MMV,MM,PAIR,PAIR_Q8,DOWN_Q8}=1` for
+model-level validation. The matching per-kernel `DISABLE_` variables override
+the opt-in; `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0=1` disables every
+generated Q4_0 route and candidate.
+Details and promotion evidence: `QUANT_KERNEL_COMPILER.md` (Current CUDA
+State).
+
+Update 2026-07-31 on branch `quant-kernel-long-context`: ten-pair warm-server
+long-context evidence (2,051-token prompt, 300 greedy tokens, F16 K/V, L4)
+puts the tuned frontier profile at 740.8 ms TTFT and 110.2 decode tokens/s
+versus llama.cpp at 329.5 ms and 114.4 tokens/s, a 1.173 total-latency ratio —
+decode is within 4% and prefill projections remain the whole gap. This is not
+a superiority result. See `docs/CUDA_TUNING.md` ("Gemma 4 E2B SM89
+optimization status") for the paired statistics, the promoted-routes-only
+measurement, and the F32-cache decode caveat.
+
+Update 2026-07-31 (flash-prefill promotion): the SM89 GQA flash-prefill F16
+composites (`attention_prefill_flash_sm89_hd{256,512}`) are promoted to
+production runtime defaults. With `ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE`
+unset, the runtime resolves an automatic selector that engages
+`flash-f16-sm89` whenever the qualified contract holds (SM89, page-16 paged
+F16 K/V, GQA 8:1, q512/q3 query-length policy, matching sliding-window/global
+geometry, symbols loaded) and otherwise silently keeps the previous unset
+launch topology. Promotion evidence: `zig build
+quant-kernel-cuda-paged-prefill-diff` passed all 90
+guard/page-table/adversarial/determinism cases bitwise-identical (also run in
+CI on the L4 lane). Rollback: `ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off`;
+all explicit profile values behave exactly as before.
+
+Update 2026-08-01 (W4A16 tensor-core prefill projections promoted): non-perturbing
+nsys profiling showed prefill is GPU-bound (99.7% device utilization — the earlier
+"host overhead" was un-bucketed GPU kernels, not host idle), with the FFN gate/up
+projection (`termite_linear_q4_0_pair_nobias_q8_1_f32_tile4`, DP4A/SIMT int8) the
+single dominant kernel at ~52% of prefill. Routing Q4_0 prefill projections through
+the BF16 tensor-core (WMMA) kernel instead cuts prefill 1.81x (2297->1269 ms on a
+1131-token chunked run) AND raises quality: vs the F32-activation reference the BF16
+tensor-core path matches 96/96 greedy tokens (100%) while the DP4A q8_1 default
+matches only 30/96 (31%, diverges at token 29) — bf16 activations track f32's argmax;
+q8_1 int8 is too coarse. `q4_0_tc_hmma_prefill` is therefore promoted default-on for
+SM89 (compute 8.9): W4A16 handles prefill projections (rows>1); DP4A stays for decode
+(rows==1). Rollback: `ANTFLY_INFERENCE_CUDA_Q4_0_TC_HMMA_PREFILL=0`.
 
 Status checked on 2026-06-21 on branch `gemma4_gpu_stuff`:
 
@@ -474,6 +673,12 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 
 ### Phase 3: Performance Work
 
+Baseline, no-MTP prefill/decode optimization is tracked separately in
+[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). That roadmap owns
+the pinned llama.cpp comparison, current experiment ledger, promotion gates,
+and ordered Metal kernel/runtime tranches. MTP speedups are additive and must
+not be used to qualify the baseline model path.
+
 - Tune `speculative_k`; start at 4 and compare against 2, 6, and 8.
 - Add a heuristic schedule that increases draft length after full acceptance
   and decreases it after rejection.
@@ -497,8 +702,11 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 - Sampling, repetition penalties, and grammar masks must be applied from the
   target logits during verification.
 - Rejected draft suffixes must be rolled back from KV state.
-- Correction and bonus tokens must be materialized into target KV before the
-  next round. Gemma 4 MTP assistants have no drafter KV; they keep only the
+- Correction and bonus tokens must be present in target KV before they are
+  consumed by later target work. The supported deferred-materialization path
+  may fold that materialization into the next verify round; it flushes any
+  pending token before another operation that requires committed target KV.
+  Gemma 4 MTP assistants have no drafter KV; they keep only the
   target-prediction activation needed to seed the next draft round.
 - MTP must fall back to standard decoding if the assistant is missing,
   incompatible, or slower for the current backend.

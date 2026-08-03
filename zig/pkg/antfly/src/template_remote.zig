@@ -19,6 +19,7 @@ const template_mod = @import("template.zig");
 const pdf_mod = @import("antfly_pdf");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("common/secrets.zig");
+const platform_time = @import("antfly_platform").time;
 
 const Allocator = std.mem.Allocator;
 
@@ -27,17 +28,34 @@ pub const RenderError = error{
     TransientPromptFailure,
 };
 
+const FatalRenderError = error{
+    Canceled,
+    Timeout,
+    OutOfMemory,
+};
+
 const RenderContext = struct {
     alloc: Allocator,
     pdf_backend: pdf_mod.Backend,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     secret_store: ?*common_secrets.FileStore = null,
+    io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
+    remote_bytes_remaining: u64,
+    max_media_parts: ?usize = null,
+    emitted_media_parts: usize = 0,
+    fatal_error: ?FatalRenderError = null,
 };
 
 pub const RenderConfig = struct {
     pdf_backend: pdf_mod.Backend = pdf_mod.Backend.system(),
     remote_content: ?*const scraping.RemoteContentConfig = null,
     secret_store: ?*common_secrets.FileStore = null,
+    /// Request-scoped I/O used by remote template helpers when provided.
+    io: ?std.Io = null,
+    /// Absolute monotonic request deadline shared by every remote helper.
+    deadline_ns: ?u64 = null,
+    max_media_parts: ?usize = null,
 };
 
 pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
@@ -47,7 +65,63 @@ const remote_fetch_security = scraping.ContentSecurityConfig{
     .max_download_size_bytes = default_remote_fetch_max_download_size_bytes,
 };
 
-threadlocal var active_render_context: ?*RenderContext = null;
+fn remoteByteBudget(remote_content: ?*const scraping.RemoteContentConfig) u64 {
+    var snapshot = if (remote_content) |cfg| cfg.acquire() else null;
+    defer if (snapshot) |*held| held.deinit();
+
+    const configured = if (snapshot) |held|
+        if (held.config.security) |security| security.max_download_size_bytes else null
+    else
+        null;
+    return @min(default_remote_fetch_max_download_size_bytes, configured orelse default_remote_fetch_max_download_size_bytes);
+}
+
+test "template remote byte budget reads the reloadable config snapshot" {
+    const Harness = struct {
+        config: scraping.RemoteContentConfig,
+        releases: usize = 0,
+
+        fn acquire(context: *anyopaque) ?scraping.RemoteContentConfig.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return .{
+                .config = &self.config,
+                .context = context,
+                .release_fn = release,
+            };
+        }
+
+        fn release(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.releases += 1;
+        }
+
+        fn health(_: *anyopaque) scraping.RemoteContentConfig.RuntimeHealth {
+            return .{
+                .generation = 1,
+                .hash = [_]u8{0} ** 32,
+                .last_reload_failed = false,
+                .stale_snapshot = false,
+                .reload_successes = 0,
+                .reload_failures = 0,
+            };
+        }
+    };
+
+    var harness = Harness{
+        .config = .{ .security = .{ .max_download_size_bytes = 4096 } },
+    };
+    var facade = scraping.RemoteContentConfig{
+        .security = .{ .max_download_size_bytes = 8192 },
+        .runtime = .{
+            .context = &harness,
+            .acquire_fn = Harness.acquire,
+            .health_fn = Harness.health,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u64, 4096), remoteByteBudget(&facade));
+    try std.testing.expectEqual(@as(usize, 1), harness.releases);
+}
 
 pub fn renderJsonToText(
     alloc: Allocator,
@@ -63,26 +137,68 @@ pub fn renderJsonToTextWithConfig(
     json_doc: []const u8,
     config: RenderConfig,
 ) ![]const u8 {
-    var helper_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer helper_arena_state.deinit();
-    const helper_arena = helper_arena_state.allocator();
-
-    var extra_helpers: hbs.HelperMap = .{};
-    try extra_helpers.put(helper_arena, "remoteMedia", hbs.Helper.from(&remoteMediaHelper));
-    try extra_helpers.put(helper_arena, "remotePDF", hbs.Helper.from(&remotePdfHelper));
-    try extra_helpers.put(helper_arena, "remoteText", hbs.Helper.from(&remoteTextHelper));
-
     var render_ctx = RenderContext{
         .alloc = alloc,
         .pdf_backend = config.pdf_backend,
         .remote_content = config.remote_content,
         .secret_store = config.secret_store,
+        .io = config.io,
+        .deadline_ns = config.deadline_ns,
+        .remote_bytes_remaining = remoteByteBudget(config.remote_content),
+        .max_media_parts = config.max_media_parts,
     };
-    const prev_ctx = active_render_context;
-    active_render_context = &render_ctx;
-    defer active_render_context = prev_ctx;
+    try ensureRenderActive(&render_ctx);
 
-    return try template_mod.renderDocumentWithHelpers(alloc, template_source, json_doc, &extra_helpers);
+    var helper_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer helper_arena_state.deinit();
+    const helper_arena = helper_arena_state.allocator();
+
+    var extra_helpers: hbs.HelperMap = .{};
+    try extra_helpers.put(helper_arena, "remoteMedia", hbs.Helper.withData(&remoteMediaHelper, @ptrCast(&render_ctx)));
+    try extra_helpers.put(helper_arena, "remotePDF", hbs.Helper.withData(&remotePdfHelper, @ptrCast(&render_ctx)));
+    try extra_helpers.put(helper_arena, "remoteText", hbs.Helper.withData(&remoteTextHelper, @ptrCast(&render_ctx)));
+
+    const rendered = try template_mod.renderDocumentWithHelpers(alloc, template_source, json_doc, &extra_helpers);
+    return try completeRenderedText(alloc, rendered, &render_ctx);
+}
+
+fn completeRenderedText(alloc: Allocator, rendered: []const u8, render_ctx: *const RenderContext) ![]const u8 {
+    ensureRenderActive(render_ctx) catch |err| {
+        alloc.free(rendered);
+        return err;
+    };
+    return rendered;
+}
+
+fn ensureRenderActive(render_ctx: *const RenderContext) !void {
+    if (render_ctx.fatal_error) |err| return err;
+    if (render_ctx.io) |io| try io.checkCancel();
+    if (render_ctx.deadline_ns) |deadline_ns| {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+}
+
+fn latchFatalRenderError(render_ctx: *RenderContext, err: anyerror) bool {
+    const fatal: FatalRenderError = switch (err) {
+        error.Canceled => error.Canceled,
+        error.Timeout => error.Timeout,
+        error.OutOfMemory => error.OutOfMemory,
+        else => return false,
+    };
+    if (render_ctx.fatal_error == null) render_ctx.fatal_error = fatal;
+    return true;
+}
+
+fn beginRemoteHelper(ctx: hbs.HelperContext) !void {
+    const render_ctx = renderContext(ctx) orelse return;
+    ensureRenderActive(render_ctx) catch |err| {
+        _ = latchFatalRenderError(render_ctx, err);
+        return err;
+    };
+}
+
+fn finishRemoteHelperError(ctx: hbs.HelperContext, err: anyerror) void {
+    if (renderContext(ctx)) |render_ctx| _ = latchFatalRenderError(render_ctx, err);
 }
 
 pub fn renderJsonToValidatedTextWithConfig(
@@ -126,6 +242,14 @@ fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
 }
 
 fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
+    try beginRemoteHelper(ctx);
+    return remoteMediaHelperImpl(ctx) catch |err| {
+        finishRemoteHelperError(ctx, err);
+        return err;
+    };
+}
+
+fn remoteMediaHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
     const url = ctx.hash.get("url") orelse return .{ .safe_string = "" };
     const url_str = switch (url) {
         .string => |s| s,
@@ -137,17 +261,39 @@ fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         .string => |s| s,
         else => "raw",
     } else "raw";
-    if (std.mem.startsWith(u8, url_str, "data:")) {
-        const result = try std.fmt.allocPrint(ctx.arena, "<<<dotprompt:media:url {s}>>>", .{url_str});
-        return .{ .safe_string = result };
-    }
 
-    const render_ctx = active_render_context orelse {
+    const render_ctx = renderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteMedia missing HTTP context");
         return .{ .safe_string = result };
     };
+    if (url_str.len >= "data:".len and std.ascii.eqlIgnoreCase(url_str[0.."data:".len], "data:")) {
+        if (mediaPartLimitReached(render_ctx)) return .{ .safe_string = "" };
+        const decoded_size = scraping.dataUriDecodedSize(url_str) catch |err| {
+            if (latchFatalRenderError(render_ctx, err)) return err;
+            const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
+            return .{ .safe_string = result };
+        };
+        chargeRemoteBytes(render_ctx, @intCast(decoded_size)) catch |err| {
+            if (latchFatalRenderError(render_ctx, err)) return err;
+            const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
+            return .{ .safe_string = result };
+        };
+        const result = try std.fmt.allocPrint(ctx.arena, "<<<dotprompt:media:url {s}>>>", .{url_str});
+        noteEmittedMediaPart(render_ctx);
+        return .{ .safe_string = result };
+    }
 
-    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
+    // `mode=extract` produces text for PDFs and therefore does not consume a
+    // media part. Other modes can be rejected before I/O once the cap is hit.
+    const extract_mode = std.mem.eql(u8, mode, "extract");
+    if (!extract_mode and mediaPartLimitReached(render_ctx)) return .{ .safe_string = "" };
+
+    const credential_name = credentialName(ctx) catch |err| {
+        const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
+        return .{ .safe_string = result };
+    };
+    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credential_name) catch |err| {
+        if (latchFatalRenderError(render_ctx, err)) return err;
         const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
     };
@@ -162,16 +308,19 @@ fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
 
     const response = fetched.ok;
     const is_pdf = std.mem.eql(u8, response.content_type, "application/pdf");
-    if (is_pdf and std.mem.eql(u8, mode, "extract")) {
+    if (is_pdf and extract_mode) {
         const extracted = render_ctx.pdf_backend.extractText(render_ctx.alloc, response.data) catch |err| {
+            if (latchFatalRenderError(render_ctx, err)) return err;
             const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
             return .{ .safe_string = result };
         };
         defer render_ctx.alloc.free(extracted);
         return .{ .string = try ctx.arena.dupe(u8, extracted) };
     }
+    if (mediaPartLimitReached(render_ctx)) return .{ .safe_string = "" };
     if (is_pdf and std.mem.eql(u8, mode, "render")) {
         const png_bytes = render_ctx.pdf_backend.renderFirstPagePng(render_ctx.alloc, response.data) catch |err| {
+            if (latchFatalRenderError(render_ctx, err)) return err;
             const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
             return .{ .safe_string = result };
         };
@@ -181,6 +330,7 @@ fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         const encoded = try ctx.arena.alloc(u8, encoded_len);
         _ = std.base64.standard.Encoder.encode(encoded, png_bytes);
         const result = try std.fmt.allocPrint(ctx.arena, "<<<dotprompt:media:url data:image/png;base64,{s}>>>", .{encoded});
+        noteEmittedMediaPart(render_ctx);
         return .{ .safe_string = result };
     }
 
@@ -192,10 +342,38 @@ fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         response.content_type,
         encoded,
     });
+    noteEmittedMediaPart(render_ctx);
     return .{ .safe_string = result };
 }
 
+fn chargeRemoteBytes(render_ctx: *RenderContext, bytes: u64) !void {
+    if (bytes > render_ctx.remote_bytes_remaining) return error.StreamTooLong;
+    render_ctx.remote_bytes_remaining -= bytes;
+}
+
+fn mediaPartLimitReached(render_ctx: *const RenderContext) bool {
+    const limit = render_ctx.max_media_parts orelse return false;
+    return render_ctx.emitted_media_parts >= limit;
+}
+
+fn noteEmittedMediaPart(render_ctx: *RenderContext) void {
+    if (render_ctx.max_media_parts != null) render_ctx.emitted_media_parts += 1;
+}
+
+fn renderContext(ctx: hbs.HelperContext) ?*RenderContext {
+    const userdata = ctx.userdata orelse return null;
+    return @ptrCast(@alignCast(userdata));
+}
+
 fn remoteTextHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
+    try beginRemoteHelper(ctx);
+    return remoteTextHelperImpl(ctx) catch |err| {
+        finishRemoteHelperError(ctx, err);
+        return err;
+    };
+}
+
+fn remoteTextHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
     const url = ctx.hash.get("url") orelse return .{ .string = "" };
     const url_str = switch (url) {
         .string => |s| s,
@@ -203,12 +381,17 @@ fn remoteTextHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
     if (url_str.len == 0) return .{ .string = "" };
 
-    const render_ctx = active_render_context orelse {
+    const render_ctx = renderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteText missing HTTP context");
         return .{ .safe_string = result };
     };
 
-    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
+    const credential_name = credentialName(ctx) catch |err| {
+        const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
+        return .{ .safe_string = result };
+    };
+    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credential_name) catch |err| {
+        if (latchFatalRenderError(render_ctx, err)) return err;
         const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
     };
@@ -234,6 +417,14 @@ fn remoteTextHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
 /// Deprecated compatibility helper. Prefer document_extraction for durable PDF
 /// ingestion or remoteMedia for template-time multimodal inference input.
 fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
+    try beginRemoteHelper(ctx);
+    return remotePdfHelperImpl(ctx) catch |err| {
+        finishRemoteHelperError(ctx, err);
+        return err;
+    };
+}
+
+fn remotePdfHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
     const url = ctx.hash.get("url") orelse return .{ .safe_string = "" };
     const url_str = switch (url) {
         .string => |s| s,
@@ -241,12 +432,17 @@ fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
     if (url_str.len == 0) return .{ .safe_string = "" };
 
-    const render_ctx = active_render_context orelse {
+    const render_ctx = renderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remotePDF missing HTTP context");
         return .{ .safe_string = result };
     };
 
-    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credentialName(ctx)) catch |err| {
+    const credential_name = credentialName(ctx) catch |err| {
+        const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
+        return .{ .safe_string = result };
+    };
+    const fetched = downloadRemoteContentOutcomeAlloc(render_ctx, url_str, credential_name) catch |err| {
+        if (latchFatalRenderError(render_ctx, err)) return err;
         const result = try formatRemoteFetchErrorDirective(ctx.arena, err);
         return .{ .safe_string = result };
     };
@@ -267,6 +463,7 @@ fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
 
     if (std.mem.eql(u8, response.content_type, "application/pdf")) {
         const extracted = render_ctx.pdf_backend.extractText(render_ctx.alloc, response.data) catch |err| {
+            if (latchFatalRenderError(render_ctx, err)) return err;
             const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
             return .{ .safe_string = result };
         };
@@ -278,17 +475,21 @@ fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     return .{ .safe_string = result };
 }
 
-fn credentialName(ctx: hbs.HelperContext) ?[]const u8 {
+fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
     const value = ctx.hash.get("credentials") orelse return null;
     return switch (value) {
-        .string => |text| if (text.len > 0) text else null,
-        else => null,
+        .string => |text| if (text.len > 0) text else error.InvalidCredentialName,
+        else => error.InvalidCredentialName,
     };
 }
 
 fn formatRemoteFetchErrorDirective(alloc: Allocator, err: anyerror) ![]const u8 {
     return switch (err) {
         error.StreamTooLong => try template_mod.formatErrorDirective(alloc, 413, @errorName(err)),
+        error.HttpCredentialNotFoundOrOutOfScope,
+        error.S3CredentialNotFoundOrOutOfScope,
+        error.InvalidCredentialName,
+        => try template_mod.formatErrorDirective(alloc, 403, @errorName(err)),
         else => try template_mod.formatErrorDirective(alloc, 0, @errorName(err)),
     };
 }
@@ -298,18 +499,174 @@ fn downloadRemoteContentOutcomeAlloc(
     url: []const u8,
     credential_name: ?[]const u8,
 ) !scraping.DownloadOutcome {
+    if (render_ctx.remote_bytes_remaining == 0) return error.StreamTooLong;
     var snapshot = if (render_ctx.remote_content) |remote_content| remote_content.acquire() else null;
     defer if (snapshot) |*held| held.deinit();
     const remote_content = if (snapshot) |*held| held.config else null;
     var resolved = try resolveRemoteContentFetchOptions(render_ctx.alloc, remote_content, render_ctx.secret_store, url, credential_name);
     defer resolved.deinit(render_ctx.alloc);
-    return try scraping.downloadContentOutcomeAllocWithHeaders(
-        render_ctx.alloc,
-        url,
-        &resolved.security,
-        if (resolved.s3_credentials) |*creds| creds else null,
-        resolved.http_headers,
+    const fetch_budget = @min(
+        resolved.security.max_download_size_bytes orelse default_remote_fetch_max_download_size_bytes,
+        render_ctx.remote_bytes_remaining,
     );
+    resolved.security.max_download_size_bytes = fetch_budget;
+    const outcome = (if (try remoteFetchDownloadContext(render_ctx, &resolved.security)) |download_context|
+        scraping.downloadContentOutcomeAllocWithHeadersAndContext(
+            render_ctx.alloc,
+            download_context,
+            url,
+            &resolved.security,
+            if (resolved.s3_credentials) |*creds| creds else null,
+            resolved.http_headers,
+        )
+    else
+        scraping.downloadContentOutcomeAllocWithHeaders(
+            render_ctx.alloc,
+            url,
+            &resolved.security,
+            if (resolved.s3_credentials) |*creds| creds else null,
+            resolved.http_headers,
+        )) catch |err| {
+        switch (err) {
+            error.StreamTooLong, error.ResponseTooLarge => render_ctx.remote_bytes_remaining = 0,
+            else => {},
+        }
+        return err;
+    };
+    errdefer if (outcome == .ok) {
+        var response = outcome.ok;
+        response.deinit(render_ctx.alloc);
+    };
+    try chargeDownloadOutcome(render_ctx, outcome, fetch_budget);
+    return outcome;
+}
+
+fn chargeDownloadOutcome(
+    render_ctx: *RenderContext,
+    outcome: scraping.DownloadOutcome,
+    fetch_budget: u64,
+) !void {
+    const downloaded_bytes: u64 = switch (outcome) {
+        .ok => |downloaded| @intCast(downloaded.data.len),
+        .http_error => |http_error| http_error.downloaded_bytes,
+    };
+    if (downloaded_bytes > fetch_budget) {
+        render_ctx.remote_bytes_remaining = 0;
+        return error.StreamTooLong;
+    }
+    render_ctx.remote_bytes_remaining -= downloaded_bytes;
+}
+
+fn remoteFetchDownloadContext(
+    render_ctx: *const RenderContext,
+    security: *const scraping.ContentSecurityConfig,
+) !?scraping.DownloadContext {
+    if (render_ctx.io == null and render_ctx.deadline_ns == null) return null;
+    return .{
+        .io = render_ctx.io orelse std.Io.Threaded.global_single_threaded.io(),
+        // Leave this null when there is no request deadline. HTTP/S3 still
+        // apply their configured ceiling; file:// can safely use caller-owned
+        // cancellation without pretending std.Io files support a deadline.
+        .timeout_ms = if (render_ctx.deadline_ns != null)
+            try requestBoundedRemoteFetchTimeoutMs(
+                security.download_timeout_seconds,
+                render_ctx.deadline_ns,
+                platform_time.monotonicNs(),
+            )
+        else
+            null,
+    };
+}
+
+fn requestBoundedRemoteFetchTimeoutMs(
+    configured_seconds: ?u32,
+    deadline_ns: ?u64,
+    now_ns: u64,
+) !u64 {
+    const configured_ms: u64 = if (configured_seconds) |seconds|
+        if (seconds == 0) 0 else @as(u64, seconds) * 1000
+    else
+        30_000;
+    const deadline = deadline_ns orelse return configured_ms;
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    const remaining_ms = @max(
+        @as(u64, 1),
+        (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms,
+    );
+    if (configured_ms == 0) return remaining_ms;
+    return @min(configured_ms, remaining_ms);
+}
+
+test "template remote request deadline bounds configured download timeout" {
+    const now_ns: u64 = 10 * std.time.ns_per_s;
+
+    try std.testing.expectEqual(
+        @as(u64, 30_000),
+        try requestBoundedRemoteFetchTimeoutMs(null, null, now_ns),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 7_000),
+        try requestBoundedRemoteFetchTimeoutMs(7, null, now_ns),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1_500),
+        try requestBoundedRemoteFetchTimeoutMs(7, now_ns + 1_500 * std.time.ns_per_ms, now_ns),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 30_000),
+        try requestBoundedRemoteFetchTimeoutMs(null, now_ns + 40 * std.time.ns_per_s, now_ns),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1_500),
+        try requestBoundedRemoteFetchTimeoutMs(0, now_ns + 1_500 * std.time.ns_per_ms, now_ns),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        try requestBoundedRemoteFetchTimeoutMs(7, now_ns + 1, now_ns),
+    );
+    try std.testing.expectError(
+        error.Timeout,
+        requestBoundedRemoteFetchTimeoutMs(7, now_ns, now_ns),
+    );
+}
+
+test "fatal helper errors survive Handlebars error swallowing" {
+    const alloc = std.testing.allocator;
+    var render_ctx = RenderContext{
+        .alloc = alloc,
+        .pdf_backend = pdf_mod.Backend.system(),
+        .remote_bytes_remaining = default_remote_fetch_max_download_size_bytes,
+    };
+
+    const FatalHelper = struct {
+        fn call(ctx: hbs.HelperContext) anyerror!hbs.Value {
+            const active = renderContext(ctx).?;
+            _ = latchFatalRenderError(active, error.Timeout);
+            return error.Timeout;
+        }
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var helpers: hbs.HelperMap = .{};
+    try helpers.put(arena_state.allocator(), "fatal", hbs.Helper.withData(&FatalHelper.call, @ptrCast(&render_ctx)));
+
+    const rendered = try template_mod.renderDocumentWithHelpers(alloc, "{{fatal}}", "{}", &helpers);
+    try std.testing.expectEqualStrings("", rendered);
+    try std.testing.expectError(error.Timeout, completeRenderedText(alloc, rendered, &render_ctx));
+}
+
+test "render completion rechecks the absolute deadline" {
+    const alloc = std.testing.allocator;
+    const render_ctx = RenderContext{
+        .alloc = alloc,
+        .pdf_backend = pdf_mod.Backend.system(),
+        .deadline_ns = platform_time.monotonicNs(),
+        .remote_bytes_remaining = default_remote_fetch_max_download_size_bytes,
+    };
+    const rendered = try alloc.dupe(u8, "rendered");
+    try std.testing.expectError(error.Timeout, completeRenderedText(alloc, rendered, &render_ctx));
 }
 
 pub fn downloadRemoteContentOutcomeAllocWithConfig(
@@ -384,17 +741,33 @@ fn resolveRemoteContentFetchOptions(
     url: []const u8,
     credential_name: ?[]const u8,
 ) !ResolvedRemoteContentFetchOptions {
-    const cfg = remote_content orelse return .{};
-    const parsed = std.Uri.parse(url) catch return .{ .security = effectiveRemoteContentSecurity(cfg, null) };
+    const parsed = std.Uri.parse(url) catch {
+        const cfg = remote_content orelse return .{};
+        return .{ .security = effectiveRemoteContentSecurity(cfg, null) };
+    };
+    const cfg = remote_content orelse {
+        if (credential_name != null and isUriScheme(parsed, "s3")) return error.S3CredentialNotFoundOrOutOfScope;
+        if (credential_name != null and (isUriScheme(parsed, "http") or isUriScheme(parsed, "https"))) {
+            return error.HttpCredentialNotFoundOrOutOfScope;
+        }
+        return .{};
+    };
     if (isUriScheme(parsed, "s3")) {
-        const credential = selectS3Credential(cfg, parsed, credential_name);
+        const selected = try selectS3Credential(alloc, cfg, secret_store, parsed, credential_name);
+        if (credential_name != null and selected == null) return error.S3CredentialNotFoundOrOutOfScope;
+        if (selected) |value| {
+            return .{
+                .security = effectiveRemoteContentSecurity(cfg, value.credential.security),
+                .s3_credentials = try resolveSelectedS3Credential(alloc, secret_store, value),
+            };
+        }
         return .{
-            .security = effectiveRemoteContentSecurity(cfg, if (credential) |creds| creds.security else null),
-            .s3_credentials = if (credential) |creds| try resolveS3Credential(alloc, secret_store, creds) else null,
+            .security = effectiveRemoteContentSecurity(cfg, null),
         };
     }
     if (isUriScheme(parsed, "http") or isUriScheme(parsed, "https")) {
         const credential = selectHttpCredential(cfg, url, credential_name);
+        if (credential_name != null and credential == null) return error.HttpCredentialNotFoundOrOutOfScope;
         return .{
             .security = effectiveRemoteContentSecurity(cfg, if (credential) |creds| creds.security else null),
             .http_headers = if (credential) |creds| try resolveHttpHeaders(alloc, secret_store, creds) else null,
@@ -430,23 +803,69 @@ fn isUriScheme(parsed: std.Uri, scheme: []const u8) bool {
     return std.ascii.eqlIgnoreCase(parsed.scheme, scheme);
 }
 
+const SelectedS3Credential = struct {
+    credential: *const scraping.S3CredentialConfig,
+    /// Resolved exactly once so secret rotation cannot change endpoint-style
+    /// bucket interpretation between scope validation and the actual fetch.
+    endpoint: ?[]u8,
+};
+
 fn selectS3Credential(
+    alloc: Allocator,
     cfg: *const scraping.RemoteContentConfig,
+    secret_store: ?*common_secrets.FileStore,
     parsed: std.Uri,
     credential_name: ?[]const u8,
-) ?*const scraping.S3CredentialConfig {
-    if (credential_name) |name| return cfg.getS3(name);
-    const bucket = (parsed.host orelse return null).percent_encoded;
+) !?SelectedS3Credential {
+    if (credential_name) |name| {
+        const credential = cfg.getS3(name) orelse return null;
+        return try selectScopedS3Credential(alloc, secret_store, credential, parsed);
+    }
     var it = cfg.s3.iterator();
     while (it.next()) |entry| {
         const credential = entry.value_ptr;
-        const patterns = credential.buckets orelse continue;
-        for (patterns) |pattern| {
-            if (bucketPatternMatches(pattern, bucket)) return credential;
-        }
+        if (credential.buckets == null) continue;
+        const maybe_selected = selectScopedS3Credential(alloc, secret_store, credential, parsed) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            else => continue,
+        };
+        if (maybe_selected) |selected| return selected;
     }
-    if (cfg.default_s3) |name| return cfg.getS3(name);
+    if (cfg.default_s3) |name| {
+        const credential = cfg.getS3(name) orelse return null;
+        return try selectScopedS3Credential(alloc, secret_store, credential, parsed);
+    }
     return null;
+}
+
+fn selectScopedS3Credential(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    credential: *const scraping.S3CredentialConfig,
+    parsed: std.Uri,
+) !?SelectedS3Credential {
+    const endpoint = if (credential.endpoint) |endpoint_ref|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, endpoint_ref)
+    else
+        null;
+    errdefer if (endpoint) |value| alloc.free(value);
+    const bucket = if (endpoint) |value| blk: {
+        break :blk try scraping.s3BucketAlloc(alloc, parsed, value, credential.use_ssl);
+    } else try alloc.dupe(u8, (parsed.host orelse return error.InvalidS3Url).percent_encoded);
+    defer alloc.free(bucket);
+    if (!s3CredentialScopeMatches(credential, bucket)) {
+        if (endpoint) |value| alloc.free(value);
+        return null;
+    }
+    return .{ .credential = credential, .endpoint = endpoint };
+}
+
+fn s3CredentialScopeMatches(credential: *const scraping.S3CredentialConfig, bucket: []const u8) bool {
+    const patterns = credential.buckets orelse return true;
+    for (patterns) |pattern| {
+        if (bucketPatternMatches(pattern, bucket)) return true;
+    }
+    return false;
 }
 
 fn selectHttpCredential(
@@ -454,37 +873,137 @@ fn selectHttpCredential(
     url: []const u8,
     credential_name: ?[]const u8,
 ) ?*const scraping.HTTPCredentialConfig {
-    if (credential_name) |name| return cfg.getHttp(name);
+    if (credential_name) |name| {
+        const credential = cfg.getHttp(name) orelse return null;
+        const base_url = credential.base_url orelse return credential;
+        return if (httpCredentialScopeMatches(base_url, url)) credential else null;
+    }
+    var selected: ?*const scraping.HTTPCredentialConfig = null;
+    var selected_name: ?[]const u8 = null;
+    var selected_scope_len: usize = 0;
     var it = cfg.http.iterator();
     while (it.next()) |entry| {
         const credential = entry.value_ptr;
         const base_url = credential.base_url orelse continue;
-        if (std.mem.startsWith(u8, url, base_url)) return credential;
+        if (!httpCredentialScopeMatches(base_url, url)) continue;
+        const scope_len = httpCredentialScopeLength(base_url) orelse continue;
+        const prefer = selected == null or
+            scope_len > selected_scope_len or
+            (scope_len == selected_scope_len and std.mem.order(u8, entry.key_ptr.*, selected_name.?) == .lt);
+        if (prefer) {
+            selected = credential;
+            selected_name = entry.key_ptr.*;
+            selected_scope_len = scope_len;
+        }
     }
-    return null;
+    return selected;
 }
 
-fn resolveS3Credential(
+fn httpCredentialScopeLength(base_url: []const u8) ?usize {
+    const base = std.Uri.parse(base_url) catch return null;
+    if (!isHttpScheme(base.scheme)) return null;
+    if (base.user != null or base.password != null or base.query != null or base.fragment != null) return null;
+    const path = httpScopePath(base.path);
+    if (!credentialScopePathIsSafe(path)) return null;
+    return path.len;
+}
+
+fn httpCredentialScopeMatches(base_url: []const u8, url: []const u8) bool {
+    const base = std.Uri.parse(base_url) catch return false;
+    const target = std.Uri.parse(url) catch return false;
+
+    if (!isHttpScheme(base.scheme) or !isHttpScheme(target.scheme)) return false;
+    if (!std.ascii.eqlIgnoreCase(base.scheme, target.scheme)) return false;
+    // A credential scope is an origin and optional path, never userinfo, a
+    // query, or a fragment. Reject ambiguous configuration instead of turning
+    // it into a broader scope than the operator intended.
+    if (base.user != null or base.password != null or base.query != null or base.fragment != null) return false;
+    if (target.user != null or target.password != null) return false;
+
+    var base_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    var target_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const base_host = (base.getHost(&base_host_buffer) catch return false).bytes;
+    const target_host = (target.getHost(&target_host_buffer) catch return false).bytes;
+    if (!std.ascii.eqlIgnoreCase(base_host, target_host)) return false;
+    if (effectiveHttpPort(base) != effectiveHttpPort(target)) return false;
+
+    const base_path = httpScopePath(base.path);
+    const target_path = httpScopePath(target.path);
+    if (!credentialScopePathIsSafe(base_path) or !credentialScopePathIsSafe(target_path)) return false;
+    if (std.mem.eql(u8, base_path, target_path)) return true;
+    if (!std.mem.startsWith(u8, target_path, base_path)) return false;
+    return base_path[base_path.len - 1] == '/' or target_path[base_path.len] == '/';
+}
+
+fn isHttpScheme(scheme: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https");
+}
+
+fn effectiveHttpPort(uri: std.Uri) u16 {
+    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+}
+
+fn httpScopePath(component: std.Uri.Component) []const u8 {
+    const path = switch (component) {
+        .raw, .percent_encoded => |value| value,
+    };
+    return if (path.len == 0) "/" else path;
+}
+
+fn credentialScopePathIsSafe(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        var decoded_len: usize = 0;
+        var dots_only = true;
+        var i: usize = 0;
+        while (i < segment.len) {
+            const decoded = if (segment[i] == '%') blk: {
+                if (i + 2 >= segment.len) return false;
+                const high = std.fmt.charToDigit(segment[i + 1], 16) catch return false;
+                const low = std.fmt.charToDigit(segment[i + 2], 16) catch return false;
+                i += 3;
+                break :blk (high << 4) | low;
+            } else blk: {
+                const value = segment[i];
+                i += 1;
+                break :blk value;
+            };
+            // Some HTTP stacks and origin servers normalize backslashes or
+            // encoded separators before routing. They cannot safely participate
+            // in a syntactic credential path scope.
+            if (decoded == '/' or decoded == '\\') return false;
+            dots_only = dots_only and decoded == '.';
+            decoded_len += 1;
+        }
+        if (dots_only and (decoded_len == 1 or decoded_len == 2)) return false;
+    }
+    return true;
+}
+
+fn resolveSelectedS3Credential(
     alloc: Allocator,
     secret_store: ?*common_secrets.FileStore,
-    credential: *const scraping.S3CredentialConfig,
+    selected: SelectedS3Credential,
 ) !scraping.S3CredentialsConfig {
-    return .{
-        .endpoint = if (credential.endpoint) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
+    const credential = selected.credential;
+    var resolved = scraping.S3CredentialsConfig{
+        .endpoint = selected.endpoint,
         .use_ssl = credential.use_ssl,
-        .access_key_id = if (credential.access_key_id) |value|
-            try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
-        else
-            common_secrets.envValueOwned(alloc, "AWS_ACCESS_KEY_ID"),
-        .secret_access_key = if (credential.secret_access_key) |value|
-            try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
-        else
-            common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY"),
-        .session_token = if (credential.session_token) |value|
-            try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
-        else
-            common_secrets.envValueOwned(alloc, "AWS_SESSION_TOKEN"),
     };
+    errdefer resolved.deinit(alloc);
+    resolved.access_key_id = if (credential.access_key_id) |value|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+    else
+        common_secrets.envValueOwned(alloc, "AWS_ACCESS_KEY_ID");
+    resolved.secret_access_key = if (credential.secret_access_key) |value|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+    else
+        common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY");
+    resolved.session_token = if (credential.session_token) |value|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+    else
+        common_secrets.envValueOwned(alloc, "AWS_SESSION_TOKEN");
+    return resolved;
 }
 
 fn resolveHttpHeaders(
@@ -561,6 +1080,336 @@ test "template remote does not apply s3 credentials to http urls" {
     try std.testing.expectEqual(@as(?bool, true), resolved.security.block_private_ips);
 }
 
+test "HTTP credential scope requires the same origin and a path boundary" {
+    try std.testing.expect(httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api/v1/document?id=1",
+    ));
+    try std.testing.expect(httpCredentialScopeMatches(
+        "https://docs.internal.com",
+        "https://DOCS.INTERNAL.COM:443/anything",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com",
+        "https://docs.internal.com.evil.test/steal",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com",
+        "https://docs.internal.com@evil.test/steal",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com",
+        "https://docs.internal.com:444/anything",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api-v2/document",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api?scope=unexpected",
+        "https://docs.internal.com/api",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api/../secret",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api/%2e%2e/secret",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api/%2E./secret",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api/%2f../secret",
+    ));
+    try std.testing.expect(!httpCredentialScopeMatches(
+        "https://docs.internal.com/api",
+        "https://docs.internal.com/api\\..\\secret",
+    ));
+}
+
+test "explicit HTTP credentials remain inside their configured scope" {
+    const alloc = std.testing.allocator;
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+
+    {
+        const name = try alloc.dupe(u8, "internal");
+        errdefer alloc.free(name);
+        const base_url = try alloc.dupe(u8, "https://docs.internal.com/api");
+        errdefer alloc.free(base_url);
+        try cfg.http.put(alloc, name, .{ .base_url = base_url });
+    }
+
+    try std.testing.expect(selectHttpCredential(
+        &cfg,
+        "https://docs.internal.com/api/document",
+        "internal",
+    ) != null);
+    try std.testing.expect(selectHttpCredential(
+        &cfg,
+        "https://docs.internal.com.evil.test/api/document",
+        "internal",
+    ) == null);
+}
+
+test "explicit remote credentials fail closed when missing or outside scope" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = scraping.RemoteContentConfig{};
+    try cfg.http.put(
+        arena,
+        try arena.dupe(u8, "internal"),
+        .{ .base_url = try arena.dupe(u8, "https://docs.internal.test/api") },
+    );
+    const bucket_patterns = [_][]u8{try arena.dupe(u8, "allowed-*")};
+    try cfg.s3.put(
+        arena,
+        try arena.dupe(u8, "archive"),
+        .{ .buckets = &bucket_patterns },
+    );
+
+    try std.testing.expectError(
+        error.HttpCredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://docs.internal.test/api/doc", "missing"),
+    );
+    try std.testing.expectError(
+        error.HttpCredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://other.internal.test/api/doc", "internal"),
+    );
+    try std.testing.expectError(
+        error.S3CredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "s3://allowed-bucket/doc", "missing"),
+    );
+    try std.testing.expectError(
+        error.S3CredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "s3://denied-bucket/doc", "archive"),
+    );
+    try std.testing.expectError(
+        error.HttpCredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(alloc, null, null, "https://docs.internal.test/api/doc", "internal"),
+    );
+    try std.testing.expectError(
+        error.S3CredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(alloc, null, null, "s3://allowed-bucket/doc", "archive"),
+    );
+}
+
+test "automatic HTTP credential selection is longest-scope and deterministic" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = scraping.RemoteContentConfig{};
+    try cfg.http.put(
+        arena,
+        try arena.dupe(u8, "broad"),
+        .{ .base_url = try arena.dupe(u8, "https://docs.internal.test/") },
+    );
+    try cfg.http.put(
+        arena,
+        try arena.dupe(u8, "z-narrow"),
+        .{ .base_url = try arena.dupe(u8, "https://docs.internal.test/api") },
+    );
+    try cfg.http.put(
+        arena,
+        try arena.dupe(u8, "a-narrow"),
+        .{ .base_url = try arena.dupe(u8, "https://docs.internal.test/api") },
+    );
+
+    const selected = selectHttpCredential(&cfg, "https://docs.internal.test/api/v1/doc", null).?;
+    try std.testing.expect(selected == cfg.getHttp("a-narrow").?);
+}
+
+test "S3 credential scopes use the canonical bucket for endpoint-style URLs" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = scraping.RemoteContentConfig{};
+    const allowed_buckets = [_][]u8{try arena.dupe(u8, "allowed-*")};
+    try cfg.s3.put(
+        arena,
+        try arena.dupe(u8, "archive"),
+        .{
+            .endpoint = try arena.dupe(u8, "http://LOCALHOST:9000"),
+            .buckets = &allowed_buckets,
+        },
+    );
+    const endpoint_named_bucket = [_][]u8{try arena.dupe(u8, "localhost")};
+    try cfg.s3.put(
+        arena,
+        try arena.dupe(u8, "host-is-not-bucket"),
+        .{
+            .endpoint = try arena.dupe(u8, "http://LOCALHOST:9000"),
+            .buckets = &endpoint_named_bucket,
+        },
+    );
+
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "s3://localhost:9000/allowed-bucket/doc.txt",
+        "archive",
+    );
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("http://LOCALHOST:9000", resolved.s3_credentials.?.endpoint.?);
+
+    try std.testing.expectError(
+        error.S3CredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(
+            alloc,
+            &cfg,
+            null,
+            "s3://localhost:9000/denied-bucket/doc.txt",
+            "archive",
+        ),
+    );
+    try std.testing.expectError(
+        error.S3CredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(
+            alloc,
+            &cfg,
+            null,
+            "s3://localhost:9000/denied-bucket/doc.txt",
+            "host-is-not-bucket",
+        ),
+    );
+}
+
+test "automatic S3 selection skips broken nonmatches and resolves only selected auth" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = scraping.RemoteContentConfig{};
+    const allowed_buckets = [_][]u8{try arena.dupe(u8, "allowed-*")};
+    try cfg.s3.put(
+        arena,
+        try arena.dupe(u8, "broken-endpoint"),
+        .{
+            .endpoint = try arena.dupe(u8, "${secret:CODEX_TEST_MISSING_S3_ENDPOINT_7C91}"),
+            .buckets = &allowed_buckets,
+        },
+    );
+    const other_buckets = [_][]u8{try arena.dupe(u8, "other-*")};
+    try cfg.s3.put(
+        arena,
+        try arena.dupe(u8, "broken-unselected-auth"),
+        .{
+            .endpoint = try arena.dupe(u8, "http://localhost:9000"),
+            .secret_access_key = try arena.dupe(u8, "${secret:CODEX_TEST_MISSING_S3_AUTH_7C91}"),
+            .buckets = &other_buckets,
+        },
+    );
+    try cfg.s3.put(
+        arena,
+        try arena.dupe(u8, "selected"),
+        .{
+            .endpoint = try arena.dupe(u8, "http://localhost:9000"),
+            .access_key_id = try arena.dupe(u8, "access"),
+            .secret_access_key = try arena.dupe(u8, "secret"),
+            .buckets = &allowed_buckets,
+        },
+    );
+
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "s3://localhost:9000/allowed-bucket/doc.txt",
+        null,
+    );
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("access", resolved.s3_credentials.?.access_key_id.?);
+    try std.testing.expectEqualStrings("secret", resolved.s3_credentials.?.secret_access_key.?);
+}
+
+test "explicit credential and invalid credential inputs render permanent 403 failures" {
+    const alloc = std.testing.allocator;
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    const json_doc =
+        \\{"http":"https://docs.internal.test/doc","s3":"s3://bucket/doc","empty":"","number":7}
+    ;
+
+    const rendered = try renderJsonToTextWithConfig(
+        alloc,
+        "{{remoteText url=http credentials=\"missing\"}}",
+        json_doc,
+        .{ .remote_content = &cfg },
+    );
+    defer alloc.free(rendered);
+    const directives = try template_mod.parseErrorDirectives(alloc, rendered);
+    defer template_mod.freeErrorDirectives(alloc, directives);
+    try std.testing.expectEqual(@as(usize, 1), directives.len);
+    try std.testing.expectEqual(@as(u16, 403), directives[0].status);
+    try std.testing.expect(directives[0].isPermanent());
+
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToValidatedTextWithConfig(
+            alloc,
+            "{{remoteText url=s3 credentials=\"missing\"}}",
+            json_doc,
+            .{ .remote_content = &cfg },
+        ),
+    );
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToValidatedTextWithConfig(
+            alloc,
+            "{{remoteText url=http credentials=empty}}",
+            json_doc,
+            .{ .remote_content = &cfg },
+        ),
+    );
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToValidatedTextWithConfig(
+            alloc,
+            "{{remoteText url=http credentials=number}}",
+            json_doc,
+            .{ .remote_content = &cfg },
+        ),
+    );
+}
+
+test "HTTP error bodies consume the aggregate render byte budget" {
+    var render_ctx = RenderContext{
+        .alloc = std.testing.allocator,
+        .pdf_backend = pdf_mod.Backend.system(),
+        .remote_bytes_remaining = 4,
+    };
+    const error_outcome = scraping.DownloadOutcome{ .http_error = .{
+        .status = 500,
+        .message = "remote fetch failed",
+        .downloaded_bytes = 2,
+    } };
+    try chargeDownloadOutcome(&render_ctx, error_outcome, 4);
+    try chargeDownloadOutcome(&render_ctx, error_outcome, 2);
+    try std.testing.expectEqual(@as(u64, 0), render_ctx.remote_bytes_remaining);
+
+    render_ctx.remote_bytes_remaining = 4;
+    const oversized_error = scraping.DownloadOutcome{ .http_error = .{
+        .status = 500,
+        .message = "remote fetch failed",
+        .downloaded_bytes = 5,
+    } };
+    try std.testing.expectError(error.StreamTooLong, chargeDownloadOutcome(&render_ctx, oversized_error, 4));
+    try std.testing.expectEqual(@as(u64, 0), render_ctx.remote_bytes_remaining);
+}
+
 test "template remote S3 credentials observe same-length secret rotation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -597,6 +1446,29 @@ test "template remote S3 credentials observe same-length secret rotation" {
     defer rotated.deinit(alloc);
     try std.testing.expectEqualStrings("ACCESS-TWO", rotated.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("SECRET-TWO", rotated.s3_credentials.?.secret_access_key.?);
+}
+
+test "template remote S3 credential resolution survives every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var credential = scraping.S3CredentialConfig{};
+            defer credential.deinit(alloc);
+            credential.access_key_id = try alloc.dupe(u8, "access-key");
+            credential.secret_access_key = try alloc.dupe(u8, "secret-key");
+            credential.session_token = try alloc.dupe(u8, "session-token");
+            const endpoint = try alloc.dupe(u8, "s3.example.test");
+            var resolved = try resolveSelectedS3Credential(alloc, null, .{
+                .credential = &credential,
+                .endpoint = endpoint,
+            });
+            defer resolved.deinit(alloc);
+            try std.testing.expectEqualStrings("s3.example.test", resolved.endpoint.?);
+            try std.testing.expectEqualStrings("access-key", resolved.access_key_id.?);
+            try std.testing.expectEqualStrings("secret-key", resolved.secret_access_key.?);
+            try std.testing.expectEqualStrings("session-token", resolved.session_token.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "template remote S3 credentials fall back to standard AWS environment" {
@@ -913,7 +1785,10 @@ test "template remote preserves http status from shared scraping fetches" {
     const json_doc = try std.fmt.allocPrint(alloc, "{{\"missing_url\":{f}}}", .{std.json.fmt(missing_url, .{})});
     defer alloc.free(json_doc);
     var remote_content = scraping.RemoteContentConfig{
-        .security = .{ .block_private_ips = false },
+        .security = .{
+            .block_private_ips = false,
+            .max_download_size_bytes = "missing".len,
+        },
     };
     defer remote_content.deinit(alloc);
 
@@ -928,6 +1803,19 @@ test "template remote preserves http status from shared scraping fetches" {
     try std.testing.expectEqual(@as(usize, 1), directives.len);
     try std.testing.expectEqual(@as(u16, 404), directives[0].status);
     try std.testing.expectEqualStrings("remote fetch failed", directives[0].message);
+
+    const twice = try renderJsonToTextWithConfig(
+        alloc,
+        "{{remoteText url=missing_url}}{{remoteText url=missing_url}}",
+        json_doc,
+        .{ .remote_content = &remote_content },
+    );
+    defer alloc.free(twice);
+    const twice_directives = try template_mod.parseErrorDirectives(alloc, twice);
+    defer template_mod.freeErrorDirectives(alloc, twice_directives);
+    try std.testing.expectEqual(@as(usize, 2), twice_directives.len);
+    try std.testing.expectEqual(@as(u16, 404), twice_directives[0].status);
+    try std.testing.expectEqual(@as(u16, 413), twice_directives[1].status);
 }
 
 test "template remote validated text rejects oversized remote media directive" {
@@ -975,4 +1863,186 @@ test "template remote validated text rejects oversized remote media directive" {
             .remote_content = &remote_content,
         }),
     );
+}
+
+test "template remote enforces one aggregate byte budget across helpers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.txt", .data = "ab" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.txt", .data = "cd" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "over.txt", .data = "cde" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const first_path = try tmp.dir.realPathFileAlloc(std.testing.io, "first.txt", alloc);
+    defer alloc.free(first_path);
+    const exact_path = try tmp.dir.realPathFileAlloc(std.testing.io, "exact.txt", alloc);
+    defer alloc.free(exact_path);
+    const over_path = try tmp.dir.realPathFileAlloc(std.testing.io, "over.txt", alloc);
+    defer alloc.free(over_path);
+
+    const json_doc = try std.fmt.allocPrint(alloc,
+        \\{{"first":"file://{s}","exact":"file://{s}","over":"file://{s}"}}
+    , .{ first_path, exact_path, over_path });
+    defer alloc.free(json_doc);
+
+    const allowed_paths = [_][]u8{root};
+    const remote_content = scraping.RemoteContentConfig{
+        .security = .{
+            .allowed_paths = &allowed_paths,
+            .max_download_size_bytes = 4,
+        },
+    };
+    try std.testing.expectEqual(@as(u64, 4), remoteByteBudget(&remote_content));
+
+    const exact = try renderJsonToTextWithConfig(
+        alloc,
+        "{{remoteText url=first}}{{remoteText url=exact}}",
+        json_doc,
+        .{ .remote_content = &remote_content },
+    );
+    defer alloc.free(exact);
+    try std.testing.expectEqualStrings("abcd", exact);
+
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToValidatedTextWithConfig(
+            alloc,
+            "{{remoteText url=first}}{{remoteText url=over}}",
+            json_doc,
+            .{ .remote_content = &remote_content },
+        ),
+    );
+}
+
+test "template remote media limit skips later fetches without changing the default" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.png", .data = "first" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "second.png", .data = "second" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const first_path = try tmp.dir.realPathFileAlloc(std.testing.io, "first.png", alloc);
+    defer alloc.free(first_path);
+    const second_path = try tmp.dir.realPathFileAlloc(std.testing.io, "second.png", alloc);
+    defer alloc.free(second_path);
+    const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    defer alloc.free(missing_path);
+
+    const json_doc = try std.fmt.allocPrint(alloc,
+        \\{{"first":"file://{s}","second":"file://{s}","missing":"file://{s}"}}
+    , .{ first_path, second_path, missing_path });
+    defer alloc.free(json_doc);
+
+    const allowed_paths = [_][]u8{root};
+    const remote_content = scraping.RemoteContentConfig{
+        .security = .{
+            .allowed_paths = &allowed_paths,
+            .max_download_size_bytes = 1024,
+        },
+    };
+
+    const default_parts = try renderJsonToPartsWithConfig(
+        alloc,
+        "{{remoteMedia url=first}}{{remoteMedia url=second}}",
+        json_doc,
+        .{ .remote_content = &remote_content },
+    );
+    defer template_mod.freeContentParts(alloc, default_parts);
+    try std.testing.expectEqual(@as(usize, 2), default_parts.len);
+
+    const bounded_parts = try renderJsonToPartsWithConfig(
+        alloc,
+        "{{remoteMedia url=first}}{{remoteMedia url=missing}}",
+        json_doc,
+        .{
+            .remote_content = &remote_content,
+            .max_media_parts = 1,
+        },
+    );
+    defer template_mod.freeContentParts(alloc, bounded_parts);
+    try std.testing.expectEqual(@as(usize, 1), bounded_parts.len);
+}
+
+test "data URI media consumes the aggregate decoded-byte budget" {
+    const alloc = std.testing.allocator;
+    const remote_content = scraping.RemoteContentConfig{
+        .security = .{ .max_download_size_bytes = 3 },
+    };
+    const json_doc =
+        \\{"image":"data:image/png;base64,YWI="}
+    ;
+
+    const one = try renderJsonToPartsWithConfig(
+        alloc,
+        "{{remoteMedia url=image}}",
+        json_doc,
+        .{ .remote_content = &remote_content },
+    );
+    defer template_mod.freeContentParts(alloc, one);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+
+    try std.testing.expectError(
+        RenderError.PermanentPromptFailure,
+        renderJsonToValidatedTextWithConfig(
+            alloc,
+            "{{remoteMedia url=image}}{{remoteMedia url=image}}",
+            json_doc,
+            .{ .remote_content = &remote_content },
+        ),
+    );
+}
+
+test "PDF extract mode emits text even when the media-part limit is exhausted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "doc.pdf", .data = "%PDF-fake" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const pdf_path = try tmp.dir.realPathFileAlloc(std.testing.io, "doc.pdf", alloc);
+    defer alloc.free(pdf_path);
+    const json_doc = try std.fmt.allocPrint(alloc, "{{\"pdf\":\"file://{s}\"}}", .{pdf_path});
+    defer alloc.free(json_doc);
+
+    const FakePdfBackend = struct {
+        fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
+            return try a.dupe(u8, "extracted text");
+        }
+
+        fn render(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
+            return try a.dupe(u8, "png");
+        }
+    };
+    const backend = pdf_mod.Backend{
+        .ptr = undefined,
+        .extract_text_fn = FakePdfBackend.extract,
+        .render_first_page_png_fn = FakePdfBackend.render,
+    };
+    const allowed_paths = [_][]u8{root};
+    const remote_content = scraping.RemoteContentConfig{
+        .security = .{
+            .allowed_paths = &allowed_paths,
+            .max_download_size_bytes = 1024,
+        },
+    };
+
+    const rendered = try renderJsonToTextWithConfig(
+        alloc,
+        "{{remoteMedia url=pdf mode=\"extract\"}}",
+        json_doc,
+        .{
+            .pdf_backend = backend,
+            .remote_content = &remote_content,
+            .max_media_parts = 0,
+        },
+    );
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings("extracted text", rendered);
 }

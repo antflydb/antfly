@@ -24,6 +24,11 @@ const Allocator = std.mem.Allocator;
 /// on HTTP wiring.
 pub var interactive_embed_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
+/// Process-wide count of interactive generation requests. Background asset
+/// producers (including GLiNER extraction) yield between batches while this is
+/// non-zero so long-running backfills do not contend with user-facing answers.
+pub var interactive_generate_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub const ExecutionPolicy = struct {
     batch_items: ?usize = null,
     batch_bytes: ?usize = null,

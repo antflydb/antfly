@@ -94,6 +94,14 @@ test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }
 
+test "managed embedder sends antfly media parts when local provider is configured" {
+    try managed_embedder.testAntflyEmbedPartSelectionAndCardinality();
+}
+
+test "managed embedder normalizes local admission overload across embedding modes" {
+    try managed_embedder.testLocalAdmissionOverloadNormalization();
+}
+
 test "query embedding cache owns results and coalesces misses" {
     try query_embedding_cache.testOwnedValuesAndHits();
     try query_embedding_cache.testConcurrentCoalescing();

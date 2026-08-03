@@ -32,6 +32,19 @@ var aggregate_runtime_input_transfers: AtomicU64 = .init(0);
 var aggregate_device_resident_transfers: AtomicU64 = .init(0);
 var aggregate_backend_command_dispatches: AtomicU64 = .init(0);
 var aggregate_planned_operator_dispatches: AtomicU64 = .init(0);
+var aggregate_quant_kernel_planned_ops: AtomicU64 = .init(0);
+var aggregate_quant_kernel_handwritten_production: AtomicU64 = .init(0);
+var aggregate_quant_kernel_generated_production: AtomicU64 = .init(0);
+var aggregate_quant_kernel_unsupported_routes: AtomicU64 = .init(0);
+var aggregate_quant_kernel_generated_candidates: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_generated_artifact_missing: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_generated_runtime_not_wired: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_unsupported_format: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_unsupported_shape: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_unsupported_epilogue: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_unsupported_backend: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_tensor_core_repack_required: AtomicU64 = .init(0);
+var aggregate_quant_kernel_fallback_unsupported: AtomicU64 = .init(0);
 var aggregate_interpreter_fallbacks: AtomicU64 = .init(0);
 var aggregate_device_resident_outputs: AtomicU64 = .init(0);
 var aggregate_host_materialized_outputs: AtomicU64 = .init(0);
@@ -46,6 +59,19 @@ pub fn record(stats: ExecutionStats) void {
     _ = aggregate_device_resident_transfers.fetchAdd(stats.device_resident_transfers, .monotonic);
     _ = aggregate_backend_command_dispatches.fetchAdd(stats.backend_command_dispatches, .monotonic);
     _ = aggregate_planned_operator_dispatches.fetchAdd(stats.planned_operator_dispatches, .monotonic);
+    _ = aggregate_quant_kernel_planned_ops.fetchAdd(stats.quant_kernel_planned_ops, .monotonic);
+    _ = aggregate_quant_kernel_handwritten_production.fetchAdd(stats.quant_kernel_handwritten_production, .monotonic);
+    _ = aggregate_quant_kernel_generated_production.fetchAdd(stats.quant_kernel_generated_production, .monotonic);
+    _ = aggregate_quant_kernel_unsupported_routes.fetchAdd(stats.quant_kernel_unsupported_routes, .monotonic);
+    _ = aggregate_quant_kernel_generated_candidates.fetchAdd(stats.quant_kernel_generated_candidates, .monotonic);
+    _ = aggregate_quant_kernel_fallback_generated_artifact_missing.fetchAdd(stats.quant_kernel_fallback_generated_artifact_missing, .monotonic);
+    _ = aggregate_quant_kernel_fallback_generated_runtime_not_wired.fetchAdd(stats.quant_kernel_fallback_generated_runtime_not_wired, .monotonic);
+    _ = aggregate_quant_kernel_fallback_unsupported_format.fetchAdd(stats.quant_kernel_fallback_unsupported_format, .monotonic);
+    _ = aggregate_quant_kernel_fallback_unsupported_shape.fetchAdd(stats.quant_kernel_fallback_unsupported_shape, .monotonic);
+    _ = aggregate_quant_kernel_fallback_unsupported_epilogue.fetchAdd(stats.quant_kernel_fallback_unsupported_epilogue, .monotonic);
+    _ = aggregate_quant_kernel_fallback_unsupported_backend.fetchAdd(stats.quant_kernel_fallback_unsupported_backend, .monotonic);
+    _ = aggregate_quant_kernel_fallback_tensor_core_repack_required.fetchAdd(stats.quant_kernel_fallback_tensor_core_repack_required, .monotonic);
+    _ = aggregate_quant_kernel_fallback_unsupported.fetchAdd(stats.quant_kernel_fallback_unsupported, .monotonic);
     _ = aggregate_interpreter_fallbacks.fetchAdd(stats.interpreter_fallbacks, .monotonic);
     _ = aggregate_device_resident_outputs.fetchAdd(stats.device_resident_outputs, .monotonic);
     _ = aggregate_host_materialized_outputs.fetchAdd(stats.host_materialized_outputs, .monotonic);
@@ -62,6 +88,19 @@ pub fn snapshot() ExecutionStats {
         .device_resident_transfers = aggregate_device_resident_transfers.load(.monotonic),
         .backend_command_dispatches = aggregate_backend_command_dispatches.load(.monotonic),
         .planned_operator_dispatches = aggregate_planned_operator_dispatches.load(.monotonic),
+        .quant_kernel_planned_ops = aggregate_quant_kernel_planned_ops.load(.monotonic),
+        .quant_kernel_handwritten_production = aggregate_quant_kernel_handwritten_production.load(.monotonic),
+        .quant_kernel_generated_production = aggregate_quant_kernel_generated_production.load(.monotonic),
+        .quant_kernel_unsupported_routes = aggregate_quant_kernel_unsupported_routes.load(.monotonic),
+        .quant_kernel_generated_candidates = aggregate_quant_kernel_generated_candidates.load(.monotonic),
+        .quant_kernel_fallback_generated_artifact_missing = aggregate_quant_kernel_fallback_generated_artifact_missing.load(.monotonic),
+        .quant_kernel_fallback_generated_runtime_not_wired = aggregate_quant_kernel_fallback_generated_runtime_not_wired.load(.monotonic),
+        .quant_kernel_fallback_unsupported_format = aggregate_quant_kernel_fallback_unsupported_format.load(.monotonic),
+        .quant_kernel_fallback_unsupported_shape = aggregate_quant_kernel_fallback_unsupported_shape.load(.monotonic),
+        .quant_kernel_fallback_unsupported_epilogue = aggregate_quant_kernel_fallback_unsupported_epilogue.load(.monotonic),
+        .quant_kernel_fallback_unsupported_backend = aggregate_quant_kernel_fallback_unsupported_backend.load(.monotonic),
+        .quant_kernel_fallback_tensor_core_repack_required = aggregate_quant_kernel_fallback_tensor_core_repack_required.load(.monotonic),
+        .quant_kernel_fallback_unsupported = aggregate_quant_kernel_fallback_unsupported.load(.monotonic),
         .interpreter_fallbacks = aggregate_interpreter_fallbacks.load(.monotonic),
         .device_resident_outputs = aggregate_device_resident_outputs.load(.monotonic),
         .host_materialized_outputs = aggregate_host_materialized_outputs.load(.monotonic),
@@ -71,6 +110,17 @@ pub fn snapshot() ExecutionStats {
     };
 }
 
+pub fn delta(after: ExecutionStats, before: ExecutionStats) ExecutionStats {
+    var result = after;
+    inline for (std.meta.fields(ExecutionStats)) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => @field(result, field.name) = @field(after, field.name) -| @field(before, field.name),
+            else => {},
+        }
+    }
+    return result;
+}
+
 pub fn reset() void {
     aggregate_partitions_executed.store(0, .monotonic);
     aggregate_cross_device_transfers.store(0, .monotonic);
@@ -78,6 +128,19 @@ pub fn reset() void {
     aggregate_device_resident_transfers.store(0, .monotonic);
     aggregate_backend_command_dispatches.store(0, .monotonic);
     aggregate_planned_operator_dispatches.store(0, .monotonic);
+    aggregate_quant_kernel_planned_ops.store(0, .monotonic);
+    aggregate_quant_kernel_handwritten_production.store(0, .monotonic);
+    aggregate_quant_kernel_generated_production.store(0, .monotonic);
+    aggregate_quant_kernel_unsupported_routes.store(0, .monotonic);
+    aggregate_quant_kernel_generated_candidates.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_generated_artifact_missing.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_generated_runtime_not_wired.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_unsupported_format.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_unsupported_shape.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_unsupported_epilogue.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_unsupported_backend.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_tensor_core_repack_required.store(0, .monotonic);
+    aggregate_quant_kernel_fallback_unsupported.store(0, .monotonic);
     aggregate_interpreter_fallbacks.store(0, .monotonic);
     aggregate_device_resident_outputs.store(0, .monotonic);
     aggregate_host_materialized_outputs.store(0, .monotonic);
@@ -143,6 +206,31 @@ pub fn print(stats: ExecutionStats) void {
             stats.runtime_frame_ineligible_missing_model_metadata,
         },
     );
+    if (hasQuantKernelPlanStats(stats)) {
+        const top_fallback = quantKernelTopFallbackReason(stats);
+        const fast_path_misses = quantKernelFastPathMisses(stats);
+        std.debug.print(
+            "quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
+            .{
+                stats.quant_kernel_planned_ops,
+                stats.quant_kernel_handwritten_production,
+                stats.quant_kernel_generated_production,
+                stats.quant_kernel_unsupported_routes,
+                fast_path_misses,
+                stats.quant_kernel_generated_candidates,
+                stats.quant_kernel_fallback_generated_artifact_missing,
+                stats.quant_kernel_fallback_generated_runtime_not_wired,
+                stats.quant_kernel_fallback_unsupported,
+                stats.quant_kernel_fallback_unsupported_format,
+                stats.quant_kernel_fallback_unsupported_shape,
+                stats.quant_kernel_fallback_unsupported_epilogue,
+                stats.quant_kernel_fallback_unsupported_backend,
+                stats.quant_kernel_fallback_tensor_core_repack_required,
+                top_fallback.name,
+                top_fallback.count,
+            },
+        );
+    }
     if (hasMetalFusionStats(stats)) {
         std.debug.print(
             "metal_graph_fusions: qkv_regions={d} attention_regions={d} ffn_regions={d} ple_regions={d} tail_regions={d} attention_output_residual={d} attention_output_residual_partial={d} gated_ffn_residual={d} linear_pair={d}\n",
@@ -182,6 +270,54 @@ pub fn print(stats: ExecutionStats) void {
             },
         );
     }
+}
+
+fn hasQuantKernelPlanStats(stats: ExecutionStats) bool {
+    return stats.quant_kernel_planned_ops != 0 or
+        stats.quant_kernel_handwritten_production != 0 or
+        stats.quant_kernel_generated_production != 0 or
+        stats.quant_kernel_unsupported_routes != 0 or
+        stats.quant_kernel_generated_candidates != 0 or
+        stats.quant_kernel_fallback_generated_artifact_missing != 0 or
+        stats.quant_kernel_fallback_generated_runtime_not_wired != 0 or
+        stats.quant_kernel_fallback_unsupported_format != 0 or
+        stats.quant_kernel_fallback_unsupported_shape != 0 or
+        stats.quant_kernel_fallback_unsupported_epilogue != 0 or
+        stats.quant_kernel_fallback_unsupported_backend != 0 or
+        stats.quant_kernel_fallback_tensor_core_repack_required != 0 or
+        stats.quant_kernel_fallback_unsupported != 0;
+}
+
+pub const FallbackReasonCount = struct {
+    name: []const u8,
+    count: u64,
+};
+
+pub fn quantKernelFastPathMisses(stats: ExecutionStats) u64 {
+    return stats.quant_kernel_fallback_generated_artifact_missing +|
+        stats.quant_kernel_fallback_generated_runtime_not_wired +|
+        stats.quant_kernel_fallback_unsupported_format +|
+        stats.quant_kernel_fallback_unsupported_shape +|
+        stats.quant_kernel_fallback_unsupported_epilogue +|
+        stats.quant_kernel_fallback_unsupported_backend +|
+        stats.quant_kernel_fallback_tensor_core_repack_required;
+}
+
+pub fn quantKernelTopFallbackReason(stats: ExecutionStats) FallbackReasonCount {
+    const reasons = [_]FallbackReasonCount{
+        .{ .name = "generated_artifact_missing", .count = stats.quant_kernel_fallback_generated_artifact_missing },
+        .{ .name = "generated_runtime_not_wired", .count = stats.quant_kernel_fallback_generated_runtime_not_wired },
+        .{ .name = "unsupported_format", .count = stats.quant_kernel_fallback_unsupported_format },
+        .{ .name = "unsupported_shape", .count = stats.quant_kernel_fallback_unsupported_shape },
+        .{ .name = "unsupported_epilogue", .count = stats.quant_kernel_fallback_unsupported_epilogue },
+        .{ .name = "unsupported_backend", .count = stats.quant_kernel_fallback_unsupported_backend },
+        .{ .name = "tensor_core_repack_required", .count = stats.quant_kernel_fallback_tensor_core_repack_required },
+    };
+    var best = FallbackReasonCount{ .name = "none", .count = 0 };
+    for (reasons) |reason| {
+        if (reason.count > best.count) best = reason;
+    }
+    return best;
 }
 
 fn hasMetalFusionStats(stats: ExecutionStats) bool {
@@ -268,6 +404,115 @@ pub fn printPartitionFallbackOps(
     }
     if (used > limit) std.debug.print(",...", .{});
     std.debug.print("\n", .{});
+}
+
+test "executor stats aggregate quant kernel plan counters" {
+    reset();
+    defer reset();
+
+    record(.{
+        .quant_kernel_planned_ops = 2,
+        .quant_kernel_handwritten_production = 2,
+        .quant_kernel_generated_production = 7,
+        .quant_kernel_unsupported_routes = 8,
+        .quant_kernel_generated_candidates = 1,
+        .quant_kernel_fallback_generated_artifact_missing = 1,
+        .quant_kernel_fallback_generated_runtime_not_wired = 6,
+        .quant_kernel_fallback_unsupported_format = 1,
+        .quant_kernel_fallback_unsupported_shape = 2,
+        .quant_kernel_fallback_unsupported_epilogue = 3,
+        .quant_kernel_fallback_unsupported_backend = 4,
+        .quant_kernel_fallback_tensor_core_repack_required = 5,
+        .quant_kernel_fallback_unsupported = 1,
+    });
+
+    const stats = snapshot();
+    try std.testing.expectEqual(@as(u64, 2), stats.quant_kernel_planned_ops);
+    try std.testing.expectEqual(@as(u64, 2), stats.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(u64, 7), stats.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(u64, 8), stats.quant_kernel_unsupported_routes);
+    try std.testing.expectEqual(@as(u64, 22), quantKernelFastPathMisses(stats));
+    try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_generated_candidates);
+    try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_fallback_generated_artifact_missing);
+    try std.testing.expectEqual(@as(u64, 6), stats.quant_kernel_fallback_generated_runtime_not_wired);
+    try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_fallback_unsupported_format);
+    try std.testing.expectEqual(@as(u64, 2), stats.quant_kernel_fallback_unsupported_shape);
+    try std.testing.expectEqual(@as(u64, 3), stats.quant_kernel_fallback_unsupported_epilogue);
+    try std.testing.expectEqual(@as(u64, 4), stats.quant_kernel_fallback_unsupported_backend);
+    try std.testing.expectEqual(@as(u64, 5), stats.quant_kernel_fallback_tensor_core_repack_required);
+    try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_fallback_unsupported);
+}
+
+test "executor stats delta reports per-run quant kernel counters" {
+    const before = ExecutionStats{
+        .partitions_executed = 9,
+        .quant_kernel_planned_ops = 10,
+        .quant_kernel_generated_production = 5,
+        .quant_kernel_fallback_unsupported_shape = 3,
+    };
+    const after = ExecutionStats{
+        .partitions_executed = 11,
+        .quant_kernel_planned_ops = 17,
+        .quant_kernel_generated_production = 8,
+        .quant_kernel_fallback_unsupported_shape = 2,
+        .quant_kernel_fallback_unsupported_epilogue = 4,
+    };
+
+    const run = delta(after, before);
+    try std.testing.expectEqual(@as(u64, 2), run.partitions_executed);
+    try std.testing.expectEqual(@as(u64, 7), run.quant_kernel_planned_ops);
+    try std.testing.expectEqual(@as(u64, 3), run.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(u64, 0), run.quant_kernel_fallback_unsupported_shape);
+    try std.testing.expectEqual(@as(u64, 4), run.quant_kernel_fallback_unsupported_epilogue);
+}
+
+test "executor stats wires every quant kernel plan counter" {
+    reset();
+    defer reset();
+
+    try std.testing.expect(!hasQuantKernelPlanStats(.{}));
+
+    inline for (@typeInfo(ExecutionStats).@"struct".fields) |field| {
+        if (comptime std.mem.startsWith(u8, field.name, "quant_kernel_")) {
+            var stats = ExecutionStats{};
+            @field(stats, field.name) = 1;
+
+            try std.testing.expect(hasQuantKernelPlanStats(stats));
+
+            record(stats);
+            const aggregated = snapshot();
+            try std.testing.expectEqual(@as(field.type, 1), @field(aggregated, field.name));
+
+            reset();
+            try std.testing.expectEqual(@as(field.type, 0), @field(snapshot(), field.name));
+        }
+    }
+}
+
+test "executor stats reports top quant kernel fallback reason" {
+    try std.testing.expectEqual(@as(u64, 0), quantKernelFastPathMisses(.{}));
+    try std.testing.expectEqualStrings("none", quantKernelTopFallbackReason(.{}).name);
+    try std.testing.expectEqual(@as(u64, 0), quantKernelTopFallbackReason(.{}).count);
+
+    const stats = ExecutionStats{
+        .quant_kernel_fallback_generated_artifact_missing = 2,
+        .quant_kernel_fallback_generated_runtime_not_wired = 5,
+        .quant_kernel_fallback_unsupported_format = 3,
+        .quant_kernel_fallback_unsupported_shape = 1,
+        .quant_kernel_fallback_unsupported_epilogue = 7,
+        .quant_kernel_fallback_unsupported_backend = 4,
+        .quant_kernel_fallback_tensor_core_repack_required = 6,
+        .quant_kernel_fallback_unsupported = 8,
+    };
+    const top = quantKernelTopFallbackReason(stats);
+    try std.testing.expectEqualStrings("unsupported_epilogue", top.name);
+    try std.testing.expectEqual(@as(u64, 7), top.count);
+    try std.testing.expectEqual(@as(u64, 28), quantKernelFastPathMisses(stats));
+
+    try std.testing.expectEqual(std.math.maxInt(u64), quantKernelFastPathMisses(.{
+        .quant_kernel_fallback_generated_artifact_missing = std.math.maxInt(u64),
+        .quant_kernel_fallback_generated_runtime_not_wired = 1,
+    }));
 }
 
 const OpCount = struct {

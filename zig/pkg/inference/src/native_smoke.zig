@@ -98,11 +98,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    var prompt_encoded = try generation.encodePromptForGeneration(
+    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+        gpt_config,
+        null,
+        @intCast(@max(opts.max_tokens, 1)),
+        0,
+        0,
+    );
+    var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
         allocator,
         rendered_prompt,
-        2048,
+        prompt_token_limit,
         model.manifest.add_bos_token,
         model.manifest.bos_token,
     );
@@ -145,21 +152,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (raw_ids.len > limit) print("  ... and {d} more\n", .{raw_ids.len - limit});
     }
 
-    var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
-    defer if (native_generate_lease) |lease| {
-        if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
-    };
-    if (model.native_generate_coordinator) |coordinator| {
-        native_generate_lease = try coordinator.acquire(.{
-            .requested_units = 1,
-            .prompt_bytes = rendered_prompt.len,
-            .max_tokens = opts.max_tokens,
-        });
-    }
-
-    var kv_manager = runtime.kv.manager.KvManager.init(allocator);
-    defer kv_manager.deinit();
-
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
@@ -168,6 +160,28 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
+    const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+        backend_kind,
+        gpt_config,
+        (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
+    );
+    var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
+    defer if (native_generate_lease) |lease| {
+        if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
+    };
+    if (model.native_generate_coordinator) |coordinator| {
+        native_generate_lease = try coordinator.acquire(.{
+            .requested_units = 1,
+            .prompt_bytes = rendered_prompt.len,
+            .prompt_tokens = prompt_tokens,
+            .prefill_chunk_limit = if (opts.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+            .max_tokens = opts.max_tokens,
+        });
+    }
+
+    var kv_manager = runtime.kv.manager.KvManager.init(allocator);
+    defer kv_manager.deinit();
+
     const kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
     else
@@ -178,17 +192,32 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = applyBudgetOverrides(budget_limits, opts);
+    budget_limits = try applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-    const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
-        backend_kind,
-        kv_dtype,
-        gpt_config,
+    const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
+        .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+    };
+    const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
+        lease.prefill_chunk_size
+    else
+        @min(
+            prompt_tokens,
+            if (opts.prefill_chunk_size == 0)
+                idle_prefill_ceiling
+            else
+                (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
+        );
+    const admission_prefill_ceiling = if (opts.prefill_chunk_size > 0)
+        @min(opts.prefill_chunk_size, scheduler_prefill_ceiling)
+    else
+        scheduler_prefill_ceiling;
+    const admitted_prefill_chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+        &run_budget,
+        &budget_components,
         prompt_tokens,
         @intCast(@max(opts.max_tokens, 1)),
-        admission_prefill_chunk,
-    )) catch |err| {
+        admission_prefill_ceiling,
+    ) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
         }
@@ -235,18 +264,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         pjrt_client = try pjrt_lib.pjrt.Client.init(plugin_path);
     }
 
-    var config = generation.GenerationConfig{
+    const config = generation.GenerationConfig{
         .max_tokens = opts.max_tokens,
         .temperature = opts.temperature,
         .top_p = opts.top_p,
         .top_k = opts.top_k,
-        .prefill_chunk_size = opts.prefill_chunk_size,
+        .prefill_chunk_size = admitted_prefill_chunk,
     };
-    if (native_generate_lease) |lease| {
-        if (config.prefill_chunk_size == 0) {
-            config.prefill_chunk_size = lease.prefill_chunk_size;
-        }
-    }
 
     var pipeline = generation.NativeGenerationPipeline{
         .allocator = allocator,
@@ -550,7 +574,7 @@ fn preflightModelLoadBudget(
         limits,
         predicted_backend_type,
     );
-    limits = applyBudgetOverrides(limits, opts);
+    limits = try applyBudgetOverrides(limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(limits);
     _ = run_budget.tryReserveWeight(reservation_tier, weight_bytes) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
@@ -805,14 +829,14 @@ fn printUsage() void {
     , .{});
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) runtime.tier.memory.Limits {
-    var limits = defaults;
-    if (opts.host_budget_mb > 0) limits.host_limit_bytes = opts.host_budget_mb * 1024 * 1024;
-    if (opts.backend_budget_mb > 0) limits.backend_limit_bytes = opts.backend_budget_mb * 1024 * 1024;
-    if (opts.combined_budget_mb > 0) limits.combined_limit_bytes = opts.combined_budget_mb * 1024 * 1024;
-    if (opts.kv_budget_mb > 0) limits.kv_limit_bytes = opts.kv_budget_mb * 1024 * 1024;
-    if (opts.scratch_budget_mb > 0) limits.scratch_limit_bytes = opts.scratch_budget_mb * 1024 * 1024;
-    return limits;
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return (runtime.tier.memory.BudgetOverridesMib{
+        .host = opts.host_budget_mb,
+        .backend = opts.backend_budget_mb,
+        .combined = opts.combined_budget_mb,
+        .kv = opts.kv_budget_mb,
+        .scratch = opts.scratch_budget_mb,
+    }).apply(defaults);
 }
 
 fn countPromptTokens(attention_mask: anytype) usize {

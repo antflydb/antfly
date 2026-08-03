@@ -5,7 +5,7 @@ Antfly SDK - Python client for Antfly distributed key-value store and search eng
 from .client import AntflyClient
 from .client_generated.models.embedding_type_1 import EmbeddingType1 as SparseEmbedding
 from .client_generated.models.embedding_type_3 import EmbeddingType3 as PackedSparseEmbedding
-from .exceptions import AntflyAuthError, AntflyConnectionError, AntflyException
+from .exceptions import AntflyAuthError, AntflyConnectionError, AntflyException, InferenceAPIError
 
 __version__ = "0.1.0"
 
@@ -14,6 +14,7 @@ __all__ = [
     "AntflyException",
     "AntflyConnectionError",
     "AntflyAuthError",
+    "InferenceAPIError",
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "__version__",

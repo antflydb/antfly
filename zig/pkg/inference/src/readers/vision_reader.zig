@@ -23,6 +23,7 @@ const image = @import("../pipelines/image.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const reader_types = @import("types.zig");
 const c_file = @import("../util/c_file.zig");
+const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
 
 pub const PreprocessorConfig = struct {
     image_size: usize = 384,
@@ -190,6 +191,14 @@ pub const LoadedVisionReader = struct {
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
         var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readDecoded(img);
+    }
+
+    pub fn snapshotMetalGeneratedQuantStats(self: *LoadedVisionReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
+        var stats = metal_generated_quant_stats.snapshotForSession(allocator, self.encoder_session);
+        if (self.decoder_session.ptr != self.encoder_session.ptr or self.decoder_session.vtable != self.encoder_session.vtable) {
+            stats = stats.add(metal_generated_quant_stats.snapshotForSession(allocator, self.decoder_session));
+        }
+        return stats;
     }
 
     fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadingPipeline {

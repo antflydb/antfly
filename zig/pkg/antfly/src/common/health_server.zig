@@ -141,7 +141,8 @@ pub const HealthServer = struct {
         return try self.listener.baseUri(alloc);
     }
 
-    /// Conditional init + start. Returns null when `port` is unset so callers
+    /// Conditional init + start. Returns null when `port` is unset and
+    /// propagates startup errors when a port was explicitly configured, so callers
     /// can write `const hs = try HealthServer.startIfConfigured(...); defer
     /// if (hs) |h| h.deinit();` without scattering if-blocks through each
     /// runtime. Prints the bound URI prefixed with `label` on success.
@@ -169,11 +170,7 @@ pub const HealthServer = struct {
             .bind_port = p,
         }, ready, metrics);
         errdefer hs.deinit();
-        hs.start() catch |err| {
-            hs.deinit();
-            std.log.warn("{s} health api disabled port={d} err={}", .{ label, p, err });
-            return null;
-        };
+        try hs.start();
         const uri = try hs.baseUri(alloc);
         defer alloc.free(uri);
         std.debug.print("{s} health api listening on {s}\n", .{ label, uri });
@@ -474,6 +471,13 @@ test "health server startIfConfiguredOnHost uses provided bind host" {
     defer hs.deinit();
 
     try testing.expectEqualStrings("127.0.0.1", hs.listener.cfg.bind_host);
+}
+
+test "health server startIfConfiguredOnHost propagates configured bind failures" {
+    try testing.expectError(
+        error.ParseFailed,
+        HealthServer.startIfConfiguredOnHost(testing.allocator, "test", "not-an-ip", 4200, null, null),
+    );
 }
 
 test "health server unknown path returns 404" {

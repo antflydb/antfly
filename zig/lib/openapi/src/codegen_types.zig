@@ -761,6 +761,19 @@ pub const TypeGenerator = struct {
 
     /// Get the Zig type string for an inline schema.
     fn zigTypeForSchema(self: *TypeGenerator, schema: types.Schema) GenError![]const u8 {
+        // OpenAPI 3.0 wraps a nullable $ref in a single-member allOf because
+        // nullable is otherwise ignored next to $ref. Preserve the referenced
+        // type instead of degrading the field to std.json.Value.
+        if (schema.nullable and
+            schema.schema_type == null and
+            schema.all_of.len == 1 and
+            schema.one_of.len == 0 and
+            schema.any_of.len == 0 and
+            schema.properties.count() == 0)
+        {
+            return self.zigTypeForSchemaOrRef(schema.all_of[0]);
+        }
+
         // String enum → will be a named type, but when used inline just emit Value
         if (schema.enum_values.len > 0) {
             return "[]const u8"; // unnamed enums default to string
@@ -830,6 +843,13 @@ test "zigTypeForSchema primitives" {
     try std.testing.expectEqualStrings("f64", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "number" } }));
     try std.testing.expectEqualStrings("f32", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "number" }, .format = "float" }));
     try std.testing.expectEqualStrings("bool", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "boolean" } }));
+    try std.testing.expectEqualStrings("Status", try gen.zigTypeForSchema(.{
+        .nullable = true,
+        .all_of = &.{.{ .ref = .{ .ref_string = "#/components/schemas/Status" } }},
+    }));
+    try std.testing.expectEqualStrings("std.json.Value", try gen.zigTypeForSchema(.{
+        .all_of = &.{.{ .ref = .{ .ref_string = "#/components/schemas/Status" } }},
+    }));
 
     // 3.1 type arrays should also work
     try std.testing.expectEqualStrings("[]const u8", try gen.zigTypeForSchema(.{ .schema_type = .{ .array = &.{ "string", "null" } } }));

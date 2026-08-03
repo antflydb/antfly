@@ -6,9 +6,7 @@ on:
       - "v*" # Triggers on tags like v1.0.0, v0.0.0-dev10
 
 permissions:
-  contents: write # Required for creating releases
-  packages: write # Required if publishing Docker images
-  id-token: write # Required for keyless OIDC signing in container workflow
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -81,6 +79,9 @@ jobs:
         with:
           version: "0.16.0"
 
+      - name: Test reproducible archive packaging
+        run: python3 scripts/packaging/test_reproducible_tar.py
+
       - name: Build archive
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -108,8 +109,11 @@ jobs:
 
   publish-release-assets:
     name: Publish release assets
-    needs: build-zig-runtime-archives
+    needs:
+      - build-zig-runtime-archives
     runs-on: arc-antfly-standard
+    permissions:
+      contents: write # Required only here for creating the draft release.
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -315,13 +319,18 @@ jobs:
             --archive-dir dist/release-archives \
             --out "$RUNNER_TEMP/antfly.rb"
 
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: antflydb/homebrew-taps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-taps
+          fetch-depth: 1
+
       - name: Push formula to tap
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
-          tap_dir="$RUNNER_TEMP/homebrew-taps"
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/antflydb/homebrew-taps.git" "$tap_dir"
+          tap_dir="$GITHUB_WORKSPACE/homebrew-taps"
           cp "$RUNNER_TEMP/antfly.rb" "$tap_dir/Formula/antfly.rb"
           cd "$tap_dir"
           git config user.name "github-actions[bot]"
@@ -339,6 +348,10 @@ jobs:
     needs:
       - build-zig-runtime-archives
       - publish-release-assets
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ github.ref_name }}

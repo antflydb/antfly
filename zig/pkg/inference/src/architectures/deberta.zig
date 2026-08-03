@@ -98,6 +98,57 @@ fn metalEncoderLayerExecutionEnabled() bool {
     return true;
 }
 
+fn metalSlotOpsEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_SLOT_OPS")) return false;
+    return true;
+}
+
+fn metalDebertaWeightMirrorMaxBytes() usize {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_DEBERTA_WEIGHT_MIRROR_MAX_MB") orelse 768;
+    return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
+}
+
+fn debertaDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
+    const layers: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+    const hidden_squared = std.math.mul(usize, hidden, hidden) catch return null;
+    const hidden_intermediate = std.math.mul(usize, hidden, intermediate) catch return null;
+    const hidden_projections = std.math.mul(usize, hidden_squared, 4) catch return null;
+    const ffn_projections = std.math.mul(usize, hidden_intermediate, 2) catch return null;
+    const elements_per_layer = std.math.add(usize, hidden_projections, ffn_projections) catch return null;
+    const total_elements = std.math.mul(usize, elements_per_layer, layers) catch return null;
+    return std.math.mul(usize, total_elements, bytes_per_element) catch null;
+}
+
+const DebertaMirrorPreference = struct {
+    enabled: bool,
+    prefer_q8: bool,
+    prefer_bf16: bool,
+    prefer_f32_mps: bool,
+    prefer_f16_mps: bool,
+};
+
+fn debertaMirrorPreference(config: Config, prefer_weight_mirrors: bool) DebertaMirrorPreference {
+    const requested = prefer_weight_mirrors and !platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS");
+    const prefer_q8 = requested and platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_Q8_MIRRORS");
+    const prefer_bf16_requested = requested and !prefer_q8 and
+        platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_BF16_MIRRORS");
+    const prefer_f32_requested = requested and !prefer_q8 and !prefer_bf16_requested and
+        platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_F32_MIRRORS");
+    const mirror_bytes = debertaDenseMirrorBytes(config, if (prefer_f32_requested) @sizeOf(f32) else @sizeOf(u16)) orelse
+        std.math.maxInt(usize);
+    const enabled = requested and mirror_bytes <= metalDebertaWeightMirrorMaxBytes();
+    return .{
+        .enabled = enabled,
+        .prefer_q8 = enabled and prefer_q8,
+        .prefer_bf16 = enabled and !prefer_q8 and prefer_bf16_requested,
+        .prefer_f32_mps = enabled and !prefer_q8 and !prefer_bf16_requested and prefer_f32_requested,
+        .prefer_f16_mps = enabled and !prefer_q8 and !prefer_bf16_requested and !prefer_f32_requested,
+    };
+}
+
 const DebertaLinearSlotKind = enum(usize) {
     q = 0,
     k = 1,
@@ -134,6 +185,7 @@ pub fn preplanMetalDebertaEncoderFrame(
     config: Config,
     batch: usize,
     seq_len: usize,
+    prefer_weight_mirrors: bool,
 ) !bool {
     if (cb.kind() != .metal) return false;
     if (!metalEncoderFrameEnabled()) return false;
@@ -146,6 +198,8 @@ pub fn preplanMetalDebertaEncoderFrame(
     const heads: usize = @intCast(config.num_attention_heads);
     if (layer_count == 0 or batch == 0 or seq_len == 0 or H == 0 or I == 0 or heads == 0) return false;
     if (H % heads != 0) return false;
+
+    const mirrors = debertaMirrorPreference(config, prefer_weight_mirrors);
 
     const layers = try allocator.alloc(ops.DebertaEncoderLayerSpec, layer_count);
     defer allocator.free(layers);
@@ -216,12 +270,42 @@ pub fn preplanMetalDebertaEncoderFrame(
         const attn_ln_slot = debertaLayerNormSlot(layer, .attention_output);
         const ffn_ln_slot = debertaLayerNormSlot(layer, .output);
 
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H, .retain_dense_fallback = true }))) return false;
+        const PrepSpec = struct {
+            slot: usize,
+            weight: ops.CT,
+            bias: ops.CT,
+            in_dim: usize,
+            out_dim: usize,
+        };
+        const prep_specs = [_]PrepSpec{
+            .{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H },
+            .{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H },
+            .{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H },
+            .{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H },
+            .{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I },
+            .{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H },
+        };
+        for (prep_specs) |spec| {
+            if (!(try cb.decoderRuntimePrepareLinear(&.{
+                .slot = spec.slot,
+                .weight = spec.weight,
+                .bias = spec.bias,
+                .in_dim = spec.in_dim,
+                .out_dim = spec.out_dim,
+                // Encoder-shaped GEMMs want the dense F16 MPS mirror path the
+                // BERT encoder uses; the packed quantized weight remains the
+                // source of truth and Q8/BF16/F32 mirrors stay available for
+                // A/B runs (see preplanMetalEncoder in bert.zig).
+                // Keep the pre-existing generic DeBERTa dense fallback.
+                // GLiNER alone opts into the new capped f16 MPS preference.
+                .retain_dense_fallback = true,
+                .dense_fallback_max_bytes = if (mirrors.enabled) 32 * 1024 * 1024 else null,
+                .allow_direct_quant_fallback = mirrors.enabled,
+                .prefer_bf16_fallback = mirrors.prefer_bf16,
+                .prefer_f16_mps_fallback = mirrors.prefer_f16_mps,
+                .prefer_f32_mps_fallback = mirrors.prefer_f32_mps,
+            }))) return false;
+        }
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = attn_ln_slot, .weight = attn_ln_w, .bias = attn_ln_b, .hidden_size = H }))) return false;
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = ffn_ln_slot, .weight = ffn_ln_w, .bias = ffn_ln_b, .hidden_size = H }))) return false;
 
@@ -237,7 +321,10 @@ pub fn preplanMetalDebertaEncoderFrame(
         };
     }
 
-    return cb.debertaEncoderPlanFrame(&.{
+    // Best-effort fused-frame hook: no Metal implementation today, but the
+    // prepared slots above are consumed by the per-op slot fast paths in
+    // encoderLayer either way.
+    _ = try cb.debertaEncoderPlanFrame(&.{
         .layer_count = layer_count,
         .batch = batch,
         .seq_len = seq_len,
@@ -249,6 +336,7 @@ pub fn preplanMetalDebertaEncoderFrame(
         .norm_eps = config.layer_norm_eps,
         .layers = layers,
     });
+    return true;
 }
 
 /// Run the full DeBERTa encoder forward pass and return the result on
@@ -266,8 +354,9 @@ pub fn forwardCt(
     attention_mask: []const i64,
     batch: usize,
     seq_len: usize,
+    prefer_weight_mirrors: bool,
 ) !CT {
-    return forwardCtProfiled(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null);
+    return forwardCtProfiled(cb, allocator, config, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors, null);
 }
 
 pub fn forwardCtProfiled(
@@ -278,12 +367,13 @@ pub fn forwardCtProfiled(
     attention_mask: []const i64,
     batch: usize,
     seq_len: usize,
+    prefer_weight_mirrors: bool,
     profile: ?*EncoderProfile,
 ) !CT {
     const H = config.hidden_size;
     const total = batch * seq_len;
 
-    _ = try preplanMetalDebertaEncoderFrame(cb, allocator, config, batch, seq_len);
+    const resident_slots = try preplanMetalDebertaEncoderFrame(cb, allocator, config, batch, seq_len, prefer_weight_mirrors);
 
     var encoder_frame_active = false;
     if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
@@ -302,7 +392,7 @@ pub fn forwardCtProfiled(
 
     for (0..config.num_hidden_layers) |layer| {
         timer = profileStart(profile);
-        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, profile);
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, resident_slots, profile);
         cb.free(hidden);
         hidden = new_hidden;
         if (profile) |p| p.layer_total_ns += profileElapsed(timer);
@@ -327,7 +417,7 @@ pub fn forward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, batch, seq_len);
+    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, batch, seq_len, false);
     defer cb.free(hidden);
     return cb.toFloat32(hidden, allocator);
 }
@@ -352,7 +442,7 @@ pub fn forwardUntilLayerCt(
     defer if (rel_emb.full_to_unique) |ids| allocator.free(ids);
 
     for (0..clamped_stop) |layer| {
-        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, null);
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, false, null);
         cb.free(hidden);
         hidden = new_hidden;
     }
@@ -410,7 +500,7 @@ pub fn forwardFromHiddenRange(
     const clamped_start = @min(start_layer, config.num_hidden_layers);
     const clamped_end = @max(clamped_start, @min(end_layer_exclusive, config.num_hidden_layers));
     for (clamped_start..clamped_end) |layer| {
-        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, null);
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, false, null);
         cb.free(hidden);
         hidden = new_hidden;
     }
@@ -592,6 +682,7 @@ fn encoderLayer(
     batch: usize,
     seq_len: usize,
     layer: usize,
+    resident_slots: bool,
     profile: ?*EncoderProfile,
 ) !CT {
     _ = allocator;
@@ -610,6 +701,7 @@ fn encoderLayer(
     const local_num_heads = if (use_tp) num_heads / tp_world_size else num_heads;
     const local_hidden = if (use_tp) H / tp_world_size else H;
     const local_intermediate = if (use_tp) I / tp_world_size else I;
+    const slot_ops = resident_slots and !use_tp and metalSlotOpsEnabled();
 
     if (!use_tp and metalEncoderFrameEnabled() and metalEncoderLayerExecutionEnabled()) {
         if (try cb.debertaEncoderLayer(&.{
@@ -670,7 +762,24 @@ fn encoderLayer(
         errdefer cb.free(K);
         const V = try linearReplicatedToMaybeSharded(cb, hidden, v_w, v_b, total, H, H);
         break :blk ops.LinearTripleResult{ .first = Q, .second = K, .third = V };
-    } else try cb.linearTriple(hidden, q_w, q_b, k_w, k_b, v_w, v_b, total, H, H);
+    } else blk: {
+        if (slot_ops) {
+            if (try cb.decoderRuntimeApplyLinearQkv(&.{
+                .q_slot = debertaLinearSlot(layer, .q),
+                .k_slot = debertaLinearSlot(layer, .k),
+                .v_slot = debertaLinearSlot(layer, .v),
+                .input = hidden,
+                .in_dim = H,
+                .q_out_dim = H,
+                .kv_out_dim = H,
+            })) |projected| break :blk ops.LinearTripleResult{
+                .first = projected.first,
+                .second = projected.second,
+                .third = projected.third,
+            };
+        }
+        break :blk try cb.linearTriple(hidden, q_w, q_b, k_w, k_b, v_w, v_b, total, H, H);
+    };
     const Q = qkv.first;
     const K = qkv.second;
     const V = qkv.third;
@@ -691,7 +800,23 @@ fn encoderLayer(
         errdefer cb.free(Q_r);
         const K_r = try linearReplicatedToMaybeSharded(cb, rel_emb.embeddings, k_w, k_b, rel_emb.unique_count, H, H);
         break :blk ops.LinearPairResult{ .first = Q_r, .second = K_r };
-    } else try cb.linearPair(rel_emb.embeddings, q_w, q_b, k_w, k_b, rel_emb.unique_count, H, H);
+    } else blk: {
+        if (slot_ops) {
+            // share_att_key: the relative projections reuse the content q/k
+            // slots, so the prepared mirrors serve both GEMMs.
+            if (try cb.decoderRuntimeApplyLinearPair(&.{
+                .slot_a = debertaLinearSlot(layer, .q),
+                .slot_b = debertaLinearSlot(layer, .k),
+                .input = rel_emb.embeddings,
+                .in_dim = H,
+                .out_dim = H,
+            })) |projected| break :blk ops.LinearPairResult{
+                .first = projected.first,
+                .second = projected.second,
+            };
+        }
+        break :blk try cb.linearPair(rel_emb.embeddings, q_w, q_b, k_w, k_b, rel_emb.unique_count, H, H);
+    };
     var Q_r = rel_qk.first;
     var K_r = rel_qk.second;
     if (rel_emb.full_to_unique) |ids| {
@@ -727,6 +852,20 @@ fn encoderLayer(
     const attn_ln_b = try getLayerWeight(cb, layer, "attention.output.LayerNorm.bias", &attn_ln_b_buf);
     defer cb.free(attn_ln_b);
     const attn_normed = if (!use_tp) blk: {
+        if (slot_ops) {
+            if (try cb.decoderRuntimeApplyLinearLayerNorm(&.{
+                .linear_slot = debertaLinearSlot(layer, .attention_output),
+                .layer_norm_slot = debertaLayerNormSlot(layer, .attention_output),
+                .input = attn_out,
+                .residual = hidden,
+                .in_dim = H,
+                .hidden_size = H,
+                .eps = eps,
+            })) |output| {
+                if (profile) |p| p.attention_output_ns += profileElapsed(timer);
+                break :blk output;
+            }
+        }
         if (try cb.denseLinearLayerNorm(&.{
             .input = attn_out,
             .residual = hidden,
@@ -774,6 +913,10 @@ fn encoderLayer(
         break :blk normed;
     };
 
+    // attn_normed feeds every FFN branch as input/residual; one deferred
+    // free covers success and error paths alike (mirrors bert.zig).
+    defer cb.free(attn_normed);
+
     // FFN
     timer = profileStart(profile);
     var ffn_i_w_buf: [256]u8 = undefined;
@@ -796,6 +939,36 @@ fn encoderLayer(
     defer cb.free(ffn_ln_b);
 
     if (!use_tp) {
+        if (slot_ops) {
+            if (try cb.decoderRuntimeApplyFfnLayerNorm(&.{
+                .first_linear_slot = debertaLinearSlot(layer, .intermediate),
+                .second_linear_slot = debertaLinearSlot(layer, .output),
+                .layer_norm_slot = debertaLayerNormSlot(layer, .output),
+                .input = attn_normed,
+                .residual = attn_normed,
+                .hidden_size = H,
+                .intermediate_size = I,
+                .eps = eps,
+                .activation = .gelu,
+            })) |layer_out| {
+                if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
+                return layer_out;
+            }
+            if (try cb.runDenseFfnResidual(&.{
+                .first_linear_slot = debertaLinearSlot(layer, .intermediate),
+                .second_linear_slot = debertaLinearSlot(layer, .output),
+                .input = attn_normed,
+                .residual = attn_normed,
+                .hidden_size = H,
+                .intermediate_size = I,
+                .activation = .gelu,
+            })) |ffn_res| {
+                defer cb.free(ffn_res);
+                const layer_out = try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, eps);
+                if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
+                return layer_out;
+            }
+        }
         if (try cb.denseFfnLayerNorm(&.{
             .input = attn_normed,
             .residual = attn_normed,
@@ -811,7 +984,6 @@ fn encoderLayer(
             .eps = eps,
             .activation = .gelu,
         })) |fused| {
-            cb.free(attn_normed);
             if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
             return fused;
         }
@@ -853,16 +1025,13 @@ fn encoderLayer(
 
     timer = profileStart(profile);
     const out = if (ffn_out_has_residual) blk: {
-        cb.free(attn_normed);
         defer cb.free(ffn_out);
         break :blk try cb.layerNorm(ffn_out, ffn_ln_w, ffn_ln_b, H, eps);
     } else if (try cb.addLayerNorm(ffn_out, attn_normed, ffn_ln_w, ffn_ln_b, H, eps)) |fused| blk: {
-        cb.free(attn_normed);
         cb.free(ffn_out);
         break :blk fused;
     } else blk: {
         const ffn_res = try cb.add(ffn_out, attn_normed);
-        cb.free(attn_normed);
         cb.free(ffn_out);
         defer cb.free(ffn_res);
         break :blk try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, eps);

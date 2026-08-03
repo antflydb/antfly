@@ -1066,9 +1066,10 @@ pub const ReadingPipeline = struct {
 
         if (fused_lm_head_allowed) {
             var capture_graph = false;
+            errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
             if (florenceCudaGraphEnabled()) {
                 if (suppress_tokens.len == 0) {
-                    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("florence.lm_head_argmax", hidden.*)) |prepared| {
+                    if (try cb.debugCudaGraphPrepareGreedyTokenReplayInput("florence.lm_head_argmax", hidden.*, 0)) |prepared| {
                         cb.free(hidden.*);
                         hidden.* = prepared;
                         hidden_live.* = true;
@@ -1096,8 +1097,6 @@ pub const ReadingPipeline = struct {
                     last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_suppress_tokens_dynamic";
                 }
             }
-            errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
-
             const fused_start = nowNs();
             if (try florence_arch.decoderFusedTokenFromFinalHiddenTensor(cb, florence_cfg, hidden.*, suppress_tokens)) |token_tensor| {
                 logReadProfile("florence_decoder_lm_head_fused_argmax", fused_start);

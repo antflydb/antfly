@@ -561,6 +561,7 @@ fn runForwardTimed(
         inputs.attention_mask,
         cfg.batch,
         cfg.seq_len,
+        true,
         &encoder_profile,
     ) catch |err| {
         std.debug.print("bench gliner2: encoder failed: {s}\n", .{@errorName(err)});

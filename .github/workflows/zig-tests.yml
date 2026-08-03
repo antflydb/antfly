@@ -97,6 +97,7 @@ jobs:
             scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
+            .github/workflows/cuda-gemma4-l4.yml \
             .github/workflows/antfly-container.yml
           then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
@@ -284,6 +285,26 @@ jobs:
 
       - name: Check generated sources
         run: make zig-generated-check
+
+      - name: Check inference kernel generator
+        working-directory: zig/pkg/inference
+        run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+
+      - name: Test standalone inference CLI configuration
+        working-directory: zig
+        run: zig build inference-cli-test -Dedition=inference -Dmetal=false -Dcuda=false -Donnx=false -Dsystem-blas=false
+
+      - name: Run CUDA benchmark contract tests
+        working-directory: zig/pkg/inference
+        run: |
+          python3 -m unittest \
+            scripts.test_benchmark_gemma4_cuda_batching \
+            scripts.test_benchmark_gemma4_cuda_matrix \
+            scripts.test_gemma4_cuda_l4_release_gate \
+            scripts.test_gemma4_cuda_production_gate \
+            scripts.test_gemma4_qat_cuda_tuning \
+            scripts.test_gemma4_qat_llamacpp_pair_benchmark \
+            scripts.test_validate_gemma4_cuda_candidate
 
       # ARC exposes the node CPU count instead of the pod quota. Keep the
       # process affinity aligned with the pod CPU budget, and independently

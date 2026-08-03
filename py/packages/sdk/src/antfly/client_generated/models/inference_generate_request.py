@@ -9,13 +9,17 @@ from attrs import field as _attrs_field
 from ..models.inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from ..models.inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from ..models.inference_generate_request_mode import InferenceGenerateRequestMode
+from ..models.inference_generate_request_speculation_calibration import InferenceGenerateRequestSpeculationCalibration
+from ..models.inference_generate_request_speculation_policy import InferenceGenerateRequestSpeculationPolicy
 from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_tool_choice_type_0 import InferenceToolChoiceType0
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_chat_message import InferenceChatMessage
+    from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
     from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
+    from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
     from ..models.inference_tool import InferenceTool
     from ..models.inference_tool_choice_type_1 import InferenceToolChoiceType1
 
@@ -30,11 +34,20 @@ class InferenceGenerateRequest:
         model (str): Name of the generator model from models_dir/generators/ Example: google/gemma-3-1b-it.
         messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format)
         max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
-        temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 1.0.
+        temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 0.0.
             Example: 0.7.
-        top_p (float | Unset): Nucleus sampling probability Default: 1.0.
-        top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 50.
+        top_p (float | Unset): Nucleus sampling probability Default: 0.0.
+        top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 0.
         stream (bool | Unset): If true, partial message deltas will be sent as SSE events Default: False.
+        stream_options (InferenceGenerateStreamOptions | Unset): Options that apply only to streamed generation
+            responses.
+        chat_template_kwargs (InferenceGenerateChatTemplateKwargs | Unset): Typed options passed to the model's chat
+            template.
+        ignore_eos (bool | Unset): inference-native benchmarking and controlled-generation extension. When true,
+            generation
+            does not stop on the model's end-of-sequence token and continues until another stop
+            condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+             Default: False.
         tools (list[InferenceTool] | Unset): List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
         min_p (float | Unset): Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to
@@ -53,7 +66,13 @@ class InferenceGenerateRequest:
             smaller draft model.
         speculative_k (int | Unset): inference-native speculative decoding extension. Number of draft tokens proposed
             per verification round.
-             Default: 4.
+        speculation_policy (InferenceGenerateRequestSpeculationPolicy | Unset): inference-native speculative decoding
+            policy: `auto`, `force`, or `off`.
+            Defaults to `auto` when a draft model is requested.
+        speculation_calibration (InferenceGenerateRequestSpeculationCalibration | Unset): inference-native speculative
+            decoding calibration state: `none`, `probe`, or `positive`.
+            Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled,
+            and to `none` for `force` or `off`.
         cache_dtype (InferenceGenerateRequestCacheDtype | Unset): inference-native KV cache quantization format. Lower
             precision reduces memory usage but may
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
@@ -61,6 +80,8 @@ class InferenceGenerateRequest:
             Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+            The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
+            device-backed compaction is not yet supported.
         prompt_cache_key (str | Unset): inference-native prompt prefix cache namespace key. Requests with the same key
             can
             reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
@@ -92,10 +113,13 @@ class InferenceGenerateRequest:
     model: str
     messages: list[InferenceChatMessage]
     max_tokens: int | Unset = 256
-    temperature: float | Unset = 1.0
-    top_p: float | Unset = 1.0
-    top_k: int | Unset = 50
+    temperature: float | Unset = 0.0
+    top_p: float | Unset = 0.0
+    top_k: int | Unset = 0
     stream: bool | Unset = False
+    stream_options: InferenceGenerateStreamOptions | Unset = UNSET
+    chat_template_kwargs: InferenceGenerateChatTemplateKwargs | Unset = UNSET
+    ignore_eos: bool | Unset = False
     tools: list[InferenceTool] | Unset = UNSET
     min_p: float | Unset = 0.0
     repetition_penalty: float | Unset = 1.0
@@ -104,7 +128,9 @@ class InferenceGenerateRequest:
     response_format: InferenceGenerateResponseFormat | Unset = UNSET
     grammar: str | Unset = UNSET
     draft_model: str | Unset = UNSET
-    speculative_k: int | Unset = 4
+    speculative_k: int | Unset = UNSET
+    speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset = UNSET
+    speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset = UNSET
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
     prompt_cache_key: str | Unset = UNSET
@@ -133,6 +159,16 @@ class InferenceGenerateRequest:
 
         stream = self.stream
 
+        stream_options: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.stream_options, Unset):
+            stream_options = self.stream_options.to_dict()
+
+        chat_template_kwargs: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.chat_template_kwargs, Unset):
+            chat_template_kwargs = self.chat_template_kwargs.to_dict()
+
+        ignore_eos = self.ignore_eos
+
         tools: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tools, Unset):
             tools = []
@@ -157,6 +193,14 @@ class InferenceGenerateRequest:
         draft_model = self.draft_model
 
         speculative_k = self.speculative_k
+
+        speculation_policy: str | Unset = UNSET
+        if not isinstance(self.speculation_policy, Unset):
+            speculation_policy = self.speculation_policy.value
+
+        speculation_calibration: str | Unset = UNSET
+        if not isinstance(self.speculation_calibration, Unset):
+            speculation_calibration = self.speculation_calibration.value
 
         cache_dtype: str | Unset = UNSET
         if not isinstance(self.cache_dtype, Unset):
@@ -206,6 +250,12 @@ class InferenceGenerateRequest:
             field_dict["top_k"] = top_k
         if stream is not UNSET:
             field_dict["stream"] = stream
+        if stream_options is not UNSET:
+            field_dict["stream_options"] = stream_options
+        if chat_template_kwargs is not UNSET:
+            field_dict["chat_template_kwargs"] = chat_template_kwargs
+        if ignore_eos is not UNSET:
+            field_dict["ignore_eos"] = ignore_eos
         if tools is not UNSET:
             field_dict["tools"] = tools
         if min_p is not UNSET:
@@ -224,6 +274,10 @@ class InferenceGenerateRequest:
             field_dict["draft_model"] = draft_model
         if speculative_k is not UNSET:
             field_dict["speculative_k"] = speculative_k
+        if speculation_policy is not UNSET:
+            field_dict["speculation_policy"] = speculation_policy
+        if speculation_calibration is not UNSET:
+            field_dict["speculation_calibration"] = speculation_calibration
         if cache_dtype is not UNSET:
             field_dict["cache_dtype"] = cache_dtype
         if cache_compaction_ratio is not UNSET:
@@ -246,7 +300,9 @@ class InferenceGenerateRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_chat_message import InferenceChatMessage
+        from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
         from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
+        from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
         from ..models.inference_tool import InferenceTool
         from ..models.inference_tool_choice_type_1 import InferenceToolChoiceType1
 
@@ -269,6 +325,22 @@ class InferenceGenerateRequest:
         top_k = d.pop("top_k", UNSET)
 
         stream = d.pop("stream", UNSET)
+
+        _stream_options = d.pop("stream_options", UNSET)
+        stream_options: InferenceGenerateStreamOptions | Unset
+        if isinstance(_stream_options, Unset):
+            stream_options = UNSET
+        else:
+            stream_options = InferenceGenerateStreamOptions.from_dict(_stream_options)
+
+        _chat_template_kwargs = d.pop("chat_template_kwargs", UNSET)
+        chat_template_kwargs: InferenceGenerateChatTemplateKwargs | Unset
+        if isinstance(_chat_template_kwargs, Unset):
+            chat_template_kwargs = UNSET
+        else:
+            chat_template_kwargs = InferenceGenerateChatTemplateKwargs.from_dict(_chat_template_kwargs)
+
+        ignore_eos = d.pop("ignore_eos", UNSET)
 
         _tools = d.pop("tools", UNSET)
         tools: list[InferenceTool] | Unset = UNSET
@@ -299,6 +371,20 @@ class InferenceGenerateRequest:
         draft_model = d.pop("draft_model", UNSET)
 
         speculative_k = d.pop("speculative_k", UNSET)
+
+        _speculation_policy = d.pop("speculation_policy", UNSET)
+        speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset
+        if isinstance(_speculation_policy, Unset):
+            speculation_policy = UNSET
+        else:
+            speculation_policy = InferenceGenerateRequestSpeculationPolicy(_speculation_policy)
+
+        _speculation_calibration = d.pop("speculation_calibration", UNSET)
+        speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset
+        if isinstance(_speculation_calibration, Unset):
+            speculation_calibration = UNSET
+        else:
+            speculation_calibration = InferenceGenerateRequestSpeculationCalibration(_speculation_calibration)
 
         _cache_dtype = d.pop("cache_dtype", UNSET)
         cache_dtype: InferenceGenerateRequestCacheDtype | Unset
@@ -361,6 +447,9 @@ class InferenceGenerateRequest:
             top_p=top_p,
             top_k=top_k,
             stream=stream,
+            stream_options=stream_options,
+            chat_template_kwargs=chat_template_kwargs,
+            ignore_eos=ignore_eos,
             tools=tools,
             min_p=min_p,
             repetition_penalty=repetition_penalty,
@@ -370,6 +459,8 @@ class InferenceGenerateRequest:
             grammar=grammar,
             draft_model=draft_model,
             speculative_k=speculative_k,
+            speculation_policy=speculation_policy,
+            speculation_calibration=speculation_calibration,
             cache_dtype=cache_dtype,
             cache_compaction_ratio=cache_compaction_ratio,
             prompt_cache_key=prompt_cache_key,

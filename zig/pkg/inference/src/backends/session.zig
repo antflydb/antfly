@@ -30,6 +30,8 @@ pub const ResidentOutputs = struct {
     outputs: []ops.CT,
     backend: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
+    backend_owner: ?*anyopaque = null,
+    deinit_backend_owner: ?*const fn (owner: *anyopaque, allocator: std.mem.Allocator) void = null,
     resource_lease: ?memory.AdmissionLease = null,
 
     pub fn deinit(self: *ResidentOutputs) void {
@@ -46,6 +48,11 @@ pub const ResidentOutputs = struct {
         self.allocator.free(self.outputs);
         if (self.resource_lease) |*lease| lease.release();
         self.outputs = &.{};
+        if (self.backend_owner) |owner| {
+            if (self.deinit_backend_owner) |deinit_owner| deinit_owner(owner, self.allocator);
+        }
+        self.backend_owner = null;
+        self.deinit_backend_owner = null;
         self.resource_lease = null;
     }
 };

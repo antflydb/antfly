@@ -54,8 +54,15 @@ const ManagedArtifactReceipt = struct {
     sha256: ?[]const u8 = null,
 };
 
+const ManagedDownloadSource = struct {
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+};
+
 const ManagedDownloadReceipt = struct {
     version: u32 = 1,
+    source: ?ManagedDownloadSource = null,
     artifacts: []const ManagedArtifactReceipt,
 };
 
@@ -1293,7 +1300,7 @@ pub fn managedDownloadState(
         .{ .ignore_unknown_fields = true },
     ) catch return .incomplete;
     defer parsed.deinit();
-    if (parsed.value.version != 1 or parsed.value.artifacts.len == 0) {
+    if ((parsed.value.version != 1 and parsed.value.version != 2) or parsed.value.artifacts.len == 0) {
         return .incomplete;
     }
 
@@ -1320,6 +1327,41 @@ pub fn managedDownloadState(
         return .incomplete;
     }
     return .complete;
+}
+
+/// Verify that a completed managed directory was published for the exact Hub
+/// reference being requested. Version-1 receipts predate source identity and
+/// therefore cannot prove an explicit variant match.
+pub fn managedDownloadMatchesSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+) bool {
+    if (managedDownloadState(allocator, io, dest_dir) != .complete) return false;
+    const complete_path = managedPath(allocator, dest_dir, managed_download_complete_filename) catch return false;
+    defer allocator.free(complete_path);
+    const receipt_json = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        complete_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return false;
+    defer allocator.free(receipt_json);
+    var parsed = std.json.parseFromSlice(
+        ManagedDownloadReceipt,
+        allocator,
+        receipt_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch return false;
+    defer parsed.deinit();
+    const source = parsed.value.source orelse return false;
+    return parsed.value.version == 2 and
+        std.mem.eql(u8, source.owner, owner) and
+        std.mem.eql(u8, source.name, name) and
+        std.mem.eql(u8, source.variant, variant);
 }
 
 fn managedPublicationFilesBlocked(
@@ -1597,7 +1639,11 @@ pub fn downloadModel(
 
     const receipt_json = try std.json.Stringify.valueAlloc(
         allocator,
-        ManagedDownloadReceipt{ .artifacts = receipts.items },
+        ManagedDownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = owner, .name = name, .variant = variant },
+            .artifacts = receipts.items,
+        },
         .{},
     );
     defer allocator.free(receipt_json);
@@ -2903,6 +2949,31 @@ test "managed download publication keeps incomplete state fail closed" {
         ManagedDownloadState.incomplete,
         managedDownloadState(allocator, io, dest_dir),
     );
+}
+
+test "managed download receipt source identity is exact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "managed-source");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const artifact_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(artifact_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = artifact_path, .data = "payload" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = complete_path,
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"gguf:Q4_K_M"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+
+    try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
+    try std.testing.expect(!managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q8_0"));
 }
 
 test "content range validation requires exact resume boundaries" {

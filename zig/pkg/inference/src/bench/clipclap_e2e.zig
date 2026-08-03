@@ -26,11 +26,15 @@ const inference = @import("inference_internal");
 const backends = inference.backends;
 const graph_runtime = inference.graph.runtime;
 const graph_executor_stats = inference.graph.executor_stats;
+const kernel_jit = inference.graph.kernel_jit;
 const native_compute = inference.native_compute.native;
 const model_manager_mod = inference.server.model_manager;
 const embedding_mod = inference.pipelines.embedding;
 const native_backend_guard = inference.native_backend_guard;
 const metal_runtime = inference.metal_runtime;
+const metal_generated_quant_stats_mod = inference.metal_generated_quant_stats;
+const kernel_jit_profile_output = inference.kernel_jit_profile_output;
+const session_factory = inference.architectures.session_factory;
 
 const max_file_bytes = 512 * 1024 * 1024;
 
@@ -62,6 +66,10 @@ const InputRef = struct {
 const Options = struct {
     model_dir: []const u8 = "",
     backend: BackendChoice = .auto,
+    kernel_jit: kernel_jit.Config = .{},
+    kernel_jit_mode_explicit: bool = false,
+    kernel_jit_profile_out: ?[]const u8 = null,
+    kernel_jit_qualified_profile_bundle: ?[]const u8 = null,
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
     resident_projection_required: bool = false,
     warmup_iters: usize = 1,
@@ -134,6 +142,8 @@ const Timing = struct {
     }
 };
 
+const MetalGeneratedQuantStats = metal_generated_quant_stats_mod.Stats;
+
 const BenchResult = struct {
     mode: []const u8,
     modality: Modality,
@@ -152,6 +162,7 @@ const BenchResult = struct {
     resident_stats: embedding_mod.ResidentProjectionStats = .{},
     quant_stats: native_compute.NativeQuantDispatchStats = .{},
     graph_stats: graph_executor_stats.ExecutionStats = .{},
+    metal_generated_quant_stats: MetalGeneratedQuantStats = .{},
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -190,11 +201,48 @@ pub fn main(init: std.process.Init) !void {
         warmup.deinit(allocator);
     }
 
+    var materialized_storage: [6]ProfileSession = undefined;
+    const materialized_sessions = materializedProfileSessions(loaded.model, &materialized_storage);
+    var captured_storage: [6]ProfileSession = undefined;
+    var profile_sessions: []const ProfileSession = materialized_sessions;
+    var active_profiles: [6]bool = @splat(false);
+    defer stopActiveProfiles(allocator, profile_sessions, &active_profiles);
+    if (opts.kernel_jit_profile_out != null) {
+        var captured_count: usize = 0;
+        profile_sessions = captured_storage[0..0];
+        for (materialized_sessions) |profile_session| {
+            if (try session_factory.beginMetalWorkloadProfile(profile_session.session, .encoder)) {
+                captured_storage[captured_count] = profile_session;
+                active_profiles[captured_count] = true;
+                captured_count += 1;
+                profile_sessions = captured_storage[0..captured_count];
+            } else {
+                std.log.warn(
+                    "kernel JIT profile bundle omits non-Metal component {s}",
+                    .{@tagName(profile_session.component)},
+                );
+            }
+        }
+        if (captured_count == 0) return error.MetalWorkloadProfileUnavailable;
+    }
+
     const warm_cached = try runWarmCachedBytes(allocator, loaded.model, opts, warm_files);
     printResult(warm_cached, opts.format);
 
     const warm_cli_like = try runWarmWithFileReads(allocator, init.io, loaded.model, opts);
     printResult(warm_cli_like, opts.format);
+
+    if (opts.kernel_jit_profile_out) |path| {
+        if (opts.order.items.len > std.math.maxInt(u32)) return error.InvalidProfileBatch;
+        try writeCapturedProfileBundle(
+            allocator,
+            init.io,
+            path,
+            profile_sessions,
+            &active_profiles,
+            @intCast(opts.order.items.len),
+        );
+    }
 }
 
 fn wantsHelp(init: std.process.Init) bool {
@@ -215,9 +263,85 @@ const LoadedBundle = struct {
     }
 };
 
+const ProfileSession = struct {
+    component: kernel_jit_profile_output.BundleComponent,
+    session: backends.Session,
+};
+
+fn materializedProfileSessions(
+    model: *const model_manager_mod.LoadedModel,
+    storage: *[6]ProfileSession,
+) []const ProfileSession {
+    var count: usize = 0;
+    storage[count] = .{ .component = .primary, .session = model.session };
+    count += 1;
+    const optional = [_]struct {
+        component: kernel_jit_profile_output.BundleComponent,
+        session: ?backends.Session,
+    }{
+        .{ .component = .vision, .session = model.vision_session },
+        .{ .component = .audio, .session = model.audio_session },
+        .{ .component = .text_projection, .session = model.text_projection },
+        .{ .component = .visual_projection, .session = model.visual_projection },
+        .{ .component = .audio_projection, .session = model.audio_projection },
+    };
+    for (optional) |item| if (item.session) |session| {
+        storage[count] = .{ .component = item.component, .session = session };
+        count += 1;
+    };
+    return storage[0..count];
+}
+
+fn stopActiveProfiles(
+    allocator: std.mem.Allocator,
+    sessions: []const ProfileSession,
+    active: *[6]bool,
+) void {
+    if (comptime !build_options.enable_metal) return;
+    for (sessions, 0..) |profile_session, index| {
+        if (!active[index]) continue;
+        if (session_factory.endMetalWorkloadProfile(profile_session.session, allocator, false) catch null) |capture_value| {
+            var capture = capture_value;
+            capture.deinit();
+        }
+        active[index] = false;
+    }
+}
+
+fn writeCapturedProfileBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    sessions: []const ProfileSession,
+    active: *[6]bool,
+    batch: u32,
+) !void {
+    if (comptime !build_options.enable_metal) return error.MetalWorkloadProfileUnavailable;
+    var captures: [6]?session_factory.MetalWorkloadProfileExport = @splat(null);
+    defer for (&captures) |*maybe_capture| if (maybe_capture.*) |*capture| capture.deinit();
+    var reports: [6]kernel_jit_profile_output.BundleReport = undefined;
+    for (sessions, 0..) |profile_session, index| {
+        captures[index] = (try session_factory.endMetalWorkloadProfile(
+            profile_session.session,
+            allocator,
+            true,
+        )) orelse return error.MetalWorkloadProfileUnavailable;
+        active[index] = false;
+        reports[index] = .{
+            .component = profile_session.component,
+            .report = captures[index].?.report(.{ .batch = batch }),
+        };
+    }
+    try kernel_jit_profile_output.writeBundle(allocator, io, path, reports[0..sessions.len]);
+    std.log.info("kernel JIT profile bundle written path={s} components={d}", .{ path, sessions.len });
+}
+
 fn loadBundle(allocator: std.mem.Allocator, io: std.Io, opts: Options) !LoadedBundle {
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&session_manager, opts.backend);
+    session_manager.kernel_jit = opts.kernel_jit;
+    session_manager.kernel_jit.qualified_profile_path = opts.kernel_jit_qualified_profile_bundle;
+    session_manager.kernel_jit_load_context = .startup_preload;
     session_manager.graph_runtime_strategy = opts.graph_runtime_strategy;
     if (opts.graph_runtime_strategy == null) {
         graph_executor_stats.printBypass("inference.clipclap_e2e_bench", "embedding_pipeline_direct_runtime");
@@ -264,7 +388,15 @@ fn runColdOnce(allocator: std.mem.Allocator, io: std.Io, opts: Options) !BenchRe
         .values = output.values,
         .checksum = output.checksum,
     };
-    return resultFromSamples(allocator, "cold_load_cli_like", opts, loaded.model.session.backend(), &.{sample}, loaded.model.resident_projection_stats.snapshot());
+    return resultFromSamples(
+        allocator,
+        "cold_load_cli_like",
+        opts,
+        loaded.model.session.backend(),
+        &.{sample},
+        loaded.model.resident_projection_stats.snapshot(),
+        snapshotMetalGeneratedQuantStats(allocator, loaded.model),
+    );
 }
 
 const AllFiles = struct {
@@ -288,6 +420,7 @@ fn runWarmCachedBytes(
     native_compute.resetNativeQuantDispatchStats();
     graph_executor_stats.reset();
     const before_stats = model.resident_projection_stats.snapshot();
+    const before_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
     const samples = try allocator.alloc(RequestSample, opts.measure_iters);
     defer allocator.free(samples);
 
@@ -310,7 +443,16 @@ fn runWarmCachedBytes(
             .checksum = output.checksum,
         };
     }
-    return resultFromSamples(allocator, "warm_cached_bytes", opts, model.session.backend(), samples, diffResidentStats(before_stats, model.resident_projection_stats.snapshot()));
+    const after_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
+    return resultFromSamples(
+        allocator,
+        "warm_cached_bytes",
+        opts,
+        model.session.backend(),
+        samples,
+        diffResidentStats(before_stats, model.resident_projection_stats.snapshot()),
+        MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
+    );
 }
 
 fn runWarmWithFileReads(
@@ -322,6 +464,7 @@ fn runWarmWithFileReads(
     native_compute.resetNativeQuantDispatchStats();
     graph_executor_stats.reset();
     const before_stats = model.resident_projection_stats.snapshot();
+    const before_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
     const samples = try allocator.alloc(RequestSample, opts.measure_iters);
     defer allocator.free(samples);
 
@@ -350,7 +493,16 @@ fn runWarmWithFileReads(
             .checksum = output.checksum,
         };
     }
-    return resultFromSamples(allocator, "warm_file_read_cli_like", opts, model.session.backend(), samples, diffResidentStats(before_stats, model.resident_projection_stats.snapshot()));
+    const after_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
+    return resultFromSamples(
+        allocator,
+        "warm_file_read_cli_like",
+        opts,
+        model.session.backend(),
+        samples,
+        diffResidentStats(before_stats, model.resident_projection_stats.snapshot()),
+        MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
+    );
 }
 
 fn runRequestWithBytes(
@@ -460,6 +612,7 @@ fn resultFromSamples(
     actual_backend: backends.BackendType,
     samples: []const RequestSample,
     resident_stats: embedding_mod.ResidentProjectionStats,
+    metal_generated_quant_stats: MetalGeneratedQuantStats,
 ) !BenchResult {
     const timing = try timingFromSamples(allocator, samples);
     var file_read_total: u64 = 0;
@@ -490,6 +643,7 @@ fn resultFromSamples(
         .resident_stats = resident_stats,
         .quant_stats = native_compute.nativeQuantDispatchStats(),
         .graph_stats = graph_executor_stats.snapshot(),
+        .metal_generated_quant_stats = metal_generated_quant_stats,
     };
 }
 
@@ -564,6 +718,19 @@ fn diffResidentStats(
     };
 }
 
+fn snapshotMetalGeneratedQuantStats(
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+) MetalGeneratedQuantStats {
+    var stats = metal_generated_quant_stats_mod.snapshotForSession(allocator, model.session);
+    if (model.vision_session) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.audio_session) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.text_projection) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.visual_projection) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.audio_projection) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    return stats;
+}
+
 fn effectiveModality(opts: Options) Modality {
     var modality: ?Modality = null;
     for (opts.order.items) |item| {
@@ -603,7 +770,7 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                 },
             );
             std.debug.print(
-                " resident_text={}/{} resident_image={}/{} resident_audio={}/{} q4q5={} q4q5_pair={} q4q5_triple={} packed_qkv_mr4={} packed_qkv_mr2={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8k_alloc_ms={d:.3} q8k_quant_ms={d:.3} q4q5_compute_ms={d:.3} q4q5_triple_compute_ms={d:.3} dequant_fetch_ms={d:.3} dequant_sgemm_compute_ms={d:.3} graph_partitions={} graph_planned={} graph_commands={} graph_fallbacks={} host_outputs={} boundary_materializations={}\n",
+                " resident_text={}/{} resident_image={}/{} resident_audio={}/{} q4q5={} q4q5_pair={} q4q5_triple={} packed_qkv_mr4={} packed_qkv_mr2={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8k_alloc_ms={d:.3} q8k_quant_ms={d:.3} q4q5_compute_ms={d:.3} q4q5_triple_compute_ms={d:.3} dequant_fetch_ms={d:.3} dequant_sgemm_compute_ms={d:.3} graph_partitions={} graph_planned={} graph_commands={} graph_fallbacks={} host_outputs={} boundary_materializations={}",
                 .{
                     result.resident_stats.text_success,
                     result.resident_stats.text_fallback,
@@ -632,6 +799,43 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                     result.graph_stats.interpreter_fallbacks,
                     result.graph_stats.host_materialized_outputs,
                     result.graph_stats.boundary_output_materializations,
+                },
+            );
+            const metal_generated_top = result.metal_generated_quant_stats.topFamily();
+            std.debug.print(
+                " metal_generated_quant={} metal_generated_top={s}:{} metal_generated_families={} metal_generated_q4_k={}/{}/{} metal_generated_q5_k={}/{}/{} metal_generated_q6_k={}/{}/{} metal_generated_q8_0={}/{}/{}/{} metal_q4_k_rows={}/{}/{}/{} metal_q6_k_rows={}/{}/{}/{} metal_q8_0_rows={}/{}/{}/{} metal_jit_exact_q4_0={} metal_jit_exact_q4_k={}\n",
+                .{
+                    result.metal_generated_quant_stats.generatedTotal(),
+                    metal_generated_top.name,
+                    metal_generated_top.count,
+                    result.metal_generated_quant_stats.nonzeroFamilyCount(),
+                    result.metal_generated_quant_stats.q4_k,
+                    result.metal_generated_quant_stats.q4_k_bias,
+                    result.metal_generated_quant_stats.q4_k_bias_gelu,
+                    result.metal_generated_quant_stats.q5_k,
+                    result.metal_generated_quant_stats.q5_k_bias,
+                    result.metal_generated_quant_stats.q5_k_bias_gelu,
+                    result.metal_generated_quant_stats.q6_k,
+                    result.metal_generated_quant_stats.q6_k_bias,
+                    result.metal_generated_quant_stats.q6_k_bias_gelu,
+                    result.metal_generated_quant_stats.q8_0,
+                    result.metal_generated_quant_stats.q8_0_bias,
+                    result.metal_generated_quant_stats.q8_0_bias_gelu,
+                    result.metal_generated_quant_stats.q8_0_relu,
+                    result.metal_generated_quant_stats.q4_k_rows_1,
+                    result.metal_generated_quant_stats.q4_k_rows_2_8,
+                    result.metal_generated_quant_stats.q4_k_rows_9_64,
+                    result.metal_generated_quant_stats.q4_k_rows_65_plus,
+                    result.metal_generated_quant_stats.q6_k_rows_1,
+                    result.metal_generated_quant_stats.q6_k_rows_2_8,
+                    result.metal_generated_quant_stats.q6_k_rows_9_64,
+                    result.metal_generated_quant_stats.q6_k_rows_65_plus,
+                    result.metal_generated_quant_stats.q8_0_rows_1,
+                    result.metal_generated_quant_stats.q8_0_rows_2_8,
+                    result.metal_generated_quant_stats.q8_0_rows_9_64,
+                    result.metal_generated_quant_stats.q8_0_rows_65_plus,
+                    result.metal_generated_quant_stats.jit_exact_q4_0,
+                    result.metal_generated_quant_stats.jit_exact_q4_k,
                 },
             );
         },
@@ -672,7 +876,7 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                 },
             );
             std.debug.print(
-                "{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{},{},{},{}\n",
+                "{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 .{
                     result.quant_stats.dequant_sgemm,
                     result.quant_stats.dequant_sgemm_pair,
@@ -689,6 +893,19 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                     result.graph_stats.interpreter_fallbacks,
                     result.graph_stats.host_materialized_outputs,
                     result.graph_stats.boundary_output_materializations,
+                    result.metal_generated_quant_stats.generatedTotal(),
+                    result.metal_generated_quant_stats.q4_k,
+                    result.metal_generated_quant_stats.q4_k_bias,
+                    result.metal_generated_quant_stats.q4_k_bias_gelu,
+                    result.metal_generated_quant_stats.q5_k,
+                    result.metal_generated_quant_stats.q6_k,
+                    result.metal_generated_quant_stats.q8_0,
+                    result.metal_generated_quant_stats.q4_k_rows_1,
+                    result.metal_generated_quant_stats.q4_k_rows_2_8,
+                    result.metal_generated_quant_stats.q4_k_rows_9_64,
+                    result.metal_generated_quant_stats.q4_k_rows_65_plus,
+                    result.metal_generated_quant_stats.jit_exact_q4_0,
+                    result.metal_generated_quant_stats.jit_exact_q4_k,
                 },
             );
         },
@@ -696,7 +913,7 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
 }
 
 fn printCsvHeader() void {
-    std.debug.print("mode,modality,backend,actual_backend,batch,avg_ms,p50_ms,p95_ms,min_ms,max_ms,throughput_embeddings_s,file_read_avg_ms,embed_avg_ms,serialize_avg_ms,file_bytes,response_bytes,values,checksum,resident_text_success,resident_text_fallback,resident_image_success,resident_image_fallback,resident_audio_success,resident_audio_fallback,q4q5,q4q5_pair,q4q5_triple,packed_qkv_mr4,packed_qkv_mr2,q4q5_panel,dequant,dequant_pair,dequant_triple,q8k_alloc_ms,q8k_quant_ms,q4q5_compute_ms,q4q5_triple_compute_ms,dequant_fetch_ms,dequant_sgemm_compute_ms,graph_partitions,graph_planned,graph_commands,graph_fallbacks,host_outputs,boundary_materializations\n", .{});
+    std.debug.print("mode,modality,backend,actual_backend,batch,avg_ms,p50_ms,p95_ms,min_ms,max_ms,throughput_embeddings_s,file_read_avg_ms,embed_avg_ms,serialize_avg_ms,file_bytes,response_bytes,values,checksum,resident_text_success,resident_text_fallback,resident_image_success,resident_image_fallback,resident_audio_success,resident_audio_fallback,q4q5,q4q5_pair,q4q5_triple,packed_qkv_mr4,packed_qkv_mr2,q4q5_panel,dequant,dequant_pair,dequant_triple,q8k_alloc_ms,q8k_quant_ms,q4q5_compute_ms,q4q5_triple_compute_ms,dequant_fetch_ms,dequant_sgemm_compute_ms,graph_partitions,graph_planned,graph_commands,graph_fallbacks,host_outputs,boundary_materializations,metal_generated_quant,metal_generated_q4_k,metal_generated_q4_k_bias,metal_generated_q4_k_bias_gelu,metal_generated_q5_k,metal_generated_q6_k,metal_generated_q8_0,metal_q4_k_rows_1,metal_q4_k_rows_2_8,metal_q4_k_rows_9_64,metal_q4_k_rows_65_plus,metal_jit_exact_q4_0,metal_jit_exact_q4_k\n", .{});
 }
 
 fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
@@ -709,6 +926,23 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             opts.model_dir = args_iter.next() orelse return error.MissingModelDir;
         } else if (std.mem.eql(u8, arg, "--backend")) {
             opts.backend = parseBackendChoice(args_iter.next() orelse return error.MissingBackend) orelse return error.InvalidBackend;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
+            opts.kernel_jit.mode = std.meta.stringToEnum(kernel_jit.Mode, args_iter.next() orelse return error.MissingKernelJitMode) orelse return error.InvalidKernelJitMode;
+            opts.kernel_jit_mode_explicit = true;
+        } else if (std.mem.eql(u8, arg, kernel_jit_profile_output.cli_flag)) {
+            const path = args_iter.next() orelse return error.MissingKernelJitProfileOut;
+            try kernel_jit_profile_output.validateOutputPath(path);
+            opts.kernel_jit_profile_out = path;
+        } else if (std.mem.eql(u8, arg, kernel_jit_profile_output.qualified_profile_cli_flag)) {
+            const path = args_iter.next() orelse return error.MissingKernelJitQualifiedProfile;
+            try kernel_jit_profile_output.validateOutputPath(path);
+            opts.kernel_jit_qualified_profile_bundle = path;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-cache-dir")) {
+            opts.kernel_jit.cache_dir = args_iter.next() orelse return error.MissingKernelJitCacheDir;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-max-cache-mb")) {
+            opts.kernel_jit.max_cache_bytes_mb = try std.fmt.parseInt(usize, args_iter.next() orelse return error.MissingKernelJitMaxCacheMb, 10);
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-preload-budget-ms")) {
+            opts.kernel_jit.preload_budget_ms = try std.fmt.parseInt(u64, args_iter.next() orelse return error.MissingKernelJitPreloadBudgetMs, 10);
         } else if (std.mem.eql(u8, arg, "--graph-runtime")) {
             opts.graph_runtime_strategy = graph_runtime.parseStrategy(args_iter.next() orelse return error.MissingGraphRuntime) orelse return error.InvalidGraphRuntime;
         } else if (std.mem.startsWith(u8, arg, "--graph-runtime=")) {
@@ -741,6 +975,21 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
         }
     }
     if (opts.measure_iters == 0) return error.InvalidMeasureIters;
+    opts.kernel_jit.mode = try kernel_jit.resolveProfileCaptureMode(
+        opts.kernel_jit.mode,
+        opts.kernel_jit_mode_explicit,
+        opts.kernel_jit_profile_out != null,
+        opts.kernel_jit_qualified_profile_bundle != null,
+    );
+    opts.kernel_jit.profile_capture_only = opts.kernel_jit_profile_out != null;
+    try kernel_jit.validateMetalProfileBackend(
+        opts.backend == .metal,
+        opts.kernel_jit_profile_out != null,
+        opts.kernel_jit_qualified_profile_bundle != null,
+    );
+    var validation_config = opts.kernel_jit;
+    validation_config.qualified_profile_path = opts.kernel_jit_qualified_profile_bundle;
+    try validation_config.validate();
     return opts;
 }
 
@@ -813,12 +1062,17 @@ fn nsToSeconds(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-clipclap-e2e -- --model-dir <dir> [--backend auto|onnx|native|metal|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--text <text>]... [--image <path>]... [--audio <path>]...
+        \\usage: zig build bench-clipclap-e2e -- --model-dir <dir> [--backend auto|onnx|native|metal|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out bundle.json] [--kernel-jit-qualified-profile bundle.json] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--text <text>]... [--image <path>]... [--audio <path>]...
         \\  Options:
         \\    --warmup-iters N                 Warm request iterations before measurement (default 1)
         \\    --measure-iters N                Measurement iterations (default 5)
         \\    --no-cold                        Skip the cold load + CLI-like single run
         \\    --resident-projection-required   Fail if resident projection falls back
+        \\    --kernel-jit-profile-out path    Component bundle + sibling profiles; selects shadow
+        \\    --kernel-jit-qualified-profile path
+        \\                                      Activate that bundle; import its package first
+        \\      export: zig build kernel-jit-package -- export-profile-bundle CACHE BUNDLE PACKAGE
+        \\      import: zig build kernel-jit-package -- import PACKAGE CACHE
         \\    --format text|csv                Output format (default text)
         \\
     , .{});

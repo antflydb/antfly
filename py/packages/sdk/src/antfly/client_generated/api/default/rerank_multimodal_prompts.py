@@ -43,15 +43,40 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 403:
+        response_403 = InferenceError.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
+
     if response.status_code == 501:
         response_501 = InferenceError.from_dict(response.json())
 
         return response_501
+
+    if response.status_code == 502:
+        response_502 = InferenceError.from_dict(response.json())
+
+        return response_502
+
+    if response.status_code == 503:
+        response_503 = InferenceError.from_dict(response.json())
+
+        return response_503
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -83,6 +108,8 @@ def sync_detailed(
     Text-only requests can be served immediately. Image-bearing requests reserve the stable
     contract for native ColQwen-style late-interaction reranking as that encoder lands.
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
+    Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+    decoded pixels are admitted before model loading.
 
     Args:
         body (InferenceRerankMultimodalRequest):
@@ -119,6 +146,8 @@ def sync(
     Text-only requests can be served immediately. Image-bearing requests reserve the stable
     contract for native ColQwen-style late-interaction reranking as that encoder lands.
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
+    Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+    decoded pixels are admitted before model loading.
 
     Args:
         body (InferenceRerankMultimodalRequest):
@@ -150,6 +179,8 @@ async def asyncio_detailed(
     Text-only requests can be served immediately. Image-bearing requests reserve the stable
     contract for native ColQwen-style late-interaction reranking as that encoder lands.
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
+    Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+    decoded pixels are admitted before model loading.
 
     Args:
         body (InferenceRerankMultimodalRequest):
@@ -184,6 +215,8 @@ async def asyncio(
     Text-only requests can be served immediately. Image-bearing requests reserve the stable
     contract for native ColQwen-style late-interaction reranking as that encoder lands.
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
+    Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+    decoded pixels are admitted before model loading.
 
     Args:
         body (InferenceRerankMultimodalRequest):

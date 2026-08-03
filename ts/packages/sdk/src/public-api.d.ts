@@ -1923,7 +1923,9 @@ export interface paths {
          *
          *     Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
          *     response envelope. For sparse-capable models, `data[i].embedding` is a sparse
-         *     vector object instead of a dense float array.
+         *     vector object instead of a dense float array. Dense image inputs are header-validated
+         *     and admitted against the aggregate decoded-pixel budget before model loading. Remote
+         *     URL byte potential is reserved before fetch; inline sources use their actual encoded size.
          */
         post: operations["generateEmbeddings"];
         delete?: never;
@@ -1985,6 +1987,8 @@ export interface paths {
          *     Text-only requests can be served immediately. Image-bearing requests reserve the stable
          *     contract for native ColQwen-style late-interaction reranking as that encoder lands.
          *     Image-bearing requests already run native Zig image preprocessing and grid preparation.
+         *     Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+         *     decoded pixels are admitted before model loading.
          */
         post: operations["rerankMultimodalPrompts"];
         delete?: never;
@@ -2064,6 +2068,19 @@ export interface paths {
          *
          *     Uses OpenAI-compatible chat format with messages array containing role
          *     (system, user, assistant) and content. Set `stream: true` for streaming responses.
+         *
+         *     Downloaded and inline encoded media is limited cumulatively across the request
+         *     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+         *     `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+         *     download limit disables nonempty media. Remote URL byte potential is reserved before
+         *     fetch; inline sources reserve their actual encoded size without adding it to the
+         *     existing request-body reservation. Accepted image headers are then validated and
+         *     decoded source pixels are admitted at a conservative 16 bytes per pixel against
+         *     the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+         *     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+         *     limits each source edge. Malformed images return 400, while dimension or aggregate
+         *     excess returns 413 before model loading. Initial capacity admission occurs before
+         *     media fetch, so an overloaded server returns 503 without fetching content.
          */
         post: operations["generateContent"];
         delete?: never;
@@ -2088,8 +2105,18 @@ export interface paths {
          *     native batched KV decoder; unsupported per-item options are returned as
          *     per-item errors without failing sibling requests.
          *
+         *     A syntactically valid batch envelope returns HTTP 200 even when some or
+         *     all items fail. Clients must inspect each item's mutually exclusive
+         *     `response` and `error` fields, plus `summary`, rather than treating HTTP
+         *     200 as success for every item. Fatal service or envelope failures still
+         *     use non-2xx responses.
+         *
          *     This endpoint implements the synchronous form only. Future async durable
          *     batching will use the same request item shape with `mode: async`.
+         *
+         *     Batch generation is text-only. Image or other multimodal content parts are
+         *     rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+         *     other item failures remain independently reported.
          */
         post: operations["generateBatchContent"];
         delete?: never;
@@ -2186,6 +2213,22 @@ export interface paths {
          *     - **Florence-2 Caption**: `<CAPTION>` for image description
          *     - **Pix2Struct**: natural-language questions like `What type of document is this?`
          *     - **Moondream**: natural-language prompts like `Describe this image.`
+         *
+         *     Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+         *     weighted capacity unit and at least one unit per two declared images. The effective
+         *     ceiling is the minimum of the configured per-image limit times image count, the
+         *     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+         *     `max_concurrent_requests`. Admission happens before model resolution or download.
+         *
+         *     After download, image headers are validated before model loading. Decoded source
+         *     pixels are admitted at a conservative 16 bytes per pixel against the lower of
+         *     512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+         *     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+         *     from downloaded-byte admission before inference. `max_image_dimension` limits
+         *     each source edge; malformed images return 400 and dimension or aggregate excess
+         *     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+         *     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+         *     embedding APIs. Batch generation rejects multimodal content before media fetch.
          */
         post: operations["readImages"];
         delete?: never;
@@ -2264,6 +2307,10 @@ export interface paths {
          *     canonical public API for named entity recognition, relation extraction,
          *     text/document classification, token classification, and structured
          *     document extraction.
+         *
+         *     Image-backed extraction uses the same byte-reserving and image-count-weighted
+         *     admission policy as `/read`, before model resolution or download. Text-only
+         *     extraction consumes one admission unit.
          */
         post: operations["extract"];
         delete?: never;
@@ -2350,7 +2397,10 @@ export interface paths {
          *     as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
          *     For sparse-capable models, each `data` item still uses the `embedding`
          *     field, but its value is a sparse vector object instead of a dense float array.
-         *     Use this endpoint for drop-in compatibility with OpenAI SDKs.
+         *     Dense image inputs are header-validated and admitted against the aggregate
+         *     decoded-pixel budget before model loading. Remote URL byte potential is reserved
+         *     before fetch; inline sources use their actual encoded size. Use this endpoint for
+         *     drop-in compatibility with OpenAI SDKs.
          */
         post: operations["createEmbedding"];
         delete?: never;
@@ -3999,7 +4049,7 @@ export interface components {
              */
             min_doc_count?: number;
             /** @description Background filter for significant_terms aggregations */
-            background_filter?: components["schemas"]["Query"] & unknown;
+            background_filter?: components["schemas"]["RawQuery"];
             /** @description Significance algorithm for significant_terms aggregations */
             algorithm?: components["schemas"]["SignificanceAlgorithm"];
             /** @description Algebraic join descriptor for bounded cross-table aggregation planning */
@@ -4390,7 +4440,7 @@ export interface components {
              *     - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
              *     - Field existence: `{"exists":{"path":"/category"}}`
              */
-            filter_query?: components["schemas"]["Query"] & unknown;
+            filter_query?: components["schemas"]["RawQuery"];
             /**
              * @description Maximum number of results to return. If not specified, returns all
              *     matching keys in the range. Useful for pagination or sampling.
@@ -5796,6 +5846,8 @@ export interface components {
              */
             packed_values: string;
         };
+        /** @description A validated Antfly query retained as raw JSON by Go servers and clients. */
+        RawQuery: components["schemas"]["Query"];
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -5860,9 +5912,7 @@ export interface components {
              *       "boost": 1
              *     }
              */
-            full_text_search?: components["schemas"]["Query"] & {
-                [key: string]: unknown;
-            };
+            full_text_search?: components["schemas"]["RawQuery"];
             /**
              * @description Natural language query for vector similarity search. Results are ranked by semantic similarity
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
@@ -5938,7 +5988,7 @@ export interface components {
              *       "boost": 1
              *     }
              */
-            filter_query?: components["schemas"]["Query"] & unknown;
+            filter_query?: components["schemas"]["RawQuery"];
             /**
              * @description Antfly query applied as a NOT condition. Documents matching this query are excluded
              *     from results. Applied before scoring.
@@ -5954,7 +6004,7 @@ export interface components {
              *       "boost": 1
              *     }
              */
-            exclusion_query?: components["schemas"]["Query"] & unknown;
+            exclusion_query?: components["schemas"]["RawQuery"];
             /**
              * @description Aggregation requests for computing metrics and bucketing results.
              *     Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
@@ -6407,7 +6457,7 @@ export interface components {
         /** @description Filters to apply to a table before joining. */
         JoinFilters: {
             /** @description Antfly query to filter rows before joining. */
-            filter_query?: components["schemas"]["Query"] & unknown;
+            filter_query?: components["schemas"]["RawQuery"];
             /**
              * Format: byte
              * @description Key prefix filter for the table.
@@ -7264,7 +7314,7 @@ export interface components {
              *     Example: `{"term": "active", "field": "status"}` becomes
              *     `WHERE ("status" = 'active')` on the publication.
              */
-            publication_filter?: components["schemas"]["Query"] & unknown;
+            publication_filter?: components["schemas"]["RawQuery"];
             /**
              * @description Conditional routes for fan-out replication. Each route evaluates its
              *     `where` filter against every CDC row and, on match, writes to the
@@ -7347,7 +7397,7 @@ export interface components {
              *     matching this filter are written to `target_table`. If omitted,
              *     all rows match (equivalent to `match_all`).
              */
-            where?: components["schemas"]["Query"] & unknown;
+            where?: components["schemas"]["RawQuery"];
             /**
              * @description Override the source-level `key_template` for this route. If omitted,
              *     the source-level template is used.
@@ -7406,11 +7456,11 @@ export interface components {
             } | null;
         };
         /**
-         * @description Type of the resource, e.g., table, user, or global ('*').
+         * @description Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes.
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "user" | "*";
+        ResourceType: "table" | "user" | "inference" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -7419,7 +7469,7 @@ export interface components {
         PermissionType: "read" | "write" | "admin";
         Permission: {
             /**
-             * @description Resource name (e.g., table name, target username, or '*' for global).
+             * @description Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
              * @example orders_table
              */
             resource: string;
@@ -7966,7 +8016,7 @@ export interface components {
          *        - Allowed host whitelist
          *        - Private IP blocking (prevents SSRF attacks)
          *        - Download size limits (default: 100MB)
-         *        - Download timeouts (default: 30s)
+         *        - HTTP downloads time out after 30 seconds by default; zero disables the deadline
          *        - Image dimension limits (default: 2048px, auto-resized)
          *
          *        See: https://antfly.io/docs/configuration#security--cors
@@ -8806,210 +8856,6 @@ export interface components {
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
         };
-        /**
-         * Format: double
-         * @description A floating-point number used to decrease or increase the relevance scores of a query.
-         * @default 1
-         */
-        Boost: number | null;
-        TermQuery: {
-            term: string;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        MatchQuery: {
-            match: string;
-            field?: string;
-            analyzer?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        MultiMatchBody: {
-            query: string;
-            fields: string[];
-            /** @enum {string} */
-            type: "bool_prefix";
-            boost?: components["schemas"]["Boost"];
-        };
-        MultiMatchQuery: {
-            multi_match: components["schemas"]["MultiMatchBody"];
-        };
-        /** @description The fuzziness of the query. Can be an integer or "auto". */
-        Fuzziness: number | "auto";
-        MatchPhraseQuery: {
-            match_phrase: string;
-            field?: string;
-            analyzer?: string;
-            boost?: components["schemas"]["Boost"];
-            fuzziness?: components["schemas"]["Fuzziness"];
-        };
-        PhraseQuery: {
-            terms: string[];
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-            fuzziness?: components["schemas"]["Fuzziness"];
-        };
-        MultiPhraseQuery: {
-            terms: string[][];
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-            fuzziness?: components["schemas"]["Fuzziness"];
-        };
-        FuzzyQuery: {
-            term: string;
-            /** Format: int32 */
-            prefix_length?: number;
-            fuzziness?: components["schemas"]["Fuzziness"];
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        PrefixQuery: {
-            prefix: string;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        RegexpQuery: {
-            regexp: string;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        WildcardQuery: {
-            wildcard: string;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        QueryStringQuery: {
-            query: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        NumericRangeQuery: {
-            /** Format: double */
-            min?: number | null;
-            /** Format: double */
-            max?: number | null;
-            inclusive_min?: boolean | null;
-            inclusive_max?: boolean | null;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        TermRangeQuery: {
-            min?: string | null;
-            max?: string | null;
-            inclusive_min?: boolean | null;
-            inclusive_max?: boolean | null;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        DateRangeStringQuery: {
-            /** Format: date-time */
-            start?: string;
-            /** Format: date-time */
-            end?: string;
-            inclusive_start?: boolean | null;
-            inclusive_end?: boolean | null;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-            datetime_parser?: string;
-        };
-        ConjunctionQuery: {
-            conjuncts: components["schemas"]["Query"][];
-            boost?: components["schemas"]["Boost"];
-        };
-        DisjunctionQuery: {
-            disjuncts: components["schemas"]["Query"][];
-            boost?: components["schemas"]["Boost"];
-            /** Format: double */
-            min?: number;
-        };
-        BooleanQuery: {
-            must?: components["schemas"]["ConjunctionQuery"];
-            should?: components["schemas"]["DisjunctionQuery"];
-            must_not?: components["schemas"]["DisjunctionQuery"];
-            filter?: components["schemas"]["Query"];
-            boost?: components["schemas"]["Boost"];
-        };
-        MatchAllQuery: {
-            match_all: Record<string, never>;
-            boost?: components["schemas"]["Boost"];
-        };
-        MatchNoneQuery: {
-            match_none: Record<string, never>;
-            boost?: components["schemas"]["Boost"];
-        };
-        DocIdQuery: {
-            ids: string[];
-            boost?: components["schemas"]["Boost"];
-        };
-        BoolFieldQuery: {
-            bool: boolean;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        IPRangeQuery: {
-            cidr: string;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        /** @description Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat. */
-        GeoBoundingBoxQuery: {
-            /** @description Field or path containing geo_point values. */
-            field: string;
-            /**
-             * Format: double
-             * @description Southern latitude bound.
-             */
-            min_lat: number;
-            /**
-             * Format: double
-             * @description Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
-             */
-            min_lon: number;
-            /**
-             * Format: double
-             * @description Northern latitude bound. Must be greater than or equal to min_lat.
-             */
-            max_lat: number;
-            /**
-             * Format: double
-             * @description Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
-             */
-            max_lon: number;
-            boost?: components["schemas"]["Boost"];
-        };
-        GeoDistanceQuery: {
-            /** @description [lon, lat] */
-            location: number[];
-            /** @example 10km */
-            distance: string;
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        GeoPoint: {
-            /** Format: double */
-            lon?: number;
-            /** Format: double */
-            lat?: number;
-        };
-        GeoBoundingPolygonQuery: {
-            polygon_points: components["schemas"]["GeoPoint"][];
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        /** @description A GeoJSON shape object. This is a simplified representation. */
-        GeoShape: {
-            type: string;
-            coordinates: unknown[];
-        };
-        GeoShapeGeometry: {
-            shape: components["schemas"]["GeoShape"];
-            /** @enum {string} */
-            relation: "intersects" | "contains" | "within";
-        };
-        GeoShapeQuery: {
-            geometry: components["schemas"]["GeoShapeGeometry"];
-            field?: string;
-            boost?: components["schemas"]["Boost"];
-        };
-        Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
             /**
@@ -10619,6 +10465,210 @@ export interface components {
             duration_ms?: number;
         };
         /**
+         * Format: double
+         * @description A floating-point number used to decrease or increase the relevance scores of a query.
+         * @default 1
+         */
+        Boost: number | null;
+        TermQuery: {
+            term: string;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        MatchQuery: {
+            match: string;
+            field?: string;
+            analyzer?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        MultiMatchBody: {
+            query: string;
+            fields: string[];
+            /** @enum {string} */
+            type: "bool_prefix";
+            boost?: components["schemas"]["Boost"];
+        };
+        MultiMatchQuery: {
+            multi_match: components["schemas"]["MultiMatchBody"];
+        };
+        /** @description The fuzziness of the query. Can be an integer or "auto". */
+        Fuzziness: number | "auto";
+        MatchPhraseQuery: {
+            match_phrase: string;
+            field?: string;
+            analyzer?: string;
+            boost?: components["schemas"]["Boost"];
+            fuzziness?: components["schemas"]["Fuzziness"];
+        };
+        PhraseQuery: {
+            terms: string[];
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+            fuzziness?: components["schemas"]["Fuzziness"];
+        };
+        MultiPhraseQuery: {
+            terms: string[][];
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+            fuzziness?: components["schemas"]["Fuzziness"];
+        };
+        FuzzyQuery: {
+            term: string;
+            /** Format: int32 */
+            prefix_length?: number;
+            fuzziness?: components["schemas"]["Fuzziness"];
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        PrefixQuery: {
+            prefix: string;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        RegexpQuery: {
+            regexp: string;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        WildcardQuery: {
+            wildcard: string;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        QueryStringQuery: {
+            query: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        NumericRangeQuery: {
+            /** Format: double */
+            min?: number | null;
+            /** Format: double */
+            max?: number | null;
+            inclusive_min?: boolean | null;
+            inclusive_max?: boolean | null;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        TermRangeQuery: {
+            min?: string | null;
+            max?: string | null;
+            inclusive_min?: boolean | null;
+            inclusive_max?: boolean | null;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        DateRangeStringQuery: {
+            /** Format: date-time */
+            start?: string;
+            /** Format: date-time */
+            end?: string;
+            inclusive_start?: boolean | null;
+            inclusive_end?: boolean | null;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+            datetime_parser?: string;
+        };
+        ConjunctionQuery: {
+            conjuncts: components["schemas"]["Query"][];
+            boost?: components["schemas"]["Boost"];
+        };
+        DisjunctionQuery: {
+            disjuncts: components["schemas"]["Query"][];
+            boost?: components["schemas"]["Boost"];
+            /** Format: double */
+            min?: number;
+        };
+        BooleanQuery: {
+            must?: components["schemas"]["ConjunctionQuery"];
+            should?: components["schemas"]["DisjunctionQuery"];
+            must_not?: components["schemas"]["DisjunctionQuery"];
+            filter?: components["schemas"]["Query"];
+            boost?: components["schemas"]["Boost"];
+        };
+        MatchAllQuery: {
+            match_all: Record<string, never>;
+            boost?: components["schemas"]["Boost"];
+        };
+        MatchNoneQuery: {
+            match_none: Record<string, never>;
+            boost?: components["schemas"]["Boost"];
+        };
+        DocIdQuery: {
+            ids: string[];
+            boost?: components["schemas"]["Boost"];
+        };
+        BoolFieldQuery: {
+            bool: boolean;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        IPRangeQuery: {
+            cidr: string;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        /** @description Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat. */
+        GeoBoundingBoxQuery: {
+            /** @description Field or path containing geo_point values. */
+            field: string;
+            /**
+             * Format: double
+             * @description Southern latitude bound.
+             */
+            min_lat: number;
+            /**
+             * Format: double
+             * @description Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+             */
+            min_lon: number;
+            /**
+             * Format: double
+             * @description Northern latitude bound. Must be greater than or equal to min_lat.
+             */
+            max_lat: number;
+            /**
+             * Format: double
+             * @description Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+             */
+            max_lon: number;
+            boost?: components["schemas"]["Boost"];
+        };
+        GeoDistanceQuery: {
+            /** @description [lon, lat] */
+            location: number[];
+            /** @example 10km */
+            distance: string;
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        GeoPoint: {
+            /** Format: double */
+            lon?: number;
+            /** Format: double */
+            lat?: number;
+        };
+        GeoBoundingPolygonQuery: {
+            polygon_points: components["schemas"]["GeoPoint"][];
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        /** @description A GeoJSON shape object. This is a simplified representation. */
+        GeoShape: {
+            type: string;
+            coordinates: unknown[];
+        };
+        GeoShapeGeometry: {
+            shape: components["schemas"]["GeoShape"];
+            /** @enum {string} */
+            relation: "intersects" | "contains" | "within";
+        };
+        GeoShapeQuery: {
+            geometry: components["schemas"]["GeoShapeGeometry"];
+            field?: string;
+            boost?: components["schemas"]["Boost"];
+        };
+        Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        /**
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
          *     rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
@@ -11012,8 +11062,12 @@ export interface components {
             retrieved_ids?: string[];
         };
         InferenceError: {
-            /** @description Error message */
+            /** @description Machine-readable code or concise error message */
             error: string;
+            /** @description Human-readable error detail */
+            message?: string;
+            /** @description Whether retrying the request may succeed */
+            retryable?: boolean;
         };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
@@ -11574,10 +11628,11 @@ export interface components {
         InferenceToolChoice: ("auto" | "none" | "required") | {
             /** @enum {string} */
             type: "function";
-            function: {
-                /** @description The name of the function to call */
-                name: string;
-            };
+            function: components["schemas"]["InferenceToolChoiceFunction"];
+        };
+        InferenceToolChoiceFunction: {
+            /** @description The name of the function to call */
+            name: string;
         };
         InferenceRole: components["schemas"]["ChatMessageRole"];
         /**
@@ -11592,6 +11647,20 @@ export interface components {
             tool_calls?: components["schemas"]["ToolCall"][];
             /** @description ID of the tool call this message is responding to (only for role=tool) */
             tool_call_id?: string;
+        };
+        /** @description Options that apply only to streamed generation responses. */
+        InferenceGenerateStreamOptions: {
+            /**
+             * @description When true, emit a final usage-only chunk before the `[DONE]` sentinel.
+             *     All preceding chunks carry null or omitted usage.
+             * @default false
+             */
+            include_usage?: boolean;
+        };
+        /** @description Typed options passed to the model's chat template. */
+        InferenceGenerateChatTemplateKwargs: {
+            /** @description Controls templates that support an `enable_thinking` variable. False asks the template to open a public/final response channel directly. Omitted preserves the model template's default behavior. */
+            enable_thinking?: boolean;
         };
         InferenceGenerateRequest: {
             /**
@@ -11610,19 +11679,19 @@ export interface components {
             /**
              * Format: float
              * @description Sampling temperature (0.0 = deterministic, higher = more random)
-             * @default 1
+             * @default 0
              * @example 0.7
              */
             temperature?: number;
             /**
              * Format: float
              * @description Nucleus sampling probability
-             * @default 1
+             * @default 0
              */
             top_p?: number;
             /**
              * @description Top-k sampling (inference extension, not in OpenAI API)
-             * @default 50
+             * @default 0
              */
             top_k?: number;
             /**
@@ -11630,6 +11699,15 @@ export interface components {
              * @default false
              */
             stream?: boolean;
+            stream_options?: components["schemas"]["InferenceGenerateStreamOptions"];
+            chat_template_kwargs?: components["schemas"]["InferenceGenerateChatTemplateKwargs"];
+            /**
+             * @description inference-native benchmarking and controlled-generation extension. When true, generation
+             *     does not stop on the model's end-of-sequence token and continues until another stop
+             *     condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+             * @default false
+             */
+            ignore_eos?: boolean;
             /**
              * @description List of tools (functions) the model can call.
              *     Only supported by models with tool_call_format configured.
@@ -11671,11 +11749,21 @@ export interface components {
             grammar?: string;
             /** @description inference-native speculative decoding extension. Path or model identifier for a smaller draft model. */
             draft_model?: string;
-            /**
-             * @description inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
-             * @default 4
-             */
+            /** @description inference-native speculative decoding extension. Number of draft tokens proposed per verification round. */
             speculative_k?: number;
+            /**
+             * @description inference-native speculative decoding policy: `auto`, `force`, or `off`.
+             *     Defaults to `auto` when a draft model is requested.
+             * @enum {string}
+             */
+            speculation_policy?: "auto" | "force" | "off";
+            /**
+             * @description inference-native speculative decoding calibration state: `none`, `probe`, or `positive`.
+             *     Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled,
+             *     and to `none` for `force` or `off`.
+             * @enum {string}
+             */
+            speculation_calibration?: "none" | "probe" | "positive";
             /**
              * @description inference-native KV cache quantization format. Lower precision reduces memory usage but may
              *     affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
@@ -11687,6 +11775,8 @@ export interface components {
              * @description inference-native KV cache compaction ratio applied after prefill via Attention Matching.
              *     Selects a subset of keys and fits new values via OLS to preserve attention behavior.
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+             *     The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
+             *     device-backed compaction is not yet supported.
              */
             cache_compaction_ratio?: number;
             /**
@@ -11755,6 +11845,14 @@ export interface components {
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
             usage: components["schemas"]["InferenceGenerateUsage"];
+            speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
+        };
+        /** @description Effective speculative-decoding decision for this completion. */
+        InferenceGenerateSpeculationStatus: {
+            policy: string;
+            calibration: string;
+            decision: string;
+            disabled_reason?: string | null;
         };
         /**
          * @description Batch execution mode. Only synchronous batches are implemented.
@@ -11771,6 +11869,7 @@ export interface components {
             body: components["schemas"]["InferenceGenerateRequest"];
         };
         InferenceGenerateBatchError: {
+            /** @description Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate media-budget failures. */
             code: string;
             message: string;
             /** @default false */
@@ -11827,6 +11926,13 @@ export interface components {
             created: number;
             model: string;
             choices: components["schemas"]["InferenceGenerateChunkChoice"][];
+            /**
+             * @description Authoritative token accounting. When `stream_options.include_usage` is true,
+             *     streaming responses emit this only on the final chunk, after the finish chunk
+             *     and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+             */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
+            speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
         };
         InferenceGenerateChunkChoice: {
             index: number;
@@ -11983,7 +12089,7 @@ export interface components {
              * @example ~/.antfly/inference/ml
              */
             ml_dir?: string;
-            /** @description Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts. */
+            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
             content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
@@ -12007,61 +12113,47 @@ export interface components {
              */
             max_loaded_models?: number;
             /**
-             * @description Number of concurrent inference pipelines per model. Each pipeline loads
-             *     a copy of the model, so higher values use more memory but allow more
-             *     concurrent requests. Note: pool_size multiplies per-model memory
-             *     independently of max_loaded_models.
-             * @default 1
-             * @example 1
+             * @deprecated
+             * @description Legacy compatibility field. The current Zig inference runtime does not
+             *     create per-model pipeline pools from this setting; configuring it has no effect.
              */
             pool_size?: number;
             /** @description Native generator prompt KV cache settings. */
             prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
             /**
-             * @description Backend priority order for model loading with optional device specifiers.
-             *     Format: `backend` or `backend:device` where device defaults to `auto`.
-             *
-             *     Antfly inference tries entries in order and uses the first available backend+device
-             *     combination that supports the model.
-             *
-             *     **Examples**:
-             *     - `["native", "onnx", "xla"]` - Try backends with auto device detection
-             *     - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-             * @default [
-             *       "native",
-             *       "onnx",
-             *       "xla"
-             *     ]
-             * @example [
-             *       "cuda",
-             *       "onnx:cuda",
-             *       "xla:tpu",
-             *       "native"
-             *     ]
+             * @deprecated
+             * @description Legacy compatibility field. The current Zig inference runtime selects a
+             *     backend from model metadata, explicit preload settings, and compiled capabilities;
+             *     configuring this list has no effect.
              */
             backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
             /**
-             * @description Maximum number of concurrent inference requests allowed.
-             *     Additional requests will be queued up to max_queue_size.
-             *     Set to 0 for unlimited (default).
-             * @default 0
-             * @example 4
+             * @description Maximum concurrent weighted inference admission units in the Zig runtime.
+             *     Request body size, generation workload, and image byte/count reservations
+             *     can consume more than one unit. Read and image-extraction admission reserves the
+             *     effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
+             *     two images. A positive capacity also clamps each such request's downloaded-image
+             *     ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
+             *     and that capacity-derived clamp.
+             *     When a positive limit is exhausted, new requests are rejected immediately
+             *     with 503 Service Unavailable and Retry-After: 1; they are not retained in
+             *     an in-process queue. Set to 0 only as an operational escape hatch for
+             *     trusted testing environments; unlimited admission is not recommended for
+             *     production native generation. Use a positive production limit. The default is 32.
+             * @default 32
+             * @example 32
              */
             max_concurrent_requests?: number;
             /**
-             * @description Maximum number of requests to queue when max_concurrent_requests is reached.
-             *     When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-             *     Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-             * @default 0
-             * @example 100
+             * @deprecated
+             * @description Legacy Go-runtime queue setting. The current Zig runtime does not retain
+             *     excess inference requests in memory and ignores this field.
              */
             max_queue_size?: number;
             /**
-             * @description Maximum time to wait for a request to complete, including queue wait time.
-             *     Use Go duration format: "30s", "1m", "0" (no timeout, default).
-             *     Requests exceeding this timeout receive 504 Gateway Timeout.
-             * @default 0
-             * @example 30s
+             * @deprecated
+             * @description Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
+             *     this field; its HTTP listener applies a separate fixed transport timeout.
              */
             request_timeout?: string;
             /**
@@ -12081,13 +12173,9 @@ export interface components {
              */
             preload?: components["schemas"]["InferenceModelRef"][];
             /**
-             * @description Maximum memory (in MB) to use for loaded models.
-             *     When this limit is approached, least recently used models are unloaded.
-             *     Set to 0 for unlimited (default). This is an advisory limit - actual memory
-             *     usage depends on model sizes and may temporarily exceed this value.
-             *     Works alongside max_loaded_models for fine-grained control.
-             * @default 0
-             * @example 4096
+             * @deprecated
+             * @description Legacy compatibility field. The current Zig runtime uses explicit host,
+             *     backend, combined, KV, and scratch budgets instead and ignores this field.
              */
             max_memory_mb?: number;
             /**
@@ -12109,9 +12197,12 @@ export interface components {
                 [key: string]: "eager" | "lazy" | "bounded";
             };
             /**
-             * @description Whether the dashboard should show model download commands.
-             *     Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
-             *     deployments (e.g., Kubernetes operator) where models are managed externally.
+             * @deprecated
+             * @description Legacy compatibility field controlling whether dashboards show model
+             *     download commands. It defaults to true for standalone deployments;
+             *     managed deployments historically set it to false. Download-command
+             *     availability is a build-time setting in the current Zig runtime, so
+             *     configuring this field has no effect.
              * @default true
              */
             allow_downloads?: boolean;
@@ -12181,18 +12272,17 @@ export interface components {
             /** @description Animation: display delay in milliseconds */
             frame_delay_ms?: number;
         };
+        /** @description Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget. */
         InferenceContentSecurityConfig: {
             /**
-             * @description Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+             * @description Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
              * @example [
-             *       "example.com",
-             *       "cdn.example.com",
-             *       "192.0.2.1"
+             *       "93.184.216.34"
              *     ]
              */
             allowed_hosts?: string[];
             /**
-             * @description Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+             * @description Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
              * @default true
              */
             block_private_ips?: boolean;
@@ -12203,19 +12293,14 @@ export interface components {
              */
             max_download_size_bytes?: number;
             /**
-             * @description Timeout for individual download operations in seconds
+             * @description Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
              * @default 30
-             * @example 30
              */
             download_timeout_seconds?: number;
-            /**
-             * @description Maximum image width/height in pixels (images will be resized)
-             * @default 2048
-             * @example 2048
-             */
+            /** @description Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting. */
             max_image_dimension?: number;
             /**
-             * @description Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+             * @description Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
              * @example [
              *       "/Users/data/",
              *       "my-bucket/uploads/"
@@ -12269,7 +12354,10 @@ export interface components {
          * @enum {string}
          */
         InferenceStyle: "terminal" | "json" | "logfmt" | "noop";
-        /** @description Logging configuration for inference services */
+        /**
+         * @deprecated
+         * @description Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
+         */
         "Inferenceschemas-Config": {
             level?: components["schemas"]["InferenceLevel"];
             style?: components["schemas"]["InferenceStyle"];
@@ -16027,6 +16115,24 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
                 headers: {
@@ -16036,8 +16142,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16078,8 +16211,26 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16120,6 +16271,24 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
                 headers: {
@@ -16129,8 +16298,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Multimodal reranking contract recognized but encoder path not implemented yet */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16171,6 +16367,15 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
                 headers: {
@@ -16189,7 +16394,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reranking service unavailable (no models configured) */
+            /** @description Reranking service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -16235,8 +16440,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Media content exceeds the per-object or aggregate decoded request size limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16253,8 +16485,26 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation request exceeds the configured memory budget */
+            507: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16277,7 +16527,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Batch generation results in request order */
+            /** @description Batch generation results in request order; item failures are represented in `data[].error` */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -16295,6 +16545,24 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Batch envelope contains more than 128 request items */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Internal server error */
             500: {
                 headers: {
@@ -16304,7 +16572,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable */
+            /** @description Generation service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -16350,8 +16618,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Media content exceeds the configured size limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16368,8 +16663,26 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation request exceeds the configured memory budget */
+            507: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16410,6 +16723,15 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
                 headers: {
@@ -16428,7 +16750,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
+            /** @description Generation service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -16470,8 +16792,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Media content exceeds the configured size limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16488,7 +16837,16 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reader service unavailable (no models configured) */
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Reader service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -16530,6 +16888,15 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
                 headers: {
@@ -16548,7 +16915,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Transcription service unavailable (no models configured) */
+            /** @description Transcription service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -16590,8 +16957,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Media content exceeds the configured size limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16608,7 +17002,16 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Extraction service unavailable (no models configured) */
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Extraction service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -16646,8 +17049,26 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16688,6 +17109,24 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content blocked by the configured content security policy */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Model not found */
             404: {
                 headers: {
@@ -16697,8 +17136,35 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Remote content fetch failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16726,8 +17192,26 @@ export interface operations {
                     "application/json": components["schemas"]["InferencePredictorsResponse"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16768,6 +17252,15 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
             /** @description Predictor not found */
             404: {
                 headers: {
@@ -16779,6 +17272,15 @@ export interface operations {
             };
             /** @description Batch too large (> 10000 rows) */
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

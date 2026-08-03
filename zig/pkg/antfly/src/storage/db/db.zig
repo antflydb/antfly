@@ -23949,6 +23949,7 @@ fn generatedEmbedBatchBytes() usize {
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
@@ -23956,6 +23957,9 @@ fn remoteRenderConfig(
     }
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = remote_content;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
+        config.max_media_parts = max_media_parts;
     }
     return config;
 }
@@ -23972,14 +23976,14 @@ fn renderSourceTemplateText(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content),
+            remoteRenderConfig(secret_store, remote_content, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
         doc_value,
-        remoteRenderConfig(secret_store, remote_content),
+        remoteRenderConfig(secret_store, remote_content, null),
     );
 }
 
@@ -23989,13 +23993,14 @@ fn renderSourceTemplateParts(
     remote_content: ?*const scraping.RemoteContentConfig,
     template_source: []const u8,
     doc_value: []const u8,
+    max_media_parts: ?usize,
 ) ![]template_mod.ContentPart {
     if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig")) {
         return try template_remote.renderJsonToPartsWithConfig(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content),
+            remoteRenderConfig(secret_store, remote_content, max_media_parts),
         );
     }
     return try template_remote.renderJsonToParts(alloc, template_source, doc_value);
@@ -27792,7 +27797,13 @@ fn computeDenseRequestImpl(
     }
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = try renderSourceParts(alloc, db, doc_value, request);
+        const source_parts = try renderSourceParts(
+            alloc,
+            db,
+            doc_value,
+            request,
+            dense_embedder.mediaPartLimit(embedding_name),
+        );
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
@@ -28225,9 +28236,10 @@ fn renderSourceParts(
     db: *DB,
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
+    max_media_parts: ?usize,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
         error.PermanentPromptFailure, error.TransientPromptFailure => return err,
         else => return null,
     };
@@ -28244,7 +28256,7 @@ fn renderSourcePartsJson(
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
-    const parts = try renderSourceParts(alloc, db, doc_value, request) orelse return null;
+    const parts = try renderSourceParts(alloc, db, doc_value, request, null) orelse return null;
     defer template_mod.freeContentParts(alloc, parts);
     return try contentPartsJsonAlloc(alloc, parts);
 }
@@ -38124,26 +38136,28 @@ fn flushFinishedDenseAppliedSequenceLocked(
     // backends. Hold a shared apply lease so concurrent persistence remains
     // parallel while catalog replacement's exclusive lease cannot retire a
     // backend underneath this durability boundary.
-    ctx.apply_mutex.lockShared();
-    defer ctx.apply_mutex.unlockShared();
-    const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
-        .index_name = pending.owned_name,
-        .sequence = pending.sequence,
-    }};
-    const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
-    defer ctx.alloc.free(enriched_updates);
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        enriched_updates,
-    );
-    lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-    const save_ns = elapsedSince(save_start_ns);
+    const save_ns = blk: {
+        ctx.apply_mutex.lockShared();
+        defer ctx.apply_mutex.unlockShared();
+        const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
+            .index_name = pending.owned_name,
+            .sequence = pending.sequence,
+        }};
+        const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
+        defer ctx.alloc.free(enriched_updates);
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try apply_state.saveAppliedSequencesWithCheckpoint(
+            ctx.alloc,
+            ctx.index_manager.checkpointIo(),
+            ctx.store,
+            ctx.applied_sequence_checkpoint_path,
+            enriched_updates,
+        );
+        lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        break :blk elapsedSince(save_start_ns);
+    };
 
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
     const flush_ns = elapsedSince(flush_start_ns);
@@ -38183,22 +38197,24 @@ fn flushPendingAppliedSequencesLocked(
     // Keep the complete metadata/checkpoint/status transaction on one stable
     // index generation. Shared holders may proceed concurrently; index
     // replacement and teardown require the exclusive lease.
-    ctx.apply_mutex.lockShared();
-    defer ctx.apply_mutex.unlockShared();
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        enriched_updates,
-    );
-    for (enriched_updates) |update| {
-        lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence) or lifecycle_completed.*;
-    }
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-    const save_ns = elapsedSince(save_start_ns);
+    const save_ns = blk: {
+        ctx.apply_mutex.lockShared();
+        defer ctx.apply_mutex.unlockShared();
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try apply_state.saveAppliedSequencesWithCheckpoint(
+            ctx.alloc,
+            ctx.index_manager.checkpointIo(),
+            ctx.store,
+            ctx.applied_sequence_checkpoint_path,
+            enriched_updates,
+        );
+        for (enriched_updates) |update| {
+            lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence) or lifecycle_completed.*;
+        }
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        break :blk elapsedSince(save_start_ns);
+    };
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
     const flush_ns = elapsedSince(flush_start_ns);
@@ -41212,6 +41228,7 @@ test "remote template host-rendered parts preserve prompt failures" {
             null,
             "{{remoteMedia url=this}}",
             "\"https://example.com/photo.png\"",
+            null,
         ),
     );
 }

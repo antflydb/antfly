@@ -954,7 +954,7 @@ tags:
          - Allowed host whitelist
          - Private IP blocking (prevents SSRF attacks)
          - Download size limits (default: 100MB)
-         - Download timeouts (default: 30s)
+         - HTTP downloads time out after 30 seconds by default; zero disables the deadline
          - Image dimension limits (default: 2048px, auto-resized)
 
          See: https://antfly.io/docs/configuration#security--cors
@@ -3518,9 +3518,7 @@ components:
           description: Minimum document count for a bucket to be included
           example: 1
         background_filter:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: Background filter for significant_terms aggregations
         algorithm:
           x-go-type-skip-optional-pointer: false
@@ -4091,9 +4089,7 @@ components:
             - Special fields: "_embeddings", "_summaries", "_chunks"
           example: ["title", "author", "metadata.tags"]
         filter_query:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: |
             Structured subset of the Antfly query AST used to filter a primary-key
             scan. Only documents matching this query are included in results.
@@ -6015,6 +6011,12 @@ components:
     # Generation Agent - Document-to-response generation
     # ==========================================
 
+    RawQuery:
+      oneOf:
+        - $ref: "query.yaml#/components/schemas/Query"
+      x-go-type: json.RawMessage
+      description: A validated Antfly query retained as raw JSON by Go servers and clients.
+
     QueryRequest: # Based on remoteindex.Query
       type: object
       properties:
@@ -6051,11 +6053,7 @@ components:
                 - exists:
                     path: /deleted_at
         full_text_search:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
-              type: object
-              additionalProperties: true
+          $ref: "#/components/schemas/RawQuery"
           description: |
             Antfly query for full-text search. Supports all Antfly query types.
 
@@ -6128,9 +6126,7 @@ components:
             - User-specific data: `"user:123:"`
             - Document type filtering: `"article:"`
         filter_query:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: |
             Antfly query applied as an AND condition. Documents must match both the main query
             and this filter. Applied before scoring for better performance.
@@ -6149,9 +6145,7 @@ components:
             query: "+category:technology +year:>2020"
             boost: 1.0
         exclusion_query:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: |
             Antfly query applied as a NOT condition. Documents matching this query are excluded
             from results. Applied before scoring.
@@ -6645,9 +6639,7 @@ components:
       description: Filters to apply to a table before joining.
       properties:
         filter_query:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: Antfly query to filter rows before joining.
         filter_prefix:
           type: string
@@ -7469,9 +7461,7 @@ components:
           example:
             - { op: "$set", path: "active", value: false }
         publication_filter:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: |
             Bleve-style filter query that gets translated to SQL and applied as a
             WHERE clause on the PostgreSQL publication. This filters rows at the
@@ -7582,9 +7572,7 @@ components:
             already exist.
           example: "premium_users"
         where:
-          allOf:
-            - $ref: "query.yaml#/components/schemas/Query"
-            - x-go-type: json.RawMessage
+          $ref: "#/components/schemas/RawQuery"
           description: |
             Bleve-style filter query evaluated against each CDC row. Only rows
             matching this filter are written to `target_table`. If omitted,
@@ -8659,6 +8647,7 @@ paths:
           application/x-ndjson:
             schema:
               type: string
+              format: binary
       responses:
         "200":
           description: Query successful
@@ -9049,6 +9038,7 @@ paths:
           application/x-ndjson:
             schema:
               type: string
+              format: binary
       responses:
         "200":
           description: Query successful
@@ -9328,6 +9318,7 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
+                format: binary
                 description: Newline-delimited JSON, each line is a JSON object with an "_id" field
         "400":
           $ref: "#/components/responses/BadRequest"

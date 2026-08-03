@@ -152,6 +152,14 @@ pub const TransportResponse = struct {
 
 const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
 
+pub const HttpContext = struct {
+    io: std.Io,
+    /// Total ceiling shared by every HTTP request made by one S3 operation.
+    /// Zero disables this additional ceiling.
+    timeout_ms: ?u64 = null,
+    client_config: httpx.ClientConfig = .{},
+};
+
 const HttpxTransport = struct {
     alloc: Allocator,
     io_impl: ?*std.Io.Threaded,
@@ -204,32 +212,119 @@ const HttpxTransport = struct {
         max_response_size: ?usize,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
-
-        var request_headers = std.ArrayListUnmanaged(HeaderPair).empty;
-        defer request_headers.deinit(alloc);
-        try request_headers.appendSlice(alloc, headers);
-        if (content_type) |value| {
-            try request_headers.append(alloc, .{ "Content-Type", value });
-        }
-
-        var response = try self.client.request(method.toHttpx(), url, .{
-            .headers = request_headers.items,
-            .body = body,
-            .max_response_size = max_response_size,
-        });
-        defer response.deinit();
-
-        return .{
-            .status = response.status.code,
-            .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
-            .etag = if (response.headers.get("ETag")) |value| try alloc.dupe(u8, value) else null,
-            .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
-            .content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null,
-            .version_id = if (response.headers.get("x-amz-version-id")) |value| try alloc.dupe(u8, value) else null,
-            .last_modified = if (response.headers.get("Last-Modified")) |value| try alloc.dupe(u8, value) else null,
-        };
+        return httpxRequest(&self.client, alloc, method, url, headers, body, content_type, null, max_response_size);
     }
 };
+
+const ContextHttpxTransport = struct {
+    io: std.Io,
+    client: httpx.Client,
+    timeout_ms: ?u64,
+    started_at: std.Io.Timestamp,
+
+    fn init(alloc: Allocator, context: HttpContext) ContextHttpxTransport {
+        return .{
+            .io = context.io,
+            .client = httpx.Client.initWithConfig(alloc, context.io, context.client_config),
+            .timeout_ms = context.timeout_ms,
+            .started_at = std.Io.Timestamp.now(context.io, .awake),
+        };
+    }
+
+    fn deinit(self: *ContextHttpxTransport) void {
+        self.client.deinit();
+        self.* = undefined;
+    }
+
+    fn remainingTimeoutMs(self: *const ContextHttpxTransport) !?u64 {
+        try self.io.checkCancel();
+        const timeout_ms = self.timeout_ms orelse return null;
+        if (timeout_ms == 0) return 0;
+        const elapsed_ns = std.Io.Timestamp.durationTo(
+            self.started_at,
+            std.Io.Timestamp.now(self.io, .awake),
+        ).toNanoseconds();
+        return try remainingRequestTimeoutMs(timeout_ms, elapsed_ns);
+    }
+
+    fn request(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+    ) !TransportResponse {
+        const self: *ContextHttpxTransport = @ptrCast(@alignCast(ctx.?));
+        var result = try httpxRequest(
+            &self.client,
+            alloc,
+            method,
+            url,
+            headers,
+            body,
+            content_type,
+            try self.remainingTimeoutMs(),
+            max_response_size,
+        );
+        errdefer result.deinit(alloc);
+        _ = try self.remainingTimeoutMs();
+        return result;
+    }
+};
+
+fn httpxRequest(
+    client: *httpx.Client,
+    alloc: Allocator,
+    method: HttpMethod,
+    url: []const u8,
+    headers: []const HeaderPair,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+    timeout_ms: ?u64,
+    max_response_size: ?usize,
+) !TransportResponse {
+    var request_headers = std.ArrayListUnmanaged(HeaderPair).empty;
+    defer request_headers.deinit(alloc);
+    try request_headers.appendSlice(alloc, headers);
+    if (content_type) |value| {
+        try request_headers.append(alloc, .{ "Content-Type", value });
+    }
+
+    var response = try client.request(method.toHttpx(), url, .{
+        .headers = request_headers.items,
+        .body = body,
+        .timeout_ms = timeout_ms,
+        .max_response_size = max_response_size,
+    });
+    defer response.deinit();
+
+    var result = TransportResponse{
+        .status = response.status.code,
+        .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
+    };
+    errdefer result.deinit(alloc);
+    if (response.headers.get("ETag")) |value| result.etag = try alloc.dupe(u8, value);
+    if (response.headers.get("Content-Type")) |value| result.content_type = try alloc.dupe(u8, value);
+    result.content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null;
+    if (response.headers.get("x-amz-version-id")) |value| result.version_id = try alloc.dupe(u8, value);
+    if (response.headers.get("Last-Modified")) |value| result.last_modified = try alloc.dupe(u8, value);
+    return result;
+}
+
+fn remainingRequestTimeoutMs(timeout_ms: u64, elapsed_ns: i96) !u64 {
+    if (timeout_ms == 0) return 0;
+    const timeout_ns = @as(i96, timeout_ms) * std.time.ns_per_ms;
+    const bounded_elapsed_ns = @max(@as(i96, 0), elapsed_ns);
+    if (bounded_elapsed_ns >= timeout_ns) return error.Timeout;
+    const remaining_ns = timeout_ns - bounded_elapsed_ns;
+    return @intCast(@max(
+        @as(i96, 1),
+        @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+    ));
+}
 
 test "s3 http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
@@ -245,12 +340,34 @@ test "s3 http transport borrows a shared io runtime" {
     try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
 }
 
+test "request-scoped S3 transport preserves caller IO and client config" {
+    var transport = ContextHttpxTransport.init(std.testing.allocator, .{
+        .io = std.testing.io,
+        .timeout_ms = 250,
+        .client_config = .{
+            .keep_alive = false,
+            .timeouts = .{ .read_ms = 123 },
+        },
+    });
+    defer transport.deinit();
+
+    try std.testing.expectEqual(std.testing.io.userdata, transport.client.io.userdata);
+    try std.testing.expect(!transport.client.config.keep_alive);
+    try std.testing.expectEqual(@as(u64, 123), transport.client.config.timeouts.read_ms);
+    const remaining = (try transport.remainingTimeoutMs()).?;
+    try std.testing.expect(remaining > 0 and remaining <= 250);
+    try std.testing.expectEqual(@as(u64, 0), try remainingRequestTimeoutMs(0, std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 1), try remainingRequestTimeoutMs(250, 249 * std.time.ns_per_ms + 1));
+    try std.testing.expectError(error.Timeout, remainingRequestTimeoutMs(250, 250 * std.time.ns_per_ms));
+}
+
 pub const Client = struct {
     alloc: Allocator,
     cfg: Config,
     request_ctx: ?*anyopaque,
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
+    owned_context_httpx: ?*ContextHttpxTransport,
 
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
@@ -262,6 +379,25 @@ pub const Client = struct {
             .request_ctx = transport,
             .request_fn = HttpxTransport.request,
             .owned_httpx = transport,
+            .owned_context_httpx = null,
+        };
+    }
+
+    /// Initializes the S3 client on caller-owned I/O. The optional timeout is
+    /// one total ceiling shared across the request sequence (for example,
+    /// metadata HEAD plus ranged GET), rather than restarting per request.
+    pub fn initWithHttpContext(alloc: Allocator, cfg: Config, context: HttpContext) !Client {
+        try context.io.checkCancel();
+        const transport = try alloc.create(ContextHttpxTransport);
+        errdefer alloc.destroy(transport);
+        transport.* = ContextHttpxTransport.init(alloc, context);
+        return .{
+            .alloc = alloc,
+            .cfg = cfg,
+            .request_ctx = transport,
+            .request_fn = ContextHttpxTransport.request,
+            .owned_httpx = null,
+            .owned_context_httpx = transport,
         };
     }
 
@@ -277,11 +413,16 @@ pub const Client = struct {
             .request_ctx = request_ctx,
             .request_fn = request_fn,
             .owned_httpx = null,
+            .owned_context_httpx = null,
         };
     }
 
     pub fn deinit(self: *Client) void {
         if (self.owned_httpx) |transport| {
+            transport.deinit();
+            self.alloc.destroy(transport);
+        }
+        if (self.owned_context_httpx) |transport| {
             transport.deinit();
             self.alloc.destroy(transport);
         }
@@ -505,7 +646,6 @@ pub const Client = struct {
             };
         } else try self.statObject(alloc, bucket, key);
         errdefer meta.deinit(alloc);
-
         const query = try buildObjectQueryAlloc(alloc, opts.version_id, opts.part_number);
         defer freeQueryPairs(alloc, query);
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
@@ -543,16 +683,20 @@ pub const Client = struct {
         }
 
         meta.content_length = @intCast(response.body.len);
-        if (opts.skip_metadata_probe) {
-            if (response.etag) |value| meta.etag = try alloc.dupe(u8, stripQuotes(value));
+        if (response.etag) |value| {
+            const next = try alloc.dupe(u8, stripQuotes(value));
+            if (meta.etag) |current| alloc.free(current);
+            meta.etag = next;
         }
         if (response.content_type) |value| {
+            const next = try alloc.dupe(u8, value);
             if (meta.content_type) |current| alloc.free(current);
-            meta.content_type = try alloc.dupe(u8, value);
+            meta.content_type = next;
         }
         if (response.version_id) |value| {
+            const next = try alloc.dupe(u8, value);
             if (meta.version_id) |current| alloc.free(current);
-            meta.version_id = try alloc.dupe(u8, value);
+            meta.version_id = next;
         }
 
         const out_body = response.body;
@@ -674,7 +818,7 @@ pub const Client = struct {
             signing_config.credentials.secret_access_key = credentials.secret_access_key;
             signing_config.credentials.session_token = credentials.session_token;
         }
-        const timestamp = currentUnixSeconds();
+        const timestamp = try currentUnixSeconds();
         const payload_hash = try sha256HexAlloc(self.alloc, body orelse "");
         defer self.alloc.free(payload_hash);
 
@@ -901,9 +1045,11 @@ fn objectTargetAllocWithQuery(alloc: Allocator, cfg: Config, bucket: []const u8,
         try alloc.dupe(u8, shape.uri)
     else
         try std.fmt.allocPrint(alloc, "{s}?{s}", .{ shape.uri, canonical_query });
+    errdefer alloc.free(url);
+    const host = try alloc.dupe(u8, shape.host);
     return .{
         .url = url,
-        .host = try alloc.dupe(u8, shape.host),
+        .host = host,
         .canonical_uri = canonical_uri,
         .query_pairs = owned_query,
     };
@@ -1037,6 +1183,27 @@ fn signHeadersAlloc(
         try headers.append(alloc, .{ authorization_name, signature });
     }
     return try headers.toOwnedSlice(alloc);
+}
+
+fn appendHeaderPair(
+    alloc: Allocator,
+    headers: *std.ArrayListUnmanaged(HeaderPair),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try headers.append(alloc, .{ owned_name, owned_value });
+}
+
+fn deinitHeaderPairList(alloc: Allocator, headers: *std.ArrayListUnmanaged(HeaderPair)) void {
+    for (headers.items) |pair| {
+        alloc.free(pair[0]);
+        alloc.free(pair[1]);
+    }
+    headers.deinit(alloc);
 }
 
 fn authorizationValueAlloc(
@@ -1280,12 +1447,18 @@ fn byteRangeHeaderAlloc(alloc: Allocator, range: types.ByteRange) ![]u8 {
     return try std.fmt.allocPrint(alloc, "bytes={d}-", .{range.offset});
 }
 
-fn currentUnixSeconds() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const now = std.Io.Timestamp.now(io_impl.io(), .real);
-    const ns: u64 = @intCast(now.toNanoseconds());
-    return ns / std.time.ns_per_s;
+fn currentUnixSeconds() !u64 {
+    return currentUnixSecondsWithIo(std.Io.Threaded.global_single_threaded.io());
+}
+
+fn currentUnixSecondsWithIo(io: std.Io) !u64 {
+    return unixSecondsFromTimestamp(std.Io.Timestamp.now(io, .real));
+}
+
+fn unixSecondsFromTimestamp(timestamp: std.Io.Timestamp) !u64 {
+    const nanoseconds = timestamp.toNanoseconds();
+    if (nanoseconds < 0) return error.InvalidSystemTime;
+    return @intCast(@divTrunc(nanoseconds, std.time.ns_per_s));
 }
 
 fn formatAmzDateAlloc(alloc: Allocator, unix_seconds: u64) ![]u8 {
@@ -1333,7 +1506,7 @@ test "s3 signing timestamp uses Unix wall clock" {
     defer io_impl.deinit();
 
     const before: u64 = @intCast(std.Io.Timestamp.now(io_impl.io(), .real).toSeconds());
-    const actual = currentUnixSeconds();
+    const actual = try currentUnixSeconds();
     const after: u64 = @intCast(std.Io.Timestamp.now(io_impl.io(), .real).toSeconds());
 
     try std.testing.expect(actual >= before);
@@ -1637,6 +1810,62 @@ test "s3 authorization uses sigv4 format" {
     try std.testing.expect(std.mem.indexOf(u8, auth, "Signature=") != null);
 }
 
+test "s3 signing timestamp is Unix wall-clock time" {
+    const fixed_seconds: i96 = 1_700_000_000;
+    const fixed = std.Io.Timestamp.fromNanoseconds(fixed_seconds * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, @intCast(fixed_seconds)), try unixSecondsFromTimestamp(fixed));
+    try std.testing.expectError(
+        error.InvalidSystemTime,
+        unixSecondsFromTimestamp(std.Io.Timestamp.fromNanoseconds(-1)),
+    );
+
+    // This bound catches accidental use of an uptime/monotonic clock while
+    // leaving decades of headroom for reproducible builds and long-lived CI.
+    const now = try currentUnixSecondsWithIo(std.testing.io);
+    try std.testing.expect(now >= 1_577_836_800); // 2020-01-01 UTC
+    try std.testing.expect(now < 4_102_444_800); // 2100-01-01 UTC
+}
+
+test "s3 GET signing ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn run(alloc: Allocator) !void {
+                const cfg = Config{
+                    .credentials = .{
+                        .endpoint = @constCast("s3.example.test"),
+                        .access_key_id = @constCast("access"),
+                        .secret_access_key = @constCast("secret"),
+                        .region = @constCast("us-east-1"),
+                    },
+                    .addressing_style = .path,
+                };
+                const query = try buildObjectQueryAlloc(alloc, "version-1", 7);
+                defer freeQueryPairs(alloc, query);
+                const cloned_query = try cloneQueryPairsAlloc(alloc, query);
+                defer freeQueryPairs(alloc, cloned_query);
+                const extra_headers = [_]HeaderPair{.{ "Range", "bytes=0-3" }};
+                const signed = try signHeadersAlloc(
+                    alloc,
+                    cfg,
+                    .GET,
+                    "s3.example.test",
+                    "/bucket/key",
+                    cloned_query,
+                    &extra_headers,
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "20260327T120000Z",
+                    "20260327",
+                    null,
+                );
+                defer freeHeaderPairs(alloc, signed);
+                try std.testing.expect(signed.len >= 5);
+            }
+        }.run,
+        .{},
+    );
+}
+
 test "s3 list parser extracts entries and prefixes" {
     const alloc = std.testing.allocator;
     const xml =
@@ -1802,6 +2031,7 @@ test "s3 client signs and issues object operations through request fn" {
         content_length: ?u64 = null,
         version_id: ?[]const u8 = null,
         expect_body: ?[]const u8 = null,
+        expect_range: ?[]const u8 = null,
         expect_max_response_size: ?usize = null,
     };
 
@@ -1831,6 +2061,9 @@ test "s3 client signs and issues object operations through request fn" {
             if (step.expect_body) |expected| {
                 try std.testing.expectEqualStrings(expected, body orelse "");
             }
+            if (step.expect_range) |expected| {
+                try expectHeaderValue(headers, "Range", expected);
+            }
             return .{
                 .status = step.status,
                 .body = try req_alloc.dupe(u8, step.body),
@@ -1847,6 +2080,16 @@ test "s3 client signs and issues object operations through request fn" {
             }
             return error.MissingHeader;
         }
+
+        fn expectHeaderValue(headers: []const HeaderPair, name: []const u8, expected: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) {
+                    try std.testing.expectEqualStrings(expected, pair[1]);
+                    return;
+                }
+            }
+            return error.MissingHeader;
+        }
     };
 
     const steps = [_]Step{
@@ -1854,7 +2097,7 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
         .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
-        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 200, .body = "hello", .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
+        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .expect_range = "bytes=1-3" },
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_max_response_size = 4 },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
@@ -1883,10 +2126,18 @@ test "s3 client signs and issues object operations through request fn" {
     defer put.deinit(alloc);
     try std.testing.expectEqualStrings("etag-put", put.etag.?);
 
-    var get = try client.getObject("bucket", "docs/a.txt", .{});
+    const before_get = fake.index;
+    var get = try client.getObject("bucket", "docs/a.txt", .{
+        .version_id = "v2",
+        .part_number = 7,
+        .range = .{ .offset = 1, .length = 3 },
+    });
     defer get.deinit(alloc);
-    try std.testing.expectEqualStrings("hello", get.body);
-    try std.testing.expectEqualStrings("etag-head", get.metadata.etag.?);
+    try std.testing.expectEqual(before_get + 2, fake.index);
+    try std.testing.expectEqualStrings("ell", get.body);
+    try std.testing.expectEqualStrings("etag-get", get.metadata.etag.?);
+    try std.testing.expectEqualStrings("v2", get.metadata.version_id.?);
+    try std.testing.expectEqual(@as(u64, 3), get.metadata.content_length);
 
     var direct = try client.getObject("bucket", "docs/a.txt", .{
         .range = .{ .offset = 0, .length = 4 },

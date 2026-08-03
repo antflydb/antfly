@@ -43,15 +43,35 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 403:
+        response_403 = InferenceError.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
+
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 502:
+        response_502 = InferenceError.from_dict(response.json())
+
+        return response_502
 
     if response.status_code == 503:
         response_503 = InferenceError.from_dict(response.json())
@@ -107,6 +127,22 @@ def sync_detailed(
     - **Pix2Struct**: natural-language questions like `What type of document is this?`
     - **Moondream**: natural-language prompts like `Describe this image.`
 
+    Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+    weighted capacity unit and at least one unit per two declared images. The effective
+    ceiling is the minimum of the configured per-image limit times image count, the
+    read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+    `max_concurrent_requests`. Admission happens before model resolution or download.
+
+    After download, image headers are validated before model loading. Decoded source
+    pixels are admitted at a conservative 16 bytes per pixel against the lower of
+    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+    from downloaded-byte admission before inference. `max_image_dimension` limits
+    each source edge; malformed images return 400 and dimension or aggregate excess
+    returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+    multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+    embedding APIs. Batch generation rejects multimodal content before media fetch.
+
     Args:
         body (InferenceReadRequest):
 
@@ -161,6 +197,22 @@ def sync(
     - **Pix2Struct**: natural-language questions like `What type of document is this?`
     - **Moondream**: natural-language prompts like `Describe this image.`
 
+    Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+    weighted capacity unit and at least one unit per two declared images. The effective
+    ceiling is the minimum of the configured per-image limit times image count, the
+    read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+    `max_concurrent_requests`. Admission happens before model resolution or download.
+
+    After download, image headers are validated before model loading. Decoded source
+    pixels are admitted at a conservative 16 bytes per pixel against the lower of
+    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+    from downloaded-byte admission before inference. `max_image_dimension` limits
+    each source edge; malformed images return 400 and dimension or aggregate excess
+    returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+    multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+    embedding APIs. Batch generation rejects multimodal content before media fetch.
+
     Args:
         body (InferenceReadRequest):
 
@@ -209,6 +261,22 @@ async def asyncio_detailed(
     - **Florence-2 Caption**: `<CAPTION>` for image description
     - **Pix2Struct**: natural-language questions like `What type of document is this?`
     - **Moondream**: natural-language prompts like `Describe this image.`
+
+    Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+    weighted capacity unit and at least one unit per two declared images. The effective
+    ceiling is the minimum of the configured per-image limit times image count, the
+    read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+    `max_concurrent_requests`. Admission happens before model resolution or download.
+
+    After download, image headers are validated before model loading. Decoded source
+    pixels are admitted at a conservative 16 bytes per pixel against the lower of
+    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+    from downloaded-byte admission before inference. `max_image_dimension` limits
+    each source edge; malformed images return 400 and dimension or aggregate excess
+    returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+    multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+    embedding APIs. Batch generation rejects multimodal content before media fetch.
 
     Args:
         body (InferenceReadRequest):
@@ -261,6 +329,22 @@ async def asyncio(
     - **Florence-2 Caption**: `<CAPTION>` for image description
     - **Pix2Struct**: natural-language questions like `What type of document is this?`
     - **Moondream**: natural-language prompts like `Describe this image.`
+
+    Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+    weighted capacity unit and at least one unit per two declared images. The effective
+    ceiling is the minimum of the configured per-image limit times image count, the
+    read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+    `max_concurrent_requests`. Admission happens before model resolution or download.
+
+    After download, image headers are validated before model loading. Decoded source
+    pixels are admitted at a conservative 16 bytes per pixel against the lower of
+    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+    from downloaded-byte admission before inference. `max_image_dimension` limits
+    each source edge; malformed images return 400 and dimension or aggregate excess
+    returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+    multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+    embedding APIs. Batch generation rejects multimodal content before media fetch.
 
     Args:
         body (InferenceReadRequest):

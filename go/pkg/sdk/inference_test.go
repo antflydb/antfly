@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -26,9 +27,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type inferenceRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f inferenceRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type infiniteZeroReader struct{}
+
+func (infiniteZeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+type closeTrackingReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed = true
+	return nil
+}
 
 // serializeFloatArrays writes embeddings in binary format matching the inference server.
 // Format: uint64(numVectors) + uint64(dimension) + float32 values in little endian
@@ -62,7 +87,7 @@ func uint32FromFloat32(f float32) uint32 {
 }
 
 func TestClient_Embed_Binary(t *testing.T) {
-	// Mock server that returns binary embeddings
+	// Legacy servers may still return binary embeddings.
 	expectedEmbeddings := [][]float32{
 		{0.1, 0.2, 0.3, 0.4},
 		{0.5, 0.6, 0.7, 0.8},
@@ -83,7 +108,7 @@ func TestClient_Embed_Binary(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "test-model", req["model"])
 
-		// Return binary response (default)
+		// Return the legacy dense binary response.
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(serializeFloatArrays(expectedEmbeddings))
@@ -103,6 +128,41 @@ func TestClient_Embed_Binary(t *testing.T) {
 	require.Len(t, embeddings, 2)
 	assert.InDeltaSlice(t, expectedEmbeddings[0], embeddings[0], 0.0001)
 	assert.InDeltaSlice(t, expectedEmbeddings[1], embeddings[1], 0.0001)
+}
+
+func TestClient_Embed_CurrentJSONResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"model":  "test-model",
+			"data": []map[string]any{
+				{"object": "embedding", "index": 0, "embedding": []float32{0.1, 0.2}},
+			},
+			"usage": map[string]any{"prompt_tokens": 1, "total_tokens": 1},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	embeddings, err := client.Embed(context.Background(), "test-model", []string{"hello"})
+	require.NoError(t, err)
+	require.Len(t, embeddings, 1)
+	assert.InDeltaSlice(t, []float32{0.1, 0.2}, embeddings[0], 0.0001)
+}
+
+func TestClient_EmbedRejectsUnregisteredBinaryMediaType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-streamx")
+		_, _ = w.Write(serializeFloatArrays([][]float32{{0.1}}))
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Embed(context.Background(), "test-model", []string{"hello"})
+	require.ErrorContains(t, err, `unexpected embedding response content type "application/octet-streamx"`)
 }
 
 func TestClient_Embed_JSON(t *testing.T) {
@@ -683,6 +743,204 @@ func TestClient_CustomHTTPClient(t *testing.T) {
 	assert.Contains(t, models.Chunkers, "fixed")
 }
 
+func TestInferenceResponseLimitsApplyBeforeGeneratedParsing(t *testing.T) {
+	for _, path := range []string{
+		"/ai/v1",
+		"/ai/v1/generate",
+		"/ml/v1/predict",
+		"/cloud/v1/instance/ai/v1/generate",
+		"/cloud/v1/instance/ml/v1/predict",
+	} {
+		assert.True(t, isInferenceAPIPath(path), path)
+	}
+
+	tests := []struct {
+		name   string
+		status int
+		limit  int64
+	}{
+		{name: "error", status: http.StatusInternalServerError, limit: maxErrorResponseBytes},
+		{name: "json success", status: http.StatusOK, limit: maxInferenceJSONResponseBytes},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			httpClient := &http.Client{Transport: inferenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: test.status,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(io.LimitReader(infiniteZeroReader{}, test.limit+1)),
+					Request:    req,
+				}, nil
+			})}
+			client, err := NewInferenceClient("http://inference.test", httpClient)
+			require.NoError(t, err)
+
+			_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+			require.ErrorContains(t, err, fmt.Sprintf("inference response exceeded %d bytes", test.limit))
+		})
+	}
+
+	jsonReq, err := http.NewRequest(http.MethodPost, "http://inference.test/ai/v1/embed", nil)
+	require.NoError(t, err)
+	for _, contentType := range []string{"application/octet-stream", "application/x-sparse-vectors"} {
+		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}}
+		assert.Equal(t, maxInferenceBinaryResponseBytes, inferenceResponseLimit(jsonReq, resp), contentType)
+	}
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}}}
+	assert.Equal(t, maxInferenceJSONResponseBytes, inferenceResponseLimit(jsonReq, resp))
+	sseReq := jsonReq.Clone(context.Background())
+	sseReq.Header.Set("Accept", "application/json, text/event-stream; q=1")
+	assert.Zero(t, inferenceResponseLimit(sseReq, resp))
+	assert.Equal(t, "text/event-stream", inferenceMediaType(resp.Header.Get("Content-Type")))
+	assert.Equal(t, "application/json", inferenceMediaType(`application/json; note="text/event-stream"`))
+	assert.Empty(t, inferenceMediaType("application/json; note=text/event-stream"))
+	assert.Empty(t, inferenceMediaType("not a media type"))
+
+	for _, contentType := range []string{
+		"application/octet-streamx",
+		"application/json; note=text/event-stream",
+		"not a media type",
+		"",
+	} {
+		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}}
+		assert.Equal(t, maxInferenceJSONResponseBytes, inferenceResponseLimit(jsonReq, resp), contentType)
+	}
+
+	for _, path := range []string{"/db/v1/query", "/auth/v1/users", "/ai/v10/generate"} {
+		originalBody := io.NopCloser(strings.NewReader("{}"))
+		httpClient := &http.Client{Transport: inferenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       originalBody,
+				Request:    req,
+			}, nil
+		})}
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://antfly.test"+path, nil)
+		require.NoError(t, err)
+		resp, err := (inferenceResponseLimitDoer{next: httpClient}).Do(req)
+		require.NoError(t, err)
+		_, limited := resp.Body.(*inferenceLimitedBody)
+		assert.False(t, limited, path)
+	}
+}
+
+func TestInferenceJSONRequestCapsSuccessfulSSEMislabeledBody(t *testing.T) {
+	body := &closeTrackingReader{Reader: io.LimitReader(infiniteZeroReader{}, maxInferenceJSONResponseBytes+1)}
+	httpClient := &http.Client{Transport: inferenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		require.NotContains(t, req.Header.Get("Accept"), "text/event-stream")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       body,
+			Request:    req,
+		}, nil
+	})}
+	client, err := NewInferenceClient("http://inference.test", httpClient)
+	require.NoError(t, err)
+
+	_, err = client.Embed(context.Background(), "target", []string{"hello"})
+	require.ErrorContains(t, err, fmt.Sprintf("inference response exceeded %d bytes", maxInferenceJSONResponseBytes))
+	assert.True(t, body.closed, "generated response parser must close the rejected body")
+}
+
+func TestInferenceBinaryResponseLimitRejectsOversizedBody(t *testing.T) {
+	httpClient := &http.Client{Transport: inferenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/octet-stream"}},
+			Body:       io.NopCloser(io.LimitReader(infiniteZeroReader{}, maxInferenceBinaryResponseBytes+1)),
+			Request:    req,
+		}, nil
+	})}
+	client, err := NewInferenceClient("http://inference.test", httpClient)
+	require.NoError(t, err)
+
+	_, err = client.Embed(context.Background(), "target", []string{"hello"})
+	require.ErrorContains(t, err, fmt.Sprintf("inference response exceeded %d bytes", maxInferenceBinaryResponseBytes))
+}
+
+func TestDeserializeFloatArraysRejectsForgedHeaders(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "missing count", body: make([]byte, 7)},
+		{name: "trailing empty payload", body: append(make([]byte, 8), 0)},
+		{name: "missing dimension", body: func() []byte {
+			body := make([]byte, 8)
+			binary.LittleEndian.PutUint64(body, 1)
+			return body
+		}()},
+		{name: "multiplication overflow", body: func() []byte {
+			body := make([]byte, 16)
+			binary.LittleEndian.PutUint64(body[0:8], ^uint64(0))
+			binary.LittleEndian.PutUint64(body[8:16], 2)
+			return body
+		}()},
+		{name: "declared payload mismatch", body: func() []byte {
+			body := make([]byte, 16)
+			binary.LittleEndian.PutUint64(body[0:8], 1)
+			binary.LittleEndian.PutUint64(body[8:16], 1)
+			return body
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := deserializeFloatArrays(test.body)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestDeserializeSparseVectorsValidatesBeforeAllocation(t *testing.T) {
+	forgedCount := make([]byte, 8)
+	binary.LittleEndian.PutUint64(forgedCount, ^uint64(0))
+	_, err := deserializeSparseVectors(forgedCount)
+	require.Error(t, err)
+
+	forgedNNZ := make([]byte, 12)
+	binary.LittleEndian.PutUint64(forgedNNZ[0:8], 1)
+	binary.LittleEndian.PutUint32(forgedNNZ[8:12], ^uint32(0))
+	_, err = deserializeSparseVectors(forgedNNZ)
+	require.ErrorContains(t, err, "beyond payload")
+
+	valid := make([]byte, 28)
+	binary.LittleEndian.PutUint64(valid[0:8], 1)
+	binary.LittleEndian.PutUint32(valid[8:12], 2)
+	binary.LittleEndian.PutUint32(valid[12:16], uint32(3))
+	binary.LittleEndian.PutUint32(valid[16:20], uint32(7))
+	binary.LittleEndian.PutUint32(valid[20:24], math.Float32bits(0.25))
+	binary.LittleEndian.PutUint32(valid[24:28], math.Float32bits(0.75))
+	vectors, err := deserializeSparseVectors(valid)
+	require.NoError(t, err)
+	require.Len(t, vectors, 1)
+	assert.Equal(t, []int32{3, 7}, vectors[0].Indices)
+	assert.InDeltaSlice(t, []float32{0.25, 0.75}, vectors[0].Values, 0.0001)
+}
+
+func TestClient_SparseEmbed_LegacyBinaryMediaType(t *testing.T) {
+	body := make([]byte, 20)
+	binary.LittleEndian.PutUint64(body[0:8], 1)
+	binary.LittleEndian.PutUint32(body[8:12], 1)
+	binary.LittleEndian.PutUint32(body[12:16], 7)
+	binary.LittleEndian.PutUint32(body[16:20], math.Float32bits(0.75))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-sparse-vectors")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	vectors, err := client.SparseEmbed(context.Background(), "sparse-model", []string{"hello"})
+	require.NoError(t, err)
+	require.Len(t, vectors, 1)
+	assert.Equal(t, []int32{7}, vectors[0].Indices)
+	assert.InDeltaSlice(t, []float32{0.75}, vectors[0].Values, 0.0001)
+}
+
 func TestClient_ContextCancellation(t *testing.T) {
 	// Server that delays response
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -751,4 +1009,220 @@ func TestClient_URLNormalization(t *testing.T) {
 	ctx := context.Background()
 	_, err = inferenceClient.ListModels(ctx)
 	require.NoError(t, err)
+}
+
+func TestClient_Generate_Speculation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/ai/v1/generate", r.URL.Path)
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		assert.Equal(t, "draft", req["draft_model"])
+		assert.Equal(t, float64(3), req["speculative_k"])
+		assert.Equal(t, "auto", req["speculation_policy"])
+		assert.Equal(t, "probe", req["speculation_calibration"])
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-test", "object": "chat.completion", "created": 1, "model": "target",
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+			}},
+			"usage":       map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			"speculation": map[string]any{"policy": "auto", "calibration": "probe", "decision": "active"},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	resp, err := client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		DraftModel:             "draft",
+		SpeculativeK:           3,
+		SpeculationPolicy:      oapi.InferenceGenerateRequestSpeculationPolicyAuto,
+		SpeculationCalibration: oapi.InferenceGenerateRequestSpeculationCalibrationProbe,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Speculation)
+	assert.Equal(t, "active", resp.Speculation.Decision)
+
+	var withoutSpeculation oapi.InferenceGenerateResponse
+	require.NoError(t, json.Unmarshal([]byte(`{"speculation":null}`), &withoutSpeculation))
+	assert.Nil(t, withoutSpeculation.Speculation)
+}
+
+func TestInferenceGenerateRequest_OmitsSamplingAndSpeculationDefaults(t *testing.T) {
+	encoded, err := json.Marshal(oapi.InferenceGenerateRequest{
+		Model:    "target",
+		Messages: []oapi.InferenceChatMessage{NewUserMessage("hello")},
+	})
+	require.NoError(t, err)
+
+	var request map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &request))
+	for _, field := range []string{"temperature", "top_p", "top_k", "speculative_k"} {
+		assert.NotContains(t, request, field)
+	}
+}
+
+func TestClient_Generate_PreservesExplicitThinkingFalse(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		requests = append(requests, request)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"target","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+	require.NoError(t, err)
+	enableThinking := false
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		EnableThinking: &enableThinking,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, requests, 2)
+	assert.NotContains(t, requests[0], "chat_template_kwargs")
+	assert.Equal(t, map[string]any{"enable_thinking": false}, requests[1]["chat_template_kwargs"])
+}
+
+func TestClient_Generate_ExplicitSamplingZeroOverrides(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		requests = append(requests, request)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"target","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	}))
+	defer server.Close()
+
+	zeroFloat := float32(0)
+	zeroInt := 0
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		Temperature: 0.7,
+		TopP:        0.9,
+		TopK:        50,
+	})
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		Temperature:         0.7,
+		TemperatureOverride: &zeroFloat,
+		TopP:                0.9,
+		TopPOverride:        &zeroFloat,
+		TopK:                50,
+		TopKOverride:        &zeroInt,
+	})
+	require.NoError(t, err)
+	require.Len(t, requests, 2)
+	assert.InDelta(t, 0.7, requests[0]["temperature"], 0.0001)
+	assert.InDelta(t, 0.9, requests[0]["top_p"], 0.0001)
+	assert.Equal(t, float64(50), requests[0]["top_k"])
+	assert.Equal(t, float64(0), requests[1]["temperature"])
+	assert.Equal(t, float64(0), requests[1]["top_p"])
+	assert.Equal(t, float64(0), requests[1]["top_k"])
+}
+
+func TestClient_Generate_PreservesErrorCodeAndMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"INVALID_REQUEST","message":"temperature must be between 0 and 2","retryable":false}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+	require.EqualError(t, err, "bad request: temperature must be between 0 and 2 (INVALID_REQUEST)")
+}
+
+func TestInferenceErrorDetail(t *testing.T) {
+	tests := []struct {
+		name string
+		err  oapi.InferenceError
+		want string
+	}{
+		{name: "code only", err: oapi.InferenceError{Error: "INVALID_REQUEST"}, want: "INVALID_REQUEST"},
+		{name: "message only", err: oapi.InferenceError{Message: "invalid request"}, want: "invalid request"},
+		{name: "same code and message", err: oapi.InferenceError{Error: "invalid request", Message: "invalid request"}, want: "invalid request"},
+		{name: "code and detail", err: oapi.InferenceError{Error: "INVALID_REQUEST", Message: "invalid request"}, want: "invalid request (INVALID_REQUEST)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, inferenceErrorDetail(&tt.err))
+		})
+	}
+}
+
+func TestClient_Generate_MemoryBudgetExceeded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInsufficientStorage)
+		_, _ = io.WriteString(w, `{"error":"MEMORY_BUDGET_EXCEEDED","message":"model needs 8 GiB","retryable":true}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+	require.EqualError(t, err, "memory budget exceeded: model needs 8 GiB (MEMORY_BUDGET_EXCEEDED)")
+	var apiErr *InferenceAPIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusInsufficientStorage, apiErr.StatusCode)
+	assert.Equal(t, "MEMORY_BUDGET_EXCEEDED", apiErr.Code)
+	assert.Equal(t, "model needs 8 GiB (MEMORY_BUDGET_EXCEEDED)", apiErr.Message)
+	require.NotNil(t, apiErr.Retryable)
+	assert.True(t, *apiErr.Retryable)
+}
+
+func TestInferenceResponseErrorPreservesUnknownRetryability(t *testing.T) {
+	err := inferenceResponseError(http.StatusServiceUnavailable, []byte(`{"error":"not_ready"}`))
+	var apiErr *InferenceAPIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "not_ready", apiErr.Code)
+	assert.Nil(t, apiErr.Retryable)
+}
+
+func TestClient_Generate_PreservesUnifiedAuthAndRemoteContentErrors(t *testing.T) {
+	tests := []struct {
+		status int
+		code   string
+	}{
+		{status: http.StatusUnauthorized, code: "UNAUTHORIZED"},
+		{status: http.StatusBadRequest, code: "INVALID_CONTENT_URL"},
+		{status: http.StatusForbidden, code: "CONTENT_NOT_ALLOWED"},
+		{status: http.StatusRequestEntityTooLarge, code: "CONTENT_TOO_LARGE"},
+		{status: http.StatusBadGateway, code: "CONTENT_FETCH_FAILED"},
+		{status: http.StatusServiceUnavailable, code: "not_ready"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.status)
+				_, _ = fmt.Fprintf(w, `{"error":%q,"message":"request rejected","retryable":false}`, test.code)
+			}))
+			defer server.Close()
+
+			client, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+			_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+			var apiErr *InferenceAPIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, test.status, apiErr.StatusCode)
+			assert.Equal(t, test.code, apiErr.Code)
+			require.NotNil(t, apiErr.Retryable)
+			assert.False(t, *apiErr.Retryable)
+		})
+	}
 }

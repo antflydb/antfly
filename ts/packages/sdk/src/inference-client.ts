@@ -4,6 +4,7 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
+import { readLimitedResponseBytes, readLimitedResponseText } from "./client.js";
 import { deserializeEmbeddings } from "./inference-codec.js";
 import type {
   ChunkConfig,
@@ -14,7 +15,11 @@ import type {
   EntityExtractionResult,
   ExtractRequest,
   ExtractResponse,
+  GenerateChunk,
+  GenerateRequest,
+  GenerateResponse,
   InferenceConfig,
+  InferenceError,
   ModelsResponse,
   RequestOptions,
   RerankResponse,
@@ -23,10 +28,30 @@ import type {
 } from "./inference-types.js";
 import type { paths } from "./public-api.js";
 
+const MAX_GENERATION_SSE_LINE_BYTES = 16 << 20;
+const MAX_GENERATION_SSE_EVENT_CHARS = 16 << 20;
+const MAX_INFERENCE_JSON_RESPONSE_BYTES = 16 << 20;
+const MAX_GENERATION_RESPONSE_BYTES = MAX_INFERENCE_JSON_RESPONSE_BYTES;
+const MAX_INFERENCE_ERROR_BYTES = 1 << 20;
+const DEFAULT_MAX_BINARY_RESPONSE_BYTES = 64 << 20;
+
+export class InferenceAPIError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+    detail: string,
+    readonly retryable: boolean | undefined
+  ) {
+    super(`inference request failed (${status}): ${detail}`);
+    this.name = "InferenceAPIError";
+  }
+}
+
 export class InferenceClient {
   private client: Client<paths>;
   private baseUrl: string;
   private headers: Record<string, string>;
+  private maxBinaryResponseBytes: number;
 
   constructor(config: InferenceConfig) {
     this.baseUrl = normalizeBaseUrl(config.baseUrl);
@@ -34,6 +59,11 @@ export class InferenceClient {
       "Content-Type": "application/json",
       ...config.headers,
     };
+    this.maxBinaryResponseBytes =
+      config.maxBinaryResponseBytes ?? DEFAULT_MAX_BINARY_RESPONSE_BYTES;
+    if (!Number.isSafeInteger(this.maxBinaryResponseBytes) || this.maxBinaryResponseBytes <= 0) {
+      throw new Error("maxBinaryResponseBytes must be a positive safe integer");
+    }
 
     this.client = createClient<paths>({
       baseUrl: this.baseUrl,
@@ -41,7 +71,80 @@ export class InferenceClient {
         ...this.headers,
         Accept: "application/json",
       },
+      fetch: (request) => fetchLimitedInferenceResponse(request, this.maxBinaryResponseBytes),
     });
+  }
+
+  /** Generate one non-streaming chat completion. */
+  async generate(
+    request: Omit<GenerateRequest, "stream">,
+    options?: RequestOptions
+  ): Promise<GenerateResponse> {
+    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+      method: "POST",
+      headers: {
+        ...this.headers,
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ ...request, stream: false }),
+      signal: options?.signal,
+    });
+    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+    const { text, truncated } = await readLimitedResponseText(
+      response,
+      MAX_GENERATION_RESPONSE_BYTES
+    );
+    if (truncated) {
+      throw new Error(`Generation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`);
+    }
+    try {
+      return JSON.parse(text) as GenerateResponse;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Generation returned invalid JSON: ${detail}`);
+    }
+  }
+
+  /** Stream chat-completion chunks until the server sends the [DONE] sentinel. */
+  async *generateStream(
+    request: Omit<GenerateRequest, "stream">,
+    options?: RequestOptions
+  ): AsyncGenerator<GenerateChunk, void, void> {
+    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+      method: "POST",
+      headers: {
+        ...this.headers,
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify({ ...request, stream: true }),
+      signal: options?.signal,
+    });
+    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+
+    const contentType = response.headers
+      .get("content-type")
+      ?.split(";", 1)[0]
+      ?.trim()
+      .toLowerCase();
+    if (contentType !== "text/event-stream") {
+      await response.body?.cancel();
+      throw new Error(
+        `Generation stream returned content type ${JSON.stringify(response.headers.get("content-type") ?? "")}`
+      );
+    }
+    if (!response.body) throw new Error("Generation stream returned an empty body");
+
+    for await (const frame of parseSSEFrames(response.body)) {
+      if (frame.event === "error") throw new Error(`Generation stream failed: ${frame.data}`);
+      if (frame.data.trim() === "[DONE]") return;
+      try {
+        yield JSON.parse(frame.data) as GenerateChunk;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Generation stream returned invalid JSON: ${detail}`);
+      }
+    }
+    throw new Error("Generation stream ended before [DONE]");
   }
 
   /**
@@ -77,7 +180,7 @@ export class InferenceClient {
     input: EmbedInput,
     options?: { truncate?: boolean }
   ): Promise<EmbedResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/embed", {
+    const { data, error, response } = await this.client.POST("/ai/v1/embed", {
       body: {
         model,
         input,
@@ -85,18 +188,17 @@ export class InferenceClient {
       },
       parseAs: "json",
     });
-    if (error) throw new Error(`Embed failed: ${error.error}`);
-    // The API returns both application/octet-stream and application/json.
-    // We request JSON via Accept header and parseAs, so cast appropriately.
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Embed failed: unexpected empty response");
+    // The current API contract returns the OpenAI-compatible JSON shape.
     return data as EmbedResponse;
   }
 
   /**
-   * Generate embeddings in binary format (more efficient for large batches)
+   * Generate dense embeddings as a plain array of vectors.
    *
-   * Binary format is the default response format from Inference and is more efficient
-   * for transferring large embedding vectors. Use this when you need raw embeddings
-   * without the model name in the response.
+   * Current servers return the OpenAI-compatible JSON response. Bounded
+   * application/octet-stream responses from legacy servers remain supported.
    *
    * @param model - Name of the embedder model (e.g., "bge-small-en-v1.5")
    * @param input - Text string, array of strings, or array of content parts (for multimodal)
@@ -127,13 +229,28 @@ export class InferenceClient {
       }),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Embed failed: ${response.status} ${errorText}`);
+    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+
+    const contentType = responseMediaType(response);
+    if (contentType !== "application/json" && contentType !== "application/octet-stream") {
+      await response.body?.cancel();
+      throw new Error(`Unexpected embedding response content type ${JSON.stringify(contentType)}`);
+    }
+    const maxResponseBytes =
+      contentType === "application/json"
+        ? Math.min(this.maxBinaryResponseBytes, MAX_INFERENCE_JSON_RESPONSE_BYTES)
+        : this.maxBinaryResponseBytes;
+    const { bytes, truncated } = await readLimitedResponseBytes(response, maxResponseBytes);
+    if (truncated) {
+      throw new Error(`Embedding response exceeded ${maxResponseBytes} bytes`);
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    return deserializeEmbeddings(arrayBuffer);
+    switch (contentType) {
+      case "application/json":
+        return denseEmbeddingsFromJSON(bytes);
+      case "application/octet-stream":
+        return deserializeEmbeddings(bytes.buffer);
+    }
   }
 
   /**
@@ -177,14 +294,14 @@ export class InferenceClient {
     config?: ChunkConfig,
     options?: RequestOptions
   ): Promise<ChunkResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/chunk", {
+    const { data, error, response } = await this.client.POST("/ai/v1/chunk", {
       body: {
         input: text,
         config,
       },
       signal: options?.signal,
     });
-    if (error) throw new Error(`Chunk failed: ${error.error}`);
+    if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Chunk failed: unexpected empty response");
     return data;
   }
@@ -213,14 +330,14 @@ export class InferenceClient {
    * ```
    */
   async rerank(model: string, query: string, prompts: string[]): Promise<RerankResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/rerank", {
+    const { data, error, response } = await this.client.POST("/ai/v1/rerank", {
       body: {
         model,
         query,
         prompts,
       },
     });
-    if (error) throw new Error(`Rerank failed: ${error.error}`);
+    if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Rerank failed: unexpected empty response");
     return data;
   }
@@ -271,10 +388,10 @@ export class InferenceClient {
    * Run the canonical schema-driven extraction API.
    */
   async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/extract", {
+    const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
-    if (error) throw new Error(`Extract failed: ${error.error}`);
+    if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Extract failed: unexpected empty response");
     return data;
   }
@@ -374,13 +491,13 @@ export class InferenceClient {
    * ```
    */
   async rewrite(model: string, inputs: string[]): Promise<RewriteResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/rewrite", {
+    const { data, error, response } = await this.client.POST("/ai/v1/rewrite", {
       body: {
         model,
         inputs,
       },
     });
-    if (error) throw new Error(`Rewrite failed: ${error.error}`);
+    if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Rewrite failed: unexpected empty response");
     return data;
   }
@@ -413,14 +530,14 @@ export class InferenceClient {
     audio: string,
     options?: { model?: string; language?: string }
   ): Promise<TranscribeResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/transcribe", {
+    const { data, error, response } = await this.client.POST("/ai/v1/transcribe", {
       body: {
         audio,
         model: options?.model,
         language: options?.language,
       },
     });
-    if (error) throw new Error(`Transcribe failed: ${error.error}`);
+    if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Transcribe failed: unexpected empty response");
     return data;
   }
@@ -439,8 +556,8 @@ export class InferenceClient {
    * ```
    */
   async listModels(): Promise<ModelsResponse> {
-    const { data, error } = await this.client.GET("/ai/v1/models");
-    if (error) throw new Error(`List models failed: ${error.error}`);
+    const { data, error, response } = await this.client.GET("/ai/v1/models");
+    if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("List models failed: unexpected empty response");
     return data;
   }
@@ -450,6 +567,242 @@ export class InferenceClient {
    */
   getRawClient() {
     return this.client;
+  }
+}
+
+function inferenceAPIError(status: number, error: InferenceError | unknown): InferenceAPIError {
+  const payload =
+    typeof error === "object" && error !== null ? (error as Partial<InferenceError>) : {};
+  const code = typeof payload.error === "string" ? payload.error : undefined;
+  const message = typeof payload.message === "string" ? payload.message : undefined;
+  const retryable = typeof payload.retryable === "boolean" ? payload.retryable : undefined;
+  const detail =
+    message && message !== code
+      ? `${message}${code ? ` (${code})` : ""}`
+      : message || code || "Unknown inference error";
+  return new InferenceAPIError(status, code, detail, retryable);
+}
+
+async function inferenceAPIErrorResponse(response: Response): Promise<InferenceAPIError> {
+  const { text, truncated } = await readLimitedResponseText(response, MAX_INFERENCE_ERROR_BYTES);
+  let error: unknown = {
+    error: text.trim() || response.statusText || `HTTP ${response.status}`,
+  };
+  try {
+    error = JSON.parse(text) as unknown;
+  } catch {
+    // Report the bounded text body when the peer did not return the documented JSON shape.
+  }
+  if (truncated) {
+    error = {
+      error: `${response.statusText || `HTTP ${response.status}`} (response body exceeded ${MAX_INFERENCE_ERROR_BYTES} bytes)`,
+    };
+  }
+  return inferenceAPIError(response.status, error);
+}
+
+function responseMediaType(response: Response): string {
+  const [mediaType = ""] = (response.headers.get("content-type") ?? "").split(";", 1);
+  return mediaType.trim().toLowerCase();
+}
+
+function requestAcceptsEventStream(request: Request): boolean {
+  return (request.headers.get("accept") ?? "")
+    .split(",")
+    .some((value) => value.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream");
+}
+
+async function fetchLimitedInferenceResponse(
+  request: Request,
+  maxBinaryResponseBytes: number
+): Promise<Response> {
+  const response = await globalThis.fetch(request);
+  if (!response.body) return response;
+
+  const mediaType = responseMediaType(response);
+  if (response.ok && mediaType === "text/event-stream" && requestAcceptsEventStream(request)) {
+    return response;
+  }
+
+  const limit = !response.ok
+    ? MAX_INFERENCE_ERROR_BYTES
+    : mediaType === "application/octet-stream" || mediaType === "application/x-sparse-vectors"
+      ? maxBinaryResponseBytes
+      : MAX_INFERENCE_JSON_RESPONSE_BYTES;
+  const tooLarge = new Error(`Inference response exceeded ${limit} bytes`);
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > limit) {
+    try {
+      await response.body.cancel(tooLarge);
+    } catch {
+      // Preserve the response-size error when cancellation itself fails.
+    }
+    throw tooLarge;
+  }
+
+  let total = 0;
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (chunk.byteLength > limit - total) throw tooLarge;
+        total += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+    })
+  );
+  const limited = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  Object.defineProperties(limited, {
+    url: { value: response.url },
+    redirected: { value: response.redirected },
+    type: { value: response.type },
+  });
+  return limited;
+}
+
+function denseEmbeddingsFromJSON(bytes: Uint8Array): number[][] {
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Embedding response returned invalid JSON: ${detail}`);
+  }
+
+  if (typeof value !== "object" || value === null) {
+    throw new Error("Embedding JSON response must be an object");
+  }
+  const data = (value as { data?: unknown }).data;
+  if (!Array.isArray(data)) {
+    throw new Error("Embedding JSON response is missing the data array");
+  }
+
+  const embeddings: number[][] = [];
+  let dimension: number | undefined;
+  for (const [index, item] of data.entries()) {
+    if (typeof item !== "object" || item === null) {
+      throw new Error(`Embedding JSON response item ${index} must be an object`);
+    }
+    const embedding = (item as { embedding?: unknown }).embedding;
+    if (!Array.isArray(embedding)) {
+      throw new Error(`Embedding JSON response item ${index} is not a dense vector`);
+    }
+    if (
+      embedding.some((component) => typeof component !== "number" || !Number.isFinite(component))
+    ) {
+      throw new Error(`Embedding JSON response item ${index} contains a non-finite number`);
+    }
+    if (embedding.length === 0) {
+      throw new Error(`Embedding JSON response item ${index} has zero dimension`);
+    }
+    if (dimension === undefined) {
+      dimension = embedding.length;
+    } else if (embedding.length !== dimension) {
+      throw new Error(
+        `Embedding JSON response item ${index} has dimension ${embedding.length}, expected ${dimension}`
+      );
+    }
+    embeddings.push(embedding as number[]);
+  }
+  return embeddings;
+}
+
+interface SSEFrame {
+  event: string;
+  data: string;
+}
+
+async function* parseSSEFrames(
+  body: ReadableStream<Uint8Array>
+): AsyncGenerator<SSEFrame, void, void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let buffer = "";
+  let event = "";
+  let data: string[] = [];
+  let dataChars = 0;
+  let lineBytes = 0;
+  let complete = false;
+
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (!result.done && result.value.byteLength > MAX_GENERATION_SSE_LINE_BYTES) {
+        throw new Error(`Generation SSE chunk exceeded ${MAX_GENERATION_SSE_LINE_BYTES} bytes`);
+      }
+      if (!result.done) {
+        for (const byte of result.value) {
+          if (byte === 0x0a) {
+            lineBytes = 0;
+          } else {
+            lineBytes += 1;
+            if (lineBytes > MAX_GENERATION_SSE_LINE_BYTES) {
+              throw new Error(
+                `Generation SSE line exceeded ${MAX_GENERATION_SSE_LINE_BYTES} bytes`
+              );
+            }
+          }
+        }
+      }
+      try {
+        buffer += result.done ? decoder.decode() : decoder.decode(result.value, { stream: true });
+      } catch {
+        throw new Error("Generation stream contained invalid UTF-8");
+      }
+      if (result.done) buffer += "\n\n";
+
+      let newline = buffer.indexOf("\n");
+      while (newline !== -1) {
+        let line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+
+        if (line === "") {
+          if (data.length > 0) yield { event, data: data.join("\n") };
+          event = "";
+          data = [];
+          dataChars = 0;
+        } else if (!line.startsWith(":")) {
+          const colon = line.indexOf(":");
+          const field = colon === -1 ? line : line.slice(0, colon);
+          let value = colon === -1 ? "" : line.slice(colon + 1);
+          if (value.startsWith(" ")) value = value.slice(1);
+          if (field === "event") event = value;
+          if (field === "data") {
+            dataChars += (data.length > 0 ? 1 : 0) + value.length;
+            if (dataChars > MAX_GENERATION_SSE_EVENT_CHARS) {
+              throw new Error(
+                `Generation SSE event exceeded ${MAX_GENERATION_SSE_EVENT_CHARS} characters`
+              );
+            }
+            data.push(value);
+          }
+        }
+        newline = buffer.indexOf("\n");
+      }
+
+      if (buffer.length > MAX_GENERATION_SSE_EVENT_CHARS) {
+        throw new Error(
+          `Generation SSE line exceeded ${MAX_GENERATION_SSE_EVENT_CHARS} characters`
+        );
+      }
+      if (result.done) {
+        complete = true;
+        return;
+      }
+    }
+  } finally {
+    if (!complete) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Preserve the parse, consumer, or abort error that ended iteration.
+      }
+    }
+    reader.releaseLock();
   }
 }
 
@@ -473,7 +826,7 @@ function parseStructureField(field: string): [string, string] {
 }
 
 function normalizeBaseUrl(baseUrl: string): string {
-  const trimmed = baseUrl.trim().replace(/\/$/, "");
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
 
   if (trimmed === "" || trimmed === "/") {
     return "";

@@ -15,7 +15,8 @@ T = TypeVar("T", bound="InferenceGenerateBatchError")
 class InferenceGenerateBatchError:
     """
     Attributes:
-        code (str):
+        code (str): Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate media-budget
+            failures.
         message (str):
         retryable (bool | Unset):  Default: False.
     """

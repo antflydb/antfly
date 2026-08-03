@@ -43,20 +43,45 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 403:
+        response_403 = InferenceError.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
         return response_404
+
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
 
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
+    if response.status_code == 502:
+        response_502 = InferenceError.from_dict(response.json())
+
+        return response_502
+
     if response.status_code == 503:
         response_503 = InferenceError.from_dict(response.json())
 
         return response_503
+
+    if response.status_code == 507:
+        response_507 = InferenceError.from_dict(response.json())
+
+        return response_507
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -100,6 +125,19 @@ def sync_detailed(
 
     Uses OpenAI-compatible chat format with messages array containing role
     (system, user, assistant) and content. Set `stream: true` for streaming responses.
+
+    Downloaded and inline encoded media is limited cumulatively across the request
+    to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    download limit disables nonempty media. Remote URL byte potential is reserved before
+    fetch; inline sources reserve their actual encoded size without adding it to the
+    existing request-body reservation. Accepted image headers are then validated and
+    decoded source pixels are admitted at a conservative 16 bytes per pixel against
+    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+    limits each source edge. Malformed images return 400, while dimension or aggregate
+    excess returns 413 before model loading. Initial capacity admission occurs before
+    media fetch, so an overloaded server returns 503 without fetching content.
 
     Args:
         body (InferenceGenerateRequest):
@@ -149,6 +187,19 @@ def sync(
     Uses OpenAI-compatible chat format with messages array containing role
     (system, user, assistant) and content. Set `stream: true` for streaming responses.
 
+    Downloaded and inline encoded media is limited cumulatively across the request
+    to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    download limit disables nonempty media. Remote URL byte potential is reserved before
+    fetch; inline sources reserve their actual encoded size without adding it to the
+    existing request-body reservation. Accepted image headers are then validated and
+    decoded source pixels are admitted at a conservative 16 bytes per pixel against
+    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+    limits each source edge. Malformed images return 400, while dimension or aggregate
+    excess returns 413 before model loading. Initial capacity admission occurs before
+    media fetch, so an overloaded server returns 503 without fetching content.
+
     Args:
         body (InferenceGenerateRequest):
 
@@ -191,6 +242,19 @@ async def asyncio_detailed(
 
     Uses OpenAI-compatible chat format with messages array containing role
     (system, user, assistant) and content. Set `stream: true` for streaming responses.
+
+    Downloaded and inline encoded media is limited cumulatively across the request
+    to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    download limit disables nonempty media. Remote URL byte potential is reserved before
+    fetch; inline sources reserve their actual encoded size without adding it to the
+    existing request-body reservation. Accepted image headers are then validated and
+    decoded source pixels are admitted at a conservative 16 bytes per pixel against
+    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+    limits each source edge. Malformed images return 400, while dimension or aggregate
+    excess returns 413 before model loading. Initial capacity admission occurs before
+    media fetch, so an overloaded server returns 503 without fetching content.
 
     Args:
         body (InferenceGenerateRequest):
@@ -237,6 +301,19 @@ async def asyncio(
 
     Uses OpenAI-compatible chat format with messages array containing role
     (system, user, assistant) and content. Set `stream: true` for streaming responses.
+
+    Downloaded and inline encoded media is limited cumulatively across the request
+    to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    download limit disables nonempty media. Remote URL byte potential is reserved before
+    fetch; inline sources reserve their actual encoded size without adding it to the
+    existing request-body reservation. Accepted image headers are then validated and
+    decoded source pixels are admitted at a conservative 16 bytes per pixel against
+    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+    limits each source edge. Malformed images return 400, while dimension or aggregate
+    excess returns 413 before model loading. Initial capacity admission occurs before
+    media fetch, so an overloaded server returns 503 without fetching content.
 
     Args:
         body (InferenceGenerateRequest):

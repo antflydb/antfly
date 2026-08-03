@@ -61,6 +61,13 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const host = b.graph.host.result;
+    return target.result.os.tag == host.os.tag and
+        target.result.cpu.arch == host.cpu.arch and
+        target.result.abi == host.abi;
+}
+
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
     const sdk_root = b.sysroot orelse
@@ -266,25 +273,553 @@ pub fn build(b: *std.Build) void {
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
     const exe = runtime_build.addStandaloneExecutable(b, runtime_graph, target, optimize, "", link_libc);
+    const install_exe = b.addInstallArtifact(exe, .{
+        .dest_sub_path = "antfly-inference",
+    });
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_exe = b.addRunArtifact(exe);
-    run_exe.step.dependOn(b.getInstallStep());
+    run_exe.step.dependOn(&install_exe.step);
     if (b.args) |args| {
         run_exe.addArgs(args);
     }
     const run_step = b.step("run", "Run the Antfly inference server");
     run_step.dependOn(&run_exe.step);
 
+    const kernel_jit_package_exe = b.addExecutable(.{
+        .name = "antfly-kernel-jit-package",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kernel_jit_package_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    kernel_jit_package_exe.root_module.link_libc = true;
+    const install_kernel_jit_package = b.addInstallArtifact(kernel_jit_package_exe, .{});
+    b.getInstallStep().dependOn(&install_kernel_jit_package.step);
+    const kernel_jit_package_runner = if (targetRunsOnBuildHost(b, target))
+        kernel_jit_package_exe
+    else blk: {
+        const host_exe = b.addExecutable(.{
+            .name = "antfly-kernel-jit-package-host",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/kernel_jit_package_main.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        host_exe.root_module.link_libc = true;
+        break :blk host_exe;
+    };
+    const run_kernel_jit_package = b.addRunArtifact(kernel_jit_package_runner);
+    if (b.args) |args| run_kernel_jit_package.addArgs(args);
+    const kernel_jit_package_step = b.step(
+        "kernel-jit-package",
+        "Export, verify, or import exact-match JIT qualification packages",
+    );
+    kernel_jit_package_step.dependOn(&kernel_jit_package_exe.step);
+    kernel_jit_package_step.dependOn(&run_kernel_jit_package.step);
+
+    const quant_kernel_codegen_exe = b.addExecutable(.{
+        .name = "antfly-quant-kernel-codegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/quant_kernel_codegen_main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    quant_kernel_codegen_exe.root_module.addImport("build_options", build_options_mod);
+    quant_kernel_codegen_exe.root_module.link_libc = link_libc;
+    const quant_kernel_codegen_check = b.addRunArtifact(quant_kernel_codegen_exe);
+    if (b.args) |args| {
+        quant_kernel_codegen_check.addArgs(args);
+    } else {
+        quant_kernel_codegen_check.addArg("--check");
+    }
+    const quant_kernel_codegen_test_check = b.addRunArtifact(quant_kernel_codegen_exe);
+    quant_kernel_codegen_test_check.addArg("--check");
+    const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
+    quant_kernel_codegen_step.dependOn(&quant_kernel_codegen_check.step);
+
+    const metal_unavailable_message = "Metal quant kernel evidence targets require a macOS target with xcrun/Metal; no Metal runtime evidence was run.";
+    const quant_kernel_metal_check_step = b.step("quant-kernel-metal-check", "Compile generated and promoted Metal quant kernels");
+    var quant_kernel_metal_artifact_check_step: ?*std.Build.Step = null;
+    var quant_kernel_metal_unavailable_step: ?*std.Build.Step = null;
+    if (target.result.os.tag == .macos) {
+        const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);
+        quant_kernel_metal_artifact_check.addArg("--check-metal");
+        quant_kernel_metal_artifact_check.step.dependOn(&quant_kernel_codegen_test_check.step);
+        quant_kernel_metal_artifact_check_step = &quant_kernel_metal_artifact_check.step;
+        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_artifact_check.step);
+    } else {
+        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);
+        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;
+        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);
+    }
+
+    const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    const metal_decode_gqa_split_routes_step = b.step("test-metal-decode-gqa-split-routes", "Run only the Metal split-GQA production-route tensor oracle");
+    const quant_kernel_metal_v2_conformance_step = b.step("quant-kernel-metal-v2-conformance", "Run rendered v2 Metal quant kernels against the CPU reference on device");
+    const quant_kernel_metal_sweep_step = b.step("quant-kernel-metal-sweep", "Sweep rendered Metal quant kernel schedule variants and report per-route winners");
+    const quant_kernel_metal_runtime_route_all_step = b.step("quant-kernel-metal-runtime-route-all", "Run dev-only generated Metal route-all evidence check");
+    const quant_kernel_metal_production_regression_step = b.step("quant-kernel-metal-production-regression-check", "Run promoted Metal quant kernel production regression gate");
+    const quant_kernel_metal_blocker_evidence_refresh_step = b.step("quant-kernel-metal-blocker-evidence-refresh", "Refresh local Metal promotion blocker evidence");
+    const quant_kernel_metal_blocker_evidence_step = b.step("quant-kernel-metal-blocker-evidence-check", "Check saved Metal promotion blocker evidence");
+    const quant_kernel_metal_blocker_strict_step = b.step("quant-kernel-metal-blocker-strict-check", "Fail if saved Metal blocker evidence clears and needs promotion review");
+    var quant_kernel_metal_production_regression_run_step: ?*std.Build.Step = null;
+    if (target.result.os.tag == .macos) {
+        const quant_kernel_metal_runtime_check_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-metal-runtime-check",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_metal_runtime_check.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, quant_kernel_metal_runtime_check_exe.root_module, target, true);
+        quant_kernel_metal_runtime_check_exe.root_module.link_libc = true;
+        const run_quant_kernel_metal_runtime_check = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        if (b.args) |args| {
+            run_quant_kernel_metal_runtime_check.addArgs(args);
+        }
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_quant_kernel_metal_runtime_check.step.dependOn(metal_artifact_check_step);
+        }
+        quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check.step);
+
+        const run_metal_decode_gqa_split_routes = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_metal_decode_gqa_split_routes.addArg("--split-gqa-only");
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_metal_decode_gqa_split_routes.step.dependOn(metal_artifact_check_step);
+        }
+        metal_decode_gqa_split_routes_step.dependOn(&run_metal_decode_gqa_split_routes.step);
+
+        const run_quant_kernel_metal_v2_conformance = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_kernel_metal_v2_conformance.addArg("--v2-conformance");
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_quant_kernel_metal_v2_conformance.step.dependOn(metal_artifact_check_step);
+        }
+        quant_kernel_metal_v2_conformance_step.dependOn(&run_quant_kernel_metal_v2_conformance.step);
+
+        const run_quant_kernel_metal_sweep = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_kernel_metal_sweep.addArg("--sweep");
+        if (b.args) |args| {
+            run_quant_kernel_metal_sweep.addArgs(args);
+        }
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_quant_kernel_metal_sweep.step.dependOn(metal_artifact_check_step);
+        }
+        quant_kernel_metal_sweep_step.dependOn(&run_quant_kernel_metal_sweep.step);
+
+        const run_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_kernel_metal_runtime_route_all.has_side_effects = true;
+        run_quant_kernel_metal_runtime_route_all.addArg("--evidence-out");
+        const route_all_evidence_name = b.fmt("antfly-quant-metal-runtime-route-all-evidence-{x}.json", .{b.graph.random_seed});
+        const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg(route_all_evidence_name);
+        run_quant_kernel_metal_runtime_route_all.addArg("--runtime-route-all");
+        const check_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        check_quant_kernel_metal_runtime_route_all.addArg("--check-evidence");
+        check_quant_kernel_metal_runtime_route_all.addFileArg(route_all_evidence);
+        check_quant_kernel_metal_runtime_route_all.addArg("--require-runtime-route-all");
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_quant_kernel_metal_runtime_route_all.step.dependOn(metal_artifact_check_step);
+            check_quant_kernel_metal_runtime_route_all.step.dependOn(metal_artifact_check_step);
+        }
+        check_quant_kernel_metal_runtime_route_all.step.dependOn(&run_quant_kernel_metal_runtime_route_all.step);
+        quant_kernel_metal_runtime_route_all_step.dependOn(&check_quant_kernel_metal_runtime_route_all.step);
+
+        const run_quant_kernel_metal_production_regression = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_kernel_metal_production_regression.has_side_effects = true;
+        run_quant_kernel_metal_production_regression.addArg("--evidence-out");
+        const production_regression_evidence_name = b.fmt("antfly-quant-metal-production-regression-evidence-{x}.json", .{b.graph.random_seed});
+        _ = run_quant_kernel_metal_production_regression.addOutputFileArg(production_regression_evidence_name);
+        run_quant_kernel_metal_production_regression.addArgs(&.{
+            "--repeat-runs",
+            "5",
+            "--measure-iters",
+            "500",
+            "--production-regression-check",
+        });
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_quant_kernel_metal_production_regression.step.dependOn(metal_artifact_check_step);
+        }
+        quant_kernel_metal_production_regression_run_step = &run_quant_kernel_metal_production_regression.step;
+        quant_kernel_metal_production_regression_step.dependOn(&run_quant_kernel_metal_production_regression.step);
+
+        const refresh_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        refresh_quant_kernel_metal_blocker_evidence.has_side_effects = true;
+        refresh_quant_kernel_metal_blocker_evidence.addArgs(&.{
+            "--refresh-blocker-evidence",
+            "--blocker-evidence-dir",
+        });
+        const blocker_evidence_dir_name = b.fmt("antfly-quant-metal-blocker-evidence-{x}", .{b.graph.random_seed});
+        const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg(blocker_evidence_dir_name);
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            refresh_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
+        }
+        refresh_quant_kernel_metal_blocker_evidence.step.dependOn(&check_quant_kernel_metal_runtime_route_all.step);
+        quant_kernel_metal_blocker_evidence_refresh_step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
+
+        const check_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        check_quant_kernel_metal_blocker_evidence.addArgs(&.{
+            "--check-blocker-evidence",
+            "--blocker-evidence-dir",
+        });
+        check_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            check_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
+        }
+        check_quant_kernel_metal_blocker_evidence.step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
+        quant_kernel_metal_blocker_evidence_step.dependOn(&check_quant_kernel_metal_blocker_evidence.step);
+
+        const strict_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        strict_quant_kernel_metal_blocker_evidence.addArgs(&.{
+            "--check-blocker-evidence",
+            "--confirm-cleared-blockers",
+            "--fail-on-cleared-blocker",
+            "--blocker-evidence-dir",
+        });
+        strict_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            strict_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
+        }
+        strict_quant_kernel_metal_blocker_evidence.step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
+        quant_kernel_metal_blocker_strict_step.dependOn(&strict_quant_kernel_metal_blocker_evidence.step);
+    } else {
+        const metal_unavailable_step = quant_kernel_metal_unavailable_step orelse unreachable;
+        quant_kernel_metal_runtime_check_step.dependOn(metal_unavailable_step);
+        metal_decode_gqa_split_routes_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_v2_conformance_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_sweep_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_runtime_route_all_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_production_regression_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_blocker_evidence_refresh_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_blocker_evidence_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_blocker_strict_step.dependOn(metal_unavailable_step);
+    }
+    const quant_kernel_metal_runtime_check_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/quant_kernel_metal_runtime_check.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"quant kernel metal runtime"},
+    });
+    const run_quant_kernel_metal_runtime_check_tests = b.addRunArtifact(quant_kernel_metal_runtime_check_tests);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        if (quant_kernel_metal_production_regression_run_step) |production_regression_step| {
+            production_regression_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+        }
+        quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+    }
+
+    const cuda_artifact_source_policy_check = b.addSystemCommand(&.{
+        "bash",
+        "scripts/regen-cuda-artifacts.sh",
+        "--check-source-policy",
+    });
+    const cuda_artifacts_freshness_check = b.addSystemCommand(&.{
+        "bash",
+        "scripts/regen-cuda-artifacts.sh",
+        "--check",
+        "--all",
+    });
+    const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
+    cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
+
+    const quant_kernel_cuda_attention_diff_step = b.step(
+        "quant-kernel-cuda-attention-diff",
+        "Run raw handwritten-vs-generated CUDA decode-attention differential checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const quant_kernel_cuda_attention_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-attention-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_attention_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_attention_diff_exe.root_module.link_libc = true;
+        const run_quant_kernel_cuda_attention_diff = b.addRunArtifact(quant_kernel_cuda_attention_diff_exe);
+        if (b.args) |args| run_quant_kernel_cuda_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        quant_kernel_cuda_attention_diff_step.dependOn(&run_quant_kernel_cuda_attention_diff.step);
+    } else {
+        const cuda_attention_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-attention-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_attention_diff_step.dependOn(&cuda_attention_diff_unavailable.step);
+    }
+
+    const quant_kernel_cuda_paged_attention_diff_step = b.step(
+        "quant-kernel-cuda-paged-attention-diff",
+        "Run raw production-vs-generated paged CUDA decode-attention differential checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const compile_score_prework_hd256 = b.addSystemCommand(&.{
+            "bash",
+            "scripts/compile-generated-cuda-candidate.sh",
+        });
+        compile_score_prework_hd256.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd256.cu"));
+        const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg("attention_decode_score_prework_hd256.sm89.cubin");
+
+        const compile_score_prework_hd512 = b.addSystemCommand(&.{
+            "bash",
+            "scripts/compile-generated-cuda-candidate.sh",
+        });
+        compile_score_prework_hd512.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd512.cu"));
+        const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg("attention_decode_score_prework_hd512.sm89.cubin");
+
+        const quant_kernel_cuda_paged_attention_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-paged-attention-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_attention_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.link_libc = true;
+        const quant_kernel_cuda_paged_attention_diff_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_attention_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.link_libc = true;
+        const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
+        const run_quant_kernel_cuda_paged_attention_diff = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_exe);
+        run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd256");
+        run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd256_cubin);
+        run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd512");
+        run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd512_cubin);
+        if (b.args) |args| run_quant_kernel_cuda_paged_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&run_quant_kernel_cuda_paged_attention_diff_tests.step);
+        quant_kernel_cuda_paged_attention_diff_step.dependOn(&run_quant_kernel_cuda_paged_attention_diff.step);
+    } else {
+        const cuda_paged_attention_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-paged-attention-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_paged_attention_diff_step.dependOn(&cuda_paged_attention_diff_unavailable.step);
+    }
+
+    const quant_kernel_cuda_paged_prefill_diff_step = b.step(
+        "quant-kernel-cuda-paged-prefill-diff",
+        "Run embedded CUDA paged-prefill attention differential and timing checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const quant_kernel_cuda_paged_prefill_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-paged-prefill-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_prefill_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_prefill_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_prefill_diff_exe.root_module.link_libc = true;
+        const quant_kernel_cuda_paged_prefill_diff_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_prefill_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_prefill_diff_tests.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_prefill_diff_tests.root_module.link_libc = true;
+        const run_quant_kernel_cuda_paged_prefill_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_tests);
+        const run_quant_kernel_cuda_paged_prefill_diff = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_exe);
+        if (b.args) |args| run_quant_kernel_cuda_paged_prefill_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifacts_freshness_check.step);
+        run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&run_quant_kernel_cuda_paged_prefill_diff_tests.step);
+        quant_kernel_cuda_paged_prefill_diff_step.dependOn(&run_quant_kernel_cuda_paged_prefill_diff.step);
+    } else {
+        const cuda_paged_prefill_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-paged-prefill-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_paged_prefill_diff_step.dependOn(&cuda_paged_prefill_diff_unavailable.step);
+    }
+
+    const quant_kernel_cuda_ffn_diff_step = b.step(
+        "quant-kernel-cuda-ffn-diff",
+        "Run raw handwritten-vs-generated CUDA exact F32 E2B FFN differential checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const quant_kernel_cuda_ffn_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-ffn-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_ffn_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_ffn_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_ffn_diff_exe.root_module.link_libc = true;
+        const run_quant_kernel_cuda_ffn_diff = b.addRunArtifact(quant_kernel_cuda_ffn_diff_exe);
+        if (b.args) |args| run_quant_kernel_cuda_ffn_diff.addArgs(args);
+        run_quant_kernel_cuda_ffn_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        quant_kernel_cuda_ffn_diff_step.dependOn(&run_quant_kernel_cuda_ffn_diff.step);
+    } else {
+        const cuda_ffn_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-ffn-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_ffn_diff_step.dependOn(&cuda_ffn_diff_unavailable.step);
+    }
+
+    const quant_kernel_local_check_step = b.step("quant-kernel-local-check", "Run local quant kernel compiler readiness checks");
+    const quant_kernel_metal_local_check_step = b.step("quant-kernel-metal-local-check", "Run local Metal quant kernel compiler readiness checks");
+    quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_check_step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+    }
+    quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_runtime_route_all_step);
+    quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_production_regression_step);
+    quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_blocker_evidence_step);
+    quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_blocker_strict_step);
+    quant_kernel_local_check_step.dependOn(&quant_kernel_codegen_test_check.step);
+    quant_kernel_local_check_step.dependOn(&cuda_artifact_source_policy_check.step);
+    if (enable_metal and target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(quant_kernel_metal_local_check_step);
+    }
+
+    const metal_gemma4_prefill_frame_script_self_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--self-test",
+    });
+    const metal_gemma4_prefill_frame_script_self_test_step = b.step(
+        "test-metal-gemma4-prefill-frame-script",
+        "Run the Metal Gemma4 prefill-frame smoke script self-test",
+    );
+    metal_gemma4_prefill_frame_script_self_test_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
+    }
+
+    const metal_quant_summary_check_self_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/check_metal_quant_summary.py",
+        "--self-test",
+    });
+    const metal_quant_summary_check_self_test_step = b.step(
+        "test-metal-quant-summary-check",
+        "Run the Metal quant summary checker self-test",
+    );
+    metal_quant_summary_check_self_test_step.dependOn(&metal_quant_summary_check_self_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
+    }
+
+    const metal_gemma4_bench_script_self_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/bench_metal_gemma4_e2b.sh",
+        "--self-test",
+    });
+    const metal_gemma4_bench_script_self_test_step = b.step(
+        "test-metal-gemma4-bench-script",
+        "Run the Metal Gemma4 bench script self-test",
+    );
+    metal_gemma4_bench_script_self_test_step.dependOn(&metal_gemma4_bench_script_self_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_bench_script_self_test.step);
+    }
+
     const metal_gemma4_prefill_frame_test = b.addSystemCommand(&.{
         "bash",
         "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--antfly-bin",
     });
-    metal_gemma4_prefill_frame_test.step.dependOn(b.getInstallStep());
+    metal_gemma4_prefill_frame_test.addFileArg(exe.getEmittedBin());
     const metal_gemma4_prefill_frame_test_step = b.step(
         "test-metal-gemma4-prefill-frame",
-        "Run the local Metal Gemma4 prefill-frame no-fallback/stage-sync smoke test",
+        "Run the local Metal Gemma4 handwritten/generated stage-sync parity smoke test",
     );
     metal_gemma4_prefill_frame_test_step.dependOn(&metal_gemma4_prefill_frame_test.step);
+
+    const metal_gemma4_prefill_frame_generated_q8_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--antfly-bin",
+    });
+    metal_gemma4_prefill_frame_generated_q8_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_generated_q8_test.addArg(
+        "--generated-q8-smoke",
+    );
+    const metal_gemma4_prefill_frame_generated_q8_test_step = b.step(
+        "test-metal-gemma4-prefill-frame-generated-q8",
+        "Run the local Metal Gemma4 generated-Q8_0 parity smoke against handwritten",
+    );
+    metal_gemma4_prefill_frame_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_generated_q8_test.step);
+
+    const metal_gemma4_prefill_frame_e4b_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--antfly-bin",
+    });
+    metal_gemma4_prefill_frame_e4b_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_e4b_test.addArg(
+        "--e4b-smoke",
+    );
+    const metal_gemma4_prefill_frame_e4b_test_step = b.step(
+        "test-metal-gemma4-prefill-frame-e4b",
+        "Run the local Metal Gemma4 E4B handwritten/generated stage-sync parity smoke",
+    );
+    metal_gemma4_prefill_frame_e4b_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_test.step);
+
+    const metal_gemma4_prefill_frame_e4b_generated_q8_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--e4b-smoke",
+        "--generated-q8-smoke",
+        "--antfly-bin",
+    });
+    metal_gemma4_prefill_frame_e4b_generated_q8_test.addFileArg(exe.getEmittedBin());
+    const metal_gemma4_prefill_frame_e4b_generated_q8_test_step = b.step(
+        "test-metal-gemma4-prefill-frame-e4b-generated-q8",
+        "Run the local Metal Gemma4 E4B generated-Q8_0 parity smoke against handwritten",
+    );
+    metal_gemma4_prefill_frame_e4b_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_test.step);
+
+    const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q4_0_SMALL_BATCH=1",
+        "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_FAMILY_COUNT=2",
+        "ANTFLY_INFERENCE_GEMMA4_EXPECTED_GENERATED_TOP_FAMILY=q4_0",
+        "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT=1",
+        "bash",
+        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--e4b-smoke",
+        "--generated-q8-smoke",
+        "--antfly-bin",
+    });
+    metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.addFileArg(exe.getEmittedBin());
+    const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step = b.step(
+        "test-metal-gemma4-prefill-frame-e4b-generated-q8-q4-0",
+        "Run the local Metal Gemma4 E4B generated-Q8_0/Q4_0 parity smoke against handwritten",
+    );
+    metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
+
+    const quant_kernel_metal_model_local_check_step = b.step(
+        "quant-kernel-metal-model-local-check",
+        "Run local model-level Metal quant kernel smoke checks",
+    );
+    quant_kernel_metal_model_local_check_step.dependOn(quant_kernel_metal_local_check_step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
+    }
+
+    const quant_kernel_metal_industry_local_check_step = b.step(
+        "quant-kernel-metal-industry-local-check",
+        "Run local Metal quant kernel readiness checks plus model smoke checks",
+    );
+    quant_kernel_metal_industry_local_check_step.dependOn(quant_kernel_metal_local_check_step);
+    quant_kernel_metal_industry_local_check_step.dependOn(quant_kernel_metal_model_local_check_step);
 
     const metal_gemma4_prefill_block_parity_test = b.addSystemCommand(&.{
         "bash",
@@ -296,6 +831,47 @@ pub fn build(b: *std.Build) void {
         "Run the local Metal Gemma4 staged-vs-full-prefill-block parity diagnostic",
     );
     metal_gemma4_prefill_block_parity_test_step.dependOn(&metal_gemma4_prefill_block_parity_test.step);
+
+    const metal_gemma4_mtp_long_context_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_mtp_long_context.sh",
+    });
+    metal_gemma4_mtp_long_context_test.step.dependOn(b.getInstallStep());
+    const metal_gemma4_mtp_long_context_test_step = b.step(
+        "test-metal-gemma4-mtp-long-context",
+        "Run the 2,003-token Metal Gemma4 target/MTP exact-token regression gate",
+    );
+    metal_gemma4_mtp_long_context_test_step.dependOn(&metal_gemma4_mtp_long_context_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_mtp_long_context_test.step);
+    }
+
+    const metal_gemma4_long_output_benchmark_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_benchmark_metal_gemma4_long_output.py",
+    });
+    const metal_gemma4_long_output_benchmark_contract_test_step = b.step(
+        "test-metal-gemma4-long-output-benchmark",
+        "Test the paired Gemma4 2K-prompt/300-output benchmark contract",
+    );
+    metal_gemma4_long_output_benchmark_contract_test_step.dependOn(&metal_gemma4_long_output_benchmark_contract_test.step);
+
+    const metal_gemma4_ab_benchmark_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_benchmark_metal_gemma4_ab.py",
+    });
+    const metal_gemma4_ab_benchmark_contract_test_step = b.step(
+        "test-metal-gemma4-ab-benchmark",
+        "Test the fail-closed Gemma4 Metal baseline/candidate benchmark contract",
+    );
+    metal_gemma4_ab_benchmark_contract_test_step.dependOn(&metal_gemma4_ab_benchmark_contract_test.step);
+
+    const metal_gemma4_benchmark_contracts_test_step = b.step(
+        "test-metal-gemma4-benchmark-contracts",
+        "Test the Gemma4 Metal comparator and baseline/candidate benchmark contracts",
+    );
+    metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_long_output_benchmark_contract_test_step);
+    metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
 
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
@@ -370,7 +946,9 @@ pub fn build(b: *std.Build) void {
     });
     metal_bench_exe.root_module.addImport("build_options", build_options_mod);
     metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, metal_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the native backend links. Configuring
+    // Metal again here compiles metal_kernels.m twice into this executable.
+    metal_bench_exe.root_module.link_libc = true;
     const run_metal_bench = b.addRunArtifact(metal_bench_exe);
     if (b.args) |args| {
         run_metal_bench.addArgs(args);
@@ -380,6 +958,154 @@ pub fn build(b: *std.Build) void {
         "Run the focused Metal kernel benchmark; pass --mode and shape filters after --",
     );
     metal_bench_step.dependOn(&run_metal_bench.step);
+
+    const q4_mm_aligned_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_aligned_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2560", "--out", "4096", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned", "--expect-output-hash", "cdaed85c5db03f09" });
+    const q4_mm_aligned_tail_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_aligned_tail_route_check.addArgs(&.{ "--mode", "linear", "--rows", "31", "--in", "2560", "--out", "512", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail", "--expect-output-hash", "eb66cbc058bfed68" });
+    q4_mm_aligned_tail_route_check.step.dependOn(&q4_mm_aligned_route_check.step);
+    const q4_mm_ragged_tail_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_ragged_tail_route_check.addArgs(&.{ "--mode", "linear", "--rows", "2003", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail", "--expect-output-hash", "96347637560a304a" });
+    q4_mm_ragged_tail_route_check.step.dependOn(&q4_mm_aligned_tail_route_check.step);
+    const q4_mm_ragged_tail_down_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_ragged_tail_down_route_check.addArgs(&.{ "--mode", "linear", "--rows", "2003", "--in", "10240", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail", "--expect-output-hash", "56067182fae278a" });
+    q4_mm_ragged_tail_down_route_check.step.dependOn(&q4_mm_ragged_tail_route_check.step);
+    const q4_mm_unrolled_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_unrolled_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2048", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-route", "unrolled", "--expect-output-hash", "cb1571d002d961f3" });
+    q4_mm_unrolled_route_check.step.dependOn(&q4_mm_ragged_tail_down_route_check.step);
+    const q4_mm_route_check_step = b.step(
+        "test-metal-q4-0-mm-routes",
+        "Run on-device assertions for aligned, ragged-tail, and unrolled Q4_0 MM routes",
+    );
+    q4_mm_route_check_step.dependOn(&q4_mm_unrolled_route_check.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&q4_mm_unrolled_route_check.step);
+    }
+
+    const q4_mmv_nr4_nsg2_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr4_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr4-nsg2");
+    q4_mmv_nr4_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr4_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr4_nsg2_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr4-nsg2", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    const q4_mmv_nr8_nsg2_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr8_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr8-nsg2");
+    q4_mmv_nr8_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr8_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr8_nsg2_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg2", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_nr8_nsg2_route_check.step.dependOn(&q4_mmv_nr4_nsg2_route_check.step);
+    const q4_mmv_nr4_nsg4_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr4_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr4-nsg4");
+    q4_mmv_nr4_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr4_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr4_nsg4_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr4-nsg4", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_nr4_nsg4_route_check.step.dependOn(&q4_mmv_nr8_nsg2_route_check.step);
+    const q4_mmv_nr8_nsg4_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr8_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr8-nsg4");
+    q4_mmv_nr8_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr8_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr8_nsg4_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg4", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_nr8_nsg4_route_check.step.dependOn(&q4_mmv_nr4_nsg4_route_check.step);
+    const q4_mmv_auto_gate_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_auto_gate_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "auto");
+    q4_mmv_auto_gate_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_auto_gate_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_auto_gate_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-auto", "--expect-output-hash", "b4826b6e363a4695" });
+    q4_mmv_auto_gate_route_check.step.dependOn(&q4_mmv_nr8_nsg4_route_check.step);
+    const q4_mmv_auto_down_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_auto_down_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "auto");
+    q4_mmv_auto_down_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_auto_down_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_auto_down_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "10240", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-auto", "--expect-output-hash", "2b8a37cc63efcfec" });
+    q4_mmv_auto_down_route_check.step.dependOn(&q4_mmv_auto_gate_route_check.step);
+    const q4_mmv_kill_switch_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_kill_switch_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr8-nsg4");
+    q4_mmv_kill_switch_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "1");
+    q4_mmv_kill_switch_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_kill_switch_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr4-nsg2", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_kill_switch_route_check.step.dependOn(&q4_mmv_auto_down_route_check.step);
+    const q4_mmv_fallback_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_fallback_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr4-nsg4");
+    q4_mmv_fallback_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_fallback_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "1");
+    q4_mmv_fallback_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg2", "--expect-q4-mmv-fallbacks", "1", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_fallback_route_check.step.dependOn(&q4_mmv_kill_switch_route_check.step);
+    const q4_mmv_ffn_workload_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_ffn_workload_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "auto");
+    q4_mmv_ffn_workload_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_FFN_GATE_UP_VARIANT", "nr8-nsg4");
+    q4_mmv_ffn_workload_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_FFN_DOWN_VARIANT", "nr8-nsg4");
+    q4_mmv_ffn_workload_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_ffn_workload_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_ffn_workload_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_mmv_ffn_workload_route_check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg4", "--expect-output-hash", "e48cf991af265cc9" });
+    q4_mmv_ffn_workload_route_check.step.dependOn(&q4_mmv_fallback_route_check.step);
+    const q4_mmv_route_check_step = b.step(
+        "test-metal-q4-0-mmv-routes",
+        "Run on-device assertions for the Q4_0 row-one MMV portfolio, workload policy, kill switch, and fallback",
+    );
+    q4_mmv_route_check_step.dependOn(&q4_mmv_ffn_workload_route_check.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&q4_mmv_ffn_workload_route_check.step);
+    }
+
+    const q4_pair_mmv_variants = [_]struct { name: []const u8, hash: []const u8 }{
+        .{ .name = "nr4-nsg2", .hash = "1b8993f8509b5da" },
+        .{ .name = "nr8-nsg2", .hash = "1b8993f8509b5da" },
+        .{ .name = "nr4-nsg4", .hash = "1b8993f8509b5da" },
+        .{ .name = "nr8-nsg4", .hash = "1b8993f8509b5da" },
+    };
+    var q4_pair_route_tail: *std.Build.Step = undefined;
+    for (q4_pair_mmv_variants, 0..) |variant, variant_index| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "0");
+        check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT", variant.name);
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-pair-mmv-variant", variant.name, "--expect-output-hash", variant.hash });
+        if (variant_index != 0) check.step.dependOn(q4_pair_route_tail);
+        q4_pair_route_tail = &check.step;
+    }
+    const q4_pair_mmv_auto_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_pair_mmv_auto_route_check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_pair_mmv_auto_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "0");
+    q4_pair_mmv_auto_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT", "auto");
+    q4_pair_mmv_auto_route_check.addArg("--skip-unless-apple-m4");
+    q4_pair_mmv_auto_route_check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-pair-mmv-variant", "nr4-nsg2", "--expect-output-hash", "1b8993f8509b5da" });
+    q4_pair_mmv_auto_route_check.step.dependOn(q4_pair_route_tail);
+
+    const q4_pair_mmv_kill_switch_check = b.addRunArtifact(metal_bench_exe);
+    q4_pair_mmv_kill_switch_check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_pair_mmv_kill_switch_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_pair_mmv_kill_switch_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT", "nr8-nsg2");
+    q4_pair_mmv_kill_switch_check.addArg("--skip-unless-apple-m4");
+    q4_pair_mmv_kill_switch_check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-output-hash", "e48cf991af265cc9" });
+    q4_pair_mmv_kill_switch_check.step.dependOn(&q4_pair_mmv_auto_route_check.step);
+
+    const q4_pair_mm_cases = [_]struct { variant: []const u8, rows: []const u8, route: []const u8, hash: []const u8 }{
+        .{ .variant = "m32-n64", .rows = "32", .route = "m32-n64-aligned", .hash = "e1941e94e89fba88" },
+        .{ .variant = "m32-n32", .rows = "32", .route = "m32-n32-aligned", .hash = "e1941e94e89fba88" },
+        .{ .variant = "m32-n64", .rows = "31", .route = "m32-n64-tail", .hash = "74bf31c81f60ad14" },
+        .{ .variant = "m32-n32", .rows = "31", .route = "m32-n32-tail", .hash = "74bf31c81f60ad14" },
+        .{ .variant = "m32-n64", .rows = "2003", .route = "m32-n64-tail", .hash = "34e1a1753b4c4dfe" },
+    };
+    q4_pair_route_tail = &q4_pair_mmv_kill_switch_check.step;
+    for (q4_pair_mm_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_MM", "0");
+        check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MM_VARIANT", case.variant);
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", case.rows, "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-pair-mm-route", case.route, "--expect-output-hash", case.hash });
+        check.step.dependOn(q4_pair_route_tail);
+        q4_pair_route_tail = &check.step;
+    }
+    const q4_pair_route_check_step = b.step(
+        "test-metal-q4-0-pair-activation-routes",
+        "Run exact-output Metal assertions for the M4-qualified Q4_0 pair activation portfolios",
+    );
+    q4_pair_route_check_step.dependOn(q4_pair_route_tail);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
+    }
 
     const run_finetune = b.addRunArtifact(exe);
     run_finetune.step.dependOn(b.getInstallStep());
@@ -502,7 +1228,8 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_bench_exe.root_module.addImport("antfly_platform", platform_mod);
     gliner2_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
     if (b.args) |args| {
@@ -529,7 +1256,8 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     if (b.args) |args| {
@@ -556,7 +1284,8 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
     if (b.args) |args| {
@@ -583,7 +1312,8 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
     if (b.args) |args| {
@@ -591,6 +1321,34 @@ pub fn build(b: *std.Build) void {
     }
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
+
+    const bge_m3_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-bge-m3-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/bge_m3_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    bge_m3_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    bge_m3_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    configureOnnxRuntime(b, bge_m3_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_bge_m3_e2e_bench = b.addRunArtifact(bge_m3_e2e_bench_exe);
+    if (b.args) |args| {
+        run_bge_m3_e2e_bench.addArgs(args);
+    }
+    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run pretokenized BGE-M3 encoder E2E benchmarks");
+    bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
     const reranker_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-reranker-e2e-bench",
@@ -610,7 +1368,8 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
     if (b.args) |args| {
@@ -715,7 +1474,30 @@ pub fn build(b: *std.Build) void {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_tests, b.args orelse &.{});
+    const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
+    run_quant_kernel_compiler_tests.addArg("--test-filter");
+    run_quant_kernel_compiler_tests.addArg("quant kernel compiler");
+    if (targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
+        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
+    }
+    const run_quant_kernel_metal_renderer_tests = b.addRunArtifact(tests);
+    run_quant_kernel_metal_renderer_tests.addArg("--test-filter");
+    run_quant_kernel_metal_renderer_tests.addArg("metal renderer");
+    if (targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(&run_quant_kernel_metal_renderer_tests.step);
+        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_metal_renderer_tests.step);
+    }
+    const run_quant_kernel_cuda_microbench_tests = b.addRunArtifact(tests);
+    run_quant_kernel_cuda_microbench_tests.addArg("--test-filter");
+    run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
+    if (targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
+    }
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&quant_kernel_codegen_test_check.step);
+    test_step.dependOn(&cuda_artifact_source_policy_check.step);
+    test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",

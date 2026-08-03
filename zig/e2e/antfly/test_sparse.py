@@ -517,20 +517,21 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
         table_api.publish_table(table_name)
 
         query_url = f"{text_server.url}/alpha.txt"
+        query = {
+            "semantic_search": query_url,
+            "embedding_template": "{{remoteText url=this}}",
+            "indexes": [index_name],
+            "limit": 2,
+        }
         result = wait_until(
-            lambda: _retry_query_table(
-                table_api,
-                table_name,
-                {
-                    "semantic_search": query_url,
-                    "embedding_template": "{{remoteText url=this}}",
-                    "indexes": [index_name],
-                    "limit": 2,
-                },
-            ),
+            lambda: _retry_query_table(table_api, table_name, query),
             timeout_s=30.0,
             interval_s=0.5,
         )
+        if result is None:
+            # Surface the final HTTP response and server logs after transient
+            # retries instead of collapsing the failure to an opaque None.
+            result = table_api.query_table(table_name, query)
         assert result is not None
         assert _top_hit_ids(result)[0] == "doc:a"
     finally:

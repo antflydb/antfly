@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-  printf 'usage: %s [--check|--write] [--portable|--fatbin|--sm89|--all]\n' "$0"
+  printf 'usage: %s [--check|--write|--check-source-policy] [--portable|--fatbin|--sm89|--all]\n' "$0"
   printf 'Regenerates checked-in CUDA artifacts with the pinned CUDA 13.2 toolkit contract.\n'
 }
 
 mode="check"
 artifact_mode="all"
+source_policy_only="false"
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h)
@@ -16,6 +17,9 @@ while [ $# -gt 0 ]; do
       ;;
     --check)
       mode="check"
+      ;;
+    --check-source-policy)
+      source_policy_only="true"
       ;;
     --write)
       mode="write"
@@ -42,10 +46,98 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pkg_dir="$(cd "$script_dir/.." && pwd)"
+repo_dir="$(cd "$pkg_dir/../../.." && pwd)"
+artifact_src_dir="$pkg_dir/src/ops/cuda/artifacts"
+dev_generated_src_dir="$pkg_dir/src/ops/cuda/generated"
 src="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.cu"
 ptx_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.ptx"
 fatbin_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin"
 sm89_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin"
+
+check_source_policy() {
+  if [ ! -f "$src" ]; then
+    printf 'error: CUDA artifact source does not exist: %s\n' "$src" >&2
+    exit 1
+  fi
+
+  case "$src" in
+    "$artifact_src_dir"/*) ;;
+    *)
+      printf 'error: CUDA artifact source must live under %s\n' "$artifact_src_dir" >&2
+      printf 'found: %s\n' "$src" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$src" in
+    "$dev_generated_src_dir"/*)
+      printf 'error: standalone dev-generated CUDA files are not direct artifact inputs: %s\n' "$src" >&2
+      exit 1
+      ;;
+  esac
+
+  if grep -Eq '^[[:space:]]*#include[[:space:]]*[<"][^">]*generated/' "$src"; then
+    printf 'error: CUDA artifact source must not directly include standalone generated kernels\n' >&2
+    exit 1
+  fi
+
+  # Benchmark-qualified generated kernels live in the canonical section.
+  # Dev-only runtime-wired candidates are permitted only in the compiler-owned
+  # marker region; standalone generated files must never be copied wholesale.
+  if grep -Eq 'Dev-only generated .*candidate from graph/quant_kernel_compiler\.zig|^[[:space:]]*//[[:space:]]*production_enabled=false' "$src"; then
+    printf 'error: standalone dev-only source was copied into the CUDA artifact bundle; use the compiler-managed runtime region\n' >&2
+    exit 1
+  fi
+
+  local runtime_dev_begin='// quant-kernel-codegen:begin generated CUDA runtime-wired dev matmul candidates (do not edit; run: zig build quant-kernel-codegen -- --write)'
+  local runtime_dev_end='// quant-kernel-codegen:end generated CUDA runtime-wired dev matmul candidates'
+  local runtime_dev_begin_count runtime_dev_end_count runtime_dev_candidate_count
+  runtime_dev_begin_count=$(grep -Fxc "$runtime_dev_begin" "$src" || true)
+  runtime_dev_end_count=$(grep -Fxc "$runtime_dev_end" "$src" || true)
+  runtime_dev_candidate_count=$(grep -Fc '// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.' "$src" || true)
+  if [ "$runtime_dev_begin_count" -ne 1 ] || [ "$runtime_dev_end_count" -ne 1 ]; then
+    printf 'error: CUDA artifact source must contain one compiler-managed runtime-wired candidate region (found begin=%s end=%s)\n' \
+      "$runtime_dev_begin_count" "$runtime_dev_end_count" >&2
+    exit 1
+  fi
+
+  CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT="$runtime_dev_candidate_count"
+}
+
+check_source_policy
+if [ "$source_policy_only" = "true" ]; then
+  printf 'CUDA artifact source policy passes: %s (%s compiler-managed dev-only runtime-wired candidates included)\n' \
+    "$src" "$CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT"
+  exit 0
+fi
+
+# Artifact freshness is meaningful only after the compiler-owned source and
+# manifest regions are current. Fail before invoking nvcc so --check cannot
+# bless stale CUDA source and --write cannot publish artifacts from it. Source
+# regeneration remains a separate, explicit review step:
+#   zig build quant-kernel-codegen -- --write
+if [ -n "${ZIG_BIN:-}" ]; then
+  zig_bin="$ZIG_BIN"
+elif [ -n "${ANTFLY_ZIG:-}" ]; then
+  zig_bin="$ANTFLY_ZIG"
+elif [ -n "${ZIG:-}" ]; then
+  zig_bin="$ZIG"
+elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig" ]; then
+  zig_bin="$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig"
+elif command -v zig >/dev/null 2>&1; then
+  zig_bin="$(command -v zig)"
+else
+  zig_bin="zig"
+fi
+if [ ! -x "$zig_bin" ]; then
+  printf 'error: Zig compiler is not executable: %s\n' "$zig_bin" >&2
+  printf 'set ZIG_BIN, ANTFLY_ZIG, or ZIG to the pinned compiler path\n' >&2
+  exit 1
+fi
+(
+  cd "$pkg_dir"
+  "$zig_bin" build quant-kernel-codegen -- --check
+)
 
 cuda_home="${CUDA_HOME:-}"
 
@@ -95,10 +187,17 @@ required_symbols=(
   termite_copy_f32
   termite_copy_u8
   termite_f32_to_bf16
+  termite_f32_to_f16
+  termite_add_bias_relu_rows_f32
   termite_add_weighted_scalars_f32
   termite_linear_bf16_weight_f32_tiled
+  termite_linear_f16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
+  termite_embedding_lookup_f16_weight_f32
+  termite_embedding_lookup_i32_f16_weight_f32
   termite_attention_f32_block
+  termite_attention_f32_bert_prefill_s256_hd64_q16
+  termite_attention_f32_bert_prefill_s256_hd64_mma
   termite_cross_attention_f32
   termite_cross_attention_q1_f32
   termite_token_to_nchw_f32
@@ -110,6 +209,9 @@ required_symbols=(
   termite_florence_vision_tail_sources_f32
   termite_linear_q4_k_pair_bias_f32_tc_hmma
   termite_deberta_attention_f32
+  termite_deberta_attention_fused_f32
+  termite_deberta_attention_tc_f16_m16n32
+  termite_deberta_attention_tc_f16_m32n16
   termite_gliner_gather_concat_relu_f32
   termite_split_last_dim3_f32
   termite_rope_per_item_f32
@@ -120,12 +222,42 @@ required_symbols=(
   termite_gqa_attention_decode_scalars_fast_f32
   termite_gqa_attention_prefill_fast_f32
   termite_gqa_attention_decode_scalars_f32
+  antfly_gqa_attention_decode_scalars_hd256_f32_v1
+  antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1
+  antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_hd512_f32_v1
+  antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1
+  antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split2_hd256_f32_v1
+  antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1
+  antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split2_hd512_f32_v1
+  antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1
+  antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split4_hd256_f32_v1
+  antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1
+  antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split4_hd512_f32_v1
+  antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1
+  antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_serial_hd256_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd256_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_serial_hd512_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd512_f32_v1
+  antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1
+  antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1
+  antfly_gqa_attention_decode_splitk_online_sm89_hd256_swa512_f16_f32_v1
+  antfly_gqa_attention_decode_splitk_online_sm89_hd512_global_f16_f32_v1
   termite_kv_write_suffix_decode_scalars_f32
   termite_gqa_attention_decode_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_tiled_f32
   termite_gqa_attention_prefill_turboquant_mma_f32
   termite_gqa_attention_prefill_turboquant_mma_m32_f32
+  termite_gqa_attention_prefill_tiled_f16_exact_f32
+  termite_gqa_attention_prefill_tiled_f16_warp_f32
   termite_dequant_q4_0_bf16
   termite_linear_q6_k_q8_1_f32_tile8_e4b
   termite_gqa_attention_decode_turboquant_split_stage1_f32
@@ -165,6 +297,15 @@ required_symbols=(
   termite_linear_q8_0_bias_f32_tc_hmma
   termite_linear_q8_0_bias_gelu_f32_tc_hmma
   termite_linear_q8_0_bias_add_f32_tc_hmma
+  termite_linear_q4_0_f32_tc_hmma
+  termite_linear_q4_0_bias_f32_tc_hmma
+  termite_linear_q4_0_bias_gelu_f32_tc_hmma
+  termite_linear_q4_0_bias_add_f32_tc_hmma
+  termite_linear_q4_0_f32_tc_hmma_bf16
+  termite_linear_q4_0_bias_f32_tc_hmma_bf16
+  termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16
+  termite_linear_q4_0_bias_add_f32_tc_hmma_bf16
+  termite_activation_multiply_fused_gate_up_f32
   termite_rms_norm_add_weighted_embedding_i32_q6_k_f32
   termite_rms_norm_f32_bf16
   termite_rms_norm_add_f32_bf16
@@ -179,6 +320,18 @@ required_symbols=(
   termite_linear_q4_0_q8_1_f32_tile4_w8_rows4
   termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4
   termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows
+  antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1
+  antfly_q4_0_down_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_down_q8_1_e2b_12288_mmv_v1
+  antfly_quantize_f32_ggml_q8_1_rows_v1
+  antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1
+  antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1
+  antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1
+  antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1
+  antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1
   termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2
@@ -217,13 +370,18 @@ required_symbols=(
   termite_embedding_lookup_q6_k_f32
   termite_embedding_lookup_i32_q6_k_f32
   termite_embedding_add_weighted_i32_q6_k_f32
+  antfly_q4_0_mmv_f32_v1
+  antfly_q4_0_mm_f32_v1
+  antfly_q4_0_pair_mmv_f32_v1
+  antfly_q4_0_pair_activation_q8_1_mmv_v1
+  antfly_q4_0_down_q8_1_mmv_v1
 )
 
 check_required_symbols() {
   local file="$1"
   for symbol in "${required_symbols[@]}"; do
-    if ! grep -q "$symbol" "$file"; then
-      printf 'error: generated PTX is missing symbol %s\n' "$symbol" >&2
+    if ! grep -a -q "$symbol" "$file"; then
+      printf 'error: generated CUDA artifact is missing symbol %s\n' "$symbol" >&2
       exit 1
     fi
   done
@@ -279,6 +437,7 @@ build_fatbin() {
     printf 'error: generated fatbin is empty\n' >&2
     exit 1
   fi
+  check_required_symbols "$tmp_fatbin"
   if [ -n "$cuobjdump" ]; then
     dump="$("$cuobjdump" --dump-elf "$tmp_fatbin" 2>/dev/null || true)"
     for arch in sm_75 sm_80 sm_89 sm_90 sm_100 sm_110 sm_120; do
@@ -298,6 +457,7 @@ build_sm89() {
     printf 'error: generated sm89 cubin is empty\n' >&2
     exit 1
   fi
+  check_required_symbols "$tmp_sm89"
   if [ -n "$cuobjdump" ]; then
     dump="$("$cuobjdump" --dump-elf "$tmp_sm89" 2>/dev/null || true)"
     if ! grep -q "sm_89" <<<"$dump"; then

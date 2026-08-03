@@ -1,16 +1,46 @@
 """Tests for Antfly client."""
 
 import json
+from collections.abc import Iterator
 from unittest.mock import MagicMock, Mock, patch
 
+import httpx
 import pytest
 from httpx import Timeout
 
 from antfly import AntflyClient, AntflyException  # noqa: E402
 from antfly.client import normalize_base_url  # noqa: E402
+from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
+from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
+from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
 from antfly.client_generated.models.sort_profile import SortProfile  # noqa: E402
 from antfly.client_generated.models.transform_op_type import TransformOpType  # noqa: E402
 from antfly.client_generated.types import Unset  # noqa: E402
+
+
+class ChunkStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self.chunks
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def configure_response(mock_httpx: MagicMock, status_code: int, body: object) -> Mock:
+    response = Mock(status_code=status_code, reason_phrase="Bad Request" if status_code >= 400 else "OK")
+    response.iter_bytes.return_value = [json.dumps(body).encode()]
+    mock_httpx.stream.return_value.__enter__.return_value = response
+    return response
+
+
+def install_transport(client: AntflyClient, transport: httpx.MockTransport) -> None:
+    generated = client._client
+    headers = generated.get_httpx_client().headers
+    generated.set_httpx_client(httpx.Client(base_url="http://test", headers=headers, transport=transport))
 
 
 class TestAntflyClient:
@@ -25,6 +55,17 @@ class TestAntflyClient:
             "ADD_TO_SET": "$addToSet",
             "MAX": "$max",
         }
+
+    def test_generate_request_defaults_match_server_and_omit_speculative_k(self) -> None:
+        request = InferenceGenerateRequest(
+            model="target",
+            messages=[InferenceChatMessage(role=InferenceRole.USER, content="hello")],
+        ).to_dict()
+
+        assert request["temperature"] == 0
+        assert request["top_p"] == 0
+        assert request["top_k"] == 0
+        assert "speculative_k" not in request
 
     def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
         """SortProfile keeps stable fields typed and drops internal counters."""
@@ -81,6 +122,12 @@ class TestAntflyClient:
             == "https://platform.antfly.io/cloud/v1/instance"
         )
 
+    def test_response_limits_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="response byte limits must be positive"):
+            AntflyClient("http://localhost:8080", max_json_response_bytes=0)
+        with pytest.raises(ValueError, match="response byte limits must be positive"):
+            AntflyClient("http://localhost:8080", max_error_response_bytes=-1)
+
     @patch("antfly.client.AuthenticatedClient")
     def test_token_auth(self, mock_client: MagicMock) -> None:
         AntflyClient(base_url="https://platform.antfly.io/cloud/v1/instance", token="antflydb_test")
@@ -97,12 +144,8 @@ class TestAntflyClient:
         """Test listing tables."""
         client = AntflyClient(base_url="http://localhost:8080")
 
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = []
-
         mock_httpx = MagicMock()
-        mock_httpx.request.return_value = mock_response
+        configure_response(mock_httpx, 200, [])
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         # Re-create client so it picks up the mock
@@ -110,35 +153,26 @@ class TestAntflyClient:
         tables = client.list_tables()
 
         assert tables == []
-        mock_httpx.request.assert_called_once_with("GET", "/db/v1/tables")
+        mock_httpx.stream.assert_called_once_with("GET", "/db/v1/tables")
 
     @patch("antfly.client.Client")
     def test_create_table(self, mock_client_class: MagicMock) -> None:
         """Test creating a table."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"name": "test_table", "shards": {}, "indexes": {}}
-
         mock_httpx = MagicMock()
-        mock_httpx.request.return_value = mock_response
+        configure_response(mock_httpx, 200, {"name": "test_table", "shards": {}, "indexes": {}})
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080")
         result = client.create_table(name="test_table", num_shards=2)
 
         assert result["name"] == "test_table"
-        mock_httpx.request.assert_called_once_with("POST", "/db/v1/tables/test_table", json={"num_shards": 2})
+        mock_httpx.stream.assert_called_once_with("POST", "/db/v1/tables/test_table", json={"num_shards": 2})
 
     @patch("antfly.client.Client")
     def test_create_table_failure(self, mock_client_class: MagicMock) -> None:
         """Test handling of create table failure."""
-        mock_response = Mock()
-        mock_response.status_code = 400
-        mock_response.text = "bad request"
-        mock_response.json.return_value = {"error": "table already exists"}
-
         mock_httpx = MagicMock()
-        mock_httpx.request.return_value = mock_response
+        configure_response(mock_httpx, 400, {"error": "table already exists"})
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080")
@@ -151,9 +185,7 @@ class TestAntflyClient:
     @patch("antfly.client.Client")
     def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:
         """High-level query forwards order_by/search_after/profile and returns generated response model."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
+        response_body = {
             "responses": [
                 {
                     "took": 3,
@@ -173,7 +205,7 @@ class TestAntflyClient:
         }
 
         mock_httpx = MagicMock()
-        mock_httpx.request.return_value = mock_response
+        configure_response(mock_httpx, 200, response_body)
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080")
@@ -186,7 +218,7 @@ class TestAntflyClient:
             profile=False,
         )
 
-        mock_httpx.request.assert_called_once_with(
+        mock_httpx.stream.assert_called_once_with(
             "POST",
             "/db/v1/tables/docs/query",
             json={
@@ -249,7 +281,7 @@ class TestAntflyClient:
             client.batch(table="users", inserts={"user:1": {"bio": "x" * 128}})
 
         assert "exceeding max write request size 32" in str(exc_info.value)
-        mock_httpx.request.assert_not_called()
+        mock_httpx.stream.assert_not_called()
 
     @patch("antfly.client.Client")
     def test_batch_sends_exact_checked_bytes(self, mock_client_class: MagicMock) -> None:
@@ -257,20 +289,38 @@ class TestAntflyClient:
         expected_body = {"inserts": {"user:1": {"name": "Zoë"}}, "deletes": []}
         expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-        mock_response = Mock()
-        mock_response.status_code = 201
-        mock_response.json.return_value = {"inserted": 1}
-
         mock_httpx = MagicMock()
-        mock_httpx.request.return_value = mock_response
+        configure_response(mock_httpx, 201, {"inserted": 1})
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080", max_write_request_bytes=len(expected_content))
         client.batch(table="users", inserts={"user:1": {"name": "Zoë"}})
 
-        mock_httpx.request.assert_called_once_with(
+        mock_httpx.stream.assert_called_once_with(
             "POST",
             "/db/v1/tables/users/batch",
             content=expected_content,
             headers={"Content-Type": "application/json"},
         )
+
+    def test_request_reads_chunked_json_and_closes(self) -> None:
+        stream = ChunkStream([b'{"ok":', b"true}"])
+        client = AntflyClient("http://test", max_json_response_bytes=16)
+        install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, stream=stream)))
+
+        assert client._request("GET", "/db/v1/test") == {"ok": True}
+        assert stream.closed
+
+    @pytest.mark.parametrize("status_code,limit", [(200, 16), (500, 8)])
+    def test_request_rejects_oversized_chunked_response_and_closes(self, status_code: int, limit: int) -> None:
+        stream = ChunkStream([b'{"value":"', b"x" * 32, b'"}'])
+        client = AntflyClient(
+            "http://test",
+            max_json_response_bytes=limit if status_code == 200 else 64,
+            max_error_response_bytes=limit if status_code >= 400 else 64,
+        )
+        install_transport(client, httpx.MockTransport(lambda _: httpx.Response(status_code, stream=stream)))
+
+        with pytest.raises(AntflyException, match=f"exceeded {limit} bytes"):
+            client._request("GET", "/db/v1/test")
+        assert stream.closed

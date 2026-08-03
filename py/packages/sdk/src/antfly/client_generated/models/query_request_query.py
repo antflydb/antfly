@@ -6,43 +6,44 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="InferenceToolChoiceType1Function")
+T = TypeVar("T", bound="QueryRequestQuery")
 
 
 @_attrs_define
-class InferenceToolChoiceType1Function:
-    """
-    Attributes:
-        name (str): The name of the function to call
+class QueryRequestQuery:
+    """Canonical public query AST. Prefer this field for new clients.
+
+    Boolean clauses are normalized before planning:
+    - `bool.must` is scoring query input.
+    - `bool.filter` is non-scoring query input.
+    - `bool.must_not` is non-scoring exclusion query input.
+
+    Filter branches accept the same query variants as `filter_query` and
+    `exclusion_query`. Structured clauses use the native document-value
+    path; text clauses are resolved through the text index before scoring.
+
+        Example:
+            {'bool': {'must': [{'match': {'field': 'body', 'text': 'computer'}}], 'filter': [{'term': {'path': '/tenant',
+                'value': 'acme'}}], 'must_not': [{'exists': {'path': '/deleted_at'}}]}}
+
     """
 
-    name: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        name = self.name
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "name": name,
-            }
-        )
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        name = d.pop("name")
+        query_request_query = cls()
 
-        inference_tool_choice_type_1_function = cls(
-            name=name,
-        )
-
-        inference_tool_choice_type_1_function.additional_properties = d
-        return inference_tool_choice_type_1_function
+        query_request_query.additional_properties = d
+        return query_request_query
 
     @property
     def additional_keys(self) -> list[str]:

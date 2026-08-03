@@ -27,6 +27,7 @@ pub const CUgraphNode = ?*anyopaque;
 pub const CUevent = ?*anyopaque;
 pub const CUjit_option = c_uint;
 pub const CUstreamCaptureMode = c_uint;
+pub const CUstreamCaptureStatus = c_uint;
 pub const CUgraphExecUpdateResult = c_uint;
 pub const CUgraphInstantiateResult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
@@ -36,6 +37,10 @@ pub const CU_EVENT_DISABLE_TIMING: c_uint = 2;
 pub const CU_STREAM_CAPTURE_MODE_GLOBAL: CUstreamCaptureMode = 0;
 pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode = 1;
 pub const CU_STREAM_CAPTURE_MODE_RELAXED: CUstreamCaptureMode = 2;
+
+pub const CU_STREAM_CAPTURE_STATUS_NONE: CUstreamCaptureStatus = 0;
+pub const CU_STREAM_CAPTURE_STATUS_ACTIVE: CUstreamCaptureStatus = 1;
+pub const CU_STREAM_CAPTURE_STATUS_INVALIDATED: CUstreamCaptureStatus = 2;
 
 pub const CU_GRAPH_EXEC_UPDATE_SUCCESS: CUgraphExecUpdateResult = 0;
 pub const CU_GRAPH_EXEC_UPDATE_ERROR: CUgraphExecUpdateResult = 1;
@@ -104,6 +109,7 @@ pub const CudaDriver = struct {
         cuStreamCreate: *const fn (phStream: *CUstream, flags: c_uint) callconv(.c) CUresult,
         cuStreamBeginCapture: *const fn (hStream: CUstream, mode: CUstreamCaptureMode) callconv(.c) CUresult,
         cuStreamEndCapture: *const fn (hStream: CUstream, phGraph: *CUgraph) callconv(.c) CUresult,
+        cuStreamIsCapturing: ?*const fn (hStream: CUstream, captureStatus: *CUstreamCaptureStatus) callconv(.c) CUresult,
         cuStreamSynchronize: *const fn (hStream: CUstream) callconv(.c) CUresult,
         cuStreamWaitEvent: *const fn (hStream: CUstream, hEvent: CUevent, flags: c_uint) callconv(.c) CUresult,
         cuStreamDestroy: *const fn (hStream: CUstream) callconv(.c) CUresult,
@@ -164,6 +170,7 @@ pub const CudaDriver = struct {
                 .cuStreamCreate = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamCreate), "cuStreamCreate") catch return error.CudaSymbolMissing,
                 .cuStreamBeginCapture = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamBeginCapture), "cuStreamBeginCapture_v2") catch return error.CudaSymbolMissing,
                 .cuStreamEndCapture = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamEndCapture), "cuStreamEndCapture") catch return error.CudaSymbolMissing,
+                .cuStreamIsCapturing = lookupOptional(&lib, *const fn (hStream: CUstream, captureStatus: *CUstreamCaptureStatus) callconv(.c) CUresult, "cuStreamIsCapturing"),
                 .cuStreamSynchronize = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamSynchronize), "cuStreamSynchronize") catch return error.CudaSymbolMissing,
                 .cuStreamWaitEvent = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamWaitEvent), "cuStreamWaitEvent") catch return error.CudaSymbolMissing,
                 .cuStreamDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamDestroy), "cuStreamDestroy") catch return error.CudaSymbolMissing,

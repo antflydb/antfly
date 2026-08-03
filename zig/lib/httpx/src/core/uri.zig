@@ -91,11 +91,11 @@ pub const Uri = struct {
     pub fn effectivePort(self: Self) u16 {
         if (self.port) |p| return p;
         if (self.scheme) |s| {
-            if (mem.eql(u8, s, "https")) return 443;
-            if (mem.eql(u8, s, "http")) return 80;
-            if (mem.eql(u8, s, "ws")) return 80;
-            if (mem.eql(u8, s, "wss")) return 443;
-            if (mem.eql(u8, s, "ftp")) return 21;
+            if (std.ascii.eqlIgnoreCase(s, "https")) return 443;
+            if (std.ascii.eqlIgnoreCase(s, "http")) return 80;
+            if (std.ascii.eqlIgnoreCase(s, "ws")) return 80;
+            if (std.ascii.eqlIgnoreCase(s, "wss")) return 443;
+            if (std.ascii.eqlIgnoreCase(s, "ftp")) return 21;
         }
         return 80;
     }
@@ -103,7 +103,7 @@ pub const Uri = struct {
     /// Returns true if the scheme requires TLS.
     pub fn isTls(self: Self) bool {
         if (self.scheme) |s| {
-            return mem.eql(u8, s, "https") or mem.eql(u8, s, "wss");
+            return std.ascii.eqlIgnoreCase(s, "https") or std.ascii.eqlIgnoreCase(s, "wss");
         }
         return false;
     }
@@ -111,7 +111,7 @@ pub const Uri = struct {
     /// Returns true if this is a WebSocket URI.
     pub fn isWebSocket(self: Self) bool {
         if (self.scheme) |s| {
-            return mem.eql(u8, s, "ws") or mem.eql(u8, s, "wss");
+            return std.ascii.eqlIgnoreCase(s, "ws") or std.ascii.eqlIgnoreCase(s, "wss");
         }
         return false;
     }
@@ -187,6 +187,20 @@ test "URI effective port" {
 
     const http = try Uri.parse("http://example.com/");
     try std.testing.expectEqual(@as(u16, 80), http.effectivePort());
+}
+
+test "URI schemes are case insensitive" {
+    const https = try Uri.parse("HTTPS://example.com/path");
+    try std.testing.expect(https.isTls());
+    try std.testing.expectEqual(@as(u16, 443), https.effectivePort());
+
+    const wss = try Uri.parse("WSS://example.com/socket");
+    try std.testing.expect(wss.isTls());
+    try std.testing.expect(wss.isWebSocket());
+    try std.testing.expectEqual(@as(u16, 443), wss.effectivePort());
+
+    const ftp = try Uri.parse("FTP://example.com/file");
+    try std.testing.expectEqual(@as(u16, 21), ftp.effectivePort());
 }
 
 test "URI TLS detection" {

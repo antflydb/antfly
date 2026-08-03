@@ -53,6 +53,7 @@ const generation = @import("../pipelines/generation.zig");
 const ChatTemplate = generation.ChatTemplate;
 const session_factory = @import("../architectures/session_factory.zig");
 const graph_mod = @import("../graph/root.zig");
+const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const runtime = @import("../runtime/root.zig");
 const onnx_graph = @import("onnx_graph");
 const ml = @import("ml");
@@ -786,6 +787,7 @@ fn componentPlanKey(
     updateComponentPlanKeySlice(&hash, model_dir);
     hash.update(&.{
         @intFromEnum(man.model_type),
+        @intFromEnum(man.model_type_origin),
         @intFromEnum(man.native_arch_hint),
         @intFromEnum(contract),
         @intFromBool(policy.allow_unknown),
@@ -1519,17 +1521,30 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     const view = gguf_metadata.View.init(&parsed);
     const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
 
-    const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
-        .byte_level
-    else if (std.mem.eql(u8, model_name, "gemma4"))
-        .gemma4
-    else
-        return error.NoTokenizerFound;
-
-    const tokenizer_bytes = try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
+    const tokenizer_bytes = if (std.mem.eql(u8, model_name, "t5"))
+        try unigramTokenizerJsonFromGguf(allocator, &parsed)
+    else blk: {
+        const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
+            .byte_level
+        else if (std.mem.eql(u8, model_name, "gemma4"))
+            .gemma4
+        else
+            return error.NoTokenizerFound;
+        break :blk try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
+    };
     defer allocator.free(tokenizer_bytes);
 
-    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytesAllowDuplicateFields(allocator, tokenizer_bytes);
+    errdefer tok.deinitSelf();
+    const tokens = try getRequiredMetadataArray(&parsed, "tokenizer.ggml.tokens", .string);
+    for (tokens.values, 0..) |token_value, index| {
+        const token = switch (token_value) {
+            .string => |value| value,
+            else => return error.InvalidTokenizerMetadata,
+        };
+        const id = std.math.cast(i32, index) orelse return error.InvalidTokenizerMetadata;
+        try tok.addTokenIdAliasForDecode(token, id);
+    }
     tok.applySpecialTokenIds(
         metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
         metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
@@ -1543,6 +1558,56 @@ const GgufBpeTokenizerFlavor = enum {
     byte_level,
     gemma4,
 };
+
+fn unigramTokenizerJsonFromGguf(
+    allocator: std.mem.Allocator,
+    parsed: *const gguf_format.File,
+) ![]u8 {
+    const tokens = try getRequiredMetadataArray(parsed, "tokenizer.ggml.tokens", .string);
+    const scores = try getRequiredMetadataArray(parsed, "tokenizer.ggml.scores", null);
+    const token_types = try getRequiredMetadataArray(parsed, "tokenizer.ggml.token_type", null);
+    if (tokens.values.len != scores.values.len or tokens.values.len != token_types.values.len) {
+        return error.InvalidTokenizerMetadata;
+    }
+    const unknown_id = metadataTokenId(parsed, "tokenizer.ggml.unknown_token_id") orelse
+        return error.InvalidTokenizerMetadata;
+    const add_space_prefix = gguf_metadata.View.init(parsed).getBool("tokenizer.ggml.add_space_prefix") orelse true;
+
+    var tokenizer_json = std.ArrayListUnmanaged(u8).empty;
+    defer tokenizer_json.deinit(allocator);
+    try tokenizer_json.appendSlice(allocator, "{\"model\":{\"type\":\"Unigram\",\"unk_id\":");
+    var unknown_id_buf: [32]u8 = undefined;
+    try tokenizer_json.appendSlice(allocator, try std.fmt.bufPrint(&unknown_id_buf, "{d}", .{unknown_id}));
+    try tokenizer_json.appendSlice(allocator, ",\"vocab\":[");
+    for (tokens.values, scores.values, 0..) |token_value, score_value, index| {
+        const token = switch (token_value) {
+            .string => |value| value,
+            else => return error.InvalidTokenizerMetadata,
+        };
+        const score = switch (score_value) {
+            .f32 => |value| value,
+            .f64 => |value| @as(f32, @floatCast(value)),
+            else => return error.InvalidTokenizerMetadata,
+        };
+        if (index > 0) try tokenizer_json.append(allocator, ',');
+        try tokenizer_json.append(allocator, '[');
+        try appendJsonString(&tokenizer_json, allocator, token);
+        var score_buf: [64]u8 = undefined;
+        try tokenizer_json.appendSlice(allocator, try std.fmt.bufPrint(&score_buf, ",{d}]", .{score}));
+    }
+    try tokenizer_json.appendSlice(
+        allocator,
+        if (add_space_prefix)
+            "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"always\",\"split\":true},\"added_tokens\":["
+        else
+            "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"never\",\"split\":true},\"added_tokens\":[",
+    );
+    // ponytail: precompiled SentencePiece normalization is intentionally left
+    // to a future shared normalizer; ordinary normalized UTF-8 needs no copy.
+    try appendSpecialTokensFromMetadata(&tokenizer_json, allocator, parsed, tokens, token_types);
+    try tokenizer_json.appendSlice(allocator, "]}");
+    return tokenizer_json.toOwnedSlice(allocator);
+}
 
 fn bpeTokenizerJsonFromGguf(
     allocator: std.mem.Allocator,
@@ -1704,6 +1769,21 @@ pub fn loadSentencePieceTokenizerFromDirOrGguf(
     return sp;
 }
 
+fn adoptAndConfigureSentencePieceTokenizer(
+    owned: *?*sentencepiece.Processor,
+    sp: *sentencepiece.Processor,
+    man: manifest_mod.ModelManifest,
+    model_dir: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    std.debug.assert(owned.* == null);
+    owned.* = sp;
+    if (shouldEnableGemmaSentencePieceCompat(man, model_dir, allocator)) {
+        sp.setPreserveInlineSpecialsAfterLiteralBos(true);
+    }
+    try loadSentencePieceAddedTokens(model_dir, allocator, sp);
+}
+
 fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !sentencepiece.Processor {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
@@ -1714,7 +1794,10 @@ fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: [
 
     const view = gguf_metadata.View.init(&parsed);
     const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
-    if (!(std.mem.eql(u8, model_name, "llama") or std.mem.startsWith(u8, model_name, "gemma"))) {
+    if (!(std.mem.eql(u8, model_name, "llama") or
+        std.mem.eql(u8, model_name, "t5") or
+        std.mem.startsWith(u8, model_name, "gemma")))
+    {
         return error.NoTokenizerFound;
     }
 
@@ -1829,6 +1912,98 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     return false;
 }
 
+const DeclaredOptionalSessionKind = enum {
+    vision,
+    audio,
+    text_projection,
+    visual_projection,
+    audio_projection,
+};
+
+const DeclaredOptionalSession = struct {
+    kind: DeclaredOptionalSessionKind,
+    path: ?[]const u8,
+};
+
+const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".fields.len;
+
+fn declaredOptionalSessions(manifest: *const manifest_mod.ModelManifest) [declared_optional_session_count]DeclaredOptionalSession {
+    return .{
+        .{ .kind = .vision, .path = manifest.visual_model_path },
+        .{ .kind = .audio, .path = manifest.audio_model_path },
+        .{ .kind = .text_projection, .path = manifest.text_projection_path },
+        .{ .kind = .visual_projection, .path = manifest.visual_projection_path },
+        .{ .kind = .audio_projection, .path = manifest.audio_projection_path },
+    };
+}
+
+fn declaredOptionalSessionsComplete(
+    manifest: *const manifest_mod.ModelManifest,
+    loaded: [declared_optional_session_count]bool,
+) bool {
+    for (declaredOptionalSessions(manifest), loaded) |declared, is_loaded| {
+        if (declared.path != null and !is_loaded) return false;
+    }
+    return true;
+}
+
+fn bindOptionalSessionProfile(
+    session_manager: *backends.SessionManager,
+    kind: DeclaredOptionalSessionKind,
+    profile_bundle: ?graph_mod.kernel_jit.QualifiedProfileBundle,
+) !void {
+    if (profile_bundle) |bundle| {
+        const component_path = switch (kind) {
+            .vision => bundle.vision,
+            .audio => bundle.audio,
+            .text_projection => bundle.text_projection,
+            .visual_projection => bundle.visual_projection,
+            .audio_projection => bundle.audio_projection,
+        };
+        if (component_path) |path| {
+            session_manager.kernel_jit.qualified_profile_path = path;
+        } else {
+            if (session_manager.kernel_jit.mode.failClosed()) {
+                return error.MissingKernelJitProfileBundleComponent;
+            }
+            std.log.warn(
+                "kernel JIT profile bundle has no {s} member; using bundled kernels",
+                .{@tagName(kind)},
+            );
+            session_manager.kernel_jit.qualified_profile_path = null;
+            session_manager.kernel_jit.mode = .off;
+        }
+    } else if (session_manager.kernel_jit.qualified_profile_path != null) {
+        if (session_manager.kernel_jit.mode.failClosed()) {
+            return error.KernelJitQualifiedProfileOptionalSessionUnsupported;
+        }
+        // One exact profile is bound to one model fingerprint. Never apply
+        // the primary model's profile to an optional submodel.
+        session_manager.kernel_jit.qualified_profile_path = null;
+        session_manager.kernel_jit.mode = .off;
+    }
+}
+
+fn ownSelectedFirstBackendPreference(
+    allocator: std.mem.Allocator,
+    preferred: []const backends.BackendType,
+    selected: backends.BackendType,
+) ![]backends.BackendType {
+    var count: usize = 1;
+    for (preferred) |backend| {
+        if (backend != selected) count += 1;
+    }
+    const result = try allocator.alloc(backends.BackendType, count);
+    result[0] = selected;
+    var index: usize = 1;
+    for (preferred) |backend| {
+        if (backend == selected) continue;
+        result[index] = backend;
+        index += 1;
+    }
+    return result;
+}
+
 pub const LoadedModel = struct {
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
@@ -1847,20 +2022,26 @@ pub const LoadedModel = struct {
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
-    // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
+    // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
-    // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
+    // Optional-session publication and shared embedding backend state.
+    // ponytail: keep one model-level execution lane until per-request resident
+    // frames and backend caches are independently owned and proven concurrent.
     embedding_session_lock: std.atomic.Mutex = .unlocked,
     /// Stateful GPU embedding sessions share mutable weight-store and command
     /// state. Cold-load waiters are released together, so serialize their
     /// forward passes without constraining thread-safe CPU sessions.
     embedding_run_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
+    recognize_session_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
     visual_projection: ?backends.Session = null,
     audio_projection: ?backends.Session = null,
+    /// Owns the strings backing the qualified JIT profile paths retained by
+    /// the primary and lazily loaded component sessions.
+    kernel_jit_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle = null,
     vision_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     audio_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     text_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
@@ -1894,12 +2075,38 @@ pub const LoadedModel = struct {
         if (self.audio_projection) |session| session_factory.attachIo(session, io);
     }
 
-    pub fn lockNativeGeneration(self: *LoadedModel) void {
-        spinLock(&self.native_generate_lock);
+    /// Snapshot all model-component exact-JIT counters while optional-session
+    /// publication is stable. Metrics must not read those lazy pointers
+    /// directly while an embedding request can materialize them.
+    pub fn metalExactJitDispatchStats(self: *LoadedModel) session_factory.MetalExactJitDispatchStats {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        var total = session_factory.MetalExactJitDispatchStats{};
+        const sessions = [_]?backends.Session{
+            self.session,
+            self.vision_session,
+            self.audio_session,
+            self.text_projection,
+            self.visual_projection,
+            self.audio_projection,
+        };
+        for (sessions) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session_factory.getMetalExactJitDispatchStats(session)) |stats| total.add(stats);
+        }
+        return total;
+    }
+
+    pub fn lockNativeGeneration(self: *LoadedModel, io: std.Io) void {
+        platform.sync.lockYieldingIo(&self.native_generate_lock, io);
     }
 
     pub fn unlockNativeGeneration(self: *LoadedModel) void {
         self.native_generate_lock.unlock();
+    }
+
+    pub fn nativeGenerationMutex(self: *LoadedModel) *std.atomic.Mutex {
+        return &self.native_generate_lock;
     }
 
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
@@ -1925,6 +2132,7 @@ pub const LoadedModel = struct {
 
     fn ensureOptionalSession(
         self: *LoadedModel,
+        kind: DeclaredOptionalSessionKind,
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
         path: ?[]const u8,
@@ -1936,10 +2144,21 @@ pub const LoadedModel = struct {
             shared.backendType()
         else
             self.session.backend()};
-        var loaded = try self.model_manager.loadManagedSessionWithAdmission(
+        var session_manager = self.session_manager.*.withPreferredBackends(
+            self.allocator,
+            strict_backend[0..],
+        );
+        const profile_bundle = if (self.kernel_jit_profile_bundle) |*bundle| blk: {
+            const mapped = bundle.kernelJitBundleForMode(session_manager.kernel_jit.mode);
+            session_manager.kernel_jit.qualified_profile_path = mapped.primary;
+            break :blk mapped;
+        } else null;
+        try bindOptionalSessionProfile(&session_manager, kind, profile_bundle);
+        var loaded = try self.model_manager.loadManagedSessionWithAdmissionUsingManager(
             session_path,
             strict_backend[0..],
             shared_ctx,
+            &session_manager,
         );
         slot.* = loaded.session;
         lease_slot.* = loaded.resource_lease;
@@ -1947,10 +2166,47 @@ pub const LoadedModel = struct {
         loaded.resource_lease = null;
     }
 
+    /// Load every optional model/projection declared by the manifest without
+    /// running media inference. Startup preload calls this while the node owns
+    /// the exclusive JIT qualification phase.
+    pub fn materializeDeclaredOptionalSessions(self: *LoadedModel) !void {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+
+        for (declaredOptionalSessions(&self.manifest)) |declared| {
+            switch (declared.kind) {
+                .vision => try self.ensureOptionalSession(.vision, &self.vision_session, &self.vision_resource_lease, declared.path),
+                .audio => try self.ensureOptionalSession(.audio, &self.audio_session, &self.audio_resource_lease, declared.path),
+                .text_projection => try self.ensureOptionalSession(.text_projection, &self.text_projection, &self.text_projection_resource_lease, declared.path),
+                .visual_projection => try self.ensureOptionalSession(.visual_projection, &self.visual_projection, &self.visual_projection_resource_lease, declared.path),
+                .audio_projection => try self.ensureOptionalSession(.audio_projection, &self.audio_projection, &self.audio_projection_resource_lease, declared.path),
+            }
+        }
+        if (!self.declaredOptionalSessionsMaterializedUnlocked())
+            return error.OptionalSessionMaterializationIncomplete;
+    }
+
+    pub fn declaredOptionalSessionsMaterialized(self: *LoadedModel) bool {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        return self.declaredOptionalSessionsMaterializedUnlocked();
+    }
+
+    fn declaredOptionalSessionsMaterializedUnlocked(self: *const LoadedModel) bool {
+        return declaredOptionalSessionsComplete(&self.manifest, .{
+            self.vision_session != null,
+            self.audio_session != null,
+            self.text_projection != null,
+            self.visual_projection != null,
+            self.audio_projection != null,
+        });
+    }
+
     pub fn ensureVisionSession(self: *LoadedModel) !void {
         spinLock(&self.embedding_session_lock);
         defer self.embedding_session_lock.unlock();
         try self.ensureOptionalSession(
+            .vision,
             &self.vision_session,
             &self.vision_resource_lease,
             self.manifest.visual_model_path,
@@ -1963,6 +2219,7 @@ pub const LoadedModel = struct {
 
         if (include_text) {
             try self.ensureOptionalSession(
+                .text_projection,
                 &self.text_projection,
                 &self.text_projection_resource_lease,
                 self.manifest.text_projection_path,
@@ -1970,11 +2227,13 @@ pub const LoadedModel = struct {
         }
         if (include_image) {
             try self.ensureOptionalSession(
+                .vision,
                 &self.vision_session,
                 &self.vision_resource_lease,
                 self.manifest.visual_model_path,
             );
             try self.ensureOptionalSession(
+                .visual_projection,
                 &self.visual_projection,
                 &self.visual_projection_resource_lease,
                 self.manifest.visual_projection_path,
@@ -1982,11 +2241,13 @@ pub const LoadedModel = struct {
         }
         if (include_audio) {
             try self.ensureOptionalSession(
+                .audio,
                 &self.audio_session,
                 &self.audio_resource_lease,
                 self.manifest.audio_model_path,
             );
             try self.ensureOptionalSession(
+                .audio_projection,
                 &self.audio_projection,
                 &self.audio_projection_resource_lease,
                 self.manifest.audio_projection_path,
@@ -1996,8 +2257,14 @@ pub const LoadedModel = struct {
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
+        const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
+        const resident_text_encoder = (self.session.backend() == .metal or self.session.backend() == .cuda) and
+            if (generic_encoder) |arch| switch (arch) {
+                .bert => true,
+                .deberta => false,
+            } else false;
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.max_position_embeddings,
+            .max_length = self.manifest.maxTextSequenceLength(),
             .normalize = self.manifest.normalize,
             .pooling = switch (self.manifest.pooling) {
                 .mean => .mean,
@@ -2006,8 +2273,9 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_text_prefix,
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or generic_encoder != null,
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
+            .resident_text_encoder = resident_text_encoder,
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;
@@ -2039,7 +2307,7 @@ pub const LoadedModel = struct {
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
         return RerankingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.max_position_embeddings,
+            .max_length = self.manifest.maxTextSequenceLength(),
             .mode = if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
                 self.manifest.hasCapability("colqwen") or
@@ -2064,6 +2332,7 @@ pub const LoadedModel = struct {
     pub fn classificationPipeline(self: *LoadedModel, allocator: std.mem.Allocator, config: ClassificationConfig) ClassificationPipeline {
         const tok = self.getTokenizer();
         var effective = config;
+        effective.max_length = @min(effective.max_length, self.manifest.maxTextSequenceLength());
         effective.distributed = runtime.distributed.configFromEnv();
         return ClassificationPipeline.init(allocator, self.session, tok, effective);
     }
@@ -2073,7 +2342,7 @@ pub const LoadedModel = struct {
         // Cast id2label from ?[][]const u8 to ?[]const []const u8
         const id2label: ?[]const []const u8 = if (self.manifest.id2label) |labels| labels else null;
         return NerPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.max_position_embeddings,
+            .max_length = self.manifest.maxTextSequenceLength(),
             .id2label = id2label,
             .distributed = runtime.distributed.configFromEnv(),
         });
@@ -2116,6 +2385,7 @@ pub const LoadedModel = struct {
             .allocator = allocator,
             .session = self.session,
             .tok = tok,
+            .execution_lock = &self.recognize_session_lock,
             .config = .{
                 .max_width = self.manifest.gliner_max_width,
                 .max_length = self.manifest.max_position_embeddings,
@@ -2159,6 +2429,7 @@ pub const LoadedModel = struct {
         if (self.text_projection) |tp| tp.close();
         if (self.visual_projection) |vp| vp.close();
         if (self.audio_projection) |ap| ap.close();
+        if (self.kernel_jit_profile_bundle) |*bundle| bundle.deinit();
         if (self.vision_resource_lease) |*lease| lease.release();
         if (self.audio_resource_lease) |*lease| lease.release();
         if (self.text_projection_resource_lease) |*lease| lease.release();
@@ -2309,6 +2580,8 @@ pub const ModelHandle = struct {
 };
 
 pub const ModelManager = struct {
+    const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
+
     const EvictedModel = struct {
         key: []const u8,
         model: *LoadedModel,
@@ -2347,8 +2620,8 @@ pub const ModelManager = struct {
         return .{
             .allocator = allocator,
             .session_manager = session_manager,
-            .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
-            .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
+            .loaded = LoadedModelMap{},
+            .loaded_aliases = LoadedModelMap{},
         };
     }
 
@@ -2935,6 +3208,21 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
     ) !ManagedSession {
+        return self.loadManagedSessionWithAdmissionUsingManager(
+            model_path,
+            preferred_backends,
+            shared_backend_ctx,
+            &self.session_manager,
+        );
+    }
+
+    fn loadManagedSessionWithAdmissionUsingManager(
+        self: *ModelManager,
+        model_path: []const u8,
+        preferred_backends: []const backends.BackendType,
+        shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        source_session_manager: *const backends.SessionManager,
+    ) !ManagedSession {
         var first_err: ?anyerror = null;
         var artifact_estimate = if (self.admission_enabled)
             try ComponentArtifactEstimate.init(self.allocator, model_path)
@@ -2952,7 +3240,7 @@ pub const ModelManager = struct {
             var session_manager = sessionManagerForPreferredBackends(
                 self.allocator,
                 single_backend[0..],
-                &self.session_manager,
+                source_session_manager,
             );
             const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
                 if (first_err == null) first_err = err;
@@ -3156,6 +3444,13 @@ pub const ModelManager = struct {
         self.unlockLoadedModels();
         if (start_eviction_loop)
             self.eviction_group.async(io, evictionLoop, .{ self, io });
+    }
+
+    pub fn detachPromptCacheResourceUsageObserver(self: *ModelManager) void {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        var it = self.loaded.valueIterator();
+        while (it.next()) |model| model.*.prompt_prefix_cache.detachResourceUsageObserver();
     }
 
     /// Counts loaded models participating in the prompt-cache accounting target.
@@ -3465,6 +3760,25 @@ pub const ModelManager = struct {
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
         if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
 
+        var qualified_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle =
+            if (sm.kernel_jit.qualified_profile_path) |path|
+                try kernel_jit_profile_output.loadQualifiedProfileBundleIfPresent(
+                    self.allocator,
+                    sm.io orelse std.Options.debug_io,
+                    path,
+                )
+            else
+                null;
+        errdefer if (qualified_profile_bundle) |*bundle| bundle.deinit();
+        if (qualified_profile_bundle) |*bundle| {
+            sm.kernel_jit.qualified_profile_path = bundle.kernelJitBundle().primary;
+            if (!sm.kernel_jit.mode.failClosed() and !bundle.hasQualifiedKernels(.primary)) {
+                std.log.warn("kernel JIT profile bundle primary has no qualified winner; using bundled kernels", .{});
+                sm.kernel_jit.qualified_profile_path = null;
+                sm.kernel_jit.mode = .off;
+            }
+        }
+
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
         var sp_tok: ?*sentencepiece.Processor = null;
@@ -3618,6 +3932,7 @@ pub const ModelManager = struct {
             .text_projection = null,
             .visual_projection = null,
             .audio_projection = null,
+            .kernel_jit_profile_bundle = null,
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = loaded_session.resource_lease,
         };
@@ -3647,6 +3962,9 @@ pub const ModelManager = struct {
                 }
             }
         }
+
+        model.kernel_jit_profile_bundle = qualified_profile_bundle;
+        qualified_profile_bundle = null;
 
         return self.publishLoadedModel(model, cache_default_alias);
     }
@@ -3746,6 +4064,11 @@ pub const ModelManager = struct {
             model_owned = false;
             return .{ .manager = self, .model = model };
         }
+    }
+
+    fn destroyLoadedModel(self: *ModelManager, model: *LoadedModel) void {
+        model.deinit();
+        self.allocator.destroy(model);
     }
 };
 
@@ -3888,6 +4211,8 @@ fn sessionManagerForPreferredBackends(
         .allocator = allocator,
         .preferred_backends = preferred_backends,
         .graph_runtime_strategy = source.graph_runtime_strategy,
+        .kernel_jit = source.kernel_jit,
+        .kernel_jit_load_context = source.kernel_jit_load_context,
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
@@ -4315,7 +4640,11 @@ fn loadSessionForPreferredBackends(
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
+        if (source_session_manager.kernel_jit.mode.failClosed() and
+            !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (source_session_manager.kernel_jit.mode.failClosed() and
+            std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
         const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
@@ -4421,14 +4750,77 @@ test "shouldPreferNativeSession prefers native GLiNER weights" {
     try std.testing.expect(shouldPreferNativeSession(man));
 }
 
-test "model manager backend clones preserve explicit graph runtime" {
-    var source = backends.SessionManager.init(std.testing.allocator);
-    source.graph_runtime_strategy = .partitioned;
-    const preferred = [_]backends.BackendType{.onnx};
+test "optional sessions retain the selected backend before fallbacks" {
+    const preferred = [_]backends.BackendType{ .metal, .native };
+    const owned = try ownSelectedFirstBackendPreference(
+        std.testing.allocator,
+        &preferred,
+        .native,
+    );
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .native, .metal }, owned);
 
-    const cloned = sessionManagerForPreferredBackends(std.testing.allocator, preferred[0..], &source);
-    try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
-    try std.testing.expectEqualSlices(backends.BackendType, preferred[0..], cloned.preferred_backends);
+    const added = try ownSelectedFirstBackendPreference(
+        std.testing.allocator,
+        &preferred,
+        .cuda,
+    );
+    defer std.testing.allocator.free(added);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .cuda, .metal, .native }, added);
+}
+
+test "required preload completeness includes every declared optional session" {
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .visual_model_path = "vision.gguf",
+        .audio_model_path = "audio.gguf",
+        .text_projection_path = "text-projection.onnx",
+        .visual_projection_path = "visual-projection.onnx",
+        .audio_projection_path = "audio-projection.onnx",
+    };
+    const declared = declaredOptionalSessions(&manifest);
+    try std.testing.expectEqual(@as(usize, 5), declared.len);
+    try std.testing.expect(!declaredOptionalSessionsComplete(
+        &manifest,
+        .{ true, true, true, true, false },
+    ));
+    try std.testing.expect(declaredOptionalSessionsComplete(
+        &manifest,
+        .{ true, true, true, true, true },
+    ));
+
+    const text_only = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    try std.testing.expect(declaredOptionalSessionsComplete(
+        &text_only,
+        .{ false, false, false, false, false },
+    ));
+}
+
+test "optional sessions bind only their component-qualified profile" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.kernel_jit = .{ .mode = .on, .qualified_profile_path = "primary.json" };
+    const bundle: graph_mod.kernel_jit.QualifiedProfileBundle = .{
+        .primary = "primary.json",
+        .vision = "vision.json",
+        .audio = "audio.json",
+    };
+
+    try bindOptionalSessionProfile(&manager, .audio, bundle);
+    try std.testing.expectEqualStrings("audio.json", manager.kernel_jit.qualified_profile_path.?);
+    try bindOptionalSessionProfile(&manager, .text_projection, bundle);
+    try std.testing.expect(manager.kernel_jit.qualified_profile_path == null);
+    try std.testing.expectEqual(graph_mod.kernel_jit.Mode.off, manager.kernel_jit.mode);
+
+    manager.kernel_jit = .{ .mode = .required, .qualified_profile_path = "primary.json" };
+    try std.testing.expectError(
+        error.MissingKernelJitProfileBundleComponent,
+        bindOptionalSessionProfile(&manager, .text_projection, bundle),
+    );
+
+    manager.kernel_jit = .{ .mode = .on, .qualified_profile_path = "primary.json" };
+    try bindOptionalSessionProfile(&manager, .vision, null);
+    try std.testing.expect(manager.kernel_jit.qualified_profile_path == null);
+    try std.testing.expectEqual(graph_mod.kernel_jit.Mode.off, manager.kernel_jit.mode);
 }
 
 test "preferredModelPathForBackend keeps metal/native on model directory when native assets exist" {
@@ -5722,6 +6114,47 @@ test "shouldEnableGemmaSentencePieceCompat applies to gguf-only gemma dirs" {
     try std.testing.expect(!shouldPreferSentencePieceOverride(man, dir_path, allocator));
 }
 
+test "sentencepiece tokenizer is owned before added-token failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "added_tokens.json",
+        .data = "]",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator };
+
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, model_dir: []const u8, manifest: manifest_mod.ModelManifest) !void {
+            var owned: ?*sentencepiece.Processor = null;
+            errdefer if (owned) |sp| {
+                sp.deinit();
+                a.destroy(sp);
+            };
+
+            const sp = try a.create(sentencepiece.Processor);
+            errdefer if (owned == null) a.destroy(sp);
+            sp.* = try sentencepiece.Processor.initFromPieces(a, &.{
+                .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+                .{ .text = "token", .score = -1, .piece_type = 1 },
+            }, .{});
+
+            try adoptAndConfigureSentencePieceTokenizer(&owned, sp, manifest, model_dir, a);
+
+            // Keep an unexpected success leak-free so expectError reports only
+            // the missing post-load failure.
+            sp.deinit();
+            a.destroy(sp);
+            owned = null;
+        }
+    };
+
+    try std.testing.expectError(error.SyntaxError, Harness.run(allocator, dir_path, man));
+}
+
 test "loadSentencePieceAddedTokens overlays gemma special tokens from tokenizer json" {
     const allocator = std.testing.allocator;
     const model_dir = "models/google/gemma-3-4b-it";
@@ -6083,7 +6516,7 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
     defer encoded.deinit();
 
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
-    try std.testing.expectEqual(@as(i32, 4), encoded.ids[1]);
+    try std.testing.expectEqual(@as(i32, 7), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 5), encoded.ids[2]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[0]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[1]);
@@ -6091,11 +6524,36 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
 
     const special_ids = try tok.tokenizer().encode(allocator, "<|turn>hello");
     defer allocator.free(special_ids);
-    try std.testing.expectEqualSlices(i32, &.{ 6, 4 }, special_ids);
+    try std.testing.expectEqualSlices(i32, &.{ 6, 7 }, special_ids);
 
-    const decoded = try tok.tokenizer().decode(allocator, &.{ 4, 5 });
+    const decoded = try tok.tokenizer().decode(allocator, &.{ 4, 7 });
     defer allocator.free(decoded);
-    try std.testing.expectEqualStrings("hello world", decoded);
+    try std.testing.expectEqualStrings("hellohello", decoded);
+    try std.testing.expectEqual(@as(usize, 8), tok.tokenizer().vocabSize());
+}
+
+test "load huggingface tokenizer from gguf t5 unigram metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithT5Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const gguf_path = try std.fs.path.join(allocator, &.{ model_dir, "bge-m3-q4_k_m.gguf" });
+    defer allocator.free(gguf_path);
+
+    var tok = try loadHuggingFaceTokenizerFromDirOrGguf(allocator, model_dir, gguf_path);
+    defer tok.deinitSelf();
+
+    var encoded = try tok.tokenizer().encodeForModel(allocator, "hello world", 8);
+    defer encoded.deinit();
+    try std.testing.expectEqualSlices(i32, &.{ 0, 4, 5, 2, 1, 1, 1, 1 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0, 0, 0 }, encoded.attention_mask);
 }
 
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
@@ -6141,14 +6599,41 @@ fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
         "hello",
         "▁world",
         "<|turn>",
+        "hello",
     });
     try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
-    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3, 1 });
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 1);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 0);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
     try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
+fn buildTestGgufWithT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 11);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "bert");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "t5");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<s>", "<pad>", "</s>", "<unk>", "\u{2581}hello", "\u{2581}world",
+    });
+    try appendTestMetadataF32Array(allocator, &data, "tokenizer.ggml.scores", &.{ 0, 0, 0, 0, -1, -1 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_eos_token", true);
 
     return data.toOwnedSlice(allocator);
 }
@@ -6195,4 +6680,12 @@ fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
+}
+
+fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u64, allocator, data, values.len);
+    for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }

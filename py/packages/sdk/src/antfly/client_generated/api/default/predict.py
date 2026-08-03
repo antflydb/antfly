@@ -43,6 +43,11 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
@@ -52,6 +57,11 @@ def _parse_response(
         response_413 = InferenceError.from_dict(response.json())
 
         return response_413
+
+    if response.status_code == 503:
+        response_503 = InferenceError.from_dict(response.json())
+
+        return response_503
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)

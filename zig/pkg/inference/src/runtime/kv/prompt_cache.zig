@@ -19,6 +19,11 @@ const pool_mod = @import("pool.zig");
 const storage_runtime_mod = @import("storage_runtime.zig");
 
 pub const max_namespace_bytes: usize = 256;
+pub const bytes_per_mebibyte: usize = 1024 * 1024;
+/// Largest whole-MiB cache target that can be represented as bytes.
+pub const max_config_bytes_mb: usize = std.math.maxInt(usize) / bytes_per_mebibyte;
+/// Expiry timestamps use signed milliseconds.
+pub const max_config_ttl_ms: u64 = @intCast(std.math.maxInt(i64));
 
 pub const Mode = enum {
     /// Whole-prefix entries with linear scan matching. O(entries) lookup and
@@ -154,6 +159,16 @@ pub const PromptPrefixCache = struct {
         if (!config.enabled) self.activation_pending = false;
         self.evictToBudget();
         self.updateResourceUsage();
+    }
+
+    pub fn detachResourceUsageObserver(self: *PromptPrefixCache) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.config.resource_usage_observer) |observer| {
+            observer.update(observer.context, &self.resource_accounted_bytes, 0);
+        }
+        self.config.resource_usage_observer = null;
+        self.resource_accounted_bytes = 0;
     }
 
     /// Reserve this cache's place in node-wide accounting before any
@@ -556,7 +571,8 @@ pub const PromptPrefixCache = struct {
 
     /// Idle TTL: hits refresh expiry, so only entries unused for ttl_ms expire.
     fn refreshedExpiryMs(self: *const PromptPrefixCache) i64 {
-        return nowMs() + @as(i64, @intCast(self.config.ttl_ms));
+        const ttl_ms = std.math.cast(i64, self.config.ttl_ms) orelse std.math.maxInt(i64);
+        return std.math.add(i64, nowMs(), ttl_ms) catch std.math.maxInt(i64);
     }
 
     pub fn isActive(self: *PromptPrefixCache) bool {
@@ -821,6 +837,17 @@ test "prompt cache refreshes idle ttl on hit" {
     const hit = (try cache.attachLongestPrefix("agent", &.{ 1, 2, 3, 9 }, 2)).?;
     try cache.manager.releaseSequence(hit.sequence_id);
     try std.testing.expect(cache.entries.items[0].expires_at_ms > aged_expiry);
+}
+
+test "prompt cache expiry saturates after timestamp overflow" {
+    var cache = PromptPrefixCache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.configure(.{
+        .enabled = true,
+        .ttl_ms = max_config_ttl_ms,
+    });
+
+    try std.testing.expectEqual(std.math.maxInt(i64), cache.refreshedExpiryMs());
 }
 
 test "prompt cache evicts retained blocks by budget" {

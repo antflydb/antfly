@@ -106,6 +106,13 @@ case "$strip" in
 esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
+if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+  echo "SOURCE_DATE_EPOCH must be a non-negative integer, got: $source_date_epoch" >&2
+  exit 2
+fi
+export SOURCE_DATE_EPOCH="$source_date_epoch"
+
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
@@ -148,6 +155,7 @@ zig_build_options=(
   -Dantfly-version="$version"
   -Donnx=false
   -Dmetal="$metal"
+  -Dcuda=false
   -Dsystem-blas="$system_blas"
 )
 
@@ -188,7 +196,10 @@ fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
 
-tar -C "$stage" -czf "$out_dir/$archive_name" .
+python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
+  --source "$stage" \
+  --output "$out_dir/$archive_name" \
+  --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null

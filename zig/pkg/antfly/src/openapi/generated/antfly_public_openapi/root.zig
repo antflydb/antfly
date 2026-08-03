@@ -120,6 +120,7 @@ pub const QueryProfile = types.QueryProfile;
 pub const QueryRequest = types.QueryRequest;
 pub const QueryResponses = types.QueryResponses;
 pub const QueryResult = types.QueryResult;
+pub const RawQuery = types.RawQuery;
 pub const RepairIssueListRequest = types.RepairIssueListRequest;
 pub const RepairRunRequest = types.RepairRunRequest;
 pub const RepairTarget = types.RepairTarget;

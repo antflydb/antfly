@@ -56,7 +56,7 @@ pub const SparseEmbeddingConfig = struct {
 
     pub fn fromManifest(manifest: *const manifest_mod.ModelManifest) SparseEmbeddingConfig {
         return .{
-            .max_length = manifest.max_position_embeddings,
+            .max_length = manifest.maxTextSequenceLength(),
             .dynamic_3d_layout = sparseLayoutFromManifest(manifest.sparse_3d_output_layout),
         };
     }

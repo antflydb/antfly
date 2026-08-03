@@ -393,6 +393,10 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     retain_dense_fallback: bool = true,
     disable_mapped_quant_weight: bool = false,
     dense_fallback_max_bytes: ?usize = null,
+    allow_direct_quant_fallback: bool = false,
+    prefer_bf16_fallback: bool = false,
+    prefer_f16_mps_fallback: bool = false,
+    prefer_f32_mps_fallback: bool = false,
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
@@ -407,6 +411,28 @@ pub const DecoderRuntimeApplyLinearRequest = struct {
     input: CT,
     in_dim: usize,
     out_dim: usize,
+};
+
+pub const DecoderRuntimeApplyLinearLayerNormRequest = struct {
+    linear_slot: usize,
+    layer_norm_slot: usize,
+    input: CT,
+    residual: CT,
+    in_dim: usize,
+    hidden_size: usize,
+    eps: f32,
+};
+
+pub const DecoderRuntimeApplyFfnLayerNormRequest = struct {
+    first_linear_slot: usize,
+    second_linear_slot: usize,
+    layer_norm_slot: usize,
+    input: CT,
+    residual: CT,
+    hidden_size: usize,
+    intermediate_size: usize,
+    eps: f32,
+    activation: DecoderRuntimeActivationKind,
 };
 
 pub const DecoderRuntimeApplyLinearArgmaxRequest = struct {
@@ -505,6 +531,8 @@ pub const KvCacheView = struct {
     logical_block_count: usize,
     tail_tokens: u16,
     position_offset: usize = 0,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
 };
@@ -812,8 +840,12 @@ pub const DecoderRuntimeLayerSpec = struct {
     kv_layer_index: usize,
     shares_kv: bool,
     sliding_window: usize,
+    /// Frequency-domain width retained for planning and provenance.
     rope_dim: usize,
+    /// Prefix width passed to the backend RoPE operation.
     rope_active_dim: usize,
+    /// Effective theta for `rope_active_dim`; model-specific frequency-factor
+    /// interpretation must be resolved before constructing this backend spec.
     rope_theta: f32,
     attn_pre_norm_slot: usize,
     attn_post_norm_slot: usize,

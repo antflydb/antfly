@@ -51,6 +51,9 @@ pub const Metrics = struct {
     extract_requests: prometheus.Counter(u64),
     rewrite_requests: prometheus.Counter(u64),
     generate_requests: prometheus.Counter(u64),
+    speculative_requested: prometheus.Counter(u64),
+    speculative_active: prometheus.Counter(u64),
+    speculative_disabled: prometheus.Counter(u64),
     transcribe_requests: prometheus.Counter(u64),
     read_requests: prometheus.Counter(u64),
     predict_requests: prometheus.Counter(u64),
@@ -92,6 +95,9 @@ pub const Metrics = struct {
             .extract_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_extract", .{ .help = "Extract endpoint requests" }, .{}),
             .rewrite_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_rewrite", .{ .help = "Rewrite endpoint requests" }, .{}),
             .generate_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_generate", .{ .help = "Generate endpoint requests" }, .{}),
+            .speculative_requested = prometheus.Counter(u64).init("antfly_inference_speculation_requested_total", .{ .help = "Generate requests that requested speculative decoding" }, .{}),
+            .speculative_active = prometheus.Counter(u64).init("antfly_inference_speculation_active_total", .{ .help = "Completed speculative decoding requests with an active or forced outcome" }, .{}),
+            .speculative_disabled = prometheus.Counter(u64).init("antfly_inference_speculation_disabled_total", .{ .help = "Completed speculative decoding requests with a disabled outcome" }, .{}),
             .transcribe_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_transcribe", .{ .help = "Transcribe endpoint requests" }, .{}),
             .read_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_read", .{ .help = "Read endpoint requests" }, .{}),
             .predict_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_predict", .{ .help = "Predict endpoint requests" }, .{}),
@@ -141,6 +147,18 @@ pub const Metrics = struct {
 
     pub fn incPredictError(self: *Metrics) void {
         self.predict_errors.incr();
+    }
+
+    pub fn incSpeculationRequested(self: *Metrics) void {
+        self.speculative_requested.incr();
+    }
+
+    pub fn incSpeculationActive(self: *Metrics) void {
+        self.speculative_active.incr();
+    }
+
+    pub fn incSpeculationDisabled(self: *Metrics) void {
+        self.speculative_disabled.incr();
     }
 
     pub fn incPredictorLoad(self: *Metrics) void {
@@ -210,6 +228,9 @@ test "metrics render" {
     m.incRequest("embed");
     m.incRequest("embed");
     m.incRequest("rerank");
+    m.incSpeculationRequested();
+    m.incSpeculationActive();
+    m.incSpeculationDisabled();
 
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
@@ -219,6 +240,9 @@ test "metrics render" {
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_requests_total 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_endpoint_requests_embed 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_endpoint_requests_rerank 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_requested_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_active_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_disabled_total 1\n") != null);
 
     m.setQueueState(3, 6, 2);
     m.recordQueueRejection(4);

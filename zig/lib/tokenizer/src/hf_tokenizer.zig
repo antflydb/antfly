@@ -712,7 +712,20 @@ pub const HfTokenizer = struct {
 
     /// Parse tokenizer.json content from memory.
     pub fn loadFromBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+        return loadFromBytesConfigured(allocator, json_bytes, false);
+    }
+
+    /// Parse generated tokenizer JSON whose vocab may contain duplicate token
+    /// strings. GGUF keeps every token ID, while encoding resolves duplicates
+    /// to the last ID.
+    pub fn loadFromBytesAllowDuplicateFields(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
+        return loadFromBytesConfigured(allocator, json_bytes, true);
+    }
+
+    fn loadFromBytesConfigured(allocator: std.mem.Allocator, json_bytes: []const u8, allow_duplicate_fields: bool) !*HfTokenizer {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
+            .duplicate_field_behavior = if (allow_duplicate_fields) .use_last else .@"error",
+        });
         defer parsed.deinit();
 
         const root = parsed.value;
@@ -841,6 +854,14 @@ pub const HfTokenizer = struct {
         }
 
         return self;
+    }
+
+    /// Preserve an alternate token ID for decoding after duplicate vocab keys
+    /// have resolved to the canonical encoding ID.
+    pub fn addTokenIdAliasForDecode(self: *HfTokenizer, token: []const u8, id: i32) !void {
+        if (self.id_to_token.contains(id)) return;
+        const canonical = self.vocab.getKey(token) orelse return error.InvalidTokenizerJson;
+        try self.id_to_token.put(self.allocator, id, canonical);
     }
 
     fn adoptArenaString(self: *HfTokenizer, owned: []u8) ![]const u8 {
@@ -6342,6 +6363,11 @@ pub const HfTokenizer = struct {
 
     fn shouldPreferDirectBpePieces(self: *const HfTokenizer) bool {
         return self.model_type == .bpe and
+            // A declared merge table defines ranked BPE semantics. The
+            // longest-vocab-piece fallback is only valid for legacy/generated
+            // vocab-only configs; using it when merges exist can select pieces
+            // that the ranked merge sequence would never produce.
+            self.merge_ranks.count() == 0 and
             self.replace_space_with != null and
             self.pre_tokenizer_type == .none and
             self.continuing_prefix.len == 0 and
@@ -6940,7 +6966,7 @@ pub const HfTokenizer = struct {
     }
 
     fn getVocabSize(self: *HfTokenizer) usize {
-        return self.vocab.count();
+        return self.id_to_token.count();
     }
 
     pub fn deinitSelf(self: *HfTokenizer) void {
@@ -10472,6 +10498,40 @@ test "bpe encode handles gemma replace+split tokenizer mode" {
     const ids = try tok.encode(allocator, "Describe this image.");
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i32, &.{ 10, 11, 12, 13 }, ids);
+}
+
+test "gemma replace+split tokenizer honors ranked bpe merges" {
+    const allocator = std.testing.allocator;
+
+    // The longer vocab pieces are deliberate distractors: greedy vocab
+    // segmentation would emit `▁Spell`+`a` and `▁Caff`+`e`, while the ranked
+    // merge table specifies the same segmentation as llama.cpp/Gemma4.
+    const json_str =
+        \\{
+        \\  "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+        \\  "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false},
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "continuing_subword_prefix": null,
+        \\    "end_of_word_suffix": null,
+        \\    "byte_fallback": false,
+        \\    "vocab": {
+        \\      "▁": 0, "S": 1, "p": 2, "e": 3, "l": 4, "a": 5, "C": 6, "f": 7,
+        \\      "el": 8, "ell": 9, "ella": 10, "▁S": 11, "▁Sp": 12,
+        \\      "ff": 13, "aff": 14, "affe": 15, "▁C": 16,
+        \\      "▁Spell": 17, "▁Caff": 18
+        \\    },
+        \\    "merges": ["e l", "▁ S", "el l", "▁S p", "ell a", "▁ C", "f f", "a ff", "aff e"]
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    const ids = try tok.encode(allocator, " Spella Caffe");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 12, 10, 16, 15 }, ids);
 }
 
 test "bpe encode applies same-rank merges left-to-right" {
