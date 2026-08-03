@@ -15,7 +15,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
-const structlog = @import("structlog");
 const testing = std.testing;
 
 pub const std_options: std.Options = .{
@@ -85,6 +84,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("test filter matched no declared tests: {s}\n", .{filter});
     }
     if (missing_filter_count != 0) {
+        std.process.exit(1);
+    }
+    if (total_count == 0) {
+        std.debug.print("test selection matched no runnable tests\n", .{});
         std.process.exit(1);
     }
 
@@ -186,6 +189,9 @@ fn appendFilter(
     count: *usize,
     filter: []const u8,
 ) void {
+    if (filter.len == 0) {
+        std.debug.panic("missing value for {s}", .{kind});
+    }
     if (count.* >= max_filters) {
         std.debug.panic("too many {s} arguments", .{kind});
     }
@@ -221,5 +227,10 @@ pub fn log(
     if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    structlog.logFn(message_level, scope, format, args);
+    std.debug.print("[{s}] ({s}): ", .{
+        @tagName(message_level),
+        @tagName(scope),
+    });
+    std.debug.print(format, args);
+    std.debug.print("\n", .{});
 }

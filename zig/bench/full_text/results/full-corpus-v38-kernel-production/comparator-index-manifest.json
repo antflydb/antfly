@@ -1,0 +1,139 @@
+{
+  "analysis": {
+    "filters": [
+      "ascii_lowercase"
+    ],
+    "name": "simple",
+    "stemming": false,
+    "stop_words": false,
+    "tokenizer": "unicode_words"
+  },
+  "bm25": {
+    "b": 0.75,
+    "k1": 1.2
+  },
+  "corpus": {
+    "empty_text_documents": 391079,
+    "indexed_documents": 5032105,
+    "input_documents": 5032105,
+    "normalization": "trim_ascii_whitespace_drop_blank_append_lf_json_or_plain_text",
+    "ordinal_assignment": "zero_based_normalized_input_order_u32",
+    "rejected_documents": 0,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+    "uncompressed_bytes": 8473678432
+  },
+  "engine": "tantivy-0.25",
+  "index_elapsed_ns": 550184738333,
+  "ingestion_batch_size": 5000,
+  "layout": {
+    "global_doc_count": 5032105,
+    "segment_count": 20,
+    "segments": [
+      {
+        "deleted_count": 0,
+        "doc_count": 2560000,
+        "segment_id": "02ca6631fdff4703bbb60444590ee534"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "b9c4e671a7fa4e13aa2de157a9aedb28"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "b3d45b1580614d98bc13b02dc2a105de"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "8b03512b38d54d14901d4f431554474d"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "a3d6f617c64847358ad20dbeb0e482e4"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "c53c7d0f8066423789aeb8380e936e51"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "a3370de11e794cea84cc1cdb20d308d5"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 320000,
+        "segment_id": "c59b22653ce945baa6ee25c443c55824"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 40000,
+        "segment_id": "5056120c2c8d412091a3c63ca9edf2fd"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 40000,
+        "segment_id": "95192d3d14bb48c7b6ece4f791e19630"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 40000,
+        "segment_id": "986c739e160a4ec7a48e43f97702b994"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 40000,
+        "segment_id": "40b162d24d8e468fab45aab1b4692565"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 40000,
+        "segment_id": "120b3d9af5e84fa0a322f5b72eebaba8"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 5000,
+        "segment_id": "97776a8343dc4163a48c05c6e301ba1d"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 5000,
+        "segment_id": "86bfa513eba0458c8c41626df2a6627c"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 5000,
+        "segment_id": "0faaee16393d4420a095aec20b74f385"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 5000,
+        "segment_id": "c25e3dd750ec4347af6a3392aef87837"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 5000,
+        "segment_id": "43f6e167a7c5408ebe62c9b96c13ad7f"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 5000,
+        "segment_id": "806cd0650b4943b0bd886f587d9b427d"
+      },
+      {
+        "deleted_count": 0,
+        "doc_count": 2105,
+        "segment_id": "8ba721d62f7f46a0b60157c241359833"
+      }
+    ],
+    "total_bytes": 3252077340
+  },
+  "query_grammar": "V1",
+  "result_schema_version": 1,
+  "schema_version": 1,
+  "segment_mode": "production"
+}

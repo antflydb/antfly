@@ -422,13 +422,13 @@ func printIndexStatus(index *antfly.IndexStatus) {
 }
 
 // Backup backs up a table
-func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location string) error {
+func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location, connection string) error {
 	if tableName == "" {
 		return fmt.Errorf("empty table name")
 	}
 	fmt.Fprintf(os.Stderr, "Sending BACKUP request for table '%s', backupID '%s', location '%s'\n", tableName, backupID, location)
 
-	err := c.AntflyClient.Backup(ctx, tableName, backupID, location)
+	err := c.AntflyClient.Backup(ctx, tableName, backupID, location, connection)
 	if err != nil {
 		return fmt.Errorf("backup request failed: %w", err)
 	}
@@ -438,30 +438,35 @@ func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location
 }
 
 // Restore restores a table from a backup
-func (c *AntflyClient) Restore(ctx context.Context, tableName, backupID, location string) error {
+func (c *AntflyClient) Restore(ctx context.Context, tableName, backupID, location, connection, idempotencyKey string) error {
 	if tableName == "" {
 		return fmt.Errorf("empty table name")
 	}
 	fmt.Fprintf(os.Stderr, "Sending RESTORE request for new table '%s' from backupID '%s', location '%s'\n", tableName, backupID, location)
 
-	err := c.AntflyClient.Restore(ctx, tableName, backupID, location)
+	job, err := c.AntflyClient.Restore(ctx, tableName, antfly.TableRestoreOptions{
+		BackupID:       backupID,
+		Location:       location,
+		Connection:     connection,
+		IdempotencyKey: idempotencyKey,
+	})
 	if err != nil {
 		return fmt.Errorf("restore request failed: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Restore request for table '%s' successfully sent/acknowledged\n", tableName)
+	fmt.Fprintf(os.Stderr, "Restore job %s for table '%s' accepted (phase: %s)\n", job.JobId, tableName, job.Phase)
 	return nil
 }
 
 // ClusterBackup backs up multiple tables or all tables
-func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location string, tableNames []string) error {
+func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location, connection string, tableNames []string) error {
 	desc := "all tables"
 	if len(tableNames) > 0 {
 		desc = strings.Join(tableNames, ", ")
 	}
 	fmt.Fprintf(os.Stderr, "Sending BACKUP request for %s, backupID '%s', location '%s'\n", desc, backupID, location)
 
-	result, err := c.AntflyClient.ClusterBackup(ctx, backupID, location, tableNames)
+	result, err := c.AntflyClient.ClusterBackup(ctx, backupID, location, connection, tableNames)
 	if err != nil {
 		return fmt.Errorf("backup request failed: %w", err)
 	}
@@ -474,38 +479,43 @@ func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location str
 			fmt.Fprintf(os.Stderr, "  - %s: %s\n", table.Name, table.Status)
 		}
 	}
+	if result.Status != "completed" {
+		return fmt.Errorf("cluster backup did not complete: status %s", result.Status)
+	}
 	return nil
 }
 
 // ClusterRestore restores multiple tables from a cluster backup
-func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location string, tableNames []string, restoreMode string) error {
+func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location, connection string, tableNames []string, restoreMode, idempotencyKey string) error {
 	desc := "all tables"
 	if len(tableNames) > 0 {
 		desc = strings.Join(tableNames, ", ")
 	}
 	fmt.Fprintf(os.Stderr, "Sending RESTORE request for %s from backupID '%s', location '%s', mode '%s'\n", desc, backupID, location, restoreMode)
 
-	result, err := c.AntflyClient.ClusterRestore(ctx, backupID, location, tableNames, restoreMode)
+	job, err := c.AntflyClient.ClusterRestore(ctx, antfly.ClusterRestoreOptions{
+		BackupID:       backupID,
+		Location:       location,
+		Connection:     connection,
+		TableNames:     tableNames,
+		RestoreMode:    restoreMode,
+		IdempotencyKey: idempotencyKey,
+	})
 	if err != nil {
 		return fmt.Errorf("restore request failed: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Restore triggered with status: %s\n", result.Status)
-	for _, table := range result.Tables {
-		if table.Error != "" {
-			fmt.Fprintf(os.Stderr, "  - %s: %s (error: %s)\n", table.Name, table.Status, table.Error)
-		} else {
-			fmt.Fprintf(os.Stderr, "  - %s: %s\n", table.Name, table.Status)
-		}
-	}
+	fmt.Fprintf(os.Stderr, "Restore job %s accepted (phase: %s)\n", job.JobId, job.Phase)
 	return nil
 }
 
 // ListBackups lists available cluster backups at a location
-func (c *AntflyClient) ListBackups(ctx context.Context, location string) error {
+func (c *AntflyClient) ListBackups(ctx context.Context, location, connection string) error {
 	fmt.Fprintf(os.Stderr, "Sending LIST BACKUPS request for location '%s'\n", location)
 
-	backups, err := c.AntflyClient.ListBackups(ctx, location)
+	backups, err := c.AntflyClient.ListBackups(ctx, antfly.BackupListOptions{
+		Location: location, Connection: connection,
+	})
 	if err != nil {
 		return fmt.Errorf("list backups request failed: %w", err)
 	}

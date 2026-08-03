@@ -1,0 +1,10 @@
+{
+  "method": "POST",
+  "path": "/api/v1/antfly-benchmark/search",
+  "expect_nonempty_hits": true,
+  "body": {
+    "query": "body:alpha",
+    "max_hits": 10,
+    "sort_by": "_score"
+  }
+}

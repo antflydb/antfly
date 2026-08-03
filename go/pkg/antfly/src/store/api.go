@@ -17,6 +17,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -112,6 +114,31 @@ func safeJoinUnder(base, name string) (string, error) {
 	return joined, nil
 }
 
+func openLocalRestoreArtifact(root *os.Root, name string) (*os.File, error) {
+	if root == nil {
+		return nil, errors.New("local restore root is required")
+	}
+	if filepath.IsAbs(name) ||
+		filepath.Base(name) != name ||
+		strings.ContainsAny(name, `/\`) {
+		return nil, fmt.Errorf("path component %q must be a file name", name)
+	}
+	file, err := root.OpenFile(name, os.O_RDONLY|localRestoreNonblockingFlag, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, fmt.Errorf("local restore artifact %q is not a regular file", name)
+	}
+	return file, nil
+}
+
 func (h *StoreAPI) allowedLocalBackupDirs() ([]string, error) {
 	baseDir, err := filepath.Abs(h.antflyConfig.GetBaseDir())
 	if err != nil {
@@ -158,6 +185,26 @@ func (h *StoreAPI) localBackupDir(location string) (string, error) {
 	return "", fmt.Errorf("file backup location %s must be under antfly base directory or a directory listed in %s", dir, allowedFileBackupDirsEnv)
 }
 
+func (h *StoreAPI) authorizedLocalBackupDir(
+	connection, capability, location string,
+) (string, error) {
+	if strings.TrimSpace(connection) != "" {
+		return h.antflyConfig.ResolveFilesystemPath(connection, capability, location)
+	}
+	return h.localBackupDir(location)
+}
+
+func (h *StoreAPI) authorizedLocalRestoreRoot(
+	connection, capability, location string,
+) (*os.Root, error) {
+	if strings.TrimSpace(connection) == "" {
+		return nil, errors.New(
+			"local restores require a named filesystem connection",
+		)
+	}
+	return h.antflyConfig.OpenFilesystemPath(connection, capability, location)
+}
+
 func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {
 	if err := common.ValidateBackupID(backupID); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
@@ -169,58 +216,174 @@ func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {
 func downloadFromS3(
 	ctx context.Context,
 	logger *zap.Logger,
-	bucketURL, objectNameKey, destPath string,
+	objectNameKey, destPath string,
 	s3Info *common.S3Info,
+	artifact *common.BackupArtifactIntegrity,
 ) error {
-	bucketName, prefix, err := common.ParseS3URL(bucketURL)
-	if err != nil {
-		return fmt.Errorf("parsing bucket URL %s: %w", bucketURL, err)
-	}
-
 	// Construct full object key with optional prefix, matching the write path
 	// in WriteBackupToBlobStore.
 	fullObjectKey := objectNameKey
-	if prefix != "" {
-		fullObjectKey = path.Join(prefix, objectNameKey)
+	if s3Info.Prefix != "" {
+		fullObjectKey = path.Join(s3Info.Prefix, objectNameKey)
 	}
 
 	logger.Info("Downloading from S3",
-		zap.String("bucket", bucketName),
+		zap.String("bucket", s3Info.Bucket),
 		zap.String("object", fullObjectKey),
 		zap.String("destination", destPath))
-
-	// TODO: Enable multipart download with progress tracking using the SDK's DownloadObject
-	// method (../../../libaf/s3) when ready:
-	//
-	// opts := &s3.DownloadObjectOptions{
-	// 	ProgressFn: func(partNumber, partSize, totalParts int) {
-	// 		logger.Info("Downloading backup part",
-	// 			zap.Int("partNumber", partNumber),
-	// 			zap.Int("size", partSize),
-	// 			zap.Int("total", totalParts),
-	// 		)
-	// 	},
-	// }
-	// if err := s3Info.GetS3Credentials().DownloadObject(ctx, bucketName, fullObjectKey, destPath, opts); err != nil {
-	// 	return err
-	// }
 
 	// Simple download without progress tracking
 	minioClient, err := s3Info.NewMinioClient()
 	if err != nil {
 		return fmt.Errorf("creating S3 client for endpoint %s: %w", s3Info.Endpoint, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(destPath), os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
-		return fmt.Errorf("creating directory %s: %w", filepath.Dir(destPath), err)
+	initial, err := minioClient.StatObject(
+		ctx,
+		s3Info.Bucket,
+		fullObjectKey,
+		minio.StatObjectOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("statting object %s in bucket %s: %w", fullObjectKey, s3Info.Bucket, err)
 	}
-	if err := minioClient.FGetObject(ctx, bucketName, fullObjectKey, destPath, minio.GetObjectOptions{}); err != nil {
-		return fmt.Errorf("downloading object %s from bucket %s: %w", fullObjectKey, bucketName, err)
+	if artifact != nil && (initial.Size <= 0 || uint64(initial.Size) != artifact.SizeBytes) {
+		return fmt.Errorf(
+			"%w: %s has an unexpected object identity",
+			common.ErrBackupArtifactIntegrityMismatch,
+			artifact.Name,
+		)
+	}
+	options := minio.GetObjectOptions{}
+	if initial.ETag != "" {
+		options.SetMatchETag(initial.ETag)
+	}
+	object, err := minioClient.GetObject(
+		ctx,
+		s3Info.Bucket,
+		fullObjectKey,
+		options,
+	)
+	if err != nil {
+		return fmt.Errorf("downloading object %s from bucket %s: %w", fullObjectKey, s3Info.Bucket, err)
+	}
+	defer func() { _ = object.Close() }()
+	if err := copyRestoreArtifactAtomically(ctx, object, destPath, artifact); err != nil {
+		return fmt.Errorf("downloading object %s from bucket %s: %w", fullObjectKey, s3Info.Bucket, err)
+	}
+	current, err := minioClient.StatObject(
+		ctx,
+		s3Info.Bucket,
+		fullObjectKey,
+		minio.StatObjectOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("restatting object %s in bucket %s: %w", fullObjectKey, s3Info.Bucket, err)
+	}
+	if current.Size != initial.Size || current.ETag != initial.ETag {
+		return fmt.Errorf(
+			"%w: object %s changed during download",
+			common.ErrBackupArtifactIntegrityMismatch,
+			fullObjectKey,
+		)
 	}
 
 	logger.Info("Successfully downloaded from S3",
-		zap.String("bucket", bucketName),
+		zap.String("bucket", s3Info.Bucket),
 		zap.String("object", fullObjectKey),
 		zap.String("destination", destPath))
+	return nil
+}
+
+func restoreArtifactForFile(
+	restoreConfig *common.BackupConfig,
+	fileName string,
+) (*common.BackupArtifactIntegrity, error) {
+	if restoreConfig == nil {
+		return nil, nil
+	}
+	format, err := common.ValidateBackupFormat(restoreConfig.Format)
+	if err != nil {
+		return nil, err
+	}
+	switch format {
+	case common.BackupFormatNative:
+		if restoreConfig.Artifact != nil {
+			return nil, errors.New("native restore must not declare portable artifact integrity")
+		}
+		return nil, nil
+	case common.BackupFormatPortable:
+		if err := common.ValidateBackupArtifactIntegrity(restoreConfig.Artifact); err != nil {
+			return nil, err
+		}
+		if restoreConfig.Artifact.Name != fileName {
+			return nil, fmt.Errorf(
+				"portable restore artifact name mismatch: expected %q, got %q",
+				fileName,
+				restoreConfig.Artifact.Name,
+			)
+		}
+		return restoreConfig.Artifact, nil
+	default:
+		return nil, fmt.Errorf("unsupported backup format %q", format)
+	}
+}
+
+func copyRestoreArtifactAtomically(
+	ctx context.Context,
+	source io.Reader,
+	destPath string,
+	artifact *common.BackupArtifactIntegrity,
+) error {
+	destDir := filepath.Dir(destPath)
+	if err := os.MkdirAll(destDir, 0o750); err != nil {
+		return fmt.Errorf("creating restore directory: %w", err)
+	}
+	output, err := os.CreateTemp(destDir, "."+filepath.Base(destPath)+".restore-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary restore artifact: %w", err)
+	}
+	tempPath := output.Name()
+	defer func() {
+		_ = output.Close()
+		_ = os.Remove(tempPath)
+	}()
+	if err := output.Chmod(0o600); err != nil {
+		return fmt.Errorf("setting restore artifact permissions: %w", err)
+	}
+	if artifact != nil {
+		if err := common.VerifyBackupArtifact(
+			ctx,
+			io.TeeReader(source, output),
+			*artifact,
+		); err != nil {
+			return err
+		}
+	} else if _, err := io.Copy(output, source); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := output.Sync(); err != nil {
+		return fmt.Errorf("syncing restore artifact: %w", err)
+	}
+	if err := output.Close(); err != nil {
+		return fmt.Errorf("closing restore artifact: %w", err)
+	}
+	if err := os.Rename(tempPath, filepath.Clean(destPath)); err != nil {
+		return fmt.Errorf("publishing restore artifact: %w", err)
+	}
+	dir, err := os.Open(destDir)
+	if err != nil {
+		return fmt.Errorf("opening restore directory for sync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("syncing restore directory: %w", err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("closing restore directory: %w", err)
+	}
 	return nil
 }
 
@@ -356,62 +519,50 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if err := common.ValidateBackupID(req.RestoreConfig.BackupID); err != nil {
 						return fmt.Errorf("%w: invalid backup ID: %v", ErrBadRequest, err)
 					}
-					if !strings.HasPrefix(filePart.FileName(), req.RestoreConfig.BackupID) {
-						return fmt.Errorf("%w: uploaded file name %s does not match expected backup ID %s", ErrBadRequest, filePart.FileName(), req.RestoreConfig.BackupID)
+					format, err := common.ValidateBackupFormat(req.RestoreConfig.Format)
+					if err != nil {
+						return fmt.Errorf("%w: %v", ErrBadRequest, err)
 					}
 
 					// Here newShardID is shardIDForBackup and req.ShardConfig.RestoreConfig.BackupID is backupIDForLeader
 					backupFileName := common.ShardBackupFileName(req.RestoreConfig.BackupID, newShardID)
-					// Auto-detect portable backup from uploaded filename
-					if strings.HasSuffix(filePart.FileName(), ".afb") {
+					if format == common.BackupFormatPortable {
 						backupFileName = common.ShardPortableBackupFileName(req.RestoreConfig.BackupID, newShardID)
+					}
+					if filePart.FileName() != backupFileName {
+						return fmt.Errorf(
+							"%w: uploaded file name %q does not match canonical %s backup file %q",
+							ErrBadRequest,
+							filePart.FileName(),
+							format,
+							backupFileName,
+						)
+					}
+					artifact, err := restoreArtifactForFile(
+						req.RestoreConfig,
+						backupFileName,
+					)
+					if err != nil {
+						return fmt.Errorf("%w: %v", ErrBadRequest, err)
 					}
 					dataDir := h.antflyConfig.GetBaseDir()
 					snapDir := common.SnapDir(dataDir, newShardID, currentNodeID)
-					if err := os.MkdirAll(snapDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
-						return fmt.Errorf("creating snapshot directory %s: %w", snapDir, err)
-					}
 					destPath, err := safeJoinUnder(snapDir, backupFileName)
 					if err != nil {
 						return fmt.Errorf("%w: invalid backup path: %v", ErrBadRequest, err)
 					}
-					if _, err := os.Stat(destPath); err == nil { //nolint:gosec // G703: path validated under snap dir
-						// TODO (ajr) Send the expected checksum from the leader to verify integrity
-						h.logger.Info("Backup file already exists, skipping save",
-							zap.String("destPath", destPath),
-							zap.Stringer("newShardID", newShardID))
-					} else if !os.IsNotExist(err) {
-						return fmt.Errorf("statting destination file %s: %w", destPath, err)
-					} else {
-						h.logger.Info("Saving uploaded backup file",
-							zap.String("backupFileName", backupFileName),
-							zap.String("destPath", destPath),
-							zap.Stringer("newShardID", newShardID))
-						outFile, err := os.Create(filepath.Clean(destPath) + ".tmp")
-						if err != nil {
-							return fmt.Errorf("creating destination file %s: %w", destPath, err)
-						}
-						// Use a 64MB buffer for copying
-						buf := make([]byte, 64*1024*1024)
-						if _, err := io.CopyBuffer(outFile, filePart, buf); err != nil {
-							_ = outFile.Close()
-							return fmt.Errorf("saving uploaded file to %s: %w", destPath, err)
-						}
-						// Ensure all data is written to disk before rename
-						if err := outFile.Sync(); err != nil {
-							return fmt.Errorf("syncing file %s: %w", destPath, err)
-						}
-						if err := outFile.Close(); err != nil {
-							return fmt.Errorf("closing file %s: %w", destPath, err)
-						}
-						if err := os.Rename(outFile.Name(), filepath.Clean(destPath)); err != nil { //nolint:gosec // G703: internal path with traversal protection
-							return fmt.Errorf("renaming temp file to final destination %s: %w", destPath, err)
-						}
-						h.logger.Info("Successfully saved uploaded backup",
-							zap.String("backupFileName", backupFileName),
-							zap.String("destPath", destPath),
-							zap.Stringer("newShardID", newShardID))
+					if err := copyRestoreArtifactAtomically(
+						r.Context(),
+						filePart,
+						destPath,
+						artifact,
+					); err != nil {
+						return fmt.Errorf("saving uploaded file to %s: %w", destPath, err)
 					}
+					h.logger.Info("Successfully saved uploaded backup",
+						zap.String("backupFileName", backupFileName),
+						zap.String("destPath", destPath),
+						zap.Stringer("newShardID", newShardID))
 
 					initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 					// If err is http.ErrMissingFile, it's fine, just means no file was uploaded.
@@ -441,11 +592,18 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 			if err := common.ValidateBackupID(restoreConf.BackupID); err != nil {
 				return fmt.Errorf("%w: invalid backup ID: %v", ErrBadRequest, err)
 			}
-			format := common.NormalizeBackupFormat(restoreConf.Format)
+			format, err := common.ValidateBackupFormat(restoreConf.Format)
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrBadRequest, err)
+			}
 			// newShardID is the shardID for this node, restoreConf.BackupID is the ID given by the leader.
 			backupFileName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
 			if format == common.BackupFormatPortable {
 				backupFileName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
+			}
+			artifact, err := restoreArtifactForFile(restoreConf, backupFileName)
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrBadRequest, err)
 			}
 			dataDir := h.antflyConfig.GetBaseDir()
 			snapDir := common.SnapDir(
@@ -455,101 +613,76 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 			) // Directory creation handled by downloadFromS3 or local copy
 
 			if strings.HasPrefix(restoreConf.Location, "s3://") {
+				s3Info, err := h.antflyConfig.ResolveS3Info(
+					restoreConf.Connection,
+					"restore.read",
+					restoreConf.Location,
+				)
+				if err != nil {
+					return fmt.Errorf("%w: authorizing S3 restore: %v", ErrBadRequest, err)
+				}
 				destPath, err := safeJoinUnder(snapDir, backupFileName)
 				if err != nil {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
-				// Don't cancel the download if the request context is canceled,
-				// it could take a while.
-				if err := downloadFromS3(context.Background(), h.logger, restoreConf.Location, backupFileName, destPath, &h.antflyConfig.Storage.S3); err != nil {
-					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
-					if format == common.BackupFormatNative {
-						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
-					}
-					alternateDestPath, alternatePathErr := safeJoinUnder(snapDir, alternateName)
-					if alternatePathErr != nil {
-						alternateDestPath = destPath
-					}
-					alternateErr := downloadFromS3(context.Background(), h.logger, restoreConf.Location, alternateName, alternateDestPath, &h.antflyConfig.Storage.S3)
-					if alternateErr != nil {
-						h.logger.Error(
-							"Failed to download backup from S3 for shard",
-							zap.Stringer("newShardID", newShardID),
-							zap.Error(err),
-							zap.NamedError("fallbackError", alternateErr),
-						)
-						return fmt.Errorf(
-							"downloading s3 backup (%s, object: %s): %w; fallback object %s: %v",
-							restoreConf.Location,
-							backupFileName,
-							err,
-							alternateName,
-							alternateErr,
-						)
-					}
-					backupFileName = alternateName
+				if err := downloadFromS3(
+					r.Context(),
+					h.logger,
+					backupFileName,
+					destPath,
+					&s3Info,
+					artifact,
+				); err != nil {
+					return fmt.Errorf(
+						"downloading %s backup from %s (object: %s): %w",
+						format,
+						restoreConf.Location,
+						backupFileName,
+						err,
+					)
 				}
 				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 			} else if strings.HasPrefix(restoreConf.Location, "file://") {
 				// This case might occur if the leader specifies a local file path accessible to this node,
 				// though typically for file transfers it would use multipart. Restrict local filesystem
 				// restore sources to the configured Antfly base directory.
-				localBasePath, err := h.localBackupDir(restoreConf.Location)
+				localRoot, err := h.authorizedLocalRestoreRoot(
+					restoreConf.Connection,
+					"restore.read",
+					restoreConf.Location,
+				)
 				if err != nil {
 					return fmt.Errorf("%w: invalid restore location: %v", ErrBadRequest, err)
 				}
-				srcPath, err := safeJoinUnder(localBasePath, backupFileName)
-				if err != nil {
-					return fmt.Errorf("%w: invalid restore path: %v", ErrBadRequest, err)
-				}
+				defer func() { _ = localRoot.Close() }()
+				srcPath := filepath.Join(localRoot.Name(), backupFileName)
 
-				if _, statErr := os.Stat(srcPath); os.IsNotExist(statErr) {
-					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
-					if format == common.BackupFormatNative {
-						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
-					}
-					alternatePath, alternatePathErr := safeJoinUnder(localBasePath, alternateName)
-					if alternatePathErr == nil {
-						if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-							backupFileName = alternateName
-							srcPath = alternatePath
-						}
-					}
-				}
 				destPath, err := safeJoinUnder(snapDir, backupFileName)
 				if err != nil {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
 
-				if _, err := os.Stat(srcPath); err == nil { //nolint:gosec // G703: path from internal config
-					if err := os.MkdirAll(snapDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
-						return fmt.Errorf("creating snapshot directory %s: %w", snapDir, err)
+				input, err := openLocalRestoreArtifact(localRoot, backupFileName)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						return fmt.Errorf("local restore artifact %s does not exist", srcPath)
 					}
-					input, err := os.Open(filepath.Clean(srcPath))
-					if err != nil {
-						return fmt.Errorf("opening local backup file %s: %w", srcPath, err)
-					}
-					defer func() { _ = input.Close() }()
-					output, err := os.Create(filepath.Clean(destPath))
-					if err != nil {
-						return fmt.Errorf("creating destination backup file %s: %w", destPath, err)
-					}
-					defer func() { _ = output.Close() }()
-					buf := make([]byte, 64*1024*1024) // 64MB buffer
-					if _, err := io.CopyBuffer(output, input, buf); err != nil {
-						return fmt.Errorf("copying local backup file from %s to %s: %w", srcPath, destPath, err)
-					}
-					h.logger.Info("Successfully copied local backup",
-						zap.String("backupFileName", backupFileName),
-						zap.String("destPath", destPath),
-						zap.Stringer("newShardID", newShardID))
-					initWithDBArchive = initArchiveFromBackupFile(backupFileName)
-				} else {
-					h.logger.Warn("RestoreConfig for shard specified local file, but it was not found",
-						zap.Stringer("newShardID", newShardID),
-						zap.String("srcPath", srcPath))
-					// Not necessarily a fatal error for the handler here, PebbleStorage will try to load this archive name.
+					return fmt.Errorf("opening local backup file %s: %w", srcPath, err)
 				}
+				defer func() { _ = input.Close() }()
+				if err := copyRestoreArtifactAtomically(
+					r.Context(),
+					input,
+					destPath,
+					artifact,
+				); err != nil {
+					return fmt.Errorf("copying local backup file from %s to %s: %w", srcPath, destPath, err)
+				}
+				h.logger.Info("Successfully copied local backup",
+					zap.String("backupFileName", backupFileName),
+					zap.String("destPath", destPath),
+					zap.Stringer("newShardID", newShardID))
+				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 			}
 		}
 
@@ -1031,27 +1164,37 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 	// Native backup: create tar.zst of Pebble checkpoint
 	// FIXME (ajr) Backups should include the byte range of the shard maybe?
 	fileName := common.ShardBackupFileName(req.BackupID, shardID)
-	var localDir string
-	if strings.HasPrefix(req.Location, "file://") {
-		var err error
-		localDir, err = h.localBackupDir(req.Location)
+	isFileBackup := strings.HasPrefix(req.Location, "file://")
+	if isFileBackup {
+		_, err := h.authorizedLocalBackupDir(
+			req.Connection,
+			"backup.write",
+			req.Location,
+		)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 			return
 		}
 	}
-	if err := shard.Backup(r.Context(), req.Location, strings.TrimSuffix(fileName, ".tar.zst")); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to backup: %v", err), http.StatusInternalServerError)
+	shardBackup := req
+	shardBackup.BackupID = strings.TrimSuffix(fileName, ".tar.zst")
+	if isFileBackup {
+		// The store owns only the staged shard snapshot. The metadata
+		// coordinator publishes the streamed response into the authorized
+		// external filesystem location.
+		shardBackup.Connection = ""
+		shardBackup.Location = ""
+	}
+	if err := shard.Backup(r.Context(), shardBackup); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, common.ErrBackupAlreadyExists) {
+			status = http.StatusConflict
+		}
+		http.Error(w, fmt.Sprintf("Failed to backup: %v", err), status)
 		return
 	}
 
-	if strings.HasPrefix(req.Location, "file://") {
-		// Try user-provided location first (single-node), then fall back to snapDir (distributed)
-		userPath, err := safeJoinUnder(localDir, fileName)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid backup path: %v", err), http.StatusBadRequest)
-			return
-		}
+	if isFileBackup {
 		dataDir := h.antflyConfig.GetBaseDir()
 		snapDir := common.SnapDir(dataDir, shardID, h.store.ID())
 		snapPath, err := safeJoinUnder(snapDir, fileName)
@@ -1060,11 +1203,7 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		filePath := userPath
-		if _, err := os.Stat(userPath); os.IsNotExist(err) { //nolint:gosec // G703: internal path with traversal protection
-			filePath = snapPath
-		}
-		file, err := os.Open(filepath.Clean(filePath)) //nolint:gosec // G703: internal path with traversal protection
+		file, err := os.Open(filepath.Clean(snapPath)) //nolint:gosec // G703: internal path with traversal protection
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to open backup file: %v", err), http.StatusNotFound)
 			return
@@ -1085,9 +1224,8 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 
-		// Stream the file content to the response body
-		buf := make([]byte, 64*1024*1024) // 64MB buffer
-		if _, err := io.CopyBuffer(w, file, buf); err != nil {
+		// Stream the file content to the response body.
+		if _, err := io.Copy(w, file); err != nil {
 			http.Error(w, "Error streaming file", http.StatusInternalServerError)
 			return
 		}
@@ -1100,45 +1238,79 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	destDir := common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
 	streamResponse := false
 	if strings.HasPrefix(req.Location, "file://") {
-		localDir, err := h.localBackupDir(req.Location)
-		if err != nil {
+		if _, err := h.authorizedLocalBackupDir(
+			req.Connection,
+			"backup.write",
+			req.Location,
+		); err != nil {
 			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 			return
 		}
-		destDir = localDir
 		streamResponse = true
 	} else if req.Location == "" {
 		streamResponse = true
 	}
-	destPath, err := safeJoinUnder(destDir, fileName)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid backup path: %v", err), http.StatusBadRequest)
-		return
-	}
-
 	if err := os.MkdirAll(destDir, 0o750); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create backup dir: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	file, err := os.Create(filepath.Clean(destPath)) //nolint:gosec // internal path
+	file, err := os.CreateTemp(destDir, "."+fileName+".tmp-*") //nolint:gosec // internal path
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create backup file: %v", err), http.StatusInternalServerError)
 		return
 	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
 
-	if err := shard.ExportPortable(r.Context(), file); err != nil {
+	artifactHasher := sha256.New()
+	if err := shard.ExportPortable(r.Context(), io.MultiWriter(file, artifactHasher)); err != nil {
 		_ = file.Close()
-		_ = os.Remove(destPath)
 		http.Error(w, fmt.Sprintf("Failed to export portable backup: %v", err), http.StatusInternalServerError)
 		return
 	}
-	_ = file.Close()
-
+	if err := r.Context().Err(); err != nil {
+		_ = file.Close()
+		http.Error(w, fmt.Sprintf("Portable backup was interrupted: %v", err), http.StatusRequestTimeout)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		http.Error(w, fmt.Sprintf("Failed to sync portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := file.Close(); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to close portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := r.Context().Err(); err != nil {
+		http.Error(w, fmt.Sprintf("Portable backup was interrupted: %v", err), http.StatusRequestTimeout)
+		return
+	}
+	fileInfo, err := os.Stat(filepath.Clean(tempPath))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to stat portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set(common.BackupArtifactNameHeader, fileName)
+	w.Header().Set(common.BackupArtifactSizeHeader, strconv.FormatInt(fileInfo.Size(), 10))
+	w.Header().Set(common.BackupArtifactSHA256Header, hex.EncodeToString(artifactHasher.Sum(nil)))
 	if strings.HasPrefix(req.Location, "s3://") {
-		if err := db.WriteBackupToBlobStore(context.Background(), req.Location, destPath, &h.antflyConfig.Storage.S3); err != nil {
-			_ = os.Remove(destPath)
-			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), http.StatusInternalServerError)
+		s3Info, err := h.antflyConfig.ResolveS3Info(
+			req.Connection,
+			"backup.write",
+			req.Location,
+		)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid S3 backup location: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := db.WriteBackupToBlobStore(r.Context(), tempPath, &s3Info); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, common.ErrBackupAlreadyExists) {
+				status = http.StatusConflict
+			}
+			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), status)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -1150,14 +1322,14 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Stream the file back in the response
-	file, err = os.Open(filepath.Clean(destPath)) //nolint:gosec // internal path
+	file, err = os.Open(filepath.Clean(tempPath)) //nolint:gosec // internal path
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to open backup file: %v", err), http.StatusNotFound)
 		return
 	}
 	defer func() { _ = file.Close() }()
 
-	fileInfo, err := file.Stat()
+	fileInfo, err = file.Stat()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to stat backup file: %v", err), http.StatusInternalServerError)
 		return
@@ -1167,8 +1339,7 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 
-	buf := make([]byte, 64*1024*1024) // 64MB buffer
-	if _, err := io.CopyBuffer(w, file, buf); err != nil {
+	if _, err := io.Copy(w, file); err != nil {
 		http.Error(w, "Error streaming file", http.StatusInternalServerError)
 		return
 	}

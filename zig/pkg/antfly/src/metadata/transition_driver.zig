@@ -60,6 +60,14 @@ pub const TransitionDriver = struct {
         record: *transition_state.SplitTransitionRecord,
     ) !StepResult {
         const observation = try runtime.observeSplit(record.*);
+        return try stepSplitObserved(runtime, record, observation);
+    }
+
+    pub fn stepSplitObserved(
+        runtime: TransitionRuntime,
+        record: *transition_state.SplitTransitionRecord,
+        observation: transition_state.SplitObservation,
+    ) !StepResult {
         const decision = transition_controller.TransitionController.planSplit(record.*, observation);
         try runtime.execute(decision.action);
         record.phase = decision.next_phase;
@@ -76,6 +84,14 @@ pub const TransitionDriver = struct {
         record: *transition_state.MergeTransitionRecord,
     ) !StepResult {
         const observation = try runtime.observeMerge(record.*);
+        return try stepMergeObserved(runtime, record, observation);
+    }
+
+    pub fn stepMergeObserved(
+        runtime: TransitionRuntime,
+        record: *transition_state.MergeTransitionRecord,
+        observation: transition_state.MergeObservation,
+    ) !StepResult {
         const decision = transition_controller.TransitionController.planMerge(record.*, observation);
         try runtime.execute(decision.action);
         record.phase = decision.next_phase;
@@ -219,6 +235,7 @@ test "metadata transition driver steps split and merge through runtime interface
 
     var split = transition_state.SplitTransitionRecord{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 11,
         .split_key = "doc:m",

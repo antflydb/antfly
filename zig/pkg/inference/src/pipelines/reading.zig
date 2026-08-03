@@ -148,6 +148,439 @@ pub const ReadingPipeline = struct {
         return self.readPixelValues(pixel_values);
     }
 
+    /// Read text from a homogeneous image batch. Unsupported model families fall
+    /// back to the existing serial path; native Florence uses a batched encoder
+    /// and KV-decoder path where the selected backend supports it.
+    pub fn readBatch(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const allocator = self.allocator;
+        if (image_datas.len == 0) return try allocator.alloc(ReadResult, 0);
+        if (image_datas.len == 1) {
+            const out = try allocator.alloc(ReadResult, 1);
+            errdefer allocator.free(out);
+            out[0] = try self.read(image_datas[0]);
+            return out;
+        }
+        if (expectsFlattenedPatches(self.vision_encoder)) return self.readBatchSerial(image_datas);
+
+        if (session_factory.getFlorenceConfig(self.vision_encoder) != null) {
+            return self.readBatchNativeFlorenceChunked(image_datas) catch |err| switch (err) {
+                error.UnsupportedShape,
+                error.UnsupportedOperation,
+                error.UnsupportedFlorence2ResidentMetal,
+                => self.readBatchSerial(image_datas),
+                else => return err,
+            };
+        }
+
+        return self.readBatchSerial(image_datas);
+    }
+
+    fn readBatchSerial(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const allocator = self.allocator;
+        const out = try allocator.alloc(ReadResult, image_datas.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            allocator.free(out);
+        }
+
+        for (image_datas, 0..) |image_data, i| {
+            out[i] = try self.read(image_data);
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn readBatchNativeFlorenceChunked(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const allocator = self.allocator;
+        const max_batch = nativeFlorenceReadBatchSize();
+        if (max_batch <= 1) return self.readBatchSerial(image_datas);
+
+        const out = try allocator.alloc(ReadResult, image_datas.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            allocator.free(out);
+        }
+
+        var offset: usize = 0;
+        while (offset < image_datas.len) {
+            const chunk_len = @min(max_batch, image_datas.len - offset);
+            const chunk = image_datas[offset .. offset + chunk_len];
+            const chunk_results = try self.readBatchNativeFlorence(chunk);
+            if (chunk_results.len != chunk_len) {
+                for (chunk_results) |*result| result.deinit();
+                allocator.free(chunk_results);
+                return error.InvalidReadResultCount;
+            }
+            {
+                defer allocator.free(chunk_results);
+                for (chunk_results, 0..) |result, i| {
+                    out[offset + i] = result;
+                }
+            }
+            filled += chunk_results.len;
+            offset += chunk_len;
+        }
+
+        return out;
+    }
+
+    fn readBatchNativeFlorence(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const allocator = self.allocator;
+        const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return error.InvalidModelForReading;
+        const batch = image_datas.len;
+        if (batch == 0) return try allocator.alloc(ReadResult, 0);
+
+        resetLastReadTelemetry();
+        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+        const img_size: u32 = @intCast(self.config.image_size);
+        const ts: usize = @intCast(img_size);
+        const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+        const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+        const pixel_count = std.math.mul(usize, batch, per_image) catch return error.InvalidInputShape;
+        const pixel_values = try allocator.alloc(f32, pixel_count);
+        defer allocator.free(pixel_values);
+
+        for (image_datas, 0..) |image_data, i| {
+            {
+                const decoded = try image.decode(allocator, image_data);
+                defer decoded.deinit(allocator);
+                const single = try image.preprocessDecodedWithResample(
+                    allocator,
+                    decoded,
+                    img_size,
+                    self.config.image_mean,
+                    self.config.image_std,
+                    self.config.resample,
+                );
+                defer allocator.free(single);
+                @memcpy(pixel_values[i * per_image ..][0..per_image], single);
+            }
+        }
+
+        const prompt_text = self.config.prompt orelse "<OCR>";
+        const prompt_i32 = try buildFlorencePromptIds(
+            allocator,
+            self.tokenizer,
+            florence_cfg,
+            prompt_text,
+        );
+        defer allocator.free(prompt_i32);
+
+        const prompt_len = prompt_i32.len;
+        const prompt_total = std.math.mul(usize, batch, prompt_len) catch return error.InvalidInputShape;
+        const prompt_i64 = try allocator.alloc(i64, prompt_total);
+        defer allocator.free(prompt_i64);
+        for (0..batch) |b| {
+            for (prompt_i32, 0..) |id, i| prompt_i64[b * prompt_len + i] = id;
+        }
+
+        var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
+        defer cb.deinit();
+
+        if (debug_cuda_session) std.log.info("reading: native florence batch encoder start batch={d}", .{batch});
+        const encoder_start = nowNs();
+        const encoder = try florence_arch.encoderForwardTensor(
+            &cb,
+            allocator,
+            florence_cfg,
+            pixel_values,
+            batch,
+            prompt_i64,
+            prompt_len,
+        );
+        logReadProfile("batch_encoder", encoder_start);
+        defer cb.free(encoder.hidden);
+
+        const decode_start = nowNs();
+        const backend = self.vision_encoder.backend();
+        if ((backend == .cuda or backend == .metal) and !florenceKvCacheDisabled()) {
+            last_read_telemetry.resident_decoder = true;
+            last_read_telemetry.kv_cache = true;
+            last_read_telemetry.cuda_graph_replay = false;
+            last_read_telemetry.cuda_graph_fallback_reason = "batched_florence_kv_decode";
+            const kv_result = self.decodeNativeFlorenceBatchIncrementalFromEncoder(&cb, florence_cfg, encoder.hidden, batch, encoder.seq_len) catch |err| fallback: {
+                if (!shouldFallbackFlorenceIncremental(err)) return err;
+                markFlorenceIncrementalFallback();
+                break :fallback null;
+            };
+            if (kv_result) |result| {
+                logReadProfile("batch_kv_decode_from_encoder", decode_start);
+                return result;
+            }
+        }
+        const result = try self.decodeNativeFlorenceBatchFromEncoder(&cb, florence_cfg, encoder.hidden, batch, encoder.seq_len);
+        logReadProfile("batch_decode_from_encoder", decode_start);
+        return result;
+    }
+
+    fn decodeNativeFlorenceBatchIncrementalFromEncoder(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        encoder_hidden: CT,
+        batch: usize,
+        enc_seq_len: usize,
+    ) ![]ReadResult {
+        const allocator = self.allocator;
+        const max_len = self.config.max_length;
+        const out = try allocator.alloc(ReadResult, batch);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            allocator.free(out);
+        }
+        if (max_len == 0) {
+            for (out) |*result| {
+                result.* = .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+                filled += 1;
+            }
+            return out;
+        }
+
+        const dec_id_count = std.math.mul(usize, batch, max_len) catch return error.InvalidInputShape;
+        const dec_ids = try allocator.alloc(i64, dec_id_count);
+        defer allocator.free(dec_ids);
+        @memset(dec_ids, @as(i64, self.config.pad_token_id));
+
+        var lengths = try allocator.alloc(usize, batch);
+        defer allocator.free(lengths);
+        var finished = try allocator.alloc(bool, batch);
+        defer allocator.free(finished);
+        @memset(finished, false);
+
+        var dec_len: usize = 1;
+        for (0..batch) |b| {
+            dec_ids[b * max_len] = @as(i64, self.config.decoder_start_token_id);
+            lengths[b] = 1;
+            if (self.config.forced_bos_token_id) |forced_bos| {
+                if (max_len > 1) {
+                    dec_ids[b * max_len + 1] = @as(i64, forced_bos);
+                    lengths[b] = 2;
+                    dec_len = 2;
+                }
+            }
+        }
+
+        const cache_start = nowNs();
+        var cache = try florence_arch.buildDecoderIncrementalCache(cb, allocator, florence_cfg, encoder_hidden, batch, enc_seq_len, max_len);
+        defer cache.deinit(cb, allocator);
+        last_read_telemetry.kv_cache_mode = if (cache.self.preallocated) "batched_preallocated" else "batched_concat";
+        logReadProfile("batch_florence_decoder_kv_cache_build", cache_start);
+
+        var hidden_opt: ?CT = null;
+        defer if (hidden_opt) |hidden| cb.free(hidden);
+
+        const step_tokens = try allocator.alloc(i64, batch);
+        defer allocator.free(step_tokens);
+        for (0..dec_len) |idx| {
+            for (0..batch) |b| step_tokens[b] = dec_ids[b * max_len + idx];
+            const prefix_step_start = nowNs();
+            const hidden = try florence_arch.decoderForwardIncrementalBatchStepFinalHiddenTensor(
+                cb,
+                allocator,
+                florence_cfg,
+                step_tokens,
+                &cache,
+            );
+            if (idx + 1 == dec_len) {
+                hidden_opt = hidden;
+            } else {
+                cb.free(hidden);
+            }
+            logReadProfileStep("batch_florence_decoder_kv_prefix_step", idx + 1, idx + 1, nowNs() - prefix_step_start);
+        }
+
+        var finished_count: usize = 0;
+        var decoder_run_total_ns: u64 = 0;
+        var decoder_steps: usize = 0;
+        while (dec_len < max_len and finished_count < batch) {
+            {
+                const hidden = hidden_opt orelse return error.InvalidInputShape;
+                hidden_opt = null;
+                var hidden_live = true;
+                errdefer if (hidden_live) cb.free(hidden);
+
+                const logits_tensor = try florence_arch.decoderLmHeadLogitsRowsFromFinalHiddenTensor(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    hidden,
+                    batch,
+                );
+                hidden_live = false;
+                defer cb.free(logits_tensor);
+                const logits = try cb.toFloat32(logits_tensor, allocator);
+                defer allocator.free(logits);
+
+                const vocab_size = florence_cfg.vocab_size;
+                for (0..batch) |b| {
+                    if (finished[b]) {
+                        step_tokens[b] = @as(i64, self.config.pad_token_id);
+                        continue;
+                    }
+                    const row = dec_ids[b * max_len ..][0..max_len];
+                    const logits_offset = std.math.mul(usize, b, vocab_size) catch return error.InvalidInputShape;
+                    const last_logits = logits[logits_offset..][0..vocab_size];
+                    const best_id = selectGreedyToken(last_logits, row[0..dec_len], self.config.no_repeat_ngram_size);
+                    if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) {
+                        finished[b] = true;
+                        finished_count += 1;
+                        lengths[b] = dec_len;
+                        step_tokens[b] = @as(i64, self.config.pad_token_id);
+                    } else {
+                        const token: i64 = @intCast(best_id);
+                        row[dec_len] = token;
+                        step_tokens[b] = token;
+                        lengths[b] = dec_len + 1;
+                    }
+                }
+            }
+
+            dec_len += 1;
+            decoder_steps += 1;
+            if (dec_len < max_len and finished_count < batch) {
+                const decoder_run_start = nowNs();
+                hidden_opt = try florence_arch.decoderForwardIncrementalBatchStepFinalHiddenTensor(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    step_tokens,
+                    &cache,
+                );
+                const decoder_run_ns = nowNs() - decoder_run_start;
+                decoder_run_total_ns += decoder_run_ns;
+                logReadProfileStep("batch_florence_decoder_kv_step", decoder_steps, dec_len, decoder_run_ns);
+            }
+        }
+        logReadProfileStep("batch_florence_decoder_kv_run_total", decoder_steps, dec_len, decoder_run_total_ns);
+
+        for (0..batch) |b| {
+            const row = dec_ids[b * max_len ..][0..max_len];
+            out[b] = try self.decodeGeneratedIds(row[0..lengths[b]], lengths[b]);
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn decodeNativeFlorenceBatchFromEncoder(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        encoder_hidden: CT,
+        batch: usize,
+        enc_seq_len: usize,
+    ) ![]ReadResult {
+        const allocator = self.allocator;
+        const max_len = self.config.max_length;
+        const out = try allocator.alloc(ReadResult, batch);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            allocator.free(out);
+        }
+        if (max_len == 0) {
+            for (out, 0..) |*result, i| {
+                _ = i;
+                result.* = .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+                filled += 1;
+            }
+            return out;
+        }
+
+        const encoder_mask_len = std.math.mul(usize, batch, enc_seq_len) catch return error.InvalidInputShape;
+        const encoder_attention_mask = try allocator.alloc(i64, encoder_mask_len);
+        defer allocator.free(encoder_attention_mask);
+        @memset(encoder_attention_mask, 1);
+
+        const dec_id_count = std.math.mul(usize, batch, max_len) catch return error.InvalidInputShape;
+        const dec_ids = try allocator.alloc(i64, dec_id_count);
+        defer allocator.free(dec_ids);
+        @memset(dec_ids, @as(i64, self.config.pad_token_id));
+
+        var lengths = try allocator.alloc(usize, batch);
+        defer allocator.free(lengths);
+        var finished = try allocator.alloc(bool, batch);
+        defer allocator.free(finished);
+        @memset(finished, false);
+
+        var dec_len: usize = 1;
+        for (0..batch) |b| {
+            dec_ids[b * max_len] = @as(i64, self.config.decoder_start_token_id);
+            lengths[b] = 1;
+            if (self.config.forced_bos_token_id) |forced_bos| {
+                if (max_len > 1) {
+                    dec_ids[b * max_len + 1] = @as(i64, forced_bos);
+                    lengths[b] = 2;
+                    dec_len = 2;
+                }
+            }
+        }
+
+        const decode_loop_start = nowNs();
+        var decoder_run_total_ns: u64 = 0;
+        var decoder_steps: usize = 0;
+        var finished_count: usize = 0;
+        while (dec_len < max_len and finished_count < batch) {
+            {
+                const decoder_input_ids = try compactDecoderInputIds(allocator, dec_ids, batch, max_len, dec_len);
+                defer allocator.free(decoder_input_ids);
+
+                const decoder_run_start = nowNs();
+                const logits = try florence_arch.decoderForward(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    decoder_input_ids,
+                    encoder_hidden,
+                    encoder_attention_mask,
+                    batch,
+                    dec_len,
+                    enc_seq_len,
+                );
+                const decoder_run_ns = nowNs() - decoder_run_start;
+                decoder_run_total_ns += decoder_run_ns;
+                decoder_steps += 1;
+                logReadProfileStep("batch_decoder_run", decoder_steps, dec_len, decoder_run_ns);
+                defer allocator.free(logits);
+
+                const vocab_size = florence_cfg.vocab_size;
+                for (0..batch) |b| {
+                    if (finished[b]) {
+                        dec_ids[b * max_len + dec_len] = @as(i64, self.config.pad_token_id);
+                        continue;
+                    }
+                    const row = dec_ids[b * max_len ..][0..max_len];
+                    const batch_decode_offset = std.math.mul(usize, b, dec_len) catch return error.InvalidInputShape;
+                    const token_offset = std.math.add(usize, batch_decode_offset, dec_len - 1) catch return error.InvalidInputShape;
+                    const logits_offset = std.math.mul(usize, token_offset, vocab_size) catch return error.InvalidInputShape;
+                    const last_logits = logits[logits_offset..][0..vocab_size];
+                    const best_id = selectGreedyToken(last_logits, row[0..dec_len], self.config.no_repeat_ngram_size);
+                    if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) {
+                        finished[b] = true;
+                        finished_count += 1;
+                        lengths[b] = dec_len;
+                        dec_ids[b * max_len + dec_len] = @as(i64, self.config.pad_token_id);
+                    } else {
+                        dec_ids[b * max_len + dec_len] = @intCast(best_id);
+                        lengths[b] = dec_len + 1;
+                    }
+                }
+            }
+            dec_len += 1;
+        }
+        logReadProfileStep("batch_decoder_total", decoder_steps, dec_len, nowNs() - decode_loop_start);
+        logReadProfileStep("batch_decoder_run_total", decoder_steps, dec_len, decoder_run_total_ns);
+
+        for (0..batch) |b| {
+            const row = dec_ids[b * max_len ..][0..max_len];
+            out[b] = try self.decodeGeneratedIds(row[0..lengths[b]], lengths[b]);
+            filled += 1;
+        }
+        return out;
+    }
+
     /// Read text from an already-decoded image crop.
     pub fn readDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
         resetLastReadTelemetry();
@@ -192,10 +625,6 @@ pub const ReadingPipeline = struct {
         var prompt_tensor: ?backends.Tensor = null;
         defer if (prompt_tensor) |*t| t.deinit();
 
-        if (is_native_florence and self.vision_encoder.backend() == .metal) {
-            return error.UnsupportedFlorence2ResidentMetal;
-        }
-
         const encoder_outputs = if (is_native_florence) blk: {
             const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder).?;
             const prompt_text = self.config.prompt orelse "<OCR>";
@@ -230,6 +659,7 @@ pub const ReadingPipeline = struct {
         }
 
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
+        logTensorStatsF32("encoder_hidden(session)", encoder_outputs[0].asFloat32());
         if (debug_cuda_session) std.log.info("reading: decode from encoder outputs start", .{});
         const decode_start = nowNs();
         const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
@@ -407,6 +837,12 @@ pub const ReadingPipeline = struct {
         )) orelse return null;
         defer cb.free(encoder.hidden);
 
+        if (florenceDebugStats()) {
+            const hidden_host = try cb.toFloat32(encoder.hidden, allocator);
+            defer allocator.free(hidden_host);
+            logTensorStatsF32("encoder_hidden(resident)", hidden_host);
+        }
+
         const encoder_attention_mask = try allocator.alloc(i64, encoder.seq_len);
         defer allocator.free(encoder_attention_mask);
         @memset(encoder_attention_mask, 1);
@@ -424,21 +860,30 @@ pub const ReadingPipeline = struct {
             }
         }
 
-        if (backend == .cuda and !florenceKvCacheDisabled()) {
+        // Incremental KV-cache decode is default-on for both device backends;
+        // ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE is the kill switch.
+        const kv_cache_backend_ok = backend == .cuda or backend == .metal;
+        if (kv_cache_backend_ok and !florenceKvCacheDisabled()) {
             last_read_telemetry.kv_cache = true;
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
             const decode_start = nowNs();
-            const result = try self.decodeFlorenceResidentIncremental(
+            const result = self.decodeFlorenceResidentIncremental(
                 &cb,
                 florence_cfg,
                 encoder.hidden,
                 encoder.seq_len,
                 dec_ids,
                 dec_len,
-            );
-            logReadProfile("florence_resident_kv_decode", decode_start);
-            return result;
+            ) catch |err| fallback: {
+                if (!shouldFallbackFlorenceIncremental(err)) return err;
+                markFlorenceIncrementalFallback();
+                break :fallback null;
+            };
+            if (result) |decoded| {
+                logReadProfile("florence_resident_kv_decode", decode_start);
+                return decoded;
+            }
         }
 
         while (dec_len < max_len) {
@@ -454,6 +899,13 @@ pub const ReadingPipeline = struct {
                 encoder.seq_len,
             )) orelse return null;
             defer cb.free(logits);
+
+            if (florenceDebugStats() and dec_len <= 5) {
+                const logits_host = try cb.toFloat32(logits, allocator);
+                defer allocator.free(logits_host);
+                const last_row = logits_host[(dec_len - 1) * florence_cfg.vocab_size ..][0..florence_cfg.vocab_size];
+                logTopLogits("logits(resident)", dec_len, last_row);
+            }
 
             const suppress_tokens = try buildNoRepeatSuppressTokens(
                 allocator,
@@ -838,6 +1290,7 @@ pub const ReadingPipeline = struct {
 
             // Last position logits
             const last_logits = logits[(dec_len - 1) * vocab_size ..][0..vocab_size];
+            if (decoder_steps <= 4) logTopLogits("logits(session)", decoder_steps, last_logits);
 
             // Greedy: argmax
             const best_id = selectGreedyToken(last_logits, dec_ids[0..dec_len], self.config.no_repeat_ngram_size);
@@ -874,12 +1327,104 @@ pub const ReadingPipeline = struct {
     }
 };
 
+fn compactDecoderInputIds(
+    allocator: std.mem.Allocator,
+    dec_ids: []const i64,
+    batch: usize,
+    max_len: usize,
+    dec_len: usize,
+) ![]i64 {
+    const total = std.math.mul(usize, batch, dec_len) catch return error.InvalidInputShape;
+    const out = try allocator.alloc(i64, total);
+    errdefer allocator.free(out);
+    for (0..batch) |b| {
+        const dst = std.math.mul(usize, b, dec_len) catch return error.InvalidInputShape;
+        const src = std.math.mul(usize, b, max_len) catch return error.InvalidInputShape;
+        @memcpy(out[dst..][0..dec_len], dec_ids[src..][0..dec_len]);
+    }
+    return out;
+}
+
+fn nativeFlorenceReadBatchSize() usize {
+    const raw = platform.env.getenv("ANTFLY_INFERENCE_READ_BATCH_SIZE") orelse return 8;
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return 8;
+    return std.math.clamp(parsed, 1, 64);
+}
+
+fn shouldFallbackFlorenceIncremental(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidInputShape, error.UnsupportedOperation, error.UnsupportedShape => true,
+        else => false,
+    };
+}
+
+fn markFlorenceIncrementalFallback() void {
+    last_read_telemetry.kv_cache = false;
+    last_read_telemetry.kv_cache_mode = null;
+    last_read_telemetry.lm_head_path = null;
+    last_read_telemetry.cuda_graph_replay = false;
+    last_read_telemetry.cuda_graph_capture_steps = 0;
+    last_read_telemetry.cuda_graph_replay_steps = 0;
+    last_read_telemetry.cuda_graph_fallback_reason = "florence_incremental_decode_unsupported";
+}
+
 fn readProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
 }
 
 fn florenceKvCacheDisabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE");
+}
+
+fn florenceDebugStats() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DEBUG_STATS");
+}
+
+fn logTensorStatsF32(label: []const u8, values: []const f32) void {
+    if (!florenceDebugStats()) return;
+    if (values.len == 0) {
+        std.log.info("florence-debug {s}: empty", .{label});
+        return;
+    }
+    var sum: f64 = 0;
+    var absmax: f32 = 0;
+    for (values) |v| {
+        sum += v;
+        const a = @abs(v);
+        if (a > absmax) absmax = a;
+    }
+    const mean = sum / @as(f64, @floatFromInt(values.len));
+    const n_first = @min(values.len, 4);
+    std.log.info("florence-debug {s}: n={d} mean={d:.6} absmax={d:.4} first={any}", .{
+        label, values.len, mean, absmax, values[0..n_first],
+    });
+}
+
+fn logTopLogits(label: []const u8, step: usize, logits: []const f32) void {
+    if (!florenceDebugStats()) return;
+    var top_ids: [3]usize = .{ 0, 0, 0 };
+    var top_vals: [3]f32 = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+    for (logits, 0..) |v, i| {
+        if (v > top_vals[0]) {
+            top_vals[2] = top_vals[1];
+            top_ids[2] = top_ids[1];
+            top_vals[1] = top_vals[0];
+            top_ids[1] = top_ids[0];
+            top_vals[0] = v;
+            top_ids[0] = i;
+        } else if (v > top_vals[1]) {
+            top_vals[2] = top_vals[1];
+            top_ids[2] = top_ids[1];
+            top_vals[1] = v;
+            top_ids[1] = i;
+        } else if (v > top_vals[2]) {
+            top_vals[2] = v;
+            top_ids[2] = i;
+        }
+    }
+    std.log.info("florence-debug {s} step={d}: top=[{d}:{d:.4}, {d}:{d:.4}, {d}:{d:.4}]", .{
+        label, step, top_ids[0], top_vals[0], top_ids[1], top_vals[1], top_ids[2], top_vals[2],
+    });
 }
 
 fn florenceCudaGraphEnabled() bool {
@@ -1085,4 +1630,31 @@ test "buildNoRepeatSuppressTokens deduplicates continuations" {
     const suppress_tokens = try buildNoRepeatSuppressTokens(allocator, &prefix, 3);
     defer allocator.free(suppress_tokens);
     try std.testing.expectEqualSlices(i32, &.{9}, suppress_tokens);
+}
+
+test "Florence incremental decode falls back only for unsupported paths" {
+    try std.testing.expect(shouldFallbackFlorenceIncremental(error.InvalidInputShape));
+    try std.testing.expect(shouldFallbackFlorenceIncremental(error.UnsupportedOperation));
+    try std.testing.expect(shouldFallbackFlorenceIncremental(error.UnsupportedShape));
+    try std.testing.expect(!shouldFallbackFlorenceIncremental(error.OutOfMemory));
+
+    last_read_telemetry = .{
+        .resident_decoder = true,
+        .kv_cache = true,
+        .kv_cache_mode = "preallocated",
+        .lm_head_path = "fused_argmax",
+        .cuda_graph_replay = true,
+        .cuda_graph_capture_steps = 2,
+        .cuda_graph_replay_steps = 1,
+    };
+    defer resetLastReadTelemetry();
+    markFlorenceIncrementalFallback();
+    try std.testing.expect(last_read_telemetry.resident_decoder);
+    try std.testing.expect(!last_read_telemetry.kv_cache);
+    try std.testing.expectEqual(@as(?[]const u8, null), last_read_telemetry.kv_cache_mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), last_read_telemetry.lm_head_path);
+    try std.testing.expect(!last_read_telemetry.cuda_graph_replay);
+    try std.testing.expectEqual(@as(usize, 0), last_read_telemetry.cuda_graph_capture_steps);
+    try std.testing.expectEqual(@as(usize, 0), last_read_telemetry.cuda_graph_replay_steps);
+    try std.testing.expectEqualStrings("florence_incremental_decode_unsupported", last_read_telemetry.cuda_graph_fallback_reason.?);
 }

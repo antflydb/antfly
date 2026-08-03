@@ -1,481 +1,154 @@
-# Secrets Management
+# Secrets management
 
-Antfly supports secure secrets management through an encrypted keystore system, similar to Elasticsearch's keystore approach. This allows you to store sensitive credentials (API keys, AWS credentials, etc.) in an encrypted file instead of plain text configuration files or environment variables.
-
-## Overview
-
-Secrets can be stored in three ways (in priority order):
-
-1. **Encrypted Keystore** - Local encrypted file (recommended for production)
-2. **Environment Variables** - Standard env vars (good for development)
-3. **Config Files** - Direct values in config (deprecated, not recommended)
-
-## Quick Start
-
-### 1. Create a Keystore
-
-```bash
-# Create encrypted keystore with password
-antfly keystore create
-# Enter keystore password: ****
-
-# Create passwordless keystore (less secure but simpler)
-echo "" | antfly keystore create --stdin
-```
-
-The keystore is created at `/etc/antfly/keystore` by default.
-
-### 2. Add Secrets
-
-```bash
-# Add secrets interactively
-antfly keystore add aws.access_key_id
-antfly keystore add aws.secret_access_key
-antfly keystore add openai.api_key
-
-# Add from stdin (for automation)
-echo "sk-..." | antfly keystore add openai.api_key --stdin
-
-# Add file contents (for service account JSONs, etc)
-antfly keystore add-file gcp.credentials /path/to/service-account.json
-```
-
-### 3. Reference in Configuration
-
-Use `${secret:key.name}` syntax in your config files:
-
-```yaml
-# config.yaml
-storage:
-  s3:
-    bucket: my-bucket
-    region: us-east-1
-    access_key_id: ${secret:aws.access_key_id}
-    secret_access_key: ${secret:aws.secret_access_key}
-
-indexes:
-  - type: embedding_enricher
-    config:
-      provider: openai
-      api_key: ${secret:openai.api_key}
-```
-
-### 4. Start Antfly
-
-```bash
-# With password-protected keystore
-ANTFLY_KEYSTORE_PASSWORD="your-password" antfly swarm --config config.yaml
-
-# With passwordless keystore
-antfly swarm --config config.yaml
-
-# Custom keystore path
-antfly swarm --config config.yaml --keystore-path /path/to/keystore
-```
-
-## CLI Commands
-
-### `keystore create`
-
-Creates a new encrypted keystore file.
-
-```bash
-antfly keystore create [flags]
-
-Flags:
-  --force           Overwrite existing keystore
-  -p, --path PATH   Keystore file path (default: /etc/antfly/keystore)
-```
-
-### `keystore add`
-
-Adds or updates a secret in the keystore.
-
-```bash
-antfly keystore add <key> [flags]
-
-Flags:
-  --stdin           Read value from stdin instead of prompting
-  -p, --path PATH   Keystore file path
-
-Examples:
-  antfly keystore add aws.access_key_id
-  echo "value" | antfly keystore add openai.api_key --stdin
-```
-
-### `keystore add-file`
-
-Adds a file's contents as a secret.
-
-```bash
-antfly keystore add-file <key> <file-path> [flags]
-
-Example:
-  antfly keystore add-file gcp.credentials /path/to/service-account.json
-```
-
-### `keystore list`
-
-Lists all secret keys (not values) in the keystore.
-
-```bash
-antfly keystore list [flags]
-
-Example output:
-  Keystore contains 3 secret(s):
-    - aws.access_key_id
-    - aws.secret_access_key
-    - openai.api_key
-```
-
-### `keystore show`
-
-Shows a secret value (prints plain text to terminal).
-
-```bash
-antfly keystore show <key> [flags]
-
-Example:
-  antfly keystore show openai.api_key
-```
-
-### `keystore remove`
-
-Removes a secret from the keystore permanently.
-
-```bash
-antfly keystore remove <key> [flags]
-
-Example:
-  antfly keystore remove aws.access_key_id
-```
-
-## Environment Variables
-
-### Keystore Configuration
-
-- `ANTFLY_KEYSTORE_PATH` - Path to keystore file (default: `/etc/antfly/keystore`)
-- `ANTFLY_KEYSTORE_PASSWORD` - Keystore password (if password-protected)
-
-### Fallback Credentials
-
-If a secret is not found in the keystore, Antfly will fall back to these environment variables:
-
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - AWS credentials
-- `OPENAI_API_KEY` - OpenAI API key
-- `ANTHROPIC_API_KEY` - Anthropic Claude API key
-- `GEMINI_API_KEY` - Google Gemini API key
-- `GOOGLE_APPLICATION_CREDENTIALS` - Google Cloud service account path
-- `VERTEXAI_PROJECT` / `VERTEXAI_LOCATION` - Google Vertex AI config
-
-## Kubernetes Deployment
-
-### Option 1: Pre-Created Keystore (Recommended)
-
-Create the keystore locally, then mount it as a Kubernetes Secret:
-
-```bash
-# 1. Create keystore locally
-antfly keystore create
-antfly keystore add aws.access_key_id
-antfly keystore add aws.secret_access_key
-antfly keystore add openai.api_key
-
-# 2. Create K8s Secret from keystore file
-kubectl create secret generic antfly-keystore \
-  --from-file=keystore=/etc/antfly/keystore
-```
-
-Mount in your deployment:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: antfly-metadata
-spec:
-  template:
-    spec:
-      containers:
-      - name: antfly
-        image: antfly:latest
-        env:
-        - name: ANTFLY_KEYSTORE_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: antfly-keystore-password
-              key: password
-        volumeMounts:
-        - name: keystore
-          mountPath: /etc/antfly
-          readOnly: true
-      volumes:
-      - name: keystore
-        secret:
-          secretName: antfly-keystore
-```
-
-### Option 2: Init Container (Kubernetes-Native)
-
-Build the keystore from individual Kubernetes Secrets using an init container:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: aws-credentials
-type: Opaque
-stringData:
-  aws.access_key_id: AKIAIOSFODNN7EXAMPLE
-  aws.secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: api-keys
-type: Opaque
-stringData:
-  openai.api_key: sk-...
-  gemini.api_key: AIza...
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: antfly-metadata
-spec:
-  template:
-    spec:
-      initContainers:
-      - name: keystore-builder
-        image: antfly:latest
-        command: ["/bin/sh", "-c"]
-        args:
-          - |
-            antfly keystore create --force
-            for secret_file in /secrets/*; do
-              while IFS='=' read -r key value; do
-                echo "$value" | antfly keystore add "$key" --stdin
-              done < "$secret_file"
-            done
-        volumeMounts:
-        - name: keystore
-          mountPath: /etc/antfly
-        - name: secrets
-          mountPath: /secrets
-      containers:
-      - name: antfly
-        image: antfly:latest
-        volumeMounts:
-        - name: keystore
-          mountPath: /etc/antfly
-          readOnly: true
-      volumes:
-      - name: keystore
-        emptyDir: {}
-      - name: secrets
-        projected:
-          sources:
-          - secret:
-              name: aws-credentials
-          - secret:
-              name: api-keys
-```
-
-## Security Best Practices
-
-1. **Use Password Protection**: Always create keystores with strong passwords in production
-2. **Restrict File Permissions**: Keystore files are automatically created with `0600` permissions
-3. **Rotate Secrets Regularly**: Update secrets periodically using `antfly keystore add`
-4. **Never Commit Keystores**: Add keystore files to `.gitignore`
-5. **Use K8s Secrets in Production**: Leverage your orchestration platform's secrets management
-6. **Limit Secret Access**: Only give keystore passwords to processes that need them
-
-## Common Secret Keys
-
-Use these conventional key names for consistency:
-
-**AWS:**
-- `aws.access_key_id`
-- `aws.secret_access_key`
-- `aws.session_token`
-
-**OpenAI:**
-- `openai.api_key`
-- `openai.base_url` (for custom endpoints)
-
-**Anthropic:**
-- `anthropic.api_key`
-
-**Google Cloud:**
-- `gcp.credentials` (service account JSON)
-- `google.project`
-- `google.location`
-- `gemini.api_key`
-- `vertexai.project`
-- `vertexai.location`
-
-## Troubleshooting
-
-### Keystore not loading
-
-```bash
-# Check if keystore exists
-ls -l /etc/antfly/keystore
-
-# Verify password is correct
-antfly keystore list
-```
-
-### Secret not resolving
-
-```bash
-# List all secrets in keystore
-antfly keystore list
-
-# Check secret value
-antfly keystore show <key>
-
-# Verify config syntax
-grep -r "secret:" config.yaml
-```
-
-### Wrong password error
-
-```
-Error: failed to decrypt value: cipher: message authentication failed
-```
-
-Solution: Ensure `ANTFLY_KEYSTORE_PASSWORD` environment variable matches the password used during keystore creation.
-
-## Migration from Environment Variables
-
-If you're currently using environment variables, migrate to keystore:
-
-```bash
-# 1. Create keystore
-antfly keystore create
-
-# 2. Add secrets from environment
-echo "$AWS_ACCESS_KEY_ID" | antfly keystore add aws.access_key_id --stdin
-echo "$AWS_SECRET_ACCESS_KEY" | antfly keystore add aws.secret_access_key --stdin
-echo "$OPENAI_API_KEY" | antfly keystore add openai.api_key --stdin
-
-# 3. Update config to use ${secret:...} references
-# 4. Remove sensitive env vars
-# 5. Keep ANTFLY_KEYSTORE_PASSWORD only
-```
-
-## Technical Details
-
-### Encryption
-
-- **Algorithm**: AES-256-GCM (authenticated encryption)
-- **Key Derivation**: PBKDF2 with SHA-256 (100,000 iterations)
-- **Salt**: 32 bytes (randomly generated per keystore)
-- **Nonce**: 12 bytes (randomly generated per secret)
-
-### File Format
-
-Keystore files are JSON with base64-encoded encrypted values:
+Antfly resolves secret references without putting credential values in the
+main configuration. The Zig runtime accepts JSON configuration only.
 
 ```json
 {
-  "version": 1,
-  "salt": "base64-encoded-salt",
-  "entries": {
-    "aws.access_key_id": {
-      "key": "aws.access_key_id",
-      "value": "base64-encoded-encrypted-value",
-      "created_at": "2025-01-15T10:30:00Z",
-      "updated_at": "2025-01-15T10:30:00Z"
+  "connections": {
+    "openai-production": {
+      "kind": "inference",
+      "capabilities": ["models.generate", "models.embed"],
+      "inference": {
+        "provider": "openai",
+        "api_key": "${secret:openai.api_key}"
+      }
     }
   }
 }
 ```
 
-### Resolution Order
+References have the exact form `${secret:key.name}`. Keys may contain ASCII
+letters, numbers, `.`, `_`, and `-`.
 
-When resolving `${secret:key.name}`:
+## Sources and precedence
 
-1. Check keystore for exact key match
-2. Check environment variable with dots replaced by underscores (e.g., `AWS_ACCESS_KEY_ID`)
-3. Check common environment variable mappings (see table above)
-4. Return error if not found
+For a referenced key, Antfly checks:
 
-## Examples
+1. each `--secret-store-path` file in command-line order;
+2. the corresponding environment variable.
 
-### Full-Text Search with OpenAI Embeddings
+The environment name is the uppercased key with punctuation replaced by `_`.
+For example, `openai.api_key` maps to `OPENAI_API_KEY`.
 
-```yaml
-# config.yaml
-tables:
-  - name: documents
-    indexes:
-      - type: embedding_enricher
-        config:
-          provider: openai
-          api_key: ${secret:openai.api_key}
-          model: text-embedding-3-small
-          field: content
+The local secret store is a JSON file protected by operating-system file
+permissions. It is deliberately not described as an encrypted keystore: disk
+encryption or a platform secret volume must provide encryption at rest. Do not
+commit this file, bake it into a container image, or place it beside public
+configuration.
+
+Antfly keeps a last-known-good in-memory snapshot during an invalid or missing
+file reload and exposes stale/reload health without returning values. Updates
+are written atomically and consumers refresh generation-aware credentials.
+
+## Recommended production setup
+
+Mount a secret-store file from the platform secret manager as read-only to the
+container and restrict it to the Antfly service account:
+
+```json
+{
+  "secrets": [
+    { "key": "openai.api_key", "value": "REDACTED" },
+    { "key": "content.internal_api_authorization", "value": "REDACTED" }
+  ]
+}
 ```
 
-```bash
-# Setup
-antfly keystore create
-echo "sk-..." | antfly keystore add openai.api_key --stdin
-
-# Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly swarm --config config.yaml
+```console
+antfly standalone \
+  --config /etc/antfly/config.json \
+  --secret-store-path /run/secrets/antfly/secrets.json
 ```
 
-### S3 Storage with AWS Credentials
+The service account should own the file with mode `0600`; the containing
+directory should not be writable by unrelated workloads. Rotation should
+replace the mounted file atomically, never rewrite it in place. Antfly notices
+the metadata change and reloads it while retaining the previous snapshot if
+the replacement is malformed.
 
-```yaml
-# config.yaml
-storage:
-  keyvalue: s3
-  s3:
-    endpoint: s3.amazonaws.com
-    region: us-east-1
-    bucket: antfly-data
-    use_ssl: true
-    access_key_id: ${secret:aws.access_key_id}
-    secret_access_key: ${secret:aws.secret_access_key}
+Multiple paths provide explicit fallback layers. Put the most specific and
+most frequently rotated source first:
+
+```console
+antfly standalone \
+  --config /etc/antfly/config.json \
+  --secret-store-path /run/secrets/tenant/secrets.json \
+  --secret-store-path /run/secrets/platform/secrets.json
 ```
 
-```bash
-# Setup
-antfly keystore create
-antfly keystore add aws.access_key_id
-antfly keystore add aws.secret_access_key
+Environment variables are convenient for local development and platform
+workload identity. Avoid process arguments because they may be visible in
+process listings.
 
-# Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly swarm --config config.yaml
+## Managing standalone secrets through the API
+
+When standalone is configured with a writable secret store, its authenticated
+`/db/v1` management API can list metadata, put a value, and delete a value.
+Values are accepted only in request bodies and are never returned.
+
+```console
+curl -X PUT https://antfly.example.com/db/v1/secrets/openai.api_key \
+  -H 'Authorization: Bearer TOKEN' \
+  -H 'Content-Type: application/json' \
+  --data '{"value":"REDACTED"}'
+
+curl https://antfly.example.com/db/v1/secrets \
+  -H 'Authorization: Bearer TOKEN'
+
+curl -X DELETE https://antfly.example.com/db/v1/secrets/openai.api_key \
+  -H 'Authorization: Bearer TOKEN'
 ```
 
-### Multi-Provider AI with Multiple Keys
+These endpoints are unavailable when there is no writable local secret store
+and must be protected by normal authentication and admin authorization. Use a
+platform secret manager rather than the API when the mounted file is
+read-only.
 
-```yaml
-# config.yaml
-tables:
-  - name: articles
-    indexes:
-      - type: embedding_enricher
-        config:
-          provider: openai
-          api_key: ${secret:openai.api_key}
-      - type: summarize_enricher
-        config:
-          provider: anthropic
-          api_key: ${secret:anthropic.api_key}
+## Storage credentials and remote-read credentials
+
+Primary database storage and user-provided remote content are separate trust
+domains:
+
+- `connections.*` with capability `storage.primary` authorizes Antfly to read
+  and write database artifacts. Serverless lanes may select different named
+  connections and buckets.
+- `remote_content.s3.*` authorizes read access to customer documents used by
+  `remoteText`, the deprecated `remotePDF`, and related helpers. Several named credentials can
+  be selected by bucket.
+
+Do not reuse a broad storage writer credential for remote content. Prefer
+short-lived workload credentials. S3 primary storage without static keys uses
+the refreshable AWS default credential chain, including environment, web
+identity/IRSA, shared profiles, ECS, and EC2 metadata credentials.
+
+Static S3-compatible credentials can use references:
+
+```json
+{
+  "connections": {
+    "primary-storage": {
+      "kind": "external_io",
+      "capabilities": ["storage.primary"],
+      "external_io": {
+        "protocol": "s3",
+        "endpoint": "minio.internal:9000",
+        "access_key_id": "${secret:storage.access_key_id}",
+        "secret_access_key": "${secret:storage.secret_access_key}",
+        "buckets": ["antfly-data"]
+      }
+    }
+  }
+}
 ```
 
-```bash
-# Setup
-antfly keystore create
-echo "$OPENAI_API_KEY" | antfly keystore add openai.api_key --stdin
-echo "$ANTHROPIC_API_KEY" | antfly keystore add anthropic.api_key --stdin
+See [`configs/config-secrets-example.json`](../configs/config-secrets-example.json)
+for a complete JSON example.
 
-# Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly swarm --config config.yaml
-```
+## Failure behavior
+
+Startup fails closed when a required reference cannot be resolved or a secret
+store is malformed. An already-running process keeps its last-known-good
+snapshot when a subsequent reload fails and reports the stale state. Literal
+credentials remain accepted by the schema for development and migration, but
+production deployments should use references or workload identity.

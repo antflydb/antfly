@@ -16,7 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const db_types = @import("types.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const generated_document_id_prefix = "doc:";
 pub const generated_document_id_entropy_bytes = 16;

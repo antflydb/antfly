@@ -27,7 +27,7 @@ const storage_schema = @import("../storage/schema.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const relational_store = @import("../storage/db/relational_store.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
-const platform_clock = @import("../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 
 const table_participant_v2_prefix = "table2:";
 
@@ -4958,6 +4958,10 @@ fn parseTxnTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
                 .value_json = if (op_obj.get("value")) |raw_value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})}) else null,
             };
             ops_initialized += 1;
+            db_mod.transform.validateDocumentTransform(alloc, .{
+                .key = key,
+                .operations = ops[i .. i + 1],
+            }) catch return error.InvalidTxnRequest;
         }
         out[initialized] = .{
             .key = try alloc.dupe(u8, key),
@@ -4988,18 +4992,10 @@ fn freeTxnTransforms(alloc: std.mem.Allocator, transforms: []const db_mod.types.
 fn parseTransformOpType(text: []const u8) ?db_mod.types.TransformOpType {
     if (std.mem.eql(u8, text, "$set")) return .set;
     if (std.mem.eql(u8, text, "$setOnInsert")) return .set_on_insert;
-    if (std.mem.eql(u8, text, "$set_on_insert")) return .set_on_insert;
     if (std.mem.eql(u8, text, "$unset")) return .unset;
     if (std.mem.eql(u8, text, "$inc")) return .inc;
-    if (std.mem.eql(u8, text, "$push")) return .push;
-    if (std.mem.eql(u8, text, "$pull")) return .pull;
     if (std.mem.eql(u8, text, "$addToSet")) return .add_to_set;
-    if (std.mem.eql(u8, text, "$pop")) return .pop;
-    if (std.mem.eql(u8, text, "$mul")) return .mul;
-    if (std.mem.eql(u8, text, "$min")) return .min;
     if (std.mem.eql(u8, text, "$max")) return .max;
-    if (std.mem.eql(u8, text, "$currentDate")) return .current_date;
-    if (std.mem.eql(u8, text, "$rename")) return .rename;
     return null;
 }
 

@@ -32,33 +32,90 @@ pub const DestinationConfig = struct {
     db: db_mod.OpenOptions = .{},
 };
 
+pub const BorrowedDestinationDb = struct {
+    db: *db_mod.DB,
+    ctx: *anyopaque,
+    release_fn: *const fn (*anyopaque) void,
+
+    pub fn release(self: BorrowedDestinationDb) void {
+        self.release_fn(self.ctx);
+    }
+};
+
 pub const SyncConfig = struct {
+    transition_id: u64 = 1,
+    attempt_epoch: u64 = 1,
     source_root_dir: []const u8,
     dest_root_dir: []const u8,
     source_group_id: u64,
     dest_group_id: u64,
     source: data_store.RaftApplyStoreConfig = .{ .root_dir = "" },
+    source_store: ?*data_store.RaftApplyStore = null,
     dest: DestinationConfig = .{ .root_dir = "" },
+    dest_db: ?*db_mod.DB = null,
+    /// Optional durable source-side acknowledgement used by distributed
+    /// handoff, where the source leader need not host a destination replica.
+    progress_db: ?*db_mod.DB = null,
+    dest_lease: ?BorrowedDestinationDb = null,
 };
 
 pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncStatus {
-    var source = try data_store.RaftApplyStore.init(alloc, cfg.source);
-    defer source.deinit();
-
-    var dest_opts = cfg.dest.db;
-    dest_opts.open_mode = .status_only;
-    dest_opts.start_index_workers = false;
-    var dest_db = try db_mod.DB.open(alloc, cfg.dest_root_dir, dest_opts);
-    defer dest_db.close();
-    try validateConfiguredDestinationIdentityNamespace(dest_opts.identity_namespace, &dest_db);
-
-    const dest_range = dest_db.getRange();
-    const bootstrapped = dest_range.start.len > 0 or dest_range.end.len > 0;
+    var owned_source: ?data_store.RaftApplyStore = null;
+    defer if (owned_source) |*source| source.deinit();
+    const source = cfg.source_store orelse source: {
+        owned_source = try data_store.RaftApplyStore.init(alloc, cfg.source);
+        break :source &owned_source.?;
+    };
     const source_state = try source.currentSplitState(alloc, cfg.source_group_id);
     defer if (source_state) |state| shard_state_store.freeSplitState(alloc, state);
-    const source_phase = if (source_state) |state| state.phase else null;
+    if (source_state) |state| try validateActiveSplitDestination(state, cfg.transition_id, cfg.attempt_epoch, cfg.dest_group_id);
+    const source_terminal = try source.currentSplitTerminal(alloc, cfg.source_group_id);
+    defer if (source_terminal) |terminal| shard_state_store.freeSplitTerminal(alloc, terminal);
+    const matching_terminal = if (source_state == null and source_terminal != null) terminal: {
+        const terminal = source_terminal.?;
+        if (cfg.attempt_epoch < terminal.attempt_epoch) return error.StaleSplitAttempt;
+        if (cfg.attempt_epoch > terminal.attempt_epoch) break :terminal null;
+        try shard_state_store.validateSplitTerminalIdentity(
+            terminal,
+            cfg.transition_id,
+            cfg.attempt_epoch,
+            cfg.dest_group_id,
+            null,
+        );
+        break :terminal terminal.outcome;
+    } else null;
+
+    var owned_dest: ?db_mod.DB = null;
+    defer if (owned_dest) |*dest| dest.close();
+    var dest_db = cfg.dest_db;
+    if (cfg.progress_db == null and dest_db == null) {
+        var dest_opts = cfg.dest.db;
+        dest_opts.open_mode = .status_only;
+        dest_opts.start_index_workers = false;
+        owned_dest = try db_mod.DB.open(alloc, cfg.dest_root_dir, dest_opts);
+        dest_db = &owned_dest.?;
+    }
+    if (dest_db) |db| try validateConfiguredDestinationIdentityNamespace(cfg.dest.db.identity_namespace, db);
+
+    const progress_db = cfg.progress_db orelse dest_db orelse return error.MissingSplitProgressStore;
+    const bootstrap_marker = try progress_db.getSplitBootstrapMarker(alloc);
+    const bootstrapped = if (bootstrap_marker) |marker|
+        marker.transition_id == cfg.transition_id and
+            marker.attempt_epoch == cfg.attempt_epoch and
+            marker.source_group_id == cfg.source_group_id and
+            marker.destination_group_id == cfg.dest_group_id and
+            marker.bootstrap_complete
+    else
+        false;
     const source_seq = try source.currentSplitDeltaSequence(alloc, cfg.source_group_id);
-    const dest_seq = try dest_db.getSplitDeltaFinalSeq(alloc);
+    const dest_seq = try progress_db.getSplitDeltaFinalSeq(alloc);
+    if (matching_terminal) |outcome| {
+        return range_transition.completedSplitStatus(outcome == .finalized, source_seq, dest_seq);
+    }
+    // No active source state is the prepare trigger for a successor. The
+    // controller uses the record's split coordinates to issue the fenced
+    // prepare command; the source epoch rejects stale predecessors.
+    const source_phase = if (source_state) |state| state.phase else null;
     const derived = range_transition.deriveSplitStatus(source_phase, bootstrapped, source_seq, dest_seq);
     return .{
         .phase = derived.phase,
@@ -81,13 +138,21 @@ fn validateConfiguredDestinationIdentityNamespace(expected: ?doc_identity.Namesp
     if (!db.core.identity_namespace.eql(namespace)) return error.DocIdentityNamespaceMismatch;
 }
 
+fn validateActiveSplitDestination(state: shard_state_store.AppliedSplitState, transition_id: u64, attempt_epoch: u64, destination_group_id: u64) !void {
+    if (state.phase == .none) return;
+    try shard_state_store.validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
+}
+
 pub const MergeConfig = struct {
     donor_root_dir: []const u8,
     receiver_root_dir: []const u8,
     donor_group_id: u64,
     receiver_group_id: u64,
     donor: data_store.RaftApplyStoreConfig = .{ .root_dir = "" },
+    donor_store: ?*data_store.RaftApplyStore = null,
     receiver: DestinationConfig = .{ .root_dir = "" },
+    receiver_db: ?*db_mod.DB = null,
+    receiver_lease: ?BorrowedDestinationDb = null,
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
 };
 
@@ -116,7 +181,9 @@ pub const Destination = struct {
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
-    db: db_mod.DB,
+    db: *db_mod.DB,
+    owned_db: ?*db_mod.DB,
+    borrowed_lease: ?BorrowedDestinationDb,
 
     pub fn init(alloc: std.mem.Allocator, cfg: DestinationConfig) !Destination {
         return try initWithCreateRoot(alloc, cfg, true);
@@ -134,11 +201,29 @@ pub const Destination = struct {
             try std.Io.Dir.cwd().access(io_impl.io(), root_dir, .{});
         }
 
+        const db = try alloc.create(db_mod.DB);
+        errdefer alloc.destroy(db);
+        db.* = try db_mod.DB.open(alloc, root_dir, cfg.db);
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
             .root_dir = root_dir,
-            .db = try db_mod.DB.open(alloc, root_dir, cfg.db),
+            .db = db,
+            .owned_db = db,
+            .borrowed_lease = null,
+        };
+    }
+
+    pub fn initBorrowed(alloc: std.mem.Allocator, root_dir_raw: []const u8, lease: BorrowedDestinationDb) !Destination {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        return .{
+            .alloc = alloc,
+            .io_impl = io_impl,
+            .root_dir = try alloc.dupe(u8, root_dir_raw),
+            .db = lease.db,
+            .owned_db = null,
+            .borrowed_lease = lease,
         };
     }
 
@@ -175,17 +260,23 @@ pub const Destination = struct {
     }
 
     pub fn deinit(self: *Destination) void {
-        self.db.close();
+        if (self.owned_db) |owned| {
+            owned.close();
+            self.alloc.destroy(owned);
+        }
+        if (self.borrowed_lease) |lease| lease.release();
         self.alloc.free(self.root_dir);
         self.io_impl.deinit();
         self.* = undefined;
     }
 
-    pub fn applyHandoff(self: *Destination, alloc: std.mem.Allocator, handoff: data_store.SplitHandoff) !void {
-        try self.db.updateRange(.{
-            .start = handoff.byte_range.start,
-            .end = handoff.byte_range.end,
-        });
+    pub fn applyHandoff(
+        self: *Destination,
+        alloc: std.mem.Allocator,
+        handoff: data_store.SplitHandoff,
+        marker: range_state.SplitBootstrapMarker,
+    ) !bool {
+        if (!marker.bootstrap_complete) return error.InvalidSplitBootstrapMarker;
 
         const writes = try alloc.alloc(db_types.BatchWrite, handoff.entries.len);
         defer alloc.free(writes);
@@ -195,10 +286,22 @@ pub const Destination = struct {
                 .value = entry.value,
             };
         }
-        try self.db.batch(.{
-            .writes = writes,
-        });
-        try self.db.setSplitDeltaFinalSeq(handoff.base_delta_sequence);
+        var reservation = marker;
+        reservation.bootstrap_complete = false;
+        const replaced = try self.db.replaceSplitBootstrap(
+            alloc,
+            handoff.byte_range,
+            writes,
+            handoff.base_delta_sequence,
+            reservation,
+        );
+        const completed = try self.db.completeSplitBootstrap(
+            alloc,
+            handoff.byte_range,
+            handoff.base_delta_sequence,
+            marker,
+        );
+        return replaced or completed;
     }
 
     pub fn applyMergeBootstrap(
@@ -385,14 +488,19 @@ pub const Destination = struct {
 
 pub const SyncCoordinator = struct {
     alloc: std.mem.Allocator,
+    transition_id: u64,
+    attempt_epoch: u64,
     source_root_dir: []u8,
     dest_root_dir: []u8,
     source_group_id: u64,
     dest_group_id: u64,
     source_cfg: data_store.RaftApplyStoreConfig,
     dest_cfg: DestinationConfig,
-    source: data_store.RaftApplyStore,
+    source: *data_store.RaftApplyStore,
+    source_owned: bool,
+    source_open: bool,
     dest: Destination,
+    dest_open: bool,
 
     pub fn init(alloc: std.mem.Allocator, cfg: SyncConfig) !SyncCoordinator {
         const source_root_dir = try alloc.dupe(u8, cfg.source_root_dir);
@@ -409,13 +517,32 @@ pub const SyncCoordinator = struct {
         var dest_cfg = cfg.dest;
         dest_cfg.root_dir = dest_root_dir;
 
-        var source = try data_store.RaftApplyStore.init(alloc, source_cfg);
-        errdefer source.deinit();
-        var dest = try Destination.init(alloc, dest_cfg);
+        var source_owned = false;
+        const source = cfg.source_store orelse source: {
+            const owned = try alloc.create(data_store.RaftApplyStore);
+            errdefer alloc.destroy(owned);
+            owned.* = try data_store.RaftApplyStore.init(alloc, source_cfg);
+            source_owned = true;
+            break :source owned;
+        };
+        errdefer if (source_owned) {
+            source.deinit();
+            alloc.destroy(source);
+        };
+        const source_state = try source.currentSplitState(alloc, cfg.source_group_id);
+        defer if (source_state) |state| shard_state_store.freeSplitState(alloc, state);
+        if (source_state) |state| try validateActiveSplitDestination(state, cfg.transition_id, cfg.attempt_epoch, cfg.dest_group_id);
+
+        var dest = if (cfg.dest_lease) |lease|
+            try Destination.initBorrowed(alloc, dest_root_dir, lease)
+        else
+            try Destination.init(alloc, dest_cfg);
         errdefer dest.deinit();
 
         return .{
             .alloc = alloc,
+            .transition_id = cfg.transition_id,
+            .attempt_epoch = cfg.attempt_epoch,
             .source_root_dir = source_root_dir,
             .dest_root_dir = dest_root_dir,
             .source_group_id = cfg.source_group_id,
@@ -423,50 +550,116 @@ pub const SyncCoordinator = struct {
             .source_cfg = source_cfg,
             .dest_cfg = dest_cfg,
             .source = source,
+            .source_owned = source_owned,
+            .source_open = true,
             .dest = dest,
+            .dest_open = true,
         };
     }
 
     pub fn deinit(self: *SyncCoordinator) void {
-        self.dest.deinit();
-        self.source.deinit();
+        if (self.dest_open) self.dest.deinit();
+        if (self.source_owned) {
+            if (self.source_open) self.source.deinit();
+            self.alloc.destroy(self.source);
+        }
         freeConfig(self.alloc, self.source_cfg);
         self.alloc.free(self.dest_root_dir);
         self.* = undefined;
     }
 
     pub fn reopenSource(self: *SyncCoordinator) !void {
+        try self.reopenSourceWithAllocator(self.alloc);
+    }
+
+    fn reopenSourceWithAllocator(self: *SyncCoordinator, reopen_alloc: std.mem.Allocator) !void {
+        if (!self.source_owned) return error.BorrowedSplitSourceStore;
+        _ = try self.sourceStore();
         self.source.deinit();
-        self.source = try data_store.RaftApplyStore.init(self.alloc, self.source_cfg);
+        self.source_open = false;
+        self.source.* = try data_store.RaftApplyStore.init(reopen_alloc, self.source_cfg);
+        self.source_open = true;
     }
 
     pub fn reopenDestination(self: *SyncCoordinator) !void {
+        try self.reopenDestinationWithAllocator(self.alloc);
+    }
+
+    fn reopenDestinationWithAllocator(self: *SyncCoordinator, reopen_alloc: std.mem.Allocator) !void {
+        const source = try self.sourceStore();
+        const dest = try self.destination();
+        if (dest.owned_db == null) return error.BorrowedSplitDestinationDb;
+        const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
+        defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try self.validateActiveState(state);
         self.dest.deinit();
-        self.dest = try Destination.init(self.alloc, self.dest_cfg);
+        self.dest_open = false;
+        self.dest = try Destination.init(reopen_alloc, self.dest_cfg);
+        self.dest_open = true;
+    }
+
+    pub fn validateTransitionCoordinates(self: *const SyncCoordinator, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !void {
+        if (self.transition_id != transition_id or self.attempt_epoch != attempt_epoch or
+            self.source_group_id != source_group_id or self.dest_group_id != destination_group_id)
+        {
+            return error.ConflictingSplitTransition;
+        }
+    }
+
+    fn validateActiveState(self: *const SyncCoordinator, state: shard_state_store.AppliedSplitState) !void {
+        try validateActiveSplitDestination(state, self.transition_id, self.attempt_epoch, self.dest_group_id);
+    }
+
+    fn sourceStore(self: *SyncCoordinator) !*data_store.RaftApplyStore {
+        if (!self.source_open) return error.SplitCoordinatorSourceClosed;
+        return self.source;
+    }
+
+    fn destination(self: *SyncCoordinator) !*Destination {
+        if (!self.dest_open) return error.SplitCoordinatorDestinationClosed;
+        return &self.dest;
     }
 
     pub fn ensureBootstrapped(self: *SyncCoordinator) !bool {
-        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        const source = try self.sourceStore();
+        const dest = try self.destination();
+        const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try self.validateActiveState(state);
         const source_phase = if (source_state) |state| state.phase else null;
         if (source_phase == null) return false;
         if (source_phase.? != .splitting and source_phase.? != .finalizing) return false;
 
-        const range = self.dest.getRange();
-        if (range.start.len > 0 or range.end.len > 0) return false;
-        const handoff = try self.source.captureSplitHandoff(self.alloc, self.source_group_id);
+        if (try dest.db.getSplitBootstrapMarker(self.alloc)) |marker| {
+            const same_attempt = marker.transition_id == self.transition_id and
+                marker.attempt_epoch == self.attempt_epoch and
+                marker.source_group_id == self.source_group_id and
+                marker.destination_group_id == self.dest_group_id;
+            if (same_attempt and marker.bootstrap_complete) return false;
+        }
+
+        const handoff = try source.captureSplitHandoff(self.alloc, self.source_group_id);
         defer shard_state_store.freeHandoff(self.alloc, handoff);
-        try self.dest.applyHandoff(self.alloc, handoff);
-        return true;
+        return try dest.applyHandoff(self.alloc, handoff, .{
+            .transition_id = self.transition_id,
+            .attempt_epoch = self.attempt_epoch,
+            .source_group_id = self.source_group_id,
+            .destination_group_id = self.dest_group_id,
+            .bootstrap_complete = true,
+        });
     }
 
     pub fn startSourceSplit(self: *SyncCoordinator) !bool {
-        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        const source = try self.sourceStore();
+        const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
         const state = source_state orelse return false;
+        try self.validateActiveState(state);
         if (state.phase != .prepare) return false;
 
-        const op = try std.fmt.allocPrint(self.alloc, "split_start:{d}:{s}", .{
+        const op = try std.fmt.allocPrint(self.alloc, "split_start:{d}:{d}:{d}:{s}", .{
+            self.transition_id,
+            self.attempt_epoch,
             self.dest_group_id,
             state.split_key,
         });
@@ -476,62 +669,102 @@ pub const SyncCoordinator = struct {
     }
 
     pub fn prepareSourceSplit(self: *SyncCoordinator, split_key: []const u8, source_range_end: ?[]const u8) !bool {
-        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        const source = try self.sourceStore();
+        const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
         if (source_state) |state| {
-            if (state.phase != .none) return false;
+            if (state.phase != .none) {
+                try self.validateActiveState(state);
+                if (!std.mem.eql(u8, state.split_key, split_key)) return error.ConflictingSplitTransition;
+                return false;
+            }
 
-            const current_range = try self.source.currentRange(self.alloc, self.source_group_id);
+            const current_range = try source.currentRange(self.alloc, self.source_group_id);
             defer range_state.freeRange(self.alloc, current_range);
             const restore = try std.fmt.allocPrint(self.alloc, "range:{s}:{s}", .{
                 current_range.start,
                 state.original_range_end,
             });
             defer self.alloc.free(restore);
-            try self.applySourceControlEntryVia(&self.source, restore);
+            try self.applySourceControlEntryVia(source, restore);
         } else if (source_range_end) |range_end| {
-            const current_range = try self.source.currentRange(self.alloc, self.source_group_id);
+            const current_range = try source.currentRange(self.alloc, self.source_group_id);
             defer range_state.freeRange(self.alloc, current_range);
             const restore = try std.fmt.allocPrint(self.alloc, "range:{s}:{s}", .{
                 current_range.start,
                 range_end,
             });
             defer self.alloc.free(restore);
-            try self.applySourceControlEntryVia(&self.source, restore);
+            try self.applySourceControlEntryVia(source, restore);
         }
 
-        const op = try std.fmt.allocPrint(self.alloc, "split_prepare:{s}", .{split_key});
+        const op = try std.fmt.allocPrint(self.alloc, "split_prepare:{d}:{d}:{d}:{s}", .{ self.transition_id, self.attempt_epoch, self.dest_group_id, split_key });
         defer self.alloc.free(op);
-        try self.applySourceControlEntryVia(&self.source, op);
+        try self.applySourceControlEntryVia(source, op);
         return true;
     }
 
     pub fn catchUp(self: *SyncCoordinator) !usize {
-        const dest_range = self.dest.getRange();
-        if (dest_range.start.len == 0 and dest_range.end.len == 0) return 0;
-
-        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        const source = try self.sourceStore();
+        const dest = try self.destination();
+        const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try self.validateActiveState(state);
         const source_phase = if (source_state) |state| state.phase else null;
         if (source_phase == null) return 0;
         if (source_phase.? != .splitting and source_phase.? != .finalizing) return 0;
 
-        const after_seq = try self.dest.appliedDeltaSequence(self.alloc);
-        const deltas = try self.source.listSplitDeltasAfter(self.alloc, self.source_group_id, after_seq);
+        const dest_range = dest.getRange();
+        if (dest_range.start.len == 0 and dest_range.end.len == 0) return 0;
+
+        const after_seq = try dest.appliedDeltaSequence(self.alloc);
+        const deltas = try source.listSplitDeltasAfter(self.alloc, self.source_group_id, after_seq);
         defer shard_mod.freeDeltas(self.alloc, deltas);
         if (deltas.len == 0) return 0;
-        try self.dest.applyDeltas(self.alloc, deltas);
+        try dest.applyDeltas(self.alloc, deltas);
         return deltas.len;
     }
 
     pub fn status(self: *SyncCoordinator) !SplitSyncStatus {
-        const dest_range = self.dest.getRange();
-        const bootstrapped = dest_range.start.len > 0 or dest_range.end.len > 0;
-        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        const source = try self.sourceStore();
+        const dest = try self.destination();
+        const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try self.validateActiveState(state);
+        const source_terminal = try source.currentSplitTerminal(self.alloc, self.source_group_id);
+        defer if (source_terminal) |terminal| shard_state_store.freeSplitTerminal(self.alloc, terminal);
+        if (source_state == null) {
+            if (source_terminal) |terminal| {
+                if (self.attempt_epoch < terminal.attempt_epoch) return error.StaleSplitAttempt;
+                if (self.attempt_epoch == terminal.attempt_epoch) {
+                    try shard_state_store.validateSplitTerminalIdentity(
+                        terminal,
+                        self.transition_id,
+                        self.attempt_epoch,
+                        self.dest_group_id,
+                        null,
+                    );
+                    return range_transition.completedSplitStatus(
+                        terminal.outcome == .finalized,
+                        try source.currentSplitDeltaSequence(self.alloc, self.source_group_id),
+                        try dest.appliedDeltaSequence(self.alloc),
+                    );
+                }
+            }
+        }
+
+        const bootstrap_marker = try dest.db.getSplitBootstrapMarker(self.alloc);
+        const bootstrapped = if (bootstrap_marker) |marker|
+            marker.transition_id == self.transition_id and
+                marker.attempt_epoch == self.attempt_epoch and
+                marker.source_group_id == self.source_group_id and
+                marker.destination_group_id == self.dest_group_id and
+                marker.bootstrap_complete
+        else
+            false;
         const source_phase = if (source_state) |state| state.phase else null;
-        const source_seq = try self.source.currentSplitDeltaSequence(self.alloc, self.source_group_id);
-        const dest_seq = try self.dest.appliedDeltaSequence(self.alloc);
+        const source_seq = try source.currentSplitDeltaSequence(self.alloc, self.source_group_id);
+        const dest_seq = try dest.appliedDeltaSequence(self.alloc);
         const derived = range_transition.deriveSplitStatus(source_phase, bootstrapped, source_seq, dest_seq);
         return .{
             .phase = derived.phase,
@@ -552,7 +785,13 @@ pub const SyncCoordinator = struct {
     pub fn finalizeSource(self: *SyncCoordinator) !bool {
         const transition_status = try self.status();
         if (transition_status.phase != .cutover_ready) return false;
-        try self.applySourceControlEntry("finalize_split");
+        const source = try self.sourceStore();
+        const source_state = (try source.currentSplitState(self.alloc, self.source_group_id)) orelse return false;
+        defer shard_state_store.freeSplitState(self.alloc, source_state);
+        try self.validateActiveState(source_state);
+        const op = try std.fmt.allocPrint(self.alloc, "finalize_split:{d}:{d}:{d}:{s}", .{ self.transition_id, self.attempt_epoch, self.dest_group_id, source_state.split_key });
+        defer self.alloc.free(op);
+        try self.applySourceControlEntry(op);
         return true;
     }
 
@@ -562,7 +801,13 @@ pub const SyncCoordinator = struct {
             .prepare, .bootstrap_peer, .replay_deltas, .rolling_back => {},
             else => return false,
         }
-        try self.applySourceControlEntry("rollback_split");
+        const source = try self.sourceStore();
+        const source_state = (try source.currentSplitState(self.alloc, self.source_group_id)) orelse return false;
+        defer shard_state_store.freeSplitState(self.alloc, source_state);
+        try self.validateActiveState(source_state);
+        const op = try std.fmt.allocPrint(self.alloc, "rollback_split:{d}:{d}:{d}:{s}", .{ self.transition_id, self.attempt_epoch, self.dest_group_id, source_state.split_key });
+        defer self.alloc.free(op);
+        try self.applySourceControlEntry(op);
         return true;
     }
 
@@ -580,7 +825,7 @@ pub const SyncCoordinator = struct {
     }
 
     fn applySourceControlEntry(self: *SyncCoordinator, op: []const u8) !void {
-        try self.applySourceControlEntryVia(&self.source, op);
+        try self.applySourceControlEntryVia(try self.sourceStore(), op);
     }
 
     fn applySourceControlEntryVia(self: *SyncCoordinator, source: *data_store.RaftApplyStore, op: []const u8) !void {
@@ -612,7 +857,8 @@ pub const MergeCoordinator = struct {
     receiver_group_id: u64,
     donor_cfg: data_store.RaftApplyStoreConfig,
     receiver_cfg: DestinationConfig,
-    donor: data_store.RaftApplyStore,
+    donor: *data_store.RaftApplyStore,
+    donor_owned: bool,
     receiver: Destination,
     receiver_accepts_donor_range: bool,
     receiver_base_range: db_types.ByteRange,
@@ -635,9 +881,22 @@ pub const MergeCoordinator = struct {
         var receiver_cfg = cfg.receiver;
         receiver_cfg.root_dir = receiver_root_dir;
 
-        var donor = try data_store.RaftApplyStore.init(alloc, donor_cfg);
-        errdefer donor.deinit();
-        var receiver = try Destination.init(alloc, receiver_cfg);
+        var donor_owned = false;
+        const donor = cfg.donor_store orelse donor: {
+            const owned = try alloc.create(data_store.RaftApplyStore);
+            errdefer alloc.destroy(owned);
+            owned.* = try data_store.RaftApplyStore.init(alloc, donor_cfg);
+            donor_owned = true;
+            break :donor owned;
+        };
+        errdefer if (donor_owned) {
+            donor.deinit();
+            alloc.destroy(donor);
+        };
+        var receiver = if (cfg.receiver_lease) |lease|
+            try Destination.initBorrowed(alloc, receiver_root_dir, lease)
+        else
+            try Destination.init(alloc, receiver_cfg);
         errdefer receiver.deinit();
 
         const persisted = try receiver.loadMergeState(alloc);
@@ -661,6 +920,7 @@ pub const MergeCoordinator = struct {
             .donor_cfg = donor_cfg,
             .receiver_cfg = receiver_cfg,
             .donor = donor,
+            .donor_owned = donor_owned,
             .receiver = receiver,
             .receiver_accepts_donor_range = if (persisted) |state|
                 state.phase == .accepting or state.phase == .finalized or state.phase == .rolling_back
@@ -678,7 +938,10 @@ pub const MergeCoordinator = struct {
 
     pub fn deinit(self: *MergeCoordinator) void {
         self.receiver.deinit();
-        self.donor.deinit();
+        if (self.donor_owned) {
+            self.donor.deinit();
+            self.alloc.destroy(self.donor);
+        }
         range_state.freeRange(self.alloc, self.receiver_base_range);
         freeConfig(self.alloc, self.donor_cfg);
         self.alloc.free(self.receiver_root_dir);
@@ -686,11 +949,13 @@ pub const MergeCoordinator = struct {
     }
 
     pub fn reopenDonor(self: *MergeCoordinator) !void {
+        if (!self.donor_owned) return error.BorrowedMergeDonorStore;
         self.donor.deinit();
-        self.donor = try data_store.RaftApplyStore.init(self.alloc, self.donor_cfg);
+        self.donor.* = try data_store.RaftApplyStore.init(self.alloc, self.donor_cfg);
     }
 
     pub fn reopenReceiver(self: *MergeCoordinator) !void {
+        if (self.receiver.owned_db == null) return error.BorrowedMergeReceiverDb;
         self.receiver.deinit();
         self.receiver = try Destination.init(self.alloc, self.receiver_cfg);
     }
@@ -891,17 +1156,7 @@ pub const SyncResult = struct {
     cutover_ready: bool,
 };
 
-pub const SplitSyncStatus = struct {
-    phase: SplitTransitionPhase,
-    source_split_phase: ?shard_mod.SplitPhase,
-    bootstrapped: bool,
-    replay_required: bool,
-    replay_caught_up: bool,
-    cutover_ready: bool,
-    destination_ready_for_reads: bool,
-    source_delta_sequence: u64,
-    dest_delta_sequence: u64,
-};
+pub const SplitSyncStatus = range_transition.SplitStatus;
 
 pub const MergeSyncStatus = range_transition.MergeStatus;
 
@@ -1072,8 +1327,8 @@ test "db split destination applies handoff and filtered split deltas" {
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:90:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:90:1:90:doc:m") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:90:1:90:doc:m") },
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = @constCast("put:doc:u={\"v\":\"right-1\"}") },
     });
     defer std.testing.allocator.free(setup);
@@ -1085,8 +1340,14 @@ test "db split destination applies handoff and filtered split deltas" {
 
     const handoff = try src.captureSplitHandoff(std.testing.allocator, 101);
     defer shard_state_store.freeHandoff(std.testing.allocator, handoff);
-    try dst.applyHandoff(std.testing.allocator, handoff);
-    try std.testing.expectEqual(@as(u64, 1), try dst.appliedDeltaSequence(std.testing.allocator));
+    _ = try dst.applyHandoff(std.testing.allocator, handoff, .{
+        .transition_id = 90,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 90,
+        .bootstrap_complete = true,
+    });
+    try std.testing.expectEqual(@as(u64, 6), try dst.appliedDeltaSequence(std.testing.allocator));
     try std.testing.expectEqualStrings("doc:m", dst.getRange().start);
     try std.testing.expectEqualStrings("doc:z", dst.getRange().end);
 
@@ -1106,12 +1367,80 @@ test "db split destination applies handoff and filtered split deltas" {
     defer shard_mod.freeDeltas(std.testing.allocator, deltas);
     try dst.applyDeltas(std.testing.allocator, deltas);
 
-    try std.testing.expectEqual(@as(u64, 2), try dst.appliedDeltaSequence(std.testing.allocator));
+    try std.testing.expectEqual(@as(u64, 9), try dst.appliedDeltaSequence(std.testing.allocator));
     try std.testing.expect((try dst.get(std.testing.allocator, "doc:t")) == null);
     const right = (try dst.get(std.testing.allocator, "doc:x")) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(right);
     try std.testing.expectEqualStrings("{\"v\":\"right-2\"}", right);
     try std.testing.expect((try dst.get(std.testing.allocator, "doc:c")) == null);
+}
+
+test "db split successor bootstrap atomically replaces stale destination generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-successor", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+    var dst = try Destination.init(std.testing.allocator, .{ .root_dir = dst_root });
+    defer dst.deinit();
+
+    var first_entries = [_]shard_state_store.AppliedDataKV{
+        .{ .key = "doc:m", .value = "{\"v\":1}" },
+        .{ .key = "doc:t", .value = "{\"stale\":true}" },
+    };
+    const first = data_store.SplitHandoff{
+        .byte_range = .{ .start = "doc:m", .end = "doc:z" },
+        .split_state = .{
+            .phase = .splitting,
+            .transition_id = 80,
+            .attempt_epoch = 1,
+            .split_key = "doc:m",
+            .new_shard_id = 200,
+            .original_range_end = "doc:z",
+        },
+        .base_delta_sequence = 7,
+        .entries = &first_entries,
+    };
+    try std.testing.expect(try dst.applyHandoff(std.testing.allocator, first, .{
+        .transition_id = 80,
+        .attempt_epoch = 1,
+        .source_group_id = 100,
+        .destination_group_id = 200,
+        .bootstrap_complete = true,
+    }));
+
+    var successor_entries = [_]shard_state_store.AppliedDataKV{
+        .{ .key = "doc:n", .value = "{\"v\":2}" },
+    };
+    const successor = data_store.SplitHandoff{
+        .byte_range = .{ .start = "doc:m", .end = "doc:z" },
+        .split_state = .{
+            .phase = .splitting,
+            .transition_id = 81,
+            .attempt_epoch = 2,
+            .split_key = "doc:m",
+            .new_shard_id = 200,
+            .original_range_end = "doc:z",
+        },
+        .base_delta_sequence = 3,
+        .entries = &successor_entries,
+    };
+    try std.testing.expect(try dst.applyHandoff(std.testing.allocator, successor, .{
+        .transition_id = 81,
+        .attempt_epoch = 2,
+        .source_group_id = 100,
+        .destination_group_id = 200,
+        .bootstrap_complete = true,
+    }));
+
+    try std.testing.expect((try dst.get(std.testing.allocator, "doc:m")) == null);
+    try std.testing.expect((try dst.get(std.testing.allocator, "doc:t")) == null);
+    const current = (try dst.get(std.testing.allocator, "doc:n")) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqualStrings("{\"v\":2}", current);
+    try std.testing.expectEqual(@as(u64, 3), try dst.appliedDeltaSequence(std.testing.allocator));
+    const marker = (try dst.db.getSplitBootstrapMarker(std.testing.allocator)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 81), marker.transition_id);
+    try std.testing.expectEqual(@as(u64, 2), marker.attempt_epoch);
 }
 
 test "db split destination persists handoff state across reopen" {
@@ -1129,8 +1458,8 @@ test "db split destination persists handoff state across reopen" {
     const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:91:doc:m") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:91:1:91:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:91:1:91:doc:m") },
     });
     defer std.testing.allocator.free(setup);
     try src.snapshotBuilder().applyBatch(.{
@@ -1145,7 +1474,13 @@ test "db split destination persists handoff state across reopen" {
     {
         var dst = try Destination.init(std.testing.allocator, .{ .root_dir = dst_root });
         defer dst.deinit();
-        try dst.applyHandoff(std.testing.allocator, handoff);
+        _ = try dst.applyHandoff(std.testing.allocator, handoff, .{
+            .transition_id = 91,
+            .attempt_epoch = 1,
+            .source_group_id = 111,
+            .destination_group_id = 91,
+            .bootstrap_complete = true,
+        });
         try std.testing.expectEqual(@as(u64, 0), try dst.appliedDeltaSequence(std.testing.allocator));
 
         const catchup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -1161,7 +1496,7 @@ test "db split destination persists handoff state across reopen" {
         const deltas = try src.listSplitDeltasAfter(std.testing.allocator, 111, handoff.base_delta_sequence);
         defer shard_mod.freeDeltas(std.testing.allocator, deltas);
         try dst.applyDeltas(std.testing.allocator, deltas);
-        try std.testing.expectEqual(@as(u64, 1), try dst.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 5), try dst.appliedDeltaSequence(std.testing.allocator));
     }
 
     {
@@ -1169,7 +1504,7 @@ test "db split destination persists handoff state across reopen" {
         defer reopened.deinit();
         try std.testing.expectEqualStrings("doc:m", reopened.getRange().start);
         try std.testing.expectEqualStrings("doc:z", reopened.getRange().end);
-        try std.testing.expectEqual(@as(u64, 1), try reopened.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 5), try reopened.appliedDeltaSequence(std.testing.allocator));
         const right = (try reopened.get(std.testing.allocator, "doc:x")) orelse return error.TestExpectedEqual;
         defer std.testing.allocator.free(right);
         try std.testing.expectEqualStrings("{\"v\":\"right-1\"}", right);
@@ -1192,8 +1527,8 @@ test "db split sync coordinator resumes catch-up across source and destination r
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-            .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:92:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:92:1:122:doc:m") },
+            .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:92:1:122:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{
@@ -1204,12 +1539,18 @@ test "db split sync coordinator resumes catch-up across source and destination r
     }
 
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 92,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 121,
         .dest_group_id = 122,
     });
     defer coord.deinit();
+
+    // Placement provisions the destination range before data handoff. Range
+    // ownership alone must never be interpreted as completed bootstrap.
+    try coord.dest.db.updateRange(.{ .start = "doc:m", .end = "doc:z" });
 
     {
         const result = try coord.syncOnce();
@@ -1238,7 +1579,7 @@ test "db split sync coordinator resumes catch-up across source and destination r
         try std.testing.expect(result.replay_required);
         try std.testing.expect(result.replay_caught_up);
         try std.testing.expect(result.cutover_ready);
-        try std.testing.expectEqual(@as(u64, 1), try coord.dest.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 6), try coord.dest.appliedDeltaSequence(std.testing.allocator));
     }
 
     try coord.reopenSource();
@@ -1250,8 +1591,8 @@ test "db split sync coordinator resumes catch-up across source and destination r
         try std.testing.expect(status.replay_required);
         try std.testing.expect(status.replay_caught_up);
         try std.testing.expect(status.cutover_ready);
-        try std.testing.expectEqual(@as(u64, 1), status.source_delta_sequence);
-        try std.testing.expectEqual(@as(u64, 1), status.dest_delta_sequence);
+        try std.testing.expectEqual(@as(u64, 6), status.source_delta_sequence);
+        try std.testing.expectEqual(@as(u64, 6), status.dest_delta_sequence);
     }
 
     const catchup_2 = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -1269,11 +1610,13 @@ test "db split sync coordinator resumes catch-up across source and destination r
     {
         const result = try coord.syncOnce();
         try std.testing.expect(!result.bootstrapped);
-        try std.testing.expectEqual(@as(usize, 1), result.applied_deltas);
+        // Each committed entry advances the cluster-stable cursor, including
+        // an entry whose document is filtered out by destination ownership.
+        try std.testing.expectEqual(@as(usize, 3), result.applied_deltas);
         try std.testing.expect(result.replay_required);
         try std.testing.expect(result.replay_caught_up);
         try std.testing.expect(result.cutover_ready);
-        try std.testing.expectEqual(@as(u64, 2), try coord.dest.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 9), try coord.dest.appliedDeltaSequence(std.testing.allocator));
         try std.testing.expect((try coord.dest.get(std.testing.allocator, "doc:t")) == null);
         const u = (try coord.dest.get(std.testing.allocator, "doc:u")) orelse return error.TestExpectedEqual;
         defer std.testing.allocator.free(u);
@@ -1300,8 +1643,8 @@ test "db split sync coordinator allocates destination identity namespace" {
         const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:doc:m") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:7022:1:7022:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:1:7022:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{
@@ -1317,6 +1660,8 @@ test "db split sync coordinator allocates destination identity namespace" {
         .range_id = 9102,
     };
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 7022,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 7021,
@@ -1375,6 +1720,8 @@ test "db split status rejects stale destination identity namespace" {
     }
 
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, observeSplitStatus(std.testing.allocator, .{
+        .transition_id = 7022,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 7021,
@@ -1390,6 +1737,77 @@ test "db split status rejects stale destination identity namespace" {
     }));
 }
 
+test "db split status borrows the live raft apply store without a second writer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-borrowed-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-borrowed-dst", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
+    {
+        var dest = try Destination.init(std.testing.allocator, .{ .root_dir = dst_root });
+        dest.deinit();
+    }
+
+    const status = try observeSplitStatus(std.testing.allocator, .{
+        .transition_id = 7002,
+        .attempt_epoch = 1,
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 7001,
+        .dest_group_id = 7002,
+        .source = .{ .root_dir = src_root },
+        .source_store = &source,
+        .dest = .{ .root_dir = dst_root },
+    });
+    try std.testing.expectEqual(SplitTransitionPhase.prepare, status.phase);
+    try std.testing.expect(!status.bootstrapped);
+}
+
+test "db split status uses source acknowledgement without opening destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const progress_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-progress", .{tmp.sub_path});
+    defer std.testing.allocator.free(progress_root);
+    const missing_dest_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-missing-dest", .{tmp.sub_path});
+    defer std.testing.allocator.free(missing_dest_root);
+
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
+    var progress = try db_mod.DB.open(std.testing.allocator, progress_root, .{});
+    defer progress.close();
+    try progress.setSplitBootstrapMarker(.{
+        .transition_id = 7002,
+        .attempt_epoch = 1,
+        .source_group_id = 7001,
+        .destination_group_id = 7002,
+        .bootstrap_complete = true,
+    });
+    try progress.setSplitDeltaFinalSeq(4);
+
+    const status = try observeSplitStatus(std.testing.allocator, .{
+        .transition_id = 7002,
+        .attempt_epoch = 1,
+        .source_root_dir = src_root,
+        .dest_root_dir = missing_dest_root,
+        .source_group_id = 7001,
+        .dest_group_id = 7002,
+        .source = .{ .root_dir = src_root },
+        .source_store = &source,
+        .progress_db = &progress,
+    });
+    try std.testing.expectEqual(SplitTransitionPhase.prepare, status.phase);
+    try std.testing.expect(!status.bootstrapped);
+    try std.testing.expect(!status.destination_ready_for_reads);
+}
+
 test "db split sync coordinator tracks explicit split transition phases" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1399,29 +1817,30 @@ test "db split sync coordinator tracks explicit split transition phases" {
     const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-phase-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_root);
 
-    {
-        var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
-        defer source.deinit();
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
 
-        const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-        });
-        defer std.testing.allocator.free(prepare);
-        try source.snapshotBuilder().applyBatch(.{
-            .group_id = 131,
-            .commit_index = 4,
-            .entries_bytes = prepare,
-        });
-    }
+    const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:1:132:doc:m") },
+    });
+    defer std.testing.allocator.free(prepare);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = 131,
+        .commit_index = 4,
+        .entries_bytes = prepare,
+    });
 
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 132,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 131,
         .dest_group_id = 132,
+        .source_store = &source,
     });
     defer coord.deinit();
 
@@ -1437,7 +1856,7 @@ test "db split sync coordinator tracks explicit split transition phases" {
     }
 
     const start = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:93:doc:m") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:1:132:doc:m") },
     });
     defer std.testing.allocator.free(start);
     try coord.source.snapshotBuilder().applyBatch(.{
@@ -1472,6 +1891,7 @@ test "db split sync coordinator tracks explicit split transition phases" {
         try std.testing.expectEqual(SplitTransitionPhase.replay_deltas, status.phase);
         try std.testing.expect(!status.destination_ready_for_reads);
         const result = try coord.syncOnce();
+        try std.testing.expect(!result.bootstrapped);
         try std.testing.expectEqual(@as(usize, 1), result.applied_deltas);
         const post = try coord.status();
         try std.testing.expectEqual(SplitTransitionPhase.cutover_ready, post.phase);
@@ -1495,27 +1915,28 @@ test "db split sync coordinator can start source split from prepare" {
     const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-start-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_root);
 
-    {
-        var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
-        defer source.deinit();
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
 
-        const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-        });
-        defer std.testing.allocator.free(prepare);
-        try source.snapshotBuilder().applyBatch(.{
-            .group_id = 133,
-            .commit_index = 2,
-            .entries_bytes = prepare,
-        });
-    }
+    const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:134:1:134:doc:m") },
+    });
+    defer std.testing.allocator.free(prepare);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = 133,
+        .commit_index = 2,
+        .entries_bytes = prepare,
+    });
 
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 134,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 133,
         .dest_group_id = 134,
+        .source_store = &source,
     });
     defer coord.deinit();
 
@@ -1543,7 +1964,7 @@ test "db split sync coordinator can prepare source split again after rollback" {
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:136:1:136:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{
@@ -1554,6 +1975,8 @@ test "db split sync coordinator can prepare source split again after rollback" {
     }
 
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 136,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 135,
@@ -1574,11 +1997,130 @@ test "db split sync coordinator can prepare source split again after rollback" {
         try std.testing.expectEqual(shard_state_store.SplitPhase.none, rolled_back.source_split_phase);
     }
 
+    // A durable rollback terminal fences the completed attempt. Re-prepare as
+    // a successor attempt instead of reusing the rolled-back identity.
+    coord.transition_id = 137;
+    coord.attempt_epoch = 2;
     try std.testing.expect(try coord.prepareSourceSplit("doc:m", "doc:z"));
     {
         const prepared = try coord.status();
         try std.testing.expectEqual(SplitTransitionPhase.prepare, prepared.phase);
         try std.testing.expectEqual(shard_state_store.SplitPhase.prepare, prepared.source_split_phase);
+    }
+}
+
+test "db split coordinator rejects mismatched active transition destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-identity-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-identity-dst", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
+
+    const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+    });
+    defer std.testing.allocator.free(setup);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = 301,
+        .commit_index = 1,
+        .entries_bytes = setup,
+    });
+
+    {
+        var coord = try SyncCoordinator.init(std.testing.allocator, .{
+            .transition_id = 302,
+            .attempt_epoch = 1,
+            .source_root_dir = src_root,
+            .dest_root_dir = dst_root,
+            .source_group_id = 301,
+            .dest_group_id = 303,
+            .source_store = &source,
+        });
+        defer coord.deinit();
+
+        const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:302:1:302:doc:m") },
+        });
+        defer std.testing.allocator.free(prepare);
+        try source.snapshotBuilder().applyBatch(.{
+            .group_id = 301,
+            .commit_index = 2,
+            .entries_bytes = prepare,
+        });
+
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.validateTransitionCoordinates(302, 1, 301, 302));
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.status());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.prepareSourceSplit("doc:m", "doc:z"));
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.startSourceSplit());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.ensureBootstrapped());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.catchUp());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.finalizeSource());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.rollbackSource());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.syncOnce());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.reopenDestination());
+    }
+
+    try std.testing.expectError(error.ConflictingSplitTransition, SyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 302,
+        .attempt_epoch = 1,
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 301,
+        .dest_group_id = 303,
+        .source_store = &source,
+    }));
+}
+
+test "db split coordinator remains closed after failed reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-reopen-failure-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const destination_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-reopen-failure-destination", .{tmp.sub_path});
+    defer std.testing.allocator.free(destination_root);
+    const second_source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-reopen-failure-source-2", .{tmp.sub_path});
+    defer std.testing.allocator.free(second_source_root);
+    const second_destination_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-reopen-failure-destination-2", .{tmp.sub_path});
+    defer std.testing.allocator.free(second_destination_root);
+
+    {
+        var coordinator = try SyncCoordinator.init(std.testing.allocator, .{
+            .transition_id = 4102,
+            .attempt_epoch = 1,
+            .source_root_dir = source_root,
+            .dest_root_dir = destination_root,
+            .source_group_id = 4101,
+            .dest_group_id = 4102,
+        });
+        defer coordinator.deinit();
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, coordinator.reopenSourceWithAllocator(failing.allocator()));
+        try std.testing.expectError(error.SplitCoordinatorSourceClosed, coordinator.status());
+        try std.testing.expectError(error.SplitCoordinatorSourceClosed, coordinator.syncOnce());
+    }
+
+    {
+        var coordinator = try SyncCoordinator.init(std.testing.allocator, .{
+            .transition_id = 4202,
+            .attempt_epoch = 1,
+            .source_root_dir = second_source_root,
+            .dest_root_dir = second_destination_root,
+            .source_group_id = 4201,
+            .dest_group_id = 4202,
+        });
+        defer coordinator.deinit();
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, coordinator.reopenDestinationWithAllocator(failing.allocator()));
+        try std.testing.expectError(error.SplitCoordinatorDestinationClosed, coordinator.status());
+        try std.testing.expectError(error.SplitCoordinatorDestinationClosed, coordinator.syncOnce());
     }
 }
 

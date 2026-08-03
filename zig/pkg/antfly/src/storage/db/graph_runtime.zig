@@ -541,7 +541,7 @@ test "db graph runtime artifact external node targets return ids without documen
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"entity_id\":\"entity:person:ada_lovelace\"}}]}}" },
+            .{ .key = "doc:a", .value = "{\"tenant\":\"visible\",\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"entity_id\":\"entity:person:ada_lovelace\"}}]}}" },
         },
         .sync_level = .enrichments,
     });
@@ -569,6 +569,48 @@ test "db graph runtime artifact external node targets return ids without documen
     try std.testing.expectEqualStrings("entity:person:ada_lovelace", result.graph_results[0].hits[0].id);
     try std.testing.expect(result.graph_results[0].hits[0].stored_data == null);
     try std.testing.expect(result.graph_results[0].hits[0].doc_ordinal == null);
+
+    var reverse = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "mentioned_by",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"entity:person:ada_lovelace"} },
+                    .params = .{ .direction = .in, .edge_types = &.{"mentions"} },
+                    .include_documents = true,
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer reverse.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), reverse.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("doc:a", reverse.graph_results[0].hits[0].id);
+    try std.testing.expect(reverse.graph_results[0].hits[0].stored_data != null);
+
+    var bidirectional = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "connected",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"entity:person:ada_lovelace"} },
+                    .params = .{ .direction = .both, .edge_types = &.{"mentions"} },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer bidirectional.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), bidirectional.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("doc:a", bidirectional.graph_results[0].nodes[0].key);
 }
 
 test "db graph runtime async asset producer source materializes through replay" {

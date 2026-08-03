@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lmdb_backend = @import("storage/lmdb_backend.zig");
 pub const mem_backend = @import("storage/mem_backend.zig");

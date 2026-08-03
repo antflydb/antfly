@@ -52,7 +52,7 @@ func setupTestMetadataStore(t *testing.T) (*MetadataStore, kv.DB) {
 
 	ms := &MetadataStore{
 		logger: zaptest.NewLogger(t),
-		config: &common.Config{SwarmMode: false},
+		config: &common.Config{DeploymentMode: common.ConfigDeploymentModeDistributed},
 		tm:     tm,
 	}
 

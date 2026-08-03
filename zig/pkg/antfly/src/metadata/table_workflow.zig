@@ -95,8 +95,16 @@ pub const TableWorkflow = struct {
         try self.bootstrapDesiredFromCommitted(service);
         var current = try self.loop.stateRef().captureCurrent(service);
         defer current.deinit(self.loop.alloc);
-        try validateMergeIntentDocIdentity(current.current, intent);
-        try self.loop.stateRef().tableManager().requestMerge(intent);
+        const requires_reassignment = try self.loop.stateRef().tableManager().mergeRequiresDocIdentityReassignment(
+            intent.donor_group_id,
+            intent.receiver_group_id,
+        );
+        const normalized_intent = try normalizeMergeIntentDocIdentity(
+            current.current,
+            intent,
+            requires_reassignment,
+        );
+        try self.loop.stateRef().tableManager().requestMerge(normalized_intent);
         return try reconcileForService(&self.loop, service);
     }
 
@@ -370,6 +378,22 @@ fn validateMergeIntentDocIdentity(current: metadata_reconciler.CurrentMetadataSt
     if (!runtimeDocIdentitySameNamespace(donor.doc_identity, receiver.doc_identity)) return error.DocIdentityNamespaceMismatch;
 }
 
+fn normalizeMergeIntentDocIdentity(
+    current: metadata_reconciler.CurrentMetadataState,
+    intent: table_manager.MergeIntent,
+    requires_reassignment: bool,
+) !table_manager.MergeIntent {
+    try validateMergeIntentDocIdentity(current, intent);
+    if (intent.allow_doc_identity_reassignment or !requires_reassignment) return intent;
+
+    // A merge approved by the runtime guard may still join distinct committed
+    // range identities. Record that reassignment so the durable contract
+    // explicitly identifies which namespace wins.
+    var normalized = intent;
+    normalized.allow_doc_identity_reassignment = true;
+    return normalized;
+}
+
 fn findMergedGroupStatus(
     statuses: []const metadata_reconciler.MergedGroupStatus,
     group_id: u64,
@@ -571,6 +595,13 @@ test "table workflow doc identity lifecycle handles mixed-version transition sta
         .donor_group_id = 102,
         .receiver_group_id = 101,
     });
+    const normalized = try normalizeMergeIntentDocIdentity(current, .{
+        .transition_id = 11,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+    }, true);
+    try std.testing.expect(normalized.allow_doc_identity_reassignment);
 
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(.{ .merged_group_statuses = &.{} }, .{
         .transition_id = 12,

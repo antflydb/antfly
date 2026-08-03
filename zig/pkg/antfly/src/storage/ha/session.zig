@@ -41,7 +41,7 @@ pub fn replicateAvailable(
     apply_ctx: *anyopaque,
     apply_fn: standby_mod.ApplyFn,
 ) !Result {
-    const from_lsn = standby.nextReceiveLsn();
+    const from_lsn = standby.snapshot().progress.nextReceiveLsn();
     const entries = primary.streamFrom(alloc, slot_name, from_lsn) catch |err| {
         primary.reportReplicationError(slot_name, @errorName(err)) catch {};
         return err;
@@ -82,10 +82,11 @@ fn reportProgress(
     slot_name: []const u8,
     standby: *const standby_mod.Standby,
 ) !void {
-    const progress = standby.currentProgress();
+    const snapshot = standby.snapshot();
+    const progress = snapshot.progress;
     try primary.standbyStatusUpdateWithSafeRead(
         slot_name,
-        standby.identity.timeline_id,
+        snapshot.identity.timeline_id,
         progress.received_lsn,
         progress.applied_lsn,
         progress.safe_read_lsn,

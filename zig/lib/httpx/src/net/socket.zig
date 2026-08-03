@@ -13,6 +13,7 @@ const Io = std.Io;
 const net = Io.net;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const common = @import("../util/common.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -70,6 +71,7 @@ fn readAtLeastOne(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
 pub const Socket = struct {
     handle: net.Socket.Handle,
     io: Io,
+    request_deadline_ms: ?i64 = null,
 
     const Self = @This();
 
@@ -94,9 +96,18 @@ pub const Socket = struct {
         self.io.vtable.netClose(self.io.userdata, @ptrCast((&self.handle)[0..1]));
     }
 
+    /// Shuts down reads and writes without releasing the handle. This is used
+    /// to wake a blocking connection fiber before its owner performs close.
+    pub fn shutdown(self: *Self) void {
+        self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
+    }
+
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
-        return self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch return error.SendFailed;
+        try self.applyRequestDeadline(.send);
+        const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch return error.SendFailed;
+        try self.checkRequestDeadline();
+        return sent;
     }
 
     /// Sends all data, blocking until complete.
@@ -116,14 +127,41 @@ pub const Socket = struct {
     /// Receives data into the buffer, returning bytes received (0 = EOF).
     pub fn recv(self: *Self, buffer: []u8) !usize {
         if (buffer.len == 0) return 0;
+        try self.applyRequestDeadline(.recv);
         if (!is_windows) {
-            return posix.read(self.handle, buffer) catch |err| switch (err) {
+            const received = posix.read(self.handle, buffer) catch |err| switch (err) {
                 error.WouldBlock => return error.Timeout,
                 else => return error.RecvFailed,
             };
+            try self.checkRequestDeadline();
+            return received;
         }
         var bufs = [_][]u8{buffer};
-        return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch return error.RecvFailed;
+        const received = self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch return error.RecvFailed;
+        try self.checkRequestDeadline();
+        return received;
+    }
+
+    pub fn setRequestDeadline(self: *Self, deadline_ms: ?i64) void {
+        self.request_deadline_ms = deadline_ms;
+    }
+
+    const DeadlineOperation = enum { recv, send };
+
+    fn applyRequestDeadline(self: *Self, operation: DeadlineOperation) !void {
+        const deadline_ms = self.request_deadline_ms orelse return;
+        const now_ms = common.milliTimestamp(self.io);
+        if (now_ms >= deadline_ms) return error.Timeout;
+        const remaining_ms: u64 = @intCast(deadline_ms - now_ms);
+        switch (operation) {
+            .recv => self.setRecvTimeout(@max(remaining_ms, 1)) catch return error.RecvFailed,
+            .send => self.setSendTimeout(@max(remaining_ms, 1)) catch return error.SendFailed,
+        }
+    }
+
+    fn checkRequestDeadline(self: *Self) !void {
+        const deadline_ms = self.request_deadline_ms orelse return;
+        if (common.milliTimestamp(self.io) >= deadline_ms) return error.Timeout;
     }
 
     /// Enables or disables TCP_NODELAY (Nagle's algorithm).
@@ -307,13 +345,9 @@ pub const SocketIoReader = struct {
         const dest_n, const data_size = try r.writableVector(&iovecs_buffer, bufs);
         const dest = iovecs_buffer[0..dest_n];
         if (dest.len == 0 or dest[0].len == 0) return 0;
-        const n = if (is_windows)
-            p.socket.io.vtable.netRead(p.socket.io.userdata, p.socket.handle, dest) catch return error.ReadFailed
-        else
-            posix.read(p.socket.handle, dest[0]) catch |err| switch (err) {
-                error.WouldBlock => return error.ReadFailed,
-                else => return error.ReadFailed,
-            };
+        // Route TLS transport reads through Socket.recv so absolute request
+        // deadlines and per-request kernel timeout resets apply consistently.
+        const n = p.socket.recv(dest[0]) catch return error.ReadFailed;
         if (n == 0) return error.EndOfStream;
         if (n > data_size) {
             r.end += n - data_size;

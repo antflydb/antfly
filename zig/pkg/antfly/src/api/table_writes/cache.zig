@@ -29,7 +29,7 @@ const ha_primary_mod = @import("../../storage/ha/primary.zig");
 const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const runtime_status = @import("../runtime_status.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
@@ -44,11 +44,14 @@ const backend_current_root_generation = table_write_core.backend_current_root_ge
 const auto_bulk_ingest_max_window_ops = table_write_bulk_ingest.max_window_ops;
 const auto_bulk_ingest_max_idle_ns = table_write_bulk_ingest.max_idle_ns;
 const auto_bulk_ingest_finish_options = table_write_bulk_ingest.finish_options;
+const StartupCatchUpMetadata = table_write_core.StartupCatchUpMetadata;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
+const managedDbOpenModeDrainsResolverBackfill = table_write_managed_db.managedDbOpenModeDrainsResolverBackfill;
 const StartupConfiguredIndexes = table_write_index_config.StartupConfiguredIndexes;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
 const loadTableIdentityNamespaceForGroup = table_write_managed_db.loadTableIdentityNamespaceForGroup;
 const openManagedDbForStatusWithCache = table_write_managed_db.openManagedDbForStatusWithCache;
+const openManagedDbForStatusWithCacheMode = table_write_managed_db.openManagedDbForStatusWithCacheMode;
 const openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions = table_write_managed_db.openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions;
 const validateProvisionedDbIdentityNamespaceExpected = table_write_managed_db.validateProvisionedDbIdentityNamespaceExpected;
 
@@ -91,6 +94,7 @@ pub const HostedManagedDbCache = struct {
     replica_root_dir: []u8,
     mutex: std.atomic.Mutex = .unlocked,
     write_cache: ProvisionedTableWriteCache,
+    runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
 
     fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !*HostedManagedDbCache {
         const cache = try alloc.create(HostedManagedDbCache);
@@ -98,6 +102,7 @@ pub const HostedManagedDbCache = struct {
         cache.* = .{
             .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
             .write_cache = ProvisionedTableWriteCache.init(alloc),
+            .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
         };
         return cache;
     }
@@ -198,22 +203,48 @@ pub fn overlayDenseHbcCacheStatsFromDb(stats: *db_mod.types.DBStats, db: *db_mod
     }
 }
 
-pub fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRuntimeStatus, db: *db_mod.DB) void {
-    const target_sequence = db.core.nextDerivedSequence();
+pub fn overlayRuntimeStatusReplayTargetFromDb(
+    alloc: std.mem.Allocator,
+    status: *runtime_status.LocalTableRuntimeStatus,
+    db: *db_mod.DB,
+) void {
     const async_stats = db.snapshotAsyncIndexingStats();
     status.stats.async_indexing = async_stats;
     for (status.stats.indexes) |*item| {
-        if (target_sequence > item.replay_target_sequence) {
-            item.replay_target_sequence = target_sequence;
-            item.catch_up_target_sequence = target_sequence;
+        const prior_backfill_active = item.backfill_active;
+        const prior_backfill_progress = item.backfill_progress;
+        const preserve_non_replay_backfill = runtime_status.indexHasNonReplayBackfillSignal(item.*);
+        if (db.executor.appliedSequence(item.name)) |live_applied| {
+            item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
         }
-        if (item.catch_up_target_sequence < item.replay_target_sequence) {
-            item.catch_up_target_sequence = item.replay_target_sequence;
-        }
-        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        item.replay_target_sequence = db.managedIndexReplayTargetSequence(
+            alloc,
+            item.name,
+            item.kind,
+            item.replay_applied_sequence,
+        ) catch @max(item.replay_target_sequence, item.replay_applied_sequence);
+        item.replay_target_sequence = @max(item.replay_target_sequence, item.replay_applied_sequence);
+        item.catch_up_target_sequence = item.replay_target_sequence;
         item.catch_up_applied_sequence = item.replay_applied_sequence;
         item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
         item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
+        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        if (item.catch_up_active or item.replay_catch_up_required) {
+            item.backfill_active = true;
+            if (item.replay_target_sequence > 0) {
+                item.backfill_progress = @min(
+                    1.0,
+                    @as(f64, @floatFromInt(item.replay_applied_sequence)) /
+                        @as(f64, @floatFromInt(item.replay_target_sequence)),
+                );
+            }
+        } else if (prior_backfill_active and preserve_non_replay_backfill) {
+            item.backfill_active = true;
+            item.backfill_progress = prior_backfill_progress;
+        } else {
+            item.backfill_active = false;
+            if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+        }
     }
 }
 
@@ -278,6 +309,7 @@ pub fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
     group_id: u64,
     configured_indexes: *const StartupConfiguredIndexes,
     startup: db_mod.types.StartupCatchUpStats,
+    load_error: ?[]const u8,
 ) !runtime_status.LocalTableRuntimeStatus {
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, configured_indexes.items.len);
     var initialized: usize = 0;
@@ -293,6 +325,10 @@ pub fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
         };
         errdefer freeSyntheticStartupIndexStatsItem(alloc, stats);
         try item.populateStats(alloc, &stats);
+        if (load_error) |message| {
+            stats.load_error = try alloc.dupe(u8, message);
+            stats.repair_degraded = true;
+        }
         indexes[initialized] = stats;
         initialized += 1;
     }
@@ -303,6 +339,7 @@ pub fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
             .index_count = @intCast(indexes.len),
             .indexes = indexes,
             .async_indexing = .{ .startup = startup },
+            .repair_degraded = load_error != null,
         },
     };
 }
@@ -313,6 +350,24 @@ pub fn snapshotLocalTableRuntimeStatusesUncached(
     replica_root_dir: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     table_name: []const u8,
+) !?runtime_status.LocalTableRuntimeStatuses {
+    return try snapshotLocalTableRuntimeStatusesUncachedMode(
+        alloc,
+        catalog,
+        replica_root_dir,
+        backend_runtime,
+        table_name,
+        .status_only,
+    );
+}
+
+pub fn snapshotLocalTableRuntimeStatusesUncachedMode(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    replica_root_dir: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    mode: ManagedDbOpenMode,
 ) !?runtime_status.LocalTableRuntimeStatuses {
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
@@ -337,7 +392,19 @@ pub fn snapshotLocalTableRuntimeStatusesUncached(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, backend_current_root_generation, null, backend_runtime);
+        var db = try openManagedDbForStatusWithCacheMode(
+            alloc,
+            path,
+            catalog,
+            table_name,
+            group_id,
+            null,
+            null,
+            backend_current_root_generation,
+            null,
+            backend_runtime,
+            mode,
+        );
         errdefer db.close();
         items[initialized] = .{
             .group_id = group_id,
@@ -453,6 +520,7 @@ pub fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     db: *db_mod.DB,
 ) !bool {
     const snapshot_cache = snapshot_cache_opt orelse return true;
+    const publication_fence = try snapshot_cache.capturePublicationToken(table_name);
     const async_stats = db.snapshotAsyncIndexingStats();
     if (mode == .best_effort and phase != .idle) {
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
@@ -470,7 +538,7 @@ pub fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             const startup = startupCatchUpStatsForPhase(phase, db);
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
-            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_fence, table_name, status);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
@@ -480,7 +548,7 @@ pub fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             const startup = startupCatchUpStatsForPhase(phase, db);
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
-            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+            try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_fence, table_name, status);
         }
         return true;
     }
@@ -563,7 +631,7 @@ pub fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         status_initialized = true;
     }
     var startup = startupCatchUpStatsForPhase(phase, db);
-    if ((phase == .idle or !startup.wal_retention_known) and cached_startup.wal_retention_known) {
+    if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
         startup.wal_retention_known = true;
         startup.wal_retained_segments = cached_startup.wal_retained_segments;
         startup.wal_retained_bytes = cached_startup.wal_retained_bytes;
@@ -574,15 +642,54 @@ pub fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         !statusHasRuntimeFactsIgnoringMetadataSource(status))
     {
         markClearedStartupRuntimeStatus(&status);
-        try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_fence, table_name, status);
     } else {
         markRuntimeStatusFromDb(&status, phase, startup_catch_up_active);
-        try snapshot_cache.upsertGroupStatus(table_name, status);
+        try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_fence, table_name, status);
     }
     return true;
 }
 
-fn markRuntimeStatusFromDb(
+fn publishRuntimeStatusGroupAfterObservation(
+    snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+    publication_fence: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
+    table_name: []const u8,
+    status: runtime_status.LocalTableRuntimeStatus,
+) !void {
+    const completed = try snapshot_cache.capturePublicationToken(table_name);
+    if (!std.meta.eql(publication_fence.table_epoch, completed.table_epoch)) {
+        return error.RuntimeStatusPublicationFenced;
+    }
+    switch (try snapshot_cache.publishGroup(completed, table_name, status)) {
+        .published, .stale_observation => {},
+        .stale_table => return error.RuntimeStatusPublicationFenced,
+    }
+}
+
+pub fn runtimeStatusNeedsAuthoritativeLifecycleRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+    if (status.stats.repair_degraded or
+        status.stats.repair_issue_count != 0 or
+        !status.stats.repair_summary_ready)
+    {
+        return true;
+    }
+    for (status.stats.indexes) |item| {
+        if (item.backfill_active or
+            item.repair_degraded or
+            item.repair_issue_count != 0 or
+            !item.repair_summary_ready or
+            item.enrichment_failed or
+            item.load_error != null or
+            item.index_repair_id != null or
+            !std.mem.eql(u8, item.projection_checkpoint_status, "clean"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn markRuntimeStatusFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     phase: db_mod.types.StartupCatchUpPhase,
     _: bool,
@@ -593,19 +700,22 @@ fn markRuntimeStatusFromDb(
             .startup_catch_up
         else
             .live_writer_publish,
-        .freshness = if (phase != .idle) .catching_up else .fresh,
+        .freshness = if (phase == .idle)
+            .fresh
+        else
+            startupRuntimeStatusFreshness(phase),
     };
 }
 
-fn statusHasRuntimeFactsIgnoringMetadataSource(status: runtime_status.LocalTableRuntimeStatus) bool {
+pub fn statusHasRuntimeFactsIgnoringMetadataSource(status: runtime_status.LocalTableRuntimeStatus) bool {
     var runtime_fact_probe = status;
     runtime_fact_probe.metadata.source = .cached_snapshot;
     return runtime_status.statusHasRuntimeFacts(runtime_fact_probe);
 }
 
-fn cachedBestEffortStartupPlaceholderSource(source: runtime_status.RuntimeStatusSource) bool {
+pub fn cachedBestEffortStartupPlaceholderSource(source: runtime_status.RuntimeStatusSource) bool {
     return switch (source) {
-        .live_writer_publish, .background_refresh, .remote_store => false,
+        .live_writer_publish, .background_refresh, .remote_store, .rebuild_state_quarantine => false,
         .unknown, .synthetic_config, .cached_snapshot, .startup_catch_up => true,
     };
 }
@@ -618,7 +728,7 @@ fn startupRuntimeStatusFreshness(phase: db_mod.types.StartupCatchUpPhase) runtim
     };
 }
 
-fn setRuntimeStatusMetadata(
+pub fn setRuntimeStatusMetadata(
     status: *runtime_status.LocalTableRuntimeStatus,
     source: runtime_status.RuntimeStatusSource,
     freshness: runtime_status.RuntimeStatusFreshness,
@@ -628,7 +738,7 @@ fn setRuntimeStatusMetadata(
     status.metadata.updated_at_ns = platform_time.monotonicNs();
 }
 
-fn markStartupRuntimeStatus(
+pub fn markStartupRuntimeStatus(
     status: *runtime_status.LocalTableRuntimeStatus,
     startup: db_mod.types.StartupCatchUpStats,
 ) void {
@@ -640,8 +750,14 @@ fn clearStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) vo
     status.stats.async_indexing.startup.phase = .idle;
 }
 
-fn markClearedStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) void {
+pub fn markClearedStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) void {
     clearStartupRuntimeStatus(status);
+    if (status.metadata.freshness == .fresh) {
+        switch (status.metadata.source) {
+            .cached_snapshot, .live_writer_publish, .background_refresh, .remote_store, .rebuild_state_quarantine => return,
+            .unknown, .synthetic_config, .startup_catch_up => {},
+        }
+    }
     var runtime_fact_probe = status.*;
     runtime_fact_probe.metadata.source = .cached_snapshot;
     const source: runtime_status.RuntimeStatusSource = if (runtime_status.statusHasRuntimeFacts(runtime_fact_probe))
@@ -677,6 +793,7 @@ pub fn publishStartupCatchUpRuntimeStatusSnapshot(
     configured_indexes: ?*const StartupConfiguredIndexes,
 ) !void {
     const snapshot_cache = snapshot_cache_opt orelse return;
+    const publication_fence = try snapshot_cache.capturePublicationToken(table_name);
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = group_id,
         .stats = .{},
@@ -718,7 +835,13 @@ pub fn publishStartupCatchUpRuntimeStatusSnapshot(
             db_mod.types.accumulateStartupCatchUpStats(&merged_existing, merged_startup);
             status.stats.async_indexing.startup = merged_existing;
         } else if (configured_indexes) |summary| {
-            status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, startup);
+            status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(
+                alloc,
+                group_id,
+                summary,
+                startup,
+                null,
+            );
             status_initialized = true;
         }
     } else if (db) |managed_db| {
@@ -760,7 +883,7 @@ pub fn publishStartupCatchUpRuntimeStatusSnapshot(
         db_mod.types.accumulateStartupCatchUpStats(&merged_startup, startup);
         status.stats.async_indexing.startup = merged_startup;
     }
-    try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+    try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_fence, table_name, status);
 }
 
 test "startup catch-up stats for path include table and index-local wal retention" {
@@ -918,7 +1041,8 @@ test "runtime status best effort preserves startup placeholder freshness transit
         },
         .stats = .{},
     };
-    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", placeholder);
+    const opening_placeholder_token = try snapshot_cache.capturePublicationToken("docs");
+    _ = try snapshot_cache.publishGroup(opening_placeholder_token, "docs", placeholder);
 
     _ = try publishRuntimeStatusSnapshotWithStartupPhaseMode(
         &snapshot_cache,
@@ -941,7 +1065,8 @@ test "runtime status best effort preserves startup placeholder freshness transit
         try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.opening_db, statuses.items[0].stats.async_indexing.startup.phase);
     }
 
-    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", placeholder);
+    const idle_placeholder_token = try snapshot_cache.capturePublicationToken("docs");
+    _ = try snapshot_cache.publishGroup(idle_placeholder_token, "docs", placeholder);
     _ = try publishRuntimeStatusSnapshotWithStartupPhaseMode(
         &snapshot_cache,
         false,
@@ -964,6 +1089,7 @@ test "runtime status best effort preserves startup placeholder freshness transit
 
 fn freeSyntheticStartupIndexStatsItem(alloc: std.mem.Allocator, item: db_mod.types.DBIndexStats) void {
     alloc.free(item.name);
+    if (item.load_error) |value| alloc.free(value);
     if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
     if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
 }
@@ -988,6 +1114,7 @@ pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
     const cache = removed orelse return;
     lockAtomic(&cache.mutex);
     cache.write_cache.deinit();
+    cache.runtime_status_cache.deinit();
     cache.mutex.unlock();
     alloc.free(cache.replica_root_dir);
     alloc.destroy(cache);
@@ -1056,6 +1183,15 @@ pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) Host
 }
 
 pub const ProvisionedTableWriteCache = struct {
+    pub const TableEvictionHook = struct {
+        ptr: *anyopaque,
+        on_evict: *const fn (ptr: *anyopaque, cache: *ProvisionedTableWriteCache, table_name: []const u8) void,
+
+        fn notify(self: @This(), cache: *ProvisionedTableWriteCache, table_name: []const u8) void {
+            self.on_evict(self.ptr, cache, table_name);
+        }
+    };
+
     alloc: std.mem.Allocator,
     lsm_cache: ?*lsm_backend.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
@@ -1083,6 +1219,8 @@ pub const ProvisionedTableWriteCache = struct {
     /// DBs. Changing the mirror retires live cached DBs so already-open tables
     /// cannot silently continue without primary-side replication.
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
+    table_eviction_hook: ?TableEvictionHook = null,
+    state_mutex: ?*std.atomic.Mutex = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -1184,12 +1322,15 @@ pub const ProvisionedTableWriteCache = struct {
     pub const Entry = struct {
         group_id: u64,
         lsm_root_generation: u64,
+        ha_write_gate_generation: ?u64 = null,
         table_name: []u8,
+        managed_config_fingerprint: [32]u8,
         promotion_owner_state: PromotionOwnerState = .{},
         db: db_mod.DB,
         schema_json: ?[]u8 = null,
         active_leases: usize = 0,
         retired: bool = false,
+        close_queued: bool = false,
         allow_generation_adoption: bool = false,
         allow_active_generation_adoption: bool = false,
         bulk_ingest_session_open: bool = false,
@@ -1198,16 +1339,29 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_started_ns: u64 = 0,
         auto_bulk_ingest_last_ns: u64 = 0,
         auto_bulk_ingest_finish_requested: bool = false,
+        auto_bulk_ingest_finishing: bool = false,
+
+        fn detachRuntimeHooks(self: *Entry) void {
+            self.db.setQueryVisibilityHook(null);
+            self.db.setResolutionCandidateSource(null);
+            self.db.setEntitySink(null);
+            self.db.setPromotionOwner(null);
+            self.promotion_owner_state = .{};
+        }
 
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+            // Callback contexts are borrowed from the attached write source.
+            // Establish the callback barrier before finish/close can drain any
+            // worker that publishes a final visibility transition.
+            self.detachRuntimeHooks();
             if (self.bulk_ingest_session_open) {
                 if (self.auto_bulk_ingest_session_open) {
-                    self.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                    self.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
                         std.log.warn("auto bulk ingest finish failed before cached db close table={s} err={s}", .{
                             self.table_name,
                             @errorName(err),
                         });
-                        self.db.abortDenseAutoBulkIngestSession();
+                        self.db.abortPrimaryStoreAutoBulkIngestSession();
                     };
                 } else {
                     self.db.abortBulkIngestSession();
@@ -1224,20 +1378,75 @@ pub const ProvisionedTableWriteCache = struct {
             // tears down async workers and flushes owned storage; callers that
             // require full-index visibility must request it through sync_level
             // or the index status path before reading.
-            self.db.setPromotionOwner(null);
             const pending = self.db.pendingWorkStats();
             if (pending.enrichment.error_count == 0) {
                 self.db.core.index_manager.syncAll(false) catch |err| {
                     std.log.warn("provisioned write cache sync failed before close: {}", .{err});
                 };
             }
-            self.db.setQueryVisibilityHook(null);
             self.db.close();
             alloc.free(self.table_name);
             if (self.schema_json) |value| alloc.free(value);
             self.* = undefined;
         }
     };
+
+    fn managedConfigFingerprint(indexes_json: ?[]const u8) [32]u8 {
+        var fingerprint: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(indexes_json orelse "", &fingerprint, .{});
+        return fingerprint;
+    }
+
+    pub fn bindStateMutex(
+        self: *ProvisionedTableWriteCache,
+        state_mutex: *std.atomic.Mutex,
+    ) void {
+        if (self.state_mutex) |existing| {
+            if (existing != state_mutex) {
+                @panic("writer cache cannot be rebound to a different state mutex");
+            }
+            return;
+        }
+        self.state_mutex = state_mutex;
+    }
+
+    pub fn entryManagedConfigMatches(entry: *const Entry, indexes_json: ?[]const u8) bool {
+        const desired = managedConfigFingerprint(indexes_json);
+        return std.mem.eql(u8, &entry.managed_config_fingerprint, &desired);
+    }
+
+    fn entryManagedMetadataMatches(
+        entry: *const Entry,
+        metadata: StartupCatchUpMetadata,
+    ) bool {
+        return entryManagedConfigMatches(entry, metadata.indexes_json) and
+            optionalMetadataBytesEqual(entry.schema_json, metadata.schema_json) and
+            entryIdentityMatchesMetadata(entry, metadata);
+    }
+
+    fn entryIdentityMatchesMetadata(
+        entry: *const Entry,
+        metadata: StartupCatchUpMetadata,
+    ) bool {
+        const namespace = metadata.identity_namespace orelse return true;
+        return switch (metadata.identity_validation) {
+            .exact => entry.db.core.identity_namespace.eql(namespace),
+            .reassign_same_table => entry.db.core.identity_namespace.table_id ==
+                namespace.table_id,
+        };
+    }
+
+    fn optionalMetadataBytesEqual(
+        lhs: ?[]const u8,
+        rhs: ?[]const u8,
+    ) bool {
+        if (lhs == null or rhs == null) return lhs == null and rhs == null;
+        return std.mem.eql(u8, lhs.?, rhs.?);
+    }
+
+    pub fn publishEntryManagedConfig(entry: *Entry, indexes_json: ?[]const u8) void {
+        entry.managed_config_fingerprint = managedConfigFingerprint(indexes_json);
+    }
 
     pub const PromotionLeadershipSource = struct {
         ptr: *anyopaque,
@@ -1284,6 +1493,24 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    pub fn entryHAWriteGateCurrent(self: *const ProvisionedTableWriteCache, entry: *const Entry) bool {
+        return entry.ha_write_gate_generation == haWriteGateCurrentGeneration(self.ha_write_gate);
+    }
+
+    pub fn groupDenseRepairWriteBackpressuredLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            return entry.db.denseRepairWriteBackpressured();
+        }
+        return false;
+    }
+
     pub fn retireFailedOpenLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
         const entry = cached.entry orelse {
             cached.deinit(self.alloc);
@@ -1298,6 +1525,35 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         if (!entry.retired) self.retireEntryLocked(entry);
+        cached.deinit(self.alloc);
+    }
+
+    pub fn retireCachedLeaseAfterMutationFailureLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
+        const entry = cached.entry orelse {
+            cached.deinit(self.alloc);
+            return;
+        };
+
+        var track_retirement = true;
+        if (!entry.retired) self.reserveRetiredEntriesCapacityLocked(1) catch |err| {
+            std.log.err("failed to reserve retired writer-cache entry after structural mutation failure: {}", .{err});
+            track_retirement = false;
+        };
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            if (self.entries.items[i] != entry) continue;
+            _ = self.entries.orderedRemove(i);
+            break;
+        }
+
+        if (!entry.retired) {
+            if (track_retirement) {
+                self.retireEntryLocked(entry);
+            } else {
+                self.markEntryRetiredUntrackedLocked(entry);
+            }
+        }
         cached.deinit(self.alloc);
     }
 
@@ -1322,13 +1578,14 @@ pub const ProvisionedTableWriteCache = struct {
         return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
     }
 
-    fn haWriteGatesEqual(a: ?db_mod.HAWriteGate, b: ?db_mod.HAWriteGate) bool {
+    pub fn haWriteGatesEqual(a: ?db_mod.HAWriteGate, b: ?db_mod.HAWriteGate) bool {
         if (a == null or b == null) return a == null and b == null;
         return switch (a.?) {
             .primary => |left| switch (b.?) {
                 .primary => |right| left == right,
                 .fenced_primary => false,
                 .standby => false,
+                .shared => false,
             },
             .fenced_primary => |left| switch (b.?) {
                 .primary => false,
@@ -1336,12 +1593,26 @@ pub const ProvisionedTableWriteCache = struct {
                     left.fence_store == right.fence_store and
                     std.mem.eql(u8, left.node_id, right.node_id),
                 .standby => false,
+                .shared => false,
             },
             .standby => |left| switch (b.?) {
                 .primary => false,
                 .fenced_primary => false,
                 .standby => |right| left == right,
+                .shared => false,
             },
+            .shared => |left| switch (b.?) {
+                .primary, .fenced_primary, .standby => false,
+                .shared => |right| left.state == right.state and left.generation == right.generation,
+            },
+        };
+    }
+
+    fn haWriteGateCurrentGeneration(gate: ?db_mod.HAWriteGate) ?u64 {
+        const configured = gate orelse return null;
+        return switch (configured) {
+            .shared => |shared| shared.state.currentGeneration(),
+            .primary, .fenced_primary, .standby => null,
         };
     }
 
@@ -1360,7 +1631,7 @@ pub const ProvisionedTableWriteCache = struct {
         return true;
     }
 
-    fn haAsyncMirrorsEqual(a: ?db_mod.HAAsyncEffectMirror, b: ?db_mod.HAAsyncEffectMirror) bool {
+    pub fn haAsyncMirrorsEqual(a: ?db_mod.HAAsyncEffectMirror, b: ?db_mod.HAAsyncEffectMirror) bool {
         if (a == null or b == null) return a == null and b == null;
         const left = a.?;
         const right = b.?;
@@ -1425,25 +1696,47 @@ pub const ProvisionedTableWriteCache = struct {
         self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) void {
+    pub fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
         if (haWriteGatesEqual(self.ha_write_gate, gate)) return;
+        lockAtomic(&self.entry_lifecycle_mutex);
+        self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
+            self.entry_lifecycle_mutex.unlock();
+            return err;
+        };
         self.ha_write_gate = gate;
-        self.clear();
+        self.clearAssumeLifecycleLocked();
+        self.entry_lifecycle_mutex.unlock();
+        self.drainPendingClosesAssumeOpenMutexHeld();
     }
 
-    pub fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) void {
+    pub fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) !void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
         if (haAsyncMirrorsEqual(self.ha_async_mirror, mirror)) return;
+        lockAtomic(&self.entry_lifecycle_mutex);
+        self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
+            self.entry_lifecycle_mutex.unlock();
+            return err;
+        };
         self.ha_async_mirror = mirror;
-        self.clear();
+        self.clearAssumeLifecycleLocked();
+        self.entry_lifecycle_mutex.unlock();
+        self.drainPendingClosesAssumeOpenMutexHeld();
     }
 
     const ActiveBulkIngestSession = struct {
+        const State = enum {
+            opening,
+            active,
+            finishing,
+        };
+
         table_name: []u8,
         depth: usize = 1,
+        state: State = .active,
+        abort_requested: bool = false,
 
         pub fn deinit(self: *ActiveBulkIngestSession, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
@@ -1460,6 +1753,21 @@ pub const ProvisionedTableWriteCache = struct {
             alloc.free(self.table_name);
             if (self.indexes_json) |value| alloc.free(value);
             if (self.schema_json) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    const PreparedStructuralPublication = struct {
+        table_metadata: ?TableMetadata,
+        entry_schema_json: []?[]u8,
+        managed_config_fingerprint: [32]u8,
+
+        pub fn deinit(self: *PreparedStructuralPublication, alloc: std.mem.Allocator) void {
+            if (self.table_metadata) |*metadata| metadata.deinit(alloc);
+            for (self.entry_schema_json) |value| {
+                if (value) |owned| alloc.free(owned);
+            }
+            alloc.free(self.entry_schema_json);
             self.* = undefined;
         }
     };
@@ -1481,6 +1789,92 @@ pub const ProvisionedTableWriteCache = struct {
             .indexes_json = owned_indexes_json,
             .schema_json = owned_schema_json,
         };
+    }
+
+    pub fn prepareStructuralPublication(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+        entry_count: usize,
+    ) !PreparedStructuralPublication {
+        var table_metadata = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
+        errdefer table_metadata.deinit(self.alloc);
+
+        const entry_schema_json = try self.alloc.alloc(?[]u8, entry_count);
+        errdefer self.alloc.free(entry_schema_json);
+        @memset(entry_schema_json, null);
+        var initialized: usize = 0;
+        errdefer for (entry_schema_json[0..initialized]) |value| {
+            if (value) |owned| self.alloc.free(owned);
+        };
+        while (initialized < entry_schema_json.len) : (initialized += 1) {
+            entry_schema_json[initialized] = try self.alloc.dupe(u8, schema_json);
+        }
+
+        return .{
+            .table_metadata = table_metadata,
+            .entry_schema_json = entry_schema_json,
+            .managed_config_fingerprint = managedConfigFingerprint(indexes_json),
+        };
+    }
+
+    pub fn publishStructuralMutationLocked(
+        self: *ProvisionedTableWriteCache,
+        cached_groups: []CachedDb,
+        target_generations: []const u64,
+        prepared: *PreparedStructuralPublication,
+    ) !void {
+        if (cached_groups.len != target_generations.len or
+            cached_groups.len != prepared.entry_schema_json.len)
+        {
+            return error.InvalidStructuralPublication;
+        }
+        const replacement_metadata = prepared.table_metadata orelse
+            return error.InvalidStructuralPublication;
+        const table_name = replacement_metadata.table_name;
+
+        for (cached_groups, target_generations) |cached, target_generation| {
+            if ((cached.cache orelse return error.StaleCachedDbLease) != self)
+                return error.StaleCachedDbLease;
+            const entry = cached.entry orelse return error.StaleCachedDbLease;
+            if (entry.retired or
+                entry.lsm_root_generation != target_generation or
+                !std.mem.eql(u8, entry.table_name, table_name))
+            {
+                return error.StaleCachedDbLease;
+            }
+        }
+
+        const replace_index = blk: {
+            for (self.table_metadata.items, 0..) |metadata, i| {
+                if (std.mem.eql(u8, metadata.table_name, table_name)) break :blk i;
+            }
+            break :blk null;
+        };
+        if (replace_index == null) try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
+
+        var retired_metadata: ?TableMetadata = null;
+        if (replace_index) |i| {
+            retired_metadata = self.table_metadata.items[i];
+            self.table_metadata.items[i] = replacement_metadata;
+        } else {
+            if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
+            self.table_metadata.appendAssumeCapacity(replacement_metadata);
+        }
+        prepared.table_metadata = retired_metadata;
+
+        for (cached_groups, target_generations, prepared.entry_schema_json) |*cached, target_generation, *replacement_schema| {
+            const entry = cached.entry.?;
+            const retired_schema = entry.schema_json;
+            entry.schema_json = replacement_schema.*;
+            replacement_schema.* = retired_schema;
+            entry.managed_config_fingerprint = prepared.managed_config_fingerprint;
+            entry.lsm_root_generation = target_generation;
+            entry.allow_generation_adoption = false;
+            entry.allow_active_generation_adoption = false;
+            cached.schema_json = entry.schema_json;
+        }
     }
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableWriteCache {
@@ -1514,21 +1908,26 @@ pub const ProvisionedTableWriteCache = struct {
         self.active_bulk_ingest_sessions = .empty;
     }
 
-    pub fn clear(self: *ProvisionedTableWriteCache) void {
-        {
-            lockAtomic(@constCast(&self.entry_lifecycle_mutex));
-            defer @constCast(&self.entry_lifecycle_mutex).unlock();
-            self.retired_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len) catch return;
-            self.closing_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len) catch return;
+    pub fn detachRuntimeHooks(self: *ProvisionedTableWriteCache) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        for (self.entries.items) |entry| entry.detachRuntimeHooks();
+        for (self.retired_entries.items) |entry| entry.detachRuntimeHooks();
+        for (self.closing_entries.items) |entry| entry.detachRuntimeHooks();
+    }
 
-            for (self.entries.items) |entry| self.retireEntryAssumeLifecycleLocked(entry);
-            self.entries.clearRetainingCapacity();
-        }
+    pub fn reserveClearCapacityAssumeLifecycleLocked(self: *ProvisionedTableWriteCache) !void {
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len);
+        try self.closing_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len);
+    }
+
+    pub fn clearAssumeLifecycleLocked(self: *ProvisionedTableWriteCache) void {
+        for (self.entries.items) |entry| self.retireEntryAssumeLifecycleLocked(entry);
+        self.entries.clearRetainingCapacity();
         for (self.table_metadata.items) |*metadata| metadata.deinit(self.alloc);
         self.table_metadata.clearRetainingCapacity();
         for (self.active_bulk_ingest_sessions.items) |*session| session.deinit(self.alloc);
         self.active_bulk_ingest_sessions.clearRetainingCapacity();
-        self.drainPendingClosesAssumeOpenMutexHeld();
     }
 
     pub fn cacheStats(self: *const ProvisionedTableWriteCache) CacheStats {
@@ -1689,7 +2088,12 @@ pub const ProvisionedTableWriteCache = struct {
                             .query_readonly => .query_readonly,
                             .status_only => .status_only,
                         },
-                        .start_optional_runtimes = open_mode != .startup_catch_up and open_mode != .query_readonly,
+                        .start_index_workers = open_mode != .startup_catch_up and
+                            open_mode != .restore_repair and
+                            open_mode != .query_readonly,
+                        .start_optional_runtimes = open_mode != .startup_catch_up and
+                            open_mode != .restore_repair and
+                            open_mode != .query_readonly,
                         .index_open_parallelism = if (open_mode == .default_async or open_mode == .writer_no_replay) 1 else null,
                     });
                 errdefer db.close();
@@ -1703,6 +2107,12 @@ pub const ProvisionedTableWriteCache = struct {
                 };
             }
         }.run;
+
+        if (mode != .status_only and mode != .query_readonly and
+            self.bulkIngestSessionTransitioningForTable(table_name))
+        {
+            return error.LsmRootWriterAlreadyOpen;
+        }
 
         const metadata = try self.getOrLoadMetadataLocked(catalog, table_name);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
@@ -1743,6 +2153,8 @@ pub const ProvisionedTableWriteCache = struct {
         }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
+                if (!self.entryHAWriteGateCurrent(entry)) continue;
+                if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1784,18 +2196,20 @@ pub const ProvisionedTableWriteCache = struct {
             self.ha_async_mirror,
         );
         errdefer opened.db.close();
-        const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionActiveForTable(table_name);
+        const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionReadyForTable(table_name);
         if (start_bulk_session) {
             try opened.db.beginBulkIngestSession();
             errdefer opened.db.abortBulkIngestSession();
         }
-        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+        try self.reserveInstalledEntryLifecycleCapacityLocked(1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
             .group_id = group_id,
             .lsm_root_generation = lsm_root_generation,
+            .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
+            .managed_config_fingerprint = managedConfigFingerprint(metadata.indexes_json),
             .db = opened.db,
             .schema_json = if (metadata.schema_json) |value| try self.alloc.dupe(u8, value) else null,
             .active_leases = 1,
@@ -1807,10 +2221,12 @@ pub const ProvisionedTableWriteCache = struct {
             .cache = self,
             .entry = owned_entry,
             .db = &owned_entry.db,
-            .schema_json = metadata.schema_json,
+            .schema_json = owned_entry.schema_json,
         };
         errdefer self.retireFailedOpenLocked(&cached);
-        try owned_entry.db.drainResolverBackfill();
+        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
+            try owned_entry.db.drainResolverBackfill();
+        }
         return cached;
     }
 
@@ -1824,13 +2240,39 @@ pub const ProvisionedTableWriteCache = struct {
         return true;
     }
 
+    pub fn publishCachedLeaseGeneration(
+        self: *ProvisionedTableWriteCache,
+        cached: *const CachedDb,
+        lsm_root_generation: u64,
+    ) void {
+        _ = self;
+        const entry = cached.entry orelse return;
+        entry.lsm_root_generation = lsm_root_generation;
+        entry.allow_generation_adoption = false;
+        entry.allow_active_generation_adoption = false;
+    }
+
     pub fn getOrPrepareOpenLocked(
         self: *ProvisionedTableWriteCache,
         group_id: u64,
         lsm_root_generation: u64,
         table_name: []const u8,
+        expected_identity_namespace: ?doc_identity.Namespace,
+        expected_metadata: ?StartupCatchUpMetadata,
     ) !GetOrPrepareOpen {
+        if (self.bulkIngestSessionTransitioningForTable(table_name))
+            return error.LsmRootWriterAlreadyOpen;
+        const exact_metadata = if (expected_metadata) |metadata|
+            if (metadata.metadata_source == .supplied) metadata else null
+        else
+            null;
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        try self.pruneIdentityMismatchedEntriesForGroupTableLocked(group_id, table_name, expected_identity_namespace);
+        try self.pruneManagedMetadataMismatchedEntriesForGroupTableLocked(
+            group_id,
+            table_name,
+            exact_metadata,
+        );
         if (self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name)) {
             return error.LsmRootWriterAlreadyOpen;
         }
@@ -1839,6 +2281,12 @@ pub const ProvisionedTableWriteCache = struct {
         }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
+                if (!self.entryHAWriteGateCurrent(entry)) continue;
+                if (!entryMatchesExpectedIdentityNamespace(entry, expected_identity_namespace)) continue;
+                if (exact_metadata) |metadata| {
+                    if (!entryManagedMetadataMatches(entry, metadata)) continue;
+                }
+                if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1856,6 +2304,11 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (!entryMatchesExpectedIdentityNamespace(entry, expected_identity_namespace)) continue;
+            if (exact_metadata) |metadata| {
+                if (!entryManagedMetadataMatches(entry, metadata)) continue;
+            }
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             _ = self.hit_count.fetchAdd(1, .monotonic);
             lockAtomic(&self.entry_lifecycle_mutex);
@@ -1890,6 +2343,8 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
             return self.leaseEntryLocked(entry);
         }
         return null;
@@ -1905,13 +2360,31 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             return self.leaseEntryLocked(entry);
         }
         return null;
     }
 
-    fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
+    pub fn snapshotGroupLeaseOrAdoptSeededLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) ?CachedDb {
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
+            if (entry.lsm_root_generation != lsm_root_generation and
+                !self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
+            return self.leaseEntryLocked(entry);
+        }
+        return null;
+    }
+
+    pub fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
         entry.active_leases += 1;
@@ -1921,6 +2394,28 @@ pub const ProvisionedTableWriteCache = struct {
             .db = &entry.db,
             .schema_json = entry.schema_json,
         };
+    }
+
+    pub fn leaseLiveEntryForLocalMutationLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+        allow_bulk_session: bool,
+    ) ?CachedDb {
+        if (self.bulkIngestSessionTransitioningForTable(table_name)) return null;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
+            if (!allow_bulk_session and
+                (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open))
+            {
+                return null;
+            }
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            return self.leaseEntryLocked(entry);
+        }
+        return null;
     }
 
     pub fn adoptPreparedOpenLocked(
@@ -1948,12 +2443,20 @@ pub const ProvisionedTableWriteCache = struct {
             };
         }
 
+        if (mode != .status_only and mode != .query_readonly and
+            self.bulkIngestSessionTransitioningForTable(table_name))
+        {
+            return error.LsmRootWriterAlreadyOpen;
+        }
+
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
         if (self.hasPendingCloseForGroupTableLocked(group_id, table_name)) {
             return error.LsmRootWriterAlreadyOpen;
         }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
+                if (!self.entryHAWriteGateCurrent(entry)) continue;
+                if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
                 if (opened.*) |*db| db.close();
                 opened.* = null;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -1974,7 +2477,7 @@ pub const ProvisionedTableWriteCache = struct {
         errdefer db.close();
 
         const start_bulk_session = switch (mode) {
-            .default, .default_async, .writer_no_replay => self.bulkIngestSessionActiveForTable(table_name),
+            .default, .default_async, .writer_no_replay => self.bulkIngestSessionReadyForTable(table_name),
             .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
         };
         if (start_bulk_session) {
@@ -1984,13 +2487,15 @@ pub const ProvisionedTableWriteCache = struct {
 
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
-        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+        try self.reserveInstalledEntryLifecycleCapacityLocked(1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
             .group_id = group_id,
             .lsm_root_generation = lsm_root_generation,
+            .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
+            .managed_config_fingerprint = managedConfigFingerprint(prepared.indexes_json),
             .db = db,
             .schema_json = prepared.schema_json,
             .active_leases = 1,
@@ -2023,6 +2528,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
             if (opened.*) |*db| db.close();
             opened.* = null;
             try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
@@ -2037,17 +2543,20 @@ pub const ProvisionedTableWriteCache = struct {
         errdefer self.alloc.free(owned_table_name);
         const owned_schema_json = try self.alloc.dupe(u8, schema_json);
         errdefer self.alloc.free(owned_schema_json);
-        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+        try self.reserveInstalledEntryLifecycleCapacityLocked(1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
             .group_id = group_id,
             .lsm_root_generation = lsm_root_generation,
+            .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
+            .managed_config_fingerprint = managedConfigFingerprint(indexes_json),
             .db = db,
             .schema_json = owned_schema_json,
             .active_leases = 0,
             .allow_generation_adoption = true,
+            .allow_active_generation_adoption = true,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         errdefer owned_entry.deinit(self.alloc);
@@ -2119,11 +2628,12 @@ pub const ProvisionedTableWriteCache = struct {
                 i += 1;
                 continue;
             }
-            if (entry.lsm_root_generation == lsm_root_generation) {
+            const stale_ha_write_gate = !self.entryHAWriteGateCurrent(entry);
+            if (entry.lsm_root_generation == lsm_root_generation and !stale_ha_write_gate) {
                 i += 1;
                 continue;
             }
-            if (self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
+            if (!stale_ha_write_gate and self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
                 i += 1;
                 continue;
             }
@@ -2134,6 +2644,85 @@ pub const ProvisionedTableWriteCache = struct {
             _ = self.entries.orderedRemove(i);
             self.retireEntryLocked(entry);
         }
+    }
+
+    fn pruneManagedMetadataMismatchedEntriesForGroupTableLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+        expected: ?StartupCatchUpMetadata,
+    ) !void {
+        const metadata = expected orelse return;
+        if (metadata.metadata_source != .supplied) return;
+        var mismatch_count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or
+                !std.mem.eql(u8, entry.table_name, table_name))
+            {
+                continue;
+            }
+            if (!entryManagedMetadataMatches(entry, metadata))
+                mismatch_count += 1;
+        }
+        try self.reserveLifecycleRetireCapacityLocked(mismatch_count);
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                entryManagedMetadataMatches(entry, metadata))
+            {
+                i += 1;
+                continue;
+            }
+            if (entry.bulk_ingest_session_open or
+                entry.auto_bulk_ingest_session_open)
+            {
+                i += 1;
+                continue;
+            }
+            if (try self.retireInactiveEntryAtIndexForCloseLocked(i)) continue;
+            i += 1;
+        }
+    }
+
+    fn pruneIdentityMismatchedEntriesForGroupTableLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+        expected: ?doc_identity.Namespace,
+    ) !void {
+        const namespace = expected orelse return;
+        var mismatch_count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!entry.db.core.identity_namespace.eql(namespace)) mismatch_count += 1;
+        }
+        try self.reserveLifecycleRetireCapacityLocked(mismatch_count);
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                entry.db.core.identity_namespace.eql(namespace))
+            {
+                i += 1;
+                continue;
+            }
+            if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) {
+                i += 1;
+                continue;
+            }
+            if (try self.retireInactiveEntryAtIndexForCloseLocked(i)) continue;
+            i += 1;
+        }
+    }
+
+    fn entryMatchesExpectedIdentityNamespace(entry: *const Entry, expected: ?doc_identity.Namespace) bool {
+        const namespace = expected orelse return true;
+        return entry.db.core.identity_namespace.eql(namespace);
     }
 
     pub fn invalidateTable(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
@@ -2147,6 +2736,24 @@ pub const ProvisionedTableWriteCache = struct {
             }
             var removed = self.table_metadata.orderedRemove(i);
             removed.deinit(self.alloc);
+        }
+    }
+
+    pub fn invalidateGroupTable(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) !void {
+        var matching_entries: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) matching_entries += 1;
+        }
+        try self.reserveLifecycleRetireCapacityLocked(matching_entries);
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) {
+                i += 1;
+                continue;
+            }
+            _ = self.entries.orderedRemove(i);
+            self.retireEntryLocked(entry);
         }
     }
 
@@ -2194,7 +2801,7 @@ pub const ProvisionedTableWriteCache = struct {
         self.drainPendingClosesAssumeOpenMutexHeld();
     }
 
-    fn hasLiveEntryForGroupTableLocked(
+    pub fn hasLiveEntryForGroupTableLocked(
         self: *const ProvisionedTableWriteCache,
         group_id: u64,
         table_name: []const u8,
@@ -2266,7 +2873,9 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn beginBulkIngestLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         for (self.active_bulk_ingest_sessions.items) |*session| {
             if (!std.mem.eql(u8, session.table_name, table_name)) continue;
-            session.depth += 1;
+            if (session.state != .active) return error.LsmRootWriterAlreadyOpen;
+            session.depth = std.math.add(usize, session.depth, 1) catch
+                return error.BulkIngestDepthOverflow;
             return;
         }
 
@@ -2282,7 +2891,9 @@ pub const ProvisionedTableWriteCache = struct {
             }
         };
         for (self.entries.items) |entry| {
-            if (!std.mem.eql(u8, entry.table_name, table_name) or entry.bulk_ingest_session_open) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
+            if (entry.bulk_ingest_session_open) continue;
             try entry.db.beginBulkIngestSession();
             entry.bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_session_open = false;
@@ -2301,6 +2912,8 @@ pub const ProvisionedTableWriteCache = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !void {
         const idx = self.findActiveBulkIngestSession(table_name) orelse return;
+        if (self.active_bulk_ingest_sessions.items[idx].state != .active)
+            return error.LsmRootWriterAlreadyOpen;
         if (self.active_bulk_ingest_sessions.items[idx].depth > 1) {
             self.active_bulk_ingest_sessions.items[idx].depth -= 1;
             return;
@@ -2309,16 +2922,11 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                try entry.db.finishDenseAutoBulkIngestSessionWithOptions(options);
+                try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
             } else {
                 try entry.db.finishBulkIngestSessionWithOptions(options);
             }
-            entry.bulk_ingest_session_open = false;
-            entry.auto_bulk_ingest_session_open = false;
-            entry.auto_bulk_ingest_ops = 0;
-            entry.auto_bulk_ingest_started_ns = 0;
-            entry.auto_bulk_ingest_last_ns = 0;
-            entry.auto_bulk_ingest_finish_requested = false;
+            clearEntryBulkIngestState(entry);
         }
         var removed = self.active_bulk_ingest_sessions.orderedRemove(idx);
         removed.deinit(self.alloc);
@@ -2326,19 +2934,18 @@ pub const ProvisionedTableWriteCache = struct {
 
     pub fn abortBulkIngestLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
         const idx = self.findActiveBulkIngestSession(table_name) orelse return;
+        if (self.active_bulk_ingest_sessions.items[idx].state != .active) {
+            self.active_bulk_ingest_sessions.items[idx].abort_requested = true;
+            return;
+        }
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                entry.db.abortDenseAutoBulkIngestSession();
+                entry.db.abortPrimaryStoreAutoBulkIngestSession();
             } else {
                 entry.db.abortBulkIngestSession();
             }
-            entry.bulk_ingest_session_open = false;
-            entry.auto_bulk_ingest_session_open = false;
-            entry.auto_bulk_ingest_ops = 0;
-            entry.auto_bulk_ingest_started_ns = 0;
-            entry.auto_bulk_ingest_last_ns = 0;
-            entry.auto_bulk_ingest_finish_requested = false;
+            clearEntryBulkIngestState(entry);
         }
         var removed = self.active_bulk_ingest_sessions.orderedRemove(idx);
         removed.deinit(self.alloc);
@@ -2348,8 +2955,9 @@ pub const ProvisionedTableWriteCache = struct {
         if (self.bulkIngestSessionActiveForTable(table_name)) return;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
             if (!entry.bulk_ingest_session_open) {
-                try entry.db.beginDenseAutoBulkIngestSession();
+                try entry.db.beginPrimaryStoreAutoBulkIngestSession();
                 entry.bulk_ingest_session_open = true;
             }
             entry.auto_bulk_ingest_session_open = true;
@@ -2364,6 +2972,7 @@ pub const ProvisionedTableWriteCache = struct {
         var should_finish = false;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or !entry.auto_bulk_ingest_session_open) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.AutoBulkIngestBusy;
             entry.auto_bulk_ingest_ops +|= ops;
             entry.auto_bulk_ingest_last_ns = now_ns;
             should_finish = should_finish or entry.auto_bulk_ingest_ops >= auto_bulk_ingest_max_window_ops;
@@ -2374,9 +2983,10 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn rollRequestedAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8, now_ns: u64) !bool {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return false;
             if (!entry.auto_bulk_ingest_session_open or !entry.auto_bulk_ingest_finish_requested) return false;
             if (self.entryActiveLeasesLocked(entry) > 1) return false;
-            try entry.db.rollDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
             entry.auto_bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_ops = 0;
             entry.auto_bulk_ingest_started_ns = now_ns;
@@ -2390,7 +3000,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn finishAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) !void {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or !entry.auto_bulk_ingest_session_open) continue;
-            try entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
             entry.bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_ops = 0;
@@ -2399,6 +3009,14 @@ pub const ProvisionedTableWriteCache = struct {
             entry.auto_bulk_ingest_finish_requested = false;
         }
         self.removeInactiveBulkIngestSessionLocked(table_name);
+    }
+
+    fn autoBulkIngestIdleLocked(self: *const ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (self.entryActiveLeasesLocked(entry) != 0) return false;
+        }
+        return true;
     }
 
     pub fn finishExpiredAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, now_ns: u64) !bool {
@@ -2421,7 +3039,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (!idle_expired and entry.auto_bulk_ingest_finish_requested) {
                 continue;
             } else {
-                entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
@@ -2478,6 +3096,32 @@ pub const ProvisionedTableWriteCache = struct {
         }
         if (best_score == 0) return null;
         return self.leaseEntryLocked(best_entry.?);
+    }
+
+    fn versionPinnedObsoleteScore(entry: *Entry) u64 {
+        const stats = entry.db.trySnapshotLsmMaintenanceStats() orelse return 0;
+        return if (stats.obsolete_paths_pinned_by_versions != 0) 1 else 0;
+    }
+
+    fn leaseLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            if (entry.db.hasActiveDenseBulkWork()) continue;
+            if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) return self.leaseEntryLocked(entry);
+            }
+        }
+        return null;
+    }
+
+    fn leasePrimaryLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) return self.leaseEntryLocked(entry);
+            }
+        }
+        return null;
     }
 
     pub fn leaseLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
@@ -2564,6 +3208,16 @@ pub const ProvisionedTableWriteCache = struct {
         return self.findActiveBulkIngestSession(table_name) != null;
     }
 
+    fn bulkIngestSessionReadyForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
+        const idx = self.findActiveBulkIngestSession(table_name) orelse return false;
+        return self.active_bulk_ingest_sessions.items[idx].state == .active;
+    }
+
+    pub fn bulkIngestSessionTransitioningForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
+        const idx = self.findActiveBulkIngestSession(table_name) orelse return false;
+        return self.active_bulk_ingest_sessions.items[idx].state != .active;
+    }
+
     pub fn bulkIngestSessionOpenForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
         if (self.bulkIngestSessionActiveForTable(table_name)) return true;
         for (self.entries.items) |entry| {
@@ -2579,23 +3233,42 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) return;
         }
         const idx = self.findActiveBulkIngestSession(table_name) orelse return;
+        // A transition owns ref-counted DB leases while this cache lock is
+        // released. Only the transition that installed it may remove it.
+        if (self.active_bulk_ingest_sessions.items[idx].state != .active) return;
         var removed = self.active_bulk_ingest_sessions.orderedRemove(idx);
         removed.deinit(self.alloc);
     }
 
-    fn findActiveBulkIngestSession(self: *const ProvisionedTableWriteCache, table_name: []const u8) ?usize {
+    pub fn findActiveBulkIngestSession(self: *const ProvisionedTableWriteCache, table_name: []const u8) ?usize {
         for (self.active_bulk_ingest_sessions.items, 0..) |session, i| {
             if (std.mem.eql(u8, session.table_name, table_name)) return i;
         }
         return null;
     }
 
-    fn evictOldestTable(self: *ProvisionedTableWriteCache) void {
+    pub fn clearEntryBulkIngestState(entry: *Entry) void {
+        entry.bulk_ingest_session_open = false;
+        entry.auto_bulk_ingest_session_open = false;
+        entry.auto_bulk_ingest_ops = 0;
+        entry.auto_bulk_ingest_started_ns = 0;
+        entry.auto_bulk_ingest_last_ns = 0;
+        entry.auto_bulk_ingest_finish_requested = false;
+        entry.auto_bulk_ingest_finishing = false;
+    }
+
+    pub fn evictOldestTable(self: *ProvisionedTableWriteCache) void {
         if (self.table_metadata.items.len == 0) return;
         const table_name = self.table_metadata.items[0].table_name;
+        if (self.table_eviction_hook) |hook| hook.notify(self, table_name);
         self.removeDbEntriesForTable(table_name);
         var removed = self.table_metadata.orderedRemove(0);
         removed.deinit(self.alloc);
+    }
+
+    pub fn notifyTableEvictions(self: *ProvisionedTableWriteCache) void {
+        const hook = self.table_eviction_hook orelse return;
+        for (self.table_metadata.items) |metadata| hook.notify(self, metadata.table_name);
     }
 
     fn reserveDbEntryRetirementsForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
@@ -2619,6 +3292,16 @@ pub const ProvisionedTableWriteCache = struct {
             }
             break :blk null;
         };
+        if (replace_index) |i| {
+            const current = self.table_metadata.items[i];
+            if (current.indexes_json != null and
+                current.schema_json != null and
+                std.mem.eql(u8, current.indexes_json.?, indexes_json) and
+                std.mem.eql(u8, current.schema_json.?, schema_json))
+            {
+                return;
+            }
+        }
         if (replace_index == null) try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
         var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
         errdefer replacement.deinit(self.alloc);
@@ -2631,6 +3314,29 @@ pub const ProvisionedTableWriteCache = struct {
 
         if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
         self.table_metadata.appendAssumeCapacity(replacement);
+    }
+
+    pub fn replaceEntrySchemaLocked(
+        self: *ProvisionedTableWriteCache,
+        entry: *Entry,
+        schema_json: []const u8,
+    ) !void {
+        if (entry.schema_json) |current| {
+            if (std.mem.eql(u8, current, schema_json)) return;
+        }
+        const replacement = try self.alloc.dupe(u8, schema_json);
+        if (entry.schema_json) |current| self.alloc.free(current);
+        entry.schema_json = replacement;
+    }
+
+    pub fn replaceTableMetadataAndRetireEntriesLocked(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+        try self.retireDbEntriesForTableLocked(table_name);
     }
 
     fn installLoadedTableMetadataLocked(
@@ -2652,11 +3358,19 @@ pub const ProvisionedTableWriteCache = struct {
         return &self.table_metadata.items[self.table_metadata.items.len - 1];
     }
 
-    fn tableMetadataLocked(self: *const ProvisionedTableWriteCache, table_name: []const u8) ?TableMetadata {
+    pub fn tableMetadataLocked(self: *const ProvisionedTableWriteCache, table_name: []const u8) ?TableMetadata {
         for (self.table_metadata.items) |metadata| {
             if (std.mem.eql(u8, metadata.table_name, table_name)) return metadata;
         }
         return null;
+    }
+
+    pub fn hasTableStateLocked(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
+        if (self.tableMetadataLocked(table_name) != null) return true;
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) return true;
+        }
+        return false;
     }
 
     fn tableHasOnlyInactiveAdoptableEntriesLocked(
@@ -2719,10 +3433,12 @@ pub const ProvisionedTableWriteCache = struct {
                 dest.retireEntryLocked(removed);
             }
 
+            try dest.reserveInstalledEntryLifecycleCapacityLocked(1);
+            try dest.entries.ensureUnusedCapacity(dest.alloc, 1);
             _ = self.entries.orderedRemove(i);
             entry.lsm_root_generation = dest_generation;
             entry.allow_generation_adoption = false;
-            try dest.entries.append(dest.alloc, entry);
+            dest.entries.appendAssumeCapacity(entry);
             moved += 1;
         }
         return moved;
@@ -2803,6 +3519,19 @@ pub const ProvisionedTableWriteCache = struct {
         return installed;
     }
 
+    pub fn reserveRetiredEntriesCapacityLocked(self: *ProvisionedTableWriteCache, count: usize) !void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, count);
+    }
+
+    fn markEntryRetiredUntrackedLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        if (entry.retired) return;
+        entry.retired = true;
+    }
+
     fn queueRetiredEntryForCloseLocked(self: *ProvisionedTableWriteCache, entry: *Entry) !void {
         try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
         var i: usize = 0;
@@ -2811,7 +3540,19 @@ pub const ProvisionedTableWriteCache = struct {
             _ = self.retired_entries.orderedRemove(i);
             break;
         }
-        self.closing_entries.appendAssumeCapacity(entry);
+        self.queueEntryForCloseAssumeLifecycleLocked(entry);
+    }
+
+    fn retireInactiveEntryAtIndexForCloseLocked(self: *ProvisionedTableWriteCache, index: usize) !bool {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        const entry = self.entries.items[index];
+        if (entry.active_leases != 0) return false;
+        try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
+        _ = self.entries.orderedRemove(index);
+        entry.retired = true;
+        self.queueEntryForCloseAssumeLifecycleLocked(entry);
+        return true;
     }
 
     fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -2826,14 +3567,27 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn reserveInstalledEntryLifecycleCapacityLocked(self: *ProvisionedTableWriteCache, additional_entries: usize) !void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        const queued = try std.math.add(usize, self.retired_entries.items.len, self.closing_entries.items.len);
+        const installed = try std.math.add(usize, self.entries.items.len, additional_entries);
+        const required = try std.math.add(usize, queued, installed);
+        try self.retired_entries.ensureTotalCapacity(self.alloc, required);
+        try self.closing_entries.ensureTotalCapacity(self.alloc, required);
+    }
+
     fn retireEntryAssumeLifecycleLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
         if (entry.retired) return;
         entry.retired = true;
         if (entry.active_leases == 0) {
-            self.closing_entries.appendAssumeCapacity(entry);
+            self.queueEntryForCloseAssumeLifecycleLocked(entry);
             return;
         }
-        self.retired_entries.appendAssumeCapacity(entry);
+        self.retired_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue retired writer-cache entry table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue retired writer-cache entry");
+        };
     }
 
     pub fn retireEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -2853,7 +3607,7 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
-    fn entryActiveLeasesLocked(self: *const ProvisionedTableWriteCache, entry: *const Entry) usize {
+    pub fn entryActiveLeasesLocked(self: *const ProvisionedTableWriteCache, entry: *const Entry) usize {
         lockAtomic(@constCast(&self.entry_lifecycle_mutex));
         defer @constCast(&self.entry_lifecycle_mutex).unlock();
         return entry.active_leases;
@@ -2864,6 +3618,15 @@ pub const ProvisionedTableWriteCache = struct {
         defer self.entry_lifecycle_mutex.unlock();
         try self.retired_entries.ensureUnusedCapacity(self.alloc, count);
         try self.closing_entries.ensureUnusedCapacity(self.alloc, count);
+    }
+
+    fn queueEntryForCloseAssumeLifecycleLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
+        if (entry.close_queued) return;
+        entry.close_queued = true;
+        self.closing_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue retired writer-cache entry for close table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue retired writer-cache entry for close");
+        };
     }
 
     fn closeEntryNow(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -2915,7 +3678,7 @@ pub const ProvisionedTableWriteCache = struct {
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
     }
 
-    fn drainPendingClosesAssumeOpenMutexHeld(self: *ProvisionedTableWriteCache) void {
+    pub fn drainPendingClosesAssumeOpenMutexHeld(self: *ProvisionedTableWriteCache) void {
         while (true) {
             var entry_to_close: ?*Entry = null;
             lockAtomic(&self.entry_lifecycle_mutex);
@@ -3073,12 +3836,12 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
     try std.testing.expect(first.db.core.index_manager.textIndex("first_idx") != null);
+    const initial_cache_stats = write_cache.cacheStats();
 
     Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
 
     try std.testing.expectError(error.LsmRootWriterAlreadyOpen, write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs"));
 
-    const first_entry = first.entry.?;
     first.deinit(alloc);
     first_released = true;
     write_cache.drainPendingClosesForGroupTable(7001, "docs");
@@ -3088,7 +3851,9 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
-    try std.testing.expect(second.entry.? != first_entry);
+    const refreshed_cache_stats = write_cache.cacheStats();
+    try std.testing.expectEqual(initial_cache_stats.hit_count, refreshed_cache_stats.hit_count);
+    try std.testing.expectEqual(initial_cache_stats.miss_count + 1, refreshed_cache_stats.miss_count);
     try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
     try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
 }
@@ -3145,7 +3910,7 @@ test "write cache reports and drains inactive retired entries as pending close" 
     try std.testing.expect(write_cache.hasPendingCloseForGroupTableLocked(7001, "docs"));
     try std.testing.expectEqual(@as(usize, 1), write_cache.closing_entries.items.len);
 
-    const open_state = try write_cache.getOrPrepareOpenLocked(7001, 0, "docs");
+    const open_state = try write_cache.getOrPrepareOpenLocked(7001, 0, "docs", null, null);
     try std.testing.expect(open_state == .pending_close);
 
     write_cache.drainPendingClosesForGroupTable(7001, "docs");
@@ -3192,7 +3957,7 @@ test "write cache HA gate clear drains inactive pending closes before returning"
     }, .{});
     defer primary.close();
 
-    write_cache.setHAWriteGate(.{ .primary = &primary });
+    try write_cache.setHAWriteGate(.{ .primary = &primary });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
@@ -3309,39 +4074,6 @@ test "write cache blocks same-root generation replacement while stale lease stay
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     adopted_gen2.deinit(alloc);
-}
-
-test "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const alloc = failing.allocator();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-retire-oom", .{tmp.sub_path});
-    defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
-
-    const catalog = testingEmptyIndexesCatalog();
-    var write_cache = ProvisionedTableWriteCache.init(alloc);
-    defer write_cache.deinit();
-
-    var cached = try write_cache.getOrOpenLocked(path, catalog, 7001, 0, "docs");
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
-
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    write_cache.removeDbEntriesForTable("docs");
-
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len + write_cache.retired_entries.items.len);
-
-    cached.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
 test "write cache transfers adoptable provisioned db to destination cache" {

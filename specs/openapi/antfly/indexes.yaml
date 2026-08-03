@@ -72,6 +72,33 @@ components:
         - asset
         - embedding
       description: "Managed generated artifact kind."
+    ExecutionPolicy:
+      type: object
+      additionalProperties: false
+      description: "Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity."
+      properties:
+        batch_items:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: "Maximum items to process in one batch for this operation."
+        batch_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint64
+          description: "Approximate maximum source bytes to process in one batch for this operation."
+    IndexExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: "Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted."
+      properties:
+        chunking:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Chunk producer batching for shorthand-created chunk enrichments."
+        embedding:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Embedding producer batching for shorthand-created embedding enrichments."
     EnrichmentConfig:
       type: object
       description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams."
@@ -128,6 +155,9 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Serialized asset producer configuration."
+        execution:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
     FullTextIndexConfig:
       type: object
       properties:
@@ -143,6 +173,24 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API."
+    IndexRepairStatus:
+      type: object
+      description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
+      required:
+        - state
+        - action_required
+      properties:
+        state:
+          type: string
+          enum:
+            - rebuilding
+            - waiting
+            - paused
+            - failed
+          description: Stable repair state. Internal state-machine phases are intentionally not exposed here.
+        action_required:
+          type: boolean
+          description: Whether an operator must resume, retry, reconfigure, or drop the affected index.
     FullTextIndexStats:
       type: object
       required:
@@ -172,6 +220,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -264,10 +314,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -342,6 +392,14 @@ components:
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       properties:
+        coverage_policy:
+          $ref: "#/components/schemas/DerivedCoveragePolicy"
+          description: >-
+            Source-unit completeness policy for managed embeddings. `strict`
+            requires one produced outcome per source document; `partial` permits
+            intentional skips; `best_effort` also treats terminal failures as
+            complete while reporting the index unhealthy. External indexes use
+            `external: true` and must not set this field.
         external:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -409,6 +467,259 @@ components:
           minimum: 64
           default: 1024
           description: "Number of documents per posting list chunk (sparse only)"
+        execution:
+          $ref: "#/components/schemas/IndexExecutionConfig"
+          description: "Non-semantic execution policy for shorthand-created chunking or embedding producers."
+    DerivedCoveragePolicy:
+      type: string
+      enum:
+        - strict
+        - partial
+        - best_effort
+      default: strict
+      description: "How generation-scoped source outcomes determine derived-index completeness."
+    DerivedCoverageStatusPolicy:
+      type: string
+      enum:
+        - strict
+        - partial
+        - best_effort
+        - external
+    DerivedCoverageObservationIncompleteReason:
+      type: string
+      enum:
+        - runtime_unavailable
+        - missing_group
+        - unknown_group
+        - remote_unknown_group
+        - stale_group
+        - summary_unavailable
+        - config_mismatch
+        - counter_mismatch
+      description: "A structured reason why the coverage projection cannot be treated as globally complete."
+    DerivedCoverageStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - policy
+        - observation_complete
+        - observation_incomplete_reasons
+        - config_fingerprint
+        - summary_ready
+        - config_mismatch_group_count
+        - source_total
+        - produced
+        - skipped
+        - terminal_failed
+        - covered
+        - pending
+        - complete
+        - healthy
+        - degraded
+      properties:
+        policy:
+          $ref: "#/components/schemas/DerivedCoverageStatusPolicy"
+        observation_complete:
+          type: boolean
+          description: "Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality."
+        observation_incomplete_reasons:
+          type: array
+          items:
+            $ref: "#/components/schemas/DerivedCoverageObservationIncompleteReason"
+          description: "Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete."
+        config_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{16}$"
+          description: "Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it."
+        summary_ready:
+          type: boolean
+          description: "Whether all observed shard-local coverage summaries were read atomically and completely."
+        config_mismatch_group_count:
+          type: integer
+          format: uint64
+          description: "Freshly observed shard groups reporting a different semantic configuration fingerprint."
+        source_total:
+          type: integer
+          format: uint64
+          description: >-
+            Source documents observed across fresh shard reports. This is the
+            exact table total only when observation_complete is true; otherwise
+            it is a lower bound and all outcome counts are partial observations.
+        produced:
+          type: integer
+          format: uint64
+          description: "Source documents with a durable produced outcome for this index generation."
+        skipped:
+          type: integer
+          format: uint64
+          description: "Source documents intentionally producing no indexable output."
+        terminal_failed:
+          type: integer
+          format: uint64
+          description: "Source documents whose generation failed non-retryably."
+        covered:
+          type: integer
+          format: uint64
+          description: "Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch."
+        pending:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint64
+          nullable: true
+          description: "Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown."
+        complete:
+          type: boolean
+          description: "Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy."
+        healthy:
+          type: boolean
+          description: "Whether coverage is complete without terminal failures."
+        degraded:
+          type: boolean
+          description: "Whether coverage is complete under best_effort but includes terminal failures."
+    EnrichmentRuntimeStatus:
+      type: object
+      additionalProperties: false
+      description: "Runtime state for the durable embeddings enrichment worker."
+      required:
+        - enabled
+        - target_sequence
+        - applied_sequence
+        - pending_sequence_count
+        - projection_checkpoint_status
+        - projection_checkpoint_applied_sequence
+        - projection_checkpoint_generation
+        - projection_checkpoint_config_fingerprint
+        - projection_checkpoint_identity_consistent
+        - checkpoint_replay_tail_sequence_count
+        - processed_requests
+        - error_count
+        - retryable_error_count
+        - fatal_error_count
+        - retrying
+        - worker_failed
+        - worker_started
+        - stalled
+        - skip_by_hash_count
+        - skipped_source_count
+        - codec_decode_failures
+        - embed_batches_started
+        - embed_batches_completed
+        - embed_items_started
+        - embed_items_completed
+        - active_embed_batch_items
+        - active_embed_batch_bytes
+        - active_embed_batch_max_bytes
+        - active_embed_batch_started_ms
+        - last_embed_batch_items
+        - last_embed_batch_bytes
+        - last_embed_batch_max_bytes
+        - last_embed_batch_completed_ms
+        - last_embed_batch_ns
+        - total_embed_ns
+      properties:
+        enabled:
+          type: boolean
+        target_sequence:
+          type: integer
+          format: uint64
+        applied_sequence:
+          type: integer
+          format: uint64
+        pending_sequence_count:
+          type: integer
+          format: uint64
+        projection_checkpoint_status:
+          type: string
+        projection_checkpoint_applied_sequence:
+          type: integer
+          format: uint64
+        projection_checkpoint_generation:
+          type: integer
+          format: uint64
+        projection_checkpoint_config_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{16}$"
+        projection_checkpoint_identity_consistent:
+          type: boolean
+          description: "Whether every shard contributing to this status reports the same checkpoint generation and configuration identity."
+        checkpoint_replay_tail_sequence_count:
+          type: integer
+          format: uint64
+        processed_requests:
+          type: integer
+          format: uint64
+        error_count:
+          type: integer
+          format: uint64
+        retryable_error_count:
+          type: integer
+          format: uint64
+        fatal_error_count:
+          type: integer
+          format: uint64
+        retrying:
+          type: boolean
+        worker_failed:
+          type: boolean
+        worker_started:
+          type: boolean
+          description: "Whether the background enrichment worker is currently running."
+        stalled:
+          type: boolean
+          description: "Whether work is pending with no running worker, retry, or terminal failure explaining the backlog."
+        skip_by_hash_count:
+          type: integer
+          format: uint64
+        skipped_source_count:
+          type: integer
+          format: uint64
+        codec_decode_failures:
+          type: integer
+          format: uint64
+        embed_batches_started:
+          type: integer
+          format: uint64
+        embed_batches_completed:
+          type: integer
+          format: uint64
+        embed_items_started:
+          type: integer
+          format: uint64
+        embed_items_completed:
+          type: integer
+          format: uint64
+        active_embed_batch_items:
+          type: integer
+          format: uint64
+        active_embed_batch_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_started_ms:
+          type: integer
+          format: uint64
+        last_embed_batch_items:
+          type: integer
+          format: uint64
+        last_embed_batch_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_completed_ms:
+          type: integer
+          format: uint64
+          description: "Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch."
+        last_embed_batch_ns:
+          type: integer
+          format: uint64
+          description: "Elapsed duration in nanoseconds for the most recently completed embedding batch."
+        total_embed_ns:
+          type: integer
+          format: uint64
     EmbeddingsIndexStats:
       type: object
       description: "Statistics for an embeddings index (dense or sparse)"
@@ -449,6 +760,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index enricher is currently backfilling"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         wal_backlog:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -476,7 +789,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Number of documents visible to the index."
+          description: "Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document."
+        coverage:
+          $ref: "#/components/schemas/DerivedCoverageStatus"
+          description: "Generation-scoped source-document coverage, separate from physical index cardinality."
         query_visible_doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -510,38 +826,6 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether dense/vector artifacts still need publication before queries see the latest data."
-        coverage:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: false
-          description: "Source document coverage accounting for embeddings indexes."
-          properties:
-            policy:
-              type: string
-              description: "Coverage policy used to decide readiness."
-            source_total:
-              type: integer
-              format: uint64
-              description: "Total source documents expected for coverage."
-            produced:
-              type: integer
-              format: uint64
-              description: "Source documents with produced embeddings."
-            skipped:
-              type: integer
-              format: uint64
-              description: "Source documents intentionally skipped by coverage policy."
-            terminal_failed:
-              type: integer
-              format: uint64
-              description: "Source documents that reached a terminal enrichment failure."
-            covered:
-              type: integer
-              format: uint64
-              description: "Source documents counted as covered by the coverage policy."
-            complete:
-              type: boolean
-              description: "Whether the coverage policy considers the index complete."
         replay_applied_sequence:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -580,14 +864,7 @@ components:
           type: integer
           format: uint64
         enrichment_runtime:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
-          properties:
-            pending_sequence_count:
-              type: integer
-              format: uint64
-          description: "Embedding enrichment worker runtime diagnostics."
+          $ref: "#/components/schemas/EnrichmentRuntimeStatus"
         hbc_cache:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -614,10 +891,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -869,6 +1146,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the sidecar is currently rebuilding"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -1049,10 +1328,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -1349,6 +1628,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -1447,10 +1728,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -2015,6 +2296,8 @@ components:
         max_depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 64
           description: "Maximum traversal depth"
         min_weight:
           x-go-type-skip-optional-pointer: true
@@ -2029,6 +2312,8 @@ components:
         max_results:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 10000
           description: "Maximum number of results (traversal)"
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
@@ -2043,6 +2328,8 @@ components:
         k:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 100
           description: "Number of paths to find (k-shortest-paths)"
         node_filter:
           $ref: "#/components/schemas/NodeFilter"
@@ -2067,6 +2354,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Document key"
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Owning table for a cross-table node; omitted for nodes in the queried table"
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer

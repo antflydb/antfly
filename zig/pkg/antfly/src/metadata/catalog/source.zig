@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const metadata_api = @import("snapshot.zig");
+const metadata_api = @import("../api.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 
 pub const CatalogSource = struct {
@@ -23,6 +23,17 @@ pub const CatalogSource = struct {
     pub const VTable = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        /// Production sources fail closed when a linearizable publication
+        /// validator is unavailable.
+        requires_linearizable_publication_fence: bool = false,
+        validate_publication: ?*const fn (
+            ptr: *anyopaque,
+            contract: metadata_api.CatalogPublicationContract,
+        ) anyerror!bool = null,
+        validate_table_publication: ?*const fn (
+            ptr: *anyopaque,
+            contract: metadata_api.CatalogTablePublicationContract,
+        ) anyerror!bool = null,
         begin_secondary_index_rebuild_range: ?*const fn (
             ptr: *anyopaque,
             request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
@@ -147,6 +158,24 @@ pub const CatalogSource = struct {
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn validatePublication(
+        self: CatalogSource,
+        contract: metadata_api.CatalogPublicationContract,
+    ) !bool {
+        const validate = self.vtable.validate_publication orelse
+            return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
+    }
+
+    pub fn validateTablePublication(
+        self: CatalogSource,
+        contract: metadata_api.CatalogTablePublicationContract,
+    ) !bool {
+        const validate = self.vtable.validate_table_publication orelse
+            return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
     }
 
     pub fn beginSecondaryIndexRebuildRange(

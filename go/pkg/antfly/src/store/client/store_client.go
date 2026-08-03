@@ -17,14 +17,17 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
@@ -168,23 +171,35 @@ func (sc *StoreClient) ApplyMergeChunk(
 	return nil
 }
 
-func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
-	format = common.NormalizeBackupFormat(format)
-	backupReq := common.BackupConfig{
-		BackupID: id,
-		Location: loc,
-		Format:   format,
+func (sc *StoreClient) Backup(
+	ctx context.Context,
+	shardID types.ID,
+	backupReq common.BackupConfig,
+) (*common.BackupArtifactIntegrity, error) {
+	backupReq.Format = common.NormalizeBackupFormat(backupReq.Format)
+	fileLocation := ""
+	if strings.HasPrefix(backupReq.Location, "file://") {
+		fileLocation = backupReq.ResolvedLocation
+		if fileLocation == "" {
+			if backupReq.Connection != "" {
+				return nil, errors.New("filesystem backup requires a coordinator-resolved location")
+			}
+			fileLocation = backupReq.Location
+		}
+		if !strings.HasPrefix(fileLocation, "file://") {
+			return nil, errors.New("resolved filesystem backup location must use file://")
+		}
 	}
 	// Create the request
 	url := sc.url + "/shard/backup"
 	body, err := json.Marshal(backupReq)
 	if err != nil {
-		return fmt.Errorf("marshaling values: %w", err)
+		return nil, fmt.Errorf("marshaling values: %w", err)
 	}
 
 	req, err := common.NewShardRequest(shardID, http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(ctx)
@@ -192,55 +207,120 @@ func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id str
 	// Send the request
 	resp, err := sc.client.Do(req) //nolint:gosec // G704: HTTP client calling configured endpoint
 	if err != nil {
-		return fmt.Errorf("sending request: %w", err)
+		return nil, fmt.Errorf("sending request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return &ResponseError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
-	}
-	if after, ok := strings.CutPrefix(backupReq.Location, "file://"); ok {
-		loc := after
-		if err := os.MkdirAll(loc, os.ModePerm); err != nil && !os.IsExist(err) { //nolint:gosec // G301: standard permissions for data directory
-			return fmt.Errorf("creating backup directory: %w", err)
+		if resp.StatusCode == http.StatusConflict {
+			return nil, fmt.Errorf("%w: %s", common.ErrBackupAlreadyExists, strings.TrimSpace(string(bodyBytes)))
 		}
-		// Create a file to save the streamed data
+		return nil, &ResponseError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
+	}
+	integrity, err := backupArtifactIntegrityFromHeaders(resp.Header, backupReq, shardID)
+	if err != nil {
+		return nil, err
+	}
+	if after, ok := strings.CutPrefix(fileLocation, "file://"); ok {
+		loc := after
+		if err := os.MkdirAll(loc, 0o750); err != nil && !os.IsExist(err) {
+			return nil, fmt.Errorf("creating backup directory: %w", err)
+		}
 		backupFileName := common.ShardBackupFileName(backupReq.BackupID, shardID)
-		if format == common.BackupFormatPortable {
+		if backupReq.Format == common.BackupFormatPortable {
 			backupFileName = common.ShardPortableBackupFileName(backupReq.BackupID, shardID)
 		}
-		filePath := filepath.Clean(path.Join(loc, backupFileName))
-		tempFile, err := os.CreateTemp(loc, "."+backupFileName+".tmp-*")
+		filePath := filepath.Clean(filepath.Join(loc, backupFileName))
+		file, err := os.CreateTemp(loc, "."+backupFileName+".tmp-*")
 		if err != nil {
-			return fmt.Errorf("creating temp backup file: %w", err)
+			return nil, fmt.Errorf("creating temporary backup file: %w", err)
 		}
-		tempPath := tempFile.Name()
-		committed := false
+		tempPath := file.Name()
 		defer func() {
-			_ = tempFile.Close()
-			if !committed {
-				_ = os.Remove(tempPath)
-			}
+			_ = file.Close()
+			_ = os.Remove(tempPath)
 		}()
-
-		written, err := io.CopyBuffer(tempFile, resp.Body, make([]byte, 4096))
+		if err := file.Chmod(0o600); err != nil {
+			return nil, fmt.Errorf("setting backup file permissions: %w", err)
+		}
+		var (
+			streamHasher hash.Hash
+			destination  io.Writer = file
+		)
+		if integrity != nil {
+			streamHasher = sha256.New()
+			destination = io.MultiWriter(file, streamHasher)
+		}
+		written, err := io.Copy(destination, resp.Body)
 		if err != nil {
-			return fmt.Errorf("reading response body: %w", err)
+			return nil, fmt.Errorf("streaming backup response: %w", err)
 		}
-		if err := tempFile.Close(); err != nil {
-			return fmt.Errorf("closing temp backup file: %w", err)
+		if integrity != nil &&
+			(uint64(written) != integrity.SizeBytes ||
+				hex.EncodeToString(streamHasher.Sum(nil)) != integrity.SHA256) {
+			return nil, errors.New("portable backup response integrity mismatch")
 		}
-		if written == 0 && resp.ContentLength == 0 {
-			return nil
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if err := os.Rename(tempPath, filePath); err != nil {
-			return fmt.Errorf("moving streamed backup into place: %w", err)
+		if err := file.Sync(); err != nil {
+			return nil, fmt.Errorf("syncing backup file: %w", err)
 		}
-		committed = true
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("closing backup file: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := os.Link(tempPath, filePath); err != nil {
+			if os.IsExist(err) {
+				return nil, fmt.Errorf("%w: shard file %s", common.ErrBackupAlreadyExists, backupFileName)
+			}
+			return nil, fmt.Errorf("publishing backup file: %w", err)
+		}
+		dir, err := os.Open(loc) //nolint:gosec // authorized coordinator-resolved directory
+		if err != nil {
+			return nil, fmt.Errorf("opening backup directory for sync: %w", err)
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			return nil, fmt.Errorf("syncing backup directory: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return nil, fmt.Errorf("closing backup directory: %w", err)
+		}
 	}
 
-	return nil
+	return integrity, nil
+}
+
+func backupArtifactIntegrityFromHeaders(
+	headers http.Header,
+	backup common.BackupConfig,
+	shardID types.ID,
+) (*common.BackupArtifactIntegrity, error) {
+	if common.NormalizeBackupFormat(backup.Format) != common.BackupFormatPortable {
+		return nil, nil
+	}
+	expectedName := common.ShardPortableBackupFileName(backup.BackupID, shardID)
+	name := headers.Get(common.BackupArtifactNameHeader)
+	sizeText := headers.Get(common.BackupArtifactSizeHeader)
+	digest := headers.Get(common.BackupArtifactSHA256Header)
+	decoded, decodeErr := hex.DecodeString(digest)
+	if name != expectedName || decodeErr != nil || len(decoded) != sha256.Size ||
+		hex.EncodeToString(decoded) != digest {
+		return nil, errors.New("portable backup response is missing a valid artifact identity")
+	}
+	size, err := strconv.ParseUint(sizeText, 10, 64)
+	if err != nil || size == 0 {
+		return nil, errors.New("portable backup response has an invalid artifact size")
+	}
+	return &common.BackupArtifactIntegrity{
+		Name:      name,
+		SizeBytes: size,
+		SHA256:    digest,
+	}, nil
 }
 
 // lookupResultEntry matches the per-key JSON returned by POST /lookup.
@@ -746,28 +826,23 @@ func (sc *StoreClient) StartShard(
 	var contentType string
 
 	if restoreConfig := shardStartReq.RestoreConfig; restoreConfig != nil {
-		location := restoreConfig.Location
+		location, locationErr := common.EffectiveFilesystemLocation(*restoreConfig)
+		if locationErr != nil {
+			return locationErr
+		}
 		if strings.HasPrefix(location, "file://") {
 			backupID := restoreConfig.BackupID
 			// Local file: stream as multipart
 			localDir := strings.TrimPrefix(location, "file://")
-			format := common.NormalizeBackupFormat(restoreConfig.Format)
+			format, formatErr := common.ValidateBackupFormat(restoreConfig.Format)
+			if formatErr != nil {
+				return formatErr
+			}
 			backupFileName := common.ShardBackupFileName(backupID, shardID)
 			if format == common.BackupFormatPortable {
 				backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
 			}
 			fullBackupFilePath := filepath.Join(localDir, backupFileName)
-			if _, statErr := os.Stat(fullBackupFilePath); os.IsNotExist(statErr) {
-				alternateBackupFileName := common.ShardBackupFileName(backupID, shardID)
-				if format == common.BackupFormatNative {
-					alternateBackupFileName = common.ShardPortableBackupFileName(backupID, shardID)
-				}
-				alternatePath := filepath.Join(localDir, alternateBackupFileName)
-				if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-					backupFileName = alternateBackupFileName
-					fullBackupFilePath = alternatePath
-				}
-			}
 
 			// Use a pipe to avoid loading the whole file into memory
 			pipeR, pipeW := io.Pipe()
@@ -812,8 +887,7 @@ func (sc *StoreClient) StartShard(
 				}
 				defer func() { _ = backupFile.Close() }()
 
-				buf := make([]byte, 64*1024*1024) // 64MB buffer
-				if _, err := io.CopyBuffer(filePart, backupFile, buf); err != nil {
+				if _, err := io.Copy(filePart, backupFile); err != nil {
 					// ln.logger.Error("Failed to copy backup file to multipart writer", zap.String("path", fullBackupFilePath), zap.Error(err))
 					pipeW.CloseWithError(
 						fmt.Errorf(

@@ -113,8 +113,10 @@ fn findGenerativeOnnxRelativePath(allocator: std.mem.Allocator, model_dir: []con
 fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_z = c_file.c.getcwd(&buf, buf.len) orelse return error.GetCwdFailed;
-    const cwd = std.mem.span(cwd_z);
+    _ = c_file.c.getcwd(&buf, buf.len) orelse return error.GetCwdFailed;
+    const cwd_len = std.mem.indexOfScalar(u8, &buf, 0) orelse
+        return error.GetCwdFailed;
+    const cwd = buf[0..cwd_len];
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
 

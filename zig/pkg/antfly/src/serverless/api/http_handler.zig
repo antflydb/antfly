@@ -60,7 +60,7 @@ const wal_mod = @import("../wal/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const scraping = @import("antfly_scraping");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const query_execution = @import("query_execution.zig");
@@ -1588,7 +1588,7 @@ pub const HttpHandler = struct {
             }
 
             execution.plan.request.offset = 0;
-            execution.plan.request.limit = std.math.maxInt(usize);
+            execution.plan.request.limit = db_mod.aggregations.max_aggregation_source_hits + 1;
             execution.plan.request.count_only = false;
 
             var aggregation_stats = query_mod.QuerySearchExecutionStats{};
@@ -1600,6 +1600,8 @@ pub const HttpHandler = struct {
             );
         };
         defer if (source_hits.ptr != execution.hits.ptr) query_mod.freeSearchHits(self.alloc, source_hits);
+        if (source_hits.len > db_mod.aggregations.max_aggregation_source_hits)
+            return error.QueryCandidateBudgetExceeded;
 
         var ctx_owned = try @This().collectServerlessAggregationContextAlloc(
             self.alloc,
@@ -3211,7 +3213,15 @@ pub const HttpHandler = struct {
         const ServerlessPatternEdgeReader = struct {
             segment: *const graph_segment_mod.Segment,
 
-            pub fn getEdges(reader: @This(), alloc: Allocator, key: []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            pub fn getEdges(
+                reader: @This(),
+                alloc: Allocator,
+                table: ?[]const u8,
+                key: []const u8,
+                direction: graph_mod.EdgeDirection,
+            ) ![]graph_mod.Edge {
+                // Serverless snapshots contain one table-local graph segment.
+                if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
                 const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
                 const edge_count: usize = switch (direction) {
                     .out => adjacency.out_edges.len,
@@ -3265,7 +3275,9 @@ pub const HttpHandler = struct {
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
             .docs = docs,
+            .cache = db_query_graph.PreparedPatternFilterCache.init(self.alloc),
         };
+        defer filter_ctx.cache.deinit();
 
         const raw_matches = try graph_pattern_mod.matchPatternWithEdgeReader(
             self.alloc,
@@ -4351,6 +4363,10 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
+            error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
+            error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
+            error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -4384,6 +4400,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: backups_api.BackupFormat,
         _: []const u8,
+        _: []const u8,
         _: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         return error.MethodNotAllowed;
@@ -4392,6 +4409,7 @@ pub const HttpHandler = struct {
     fn executePublicTableRestore(
         _: *anyopaque,
         _: Allocator,
+        _: []const u8,
         _: []const u8,
         _: []const u8,
         _: []const u8,
@@ -4580,6 +4598,7 @@ fn findMaterializedDocumentBody(docs: []const query_materializer.Document, doc_i
 const PatternDocumentFilterContext = struct {
     alloc: Allocator,
     docs: []const query_materializer.Document,
+    cache: db_query_graph.PreparedPatternFilterCache,
 };
 
 fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep) bool {
@@ -4593,7 +4612,8 @@ fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
     if (filter.filter_query_json == null) return true;
     const body = findMaterializedDocumentBody(active.docs, key) orelse return false;
-    return try db_query_graph.storedDocMatchesPatternFilter(active.alloc, key, body, filter.filter_query_json.?);
+    const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
+    return try prepared.matchesStored(active.alloc, key, body);
 }
 
 fn removeDocumentMutationById(

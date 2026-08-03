@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const platform_clock = @import("../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_sync = @import("antfly_platform").sync;
 const sql_backend = @import("sql_backend.zig");
 const sql_adapter = @import("../sql/mod.zig");

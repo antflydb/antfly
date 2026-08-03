@@ -31,7 +31,7 @@ import pytest
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
-    SwarmAntflyServer,
+    StandaloneAntflyServer,
     _metadata_command,
     _read_log_tail,
     find_free_port,
@@ -61,7 +61,7 @@ def pgwire_server():
 
     port = find_free_port()
     pgwire_port = find_free_port()
-    server = SwarmAntflyServer(binary, "127.0.0.1", port, pgwire_port=pgwire_port)
+    server = StandaloneAntflyServer(binary, "127.0.0.1", port, pgwire_port=pgwire_port)
     yield server
     server.stop()
 
@@ -74,7 +74,7 @@ def auth_pgwire_server():
 
     port = find_free_port()
     pgwire_port = find_free_port()
-    server = SwarmAntflyServer(binary, "127.0.0.1", port, pgwire_port=pgwire_port, auth_enabled=True)
+    server = StandaloneAntflyServer(binary, "127.0.0.1", port, pgwire_port=pgwire_port, auth_enabled=True)
     yield server
     server.stop()
 
@@ -133,7 +133,7 @@ def _table_name(prefix: str) -> str:
 
 def _run_cli(
     binary: str,
-    server: SwarmAntflyServer,
+    server: StandaloneAntflyServer,
     *args: str,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:

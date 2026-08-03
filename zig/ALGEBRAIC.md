@@ -1421,7 +1421,7 @@ LSM analytics benchmark mode for durable sidecar scale, cardinality, write ampli
 churn row-family benchmark counters for materialized_expr, docfact, pathfact, path_lookup, path_profile, joinfact, docjf, minmax, and sym sidecar rows
 public query guardrail query shapes for dense, hybrid, hybrid-filter, hybrid-filter-exclude, and projected hybrid filter vector searches
 public query guardrail schema and algebraic toggles so default, schema-only, and schema-plus-algebraic runs are comparable
-public query guardrail JSONL summary events for no-schema, schema-only, and schema-plus-algebraic vector-pruning comparisons, including a no-listener handler mode for reproducible archived runs and local/swarm modes for transport/server overhead evidence
+public query guardrail JSONL summary events for no-schema, schema-only, and schema-plus-algebraic vector-pruning comparisons, including a no-listener handler mode for reproducible archived runs and local/standalone modes for transport/server overhead evidence
 benchmark-wide performance evidence summary for dataset, query, correctness, cold/warm, fanout, constrained, wide-key, stats, cardinality, range, histogram, churn, churn row-family, public-query, LSM, symbol/support byte growth, accumulator flush, adaptive bulk-maintenance counters, and public-query RSS coverage
 mixed-role benchmark root-cardinality comparisons constrain algebraic sidecar reads by primary document role so derived customer/profile facts do not broaden doc-scan/full-text order-only baselines
 algebraic-summary performance guardrail thresholds for coverage counts, cold/warm reads, fanout, constrained queries, wide-key composite queries, stats/cardinality/range/histogram queries, correctness failures, query latency, byte cost, symbol/support bytes, accumulator flushes, LSM flush/write-pressure compaction counts, public-query RSS, and churn cost
@@ -2250,19 +2250,24 @@ above and remove the temporary roadmap item.
    summaries, record hardware/environment notes, and set regression thresholds
    for latency, bytes, symbol/support-row growth, accumulator flushes, public
    query RSS, write cost, churn, cold/warm reads, fanout, constrained queries,
-   and public query behavior. Use direct `algebraic-bench`,
-   `public-query-guardrail`, and `algebraic-summary` commands for archive
-   generation so the public build surface stays focused on
-   `zig build algebraic-guardrail`. Public-query archive comparisons should use
-   handler mode by default, which exercises the public query handler and planner
-   without a TCP listener; use local or swarm mode only for transport/server
-   overhead runs. Symbolic profile enforcement is a separate opt-in for archives
-   that specifically validate vector-pruning profile counters. Keep the default
-   combined run direct unless the run is specifically validating LSM bulk
-   ingest; archive that stress path separately. Set a baseline summary plus
-   threshold flags once representative runs establish acceptable variance, so
-   production archives fail closed on correctness, coverage, latency, byte, and
-   churn regressions.
+   and public query behavior. Use
+   `scripts/run_algebraic_production_hardening.sh` as the canonical local runner
+   so every archived run includes the same raw JSONL, combined summary, and
+   environment metadata. Public-query archive comparisons default to
+   `ALGEBRAIC_HARDENING_PUBLIC_MODE=handler`, which exercises the public query
+   handler and planner without a TCP listener; use
+   `ALGEBRAIC_HARDENING_PUBLIC_MODE=local` or `standalone` for transport/server
+   overhead runs. Symbolic profile enforcement is a separate opt-in
+   (`ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`) for archives that
+   specifically validate vector-pruning profile counters. Keep the default
+   combined run direct unless the run is specifically validating LSM bulk ingest; set
+   `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` for that stress path and archive it
+   separately. Set `ALGEBRAIC_HARDENING_BASELINE` plus threshold env vars once
+   representative runs establish acceptable variance, so production archives
+   fail closed on correctness, coverage, latency, byte, and churn regressions.
+   Validate any archive used as evidence with
+   `zig build algebraic-archive-guardrail -- --archive <dir>
+   --require-thresholds --require-baseline --require-non-smoke`.
 
 2. Prove full-suite test health.
    Run the broad repo test/build matrix with algebraic enabled and disabled.

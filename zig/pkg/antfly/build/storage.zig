@@ -46,7 +46,7 @@ pub fn makeRootBuildOptions(
     storage_sim_soak: bool,
     with_tla: bool,
     link_libc: bool,
-    swarm_runtime_focused_test: bool,
+    standalone_runtime_focused_test: bool,
     lite_local_inference_runtime: bool,
     antfly_version: []const u8,
 ) *std.Build.Step.Options {
@@ -56,7 +56,7 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "storage_sim_soak", storage_sim_soak);
     options.addOption(bool, "with_tla", with_tla);
     options.addOption(bool, "link_libc", link_libc);
-    options.addOption(bool, "swarm_runtime_focused_test", swarm_runtime_focused_test);
+    options.addOption(bool, "standalone_runtime_focused_test", standalone_runtime_focused_test);
     options.addOption(bool, "lite_local_inference_runtime", lite_local_inference_runtime);
     options.addOption(bool, "bench_minimal_deps", false);
     options.addOption(bool, "usermgr_storage_adapter", true);
@@ -76,6 +76,17 @@ fn readBuildFileAlloc(b: *std.Build, path: []const u8) []const u8 {
     };
 }
 
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    const sdk_root = b.sysroot orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+        b.graph.environ_map.get("SDK_PATH") orelse
+        return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+}
+
 pub fn makeLmdbEngineModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -91,6 +102,7 @@ pub fn makeLmdbEngineModule(
     mod.addOptions("build_options", build_options);
     if (link_libc and target.result.os.tag != .freestanding) {
         mod.link_libc = true;
+        addMacosSdkPaths(b, mod, target);
     }
     return mod;
 }
@@ -118,5 +130,6 @@ pub fn makeLmdbModule(
     });
     mod.addIncludePath(b.path("lib/lmdb"));
     mod.link_libc = true;
+    addMacosSdkPaths(b, mod, target);
     return mod;
 }

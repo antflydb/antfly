@@ -57,6 +57,7 @@ pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 pub const repair_jobs = @import("repair_jobs.zig");
+pub const restore_jobs = @import("restore_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
@@ -94,6 +95,10 @@ pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
 
+test "api restore jobs module compiles" {
+    _ = restore_jobs;
+}
+
 test {
     _ = auth_sql_adapter;
     _ = catalog_jobs;
@@ -111,6 +116,7 @@ test {
     _ = public_runtime;
     _ = pgwire_backend;
     _ = protocol_adapters;
+    _ = restore_jobs;
 }
 
 test "api query contract preserves filter-only query string filters" {
@@ -270,6 +276,7 @@ test "api module compiles" {
     _ = relational_rows;
     _ = sql_adapter_integration;
     _ = public_sql_endpoint_parity;
+    _ = linear_merge;
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;
@@ -288,6 +295,7 @@ test "api module compiles" {
     _ = table_router;
     _ = table_contract;
     _ = indexes;
+    _ = openapi_contract;
     _ = http_routes;
     _ = provisioned_storage;
     _ = table_reads;
@@ -332,8 +340,8 @@ test "api distributed graph hydrate carries identity generation and clears cross
     try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
 }
 
-test "api distributed graph cross-table hydrate clears query scoped filter" {
-    try distributed_graph.testCrossTableHydrateClearsQueryScopedFilterAndOrdinals(std.testing.allocator);
+test "api distributed graph cross-table hydrate enforces target authorization" {
+    try distributed_graph.testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(std.testing.allocator);
 }
 
 test "public graph result_ref fail-closed guards are covered" {

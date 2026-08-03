@@ -24,6 +24,7 @@ pub const Dialect = struct {
     name: []const u8,
     placeholder_style: PlaceholderStyle,
     quote_identifier: *const fn (alloc: std.mem.Allocator, name: []const u8) anyerror![]u8,
+    quote_relation: *const fn (alloc: std.mem.Allocator, name: []const u8) anyerror![]u8,
 };
 
 pub const SqlSourceConfig = struct {
@@ -73,6 +74,7 @@ pub fn postgresDialect() Dialect {
         .name = "postgres",
         .placeholder_style = .dollar_numbered,
         .quote_identifier = quotePostgresIdentifierAlloc,
+        .quote_relation = quotePostgresRelationAlloc,
     };
 }
 
@@ -108,7 +110,7 @@ pub fn buildSelectStatementAlloc(
     }
 
     try out.appendSlice(alloc, " FROM ");
-    const quoted_table = try dialect.quote_identifier(alloc, options.table);
+    const quoted_table = try dialect.quote_relation(alloc, options.table);
     defer alloc.free(quoted_table);
     try out.appendSlice(alloc, quoted_table);
 
@@ -143,6 +145,8 @@ pub fn buildSelectStatementAlloc(
 }
 
 fn quotePostgresIdentifierAlloc(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, 0) != null)
+        return error.InvalidQueryRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, '"');
@@ -154,11 +158,94 @@ fn quotePostgresIdentifierAlloc(alloc: std.mem.Allocator, name: []const u8) ![]u
     return try out.toOwnedSlice(alloc);
 }
 
+/// Canonicalizes the public PostgreSQL relation syntax used by foreign-source
+/// configuration. A dot separates schema and relation names; double quotes
+/// allow dots inside a component and use PostgreSQL's doubled-quote escaping.
+/// Every component is emitted quoted so query, statistics, and discovery all
+/// resolve exactly the same relation.
+pub fn quotePostgresRelationAlloc(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, 0) != null)
+        return error.InvalidQueryRequest;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var pos: usize = 0;
+    var component_count: u8 = 0;
+    while (pos < name.len) {
+        if (component_count == 2) return error.InvalidQueryRequest;
+        if (component_count != 0) try out.append(alloc, '.');
+        try out.append(alloc, '"');
+
+        var component_len: usize = 0;
+        if (name[pos] == '"') {
+            pos += 1;
+            var closed = false;
+            while (pos < name.len) {
+                if (name[pos] != '"') {
+                    try out.append(alloc, name[pos]);
+                    component_len += 1;
+                    pos += 1;
+                    continue;
+                }
+                if (pos + 1 < name.len and name[pos + 1] == '"') {
+                    try out.appendSlice(alloc, "\"\"");
+                    component_len += 1;
+                    pos += 2;
+                    continue;
+                }
+                pos += 1;
+                closed = true;
+                break;
+            }
+            if (!closed or component_len == 0) return error.InvalidQueryRequest;
+            if (pos < name.len and name[pos] != '.') return error.InvalidQueryRequest;
+        } else {
+            const start = pos;
+            while (pos < name.len and name[pos] != '.') : (pos += 1) {
+                if (name[pos] == '"') return error.InvalidQueryRequest;
+            }
+            if (pos == start) return error.InvalidQueryRequest;
+            component_len = pos - start;
+            for (name[start..pos]) |ch| {
+                if (ch == '"') try out.append(alloc, '"');
+                try out.append(alloc, ch);
+            }
+        }
+        try out.append(alloc, '"');
+        component_count += 1;
+
+        if (pos == name.len) break;
+        pos += 1;
+        if (pos == name.len) return error.InvalidQueryRequest;
+    }
+    if (component_count == 0) return error.InvalidQueryRequest;
+    return try out.toOwnedSlice(alloc);
+}
+
 test "postgres dialect quotes identifiers" {
     const alloc = std.testing.allocator;
     const quoted = try postgresDialect().quote_identifier(alloc, "customer\"name");
     defer alloc.free(quoted);
     try std.testing.expectEqualStrings("\"customer\"\"name\"", quoted);
+}
+
+test "postgres relation quoting canonicalizes qualified and quoted names" {
+    const alloc = std.testing.allocator;
+    const qualified = try quotePostgresRelationAlloc(alloc, "public.users");
+    defer alloc.free(qualified);
+    try std.testing.expectEqualStrings("\"public\".\"users\"", qualified);
+
+    const quoted = try quotePostgresRelationAlloc(alloc, "\"tenant.data\".\"User\"\"Events\"");
+    defer alloc.free(quoted);
+    try std.testing.expectEqualStrings("\"tenant.data\".\"User\"\"Events\"", quoted);
+
+    const exact = try quotePostgresRelationAlloc(alloc, "Users-Prod");
+    defer alloc.free(exact);
+    try std.testing.expectEqualStrings("\"Users-Prod\"", exact);
+
+    try std.testing.expectError(error.InvalidQueryRequest, quotePostgresRelationAlloc(alloc, "public."));
+    try std.testing.expectError(error.InvalidQueryRequest, quotePostgresRelationAlloc(alloc, "one.two.three"));
+    try std.testing.expectError(error.InvalidQueryRequest, quotePostgresRelationAlloc(alloc, "\"unterminated"));
 }
 
 test "placeholder helper supports postgres style" {
@@ -187,4 +274,18 @@ test "select builder emits postgres-compatible query shape" {
         "SELECT \"id\", \"first_name\" FROM \"customers\" WHERE \"id\" = $1 ORDER BY \"last_name\" ASC, \"created_at\" DESC LIMIT 10 OFFSET 20",
         sql,
     );
+}
+
+test "select builder emits a schema-qualified PostgreSQL relation" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        buildSelectStatementAlloc(alloc, postgresDialect(), .{ .table = "audit.customer.events" }),
+    );
+
+    const quoted = try buildSelectStatementAlloc(alloc, postgresDialect(), .{
+        .table = "\"audit.data\".events",
+    });
+    defer alloc.free(quoted);
+    try std.testing.expectEqualStrings("SELECT * FROM \"audit.data\".\"events\"", quoted);
 }

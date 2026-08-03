@@ -314,6 +314,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: |
+        Runs multiple non-streaming generation requests as one synchronous batch.
+        Compatible native requests for the same model are executed through the
+        native batched KV decoder; unsupported per-item options are returned as
+        per-item errors without failing sibling requests.
+
+        This endpoint implements the synchronous form only. Future async durable
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateBatchRequest'
+      responses:
+        '200':
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateBatchResponse'
+        '400':
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Generation service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -935,6 +978,18 @@ components:
             - document
             - classification
             - clustering
+        error_policy:
+          type: string
+          description: |
+            Controls how dense embedding requests report per-input failures.
+            `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+            `per_item` returns successful embeddings in `data` and indexed
+            permanent/transient failures in `errors` without failing the
+            entire HTTP request.
+          default: fail_fast
+          enum:
+            - fail_fast
+            - per_item
     EmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -959,6 +1014,65 @@ components:
           description: Model used for embedding generation
         usage:
           $ref: '#/components/schemas/EmbeddingUsage'
+        errors:
+          type: array
+          description: Indexed per-input failures. Only populated when request error_policy is per_item.
+          items:
+            $ref: '#/components/schemas/EmbeddingItemError'
+        summary:
+          $ref: '#/components/schemas/EmbeddingBatchSummary'
+    EmbeddingItemError:
+      type: object
+      description: Per-input embedding failure for error_policy=per_item responses
+      required:
+        - index
+        - code
+        - message
+        - stage
+        - retryable
+        - status
+      properties:
+        index:
+          type: integer
+          description: Original input index that failed
+        code:
+          type: string
+          description: Stable machine-readable failure code
+        message:
+          type: string
+          description: Human-readable failure message
+        stage:
+          type: string
+          description: Pipeline stage that classified the failure
+          enum:
+            - parse
+            - fetch
+            - image_decode
+            - audio_decode
+            - text_inference
+            - image_inference
+            - audio_inference
+            - inference
+        retryable:
+          type: boolean
+          description: Whether retrying the same item may succeed
+        status:
+          type: integer
+          description: HTTP-style status classification for this item
+    EmbeddingBatchSummary:
+      type: object
+      description: Counts for per-item embedding responses
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
     SparseVector:
       type: object
       description: A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -1850,6 +1964,8 @@ components:
             - John Smith is 30 years old and works at Google.
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/ImageURL'
           description: |
@@ -1867,6 +1983,8 @@ components:
           description: |
             Maximum tokens for the read stage when `images` are provided.
             Ignored for text-only extraction requests.
+          minimum: 1
+          maximum: 1024
           default: 256
         schema:
           type: object
@@ -1983,6 +2101,8 @@ components:
           example: microsoft/trocr-base-printed
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/ImageURL'
           description: |
@@ -2005,6 +2125,8 @@ components:
         max_tokens:
           type: integer
           description: Maximum tokens to generate
+          minimum: 1
+          maximum: 1024
           default: 256
           example: 256
     TextRegion:
@@ -2476,6 +2598,17 @@ components:
             inference-native KV cache compaction ratio applied after prefill via Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+        prompt_cache_key:
+          type: string
+          maxLength: 256
+          description: |
+            inference-native prompt prefix cache namespace key. Requests with the same key can
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+            requests without a key are never cached.
+        prompt_cache:
+          type: boolean
+          description: |
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         backend:
           $ref: '#/components/schemas/ModelBackend'
         mode:
@@ -2560,6 +2693,93 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: '#/components/schemas/GenerateUsage'
+    GenerateBatchMode:
+      type: string
+      enum:
+        - sync
+      description: Batch execution mode. Only synchronous batches are implemented.
+    GenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: '#/components/schemas/GenerateBatchMode'
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/GenerateBatchRequestItem'
+    GenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: '#/components/schemas/GenerateRequest'
+    GenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+    GenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: '#/components/schemas/GenerateResponse'
+        error:
+          $ref: '#/components/schemas/GenerateBatchError'
+    GenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+    GenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum:
+            - generate.batch
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenerateBatchResultItem'
+        summary:
+          $ref: '#/components/schemas/GenerateBatchSummary'
     GenerateChoice:
       type: object
       required:
@@ -2610,6 +2830,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
     GenerateChunk:
       type: object
       description: Streaming generation chunk (SSE event data)
@@ -2775,6 +2998,43 @@ components:
           $ref: '#/components/schemas/ModelFormat'
         quantization:
           $ref: '#/components/schemas/ModelQuantization'
+    PromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: |
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+            scalable production mode. `simple` keeps the linear-scan retained-prefix
+            cache and is only suitable for small caches or debugging.
+          enum:
+            - simple
+            - block_hash
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          description: |
+            Node-wide target for live prompt-cache entries. The runtime divides it
+            across participating model caches and evicts using estimated metadata
+            and logical host/device KV bytes. Backend allocators may retain reusable
+            capacity, so this is not a hard cap on process or accelerator memory.
+          default: 512
+        min_tokens:
+          type: integer
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          description: |
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+            hit, so only entries left unused for this duration expire.
+          default: 300000
     Config:
       type: object
       required:
@@ -2819,9 +3079,9 @@ components:
           description: |
             How long to keep models loaded in memory after last use (Ollama-compatible).
             Models are automatically unloaded after this duration of inactivity.
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-            where all models are loaded at startup and never unloaded.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+            still be evicted under resource pressure or to enforce max_loaded_models.
           default: 5m
           example: 5m
         max_loaded_models:
@@ -2829,8 +3089,9 @@ components:
           description: |
             Maximum total models loaded across all registry types (embedders, rerankers,
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+            Defaults to 10.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -2841,6 +3102,9 @@ components:
             independently of max_loaded_models.
           default: 1
           example: 1
+        prompt_cache:
+          $ref: '#/components/schemas/PromptCacheConfig'
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:
@@ -2923,9 +3187,8 @@ components:
               - bounded
           description: |
             Per-model loading strategy overrides. Maps model names to their loading strategy.
-            Models not in this map use the default strategy based on keep_alive:
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-            - If keep_alive="0": eager loading (load at startup, never unload)
+            Models not in this map load on demand. keep_alive controls their idle
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
             When a model has strategy "eager" in this map:
             - It is loaded at startup through the same startup warmup path
@@ -2939,7 +3202,7 @@ components:
           type: boolean
           description: |
             Whether the dashboard should show model download commands.
-            Defaults to true for standalone/swarm mode. Set to false in managed
+            Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
             deployments (e.g., Kubernetes operator) where models are managed externally.
           default: true
         log:

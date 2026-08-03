@@ -13,13 +13,17 @@
 // limitations.
 
 const std = @import("std");
+const scraping = @import("antfly_scraping");
 
+const common_secrets = @import("../../common/secrets.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const managed_embedder = @import("../../inference/managed_embedder.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const query_api = @import("../query.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const raft_mod = @import("../../raft/mod.zig");
+const ha_public_gate_state = @import("../../storage/ha/public_gate_state.zig");
 const ha_read_gate_mod = @import("../../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../../storage/ha/standby.zig");
 const serverless_query = @import("../../serverless/query/mod.zig");
@@ -138,21 +142,28 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
     }
 };
 
-pub const HAReadGate = struct {
+pub const HAReadGate = union(enum) {
     standby: *const ha_standby_mod.Standby,
+    shared: *const ha_public_gate_state.State,
 
     pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
-        const decision = try ha_read_gate_mod.evaluateStandby(self.standby, .{
+        const request = ha_read_gate_mod.Request{
             .consistency = switch (consistency) {
                 .stale => .stale_ok,
                 .leader_lease, .read_index => .primary,
             },
-        });
-        switch (decision.action) {
-            .serve_standby => {},
-            .wait_for_apply => return error.HAReadWaitForApply,
-            .wait_for_metadata => return error.HAReadWaitForMetadata,
-            .route_to_primary => return error.HAReadRequiresPrimary,
+        };
+        switch (self) {
+            .shared => |state| try state.checkRead(request),
+            .standby => |standby| {
+                const decision = try ha_read_gate_mod.evaluateStandby(standby, request);
+                switch (decision.action) {
+                    .serve_standby => {},
+                    .wait_for_apply => return error.HAReadWaitForApply,
+                    .wait_for_metadata => return error.HAReadWaitForMetadata,
+                    .route_to_primary => return error.HAReadRequiresPrimary,
+                }
+            },
         }
     }
 };
@@ -258,12 +269,34 @@ pub const ReadPreparation = struct {
         dense_query,
     };
 
+    pub const Activity = struct {
+        ptr: *anyopaque,
+        table_name: []const u8,
+        release_fn: *const fn (ptr: *anyopaque, table_name: []const u8) void,
+        active: bool = true,
+
+        pub fn deinit(self: *Activity) void {
+            if (!self.active) return;
+            self.release_fn(self.ptr, self.table_name);
+            self.active = false;
+        }
+    };
+
     pub const VTable = struct {
         prepare_for_read: *const fn (ptr: *anyopaque, table_name: []const u8, kind: Kind) void,
+        begin_read: ?*const fn (ptr: *anyopaque, table_name: []const u8, kind: Kind) Activity = null,
     };
 
     pub fn prepareForRead(self: ReadPreparation, table_name: []const u8, kind: Kind) void {
         self.vtable.prepare_for_read(self.ptr, table_name, kind);
+    }
+
+    pub fn beginRead(self: ReadPreparation, table_name: []const u8, kind: Kind) ?Activity {
+        const begin_read = self.vtable.begin_read orelse {
+            self.prepareForRead(table_name, kind);
+            return null;
+        };
+        return begin_read(self.ptr, table_name, kind);
     }
 };
 
@@ -274,6 +307,26 @@ pub const backend_current_root_generation: u64 = 0;
 pub const GroupVisibleRootGenerationSource = struct {
     ptr: *anyopaque,
     visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+    reserve_root_generation_for_group: ?*const fn (ptr: *anyopaque, group_id: u64) anyerror!void = null,
+    finish_root_generation_reservation: ?*const fn (ptr: *anyopaque, group_id: u64, advance: bool) void = null,
+
+    pub const Reservation = struct {
+        source: GroupVisibleRootGenerationSource,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn advance(self: *Reservation) void {
+            if (!self.active) return;
+            self.source.finish_root_generation_reservation.?(self.source.ptr, self.group_id, true);
+            self.active = false;
+        }
+
+        pub fn deinit(self: *Reservation) void {
+            if (!self.active) return;
+            self.source.finish_root_generation_reservation.?(self.source.ptr, self.group_id, false);
+            self.active = false;
+        }
+    };
 
     /// Shared LSM/HBC cache namespace for the currently visible replica root.
     /// This is advanced when local root/catalog visibility is reconciled; it is
@@ -281,20 +334,38 @@ pub const GroupVisibleRootGenerationSource = struct {
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
     }
+
+    pub fn reserveRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) !?Reservation {
+        const reserve = self.reserve_root_generation_for_group orelse {
+            if (self.finish_root_generation_reservation != null) return error.InvalidRootGenerationSource;
+            return null;
+        };
+        if (self.finish_root_generation_reservation == null) return error.InvalidRootGenerationSource;
+        try reserve(self.ptr, group_id);
+        return .{ .source = self, .group_id = group_id };
+    }
 };
 
-pub const PrimaryLookupDbLease = struct {
+pub const ManagedReadRuntimeConfig = struct {
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+};
+
+pub const ResidentDbLease = struct {
     ptr: *anyopaque,
     db: *db_mod.DB,
     release_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) void,
 
-    pub fn release(self: *PrimaryLookupDbLease, alloc: std.mem.Allocator) void {
+    pub fn release(self: *ResidentDbLease, alloc: std.mem.Allocator) void {
         self.release_fn(self.ptr, alloc);
         self.* = undefined;
     }
 };
 
-pub const PrimaryLookupDbSource = struct {
+pub const ResidentDbSource = struct {
     ptr: *anyopaque,
     lease_group: *const fn (
         ptr: *anyopaque,
@@ -302,15 +373,15 @@ pub const PrimaryLookupDbSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) anyerror!?PrimaryLookupDbLease,
+    ) anyerror!?ResidentDbLease,
 
     pub fn leaseGroup(
-        self: PrimaryLookupDbSource,
+        self: ResidentDbSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?PrimaryLookupDbLease {
+    ) !?ResidentDbLease {
         return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation);
     }
 };
@@ -672,6 +743,38 @@ pub const TableReadSource = struct {
             group_id: u64,
             table_name: []const u8,
             body: []const u8,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_partition_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_rows_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_unmatched_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_finalize_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
         ) anyerror!?query_api.QueryResponse = null,
         join_job_state_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -1269,8 +1372,11 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_partition_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        if (self.vtable.join_partition_group_local) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        }
+        const fn_ptr = self.vtable.join_partition_group_local_with_timeout orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, body, null);
     }
 
     pub fn joinRowsGroupLocal(
@@ -1280,8 +1386,11 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_rows_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        if (self.vtable.join_rows_group_local) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        }
+        const fn_ptr = self.vtable.join_rows_group_local_with_timeout orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, body, null);
     }
 
     pub fn joinUnmatchedGroupLocal(
@@ -1291,8 +1400,11 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_unmatched_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        if (self.vtable.join_unmatched_group_local) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        }
+        const fn_ptr = self.vtable.join_unmatched_group_local_with_timeout orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, body, null);
     }
 
     pub fn joinFinalizeGroupLocal(
@@ -1302,8 +1414,71 @@ pub const TableReadSource = struct {
         table_name: []const u8,
         body: []const u8,
     ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_finalize_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        if (self.vtable.join_finalize_group_local) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        }
+        const fn_ptr = self.vtable.join_finalize_group_local_with_timeout orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, body, null);
+    }
+
+    pub fn joinPartitionGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_partition_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinPartitionGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinRowsGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_rows_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinRowsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinUnmatchedGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_unmatched_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinUnmatchedGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinFinalizeGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_finalize_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
     }
 
     pub fn joinJobStateGroupLocal(

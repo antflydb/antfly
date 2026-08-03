@@ -51,7 +51,7 @@ test: ## Run the default Zig test aggregate.
 	$(ZIG) build test
 
 unit-test: ## Run hermetic Antfly unit tests.
-	$(ZIG) build unit-test
+	$(ZIG) build unit-test $(ZIG_BUILD_FLAGS)
 
 sql-api-parity-test: ## Run SQL/API typed-plan parity corpus tests.
 	$(ZIG) build sql-api-parity-test

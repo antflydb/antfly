@@ -33,6 +33,7 @@ import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { fetchWithRetry } from "@/lib/utils";
 
 // --- Local type definitions ---
@@ -61,11 +62,6 @@ interface UploadedImage {
   dataUri: string;
   width: number;
   height: number;
-}
-
-interface ModelsResponse {
-  readers?: Record<string, unknown>;
-  [key: string]: unknown;
 }
 
 // --- Helpers ---
@@ -139,7 +135,7 @@ function copyToClipboard(text: string) {
 // --- Component ---
 
 const ReaderPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
 
   // Shared state
   const [isLoading, setIsLoading] = useState(false);
@@ -163,26 +159,16 @@ const ReaderPlaygroundPage: React.FC = () => {
 
   // Refs
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("reader");
 
-  // Fetch available models on mount
   useEffect(() => {
-    const fetchModels = async () => {
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const readers = Object.keys(data.readers || {});
-          setAvailableReaders(readers);
-          if (readers.length > 0) setSelectedReaderModel(readers[0]);
-        }
-      } catch {
-        console.error("Failed to fetch models");
-      } finally {
-        setModelsLoaded(true);
-      }
-    };
-    fetchModels();
-  }, [inferenceApiUrl]);
+    setAvailableReaders(connectionModels);
+    setSelectedReaderModel((current) =>
+      current && connectionModels.includes(current) ? current : connectionModels[0] || ""
+    );
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   // Auto-set prompt based on selected model (only when prompt is empty or a known auto-value)
   useEffect(() => {
@@ -280,7 +266,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       if (maxTokens && Number.parseInt(maxTokens, 10) > 0)
         body.max_tokens = Number.parseInt(maxTokens, 10);
 
-      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/read`, {
+      const response = await fetchWithRetry(inferenceUrl("read"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -299,11 +285,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       setOutputTab("text");
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
-      );
+      setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
       setIsLoading(false);
     }

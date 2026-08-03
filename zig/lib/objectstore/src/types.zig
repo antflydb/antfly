@@ -67,8 +67,17 @@ pub const PutOptions = struct {
 pub const GetOptions = struct {
     version_id: ?[]const u8 = null,
     range: ?ByteRange = null,
+    /// Strong conditional read. Implementations must return
+    /// `error.PreconditionFailed` rather than data from another object version.
     if_match_etag: ?[]const u8 = null,
     part_number: ?u32 = null,
+    /// Avoid a separate provider metadata request when the caller only needs
+    /// the response body and response-derived metadata. Defaults to false so
+    /// existing callers retain complete metadata semantics.
+    skip_metadata_probe: bool = false,
+    /// Bound bytes buffered by transports for this request. Implementations
+    /// must enforce this before returning a response body.
+    max_response_bytes: ?usize = null,
 };
 
 pub const DeleteOptions = struct {
@@ -80,7 +89,10 @@ pub const ListOptions = struct {
     prefix: []const u8 = "",
     recursive: bool = true,
     delimiter: []const u8 = "/",
+    /// Exclusive lexicographic lower bound. Providers with an inclusive native
+    /// primitive (notably GCS `startOffset`) must normalize their first page.
     start_after: ?[]const u8 = null,
+    /// Opaque provider cursor. Mutually exclusive with `start_after`.
     continuation_token: ?[]const u8 = null,
     max_keys: u32 = 1000,
 };

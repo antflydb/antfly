@@ -10,13 +10,14 @@ from ..models.embeddings_index_stats_index_type import EmbeddingsIndexStatsIndex
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.derived_coverage_status import DerivedCoverageStatus
     from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-    from ..models.embeddings_index_stats_coverage import EmbeddingsIndexStatsCoverage
-    from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
     from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
     from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
     from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
     from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
+    from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
+    from ..models.index_repair_status import IndexRepairStatus
 
 
 T = TypeVar("T", bound="EmbeddingsIndexStats")
@@ -34,12 +35,16 @@ class EmbeddingsIndexStats:
         total_nodes (int | Unset): Total number of nodes in the index (dense only)
         total_terms (int | Unset): Number of unique terms in the inverted index (sparse only)
         rebuilding (bool | Unset): Whether the index enricher is currently backfilling
+        repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
+            diagnostics are available from the admin API and metrics.
         wal_backlog (int | Unset): Number of documents pending enrichment in the WAL
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, enriching, or catching up.
         backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
         backfill_items_processed (int | Unset): Total items processed during backfill
         backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
-        doc_count (int | Unset): Number of documents visible to the index.
+        doc_count (int | Unset): Number of physical vectors or sparse entries visible to the index; chunked indexes may
+            contain multiple entries per source document.
+        coverage (DerivedCoverageStatus | Unset):
         query_visible_doc_count (int | Unset): Documents currently visible to queries.
         published_doc_count (int | Unset):
         published_node_count (int | Unset):
@@ -49,7 +54,6 @@ class EmbeddingsIndexStats:
         dense_replay_target_sequence (int | Unset):
         dense_publish_pending (bool | Unset): Whether dense/vector artifacts still need publication before queries see
             the latest data.
-        coverage (EmbeddingsIndexStatsCoverage | Unset): Source document coverage accounting for embeddings indexes.
         replay_applied_sequence (int | Unset):
         replay_target_sequence (int | Unset):
         replay_catch_up_required (bool | Unset):
@@ -61,8 +65,8 @@ class EmbeddingsIndexStats:
         catch_up_phase (str | Unset):
         catch_up_applied_sequence (int | Unset):
         catch_up_target_sequence (int | Unset):
-        enrichment_runtime (EmbeddingsIndexStatsEnrichmentRuntime | Unset): Embedding enrichment worker runtime
-            diagnostics.
+        enrichment_runtime (EnrichmentRuntimeStatus | Unset): Runtime state for the durable embeddings enrichment
+            worker.
         hbc_cache (EmbeddingsIndexStatsHbcCache | Unset):
         hbc_posting (EmbeddingsIndexStatsHbcPosting | Unset):
         async_indexing (EmbeddingsIndexStatsAsyncIndexing | Unset):
@@ -71,8 +75,8 @@ class EmbeddingsIndexStats:
         projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
             projection checkpoint.
         projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash (int | Unset): Projection configuration identity associated with the durable
-            checkpoint.
+        projection_checkpoint_config_fingerprint (str | Unset): Projection configuration identity associated with the
+            durable checkpoint.
         checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
             checkpoint that still need replay.
         repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
@@ -101,12 +105,14 @@ class EmbeddingsIndexStats:
     total_nodes: int | Unset = UNSET
     total_terms: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    repair: IndexRepairStatus | Unset = UNSET
     wal_backlog: int | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
     backfill_items_processed: int | Unset = UNSET
     backfill_state: str | Unset = UNSET
     doc_count: int | Unset = UNSET
+    coverage: DerivedCoverageStatus | Unset = UNSET
     query_visible_doc_count: int | Unset = UNSET
     published_doc_count: int | Unset = UNSET
     published_node_count: int | Unset = UNSET
@@ -115,7 +121,6 @@ class EmbeddingsIndexStats:
     dense_replay_applied_sequence: int | Unset = UNSET
     dense_replay_target_sequence: int | Unset = UNSET
     dense_publish_pending: bool | Unset = UNSET
-    coverage: EmbeddingsIndexStatsCoverage | Unset = UNSET
     replay_applied_sequence: int | Unset = UNSET
     replay_target_sequence: int | Unset = UNSET
     replay_catch_up_required: bool | Unset = UNSET
@@ -127,14 +132,14 @@ class EmbeddingsIndexStats:
     catch_up_phase: str | Unset = UNSET
     catch_up_applied_sequence: int | Unset = UNSET
     catch_up_target_sequence: int | Unset = UNSET
-    enrichment_runtime: EmbeddingsIndexStatsEnrichmentRuntime | Unset = UNSET
+    enrichment_runtime: EnrichmentRuntimeStatus | Unset = UNSET
     hbc_cache: EmbeddingsIndexStatsHbcCache | Unset = UNSET
     hbc_posting: EmbeddingsIndexStatsHbcPosting | Unset = UNSET
     async_indexing: EmbeddingsIndexStatsAsyncIndexing | Unset = UNSET
     projection_checkpoint_status: str | Unset = UNSET
     projection_checkpoint_applied_sequence: int | Unset = UNSET
     projection_checkpoint_generation: int | Unset = UNSET
-    projection_checkpoint_config_hash: int | Unset = UNSET
+    projection_checkpoint_config_fingerprint: str | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
     term_count: int | Unset = UNSET
@@ -169,6 +174,10 @@ class EmbeddingsIndexStats:
 
         rebuilding = self.rebuilding
 
+        repair: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.repair, Unset):
+            repair = self.repair.to_dict()
+
         wal_backlog = self.wal_backlog
 
         backfill_active = self.backfill_active
@@ -180,6 +189,10 @@ class EmbeddingsIndexStats:
         backfill_state = self.backfill_state
 
         doc_count = self.doc_count
+
+        coverage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.coverage, Unset):
+            coverage = self.coverage.to_dict()
 
         query_visible_doc_count = self.query_visible_doc_count
 
@@ -196,10 +209,6 @@ class EmbeddingsIndexStats:
         dense_replay_target_sequence = self.dense_replay_target_sequence
 
         dense_publish_pending = self.dense_publish_pending
-
-        coverage: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.coverage, Unset):
-            coverage = self.coverage.to_dict()
 
         replay_applied_sequence = self.replay_applied_sequence
 
@@ -245,7 +254,7 @@ class EmbeddingsIndexStats:
 
         projection_checkpoint_generation = self.projection_checkpoint_generation
 
-        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+        projection_checkpoint_config_fingerprint = self.projection_checkpoint_config_fingerprint
 
         checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
 
@@ -304,6 +313,8 @@ class EmbeddingsIndexStats:
             field_dict["total_terms"] = total_terms
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if repair is not UNSET:
+            field_dict["repair"] = repair
         if wal_backlog is not UNSET:
             field_dict["wal_backlog"] = wal_backlog
         if backfill_active is not UNSET:
@@ -316,6 +327,8 @@ class EmbeddingsIndexStats:
             field_dict["backfill_state"] = backfill_state
         if doc_count is not UNSET:
             field_dict["doc_count"] = doc_count
+        if coverage is not UNSET:
+            field_dict["coverage"] = coverage
         if query_visible_doc_count is not UNSET:
             field_dict["query_visible_doc_count"] = query_visible_doc_count
         if published_doc_count is not UNSET:
@@ -332,8 +345,6 @@ class EmbeddingsIndexStats:
             field_dict["dense_replay_target_sequence"] = dense_replay_target_sequence
         if dense_publish_pending is not UNSET:
             field_dict["dense_publish_pending"] = dense_publish_pending
-        if coverage is not UNSET:
-            field_dict["coverage"] = coverage
         if replay_applied_sequence is not UNSET:
             field_dict["replay_applied_sequence"] = replay_applied_sequence
         if replay_target_sequence is not UNSET:
@@ -370,8 +381,8 @@ class EmbeddingsIndexStats:
             field_dict["projection_checkpoint_applied_sequence"] = projection_checkpoint_applied_sequence
         if projection_checkpoint_generation is not UNSET:
             field_dict["projection_checkpoint_generation"] = projection_checkpoint_generation
-        if projection_checkpoint_config_hash is not UNSET:
-            field_dict["projection_checkpoint_config_hash"] = projection_checkpoint_config_hash
+        if projection_checkpoint_config_fingerprint is not UNSET:
+            field_dict["projection_checkpoint_config_fingerprint"] = projection_checkpoint_config_fingerprint
         if checkpoint_replay_tail_sequence_count is not UNSET:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
@@ -411,13 +422,14 @@ class EmbeddingsIndexStats:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.derived_coverage_status import DerivedCoverageStatus
         from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-        from ..models.embeddings_index_stats_coverage import EmbeddingsIndexStatsCoverage
-        from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
         from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
         from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
         from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
         from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
+        from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
+        from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = EmbeddingsIndexStatsIndexType(d.pop("index_type"))
@@ -434,6 +446,13 @@ class EmbeddingsIndexStats:
 
         rebuilding = d.pop("rebuilding", UNSET)
 
+        _repair = d.pop("repair", UNSET)
+        repair: IndexRepairStatus | Unset
+        if isinstance(_repair, Unset):
+            repair = UNSET
+        else:
+            repair = IndexRepairStatus.from_dict(_repair)
+
         wal_backlog = d.pop("wal_backlog", UNSET)
 
         backfill_active = d.pop("backfill_active", UNSET)
@@ -445,6 +464,13 @@ class EmbeddingsIndexStats:
         backfill_state = d.pop("backfill_state", UNSET)
 
         doc_count = d.pop("doc_count", UNSET)
+
+        _coverage = d.pop("coverage", UNSET)
+        coverage: DerivedCoverageStatus | Unset
+        if isinstance(_coverage, Unset):
+            coverage = UNSET
+        else:
+            coverage = DerivedCoverageStatus.from_dict(_coverage)
 
         query_visible_doc_count = d.pop("query_visible_doc_count", UNSET)
 
@@ -461,13 +487,6 @@ class EmbeddingsIndexStats:
         dense_replay_target_sequence = d.pop("dense_replay_target_sequence", UNSET)
 
         dense_publish_pending = d.pop("dense_publish_pending", UNSET)
-
-        _coverage = d.pop("coverage", UNSET)
-        coverage: EmbeddingsIndexStatsCoverage | Unset
-        if isinstance(_coverage, Unset):
-            coverage = UNSET
-        else:
-            coverage = EmbeddingsIndexStatsCoverage.from_dict(_coverage)
 
         replay_applied_sequence = d.pop("replay_applied_sequence", UNSET)
 
@@ -492,11 +511,11 @@ class EmbeddingsIndexStats:
         catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
 
         _enrichment_runtime = d.pop("enrichment_runtime", UNSET)
-        enrichment_runtime: EmbeddingsIndexStatsEnrichmentRuntime | Unset
+        enrichment_runtime: EnrichmentRuntimeStatus | Unset
         if isinstance(_enrichment_runtime, Unset):
             enrichment_runtime = UNSET
         else:
-            enrichment_runtime = EmbeddingsIndexStatsEnrichmentRuntime.from_dict(_enrichment_runtime)
+            enrichment_runtime = EnrichmentRuntimeStatus.from_dict(_enrichment_runtime)
 
         _hbc_cache = d.pop("hbc_cache", UNSET)
         hbc_cache: EmbeddingsIndexStatsHbcCache | Unset
@@ -525,7 +544,7 @@ class EmbeddingsIndexStats:
 
         projection_checkpoint_generation = d.pop("projection_checkpoint_generation", UNSET)
 
-        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash", UNSET)
+        projection_checkpoint_config_fingerprint = d.pop("projection_checkpoint_config_fingerprint", UNSET)
 
         checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count", UNSET)
 
@@ -579,12 +598,14 @@ class EmbeddingsIndexStats:
             total_nodes=total_nodes,
             total_terms=total_terms,
             rebuilding=rebuilding,
+            repair=repair,
             wal_backlog=wal_backlog,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
             backfill_items_processed=backfill_items_processed,
             backfill_state=backfill_state,
             doc_count=doc_count,
+            coverage=coverage,
             query_visible_doc_count=query_visible_doc_count,
             published_doc_count=published_doc_count,
             published_node_count=published_node_count,
@@ -593,7 +614,6 @@ class EmbeddingsIndexStats:
             dense_replay_applied_sequence=dense_replay_applied_sequence,
             dense_replay_target_sequence=dense_replay_target_sequence,
             dense_publish_pending=dense_publish_pending,
-            coverage=coverage,
             replay_applied_sequence=replay_applied_sequence,
             replay_target_sequence=replay_target_sequence,
             replay_catch_up_required=replay_catch_up_required,
@@ -612,7 +632,7 @@ class EmbeddingsIndexStats:
             projection_checkpoint_status=projection_checkpoint_status,
             projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
             projection_checkpoint_generation=projection_checkpoint_generation,
-            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            projection_checkpoint_config_fingerprint=projection_checkpoint_config_fingerprint,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
             term_count=term_count,

@@ -21,6 +21,7 @@ const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
 const db_config = @import("config.zig");
+const generation_lifecycle = @import("generation_lifecycle.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const split_restore = @import("split_restore.zig");
@@ -33,6 +34,7 @@ const write_path = @import("write_path.zig");
 const db_transactions = @import("transactions.zig");
 const schema_runtime = @import("schema_runtime.zig");
 const relational_integrity = @import("relational_integrity.zig");
+const range_state_mod = @import("range_state.zig");
 const relational_rows = @import("relational_rows.zig");
 const search_runtime = @import("search_runtime.zig");
 const artifact_repair = @import("artifact_repair.zig");
@@ -46,9 +48,11 @@ const types = @import("types.zig");
 const aggregations_mod = @import("aggregations.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const derived_types = @import("derived/derived_types.zig");
+const index_repair_state = @import("derived/index_repair_state.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const derived_async = @import("derived_async.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
@@ -132,20 +136,28 @@ pub const RestoreState = split_restore.RestoreState;
 pub const RestoreIdentity = split_restore.RestoreIdentity;
 
 pub const DB = struct {
+    closed: bool = false,
     alloc: Allocator,
     runtime_alloc: Allocator,
+    generation_read_lease: ?generation_lifecycle.ReadLease,
     open_mode: OpenOptions.OpenMode,
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     index_backends: db_config.IndexBackendOptions,
     core: db_core.DBCore,
+    root_incarnation: u128 = 0,
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     relational_index_worker_owner_id: u64,
+    repair_cleanup_owner_id: u64,
+    algebraic_hll_owner_id: u64,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
+    owned_resource_manager: ?*resource_manager_mod.ResourceManager,
+    capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
+    optional_runtime_workers_enabled: bool,
     graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
     graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
     graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
@@ -186,18 +198,36 @@ pub const DB = struct {
     live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
     live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     live_doc_set_cache_generation: ?u64 = null,
+    nonvisible_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    nonvisible_doc_set_cache_generation: ?u64 = null,
+    nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set_cache_overflow: bool = false,
+    nonvisible_doc_set_cache_entries: platform.atomic.Value(u64) = .init(0),
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
+    visibility_runtime_stats: search_runtime.VisibilityRuntimeStats = .{},
     foreign_key_stats: ForeignKeyRuntimeStats = .{},
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
+    managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
-    active_index_repairs: std.StringHashMapUnmanaged(void) = .{},
+    generation_replace_mutex: std.atomic.Mutex = .unlocked,
+    active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
     pub const ShadowIndexRepairHook = struct {
         ptr: *anyopaque,
         after_snapshot_build: *const fn (ptr: *anyopaque, db: *DB, index_name: []const u8, build_floor_sequence: u64) anyerror!void,
+        after_pointer_activation: ?*const fn (ptr: *anyopaque, db: *DB, index_name: []const u8) anyerror!void = null,
+        after_clean_checkpoint: ?*const fn (ptr: *anyopaque, db: *DB, index_name: []const u8) anyerror!void = null,
+        after_phase_persisted: ?*const fn (
+            ptr: *anyopaque,
+            db: *DB,
+            repair_id: u128,
+            phase: index_repair_state.Phase,
+        ) anyerror!void = null,
     };
 
     const split_restore_impl = split_restore.Impl(@This());
@@ -224,19 +254,35 @@ pub const DB = struct {
         pub const notify_derived_executor_sequence = derived_async_impl.notifyDerivedExecutorSequence;
         pub const delete_expired_documents_from_candidates = write_path_impl.deleteExpiredDocumentsFromCandidates;
         pub const notify_async_context_visibility_hook = internal_impl.notifyAsyncContextVisibilityHook;
+        pub const notify_derived_applied_sequence_advanced = internal_impl.notifyDerivedAppliedSequenceAdvanced;
         pub const clear_bulk_ingest_seen_doc_keys_locked = write_path_impl.clearBulkIngestSeenDocKeysLocked;
+        pub const clear_bulk_ingest_identity_all_new_locked = write_path_impl.clearBulkIngestIdentityAllNewLocked;
         pub const deinit_bulk_ingest_coalescer = write_path_impl.deinitBulkIngestCoalescer;
         pub const replay_pending_derived_batches = derived_async_impl.replayPendingDerivedBatches;
+        pub const replay_pending_derived_batches_with_options = derived_async_impl.replayPendingDerivedBatchesWithOptions;
+        pub const drain_replay_stages_until_stable_without_truncation = lifecycle_impl.drainReplayStagesUntilStableWithoutTruncation;
         pub const start_async_workers = lifecycle_impl.startAsyncWorkers;
         pub const flush_applied_sequences_for_idle = derived_async_impl.flushAppliedSequencesForIdle;
+        pub const prepare_snapshot = lifecycle_impl.prepareSnapshot;
+        pub const save_all_live_index_status_snapshots = lifecycle_impl.saveAllLiveIndexStatusSnapshots;
         pub const wait_for_sync_level = derived_async_impl.waitForSyncLevel;
         pub const dense_index_rebuild_state_path_alloc = derived_async_impl.denseIndexRebuildStatePathAlloc;
+        pub const dense_artifact_watermark_repair_needed = derived_async_impl.denseArtifactWatermarkRepairNeeded;
         pub const set_dense_catch_up_progress = derived_async_impl.setDenseCatchUpProgress;
         pub const probe_derived_replay_target_sequence = lifecycle_mod.probeDerivedReplayTargetSequence;
         pub const lock_apply = internal_impl.lockApply;
+        pub const restart_enrichment_after_structural_mutation = schema_runtime_impl.restartEnrichmentAfterStructuralMutation;
+        pub const load_managed_admission_snapshot_for_open = artifact_repair_impl.loadManagedAdmissionSnapshotForOpen;
+        pub const initialize_index_repair_state_for_open = artifact_repair_impl.initializeIndexRepairStateForOpen;
+        pub const schedule_generated_artifact_cleanup = artifact_repair_impl.scheduleGeneratedArtifactCleanup;
         pub const populate_algebraic_index_stats = lifecycle_impl.populateAlgebraicIndexStats;
+        pub const enrichment_stats_with_supervisor_state = lifecycle_impl.enrichmentStatsWithSupervisorState;
+        pub const initialize_derived_coverage_identity = lifecycle_impl.initializeDerivedCoverageIdentity;
+        pub const normalize_replay_status_from_durable_checkpoint = lifecycle_impl.normalizeReplayStatusFromDurableCheckpoint;
         pub const open_mode_requires_read_only_backends = db_config.openModeRequiresReadOnlyBackends;
     };
+    pub const hasQueryVisibilityHook = internal_impl.hasQueryVisibilityHook;
+    pub const notifyQueryVisibilityHook = internal_impl.notifyQueryVisibilityHook;
     pub const DerivedAsyncCallbacks = struct {
         pub const dense_catch_up_finish_options = denseCatchUpFinishOptions;
         pub const enforce_ha_write_gate_optional = ha_replication.enforceWriteGateOptional;
@@ -247,13 +293,62 @@ pub const DB = struct {
         pub const async_index_profile_enabled = db_internal.asyncIndexProfileEnabled;
         pub const replay_pending_derived_batches_context = derived_async_impl.replayPendingDerivedBatchesContext;
         pub const catch_up_managed_index_with_batch_context = derived_async_impl.catchUpManagedIndexWithBatchContext;
+        pub const catch_up_managed_index_with_batch_context_options = derived_async_impl.catchUpManagedIndexWithBatchContextOptions;
         pub const can_advance_derived_replay_target_for_batch_context = derived_async_impl.canAdvanceDerivedReplayTargetForBatchContext;
         pub const rebuild_dense_index_for_target_coverage_context = derived_async_impl.rebuildDenseIndexForTargetCoverageContext;
+        pub const rebuild_dense_index_for_target_coverage_slice_context = derived_async_impl.rebuildDenseIndexForTargetCoverageSliceContext;
         pub const rebuild_sparse_index_from_stored_embedding_artifacts_context = derived_async_impl.rebuildSparseIndexFromStoredEmbeddingArtifactsContext;
         pub const save_applied_sequences_batch_context = derived_async_impl.saveAppliedSequencesBatchContext;
+        pub const save_dense_projection_metadata_for_applied_sequence_updates = derived_async_impl.saveDenseProjectionMetadataForAppliedSequenceUpdates;
+        pub const checkpoint_managed_projection_effects_for_applied_sequence_updates = derived_async_impl.checkpointManagedProjectionEffectsForAppliedSequenceUpdates;
         pub const open_profile_enabled = lifecycle_mod.openProfileEnabled;
+        pub const dense_artifact_counter_bootstrap_key_alloc = derived_async_impl.denseArtifactCounterBootstrapKeyAlloc;
+        pub const dense_artifact_target_counter_key_alloc = derived_async_impl.denseArtifactTargetCounterKeyAlloc;
+        pub const dense_artifact_counter_bootstrap_encoded_len = derived_async_impl.dense_artifact_counter_bootstrap_encoded_len;
+        pub const encode_dense_artifact_counter_bootstrap = derived_async_impl.encodeDenseArtifactCounterBootstrap;
+        pub const load_dense_artifact_counter_bootstrap = derived_async_impl.loadDenseArtifactCounterBootstrap;
+        pub const dense_index_is_artifact_backed = derived_async_impl.denseIndexIsArtifactBacked;
+        pub const dense_target_count_for_index_context = derived_async_impl.denseTargetCountForIndexContext;
+        pub const dense_coverage_matches_target = derived_async_impl.denseCoverageMatchesTarget;
+        pub const finalize_covered_dense_projection_checkpoint = derived_async_impl.finalizeCoveredDenseProjectionCheckpoint;
+        pub const finalize_covered_dense_projection_checkpoints_if_idle = derived_async_impl.finalizeCoveredDenseProjectionCheckpointsIfIdle;
+        pub const drain_claimed_dense_projection_finalizations = derived_async_impl.drainClaimedDenseProjectionFinalizations;
+        pub const finish_external_dense_bulk_session_tracked_and_finalize = derived_async_impl.finishExternalDenseBulkSessionTrackedAndFinalize;
+        pub const finish_dense_catch_up_session_tracked_and_finalize = derived_async_impl.finishDenseCatchUpSessionTrackedAndFinalize;
         pub const log_replay_catch_up_profile = derived_async.logReplayCatchUpProfile;
         pub const log_derived_worker_profile = derived_async.logDerivedWorkerProfile;
+    };
+    pub const ArtifactRepairCallbacks = struct {
+        pub const delete_dense_artifact_counter_metadata_context = derived_async_impl.deleteDenseArtifactCounterMetadataContext;
+        pub const managed_admission_visibility_summary = schema_runtime_impl.managedAdmissionVisibilitySummary;
+        pub const refresh_index_repair_availability_for_index = artifact_repair_impl.refreshIndexRepairAvailabilityForIndex;
+        pub const repair_capacity_observation = artifact_repair_impl.repairCapacityObservation;
+        pub const repair_working_set_plan = artifact_repair_impl.repairWorkingSetPlan;
+        pub const reserve_dense_counter_bootstrap_working_set = artifact_repair_impl.reserveDenseCounterBootstrapWorkingSet;
+        pub const dense_counter_bootstrap_working_set_bytes = artifact_repair_impl.dense_counter_bootstrap_working_set_bytes;
+        pub const set_test_enrichment_restart_failures_remaining = artifact_repair_impl.setTestEnrichmentRestartFailuresRemaining;
+        pub const test_enrichment_restart_failures_remaining = artifact_repair_impl.testEnrichmentRestartFailuresRemaining;
+        pub const load_index_repair_entry_by_id = artifact_repair_impl.loadIndexRepairEntryById;
+        pub const create_operator_generation_repair_intent = artifact_repair_impl.createOperatorGenerationRepairIntent;
+        pub const update_index_repair_intent = artifact_repair_impl.updateIndexRepairIntent;
+        pub const rollback_unavailable_activated_index_repair = artifact_repair_impl.rollbackUnavailableActivatedIndexRepair;
+        pub const begin_pinned_index_repair_snapshot = artifact_repair_impl.beginPinnedIndexRepairSnapshot;
+        pub const managed_admission_materialization_pending = artifact_repair_impl.managedAdmissionMaterializationPending;
+        pub const begin_dense_artifact_counter_bootstrap_snapshot = artifact_repair_impl.beginDenseArtifactCounterBootstrapSnapshot;
+        pub const finish_dense_artifact_counter_bootstrap = artifact_repair_impl.finishDenseArtifactCounterBootstrap;
+        pub const count_dense_artifacts_for_config_from_read_txn = artifact_repair_impl.countDenseArtifactsForConfigFromReadTxn;
+        pub const index_generation_repair_required = artifact_repair_impl.indexGenerationRepairRequired;
+        pub const ensure_automatic_dense_generation_repair_intent = artifact_repair_impl.ensureAutomaticDenseGenerationRepairIntent;
+        pub const ensure_dense_artifact_target_counter_for_repair = artifact_repair_impl.ensureDenseArtifactTargetCounterForRepair;
+        pub const rebuild_index_with_shadow_replacement = artifact_repair_impl.rebuildIndexWithShadowReplacement;
+        pub const encode_managed_index_admission_marker = artifact_repair_impl.encodeManagedIndexAdmissionMarker;
+        pub const decode_managed_index_admission_marker = artifact_repair_impl.decodeManagedIndexAdmissionMarker;
+        pub const test_block_generated_artifact_finalization = &artifact_repair_impl.test_block_generated_artifact_finalization;
+        pub const test_generated_artifact_finalization_entered = &artifact_repair_impl.test_generated_artifact_finalization_entered;
+        pub const test_release_generated_artifact_finalization = &artifact_repair_impl.test_release_generated_artifact_finalization;
+        pub const test_managed_admission_materialization_hook = &artifact_repair_impl.test_managed_admission_materialization_hook;
+        pub const IndexAdmissionDisposition = artifact_repair_impl.IndexAdmissionDisposition;
+        pub const RepairCapacityGuard = artifact_repair_impl.RepairCapacityGuard;
     };
     pub const WritePathCallbacks = struct {
         pub const Profile = BatchProfile;
@@ -288,6 +383,9 @@ pub const DB = struct {
         pub const append_precomputed_graph_source_artifacts = write_path_impl.appendPrecomputedGraphSourceArtifacts;
         pub const graph_writes_from_artifact_value_alloc = artifact_replay.graphWritesFromArtifactValueAlloc;
         pub const free_graph_writes = artifact_replay.freeGraphWrites;
+        pub const graph_artifact_source_consumes_ref = artifact_replay.graphArtifactSourceConsumesRef;
+        pub const graph_artifact_ref_uses_document_wide_fallback = artifact_replay.graphArtifactRefUsesDocumentWideFallback;
+        pub const graph_artifact_state_name_alloc = artifact_replay.graphArtifactStateNameAlloc;
         pub const resolution_mention_state_keys_for_graph_source_alloc = artifact_replay.resolutionMentionStateKeysForGraphSourceAlloc;
         pub const attach_inline_upsert_document_values = derived_async.attachInlineUpsertDocumentValues;
         pub const apply_derived_batch_to_shadow_if_needed = derived_async_impl.applyDerivedBatchToShadowIfNeeded;
@@ -300,6 +398,9 @@ pub const DB = struct {
         pub const mirror_ha_replay_payload_commit = ha_replication_impl.mirrorDBReplayPayloadCommit;
         pub const mirror_ha_replay_payload_best_effort = ha_replication_impl.mirrorDBReplayPayloadBestEffort;
         pub const mirror_ha_replay_payload_best_effort_context = ha_replication.mirrorReplayPayloadBestEffort;
+        pub const begin_external_dense_bulk_session_tracked_wait = derived_async_impl.beginExternalDenseBulkSessionTrackedWait;
+        pub const finish_external_dense_bulk_session_tracked_and_finalize = derived_async_impl.finishExternalDenseBulkSessionTrackedAndFinalize;
+        pub const finish_external_dense_bulk_session_tracked_best_effort = derived_async_impl.finishExternalDenseBulkSessionTrackedBestEffort;
         pub const should_append_split_delta = split_restore_impl.shouldAppendSplitDelta;
         pub const current_time_ns = db_internal.currentTimeNs;
         pub const mark_precomputed_enrichment_applied_for_sync = lifecycle_impl.markPrecomputedEnrichmentAppliedForSync;
@@ -320,7 +421,25 @@ pub const DB = struct {
         pub const notify_resolver_replay_runtimes_for_catalog = derived_async_impl.notifyResolverReplayRuntimesForCatalog;
     };
     pub const SchemaRuntimeCallbacks = struct {
+        pub const drain_managed_index_admissions = artifact_repair_impl.drainManagedIndexAdmissions;
+        pub const encode_managed_index_admission_value = artifact_repair_impl.encodeManagedIndexAdmissionValue;
         pub const hydrate_algebraic_observation_status_for_index_best_effort = lifecycle_impl.hydrateAlgebraicObservationStatusForIndexBestEffort;
+        pub const index_repair_id_for_index = artifact_repair_impl.indexRepairIdForIndex;
+        pub const initialize_dense_artifact_target_counter_if_needed = derived_async_impl.initializeDenseArtifactTargetCounterIfNeeded;
+        pub const delete_dense_artifact_counter_metadata_context = derived_async_impl.deleteDenseArtifactCounterMetadataContext;
+        pub const quiesce_enrichment_for_structural_mutation = artifact_repair_impl.quiesceEnrichmentForStructuralMutation;
+        pub const prepare_index_repair_for_deletion = artifact_repair_impl.prepareIndexRepairForDeletion;
+        pub const end_index_repair_lease = artifact_repair_impl.endIndexRepairLease;
+        pub const remove_index_repair_intent_and_pin = artifact_repair_impl.removeIndexRepairIntentAndPin;
+        pub const schedule_generated_artifact_cleanup = artifact_repair_impl.scheduleGeneratedArtifactCleanup;
+        pub const reject_conflicting_retired_index_cleanup_for_admission = artifact_repair_impl.rejectConflictingRetiredIndexCleanupForAdmission;
+        pub const remove_orphaned_index_repair_intent_for_fresh_admission = artifact_repair_impl.removeOrphanedIndexRepairIntentForFreshAdmission;
+        pub const request_managed_admission_materialization = artifact_repair_impl.requestManagedAdmissionMaterialization;
+        pub const rebuild_dense_index_for_target_coverage_context = derived_async_impl.rebuildDenseIndexForTargetCoverageContext;
+        pub const rebuild_sparse_index_from_stored_embedding_artifacts_context = derived_async_impl.rebuildSparseIndexFromStoredEmbeddingArtifactsContext;
+        pub const schedule_enrichment_restart_context = artifact_repair_impl.scheduleEnrichmentRestartContext;
+        pub const restart_enrichment_after_structural_mutation = schema_runtime_impl.restartEnrichmentAfterStructuralMutation;
+        pub const start_enrichment_runtime_for_lifecycle = artifact_repair_impl.startEnrichmentRuntimeForLifecycle;
         pub const replay_generated_enrichments_from_stored_docs = replayGeneratedEnrichmentsFromStoredDocs;
         pub const append_generated_enrichments = write_path_impl.appendGeneratedEnrichments;
         pub const append_derived_batch_record = derivedAsyncAppendDerivedBatchRecord;
@@ -330,6 +449,8 @@ pub const DB = struct {
         pub const mirror_ha_schema_metadata_commit = ha_replication_impl.mirrorDBSchemaMetadataCommit;
         pub const mirror_ha_schema_json_metadata_commit = ha_replication_impl.mirrorDBSchemaJsonMetadataCommit;
         pub const mirror_ha_lite_sql_table_metadata_commit = ha_replication_impl.mirrorDBLiteSqlTableMetadataCommit;
+        pub const install_index_while_enrichment_quiesced = schema_runtime_impl.installIndexWhileEnrichmentQuiesced;
+        pub const test_fail_index_activation_after_catalog_commit = &schema_runtime_impl.test_fail_index_activation_after_catalog_commit;
     };
     pub const HAReplicationCallbacks = struct {
         pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
@@ -347,8 +468,34 @@ pub const DB = struct {
         return try lifecycle_impl.open(alloc, path, opts);
     }
 
+    pub const materializeManagedIndexAdmission = artifact_repair_impl.materializeManagedIndexAdmission;
+    pub const GeneratedArtifactCleanupAdvanceResult = artifact_repair_impl.GeneratedArtifactCleanupAdvanceResult;
+    pub const StartupIndexRepairDiscovery = artifact_repair_impl.StartupIndexRepairDiscovery;
+    pub const IndexRepairIntentSummary = artifact_repair_impl.IndexRepairIntentSummary;
+    pub const IndexRepairAdvanceResult = artifact_repair_impl.IndexRepairAdvanceResult;
+    pub const StartupIndexRepairResult = artifact_repair_impl.StartupIndexRepairResult;
+    pub const advanceGeneratedArtifactCleanupPage = artifact_repair_impl.advanceGeneratedArtifactCleanupPage;
+    pub const indexRepairIntentSummary = artifact_repair_impl.indexRepairIntentSummary;
+    pub const loadIndexRepairState = artifact_repair_impl.loadIndexRepairState;
+    pub const denseRepairWriteBackpressured = artifact_repair_impl.denseRepairWriteBackpressured;
+    pub const discoverRecoverableStartupIndexFailures = artifact_repair_impl.discoverRecoverableStartupIndexFailures;
+    pub const advanceIndexRepairIntent = artifact_repair_impl.advanceIndexRepairIntent;
+    pub const repairRecoverableStartupIndexFailures = artifact_repair_impl.repairRecoverableStartupIndexFailures;
+    pub const countTextKernel = search_runtime_impl.countTextKernel;
+    pub const textKernelTermStats = search_runtime_impl.textKernelTermStats;
+    pub const textIndexLayoutStats = search_runtime_impl.textIndexLayoutStats;
+    pub const indexTextKernelDocuments = write_path_impl.indexTextKernelDocuments;
+
     pub fn close(self: *DB) void {
         lifecycle_impl.close(self);
+    }
+
+    pub fn isClosed(self: *const DB) bool {
+        return lifecycle_impl.isClosed(self);
+    }
+
+    pub fn durableRootIncarnation(self: *const DB) !u128 {
+        return lifecycle_impl.durableRootIncarnation(self);
     }
 
     pub fn maintenanceDriver(self: *DB) db_core.MaintenanceDriver {
@@ -369,6 +516,10 @@ pub const DB = struct {
 
     pub fn clearLiveDocSetCache(self: *DB) void {
         search_runtime_impl.clearLiveDocSetCache(self);
+    }
+
+    pub fn clearNonVisibleDocSetCache(self: *DB) void {
+        search_runtime_impl.clearNonVisibleDocSetCache(self);
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
@@ -893,6 +1044,14 @@ pub const DB = struct {
         return try artifact_repair_impl.repairEmbeddingArtifactIssues(self, alloc, limit);
     }
 
+    pub fn indexRepairIdForIndex(self: *const DB, alloc: Allocator, index_name: []const u8) !?u128 {
+        return try artifact_repair_impl.indexRepairIdForIndex(self, alloc, index_name);
+    }
+
+    pub fn hasPendingIndexRepairIntents(self: *const DB, alloc: Allocator) !bool {
+        return try artifact_repair_impl.hasPendingIndexRepairIntents(self, alloc);
+    }
+
     pub fn beginPublishedDenseSearch(self: *DB) bool {
         return search_runtime_impl.beginPublishedDenseSearch(self);
     }
@@ -1027,6 +1186,72 @@ pub const DB = struct {
         try split_restore_impl.clearSplitDeltaFinalSeq(self);
     }
 
+    pub fn getSplitBootstrapMarker(self: *DB, alloc: Allocator) !?range_state_mod.SplitBootstrapMarker {
+        return try split_restore_impl.getSplitBootstrapMarker(self, alloc);
+    }
+
+    pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        try split_restore_impl.setSplitBootstrapMarker(self, marker);
+    }
+
+    pub fn replaceRaftDocumentSnapshot(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+    ) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        try split_restore_impl.replaceRaftDocumentSnapshot(self, alloc, byte_range, writes);
+    }
+
+    pub fn appendRaftDocumentSnapshotChunk(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+    ) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        try split_restore_impl.appendRaftDocumentSnapshotChunk(self, staged_generation, byte_range, writes);
+    }
+
+    pub fn finishRaftDocumentSnapshot(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        byte_range: types.ByteRange,
+    ) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        try split_restore_impl.finishRaftDocumentSnapshot(self, staged_generation, byte_range);
+    }
+
+    pub fn replaceSplitBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+        base_delta_sequence: u64,
+        marker: range_state_mod.SplitBootstrapMarker,
+    ) !bool {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try split_restore_impl.replaceSplitBootstrap(self, alloc, byte_range, writes, base_delta_sequence, marker);
+    }
+
+    pub fn completeSplitBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        base_delta_sequence: u64,
+        marker: range_state_mod.SplitBootstrapMarker,
+    ) !bool {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try split_restore_impl.completeSplitBootstrap(self, alloc, byte_range, base_delta_sequence, marker);
+    }
+
+    pub fn clearSplitBootstrapMarker(self: *DB) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        try split_restore_impl.clearSplitBootstrapMarker(self);
+    }
+
     pub fn listSplitDeltaEntriesAfter(self: *DB, alloc: Allocator, after_seq: u64) ![]types.SplitDeltaEntry {
         return try split_restore_impl.listSplitDeltaEntriesAfter(self, alloc, after_seq);
     }
@@ -1086,37 +1311,100 @@ pub const DB = struct {
         try split_restore_impl.restoreSnapshotTo(alloc, snapshot_root, path, opts);
     }
 
+    pub fn restoreSnapshotToStagedGeneration(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+    ) !void {
+        try split_restore_impl.restoreSnapshotToStagedGeneration(staged_generation, alloc, snapshot_root, path, opts);
+    }
+
     pub fn restoreSnapshotToDeferredRuntimeRepair(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
         alloc: Allocator,
         snapshot_root: []const u8,
         path: []const u8,
         opts: OpenOptions,
         identity: RestoreIdentity,
     ) !void {
-        try split_restore_impl.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, opts, identity);
+        try split_restore_impl.restoreSnapshotToDeferredRuntimeRepair(staged_generation, alloc, snapshot_root, path, opts, identity);
+    }
+
+    pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+    ) !void {
+        try split_restore_impl.restoreSnapshotToDeferredRuntimeRepairWithIo(staged_generation, alloc, io, snapshot_root, path, opts, identity);
     }
 
     pub fn recoverIncompleteRestoreImportIfNeeded(alloc: Allocator, path: []const u8, opts: OpenOptions) !bool {
         return try split_restore_impl.recoverIncompleteRestoreImportIfNeeded(alloc, path, opts);
     }
 
+    pub fn recoverIncompleteRestoreImportIfNeededWithIo(alloc: Allocator, io: std.Io, path: []const u8, opts: OpenOptions) !bool {
+        return try split_restore_impl.recoverIncompleteRestoreImportIfNeededWithIo(alloc, io, path, opts);
+    }
+
+    pub fn restoreRuntimeRepairNeededForPathWithIo(alloc: Allocator, io: std.Io, path: []const u8) !bool {
+        return try split_restore_impl.restoreRuntimeRepairNeededForPathWithIo(alloc, io, path);
+    }
+
+    pub fn managedIndexReplayTargetSequence(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        kind: types.IndexKind,
+        applied_sequence: u64,
+    ) !u64 {
+        return try lifecycle_impl.managedIndexReplayTargetSequence(self, alloc, index_name, kind, applied_sequence);
+    }
+
     pub fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
         try split_restore_impl.beginRestoreImport(alloc, path, snapshot_root, identity);
+    }
+
+    pub fn beginRestoreImportWithIo(alloc: Allocator, io: std.Io, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
+        try split_restore_impl.beginRestoreImportWithIo(alloc, io, path, snapshot_root, identity);
     }
 
     pub fn readRestoreStateForPath(alloc: Allocator, path: []const u8) !?RestoreState {
         return try split_restore_impl.readRestoreStateForPath(alloc, path);
     }
 
-    pub fn markRestorePrimaryRestoredForPath(
+    pub fn readRestoreStateForPathWithIo(alloc: Allocator, io: std.Io, path: []const u8) !?RestoreState {
+        return try split_restore_impl.readRestoreStateForPathWithIo(alloc, io, path);
+    }
+
+    pub fn markRestorePrimaryRestoredForPathWithArtifact(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
         location: []const u8,
+        artifact_sha256: []const u8,
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        try split_restore_impl.markRestorePrimaryRestoredForPath(alloc, path, backup_id, location, snapshot_path, group_id);
+        try split_restore_impl.markRestorePrimaryRestoredForPathWithArtifact(alloc, path, backup_id, location, artifact_sha256, snapshot_path, group_id);
+    }
+
+    pub fn markRestorePrimaryRestoredForPathWithArtifactWithIo(
+        alloc: Allocator,
+        io: std.Io,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        artifact_sha256: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        try split_restore_impl.markRestorePrimaryRestoredForPathWithArtifactWithIo(alloc, io, path, backup_id, location, artifact_sha256, snapshot_path, group_id);
     }
 
     pub fn markRestoreCompleteForPath(
@@ -1124,10 +1412,11 @@ pub const DB = struct {
         path: []const u8,
         backup_id: []const u8,
         location: []const u8,
+        artifact_sha256: []const u8,
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        try split_restore_impl.markRestoreCompleteForPath(alloc, path, backup_id, location, snapshot_path, group_id);
+        try split_restore_impl.markRestoreCompleteForPath(alloc, path, backup_id, location, artifact_sha256, snapshot_path, group_id);
     }
 
     pub fn restoreRuntimeRepairNeededForPath(alloc: Allocator, path: []const u8) !bool {
@@ -1138,6 +1427,10 @@ pub const DB = struct {
         try split_restore_impl.markRestoreRuntimeRepairNeeded(alloc, path);
     }
 
+    pub fn markRestoreRuntimeRepairNeededWithIo(alloc: Allocator, io: std.Io, path: []const u8) !void {
+        try split_restore_impl.markRestoreRuntimeRepairNeededWithIo(alloc, io, path);
+    }
+
     pub fn restoreRuntimeRepairNeeded(self: *DB) !bool {
         return try split_restore_impl.restoreRuntimeRepairNeeded(self);
     }
@@ -1145,6 +1438,11 @@ pub const DB = struct {
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try split_restore_impl.repairRestoreRuntimeStateStepIfNeeded(self, alloc);
+    }
+
+    pub fn repairRestoreRuntimeStateStepIfNeededWithIo(self: *DB, alloc: Allocator, io: std.Io) !bool {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try split_restore_impl.repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io);
     }
 
     pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
@@ -1706,9 +2004,32 @@ pub const DB = struct {
         return try search_runtime_impl.executeNamedGraphQueries(self, alloc, req, graph_queries, input_sets);
     }
 
+    pub fn graphHydrateKeysForInternalRead(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) ![]types.SearchHit {
+        return try search_runtime_impl.graphHydrateKeysForInternalRead(self, alloc, req, keys);
+    }
+
+    pub fn graphHasIncomingEdgesForInternalRead(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]bool {
+        return try search_runtime_impl.graphHasIncomingEdgesForInternalRead(self, alloc, index_name, keys);
+    }
+
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.addIndex(self, cfg);
+    }
+
+    pub fn admitManagedFullTextIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try schema_runtime_impl.admitManagedFullTextIndex(self, cfg);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
@@ -2246,6 +2567,16 @@ pub const DB = struct {
         return try derived_async_impl.loadDenseArtifactTargetCounter(alloc, store, index_name);
     }
 
+    pub const DenseArtifactCounterBootstrap = derived_async_impl.DenseArtifactCounterBootstrap;
+
+    pub fn loadDenseArtifactCounterBootstrap(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+    ) !?DenseArtifactCounterBootstrap {
+        return try derived_async_impl.loadDenseArtifactCounterBootstrap(alloc, store, index_name);
+    }
+
     pub fn appendDenseArtifactCounterMutations(
         alloc: Allocator,
         store: *docstore_mod.DocStore,
@@ -2292,7 +2623,7 @@ pub const DB = struct {
         return lifecycle_impl.overlayRuntimeStatusBestEffort(self, stats_alloc, runtime_stats);
     }
 
-    pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
+    pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
         return lifecycle_impl.overlayRuntimeStatusConsistent(self, stats_alloc, runtime_stats);
     }
 
@@ -3940,6 +4271,16 @@ pub const DB = struct {
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
         return try search_runtime_impl.search(self, alloc, req);
+    }
+
+    pub fn searchTextKernel(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        text_query: types.TextQuery,
+        options: types.TextKernelSearchOptions,
+    ) !types.TextKernelResult {
+        return try search_runtime_impl.searchTextKernel(self, alloc, index_name, text_query, options);
     }
 
     pub fn searchWithExecutionContext(

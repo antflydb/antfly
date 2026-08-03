@@ -99,13 +99,184 @@ pub const DecodedLogRecord = struct {
     }
 };
 
-pub fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void {
-    for (batch.documents) |doc| {
-        alloc.free(doc.key);
-        if (doc.cleaned_value) |value| alloc.free(value);
-        for (doc.targets) |target| alloc.free(target.index_name);
-        if (doc.targets.len > 0) alloc.free(doc.targets);
+pub fn deinitDerivedDocument(alloc: Allocator, doc: DerivedDocument) void {
+    alloc.free(doc.key);
+    if (doc.cleaned_value) |value| alloc.free(value);
+    for (doc.targets) |target| alloc.free(target.index_name);
+    if (doc.targets.len > 0) alloc.free(doc.targets);
+}
+
+pub fn deinitDerivedGraphDocClear(alloc: Allocator, clear: DerivedGraphDocClear) void {
+    alloc.free(clear.key);
+    for (clear.index_names) |index_name| alloc.free(index_name);
+    if (clear.index_names.len > 0) alloc.free(clear.index_names);
+}
+
+pub fn deinitDerivedDenseEmbedding(alloc: Allocator, embedding: DerivedDenseEmbeddingWrite) void {
+    alloc.free(embedding.index_name);
+    if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
+    alloc.free(embedding.doc_key);
+    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+    if (embedding.vector.len > 0) alloc.free(embedding.vector);
+}
+
+pub fn deinitDerivedSparseEmbedding(alloc: Allocator, embedding: DerivedSparseEmbeddingWrite) void {
+    alloc.free(embedding.index_name);
+    alloc.free(embedding.doc_key);
+    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+    if (embedding.indices.len > 0) alloc.free(embedding.indices);
+    if (embedding.values.len > 0) alloc.free(embedding.values);
+}
+
+pub fn deinitDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) void {
+    alloc.free(@constCast(write.index_name));
+    alloc.free(@constCast(write.source));
+    alloc.free(@constCast(write.target));
+    alloc.free(@constCast(write.edge_type));
+    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+}
+
+pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) void {
+    alloc.free(@constCast(delete.index_name));
+    alloc.free(@constCast(delete.source));
+    alloc.free(@constCast(delete.target));
+    alloc.free(@constCast(delete.edge_type));
+}
+
+fn cloneDerivedTargetRefs(alloc: Allocator, targets: []const DerivedTargetRef) ![]DerivedTargetRef {
+    const cloned = try alloc.alloc(DerivedTargetRef, targets.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |target| alloc.free(target.index_name);
+        if (cloned.len > 0) alloc.free(cloned);
     }
+    for (targets, 0..) |target, i| {
+        cloned[i] = .{
+            .kind = target.kind,
+            .index_name = try alloc.dupe(u8, target.index_name),
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn cloneDerivedDocument(alloc: Allocator, doc: DerivedDocument) !DerivedDocument {
+    const key = try alloc.dupe(u8, doc.key);
+    errdefer alloc.free(key);
+    const cleaned_value = if (doc.cleaned_value) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cleaned_value) |value| alloc.free(value);
+    const targets = try cloneDerivedTargetRefs(alloc, doc.targets);
+    return .{
+        .key = key,
+        .action = doc.action,
+        .cleaned_value = cleaned_value,
+        .targets = targets,
+    };
+}
+
+pub fn cloneDerivedGraphDocClear(alloc: Allocator, clear: DerivedGraphDocClear) !DerivedGraphDocClear {
+    const key = try alloc.dupe(u8, clear.key);
+    errdefer alloc.free(key);
+    const index_names = try alloc.alloc([]const u8, clear.index_names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (index_names[0..initialized]) |index_name| alloc.free(index_name);
+        if (index_names.len > 0) alloc.free(index_names);
+    }
+    for (clear.index_names, 0..) |index_name, i| {
+        index_names[i] = try alloc.dupe(u8, index_name);
+        initialized += 1;
+    }
+    return .{ .key = key, .index_names = index_names };
+}
+
+pub fn cloneDerivedDenseEmbedding(
+    alloc: Allocator,
+    embedding: DerivedDenseEmbeddingWrite,
+) !DerivedDenseEmbeddingWrite {
+    const index_name = try alloc.dupe(u8, embedding.index_name);
+    errdefer alloc.free(index_name);
+    const parent_doc_key = if (embedding.parent_doc_key) |key| try alloc.dupe(u8, key) else null;
+    errdefer if (parent_doc_key) |key| alloc.free(key);
+    const doc_key = try alloc.dupe(u8, embedding.doc_key);
+    errdefer alloc.free(doc_key);
+    const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+    errdefer if (artifact_key) |key| alloc.free(key);
+    const vector = try alloc.dupe(f32, embedding.vector);
+    return .{
+        .index_name = index_name,
+        .parent_doc_key = parent_doc_key,
+        .doc_key = doc_key,
+        .artifact_key = artifact_key,
+        .vector = vector,
+    };
+}
+
+pub fn cloneDerivedSparseEmbedding(
+    alloc: Allocator,
+    embedding: DerivedSparseEmbeddingWrite,
+) !DerivedSparseEmbeddingWrite {
+    const index_name = try alloc.dupe(u8, embedding.index_name);
+    errdefer alloc.free(index_name);
+    const doc_key = try alloc.dupe(u8, embedding.doc_key);
+    errdefer alloc.free(doc_key);
+    const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+    errdefer if (artifact_key) |key| alloc.free(key);
+    const indices = try alloc.dupe(u32, embedding.indices);
+    errdefer if (indices.len > 0) alloc.free(indices);
+    const values = try alloc.dupe(f32, embedding.values);
+    return .{
+        .index_name = index_name,
+        .doc_key = doc_key,
+        .artifact_key = artifact_key,
+        .indices = indices,
+        .values = values,
+    };
+}
+
+pub fn cloneDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {
+    const index_name = try alloc.dupe(u8, write.index_name);
+    errdefer alloc.free(index_name);
+    const source = try alloc.dupe(u8, write.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, write.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, write.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata_json = if (write.metadata_json.len > 0)
+        try alloc.dupe(u8, write.metadata_json)
+    else
+        "";
+    return .{
+        .index_name = index_name,
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = write.weight,
+        .created_at = write.created_at,
+        .updated_at = write.updated_at,
+        .metadata_json = metadata_json,
+    };
+}
+
+pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.GraphEdgeDelete {
+    const index_name = try alloc.dupe(u8, delete.index_name);
+    errdefer alloc.free(index_name);
+    const source = try alloc.dupe(u8, delete.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, delete.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, delete.edge_type);
+    return .{
+        .index_name = index_name,
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+    };
+}
+
+pub fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void {
+    for (batch.documents) |doc| deinitDerivedDocument(alloc, doc);
     if (batch.documents.len > 0) alloc.free(batch.documents);
 
     for (batch.deleted_keys) |key| alloc.free(key);
@@ -117,48 +288,21 @@ pub fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void {
     for (batch.changed_artifact_keys) |key| alloc.free(key);
     if (batch.changed_artifact_keys.len > 0) alloc.free(batch.changed_artifact_keys);
 
-    for (batch.graph_doc_clears) |clear| {
-        alloc.free(clear.key);
-        for (clear.index_names) |index_name| alloc.free(index_name);
-        if (clear.index_names.len > 0) alloc.free(clear.index_names);
-    }
+    for (batch.graph_doc_clears) |clear| deinitDerivedGraphDocClear(alloc, clear);
     if (batch.graph_doc_clears.len > 0) alloc.free(batch.graph_doc_clears);
 
-    for (batch.dense_embeddings) |embedding| {
-        alloc.free(embedding.index_name);
-        if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
-        alloc.free(embedding.doc_key);
-        if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-        if (embedding.vector.len > 0) alloc.free(embedding.vector);
-    }
+    for (batch.dense_embeddings) |embedding| deinitDerivedDenseEmbedding(alloc, embedding);
     if (batch.dense_embeddings.len > 0) alloc.free(batch.dense_embeddings);
 
-    for (batch.sparse_embeddings) |embedding| {
-        alloc.free(embedding.index_name);
-        alloc.free(embedding.doc_key);
-        if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-        if (embedding.indices.len > 0) alloc.free(embedding.indices);
-        if (embedding.values.len > 0) alloc.free(embedding.values);
-    }
+    for (batch.sparse_embeddings) |embedding| deinitDerivedSparseEmbedding(alloc, embedding);
     if (batch.sparse_embeddings.len > 0) alloc.free(batch.sparse_embeddings);
 
     enrichment_types.deinitGeneratedRefs(alloc, batch.generated_enrichment_refs);
 
-    for (batch.graph_writes) |write| {
-        alloc.free(@constCast(write.index_name));
-        alloc.free(@constCast(write.source));
-        alloc.free(@constCast(write.target));
-        alloc.free(@constCast(write.edge_type));
-        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-    }
+    for (batch.graph_writes) |write| deinitDerivedGraphWrite(alloc, write);
     if (batch.graph_writes.len > 0) alloc.free(batch.graph_writes);
 
-    for (batch.graph_deletes) |delete| {
-        alloc.free(@constCast(delete.index_name));
-        alloc.free(@constCast(delete.source));
-        alloc.free(@constCast(delete.target));
-        alloc.free(@constCast(delete.edge_type));
-    }
+    for (batch.graph_deletes) |delete| deinitDerivedGraphDelete(alloc, delete);
     if (batch.graph_deletes.len > 0) alloc.free(batch.graph_deletes);
 
     batch.* = undefined;
@@ -168,24 +312,12 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
     var docs = try alloc.alloc(DerivedDocument, batch.documents.len);
     var initialized_docs: usize = 0;
     errdefer {
-        var tmp = DerivedBatch{ .documents = docs[0..initialized_docs] };
-        deinitDerivedBatch(alloc, &tmp);
+        for (docs[0..initialized_docs]) |doc| deinitDerivedDocument(alloc, doc);
+        if (docs.len > 0) alloc.free(docs);
     }
 
     for (batch.documents, 0..) |doc, i| {
-        var targets = try alloc.alloc(DerivedTargetRef, doc.targets.len);
-        for (doc.targets, 0..) |target, j| {
-            targets[j] = .{
-                .kind = target.kind,
-                .index_name = try alloc.dupe(u8, target.index_name),
-            };
-        }
-        docs[i] = .{
-            .key = try alloc.dupe(u8, doc.key),
-            .action = doc.action,
-            .cleaned_value = if (doc.cleaned_value) |value| try alloc.dupe(u8, value) else null,
-            .targets = targets,
-        };
+        docs[i] = try cloneDerivedDocument(alloc, doc);
         initialized_docs += 1;
     }
 
@@ -225,58 +357,36 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
     var graph_doc_clears = try alloc.alloc(DerivedGraphDocClear, batch.graph_doc_clears.len);
     var initialized_graph_doc_clears: usize = 0;
     errdefer {
-        var tmp = DerivedBatch{
-            .graph_doc_clears = graph_doc_clears[0..initialized_graph_doc_clears],
-        };
-        deinitDerivedBatch(alloc, &tmp);
+        for (graph_doc_clears[0..initialized_graph_doc_clears]) |clear|
+            deinitDerivedGraphDocClear(alloc, clear);
+        if (graph_doc_clears.len > 0) alloc.free(graph_doc_clears);
     }
     for (batch.graph_doc_clears, 0..) |clear, i| {
-        var index_names = try alloc.alloc([]const u8, clear.index_names.len);
-        for (clear.index_names, 0..) |index_name, j| {
-            index_names[j] = try alloc.dupe(u8, index_name);
-        }
-        graph_doc_clears[i] = .{
-            .key = try alloc.dupe(u8, clear.key),
-            .index_names = index_names,
-        };
+        graph_doc_clears[i] = try cloneDerivedGraphDocClear(alloc, clear);
         initialized_graph_doc_clears += 1;
     }
 
     var dense_embeddings = try alloc.alloc(DerivedDenseEmbeddingWrite, batch.dense_embeddings.len);
     var initialized_dense: usize = 0;
     errdefer {
-        var tmp = DerivedBatch{
-            .dense_embeddings = dense_embeddings[0..initialized_dense],
-        };
-        deinitDerivedBatch(alloc, &tmp);
+        for (dense_embeddings[0..initialized_dense]) |embedding|
+            deinitDerivedDenseEmbedding(alloc, embedding);
+        if (dense_embeddings.len > 0) alloc.free(dense_embeddings);
     }
     for (batch.dense_embeddings, 0..) |embedding, i| {
-        dense_embeddings[i] = .{
-            .index_name = try alloc.dupe(u8, embedding.index_name),
-            .parent_doc_key = if (embedding.parent_doc_key) |parent_doc_key| try alloc.dupe(u8, parent_doc_key) else null,
-            .doc_key = try alloc.dupe(u8, embedding.doc_key),
-            .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-            .vector = try alloc.dupe(f32, embedding.vector),
-        };
+        dense_embeddings[i] = try cloneDerivedDenseEmbedding(alloc, embedding);
         initialized_dense += 1;
     }
 
     var sparse_embeddings = try alloc.alloc(DerivedSparseEmbeddingWrite, batch.sparse_embeddings.len);
     var initialized_sparse: usize = 0;
     errdefer {
-        var tmp = DerivedBatch{
-            .sparse_embeddings = sparse_embeddings[0..initialized_sparse],
-        };
-        deinitDerivedBatch(alloc, &tmp);
+        for (sparse_embeddings[0..initialized_sparse]) |embedding|
+            deinitDerivedSparseEmbedding(alloc, embedding);
+        if (sparse_embeddings.len > 0) alloc.free(sparse_embeddings);
     }
     for (batch.sparse_embeddings, 0..) |embedding, i| {
-        sparse_embeddings[i] = .{
-            .index_name = try alloc.dupe(u8, embedding.index_name),
-            .doc_key = try alloc.dupe(u8, embedding.doc_key),
-            .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-            .indices = try alloc.dupe(u32, embedding.indices),
-            .values = try alloc.dupe(f32, embedding.values),
-        };
+        sparse_embeddings[i] = try cloneDerivedSparseEmbedding(alloc, embedding);
         initialized_sparse += 1;
     }
 
@@ -286,43 +396,24 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
     var graph_writes = try alloc.alloc(types.GraphEdgeWrite, batch.graph_writes.len);
     var initialized_graph_writes: usize = 0;
     errdefer {
-        var tmp = DerivedBatch{
-            .graph_writes = graph_writes[0..initialized_graph_writes],
-        };
-        deinitDerivedBatch(alloc, &tmp);
+        for (graph_writes[0..initialized_graph_writes]) |write|
+            deinitDerivedGraphWrite(alloc, write);
+        if (graph_writes.len > 0) alloc.free(graph_writes);
     }
     for (batch.graph_writes, 0..) |write, i| {
-        graph_writes[i] = .{
-            .index_name = try alloc.dupe(u8, write.index_name),
-            .source = try alloc.dupe(u8, write.source),
-            .target = try alloc.dupe(u8, write.target),
-            .edge_type = try alloc.dupe(u8, write.edge_type),
-            .weight = write.weight,
-            .created_at = write.created_at,
-            .updated_at = write.updated_at,
-            .metadata_json = if (write.metadata_json.len > 0)
-                try alloc.dupe(u8, write.metadata_json)
-            else
-                "",
-        };
+        graph_writes[i] = try cloneDerivedGraphWrite(alloc, write);
         initialized_graph_writes += 1;
     }
 
     var graph_deletes = try alloc.alloc(types.GraphEdgeDelete, batch.graph_deletes.len);
     var initialized_graph_deletes: usize = 0;
     errdefer {
-        var tmp = DerivedBatch{
-            .graph_deletes = graph_deletes[0..initialized_graph_deletes],
-        };
-        deinitDerivedBatch(alloc, &tmp);
+        for (graph_deletes[0..initialized_graph_deletes]) |delete|
+            deinitDerivedGraphDelete(alloc, delete);
+        if (graph_deletes.len > 0) alloc.free(graph_deletes);
     }
     for (batch.graph_deletes, 0..) |delete, i| {
-        graph_deletes[i] = .{
-            .index_name = try alloc.dupe(u8, delete.index_name),
-            .source = try alloc.dupe(u8, delete.source),
-            .target = try alloc.dupe(u8, delete.target),
-            .edge_type = try alloc.dupe(u8, delete.edge_type),
-        };
+        graph_deletes[i] = try cloneDerivedGraphDelete(alloc, delete);
         initialized_graph_deletes += 1;
     }
 
@@ -883,4 +974,88 @@ test "derived batch deinit tolerates artifact-backed empty payload slices" {
         .sparse_embeddings = sparse,
     };
     deinitDerivedBatch(alloc, &batch);
+}
+
+test "derived batch clone releases every partial allocation" {
+    const source: DerivedBatch = .{
+        .sequence = 19,
+        .documents = &.{
+            .{
+                .key = "doc:a",
+                .cleaned_value = "{\"body\":\"alpha\"}",
+                .targets = &.{
+                    .{ .kind = .full_text, .index_name = "full_text_index_v0" },
+                    .{ .kind = .dense_vector, .index_name = "dense_v1" },
+                },
+            },
+            .{
+                .key = "doc:b",
+                .action = .preserve_base_document,
+            },
+        },
+        .deleted_keys = &.{ "doc:deleted-a", "doc:deleted-b" },
+        .overwritten_doc_keys = &.{"doc:overwritten"},
+        .changed_artifact_keys = &.{"artifact:changed"},
+        .graph_doc_clears = &.{
+            .{ .key = "doc:a", .index_names = &.{ "graph_v1", "graph_v2" } },
+        },
+        .dense_embeddings = &.{
+            .{
+                .index_name = "dense_v1",
+                .parent_doc_key = "doc:a",
+                .doc_key = "chunk:a:0",
+                .artifact_key = "artifact:dense:a:0",
+                .vector = &.{ 1.0, 2.0, 3.0 },
+            },
+        },
+        .sparse_embeddings = &.{
+            .{
+                .index_name = "sparse_v1",
+                .doc_key = "chunk:a:0",
+                .artifact_key = "artifact:sparse:a:0",
+                .indices = &.{ 2, 9 },
+                .values = &.{ 0.25, 0.75 },
+            },
+        },
+        .generated_enrichment_refs = &.{
+            .{
+                .kind = .dense_embedding,
+                .index_name = "dense_v1",
+                .artifact_name = "chunks_v1",
+                .embedding_name = "embedding_v1",
+                .doc_key = "doc:a",
+            },
+        },
+        .graph_writes = &.{
+            .{
+                .index_name = "graph_v1",
+                .source = "doc:a",
+                .target = "doc:b",
+                .edge_type = "related",
+                .metadata_json = "{\"score\":1}",
+            },
+        },
+        .graph_deletes = &.{
+            .{
+                .index_name = "graph_v1",
+                .source = "doc:b",
+                .target = "doc:c",
+                .edge_type = "stale",
+            },
+        },
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn run(alloc: Allocator, batch: DerivedBatch) !void {
+                var cloned = try cloneBatch(alloc, batch);
+                defer deinitDerivedBatch(alloc, &cloned);
+                try std.testing.expectEqual(batch.sequence, cloned.sequence);
+                try std.testing.expectEqual(batch.documents.len, cloned.documents.len);
+                try std.testing.expectEqual(batch.generated_enrichment_refs.len, cloned.generated_enrichment_refs.len);
+            }
+        }.run,
+        .{source},
+    );
 }

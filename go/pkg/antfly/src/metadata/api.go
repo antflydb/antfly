@@ -85,6 +85,10 @@ type TableApi struct {
 	foreignPool    *foreign.PoolManager
 	prunerCache    sync.Map // documentRenderer string → *ai.Pruner
 	baseIndexCache sync.Map // baseIndexPlanKey (uint64) → *indexes.BaseShardIndexPlan
+
+	backupTransferOnce sync.Once
+	backupTransfers    chan struct{}
+	backupMaintenance  sync.Map // repository identity -> struct{}
 }
 type ClusterApi struct {
 	ln     *MetadataStore
@@ -195,7 +199,7 @@ func (ca *ClusterApi) clusterStatus() (ClusterStatus, map[string]any) {
 			health = ClusterHealthDegraded
 			message = fmt.Sprintf("shard %s is in a transition state", id)
 		}
-		if !ca.ln.config.SwarmMode {
+		if !ca.ln.config.IsStandalone() {
 
 			if status.RaftStatus == nil {
 				health = ClusterHealthDegraded
@@ -233,10 +237,10 @@ func (ca *ClusterApi) clusterStatus() (ClusterStatus, map[string]any) {
 	}
 	authEnabled := ca.ln.config.EnableAuth
 	status := ClusterStatus{
-		Health:      health,
-		Message:     message,
-		AuthEnabled: authEnabled,
-		SwarmMode:   ca.ln.config.SwarmMode,
+		Health:         health,
+		Message:        message,
+		AuthEnabled:    authEnabled,
+		DeploymentMode: ClusterStatusDeploymentMode(ca.ln.config.EffectiveDeploymentMode()),
 	}
 	legacyStatus := map[string]any{
 		"shards":        shards,
@@ -263,7 +267,7 @@ func (ca *ClusterApi) GetCluster(w http.ResponseWriter, r *http.Request) {
 		Health:               status.Health,
 		Message:              status.Message,
 		AuthEnabled:          status.AuthEnabled,
-		SwarmMode:            status.SwarmMode,
+		DeploymentMode:       ClusterTopologyDeploymentMode(status.DeploymentMode),
 		SecretStore:          status.SecretStore,
 		Data:                 ClusterDataStatus{},
 		AdditionalProperties: legacyStatus,
@@ -280,6 +284,38 @@ func (ca *ClusterApi) ListConnections(w http.ResponseWriter, r *http.Request, pa
 	if err := json.NewEncoder(w).Encode(ConnectionsResponse{Connections: []Connection{}}); err != nil {
 		ca.ln.logger.Warn("Failed to marshal connections", zap.Error(err))
 	}
+}
+
+func (ca *ClusterApi) InvokeInferenceConnection(
+	w http.ResponseWriter,
+	_ *http.Request,
+	_ string,
+	_ InvokeInferenceConnectionParamsOperation,
+) {
+	http.Error(
+		w,
+		"inference connection invocation is not supported by the Go metadata server",
+		http.StatusNotImplemented,
+	)
+}
+
+// Restore job orchestration is implemented by the Zig metadata service. The Go
+// server rejects these endpoints explicitly instead of reporting fabricated
+// progress for work it cannot schedule or observe.
+func (t *TableApi) ListRestoreJobs(
+	w http.ResponseWriter,
+	_ *http.Request,
+	_ ListRestoreJobsParams,
+) {
+	http.Error(w, "restore jobs are not supported by the Go metadata server", http.StatusNotImplemented)
+}
+
+func (t *TableApi) CancelRestoreJob(w http.ResponseWriter, _ *http.Request, _ string) {
+	http.Error(w, "restore jobs are not supported by the Go metadata server", http.StatusNotImplemented)
+}
+
+func (t *TableApi) GetRestoreJob(w http.ResponseWriter, _ *http.Request, _ string) {
+	http.Error(w, "restore jobs are not supported by the Go metadata server", http.StatusNotImplemented)
 }
 
 type wrapper struct {

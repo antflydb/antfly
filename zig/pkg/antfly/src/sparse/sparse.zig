@@ -29,7 +29,7 @@ const Allocator = std.mem.Allocator;
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const supports_native_sparse_lmdb = builtin.os.tag != .freestanding;
 const lmdb_backend = if (supports_native_sparse_lmdb) @import("../storage/lmdb_backend.zig") else struct {
     pub const Backend = struct {
@@ -1172,6 +1172,22 @@ pub const SparseIndex = struct {
             self.* = .none;
         }
 
+        fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
+            switch (self.*) {
+                .none => {},
+                .lmdb => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .mem => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .lsm => |*handle| handle.abandonAfterCrash(),
+            }
+            self.* = .none;
+        }
+
         fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
@@ -1384,6 +1400,12 @@ pub const SparseIndex = struct {
     pub fn close(self: *SparseIndex) void {
         self.store.deinit();
         self.owner.close(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn abandonAfterCrash(self: *SparseIndex) void {
+        self.store.deinit();
+        self.owner.abandonAfterCrash(self.alloc);
         self.* = undefined;
     }
 
@@ -4913,9 +4935,13 @@ test "sparse backend adapters expose txn cursor operations" {
         errdefer txn.abort();
         const encoded = std.mem.toBytes(@as(u64, 7));
         try txn.put("meta:next_doc_num", &encoded);
-        var cur = try txn.openCursor();
-        defer cur.close();
-        try std.testing.expectEqualStrings("meta:next_doc_num", (try cur.first()).?.key);
+        {
+            // Cursors must close before commit: committing with an open
+            // cursor fails closed with error.TransactionCursorActive.
+            var cur = try txn.openCursor();
+            defer cur.close();
+            try std.testing.expectEqualStrings("meta:next_doc_num", (try cur.first()).?.key);
+        }
         try txn.commit();
     }
 

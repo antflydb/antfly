@@ -94,7 +94,9 @@ from .cluster_restore_request_restore_mode import ClusterRestoreRequestRestoreMo
 from .cluster_restore_response import ClusterRestoreResponse
 from .cluster_restore_response_status import ClusterRestoreResponseStatus
 from .cluster_status import ClusterStatus
+from .cluster_status_deployment_mode import ClusterStatusDeploymentMode
 from .cluster_topology import ClusterTopology
+from .cluster_topology_deployment_mode import ClusterTopologyDeploymentMode
 from .cohere_embedder_config import CohereEmbedderConfig
 from .cohere_embedder_config_input_type import CohereEmbedderConfigInputType
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
@@ -120,6 +122,12 @@ from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_repair_backpressure_error import DenseRepairBackpressureError
+from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
+from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
+from .derived_coverage_policy import DerivedCoveragePolicy
+from .derived_coverage_status import DerivedCoverageStatus
+from .derived_coverage_status_policy import DerivedCoverageStatusPolicy
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
 from .distance_range import DistanceRange
@@ -162,8 +170,6 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-from .embeddings_index_stats_coverage import EmbeddingsIndexStatsCoverage
-from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
 from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
 from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
@@ -171,6 +177,7 @@ from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
+from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -188,6 +195,7 @@ from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
 from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
+from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -312,6 +320,9 @@ from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
+from .index_execution_config import IndexExecutionConfig
+from .index_repair_status import IndexRepairStatus
+from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
@@ -335,10 +346,14 @@ from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
+from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
 from .inference_embed_request_input_type import InferenceEmbedRequestInputType
 from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
+from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_item_error import InferenceEmbeddingItemError
+from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
@@ -346,6 +361,14 @@ from .inference_error import InferenceError
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
+from .inference_generate_batch_error import InferenceGenerateBatchError
+from .inference_generate_batch_mode import InferenceGenerateBatchMode
+from .inference_generate_batch_request import InferenceGenerateBatchRequest
+from .inference_generate_batch_request_item import InferenceGenerateBatchRequestItem
+from .inference_generate_batch_response import InferenceGenerateBatchResponse
+from .inference_generate_batch_response_object import InferenceGenerateBatchResponseObject
+from .inference_generate_batch_result_item import InferenceGenerateBatchResultItem
+from .inference_generate_batch_summary import InferenceGenerateBatchSummary
 from .inference_generate_choice import InferenceGenerateChoice
 from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLogprobsType0
 from .inference_generate_chunk import InferenceGenerateChunk
@@ -396,6 +419,8 @@ from .inference_predictor_task import InferencePredictorTask
 from .inference_predictors_response import InferencePredictorsResponse
 from .inference_predictors_response_object import InferencePredictorsResponseObject
 from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
+from .inference_prompt_cache_config import InferencePromptCacheConfig
+from .inference_prompt_cache_config_mode import InferencePromptCacheConfigMode
 from .inference_provider_type import InferenceProviderType
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
@@ -441,6 +466,9 @@ from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
 from .installed_extension_status import InstalledExtensionStatus
+from .invoke_inference_connection_body import InvokeInferenceConnectionBody
+from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
+from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -456,6 +484,8 @@ from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
+from .list_restore_jobs_phase import ListRestoreJobsPhase
+from .list_restore_jobs_scope import ListRestoreJobsScope
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
@@ -467,7 +497,6 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
-from .match_query_operator import MatchQueryOperator
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -569,6 +598,7 @@ from .relational_period import RelationalPeriod
 from .relational_period_range_type import RelationalPeriodRangeType
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
+from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
@@ -577,8 +607,17 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
+from .restore_job import RestoreJob
+from .restore_job_list import RestoreJobList
+from .restore_job_phase import RestoreJobPhase
+from .restore_job_result import RestoreJobResult
+from .restore_job_result_durability import RestoreJobResultDurability
+from .restore_job_result_failure_details_item import RestoreJobResultFailureDetailsItem
+from .restore_job_result_restore import RestoreJobResultRestore
+from .restore_job_result_status import RestoreJobResultStatus
+from .restore_job_scope import RestoreJobScope
 from .restore_namespace_table_response_202 import RestoreNamespaceTableResponse202
-from .restore_table_response_202 import RestoreTableResponse202
+from .restore_request import RestoreRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -696,6 +735,7 @@ from .rows_window_frame_unit import RowsWindowFrameUnit
 from .rows_window_plan_request import RowsWindowPlanRequest
 from .rows_window_request import RowsWindowRequest
 from .rows_window_spec import RowsWindowSpec
+from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
@@ -729,6 +769,9 @@ from .sse_step_progress import SSEStepProgress
 from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
+from .storage_maintenance_capabilities import StorageMaintenanceCapabilities
+from .storage_runtime_status import StorageRuntimeStatus
+from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
@@ -913,7 +956,9 @@ __all__ = (
     "ClusterRestoreResponse",
     "ClusterRestoreResponseStatus",
     "ClusterStatus",
+    "ClusterStatusDeploymentMode",
     "ClusterTopology",
+    "ClusterTopologyDeploymentMode",
     "CohereEmbedderConfig",
     "CohereEmbedderConfigInputType",
     "CohereEmbedderConfigTruncate",
@@ -939,6 +984,12 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseRepairBackpressureError",
+    "DenseRepairBackpressureErrorCode",
+    "DerivedCoverageObservationIncompleteReason",
+    "DerivedCoveragePolicy",
+    "DerivedCoverageStatus",
+    "DerivedCoverageStatusPolicy",
     "DisjunctionQuery",
     "DistanceMetric",
     "DistanceRange",
@@ -977,8 +1028,6 @@ __all__ = (
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
-    "EmbeddingsIndexStatsCoverage",
-    "EmbeddingsIndexStatsEnrichmentRuntime",
     "EmbeddingsIndexStatsHbcCache",
     "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
@@ -988,6 +1037,7 @@ __all__ = (
     "EmbeddingType3",
     "EnrichmentConfig",
     "EnrichmentKind",
+    "EnrichmentRuntimeStatus",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -1005,6 +1055,7 @@ __all__ = (
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExecuteGraphMetricActionAction",
+    "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
     "ExtensionObjectDecl",
@@ -1129,6 +1180,9 @@ __all__ = (
     "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
+    "IndexExecutionConfig",
+    "IndexRepairStatus",
+    "IndexRepairStatusState",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
@@ -1150,11 +1204,15 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingItemError",
+    "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",
     "InferenceEmbeddingObjectObject",
     "InferenceEmbeddingUsage",
     "InferenceEmbedRequest",
     "InferenceEmbedRequestEncodingFormat",
+    "InferenceEmbedRequestErrorPolicy",
     "InferenceEmbedRequestInputType",
     "InferenceEmbedRequestTaskType",
     "InferenceEmbedResponse",
@@ -1163,6 +1221,14 @@ __all__ = (
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
+    "InferenceGenerateBatchError",
+    "InferenceGenerateBatchMode",
+    "InferenceGenerateBatchRequest",
+    "InferenceGenerateBatchRequestItem",
+    "InferenceGenerateBatchResponse",
+    "InferenceGenerateBatchResponseObject",
+    "InferenceGenerateBatchResultItem",
+    "InferenceGenerateBatchSummary",
     "InferenceGenerateChoice",
     "InferenceGenerateChoiceLogprobsType0",
     "InferenceGenerateChunk",
@@ -1213,6 +1279,8 @@ __all__ = (
     "InferencePredictorTask",
     "InferencePredictRequest",
     "InferencePredictResponse",
+    "InferencePromptCacheConfig",
+    "InferencePromptCacheConfigMode",
     "InferenceProviderType",
     "InferenceReadObject",
     "InferenceReadObjectObject",
@@ -1258,6 +1326,9 @@ __all__ = (
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
     "InstallManifest",
+    "InvokeInferenceConnectionBody",
+    "InvokeInferenceConnectionOperation",
+    "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -1273,6 +1344,8 @@ __all__ = (
     "LinkupSearchConfigDepth",
     "LinkupSearchConfigOutputType",
     "ListDocumentArtifactManifestsDetail",
+    "ListRestoreJobsPhase",
+    "ListRestoreJobsScope",
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
@@ -1284,7 +1357,6 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
-    "MatchQueryOperator",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
@@ -1386,6 +1458,7 @@ __all__ = (
     "RelationalPeriodRangeType",
     "RepairIssueListRequest",
     "RepairRunRequest",
+    "RepairRunRequestControl",
     "RepairTarget",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
@@ -1394,8 +1467,17 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
+    "RestoreJob",
+    "RestoreJobList",
+    "RestoreJobPhase",
+    "RestoreJobResult",
+    "RestoreJobResultDurability",
+    "RestoreJobResultFailureDetailsItem",
+    "RestoreJobResultRestore",
+    "RestoreJobResultStatus",
+    "RestoreJobScope",
     "RestoreNamespaceTableResponse202",
-    "RestoreTableResponse202",
+    "RestoreRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",
@@ -1513,6 +1595,7 @@ __all__ = (
     "RowsWindowSpec",
     "RowUniqueSelector",
     "RowUniqueSelectorValues",
+    "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
     "SecretEntry",
@@ -1546,6 +1629,9 @@ __all__ = (
     "SSEStepStarted",
     "SSEToolMode",
     "SSEToolModeMode",
+    "StorageMaintenanceCapabilities",
+    "StorageRuntimeStatus",
+    "StorageRuntimeStatusEngine",
     "StorageStatus",
     "SuccessMessage",
     "SyncLevel",

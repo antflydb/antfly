@@ -152,6 +152,11 @@ pub const SegmentInfo = struct {
 pub const MergeOutputOptions = struct {
     target_segment_bytes: usize = 256 * 1024 * 1024,
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
+    /// Optional task-owned deletion view aligned with `segment_indices`.
+    /// Background merges use this to remain independent of later mutations to
+    /// the live segment bitmaps while the expensive merge runs without the
+    /// per-index apply mutex.
+    deleted_docs: ?[]const ?roaring.RoaringBitmap = null,
 };
 
 /// Merge multiple segments from the snapshot into one.
@@ -189,6 +194,9 @@ pub fn mergeSegmentsBounded(
     options: MergeOutputOptions,
 ) ![][]u8 {
     if (segment_indices.len == 0) return error.NoSegments;
+    if (options.deleted_docs) |deleted_docs| {
+        if (deleted_docs.len != segment_indices.len) return error.InvalidDeletionSnapshot;
+    }
 
     var inputs = try alloc.alloc(segment_mod.MergeInput, segment_indices.len);
     defer alloc.free(inputs);
@@ -199,7 +207,7 @@ pub fn mergeSegmentsBounded(
         total_input_bytes += seg.data.bytes().len;
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = seg.shared.deleted,
+            .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else seg.shared.deleted,
         };
     }
     const common_index_sort = if (options.index_sort.len == 0)
@@ -476,8 +484,8 @@ test "merge preserves common sorted segment index_sort metadata" {
 
     var reader = try segment_mod.SegmentReader.init(alloc, merged);
     defer reader.deinit();
-    try std.testing.expectEqualStrings("doc:a", reader.storedDoc(0).?.id);
-    try std.testing.expectEqualStrings("doc:c", reader.storedDoc(1).?.id);
+    try std.testing.expectEqualStrings("doc:a", (try reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:c", (try reader.storedDoc(1)).?.id);
 
     const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
     defer segment_mod.freeIndexSortFields(alloc, fields);
@@ -702,7 +710,7 @@ test "merge direct-copies single-source field sections when eligible" {
     } });
 
     const snap = writer.snapshot();
-    const original_title = snap.segments[0].reader.getSection("title", .inverted_text).?;
+    const original_title = (try snap.segments[0].reader.getSection("title", .inverted_text)).?;
 
     const merged = try mergeSegments(alloc, snap, &.{ 0, 1 });
     defer alloc.free(merged);
@@ -710,12 +718,12 @@ test "merge direct-copies single-source field sections when eligible" {
     var merged_reader = try segment_mod.SegmentReader.init(alloc, merged);
     defer merged_reader.deinit();
 
-    const merged_title = merged_reader.getSection("title", .inverted_text).?;
+    const merged_title = (try merged_reader.getSection("title", .inverted_text)).?;
     try std.testing.expectEqualStrings(original_title, merged_title);
 
-    const stored0 = (try merged_reader.storedDocDecompressed(0)).?;
+    const stored0 = (try merged_reader.storedDocDecompressed(alloc, 0)).?;
     defer alloc.free(stored0.data);
-    const stored1 = (try merged_reader.storedDocDecompressed(1)).?;
+    const stored1 = (try merged_reader.storedDocDecompressed(alloc, 1)).?;
     defer alloc.free(stored1.data);
 
     try std.testing.expectEqualStrings("title-doc", stored0.id);
@@ -759,11 +767,11 @@ test "merge mapper-built multi-field text segments" {
     try std.testing.expectEqual(@as(u32, 2), alpha.docFreq());
     try std.testing.expectEqual(@as(u32, 2), beta.docFreq());
 
-    const doc0 = (try reader.storedDocDecompressed(0)).?;
+    const doc0 = (try reader.storedDocDecompressed(alloc, 0)).?;
     defer alloc.free(doc0.data);
-    const doc1 = (try reader.storedDocDecompressed(1)).?;
+    const doc1 = (try reader.storedDocDecompressed(alloc, 1)).?;
     defer alloc.free(doc1.data);
-    const doc2 = (try reader.storedDocDecompressed(2)).?;
+    const doc2 = (try reader.storedDocDecompressed(alloc, 2)).?;
     defer alloc.free(doc2.data);
 
     try std.testing.expectEqualStrings("doc1", doc0.id);
@@ -811,17 +819,17 @@ test "merge mapper-built segments preserves typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, merged);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(@as(?f64, 10.0), try price_reader.getF64(0));
     try std.testing.expectEqual(@as(?f64, 20.0), try price_reader.getF64(1));
 
-    const ts_section = reader.getSection("published_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("published_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expect((try ts_reader.getU64(0)) != null);
     try std.testing.expect((try ts_reader.getU64(1)) != null);
 
-    const geo_section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const geo_section = (try reader.getSection("location", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var geo_reader = try typed_dv.TypedDocValuesReader.init(alloc, geo_section);
     try std.testing.expect((try geo_reader.getGeoPoint(0)) != null);
     try std.testing.expect((try geo_reader.getGeoPoint(1)) != null);

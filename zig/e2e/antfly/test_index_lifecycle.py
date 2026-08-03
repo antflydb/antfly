@@ -39,6 +39,18 @@ def _response_hit_ids(result: dict) -> list[str]:
     return [hit.get("_id") for hit in responses[0].get("hits", {}).get("hits", [])]
 
 
+def test_missing_table_index_list_fails_without_status_retry_delay(stateful_api):
+    started = time.monotonic()
+    response = stateful_api.s.get(
+        f"{stateful_api.url}/tables/missing-{time.time_ns()}/indexes",
+        timeout=5,
+    )
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 404
+    assert elapsed < 2.0
+
+
 def _index_names(index_list: list[dict]) -> set[str]:
     return {entry["config"]["name"] for entry in index_list}
 
@@ -149,15 +161,52 @@ def _pack_f32_le(values: list[float]) -> str:
 
 def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
     try:
-        stats = _index_stats(stateful_api.get_index(table_name, index_name))
+        index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    if stats.get("rebuilding", stats.get("backfill_active", False)):
+    stats = ready_index_status(index_info, require_query_fresh=True)
+    if stats is None:
         return None
     total_indexed = stats.get("total_indexed", stats.get("doc_count", 0))
     if total_indexed < expected_docs:
         return None
     return stats
+
+
+def test_ready_index_status_requires_current_coverage_observation():
+    ready_status = {
+        "status": {
+            "rebuilding": False,
+            "dense_publish_pending": False,
+            "replay_catch_up_required": False,
+            "catch_up_active": False,
+            "coverage": {
+                "observation_complete": True,
+                "config_mismatch_group_count": 0,
+            },
+        }
+    }
+    assert ready_index_status(ready_status) is ready_status["status"]
+
+    stale_incarnation = json.loads(json.dumps(ready_status))
+    stale_incarnation["status"]["coverage"]["observation_complete"] = False
+    stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
+    assert ready_index_status(stale_incarnation) is None
+
+    rebuilding = json.loads(json.dumps(ready_status))
+    rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
+    assert ready_index_status(rebuilding) is None
+
+    for field, value in (
+        ("error", "load failed: UnsupportedVersion"),
+        ("backfill_state", "failed"),
+        ("repair_degraded", True),
+        ("repair_summary_ready", False),
+        ("repair_issue_count", 1),
+    ):
+        terminal = json.loads(json.dumps(ready_status))
+        terminal["status"][field] = value
+        assert ready_index_status(terminal) is None
 
 
 def _retrying_partial_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
@@ -485,7 +534,7 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
         timeout_s=30.0,
         interval_s=0.5,
     )
-    assert ready is not None
+    assert ready is not None, json.dumps(stateful_api.get_index(table_name, index_name), indent=2, sort_keys=True)
 
     result = wait_until(
         lambda: (
@@ -514,6 +563,95 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
 
     hits = result["responses"][0]["hits"]["hits"]
     assert hits[0]["_id"] == "doc:a"
+
+
+def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
+    stateful_api,
+    openai_embedder,
+):
+    """A field-less write tail must not leave public replay status idle-behind."""
+    table_name = f"stateful_managed_embeddings_replay_tail_{time.time_ns()}"
+    index_name = "semantic_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "embeddings",
+                "field": "semantic_content",
+                "dimension": 3,
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": openai_embedder,
+                },
+            },
+        )
+        == {}
+    )
+    assert wait_until(
+        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        timeout_s=10.0,
+        interval_s=0.1,
+    )
+
+    semantic_batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            f"doc:{i}": {
+                "content": f"semantic document {i}",
+                "semantic_content": f"unique semantic payload {i}",
+            }
+            for i in range(6)
+        },
+        sync_level="write",
+    )
+    assert semantic_batch["inserted"] == 6
+
+    # End the burst with committed records that have no work for this index.
+    # The test intentionally issues no later write or explicit catch-up request.
+    plain_batch = stateful_api.batch_write(
+        table_name,
+        inserts={f"plain:{i}": {"content": f"plain trailing document {i}"} for i in range(3)},
+        sync_level="write",
+    )
+    assert plain_batch["inserted"] == 3
+
+    latest_status: dict | None = None
+
+    def converged_replay_status() -> dict | None:
+        nonlocal latest_status
+        latest_status = _index_stats(stateful_api.get_index(table_name, index_name))
+        applied = int(latest_status.get("replay_applied_sequence", 0))
+        target = int(latest_status.get("replay_target_sequence", 0))
+        indexed = int(latest_status.get("total_indexed", latest_status.get("doc_count", 0)))
+        if (
+            indexed < 6
+            or applied < target
+            or latest_status.get("replay_catch_up_required") is not False
+            or latest_status.get("catch_up_active") is not False
+            or latest_status.get("catch_up_phase") != "idle"
+        ):
+            return None
+        return latest_status
+
+    converged = wait_until(converged_replay_status, timeout_s=12.0, interval_s=0.1)
+    assert converged is not None, json.dumps(latest_status, indent=2, sort_keys=True)
+
+    # The default strict policy still reports the three field-less documents as
+    # coverage debt. It must not rewrite the authoritative replay ledger into
+    # fake replay debt or imply that a worker is still active.
+    coverage = converged["coverage"]
+    assert coverage["policy"] == "strict"
+    assert coverage["complete"] is False
+    assert coverage["pending"] >= 3
+    assert converged["backfill_active"] is True
+    assert converged["rebuilding"] is True
 
 
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited_enrichment(
@@ -626,6 +764,124 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     assert beta_hits[0]["_id"] == "doc:b"
 
 
+def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
+    single_item_enrichment_batches,
+    stateful_api,
+    rate_limited_openai_embedder,
+):
+    hot_tables = [f"stateful_drop_pending_{time.time_ns()}_{i}" for i in range(3)]
+    survivor = f"stateful_drop_survivor_{time.time_ns()}"
+    created_tables = {*hot_tables, survivor}
+    index_name = "semantic_idx"
+    index_payload = {
+        "name": index_name,
+        "type": "embeddings",
+        "field": "body",
+        "dimension": 3,
+        "embedder": {
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "url": rate_limited_openai_embedder.url,
+        },
+    }
+
+    try:
+        for table_name in [*hot_tables, survivor]:
+            created = stateful_api.create_table(table_name, num_shards=1)
+            assert created["name"] == table_name
+        rate_limited_openai_embedder.allow_all_requests()
+        for table_name in hot_tables:
+            assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+            assert wait_until(
+                lambda table_name=table_name: ready_index_status(
+                    stateful_api.get_index(table_name, index_name)
+                ),
+                timeout_s=30.0,
+                interval_s=0.1,
+            )
+        rate_limited_openai_embedder.deny_requests()
+
+        docs = {
+            f"doc:{i:02d}": {
+                "title": f"pending document {i}",
+                "body": f"rate limited semantic payload {i}",
+            }
+            for i in range(24)
+        }
+        for table_name in hot_tables:
+            batch = stateful_api.batch_write(
+                table_name,
+                inserts=docs,
+                sync_level="write",
+            )
+            assert batch["inserted"] == len(docs)
+
+        pending_statuses: dict[str, dict] = {}
+
+        def pending_work_observed() -> dict | None:
+            stats = rate_limited_openai_embedder.stats()
+            for table_name in hot_tables:
+                try:
+                    detail = stateful_api.get_index(table_name, index_name)
+                except requests.RequestException:
+                    continue
+                pending_statuses[table_name] = detail
+            if stats["rate_limited_requests"] == 0 or len(pending_statuses) != len(hot_tables):
+                return None
+            if not all(
+                int(detail.get("status", {}).get("coverage", {}).get("pending", 0)) > 0
+                for detail in pending_statuses.values()
+            ):
+                return None
+            return {"embedder": stats, "indexes": pending_statuses.copy()}
+
+        observed = wait_until(
+            pending_work_observed,
+            timeout_s=30.0,
+            interval_s=0.1,
+        )
+        assert observed is not None, json.dumps(
+            {
+                "embedder": rate_limited_openai_embedder.stats(),
+                "indexes": pending_statuses,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+        for table_name in hot_tables:
+            stateful_api.delete_table(table_name)
+
+        def dropped_tables_are_absent() -> dict | None:
+            try:
+                names = {table["name"] for table in stateful_api.get("/tables")}
+            except requests.RequestException:
+                return None
+            return {"tables": names} if not names.intersection(hot_tables) else None
+
+        assert wait_until(
+            dropped_tables_are_absent,
+            timeout_s=30.0,
+            interval_s=0.1,
+        )
+
+        survivor_batch = stateful_api.batch_write(
+            survivor,
+            inserts={"doc:survivor": {"title": "survivor remains writable"}},
+            sync_level="write",
+        )
+        assert survivor_batch["inserted"] == 1
+        survivor_doc = stateful_api.lookup_key(survivor, "doc:survivor")
+        assert survivor_doc["title"] == "survivor remains writable"
+    finally:
+        rate_limited_openai_embedder.allow_all_requests()
+        for table_name in sorted(created_tables):
+            try:
+                stateful_api.delete_table(table_name)
+            except requests.RequestException:
+                pass
+
+
 def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrichment_without_recreate(
     single_item_enrichment_batches,
     stateful_api,
@@ -723,6 +979,94 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
     assert _response_hit_ids(alpha_query)[0] == "doc:a"
 
 
+def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
+    single_item_enrichment_batches,
+    stateful_api,
+    rate_limited_openai_embedder,
+):
+    table_name = f"stateful_restart_managed_embeddings_{time.time_ns()}"
+    index_name = "semantic_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "embeddings",
+                "field": "body",
+                "dimension": 3,
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": rate_limited_openai_embedder.url,
+                },
+            },
+        )
+        == {}
+    )
+    assert wait_until(
+        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
+
+    documents = {
+        f"doc:{i:03d}": {
+            "title": f"restart document {i}",
+            "body": "alpha concept overview" if i == 0 else f"managed restart payload {i}",
+        }
+        for i in range(24)
+    }
+    batch = stateful_api.batch_write(table_name, inserts=documents, sync_level="write")
+    assert batch["inserted"] == len(documents)
+    assert wait_until(
+        lambda: (
+            stats
+            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"] > 0
+            and stats["successful_requests"] >= 1
+            else None
+        ),
+        timeout_s=30.0,
+        interval_s=0.1,
+    )
+
+    stateful_api.pause_server()
+    rate_limited_before_restart = rate_limited_openai_embedder.stats()["rate_limited_requests"]
+    stateful_api.resume_server()
+    rate_limited_during_restart = (
+        rate_limited_openai_embedder.stats()["rate_limited_requests"] - rate_limited_before_restart
+    )
+    assert rate_limited_during_restart <= 12
+    rate_limited_openai_embedder.allow_all_requests()
+
+    recovered = wait_until(
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=len(documents)),
+        timeout_s=90.0,
+        interval_s=0.25,
+    )
+    assert recovered is not None, json.dumps(
+        {
+            "index": stateful_api.get_index(table_name, index_name),
+            "embedder": rate_limited_openai_embedder.stats(),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+    query = stateful_api.query_table(
+        table_name,
+        {
+            "embeddings": {index_name: [1.0, 0.0, 0.0]},
+            "indexes": [index_name],
+            "limit": 3,
+        },
+    )
+    assert _response_hit_ids(query)[0] == "doc:000"
+
+
 def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_after_rate_limit(
     single_item_enrichment_batches,
     stateful_api,
@@ -792,7 +1136,10 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert partial["backfill_state"] == "retrying"
     assert partial["backfill_active"] is True
     assert partial["backfill_progress"] < 1.0
-    assert partial["replay_applied_sequence"] < partial["replay_target_sequence"]
+    # Replay and managed enrichment coverage are independent axes. The write
+    # log may be fully consumed while retryable provider work still leaves the
+    # derived index partially covered.
+    assert partial["replay_applied_sequence"] <= partial["replay_target_sequence"]
 
     enrichment = partial["enrichment_runtime"]
     assert enrichment["error_count"] >= 1
@@ -908,7 +1255,10 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         }
         assert stateful_api.create_index(table_name, index_name, index_payload) == {}
         assert wait_until(
-            lambda table_name=table_name: ready_index_status(stateful_api.get_index(table_name, index_name)),
+            lambda table_name=table_name: ready_index_status(
+                stateful_api.get_index(table_name, index_name),
+                require_query_fresh=True,
+            ),
             timeout_s=30.0,
             interval_s=0.5,
         )
@@ -943,9 +1293,37 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         interval_s=0.5,
     )
     def shared_pacing_debug() -> dict:
+        status_keys = (
+            "backfill_active",
+            "backfill_progress",
+            "backfill_state",
+            "rebuilding",
+            "total_indexed",
+            "source_doc_count",
+            "replay_applied_sequence",
+            "replay_target_sequence",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_generation",
+            "runtime_source",
+            "runtime_freshness",
+            "coverage",
+        )
+
+        def index_status(table_name: str) -> dict:
+            info = stateful_api.get_index(table_name, index_name)
+            aggregate = info.get("status", {})
+            shards = info.get("shard_status", {})
+            return {
+                "status": {key: aggregate.get(key) for key in status_keys if key in aggregate},
+                "shards": {
+                    group_id: {key: shard.get(key) for key in status_keys if key in shard}
+                    for group_id, shard in shards.items()
+                },
+            }
+
         def query(table_name: str) -> dict:
             try:
-                return stateful_api.query_table(
+                response = stateful_api.query_table(
                     table_name,
                     {
                         "embeddings": {
@@ -955,12 +1333,14 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
                         "limit": 3,
                     },
                 )
+                hits = response.get("responses", [{}])[0].get("hits", {}).get("hits", [])
+                return {"ids": [hit.get("_id") for hit in hits]}
             except Exception as exc:  # pragma: no cover - failure diagnostics only
                 return {"error": repr(exc)}
 
         return {
-            "first_index": stateful_api.get_index(first_table, index_name),
-            "second_index": stateful_api.get_index(second_table, index_name),
+            "first_index": index_status(first_table),
+            "second_index": index_status(second_table),
             "first_query": query(first_table),
             "second_query": query(second_table),
             "embedder": strict_pacing_sensitive_openai_embedder.stats(),
@@ -1735,7 +2115,7 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or 2
-    ready = _wait_for_serverless_build_status(
+    _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (
@@ -1852,7 +2232,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     )
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = _wait_for_serverless_build_status(
+    _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (
@@ -2073,7 +2453,7 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = _wait_for_serverless_build_status(
+    _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (

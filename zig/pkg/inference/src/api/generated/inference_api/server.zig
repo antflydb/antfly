@@ -37,6 +37,11 @@ pub fn parseGenerateContentBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for generateBatchContent.
+pub fn parseGenerateBatchContentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GenerateBatchRequest) {
+    return std.json.parseFromSlice(types.GenerateBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for predict.
 pub fn parsePredictBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.PredictRequest) {
     return std.json.parseFromSlice(types.PredictRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -81,6 +86,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding" },
     .{ .method = "POST", .path = "/extract", .operation_id = "extract" },
     .{ .method = "POST", .path = "/generate", .operation_id = "generateContent" },
+    .{ .method = "POST", .path = "/generate/batch", .operation_id = "generateBatchContent" },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels" },
     .{ .method = "POST", .path = "/predict", .operation_id = "predict" },
     .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors" },
@@ -108,6 +114,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
         if (!@hasDecl(Impl, "generateContent")) @compileError("ServerRouter: Impl missing required method 'generateContent'");
+        if (!@hasDecl(Impl, "generateBatchContent")) @compileError("ServerRouter: Impl missing required method 'generateBatchContent'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
         if (!@hasDecl(Impl, "listPredictors")) @compileError("ServerRouter: Impl missing required method 'listPredictors'");
@@ -136,6 +143,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/embeddings", createEmbedding);
             try server.post("/extract", extract);
             try server.post("/generate", generateContent);
+            try server.post("/generate/batch", generateBatchContent);
             try server.get("/models", listModels);
             try server.post("/predict", predict);
             try server.get("/predictors", listPredictors);
@@ -186,6 +194,13 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn generateContent(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.generateContent(ctx);
+        }
+
+        /// Generate text for a synchronous batch of requests
+        /// POST /generate/batch
+        fn generateBatchContent(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.generateBatchContent(ctx);
         }
 
         /// List available models
@@ -254,6 +269,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn generateBatchContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listPredictors(self: *Impl, ctx: *httpx.Context) !httpx.Response

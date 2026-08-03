@@ -13,8 +13,10 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const fs_paths = @import("../../common/fs_paths.zig");
+const background_runtime_mod = @import("../background_runtime.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
@@ -23,10 +25,14 @@ const artifact_replay = @import("artifact_replay.zig");
 const db_config = @import("config.zig");
 const db_core = @import("core.zig");
 const db_internal = @import("internal.zig");
+const derived_async = @import("derived_async.zig");
 const doc_identity = @import("doc_identity.zig");
+const generation_lifecycle = @import("generation_lifecycle.zig");
 const mapper = @import("document_mapper.zig");
 const apply_state = @import("derived/apply_state.zig");
 const range_state_mod = @import("range_state.zig");
+const range_cardinality = @import("range_cardinality.zig");
+const root_identity = @import("root_identity.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const types = @import("types.zig");
@@ -34,6 +40,7 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const DerivedCoverageOutcome = derived_async.DerivedCoverageOutcome;
 
 pub const ShadowState = struct {
     manager: *index_manager_mod.IndexManager,
@@ -48,6 +55,20 @@ const putLeakyJsonU64Field = db_internal.putLeakyJsonU64Field;
 
 const threadedIo = db_internal.threadedIo;
 
+fn loadOrCreateDurableRootIdentity(
+    alloc: Allocator,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    path: []const u8,
+) !root_identity.State {
+    if (backend_runtime) |runtime| {
+        if (runtime.io()) |io| return try root_identity.loadOrCreate(alloc, io, path);
+    }
+    if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
+}
+
 fn ensureDirPath(path: []const u8) !void {
     if (path.len == 0) return;
     var io_impl = threadedIo();
@@ -57,6 +78,14 @@ fn ensureDirPath(path: []const u8) !void {
 
 fn byteRangesEqual(a: types.ByteRange, b: types.ByteRange) bool {
     return std.mem.eql(u8, a.start, b.start) and std.mem.eql(u8, a.end, b.end);
+}
+
+fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_state_mod.SplitBootstrapMarker) bool {
+    return a.transition_id == b.transition_id and
+        a.attempt_epoch == b.attempt_epoch and
+        a.source_group_id == b.source_group_id and
+        a.destination_group_id == b.destination_group_id and
+        a.bootstrap_complete == b.bootstrap_complete;
 }
 
 fn documentRangeLowerAlloc(alloc: Allocator, raw_key: []const u8) ![]u8 {
@@ -229,6 +258,185 @@ fn copyIdentityMetadataToStore(
     const rows = try src_store.scanRange(alloc, range.lower[0..], range.upper[0..]);
     defer docstore_mod.DocStore.freeResults(alloc, rows);
     try putIdentityMetadataRows(alloc, dest_store, rows);
+}
+
+fn copyDerivedCoverageMetadataToStore(
+    alloc: Allocator,
+    src_store: *docstore_mod.DocStore,
+    dest_store: *docstore_mod.DocStore,
+) !void {
+    const lower = [_]u8{ internal_keys.replay_namespace, 0xff, internal_keys.derived_coverage_kind };
+    const upper = try internal_keys.nextPrefixAlloc(alloc, &lower);
+    defer if (upper) |key| alloc.free(key);
+
+    const CopyState = struct {
+        alloc: Allocator,
+        dest: *docstore_mod.DocStore,
+        writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+        owned: std.ArrayListUnmanaged(docstore_mod.OwnedKVPair) = .empty,
+
+        fn deinit(state: *@This()) void {
+            state.freeOwned();
+            state.writes.deinit(state.alloc);
+            state.owned.deinit(state.alloc);
+        }
+
+        fn freeOwned(state: *@This()) void {
+            for (state.owned.items) |item| {
+                state.alloc.free(item.key);
+                state.alloc.free(item.value);
+            }
+            state.owned.clearRetainingCapacity();
+        }
+
+        fn flush(state: *@This()) !void {
+            if (state.writes.items.len == 0) return;
+            try state.dest.putBatch(state.writes.items, &.{});
+            state.writes.clearRetainingCapacity();
+            state.freeOwned();
+        }
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const owned_key = try state.alloc.dupe(u8, key);
+            const owned_value = state.alloc.dupe(u8, value) catch |err| {
+                state.alloc.free(owned_key);
+                return err;
+            };
+            state.owned.append(state.alloc, .{ .key = owned_key, .value = owned_value }) catch |err| {
+                state.alloc.free(owned_key);
+                state.alloc.free(owned_value);
+                return err;
+            };
+            try state.writes.append(state.alloc, .{ .key = owned_key, .value = owned_value });
+            if (state.writes.items.len >= 8192) try state.flush();
+            return .@"continue";
+        }
+    };
+
+    var state = CopyState{ .alloc = alloc, .dest = dest_store };
+    defer state.deinit();
+    try src_store.scanWithContext(&lower, if (upper) |key| key else "", .{}, &state, CopyState.scanEntry);
+    try state.flush();
+}
+
+fn rebaseRangeCoverageMetadata(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    byte_range: types.ByteRange,
+    extra_writes: []const docstore_mod.KVPair,
+) !void {
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+    var seen_indexes = std.StringHashMapUnmanaged(void).empty;
+    defer seen_indexes.deinit(alloc);
+    try writes.appendSlice(alloc, extra_writes);
+
+    const append_index = struct {
+        fn run(
+            inner_alloc: Allocator,
+            inner_store: *docstore_mod.DocStore,
+            inner_manager: *index_manager_mod.IndexManager,
+            range: types.ByteRange,
+            index_name: []const u8,
+            seen: *std.StringHashMapUnmanaged(void),
+            out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            keys: *std.ArrayListUnmanaged([]u8),
+            values: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            const gop = try seen.getOrPut(inner_alloc, index_name);
+            if (gop.found_existing) return;
+            const generation = inner_manager.coverageGenerationForIndex(index_name) orelse return;
+            const prefix = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(inner_alloc, index_name, generation);
+            defer inner_alloc.free(prefix);
+            const upper = try internal_keys.nextPrefixAlloc(inner_alloc, prefix);
+            defer if (upper) |key| inner_alloc.free(key);
+
+            const ScanState = struct {
+                alloc: Allocator,
+                index_name: []const u8,
+                generation: u64,
+                byte_range: types.ByteRange,
+                counts: [std.meta.tags(DerivedCoverageOutcome).len]u64 =
+                    [_]u64{0} ** std.meta.tags(DerivedCoverageOutcome).len,
+
+                fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                    const doc_key = try internal_keys.derivedCoverageOutcomeDocKeyAlloc(
+                        state.alloc,
+                        state.index_name,
+                        state.generation,
+                        key,
+                    );
+                    defer state.alloc.free(doc_key);
+                    if (!state.byte_range.contains(doc_key)) return .@"continue";
+                    const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse
+                        return error.InvalidDerivedCoverageOutcome;
+                    const outcome_index = @intFromEnum(outcome);
+                    state.counts[outcome_index] = std.math.add(u64, state.counts[outcome_index], 1) catch
+                        return error.InvalidDerivedCoverageCounter;
+                    return .@"continue";
+                }
+            };
+
+            var state = ScanState{
+                .alloc = inner_alloc,
+                .index_name = index_name,
+                .generation = generation,
+                .byte_range = range,
+            };
+            try inner_store.scanWithContext(prefix, if (upper) |key| key else "", .{}, &state, ScanState.scanEntry);
+
+            inline for (std.meta.tags(DerivedCoverageOutcome), 0..) |outcome, i| {
+                const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(inner_alloc, index_name, generation, @tagName(outcome));
+                keys.append(inner_alloc, key) catch |err| {
+                    inner_alloc.free(key);
+                    return err;
+                };
+                const value = try inner_alloc.alloc(u8, 8);
+                std.mem.writeInt(u64, value[0..8], state.counts[i], .little);
+                values.append(inner_alloc, value) catch |err| {
+                    inner_alloc.free(value);
+                    return err;
+                };
+                try out.append(inner_alloc, .{ .key = key, .value = value });
+            }
+        }
+    }.run;
+
+    for (index_manager.dense_indexes.items) |entry| {
+        try append_index(alloc, store, index_manager, byte_range, entry.config.name, &seen_indexes, &writes, &owned_keys, &owned_values);
+    }
+    for (index_manager.sparse_indexes.items) |entry| {
+        try append_index(alloc, store, index_manager, byte_range, entry.config.name, &seen_indexes, &writes, &owned_keys, &owned_values);
+    }
+
+    const document_count = try range_cardinality.countPrimaryDocuments(alloc, store, byte_range);
+    const count_key = try alloc.dupe(u8, &internal_keys.range_document_count_key);
+    owned_keys.append(alloc, count_key) catch |err| {
+        alloc.free(count_key);
+        return err;
+    };
+    const count_value = try alloc.alloc(u8, 8);
+    std.mem.writeInt(u64, count_value[0..8], document_count, .little);
+    owned_values.append(alloc, count_value) catch |err| {
+        alloc.free(count_value);
+        return err;
+    };
+    try writes.append(alloc, .{ .key = count_key, .value = count_value });
+
+    try store.putBatch(writes.items, &.{});
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -692,6 +900,7 @@ pub fn deleteFileIfExists(io: Io, path: []const u8) !void {
 pub const RestoreState = struct {
     backup_id: []u8,
     location: []u8,
+    artifact_sha256: []u8,
     snapshot_path: []u8,
     group_id: u64,
     phase: []u8,
@@ -702,6 +911,7 @@ pub const RestoreState = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.backup_id);
         alloc.free(self.location);
+        alloc.free(self.artifact_sha256);
         alloc.free(self.snapshot_path);
         alloc.free(self.phase);
         alloc.free(self.last_error);
@@ -712,6 +922,33 @@ pub const RestoreState = struct {
 pub const RestoreIdentity = struct {
     backup_id: []const u8,
     location: []const u8,
+    artifact_sha256: []const u8,
+    snapshot_path: []const u8,
+    group_id: u64,
+};
+
+const restore_marker_format_version: u32 = 1;
+const max_restore_marker_bytes: usize = 64 * 1024;
+
+const RestoreStateDisk = struct {
+    format_version: u32 = restore_marker_format_version,
+    backup_id: []const u8,
+    location: []const u8,
+    artifact_sha256: []const u8,
+    snapshot_path: []const u8,
+    group_id: u64,
+    phase: []const u8,
+    primary_restored: bool,
+    runtime_repair_complete: bool,
+    last_error: []const u8,
+};
+
+const RestoreImportDisk = struct {
+    format_version: u32 = restore_marker_format_version,
+    snapshot_root: []const u8,
+    backup_id: []const u8,
+    location: []const u8,
+    artifact_sha256: []const u8,
     snapshot_path: []const u8,
     group_id: u64,
 };
@@ -720,6 +957,7 @@ pub fn restoreStateAlloc(
     alloc: Allocator,
     backup_id: []const u8,
     location: []const u8,
+    artifact_sha256: []const u8,
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -731,6 +969,8 @@ pub fn restoreStateAlloc(
     errdefer alloc.free(backup_id_owned);
     const location_owned = try alloc.dupe(u8, location);
     errdefer alloc.free(location_owned);
+    const artifact_sha256_owned = try alloc.dupe(u8, artifact_sha256);
+    errdefer alloc.free(artifact_sha256_owned);
     const snapshot_path_owned = try alloc.dupe(u8, snapshot_path);
     errdefer alloc.free(snapshot_path_owned);
     const phase_owned = try alloc.dupe(u8, phase);
@@ -741,6 +981,7 @@ pub fn restoreStateAlloc(
     return .{
         .backup_id = backup_id_owned,
         .location = location_owned,
+        .artifact_sha256 = artifact_sha256_owned,
         .snapshot_path = snapshot_path_owned,
         .group_id = group_id,
         .phase = phase_owned,
@@ -752,221 +993,523 @@ pub fn restoreStateAlloc(
 
 pub const RestoreImportState = struct {
     snapshot_root: []u8,
-    identity: ?RestoreState = null,
+    identity: RestoreState,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.snapshot_root);
-        if (self.identity) |*identity| identity.deinit(alloc);
+        self.identity.deinit(alloc);
         self.* = undefined;
     }
 };
 
-fn parseRestoreStateBool(value: []const u8) !bool {
-    if (std.mem.eql(u8, value, "1")) return true;
-    if (std.mem.eql(u8, value, "0")) return false;
-    return error.InvalidRestoreState;
+fn validRestoreArtifactSha256(value: []const u8) bool {
+    if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
+}
+
+fn validRestoreIdentity(identity: RestoreIdentity) bool {
+    return identity.backup_id.len > 0 and
+        identity.location.len > 0 and
+        validRestoreArtifactSha256(identity.artifact_sha256) and
+        identity.snapshot_path.len > 0 and
+        identity.group_id != 0;
+}
+
+fn writeRestoreMarkerAtomicWithIo(
+    alloc: Allocator,
+    io: Io,
+    root: []const u8,
+    path: []const u8,
+    raw: []const u8,
+) !void {
+    if (raw.len > max_restore_marker_bytes) return error.RestoreMarkerTooLarge;
+    var entropy: [8]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var writer_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &writer_buffer);
+        try writer.interface.writeAll(raw);
+        try writer.end();
+        try file.sync(io);
+    }
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, root);
 }
 
 pub fn readRestoreStateForPathAlloc(alloc: Allocator, path: []const u8) !?RestoreState {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try readRestoreStateForPathAllocWithIo(alloc, io_impl.io(), path);
+}
+
+pub fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreState {
     const state_path = try restoreStateMarkerPathAlloc(alloc, path);
     defer alloc.free(state_path);
 
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, state_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-
-    var backup_id: ?[]u8 = null;
-    errdefer if (backup_id) |value| alloc.free(value);
-    var location: ?[]u8 = null;
-    errdefer if (location) |value| alloc.free(value);
-    var snapshot_path: ?[]u8 = null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    var group_id: ?u64 = null;
-    var phase: ?[]u8 = null;
-    errdefer if (phase) |value| alloc.free(value);
-    var primary_restored: ?bool = null;
-    var runtime_repair_complete: ?bool = null;
-    var last_error: ?[]u8 = null;
-    errdefer if (last_error) |value| alloc.free(value);
-
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    const version = lines.next() orelse return error.InvalidRestoreState;
-    if (!std.mem.eql(u8, version, "restore_state_v2")) return error.InvalidRestoreState;
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidRestoreState;
-        const key = line[0..eq];
-        const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "backup_id")) {
-            if (backup_id) |old| alloc.free(old);
-            backup_id = null;
-            backup_id = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "location")) {
-            if (location) |old| alloc.free(old);
-            location = null;
-            location = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "snapshot_path")) {
-            if (snapshot_path) |old| alloc.free(old);
-            snapshot_path = null;
-            snapshot_path = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "group_id")) {
-            group_id = try std.fmt.parseInt(u64, value, 10);
-        } else if (std.mem.eql(u8, key, "phase")) {
-            if (phase) |old| alloc.free(old);
-            phase = null;
-            phase = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "primary_restored")) {
-            primary_restored = try parseRestoreStateBool(value);
-        } else if (std.mem.eql(u8, key, "runtime_repair_complete")) {
-            runtime_repair_complete = try parseRestoreStateBool(value);
-        } else if (std.mem.eql(u8, key, "last_error")) {
-            if (last_error) |old| alloc.free(old);
-            last_error = null;
-            last_error = try alloc.dupe(u8, value);
-        }
+    var parsed = std.json.parseFromSlice(RestoreStateDisk, alloc, raw, .{ .allocate = .alloc_always }) catch
+        return error.InvalidRestoreState;
+    defer parsed.deinit();
+    const disk = parsed.value;
+    if (disk.format_version != restore_marker_format_version or
+        disk.backup_id.len == 0 or
+        disk.location.len == 0 or
+        !validRestoreArtifactSha256(disk.artifact_sha256) or
+        disk.snapshot_path.len == 0 or
+        disk.group_id == 0 or
+        disk.phase.len == 0)
+    {
+        return error.InvalidRestoreState;
     }
-
-    if (backup_id == null) backup_id = try alloc.dupe(u8, "");
-    if (location == null) location = try alloc.dupe(u8, "");
-    if (snapshot_path == null) snapshot_path = try alloc.dupe(u8, "");
-    if (phase == null) phase = try alloc.dupe(u8, "accepted");
-    if (last_error == null) last_error = try alloc.dupe(u8, "");
-
-    return .{
-        .backup_id = backup_id.?,
-        .location = location.?,
-        .snapshot_path = snapshot_path.?,
-        .group_id = group_id orelse 0,
-        .phase = phase.?,
-        .primary_restored = primary_restored orelse false,
-        .runtime_repair_complete = runtime_repair_complete orelse false,
-        .last_error = last_error.?,
-    };
+    return try restoreStateAlloc(
+        alloc,
+        disk.backup_id,
+        disk.location,
+        disk.artifact_sha256,
+        disk.snapshot_path,
+        disk.group_id,
+        disk.phase,
+        disk.primary_restored,
+        disk.runtime_repair_complete,
+        disk.last_error,
+    );
 }
 
 pub fn writeRestoreStateForPath(alloc: Allocator, path: []const u8, state: RestoreState) !void {
-    try ensureDirPath(path);
-    const state_path = try restoreStateMarkerPathAlloc(alloc, path);
-    defer alloc.free(state_path);
-    const raw = try std.fmt.allocPrint(
-        alloc,
-        "restore_state_v2\nbackup_id={s}\nlocation={s}\nsnapshot_path={s}\ngroup_id={d}\nphase={s}\nprimary_restored={d}\nruntime_repair_complete={d}\nlast_error={s}\n",
-        .{
-            state.backup_id,
-            state.location,
-            state.snapshot_path,
-            state.group_id,
-            state.phase,
-            @as(u8, if (state.primary_restored) 1 else 0),
-            @as(u8, if (state.runtime_repair_complete) 1 else 0),
-            state.last_error,
-        },
-    );
-    defer alloc.free(raw);
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
-        .sub_path = state_path,
-        .data = raw,
-    });
+    return try writeRestoreStateForPathWithIo(alloc, io_impl.io(), path, state);
+}
+
+pub fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, state: RestoreState) !void {
+    if (!validRestoreIdentity(.{
+        .backup_id = state.backup_id,
+        .location = state.location,
+        .artifact_sha256 = state.artifact_sha256,
+        .snapshot_path = state.snapshot_path,
+        .group_id = state.group_id,
+    }) or state.phase.len == 0) return error.InvalidRestoreState;
+    try fs_paths.createDirPathPortable(io, path);
+    const state_path = try restoreStateMarkerPathAlloc(alloc, path);
+    defer alloc.free(state_path);
+    const raw = try std.json.Stringify.valueAlloc(alloc, RestoreStateDisk{
+        .backup_id = state.backup_id,
+        .location = state.location,
+        .artifact_sha256 = state.artifact_sha256,
+        .snapshot_path = state.snapshot_path,
+        .group_id = state.group_id,
+        .phase = state.phase,
+        .primary_restored = state.primary_restored,
+        .runtime_repair_complete = state.runtime_repair_complete,
+        .last_error = state.last_error,
+    }, .{});
+    defer alloc.free(raw);
+    try writeRestoreMarkerAtomicWithIo(alloc, io, path, state_path, raw);
 }
 
 pub fn readRestoreImportStateAlloc(alloc: Allocator, path: []const u8) !?RestoreImportState {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try readRestoreImportStateAllocWithIo(alloc, io_impl.io(), path);
+}
+
+pub fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreImportState {
     const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
     defer alloc.free(import_marker_path);
 
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), import_marker_path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, import_marker_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-
-    var snapshot_root: ?[]u8 = null;
-    errdefer if (snapshot_root) |value| alloc.free(value);
-    var backup_id: ?[]u8 = null;
-    errdefer if (backup_id) |value| alloc.free(value);
-    var location: ?[]u8 = null;
-    errdefer if (location) |value| alloc.free(value);
-    var snapshot_path: ?[]u8 = null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    var group_id: ?u64 = null;
-
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0 or std.mem.eql(u8, line, "restore_import_v1")) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidRestoreImportMarker;
-        const key = line[0..eq];
-        const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "snapshot_root")) {
-            if (snapshot_root) |old| alloc.free(old);
-            snapshot_root = null;
-            snapshot_root = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "backup_id")) {
-            if (backup_id) |old| alloc.free(old);
-            backup_id = null;
-            backup_id = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "location")) {
-            if (location) |old| alloc.free(old);
-            location = null;
-            location = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "snapshot_path")) {
-            if (snapshot_path) |old| alloc.free(old);
-            snapshot_path = null;
-            snapshot_path = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "group_id")) {
-            group_id = try std.fmt.parseInt(u64, value, 10);
-        }
+    var parsed = std.json.parseFromSlice(RestoreImportDisk, alloc, raw, .{ .allocate = .alloc_always }) catch
+        return error.InvalidRestoreImportMarker;
+    defer parsed.deinit();
+    const disk = parsed.value;
+    if (disk.format_version != restore_marker_format_version or
+        disk.snapshot_root.len == 0 or
+        disk.backup_id.len == 0 or
+        disk.location.len == 0 or
+        !validRestoreArtifactSha256(disk.artifact_sha256) or
+        disk.snapshot_path.len == 0 or
+        disk.group_id == 0)
+    {
+        return error.InvalidRestoreImportMarker;
     }
-
-    const root = snapshot_root orelse return error.InvalidRestoreImportMarker;
-    snapshot_root = null;
-    const identity = if (backup_id != null or location != null or snapshot_path != null or group_id != null) blk: {
-        const backup = backup_id orelse return error.InvalidRestoreImportMarker;
-        const loc = location orelse return error.InvalidRestoreImportMarker;
-        const snap = snapshot_path orelse return error.InvalidRestoreImportMarker;
-        const gid = group_id orelse return error.InvalidRestoreImportMarker;
-        backup_id = null;
-        location = null;
-        snapshot_path = null;
-        errdefer alloc.free(backup);
-        errdefer alloc.free(loc);
-        errdefer alloc.free(snap);
-        const phase = try alloc.dupe(u8, "runtime_repair");
-        errdefer alloc.free(phase);
-        const last_error = try alloc.dupe(u8, "");
-        errdefer alloc.free(last_error);
-        break :blk RestoreState{
-            .backup_id = backup,
-            .location = loc,
-            .snapshot_path = snap,
-            .group_id = gid,
-            .phase = phase,
-            .primary_restored = true,
-            .runtime_repair_complete = false,
-            .last_error = last_error,
-        };
-    } else null;
-
+    const snapshot_root = try alloc.dupe(u8, disk.snapshot_root);
+    errdefer alloc.free(snapshot_root);
+    const identity = try restoreStateAlloc(
+        alloc,
+        disk.backup_id,
+        disk.location,
+        disk.artifact_sha256,
+        disk.snapshot_path,
+        disk.group_id,
+        "runtime_repair",
+        true,
+        false,
+        "",
+    );
     return .{
-        .snapshot_root = root,
+        .snapshot_root = snapshot_root,
         .identity = identity,
     };
 }
 
 pub fn Impl(comptime DB: type) type {
     return struct {
+        pub fn getSplitBootstrapMarker(self: *DB, alloc: Allocator) !?range_state_mod.SplitBootstrapMarker {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try self.core.loadSplitBootstrapMarker(alloc);
+        }
+
+        pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.saveSplitBootstrapMarker(marker);
+        }
+
+        pub fn replaceRaftDocumentSnapshot(
+            self: *DB,
+            alloc: Allocator,
+            byte_range: types.ByteRange,
+            writes: []const types.BatchWrite,
+        ) !void {
+            db_internal.lockAtomicWithBackoff(&self.generation_replace_mutex);
+            defer self.generation_replace_mutex.unlock();
+            if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+                std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+            {
+                return error.InvalidAppliedDataRange;
+            }
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(alloc);
+            try seen.ensureTotalCapacity(alloc, @intCast(writes.len));
+            for (writes) |write| {
+                if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+                const result = try seen.getOrPut(alloc, write.key);
+                if (result.found_existing) return error.DuplicateDocumentKey;
+            }
+
+            const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+            defer alloc.free(lower);
+            const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidAppliedDataRange;
+            defer alloc.free(upper);
+            self.core.lockApplyShared();
+            const existing_documents = self.core.scanStoreRange(alloc, lower, upper) catch |err| {
+                self.core.unlockApplyShared();
+                return err;
+            };
+            self.core.unlockApplyShared();
+            defer docstore_mod.DocStore.freeResults(alloc, existing_documents);
+
+            var deletes = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (deletes.items) |key| alloc.free(key);
+                deletes.deinit(alloc);
+            }
+            for (existing_documents) |entry| {
+                const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+                if (seen.contains(logical_key)) {
+                    alloc.free(logical_key);
+                    continue;
+                }
+                errdefer alloc.free(logical_key);
+                try deletes.append(alloc, logical_key);
+            }
+
+            const range_value = try range_state_mod.encodeRangeAlloc(alloc, byte_range);
+            defer alloc.free(range_value);
+            const range_write: docstore_mod.KVPair = .{ .key = range_state_mod.range_key, .value = range_value };
+            try DB.WritePathCallbacks.batch_internal(self, .{
+                .writes = writes,
+                .deletes = deletes.items,
+                .sync_level = .write,
+            }, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_ha_write_gate = true,
+                .extra_store_writes = &.{range_write},
+            });
+            try Self.refreshSplitBootstrapRangeInMemory(self, byte_range);
+        }
+
+        pub fn appendRaftDocumentSnapshotChunk(
+            self: *DB,
+            staged_generation: *const generation_lifecycle.StagedGeneration,
+            byte_range: types.ByteRange,
+            writes: []const types.BatchWrite,
+        ) !void {
+            try staged_generation.validatePath(self.core.path);
+            if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+                std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+            {
+                return error.InvalidAppliedDataRange;
+            }
+            for (writes) |write| if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+            try DB.WritePathCallbacks.batch_internal(self, .{
+                .writes = writes,
+                .sync_level = .write,
+            }, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_ha_write_gate = true,
+            });
+        }
+
+        pub fn finishRaftDocumentSnapshot(
+            self: *DB,
+            staged_generation: *const generation_lifecycle.StagedGeneration,
+            byte_range: types.ByteRange,
+        ) !void {
+            try staged_generation.validatePath(self.core.path);
+            const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, byte_range);
+            defer self.alloc.free(range_value);
+            const range_write: docstore_mod.KVPair = .{ .key = range_state_mod.range_key, .value = range_value };
+            try DB.WritePathCallbacks.batch_internal(self, .{ .sync_level = .write }, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_ha_write_gate = true,
+                .extra_store_writes = &.{range_write},
+            });
+            try Self.refreshSplitBootstrapRangeInMemory(self, byte_range);
+        }
+
+        pub fn replaceSplitBootstrap(
+            self: *DB,
+            alloc: Allocator,
+            byte_range: types.ByteRange,
+            writes: []const types.BatchWrite,
+            base_delta_sequence: u64,
+            marker: range_state_mod.SplitBootstrapMarker,
+        ) !bool {
+            db_internal.lockAtomicWithBackoff(&self.generation_replace_mutex);
+            defer self.generation_replace_mutex.unlock();
+
+            if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+                marker.source_group_id == 0 or marker.destination_group_id == 0 or
+                marker.bootstrap_complete)
+            {
+                return error.InvalidSplitBootstrapMarker;
+            }
+            if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+                std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+            {
+                return error.InvalidAppliedDataRange;
+            }
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(alloc);
+            try seen.ensureTotalCapacity(alloc, @intCast(writes.len));
+            for (writes) |write| {
+                if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+                const result = try seen.getOrPut(alloc, write.key);
+                if (result.found_existing) return error.DuplicateDocumentKey;
+            }
+
+            if (try Self.getSplitBootstrapMarker(self, alloc)) |existing| {
+                const same_attempt = existing.transition_id == marker.transition_id and
+                    existing.attempt_epoch == marker.attempt_epoch and
+                    existing.source_group_id == marker.source_group_id and
+                    existing.destination_group_id == marker.destination_group_id;
+                if (same_attempt) {
+                    const reserved_sequence = try Self.getSplitDeltaFinalSeq(self, alloc);
+                    if (base_delta_sequence < reserved_sequence) return error.StaleSplitBootstrap;
+                    if (!byteRangesEqual(self.core.byteRange(), byte_range)) return error.ConflictingSplitTransition;
+                    if (existing.bootstrap_complete) {
+                        if (base_delta_sequence > reserved_sequence) return error.SplitBootstrapComplete;
+                        return false;
+                    }
+                    // Source leadership can change after an earlier worker has
+                    // reserved and populated this exact transfer. Replaying begin
+                    // must not erase those chunks beneath its pending completion.
+                    if (base_delta_sequence == reserved_sequence) return false;
+                }
+                if (!same_attempt and
+                    (existing.source_group_id != marker.source_group_id or
+                        existing.destination_group_id != marker.destination_group_id or
+                        existing.attempt_epoch >= marker.attempt_epoch))
+                {
+                    return error.ConflictingSplitTransition;
+                }
+            }
+
+            const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+            defer alloc.free(lower);
+            const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidAppliedDataRange;
+            defer alloc.free(upper);
+            self.core.lockApplyShared();
+            const existing_documents = self.core.scanStoreRange(alloc, lower, upper) catch |err| {
+                self.core.unlockApplyShared();
+                return err;
+            };
+            self.core.unlockApplyShared();
+            defer docstore_mod.DocStore.freeResults(alloc, existing_documents);
+
+            var deletes = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (deletes.items) |key| alloc.free(key);
+                deletes.deinit(alloc);
+            }
+            for (existing_documents) |entry| {
+                const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+                if (seen.contains(logical_key)) {
+                    alloc.free(logical_key);
+                    continue;
+                }
+                errdefer alloc.free(logical_key);
+                try deletes.append(alloc, logical_key);
+            }
+
+            const range_value = try range_state_mod.encodeRangeAlloc(alloc, byte_range);
+            defer alloc.free(range_value);
+            var sequence_buf: [8]u8 = undefined;
+            var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+            const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
+                range_value,
+                base_delta_sequence,
+                marker,
+                &sequence_buf,
+                &marker_buf,
+            );
+            DB.WritePathCallbacks.batch_internal(self, .{
+                .writes = writes,
+                .deletes = deletes.items,
+                .sync_level = .write,
+            }, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_ha_write_gate = true,
+                .extra_store_writes = &metadata_writes,
+            }) catch |err| {
+                if (try Self.getSplitBootstrapMarker(self, alloc)) |committed| {
+                    if (splitBootstrapMarkersEqual(committed, marker)) {
+                        try Self.refreshSplitBootstrapRangeInMemory(self, byte_range);
+                        return true;
+                    }
+                }
+                return err;
+            };
+            try Self.refreshSplitBootstrapRangeInMemory(self, byte_range);
+            return true;
+        }
+
+        pub fn completeSplitBootstrap(
+            self: *DB,
+            alloc: Allocator,
+            byte_range: types.ByteRange,
+            base_delta_sequence: u64,
+            marker: range_state_mod.SplitBootstrapMarker,
+        ) !bool {
+            db_internal.lockAtomicWithBackoff(&self.generation_replace_mutex);
+            defer self.generation_replace_mutex.unlock();
+
+            if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+                marker.source_group_id == 0 or marker.destination_group_id == 0 or
+                !marker.bootstrap_complete)
+            {
+                return error.InvalidSplitBootstrapMarker;
+            }
+            if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+                std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+            {
+                return error.InvalidAppliedDataRange;
+            }
+
+            const existing = (try Self.getSplitBootstrapMarker(self, alloc)) orelse
+                return error.SplitBootstrapRequired;
+            if (existing.transition_id != marker.transition_id or
+                existing.attempt_epoch != marker.attempt_epoch or
+                existing.source_group_id != marker.source_group_id or
+                existing.destination_group_id != marker.destination_group_id)
+            {
+                return error.ConflictingSplitTransition;
+            }
+            const reserved_sequence = try Self.getSplitDeltaFinalSeq(self, alloc);
+            if (base_delta_sequence != reserved_sequence) return error.StaleSplitBootstrap;
+            if (!byteRangesEqual(self.core.byteRange(), byte_range)) return error.ConflictingSplitTransition;
+            if (existing.bootstrap_complete) {
+                try Self.refreshSplitBootstrapRangeInMemory(self, byte_range);
+                return false;
+            }
+
+            const range_value = try range_state_mod.encodeRangeAlloc(alloc, byte_range);
+            defer alloc.free(range_value);
+            var sequence_buf: [8]u8 = undefined;
+            var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+            const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
+                range_value,
+                base_delta_sequence,
+                marker,
+                &sequence_buf,
+                &marker_buf,
+            );
+            try DB.WritePathCallbacks.batch_internal(self, .{ .sync_level = .write }, null, .{
+                .validate_range_ownership = false,
+                .wait_for_sync_level = false,
+                .bypass_ha_write_gate = true,
+                .extra_store_writes = &metadata_writes,
+            });
+            try Self.refreshSplitBootstrapRangeInMemory(self, byte_range);
+            return true;
+        }
+
+        fn refreshSplitBootstrapRangeInMemory(self: *DB, byte_range: types.ByteRange) !void {
+            const start = try self.alloc.dupe(u8, byte_range.start);
+            errdefer self.alloc.free(start);
+            const end = try self.alloc.dupe(u8, byte_range.end);
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            self.core.replaceRangeInMemoryOwned(start, end);
+        }
+
+        pub fn clearSplitBootstrapMarker(self: *DB) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.clearSplitBootstrapMarker();
+        }
+
         const Self = @This();
 
         pub fn updateRangeAfterGate(self: *DB, byte_range: types.ByteRange) !void {
             self.core.lockApply();
             defer self.core.unlockApply();
-            try self.core.updateRange(byte_range);
+            const start = try self.alloc.dupe(u8, byte_range.start);
+            errdefer self.alloc.free(start);
+            const end = try self.alloc.dupe(u8, byte_range.end);
+            errdefer self.alloc.free(end);
+            const owned_range: types.ByteRange = .{ .start = start, .end = end };
+            const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, owned_range);
+            defer self.alloc.free(range_value);
+            const range_write: docstore_mod.KVPair = .{ .key = range_state_mod.range_key, .value = range_value };
+            try rebaseRangeCoverageMetadata(
+                self.alloc,
+                self.core.store,
+                self.core.index_manager,
+                owned_range,
+                &.{range_write},
+            );
+            self.core.adoptRangeInMemoryOwned(start, end);
         }
 
         pub fn getRange(self: *DB) types.ByteRange {
@@ -1002,13 +1545,24 @@ pub fn Impl(comptime DB: type) type {
             return try self.core.rewriteLeftStoreInPlace(split_lower);
         }
 
-        fn finalizePrimarySplitPreservingIdentity(self: *DB, split_lower: []const u8) !void {
+        fn finalizePrimarySplitPreservingIdentity(
+            self: *DB,
+            split_lower: []const u8,
+            retained_range: types.ByteRange,
+        ) !void {
             const range = identityMetadataRange();
             const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
             defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
 
             _ = try Self.tryFinalizePrimarySplitFast(self, split_lower);
             try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
+            try rebaseRangeCoverageMetadata(
+                self.alloc,
+                self.core.store,
+                self.core.index_manager,
+                retained_range,
+                &.{},
+            );
         }
 
         fn splitDestinationStorePlan(self: *DB) SplitDestinationStorePlan {
@@ -1109,15 +1663,25 @@ pub fn Impl(comptime DB: type) type {
             );
         }
 
-        fn resetManagedIndexAppliedSequences(self: *DB) !void {
-            const managed_indexes = try self.core.managedIndexes(self.alloc);
+        fn resetManagedIndexAppliedSequencesForRestoreRepair(self: *DB, alloc: Allocator) !void {
+            const managed_indexes = try self.core.managedIndexes(alloc);
             defer {
-                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
-                self.alloc.free(managed_indexes);
+                for (managed_indexes) |index_ref| alloc.free(@constCast(index_ref.name));
+                alloc.free(managed_indexes);
             }
 
             for (managed_indexes) |index_ref| {
-                try self.core.saveAppliedSequence(index_ref.name, 0);
+                const sequence: u64 = switch (index_ref.kind) {
+                    .full_text => try DB.LifecycleCallbacks.probe_derived_replay_target_sequence(
+                        self,
+                        alloc,
+                        self.core.replaySource(),
+                        index_ref,
+                        0,
+                    ),
+                    else => 0,
+                };
+                try self.core.saveAppliedSequence(index_ref.name, sequence);
             }
         }
 
@@ -1161,6 +1725,7 @@ pub fn Impl(comptime DB: type) type {
 
         fn registerSplitDestinationIndexesDirect(
             alloc: Allocator,
+            io: std.Io,
             dest_store: *docstore_mod.DocStore,
             applied_sequence_checkpoint_path: ?[]const u8,
             dest_indexes: *index_manager_mod.IndexManager,
@@ -1176,9 +1741,11 @@ pub fn Impl(comptime DB: type) type {
                 updates[i] = .{
                     .index_name = cfg.name,
                     .sequence = applied_sequence,
+                    .config_hash = types.indexConfigHash(cfg),
                 };
             }
-            try apply_state.saveAppliedSequencesWithCheckpoint(alloc, dest_store, applied_sequence_checkpoint_path, updates);
+            try DB.DerivedAsyncCallbacks.save_dense_projection_metadata_for_applied_sequence_updates(dest_indexes, updates);
+            try apply_state.saveAppliedSequencesWithCheckpoint(alloc, io, dest_store, applied_sequence_checkpoint_path, updates);
         }
 
         fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []const u8) !void {
@@ -1206,6 +1773,7 @@ pub fn Impl(comptime DB: type) type {
             try clearSplitMetadataFromStore(self.alloc, dest_store);
             try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
             try copyIdentityMetadataToStore(self.alloc, self.core.store, dest_store);
+            if (!page_split_built) try copyDerivedCoverageMetadataToStore(self.alloc, self.core.store, dest_store);
             const replay_floor = self.core.nextDerivedAppendSequence();
             try ensureReplayFloor(dest_store, replay_floor);
 
@@ -1224,7 +1792,8 @@ pub fn Impl(comptime DB: type) type {
 
             const configs = try self.core.listIndexes(self.alloc);
             defer types.freeIndexConfigs(self.alloc, configs);
-            try Self.registerSplitDestinationIndexesDirect(self.alloc, dest_store, dest_applied_sequence_checkpoint_path, &dest_indexes, configs, replay_floor -| 1);
+            const io = self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+            try Self.registerSplitDestinationIndexesDirect(self.alloc, io, dest_store, dest_applied_sequence_checkpoint_path, &dest_indexes, configs, replay_floor -| 1);
             const collect_skip_doc_keys = true;
             var split_handoffs = try self.core.collectSplitIndexHandoffs(
                 &dest_indexes,
@@ -1285,6 +1854,8 @@ pub fn Impl(comptime DB: type) type {
                 &dest_indexes,
             );
             try Self.rebuildRelationalColumnIndexesInStoreRange(self, dest_store, byte_range.start, byte_range.end);
+
+            try rebaseRangeCoverageMetadata(self.alloc, dest_store, &dest_indexes, byte_range, &.{});
 
             try dest_indexes.syncAll(true);
             try dest_store.sync(true);
@@ -1647,7 +2218,7 @@ pub fn Impl(comptime DB: type) type {
 
             const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
             defer self.alloc.free(split_lower);
-            try Self.finalizePrimarySplitPreservingIdentity(self, split_lower);
+            try Self.finalizePrimarySplitPreservingIdentity(self, split_lower, new_range);
             try Self.rebuildRelationalColumnIndexesInStoreRange(self, self.core.store, new_range.start, new_range.end);
             try self.core.store.ensureReplayNextSequenceAtLeast(replay_floor);
             try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
@@ -1667,10 +2238,13 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn snapshot(self: *DB, id: []const u8) !u64 {
+            try DB.LifecycleCallbacks.prepare_snapshot(self);
+
             self.core.lockApply();
             defer self.core.unlockApply();
 
             try self.core.syncStore(true);
+            try self.core.index_manager.syncAll(true);
 
             const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}.snapshots/{s}", .{ self.core.path, id });
             defer self.alloc.free(snapshot_root);
@@ -1679,8 +2253,21 @@ pub fn Impl(comptime DB: type) type {
             return try self.core.writeSnapshot(snapshot_root);
         }
 
-        pub fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: anytype, restore_identity: ?RestoreIdentity) !void {
-            if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
+        pub fn restoreSnapshotStoreTo(
+            alloc: Allocator,
+            snapshot_root: []const u8,
+            path: []const u8,
+            opts: anytype,
+            restore_identity: ?RestoreIdentity,
+            restore_io: ?Io,
+        ) !void {
+            const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.io() else null;
+            if (restore_identity) |identity| {
+                if (shared_io) |io|
+                    try beginRestoreImportWithIo(alloc, io, path, snapshot_root, identity)
+                else
+                    try beginRestoreImport(alloc, path, snapshot_root, identity);
+            }
             var opened_primary = try db_internal.openPrimaryStore(alloc, path, .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
@@ -1699,14 +2286,35 @@ pub fn Impl(comptime DB: type) type {
             try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
             try validateRestoredIdentityNamespace(&opened_primary.store, opts);
             try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
-            if (restore_identity) |identity| try markRestorePrimaryRestored(
-                alloc,
-                path,
-                identity.backup_id,
-                identity.location,
-                identity.snapshot_path,
-                identity.group_id,
-            );
+            if (opts.physical_root_mode == .filesystem_managed) {
+                _ = if (shared_io) |io|
+                    try root_identity.loadOrCreate(alloc, io, path)
+                else
+                    try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
+            }
+            if (restore_identity) |identity| {
+                if (shared_io) |io|
+                    try markRestorePrimaryRestoredForPathWithArtifactWithIo(
+                        alloc,
+                        io,
+                        path,
+                        identity.backup_id,
+                        identity.location,
+                        identity.artifact_sha256,
+                        identity.snapshot_path,
+                        identity.group_id,
+                    )
+                else
+                    try markRestorePrimaryRestoredForPathWithArtifact(
+                        alloc,
+                        path,
+                        identity.backup_id,
+                        identity.location,
+                        identity.artifact_sha256,
+                        identity.snapshot_path,
+                        identity.group_id,
+                    );
+            }
         }
 
         fn validateRestoredIdentityNamespace(store: *docstore_mod.DocStore, opts: anytype) !void {
@@ -1716,31 +2324,65 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: anytype) !void {
-            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null);
+            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null);
             // Graph reverse indexes are derived from stored outgoing edge keys,
             // so restore them after the logical store and derived log are rehydrated.
             var restored = try DB.open(alloc, path, opts);
             defer restored.close();
-            _ = try restored.core.index_manager.rebuildGraphSplitDestination(
-                restored.getRange().start,
-                restored.getRange().end,
-            );
+            _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+            _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+            try restored.rebuildGraphIndexesForTargetCoverage(alloc);
+            try restored.core.index_manager.syncAll(true);
+        }
+
+        pub fn restoreSnapshotToStagedGeneration(
+            staged_generation: *const generation_lifecycle.StagedGeneration,
+            alloc: Allocator,
+            snapshot_root: []const u8,
+            path: []const u8,
+            opts: anytype,
+        ) !void {
+            try staged_generation.validatePath(path);
+            var staged_opts = opts;
+            staged_opts.staged_generation = staged_generation;
+            try restoreSnapshotTo(alloc, snapshot_root, path, staged_opts);
         }
 
         pub fn restoreSnapshotToDeferredRuntimeRepair(
+            staged_generation: *const generation_lifecycle.StagedGeneration,
             alloc: Allocator,
             snapshot_root: []const u8,
             path: []const u8,
             opts: anytype,
             identity: RestoreIdentity,
         ) !void {
-            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity);
+            try staged_generation.validatePath(path);
+            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, null);
+        }
+
+        pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
+            staged_generation: *const generation_lifecycle.StagedGeneration,
+            alloc: Allocator,
+            io: Io,
+            snapshot_root: []const u8,
+            path: []const u8,
+            opts: anytype,
+            identity: RestoreIdentity,
+        ) !void {
+            try staged_generation.validatePath(path);
+            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io);
         }
 
         pub fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
-            try ensureDirPath(path);
-            const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-            defer alloc.free(repair_marker_path);
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            return try beginRestoreImportWithIo(alloc, io_impl.io(), path, snapshot_root, identity);
+        }
+
+        pub fn beginRestoreImportWithIo(alloc: Allocator, io: Io, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
+            if (snapshot_root.len == 0 or !validRestoreIdentity(identity))
+                return error.InvalidRestoreImportMarker;
+            try fs_paths.createDirPathPortable(io, path);
             const restore_intent_path = try restoreIntentMarkerPathAlloc(alloc, path);
             defer alloc.free(restore_intent_path);
             const restore_state_path = try restoreStateMarkerPathAlloc(alloc, path);
@@ -1748,48 +2390,45 @@ pub fn Impl(comptime DB: type) type {
             const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
             defer alloc.free(import_marker_path);
 
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            const io = io_impl.io();
-            try deleteFileIfExists(io, repair_marker_path);
             try deleteFileIfExists(io, restore_intent_path);
             try deleteFileIfExists(io, restore_state_path);
-            const marker = try std.fmt.allocPrint(
-                alloc,
-                "restore_import_v1\nsnapshot_root={s}\nbackup_id={s}\nlocation={s}\nsnapshot_path={s}\ngroup_id={d}\n",
-                .{
-                    snapshot_root,
-                    identity.backup_id,
-                    identity.location,
-                    identity.snapshot_path,
-                    identity.group_id,
-                },
-            );
+            const marker = try std.json.Stringify.valueAlloc(alloc, RestoreImportDisk{
+                .snapshot_root = snapshot_root,
+                .backup_id = identity.backup_id,
+                .location = identity.location,
+                .artifact_sha256 = identity.artifact_sha256,
+                .snapshot_path = identity.snapshot_path,
+                .group_id = identity.group_id,
+            }, .{});
             defer alloc.free(marker);
-            try std.Io.Dir.cwd().writeFile(io, .{
-                .sub_path = import_marker_path,
-                .data = marker,
-            });
+            try writeRestoreMarkerAtomicWithIo(alloc, io, path, import_marker_path, marker);
         }
 
         pub fn recoverIncompleteRestoreImportIfNeeded(alloc: Allocator, path: []const u8, opts: anytype) !bool {
-            if (try readRestoreStateForPathAlloc(alloc, path)) |state_value| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            return try recoverIncompleteRestoreImportIfNeededWithIo(alloc, io_impl.io(), path, opts);
+        }
+
+        pub fn recoverIncompleteRestoreImportIfNeededWithIo(alloc: Allocator, io: Io, path: []const u8, opts: anytype) !bool {
+            if (try readRestoreStateForPathAllocWithIo(alloc, io, path)) |state_value| {
                 var state = state_value;
                 state.deinit(alloc);
                 return false;
             }
 
-            var import_state = (try readRestoreImportStateAlloc(alloc, path)) orelse return false;
+            var import_state = (try readRestoreImportStateAllocWithIo(alloc, io, path)) orelse return false;
             defer import_state.deinit(alloc);
-            const identity_state = import_state.identity orelse return error.InvalidRestoreImportMarker;
+            const identity_state = import_state.identity;
             const identity: RestoreIdentity = .{
                 .backup_id = identity_state.backup_id,
                 .location = identity_state.location,
+                .artifact_sha256 = identity_state.artifact_sha256,
                 .snapshot_path = identity_state.snapshot_path,
                 .group_id = identity_state.group_id,
             };
-            std.log.warn("recovering incomplete restore import path={s} snapshot_root={s}", .{ path, import_state.snapshot_root });
-            try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity);
+            std.log.warn("recovering incomplete restore import phase=startup", .{});
+            try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io);
             return true;
         }
 
@@ -1797,36 +2436,48 @@ pub fn Impl(comptime DB: type) type {
             return try readRestoreStateForPathAlloc(alloc, path);
         }
 
-        pub fn markRestorePrimaryRestoredForPath(
-            alloc: Allocator,
-            path: []const u8,
-            backup_id: []const u8,
-            location: []const u8,
-            snapshot_path: []const u8,
-            group_id: u64,
-        ) !void {
-            try markRestorePrimaryRestored(alloc, path, backup_id, location, snapshot_path, group_id);
+        pub fn readRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreState {
+            return try readRestoreStateForPathAllocWithIo(alloc, io, path);
         }
 
-        pub fn markRestorePrimaryRestored(
+        pub fn markRestorePrimaryRestoredForPathWithArtifact(
             alloc: Allocator,
             path: []const u8,
             backup_id: []const u8,
             location: []const u8,
+            artifact_sha256: []const u8,
             snapshot_path: []const u8,
             group_id: u64,
         ) !void {
-            var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "runtime_repair", true, false, "");
-            defer state.deinit(alloc);
-            try writeRestoreStateForPath(alloc, path, state);
-            const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-            defer alloc.free(repair_marker_path);
-            const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
-            defer alloc.free(import_marker_path);
             var io_impl = threadedIo();
             defer io_impl.deinit();
-            const io = io_impl.io();
-            try deleteFileIfExists(io, repair_marker_path);
+            return try markRestorePrimaryRestoredForPathWithArtifactWithIo(
+                alloc,
+                io_impl.io(),
+                path,
+                backup_id,
+                location,
+                artifact_sha256,
+                snapshot_path,
+                group_id,
+            );
+        }
+
+        pub fn markRestorePrimaryRestoredForPathWithArtifactWithIo(
+            alloc: Allocator,
+            io: Io,
+            path: []const u8,
+            backup_id: []const u8,
+            location: []const u8,
+            artifact_sha256: []const u8,
+            snapshot_path: []const u8,
+            group_id: u64,
+        ) !void {
+            var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "");
+            defer state.deinit(alloc);
+            try writeRestoreStateForPathWithIo(alloc, io, path, state);
+            const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
+            defer alloc.free(import_marker_path);
             try deleteFileIfExists(io, import_marker_path);
         }
 
@@ -1835,10 +2486,11 @@ pub fn Impl(comptime DB: type) type {
             path: []const u8,
             backup_id: []const u8,
             location: []const u8,
+            artifact_sha256: []const u8,
             snapshot_path: []const u8,
             group_id: u64,
         ) !void {
-            var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+            var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "complete", true, true, "");
             defer state.deinit(alloc);
             try writeRestoreStateForPath(alloc, path, state);
             const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
@@ -1852,57 +2504,64 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn restoreRuntimeRepairNeededForPath(alloc: Allocator, path: []const u8) !bool {
-            var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return false;
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            return try restoreRuntimeRepairNeededForPathWithIo(alloc, io_impl.io(), path);
+        }
+
+        pub fn restoreRuntimeRepairNeededForPathWithIo(alloc: Allocator, io: Io, path: []const u8) !bool {
+            var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return false;
             defer state.deinit(alloc);
             return state.primary_restored and !state.runtime_repair_complete;
         }
 
         pub fn markRestoreRuntimeRepairNeeded(alloc: Allocator, path: []const u8) !void {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            return try markRestoreRuntimeRepairNeededWithIo(alloc, io_impl.io(), path);
+        }
+
+        pub fn markRestoreRuntimeRepairNeededWithIo(alloc: Allocator, io: Io, path: []const u8) !void {
             const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
             defer alloc.free(repair_marker_path);
             const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
             defer alloc.free(import_marker_path);
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            const io = io_impl.io();
             try deleteFileIfExists(io, repair_marker_path);
 
-            var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return error.InvalidRestoreState;
+            var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return error.InvalidRestoreState;
             defer state.deinit(alloc);
             const new_phase = try alloc.dupe(u8, "runtime_repair");
             alloc.free(state.phase);
             state.phase = new_phase;
             state.primary_restored = true;
             state.runtime_repair_complete = false;
-            try writeRestoreStateForPath(alloc, path, state);
+            try writeRestoreStateForPathWithIo(alloc, io, path, state);
             try deleteFileIfExists(io, import_marker_path);
         }
 
-        pub fn markRestoreRuntimeRepairComplete(alloc: Allocator, path: []const u8) !void {
-            var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return error.InvalidRestoreState;
+        pub fn markRestoreRuntimeRepairCompleteWithIo(alloc: Allocator, io: Io, path: []const u8) !void {
+            var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return error.InvalidRestoreState;
             defer state.deinit(alloc);
             const new_phase = try alloc.dupe(u8, "complete");
             alloc.free(state.phase);
             state.phase = new_phase;
             state.primary_restored = true;
             state.runtime_repair_complete = true;
-            try writeRestoreStateForPath(alloc, path, state);
+            try writeRestoreStateForPathWithIo(alloc, io, path, state);
             const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
             defer alloc.free(repair_marker_path);
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
-                .sub_path = repair_marker_path,
-                .data = "done\n",
-            });
+            try writeRestoreMarkerAtomicWithIo(alloc, io, path, repair_marker_path, "done\n");
         }
 
         pub fn restoreRuntimeRepairNeeded(self: *DB) !bool {
+            if (self.backend_runtime.io()) |io| {
+                return try restoreRuntimeRepairNeededForPathWithIo(self.alloc, io, self.core.path);
+            }
             return try restoreRuntimeRepairNeededForPath(self.alloc, self.core.path);
         }
 
-        pub fn updateRestoreRuntimeRepairPhase(self: *DB, alloc: Allocator, phase: []const u8, complete: bool) !void {
-            var state = (try readRestoreStateForPathAlloc(alloc, self.core.path)) orelse return error.InvalidRestoreState;
+        fn updateRestoreRuntimeRepairPhaseWithIo(self: *DB, alloc: Allocator, io: Io, phase: []const u8, complete: bool) !void {
+            var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return error.InvalidRestoreState;
             defer state.deinit(alloc);
             const new_phase = try alloc.dupe(u8, phase);
             alloc.free(state.phase);
@@ -1912,27 +2571,35 @@ pub fn Impl(comptime DB: type) type {
             const new_last_error = try alloc.dupe(u8, "");
             alloc.free(state.last_error);
             state.last_error = new_last_error;
-            try writeRestoreStateForPath(alloc, self.core.path, state);
+            try writeRestoreStateForPathWithIo(alloc, io, self.core.path, state);
         }
 
         pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
-            if (!try Self.restoreRuntimeRepairNeeded(self)) return false;
+            if (self.backend_runtime.io()) |io| {
+                return try Self.repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io);
+            }
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            return try Self.repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io_impl.io());
+        }
 
-            var state = (try readRestoreStateForPathAlloc(alloc, self.core.path)) orelse return false;
+        pub fn repairRestoreRuntimeStateStepIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
+            var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return false;
             defer state.deinit(alloc);
+            if (!state.primary_restored or state.runtime_repair_complete) return false;
             const phase = state.phase;
 
             if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
                 std.log.info("restore runtime repair reset managed index watermarks path={s}", .{self.core.path});
-                try Self.resetManagedIndexAppliedSequences(self);
+                try Self.resetManagedIndexAppliedSequencesForRestoreRepair(self, alloc);
                 try Self.refreshManagedIndexWorkersLocked(self);
-                try Self.updateRestoreRuntimeRepairPhase(self, alloc, "rebuild_graph", false);
+                try Self.updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_graph", false);
                 return true;
             }
             if (std.mem.eql(u8, phase, "rebuild_graph")) {
                 std.log.info("restore runtime repair rebuild graph state path={s}", .{self.core.path});
                 _ = try Self.rebuildGraphDerivedState(self);
-                try Self.updateRestoreRuntimeRepairPhase(self, alloc, "rebuild_artifacts", false);
+                try Self.updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_artifacts", false);
                 return true;
             }
             if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
@@ -1940,7 +2607,7 @@ pub fn Impl(comptime DB: type) type {
                 _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
                 _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
                 _ = try Self.rebuildSparseIndexesFromPrimaryDocsForRestore(self, alloc);
-                try Self.updateRestoreRuntimeRepairPhase(self, alloc, "replay_enrichments", false);
+                try Self.updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "replay_enrichments", false);
                 return true;
             }
             if (std.mem.eql(u8, phase, "replay_enrichments")) {
@@ -1949,25 +2616,39 @@ pub fn Impl(comptime DB: type) type {
                     std.log.info("restore runtime repair replay generated enrichments path={s}", .{self.core.path});
                     _ = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
                 }
-                try Self.updateRestoreRuntimeRepairPhase(self, alloc, "drain_async", false);
+                try Self.updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "drain_async", false);
                 return true;
             }
             if (std.mem.eql(u8, phase, "drain_async")) {
                 std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
                 // Earlier repair phases synchronously rebuild restored runtime state.
-                // At this point only persisted applied-sequence watermarks need to
-                // be flushed before the final index sync/complete marker. Do not
-                // call runUntilIdle here: large portable restores can leave
-                // substantial replay, posting-maintenance, or LSM maintenance debt,
-                // and queries remain correct while that background debt is paid down.
+                // Publish replay-driven query state before the final index
+                // sync/complete marker, but preserve the replay journal until
+                // restore repair has durably crossed that boundary.
+                try DB.LifecycleCallbacks.drain_replay_stages_until_stable_without_truncation(self);
                 try DB.LifecycleCallbacks.flush_applied_sequences_for_idle(self);
-                try Self.updateRestoreRuntimeRepairPhase(self, alloc, "sync_indexes", false);
+                try Self.updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_replayed_artifacts", false);
+                return true;
+            }
+            if (std.mem.eql(u8, phase, "rebuild_replayed_artifacts")) {
+                std.log.info("restore runtime repair rebuild replayed embedding artifacts path={s}", .{self.core.path});
+                _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+                _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
+                try Self.updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "sync_indexes", false);
                 return true;
             }
             if (std.mem.eql(u8, phase, "sync_indexes")) {
                 std.log.info("restore runtime repair sync indexes path={s}", .{self.core.path});
-                try self.core.index_manager.syncAll(false);
-                try markRestoreRuntimeRepairComplete(alloc, self.core.path);
+                _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+                if (try self.hasPendingDenseArtifactRebuild(alloc) or
+                    try DB.LifecycleCallbacks.dense_artifact_watermark_repair_needed(self, alloc))
+                {
+                    return error.RestoreRuntimeRepairIncomplete;
+                }
+                try DB.LifecycleCallbacks.save_all_live_index_status_snapshots(self, alloc);
+                try self.core.index_manager.syncAll(true);
+                try self.core.syncStore(true);
+                try markRestoreRuntimeRepairCompleteWithIo(alloc, io, self.core.path);
                 std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
                 return true;
             }
@@ -2008,9 +2689,17 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
+            if (self.backend_runtime.io()) |io| {
+                return try Self.repairRestoreRuntimeStateIfNeededWithIo(self, alloc, io);
+            }
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            return try Self.repairRestoreRuntimeStateIfNeededWithIo(self, alloc, io_impl.io());
+        }
+
+        pub fn repairRestoreRuntimeStateIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
             var repaired = false;
-            while (try Self.restoreRuntimeRepairNeeded(self)) {
-                _ = try Self.repairRestoreRuntimeStateStepIfNeeded(self, alloc);
+            while (try Self.repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io)) {
                 repaired = true;
             }
             return repaired;

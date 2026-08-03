@@ -26,6 +26,7 @@ const backend_runtime_mod = @import("../storage/background_runtime.zig");
 
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpServerConfig = http_server.ApiHttpServerConfig;
+pub const metadataNotLeaderResponse = http_server.metadataNotLeaderResponse;
 
 pub const MetadataServiceSurfaceConfig = struct {
     svc: *metadata_service.MetadataHttpService,
@@ -91,6 +92,7 @@ pub const PublicApiSurface = struct {
             cfg.request_executor,
         );
         _ = write_source.withBackendRuntime(cfg.backend_runtime);
+        _ = write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
         _ = write_source.withSecretStore(cfg.api_server_cfg.secret_store);
         _ = write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
         self.owned_metadata_write_source = write_source;
@@ -98,7 +100,7 @@ pub const PublicApiSurface = struct {
         const api_server_cfg = cfg.api_server_cfg;
 
         const api_server = try alloc.create(ApiHttpServer);
-        api_server.* = ApiHttpServer.init(
+        api_server.* = ApiHttpServer.initWithProcessRequestAllocator(
             alloc,
             api_server_cfg,
             http_server.StatusSource.fromMetadataHttpService(cfg.svc),

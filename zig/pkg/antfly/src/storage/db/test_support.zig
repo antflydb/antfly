@@ -23,6 +23,18 @@ const types = @import("types.zig");
 pub const default_test_wait_attempts: usize = 100;
 pub const slow_test_wait_attempts: usize = 500;
 
+pub fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
+    const header = try enrichment_artifact_codec.decodeHeader(value);
+    try std.testing.expectEqual(enrichment_artifact_codec.codec_version, header.version);
+    try std.testing.expectEqual(enrichment_artifact_codec.Kind.dense_embedding, header.kind);
+    try std.testing.expectEqual(source_hash != null, header.flags.has_source_hash);
+    if (source_hash) |expected_hash| try std.testing.expectEqual(expected_hash, header.source_hash);
+
+    const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value);
+    defer alloc.free(vector);
+    try std.testing.expectEqual(dims, vector.len);
+}
+
 var temp_path_nonce: u64 = 0;
 
 pub fn profileBenchTestsEnabled() bool {

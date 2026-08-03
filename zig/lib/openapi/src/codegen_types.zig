@@ -742,7 +742,9 @@ pub const TypeGenerator = struct {
         self.w.indent();
         try self.w.line("const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{{}});", .{});
         try self.w.line("defer allocator.free(encoded);", .{});
-        try self.w.line("return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {{", .{});
+        try self.w.line("var owned_options = options;", .{});
+        try self.w.line("owned_options.allocate = .alloc_always;", .{});
+        try self.w.line("return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {{", .{});
         self.w.indent();
         try self.w.line("error.OutOfMemory => return error.OutOfMemory,", .{});
         try self.w.line("else => return error.UnexpectedToken,", .{});
@@ -1218,6 +1220,7 @@ test "undiscriminated recursive oneOf generates structural union" {
     try std.testing.expect(std.mem.indexOf(u8, output, "match_query: *MatchQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "boolean_query: *BooleanQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (objectHasAnyKey(source.object, &.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "owned_options.allocate = .alloc_always;") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {") != null);
 }
 

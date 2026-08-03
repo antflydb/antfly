@@ -35,7 +35,7 @@ pub fn encodeSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
     var parsed = try std.json.parseFromSlice(
         schema_openapi.TableSchema,
         alloc,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"},\"score\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"datetime\"},\"customer_id\":{\"type\":\"keyword\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\"}},\"body\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\"}},\"status\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}},\"score\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"number\",\"sortable\":true}},\"created_at\":{\"type\":\"string\",\"format\":\"date-time\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}},\"customer_id\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}",
         .{},
     );
     defer parsed.deinit();
@@ -46,7 +46,7 @@ pub fn encodeCustomersSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
     var parsed = try std.json.parseFromSlice(
         schema_openapi.TableSchema,
         alloc,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"name\":{\"type\":\"text\"},\"tier\":{\"type\":\"keyword\"},\"address_id\":{\"type\":\"keyword\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"id\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}},\"name\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\"}},\"tier\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}},\"address_id\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}",
         .{},
     );
     defer parsed.deinit();
@@ -57,7 +57,7 @@ pub fn encodeAddressesSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
     var parsed = try std.json.parseFromSlice(
         schema_openapi.TableSchema,
         alloc,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"city\":{\"type\":\"text\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"id\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}},\"city\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\"}}}}}}}",
         .{},
     );
     defer parsed.deinit();

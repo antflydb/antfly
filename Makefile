@@ -10,6 +10,16 @@ MERGE_AUDIT_SNAPSHOT ?= /tmp/antfly-main-merge-snapshot.json
 MERGE_AUDIT_JSON ?= /tmp/antfly-main-merge-audit.json
 MERGE_AUDIT_REPORT ?= /tmp/antfly-main-merge-audit.md
 MERGE_AUDIT_ZIG_REPORT ?= /tmp/antfly-zig-split-merge-audit.md
+MERGE_AUDIT_SPLIT_DIR ?= /tmp/antfly-split-declaration-audit
+MERGE_AUDIT_SPLIT_BASELINE_DIR ?= /tmp/antfly-split-declaration-baseline
+MERGE_AUDIT_SPLIT_BRANCH_BASELINE_DIR ?= /tmp/antfly-split-branch-baseline
+MERGE_AUDIT_BUILD_SURFACE_JSON ?= /tmp/antfly-zig-build-surface-audit.json
+MERGE_AUDIT_INFERENCE_BUILD_SURFACE_JSON ?= /tmp/antfly-inference-build-surface-audit.json
+MERGE_AUDIT_ZIG_BUILD_DIR ?= zig
+MERGE_AUDIT_RELATIVE_IMPORTS_JSON ?= /tmp/antfly-zig-relative-imports-audit.json
+MERGE_AUDIT_DESTINATION_REF ?= HEAD
+MERGE_AUDIT_RETENTION_REF ?= $(MERGE_AUDIT_DESTINATION_REF)
+MERGE_AUDIT_POLICY ?= scripts/merge_audit/policy.json
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -97,6 +107,12 @@ help:
 	@echo "  merge-audit-snapshot  Snapshot incoming main before a conflict-heavy merge"
 	@echo "  merge-audit-check-snapshot  Fail if the snapshot incoming ref moved"
 	@echo "  merge-audit        Run merge audits after resolving conflicts"
+	@echo "  merge-audit-split-baseline  Inventory all split monolith deltas against clean HEAD"
+	@echo "  merge-audit-split-branch-baseline  Inventory prior-main declarations in the clean split branch"
+	@echo "  merge-audit-split-baselines  Generate both pre-merge split inventories"
+	@echo "  merge-audit-split-declarations  Audit every configured monolith against split modules"
+	@echo "  merge-audit-build-surface  Audit incoming and pre-merge Zig build registrations against split owners"
+	@echo "  merge-audit-relative-imports  Validate local imports across split owners"
 	@echo "  merge-audit-post-commit  Run merge audits against HEAD^1/HEAD^2 after commit"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
@@ -149,7 +165,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-go build-docs generate generated-check go-generated-check ts-generated-check py-generated-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
-.PHONY: merge-audit-snapshot merge-audit-check-snapshot merge-audit merge-audit-post-commit
+.PHONY: merge-audit-snapshot merge-audit-check-snapshot merge-audit merge-audit-split-baseline merge-audit-split-branch-baseline merge-audit-split-baselines merge-audit-split-declarations merge-audit-build-surface merge-audit-relative-imports merge-audit-post-commit
 .PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-db-temporal-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -194,7 +210,61 @@ merge-audit-check-snapshot:
 		--snapshot $(MERGE_AUDIT_SNAPSHOT) \
 		--check-snapshot-ref
 
-merge-audit:
+merge-audit-split-baseline:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_split_migrations.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming $(MERGE_AUDIT_INCOMING) \
+		--destination-ref $(MERGE_AUDIT_DESTINATION_REF) \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--include-unchanged \
+		--output-dir $(MERGE_AUDIT_SPLIT_BASELINE_DIR)
+
+merge-audit-split-branch-baseline:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_split_migrations.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming $(MERGE_AUDIT_BASE) \
+		--destination-ref $(MERGE_AUDIT_DESTINATION_REF) \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--include-unchanged \
+		--output-dir $(MERGE_AUDIT_SPLIT_BRANCH_BASELINE_DIR)
+
+merge-audit-split-baselines: merge-audit-split-branch-baseline merge-audit-split-baseline
+
+merge-audit-split-declarations:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_split_migrations.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming $(MERGE_AUDIT_INCOMING) \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--include-unchanged \
+		--output-dir $(MERGE_AUDIT_SPLIT_DIR) \
+		--strict
+
+merge-audit-build-surface:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_build_surface.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming $(MERGE_AUDIT_INCOMING) \
+		--retention-ref $(MERGE_AUDIT_RETENTION_REF) \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--include-carried \
+		--zig-build-dir $(MERGE_AUDIT_ZIG_BUILD_DIR) \
+		--json-out $(MERGE_AUDIT_BUILD_SURFACE_JSON)
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_build_surface.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming $(MERGE_AUDIT_INCOMING) \
+		--retention-ref $(MERGE_AUDIT_RETENTION_REF) \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--migration inference_build \
+		--include-carried \
+		--zig-build-dir $(MERGE_AUDIT_ZIG_BUILD_DIR) \
+		--zig-build-dir zig/pkg/inference \
+		--json-out $(MERGE_AUDIT_INFERENCE_BUILD_SURFACE_JSON)
+
+merge-audit-relative-imports:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_relative_imports.py \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--json-out $(MERGE_AUDIT_RELATIVE_IMPORTS_JSON)
+
+merge-audit: merge-audit-split-declarations merge-audit-build-surface merge-audit-relative-imports
 	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_main_capture.py \
 		--snapshot $(MERGE_AUDIT_SNAPSHOT) \
 		--strict-snapshot-ref \
@@ -205,15 +275,43 @@ merge-audit:
 
 merge-audit-post-commit:
 	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_main_capture.py \
-		--incoming-ref HEAD^2 \
+		--snapshot $(MERGE_AUDIT_SNAPSHOT) \
 		--ours-ref HEAD^1 \
-		--previous-main-merge $(MERGE_AUDIT_PREVIOUS_MAIN_MERGE) \
+		--strict-snapshot-ref \
 		--json-out $(MERGE_AUDIT_JSON) \
 		--write-report $(MERGE_AUDIT_REPORT)
 	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_split_merge.py \
 		--origin HEAD^2 \
 		--base $(MERGE_AUDIT_BASE) \
 		--write-report $(MERGE_AUDIT_ZIG_REPORT)
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_split_migrations.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming HEAD^2 \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--include-unchanged \
+		--output-dir $(MERGE_AUDIT_SPLIT_DIR) \
+		--strict
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_build_surface.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming HEAD^2 \
+		--retention-ref HEAD^1 \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--include-carried \
+		--zig-build-dir $(MERGE_AUDIT_ZIG_BUILD_DIR) \
+		--json-out $(MERGE_AUDIT_BUILD_SURFACE_JSON)
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_build_surface.py \
+		--base $(MERGE_AUDIT_BASE) \
+		--incoming HEAD^2 \
+		--retention-ref HEAD^1 \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--migration inference_build \
+		--include-carried \
+		--zig-build-dir $(MERGE_AUDIT_ZIG_BUILD_DIR) \
+		--zig-build-dir zig/pkg/inference \
+		--json-out $(MERGE_AUDIT_INFERENCE_BUILD_SURFACE_JSON)
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_relative_imports.py \
+		--policy $(MERGE_AUDIT_POLICY) \
+		--json-out $(MERGE_AUDIT_RELATIVE_IMPORTS_JSON)
 
 go-generated-check: build-docs
 	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
@@ -259,7 +357,7 @@ zig-test:
 	$(ZIG_MAKE) test
 
 zig-unit-test:
-	$(ZIG_MAKE) unit-test
+	$(ZIG_MAKE) unit-test ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 
 zig-sql-api-parity-test:
 	$(ZIG_MAKE) sql-api-parity-test

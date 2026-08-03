@@ -178,6 +178,8 @@ pub const GenerationConfig = struct {
     /// KV cache compaction ratio after prefill. null = no compaction.
     /// 0.02 = 50x compression, 0.1 = 10x compression.
     cache_compaction_ratio: ?f32 = null,
+    prompt_cache_enabled: bool = false,
+    prompt_cache_key: ?[]const u8 = null,
     /// Benchmark/compatibility mode: continue decoding when the model emits an
     /// EOS token. Defaults to production stop-on-EOS behavior.
     ignore_eos: bool = false,
@@ -257,6 +259,7 @@ pub const GenerationResult = struct {
     prompt_tokens: usize = 0,
     tokens_used: usize,
     finish_reason: []const u8,
+    cached_prompt_tokens: usize = 0,
     timing_ms: ?GenerationTimingMs = null,
     speculative: ?SpeculativeDecodeStats = null,
     allocator: std.mem.Allocator,
@@ -417,6 +420,251 @@ pub const SpeculativeDecodeStats = struct {
 /// Streaming token callback. Called with each decoded text delta.
 /// Return `true` to continue generation, `false` to stop early.
 pub const TokenCallback = *const fn (ctx: *anyopaque, token_text: []const u8) bool;
+
+const StreamingTextState = struct {
+    emitted_text: []u8,
+    /// Set from the model contract, independently of tokenizer resolution.
+    /// A channel-aware model must never fall back to decoding its raw generated
+    /// tokens merely because one of the protocol tokens is missing or malformed.
+    final_channel_required: bool = false,
+    final_channel_end_token_id: ?i32 = null,
+    /// Exact token sequence for `<|channel>final\n<channel|>`. A bare
+    /// `<channel|>` also terminates private/intermediate channel headers, so it
+    /// is not sufficient evidence that subsequent content is public.
+    final_channel_header_token_ids: []const i32 = &.{},
+    channel_start_token_id: ?i32 = null,
+    turn_end_token_id: ?i32 = null,
+    inspected_token_count: usize = 0,
+    final_channel_content_start: ?usize = null,
+    final_channel_content_end: ?usize = null,
+    saw_final_channel: bool = false,
+};
+
+const gemma4_thought_channel_prompt_suffix = "<|channel>thought\n<channel|>";
+const gemma4_final_channel_prompt_suffix = "<|channel>final\n<channel|>";
+
+/// Grammar-constrained generation must start in a public channel because the
+/// grammar applies to the first generated token. Leaving the normal private
+/// `thought` channel open would make the grammar reject the final-channel
+/// transition and the fail-closed response projection would correctly withhold
+/// the entire result.
+fn openGemma4FinalChannelForGrammar(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, prompt, &std.ascii.whitespace);
+    const trailing = prompt[trimmed.len..];
+    if (std.mem.endsWith(u8, trimmed, gemma4_final_channel_prompt_suffix)) {
+        return allocator.dupe(u8, prompt);
+    }
+    if (!std.mem.endsWith(u8, trimmed, gemma4_thought_channel_prompt_suffix)) {
+        return error.GrammarRequiresGemma4ChannelPrompt;
+    }
+
+    const prefix_len = trimmed.len - gemma4_thought_channel_prompt_suffix.len;
+    const result = try allocator.alloc(
+        u8,
+        prefix_len + gemma4_final_channel_prompt_suffix.len + trailing.len,
+    );
+    errdefer allocator.free(result);
+    @memcpy(result[0..prefix_len], trimmed[0..prefix_len]);
+    @memcpy(
+        result[prefix_len .. prefix_len + gemma4_final_channel_prompt_suffix.len],
+        gemma4_final_channel_prompt_suffix,
+    );
+    @memcpy(result[result.len - trailing.len ..], trailing);
+    return result;
+}
+
+fn finalChannelContentStart(token_ids: []const i64, marker_id: ?i32) ?usize {
+    const marker = marker_id orelse return null;
+    var start: ?usize = null;
+    for (token_ids, 0..) |token_id, idx| {
+        if (token_id == marker) start = idx + 1;
+    }
+    return start;
+}
+
+const FinalChannelRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn completeFinalChannelRange(
+    token_ids: []const i64,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
+    turn_end_id: ?i32,
+) ?FinalChannelRange {
+    const start = findTokenSequenceEndingAtOrAfter(
+        token_ids,
+        final_header_token_ids,
+        0,
+    ) orelse return null;
+    var end = token_ids.len;
+    for (token_ids[start..], start..) |token_id, idx| {
+        if ((turn_end_id != null and token_id == turn_end_id.?) or
+            (channel_start_id != null and token_id == channel_start_id.?))
+        {
+            end = idx;
+            break;
+        }
+    }
+    return .{ .start = start, .end = end };
+}
+
+fn finalChannelTokenSlice(token_ids: []const i64, marker_id: ?i32) []const i64 {
+    const start = finalChannelContentStart(token_ids, marker_id) orelse return token_ids;
+    return token_ids[start..];
+}
+
+fn finalResponseTokenSlice(
+    token_ids: []const i64,
+    final_channel_required: bool,
+    marker_id: ?i32,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
+    turn_end_id: ?i32,
+) []const i64 {
+    if (!final_channel_required) return token_ids;
+    if (marker_id == null or
+        turn_end_id == null or
+        channel_start_id == null or
+        final_header_token_ids.len == 0)
+    {
+        return token_ids[0..0];
+    }
+    if (completeFinalChannelRange(
+        token_ids,
+        final_header_token_ids,
+        channel_start_id,
+        turn_end_id,
+    )) |range| {
+        return token_ids[range.start..range.end];
+    }
+    // The generation prompt for a channel-aware model opens the private
+    // `thought` channel. Until the exact final-channel header is present, every
+    // generated token is private regardless of whether generation ended by
+    // length, EOS, cancellation, or a malformed protocol boundary.
+    return token_ids[0..0];
+}
+
+fn resolveTokenId(
+    tokenizer: tokenizer_mod.Tokenizer,
+    allocator: std.mem.Allocator,
+    token_text: []const u8,
+) !?i32 {
+    const ids = try tokenizer.encode(allocator, token_text);
+    defer allocator.free(ids);
+    if (ids.len != 1) return null;
+    return ids[0];
+}
+
+fn findTokenSequenceEndingAtOrAfter(
+    token_ids: []const i64,
+    pattern: []const i32,
+    first_uninspected_end: usize,
+) ?usize {
+    if (pattern.len == 0 or token_ids.len < pattern.len) return null;
+    const first_end = @max(first_uninspected_end, pattern.len - 1);
+    for (first_end..token_ids.len) |end| {
+        if (token_ids[end] != pattern[pattern.len - 1]) continue;
+        const start = end + 1 - pattern.len;
+        var matches = true;
+        for (pattern, 0..) |expected, offset| {
+            if (token_ids[start + offset] != expected) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return end + 1;
+    }
+    return null;
+}
+
+fn emitDecodedDeltaForTokenizer(
+    tokenizer: tokenizer_mod.Tokenizer,
+    allocator: std.mem.Allocator,
+    generated_token_ids: []const i64,
+    state: *StreamingTextState,
+    on_token_fn: TokenCallback,
+    on_token_ctx: *anyopaque,
+) !bool {
+    var projected_ids = generated_token_ids;
+    if (state.final_channel_required) {
+        if (state.final_channel_end_token_id == null) return true;
+        const turn_end = state.turn_end_token_id orelse return true;
+        const channel_start_token = state.channel_start_token_id orelse return true;
+        if (state.final_channel_header_token_ids.len == 0) return true;
+
+        if (state.final_channel_content_start == null) {
+            // Generation grows monotonically. Only consider newly appended
+            // sequence ends, while allowing the header itself to straddle
+            // callbacks. This is O(new tokens * short header length) and never
+            // rescans a potentially long reasoning prefix.
+            const first_uninspected_end = @min(state.inspected_token_count, generated_token_ids.len);
+            if (findTokenSequenceEndingAtOrAfter(
+                generated_token_ids,
+                state.final_channel_header_token_ids,
+                first_uninspected_end,
+            )) |content_start| {
+                state.final_channel_content_start = content_start;
+                state.saw_final_channel = true;
+                // Let the turn-end scan below cover content appended in the
+                // same speculative batch as the final-channel header.
+                state.inspected_token_count = content_start;
+            } else {
+                state.inspected_token_count = generated_token_ids.len;
+            }
+        }
+
+        const channel_start = state.final_channel_content_start orelse return true;
+        if (state.final_channel_content_end == null) {
+            const scan_start = @max(
+                channel_start,
+                @min(state.inspected_token_count, generated_token_ids.len),
+            );
+            const turn_end_offset = std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                turn_end,
+            );
+            const next_channel_offset = std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                channel_start_token,
+            );
+            const content_end_offset = if (turn_end_offset) |turn_offset|
+                if (next_channel_offset) |channel_offset|
+                    @min(turn_offset, channel_offset)
+                else
+                    turn_offset
+            else
+                next_channel_offset;
+            if (content_end_offset) |offset| {
+                state.final_channel_content_end = scan_start + offset;
+            }
+            state.inspected_token_count = generated_token_ids.len;
+        }
+        const channel_end = state.final_channel_content_end orelse generated_token_ids.len;
+        projected_ids = generated_token_ids[channel_start..channel_end];
+    }
+
+    const decoded_ids = try allocator.alloc(i32, projected_ids.len);
+    defer allocator.free(decoded_ids);
+    for (projected_ids, 0..) |token_id, idx| decoded_ids[idx] = @intCast(token_id);
+
+    const decoded_text = try tokenizer.decode(allocator, decoded_ids);
+    defer allocator.free(decoded_text);
+
+    const prefix_len = std.mem.indexOfDiff(u8, state.emitted_text, decoded_text) orelse @min(state.emitted_text.len, decoded_text.len);
+    const delta = decoded_text[prefix_len..];
+
+    allocator.free(state.emitted_text);
+    state.emitted_text = try allocator.dupe(u8, decoded_text);
+    if (delta.len == 0) return true;
+    return on_token_fn(on_token_ctx, delta);
+}
 
 pub const KvView = struct {
     sequence_id: runtime.kv.manager.SequenceId,
@@ -1198,6 +1446,11 @@ pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+    /// Optional external lock for shared paged KV metadata/storage. Batch
+    /// generation wires every decode state in a group to the same manager and
+    /// storage runtime, so admission reads and KV mutations must share this
+    /// lock even though forward execution is serialized by the scheduler turn.
+    kv_lock: ?*std.atomic.Mutex = null,
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     pool_id: ?runtime.kv.block.KvPoolId = null,
     total_tokens: usize = 0,
@@ -1231,6 +1484,12 @@ pub const NativeDecodeState = struct {
             .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
             .shared_moe_cache = shared_moe_cache,
         };
+    }
+
+    fn lockPagedKv(self: *const NativeDecodeState) ?*std.atomic.Mutex {
+        const mutex = self.kv_lock orelse return null;
+        platform.sync.lockYielding(mutex);
+        return mutex;
     }
 
     pub fn isPaged(self: *const NativeDecodeState) bool {
@@ -1283,7 +1542,7 @@ pub const NativeDecodeState = struct {
         self.deepseek_v4_compressed_cache = null;
     }
 
-    pub fn ensureAttached(self: *NativeDecodeState) !void {
+    fn ensureAttachedUnlocked(self: *NativeDecodeState) !void {
         if (!self.isPaged()) return;
         if (self.sequence_id != null) return;
         self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
@@ -1291,6 +1550,26 @@ pub const NativeDecodeState = struct {
             const storage_sequence_id = try storage.attachSequence(storage.poolId());
             if (storage_sequence_id != self.sequence_id.?) return error.InvalidPagedKvState;
         }
+    }
+
+    pub fn seedAttachedPrefix(self: *NativeDecodeState, sequence_id: runtime.kv.manager.SequenceId, token_count: usize) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged()) return error.InvalidPagedKvState;
+        if (self.sequence_id != null) return error.InvalidPagedKvState;
+        if (self.kv_storage) |storage| {
+            if ((storage.tokenCount(sequence_id) orelse return error.InvalidPagedKvState) != token_count) return error.InvalidPagedKvState;
+        }
+        self.sequence_id = sequence_id;
+        self.total_tokens = token_count;
+        self.kv_compacted = false;
+        self.syncPagedKvViewForPrefill();
+    }
+
+    pub fn ensureAttached(self: *NativeDecodeState) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        return self.ensureAttachedUnlocked();
     }
 
     fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
@@ -1426,6 +1705,8 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn deinit(self: *NativeDecodeState) void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         if (self.kv_manager) |manager| {
             if (self.sequence_id) |sequence_id| {
                 manager.releaseSequence(sequence_id) catch {};
@@ -1458,7 +1739,9 @@ pub const NativeDecodeState = struct {
     pub fn notePrefill(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens = token_count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
             if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             try self.reservePagedKvReplayCapacity();
@@ -1477,7 +1760,9 @@ pub const NativeDecodeState = struct {
     pub fn appendPrefillChunk(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens += token_count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
             if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             try self.reservePagedKvReplayCapacity();
@@ -1496,7 +1781,9 @@ pub const NativeDecodeState = struct {
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
         self.total_tokens += 1;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
@@ -1520,7 +1807,9 @@ pub const NativeDecodeState = struct {
     pub fn appendGeneratedTokens(self: *NativeDecodeState, count: usize) !void {
         self.total_tokens += count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(count));
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
@@ -1549,6 +1838,8 @@ pub const NativeDecodeState = struct {
         const was_paged = self.isPaged();
         self.total_tokens -= count;
         if (was_paged) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
             const manager = self.kv_manager.?;
             if (self.sequence_id) |seq_id| {
                 const removed = try manager.truncateSequence(seq_id, count);
@@ -1577,6 +1868,8 @@ pub const NativeDecodeState = struct {
     /// attention output. Call after prefill, before the decode loop.
     pub fn compactKvCache(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !usize {
         if (self.deepseek_v4_compressed_cache != null) return error.DeepSeekV4CompressedKvCompactionNotSupported;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         const manager = self.kv_manager orelse return 0;
         const seq_id = self.sequence_id orelse return 0;
         const pool_id = self.pool_id orelse return error.InvalidPoolId;
@@ -1816,8 +2109,10 @@ pub fn buildOwnedBatchDecodeContext(
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
+                .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage,
         };
     }
 
@@ -1830,6 +2125,7 @@ pub fn buildOwnedBatchDecodeContext(
             .query_sequence_len = first_ctx.query_sequence_len,
             .kv_sequence_len = first_ctx.kv_sequence_len,
             .kv_position_offset = first_ctx.kv_position_offset,
+            .kv_storage = first_ctx.kv_storage,
             .kv_batch = batch,
             .moe_runtime = first_ctx.moe_runtime,
         },
@@ -1897,8 +2193,10 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
+                .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage,
             .per_item_query_len = item.query_sequence_len,
             .per_item_total_len = item.total_sequence_len,
             .per_item_kv_len = item.kv_sequence_len,
@@ -1920,6 +2218,7 @@ pub fn buildOwnedMixedBatchDecodeContext(
             .query_sequence_len = max_query_seq_len,
             .kv_sequence_len = max_kv_seq_len,
             .kv_position_offset = 0,
+            .kv_storage = items[0].state.kv_storage,
             .kv_batch = batch,
             .moe_runtime = &items[0].state.moe_runtime,
         },
@@ -2064,6 +2363,7 @@ pub const NativeGenerationPipeline = struct {
     draft_cb: ?ComputeBackend = null,
     draft_gpt_config: ?gpt_mod.Config = null,
     draft_decode_state: ?*NativeDecodeState = null,
+    prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null,
     /// Optional graph cache for graph-mode execution. When non-null,
     /// the decode loop traces the forward pass once, caches the graph,
     /// and replays it through the interpreter on subsequent steps.
@@ -2153,6 +2453,10 @@ pub const NativeGenerationPipeline = struct {
     ) !GenerationResult {
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const grammar_opens_public_final_channel =
+            config.grammar != null and
+            self.gpt_config.family == .gemma and
+            self.gpt_config.hasPle();
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
         defer fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
@@ -2167,14 +2471,19 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Format prompt
-        const prompt = if (self.prompt_override) |override|
+        var prompt = if (self.prompt_override) |override|
             try allocator.dupe(u8, override)
         else if (self.chat_template) |ct|
             try ct.apply(allocator, messages, true)
         else
             try formatMessages(allocator, messages);
-        const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer allocator.free(prompt);
+        if (grammar_opens_public_final_channel) {
+            const public_prompt = try openGemma4FinalChannelForGrammar(allocator, prompt);
+            allocator.free(prompt);
+            prompt = public_prompt;
+        }
+        const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         // Tokenize
         var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
@@ -2398,13 +2707,39 @@ pub const NativeGenerationPipeline = struct {
             debugGenerationStage("prepared compiled generation runtime prompt_token_count={d}", .{prompt_token_count});
         }
 
+        var cached_prompt_tokens: usize = 0;
+        var prefill_ids = token_ids[0..seq_len];
+        if (self.prompt_cache) |cache| {
+            const cache_eligible =
+                config.prompt_cache_enabled and
+                config.prompt_cache_key != null and
+                prepared_multimodal_prompt == null and
+                !use_speculative and
+                config.cache_compaction_ratio == null and
+                self.compiled_partition_backend == null and
+                !NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config) and
+                !self.gpt_config.isQwen35() and
+                decode_state.isPaged() and
+                decode_state.kv_manager == cache.managerPtr();
+            if (cache_eligible) {
+                const page_size = cache.pageSize() orelse 0;
+                if (page_size > 0 and seq_len > page_size) {
+                    if (try cache.attachLongestPrefix(config.prompt_cache_key.?, token_ids[0..seq_len], seq_len - page_size)) |hit| {
+                        try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
+                        cached_prompt_tokens = hit.token_count;
+                        prefill_ids = token_ids[cached_prompt_tokens..seq_len];
+                    }
+                }
+            }
+        }
+
         // Prefill
         const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (prepared_multimodal_prompt) |*prepared|
             PrefillOutput{ .last_logits = try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state) }
         else
-            try self.executePrefill(token_ids[0..seq_len], seq_len, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
+            try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
         var prefill_last_logits = prefill_output.last_logits;
         var prefill_greedy_token = prefill_output.greedy_token;
         const prefill_last_hidden = prefill_output.last_hidden;
@@ -2416,6 +2751,16 @@ pub const NativeGenerationPipeline = struct {
             "finished prefill seq_len={d} cached_logits={} greedy_token={}",
             .{ seq_len, prefill_last_logits != null, prefill_greedy_token != null },
         );
+
+        if (self.prompt_cache) |cache| {
+            if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
+                if (config.prompt_cache_key) |cache_key| {
+                    if (decode_state.sequence_id) |sequence_id| {
+                        try cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id);
+                    }
+                }
+            }
+        }
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
@@ -2466,8 +2811,40 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
-        var emitted_text: []u8 = if (stream_enabled) try allocator.dupe(u8, "") else &.{};
-        defer if (stream_enabled) allocator.free(emitted_text);
+        const final_channel_required =
+            self.gpt_config.family == .gemma and
+            self.gpt_config.hasPle() and
+            !grammar_opens_public_final_channel;
+        // Resolve the channel protocol once for the whole request. Buffered and
+        // streaming callers must use the same exact final-header projection;
+        // resolving only the generic terminator at completion can expose a
+        // malformed trailing private channel.
+        const final_channel_end = if (final_channel_required)
+            try self.resolveFinalChannelEndTokenId()
+        else
+            null;
+        const turn_end = if (final_channel_end != null)
+            try self.resolveTurnEndTokenId()
+        else
+            null;
+        const channel_start = if (final_channel_end != null)
+            try self.resolveChannelStartTokenId()
+        else
+            null;
+        const owned_final_channel_header = if (final_channel_end) |marker|
+            try self.resolveFinalChannelHeaderTokenIds(marker)
+        else
+            null;
+        defer if (owned_final_channel_header) |ids| allocator.free(ids);
+        var streaming_text = StreamingTextState{
+            .emitted_text = if (stream_enabled) try allocator.dupe(u8, "") else &.{},
+            .final_channel_required = final_channel_required,
+            .final_channel_end_token_id = final_channel_end,
+            .final_channel_header_token_ids = owned_final_channel_header orelse &.{},
+            .channel_start_token_id = channel_start,
+            .turn_end_token_id = turn_end,
+        };
+        defer if (stream_enabled) allocator.free(streaming_text.emitted_text);
         var penalty_state = SamplingPenaltyState.init(hasSamplingPenalties(config));
         defer penalty_state.deinit(allocator);
         try penalty_state.seedFromHistory(allocator, token_ids[0..seq_len]);
@@ -2507,7 +2884,7 @@ pub const NativeGenerationPipeline = struct {
                 prompt_token_count,
                 if (stream_enabled) on_token_fn else null,
                 if (stream_enabled) on_token_ctx else null,
-                if (stream_enabled) &emitted_text else null,
+                if (stream_enabled) &streaming_text else null,
             )) |decode_result| {
                 tokens_generated = decode_result.tokens_generated;
                 finish_reason = decode_result.finish_reason;
@@ -2696,7 +3073,7 @@ pub const NativeGenerationPipeline = struct {
             if (stream_enabled) {
                 const keep_streaming = try self.emitDecodedDelta(
                     token_ids[prompt_token_count..seq_len],
-                    &emitted_text,
+                    &streaming_text,
                     on_token_fn.?,
                     on_token_ctx.?,
                 );
@@ -2816,7 +3193,7 @@ pub const NativeGenerationPipeline = struct {
                     if (stream_enabled and result.accepted > 0) {
                         const keep_streaming = try self.emitDecodedDelta(
                             token_ids[prompt_token_count..seq_len],
-                            &emitted_text,
+                            &streaming_text,
                             on_token_fn.?,
                             on_token_ctx.?,
                         );
@@ -2902,7 +3279,7 @@ pub const NativeGenerationPipeline = struct {
                             prompt_token_count,
                             if (stream_enabled) on_token_fn else null,
                             if (stream_enabled) on_token_ctx else null,
-                            if (stream_enabled) &emitted_text else null,
+                            if (stream_enabled) &streaming_text else null,
                         );
                         if (speculative_stats.mtp_profile.enabled) {
                             speculative_stats.mtp_profile.fallback_calls += 1;
@@ -2935,7 +3312,7 @@ pub const NativeGenerationPipeline = struct {
                             prompt_token_count,
                             if (stream_enabled) on_token_fn else null,
                             if (stream_enabled) on_token_ctx else null,
-                            if (stream_enabled) &emitted_text else null,
+                            if (stream_enabled) &streaming_text else null,
                         );
                         if (speculative_stats.mtp_profile.enabled) {
                             speculative_stats.mtp_profile.fallback_calls += 1;
@@ -2972,7 +3349,7 @@ pub const NativeGenerationPipeline = struct {
                 prompt_token_count,
                 if (stream_enabled) on_token_fn else null,
                 if (stream_enabled) on_token_ctx else null,
-                if (stream_enabled) &emitted_text else null,
+                if (stream_enabled) &streaming_text else null,
             );
             tokens_generated = decode_result.tokens_generated;
             finish_reason = decode_result.finish_reason;
@@ -2982,13 +3359,26 @@ pub const NativeGenerationPipeline = struct {
             );
         }
 
-        // Decode only the generated tokens
+        // Decode only the generated tokens. Channel-aware models project both the
+        // public text and public token IDs from the same slice so callers cannot
+        // reconstruct a withheld reasoning channel from GenerationResult.token_ids.
         const gen_start = prompt_token_count;
-        const gen_ids = try allocator.alloc(i32, seq_len - gen_start);
-        for (0..gen_ids.len) |i| gen_ids[i] = @intCast(token_ids[gen_start + i]);
+        const final_channel_end_token_id = streaming_text.final_channel_end_token_id;
+        const turn_end_token_id = streaming_text.turn_end_token_id;
+        const projected_gen_token_ids = finalResponseTokenSlice(
+            token_ids[gen_start..seq_len],
+            streaming_text.final_channel_required,
+            final_channel_end_token_id,
+            streaming_text.final_channel_header_token_ids,
+            streaming_text.channel_start_token_id,
+            turn_end_token_id,
+        );
+        const projected_gen_ids = try allocator.alloc(i32, projected_gen_token_ids.len);
+        errdefer allocator.free(projected_gen_ids);
+        for (projected_gen_token_ids, 0..) |token_id, idx| projected_gen_ids[idx] = @intCast(token_id);
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const text = try self.tokenizer.decode(allocator, gen_ids);
+        const text = try self.tokenizer.decode(allocator, projected_gen_ids);
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
             .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
@@ -3045,10 +3435,11 @@ pub const NativeGenerationPipeline = struct {
         }
         return .{
             .text = text,
-            .token_ids = gen_ids,
+            .token_ids = projected_gen_ids,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
+            .cached_prompt_tokens = cached_prompt_tokens,
             .timing_ms = timing_ms,
             .speculative = if (use_speculative or draft_requested) speculative_stats else null,
             .allocator = allocator,
@@ -3128,6 +3519,7 @@ pub const NativeGenerationPipeline = struct {
         self: *NativeGenerationPipeline,
         prompt_ids: []const i64,
         seq_len: usize,
+        prefilled_tokens: usize,
         decode_state: *NativeDecodeState,
         config: GenerationConfig,
         allow_resident_greedy_token: bool,
@@ -3147,9 +3539,11 @@ pub const NativeGenerationPipeline = struct {
             enableCudaPrefillGreedyToken(),
         );
         debugGenerationStage(
-            "executePrefill enter seq_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
+            "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
                 seq_len,
+                prefilled_tokens,
+                prompt_ids.len,
                 decode_state.isPaged(),
                 self.scheduler != null,
                 self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null,
@@ -3164,11 +3558,12 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
-                scheduler.notePrefillProgress(lease, 0, seq_len);
+                scheduler.notePrefillProgress(lease, prefilled_tokens, seq_len);
             }
         }
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
+            if (prefilled_tokens != 0) return error.UnsupportedShape;
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
@@ -3200,6 +3595,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (decode_state.isPaged() and seq_len > 1) {
+            const query_len = prompt_ids.len;
             var current_chunk_size = blk: {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0;
                 if (config.prefill_chunk_size > 0 and scheduler_chunk > 0) {
@@ -3207,15 +3603,15 @@ pub const NativeGenerationPipeline = struct {
                 }
                 if (config.prefill_chunk_size > 0) break :blk config.prefill_chunk_size;
                 if (scheduler_chunk > 0) break :blk scheduler_chunk;
-                break :blk seq_len;
+                break :blk query_len;
             };
-            current_chunk_size = @max(@min(current_chunk_size, seq_len), 1);
+            current_chunk_size = @max(@min(current_chunk_size, query_len), 1);
             const coalesced_chunk_size = coalescedPrefillChunkSizeForFirstToken(
                 self.cb.kind(),
                 @intCast(@max(config.max_tokens, 1)),
                 !allow_resident_greedy_token,
                 enableCudaPrefillFirstToken(),
-                seq_len,
+                query_len,
                 current_chunk_size,
                 cudaPrefillFirstTokenCoalesceTokenLimit(),
             );
@@ -3223,26 +3619,27 @@ pub const NativeGenerationPipeline = struct {
             if (first_token_coalesced) {
                 debugFirstToken(
                     "prefill_first_token coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
-                    .{ current_chunk_size, coalesced_chunk_size, seq_len },
+                    .{ current_chunk_size, coalesced_chunk_size, query_len },
                 );
                 current_chunk_size = coalesced_chunk_size;
             }
             var processed: usize = 0;
-            while (processed < seq_len) {
+            while (processed < query_len) {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
                 const iteration_chunk = schedulerChunkForPrefillIteration(scheduler_chunk, current_chunk_size, first_token_coalesced);
                 const chunk_size = @max(@min(current_chunk_size, iteration_chunk), 1);
-                const chunk_end = @min(seq_len, processed + chunk_size);
+                const chunk_end = @min(query_len, processed + chunk_size);
+                const total_chunk_end = prefilled_tokens + chunk_end;
                 const chunk = prompt_ids[processed..chunk_end];
                 debugGenerationStage(
-                    "executePrefill chunk start processed={d} chunk_len={d} chunk_end={d} current_chunk_size={d}",
-                    .{ processed, chunk.len, chunk_end, current_chunk_size },
+                    "executePrefill chunk start processed={d} chunk_len={d} total_chunk_end={d} current_chunk_size={d}",
+                    .{ processed, chunk.len, total_chunk_end, current_chunk_size },
                 );
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!(chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
-                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, chunk_end, chunk.len, chunk_end == seq_len) catch |err| {
+                            if (!(total_chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
+                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
                                         continue;
@@ -3250,7 +3647,7 @@ pub const NativeGenerationPipeline = struct {
                                     return err;
                                 };
                                 processed = chunk_end;
-                                scheduler.notePrefillProgress(lease, processed, seq_len);
+                                scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
                                 continue;
                             }
                         }
@@ -3263,14 +3660,14 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 try decode_runtime.appendPrefillChunk(chunk.len);
-                const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
-                if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
-                    if (try self.tryCudaPreparedTailPrefillGreedy(chunk, chunk_end, &decode_context, capture_last_hidden)) |prepared| {
+                const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
+                if (total_chunk_end == seq_len and use_cuda_prefill_greedy_token) {
+                    if (try self.tryCudaPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)) |prepared| {
                         prefill_greedy_token = prepared.greedy_token;
                         prefill_last_hidden = prepared.last_hidden;
                         prefill_last_hidden_rows = prepared.last_hidden_rows;
                     } else if (capture_last_hidden) {
-                        var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                        var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
                             if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                 current_chunk_size = @max(chunk_size / 2, 1);
                                 continue;
@@ -3285,7 +3682,7 @@ pub const NativeGenerationPipeline = struct {
                         prefill_last_hidden = greedy_hidden.hidden;
                         prefill_last_hidden_rows = greedy_hidden.rows;
                     } else {
-                        prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                        prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
                             if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                 current_chunk_size = @max(chunk_size / 2, 1);
                                 continue;
@@ -3298,7 +3695,7 @@ pub const NativeGenerationPipeline = struct {
                         .{prefill_greedy_token.?},
                     );
                 } else {
-                    const logits = self.forwardAllLogits(chunk, 1, chunk_end, &decode_context) catch |err| {
+                    const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
                         if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                             current_chunk_size = @max(chunk_size / 2, 1);
                             continue;
@@ -3307,10 +3704,10 @@ pub const NativeGenerationPipeline = struct {
                     };
                     defer allocator.free(logits);
                     debugGenerationStage(
-                        "executePrefill chunk complete processed={d} chunk_end={d} logits_len={d}",
-                        .{ processed, chunk_end, logits.len },
+                        "executePrefill chunk complete processed={d} total_chunk_end={d} logits_len={d}",
+                        .{ processed, total_chunk_end, logits.len },
                     );
-                    if (chunk_end == seq_len) {
+                    if (total_chunk_end == seq_len) {
                         prefill_last_logits = try allocator.dupe(f32, logits[(chunk.len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
                         debugGenerationStage(
                             "executePrefill captured last logits vocab_size={d}",
@@ -3321,12 +3718,13 @@ pub const NativeGenerationPipeline = struct {
                 processed = chunk_end;
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
-                        scheduler.notePrefillProgress(lease, processed, seq_len);
+                        scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
                         scheduler.finishTurn(lease, .prefill);
                     }
                 }
             }
         } else {
+            if (prefilled_tokens != 0) return error.UnsupportedShape;
             if (self.scheduler) |scheduler| {
                 if (self.scheduler_lease) |lease| {
                     if (self.io) |io| {
@@ -3440,28 +3838,51 @@ pub const NativeGenerationPipeline = struct {
         }
     }
 
+    fn resolveFinalChannelEndTokenId(self: *NativeGenerationPipeline) !?i32 {
+        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        return resolveTokenId(self.tokenizer, self.allocator, "<channel|>");
+    }
+
+    fn resolveFinalChannelHeaderTokenIds(
+        self: *NativeGenerationPipeline,
+        final_channel_end_token_id: i32,
+    ) !?[]i32 {
+        const ids = try self.tokenizer.encode(
+            self.allocator,
+            "<|channel>final\n<channel|>",
+        );
+        errdefer self.allocator.free(ids);
+        if (ids.len == 0 or ids[ids.len - 1] != final_channel_end_token_id) {
+            self.allocator.free(ids);
+            return null;
+        }
+        return ids;
+    }
+
+    fn resolveChannelStartTokenId(self: *NativeGenerationPipeline) !?i32 {
+        return resolveTokenId(self.tokenizer, self.allocator, "<|channel>");
+    }
+
+    fn resolveTurnEndTokenId(self: *NativeGenerationPipeline) !?i32 {
+        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        return resolveTokenId(self.tokenizer, self.allocator, "<turn|>");
+    }
+
     fn emitDecodedDelta(
         self: *NativeGenerationPipeline,
         generated_token_ids: []const i64,
-        emitted_text: *[]u8,
+        state: *StreamingTextState,
         on_token_fn: TokenCallback,
         on_token_ctx: *anyopaque,
     ) !bool {
-        const allocator = self.allocator;
-        const decoded_ids = try allocator.alloc(i32, generated_token_ids.len);
-        defer allocator.free(decoded_ids);
-        for (generated_token_ids, 0..) |token_id, idx| decoded_ids[idx] = @intCast(token_id);
-
-        const decoded_text = try self.tokenizer.decode(allocator, decoded_ids);
-        defer allocator.free(decoded_text);
-
-        const prefix_len = std.mem.indexOfDiff(u8, emitted_text.*, decoded_text) orelse @min(emitted_text.*.len, decoded_text.len);
-        const delta = decoded_text[prefix_len..];
-
-        allocator.free(emitted_text.*);
-        emitted_text.* = try allocator.dupe(u8, decoded_text);
-        if (delta.len == 0) return true;
-        return on_token_fn(on_token_ctx, delta);
+        return emitDecodedDeltaForTokenizer(
+            self.tokenizer,
+            self.allocator,
+            generated_token_ids,
+            state,
+            on_token_fn,
+            on_token_ctx,
+        );
     }
 
     fn tryReturnPrefillFirstToken(
@@ -3479,7 +3900,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
     ) !?DecodeResult {
         if (!shouldUsePrefillFirstTokenPath(self.cb.kind(), max_tokens, false, enableCudaPrefillFirstToken())) {
             debugFirstToken(
@@ -3620,7 +4041,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
     ) !DecodeResult {
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
@@ -3867,7 +4288,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
         tokens_generated: *usize,
         finish_reason: *[]const u8,
     ) !bool {
@@ -3988,7 +4409,7 @@ pub const NativeGenerationPipeline = struct {
         prompt_token_count: usize,
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
-        emitted_text: ?*[]u8,
+        emitted_text: ?*StreamingTextState,
     ) !?DecodeResult {
         _ = prompt_token_count;
         if (!enableCudaGreedyPendingTokenReadback()) return null;
@@ -7071,10 +7492,9 @@ pub const NativeGenerationPipeline = struct {
             .token_id = token_id,
             .seq_len = seq_len,
         };
-        try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
+        const pending_options = pendingWorkOptionsFromState(decode_state, 1);
+        try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
         defer if (!work.ready) scheduler.cancelDecodeWork(@ptrCast(&work));
-        notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .decode, 1);
-        notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .decode);
 
         var driver = DecodeStepDriver{
             .pipeline = self,
@@ -7111,10 +7531,9 @@ pub const NativeGenerationPipeline = struct {
             .query_seq_len = query_seq_len,
             .wants_last_logits = wants_last_logits,
         };
-        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
+        const pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
         defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
-        notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .prefill, query_seq_len);
-        notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .prefill);
 
         var driver = PrefillStepDriver{
             .pipeline = self,
@@ -7484,6 +7903,8 @@ fn stepBudgetFromState(
     decode_state: *NativeDecodeState,
 ) runtime.scheduler.native_generate.StepBudget {
     var budget = scheduler.defaultStepBudget();
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
     const km = decode_state.kv_manager orelse return budget;
     const pool_id = decode_state.pool_id orelse return budget;
     const avail = km.poolAvailableBlocks(pool_id) orelse return budget;
@@ -7502,10 +7923,27 @@ fn notePendingKvBlocksFromState(
     phase: runtime.scheduler.native_generate.Phase,
     additional_tokens: usize,
 ) void {
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
     const km = decode_state.kv_manager orelse return;
     const seq_id = decode_state.sequence_id orelse return;
     const est = km.estimateBlocksFor(seq_id, additional_tokens) orelse return;
     scheduler.notePendingKvBlocks(work_ptr, phase, est);
+}
+
+fn pendingWorkOptionsFromState(
+    decode_state: *NativeDecodeState,
+    additional_tokens: usize,
+) runtime.scheduler.native_generate.PendingWorkOptions {
+    var options = runtime.scheduler.native_generate.PendingWorkOptions{
+        .exclusive_step = decode_state.deepseek_v4_compressed_cache != null,
+    };
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
+    const km = decode_state.kv_manager orelse return options;
+    const seq_id = decode_state.sequence_id orelse return options;
+    options.kv_blocks_estimate = km.estimateBlocksFor(seq_id, additional_tokens) orelse 0;
+    return options;
 }
 
 fn notePendingExclusiveStepFromState(
@@ -7697,6 +8135,238 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
     try std.testing.expectEqual(@as(i32, 3), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[2]);
+}
+
+test "grammar prompt opens Gemma4 public final channel" {
+    const allocator = std.testing.allocator;
+    const thought_prompt =
+        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
+        gemma4_thought_channel_prompt_suffix ++ "\n";
+    const expected =
+        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
+        gemma4_final_channel_prompt_suffix ++ "\n";
+    const opened = try openGemma4FinalChannelForGrammar(allocator, thought_prompt);
+    defer allocator.free(opened);
+    try std.testing.expectEqualStrings(expected, opened);
+
+    const already_open = try openGemma4FinalChannelForGrammar(allocator, expected);
+    defer allocator.free(already_open);
+    try std.testing.expectEqualStrings(expected, already_open);
+
+    try std.testing.expectError(
+        error.GrammarRequiresGemma4ChannelPrompt,
+        openGemma4FinalChannelForGrammar(allocator, "<bos>raw prompt"),
+    );
+}
+
+test "final channel projection requires exact header and stops before trailing channels" {
+    const header = [_]i32{ 102, 103, 104, 101 };
+    const ids = [_]i64{ 7, 101, 9, 102, 103, 104, 101, 10, 106 };
+    try std.testing.expectEqual(@as(?usize, 7), finalChannelContentStart(&ids, 101));
+    try std.testing.expectEqualSlices(i64, &.{ 10, 106 }, finalChannelTokenSlice(&ids, 101));
+    try std.testing.expectEqualSlices(i64, &ids, finalChannelTokenSlice(&ids, null));
+    try std.testing.expectEqualSlices(i64, &ids, finalChannelTokenSlice(&ids, 999));
+    const range = completeFinalChannelRange(&ids, &header, 102, 106) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 7), range.start);
+    try std.testing.expectEqual(@as(usize, 8), range.end);
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{10},
+        finalResponseTokenSlice(&ids, true, 101, &header, 102, 106),
+    );
+
+    const malformed_trailing = [_]i64{
+        7,   101, 9,   102, 103, 104, 101, 10,
+        102, 103, 104, 101, 7,   106,
+    };
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{10},
+        finalResponseTokenSlice(&malformed_trailing, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 101, 10 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, null, &.{}, null, null),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        finalResponseTokenSlice(&.{ 7, 8 }, false, null, &.{}, null, null),
+    );
+}
+
+test "streaming final channel projection ignores intermediate boundaries and streams final text" {
+    const allocator = std.testing.allocator;
+    const tokenizer_json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "<unk>": 0,
+        \\      "reasoning": 7,
+        \\      "answer": 8,
+        \\      " follows": 9,
+        \\      "<channel|>": 101,
+        \\      "<turn|>": 106
+        \\    },
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 101, "content": "<channel|>", "special": true},
+        \\    {"id": 106, "content": "<turn|>", "special": true}
+        \\  ]
+        \\}
+    ;
+
+    var tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    defer tok.deinitSelf();
+    const tokenizer = tok.tokenizer();
+    try std.testing.expectEqual(@as(?i32, 101), try resolveTokenId(tokenizer, allocator, "<channel|>"));
+    try std.testing.expectEqual(@as(?i32, 106), try resolveTokenId(tokenizer, allocator, "<turn|>"));
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        text: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, delta: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.text.appendSlice(self.allocator, delta) catch return false;
+            return true;
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.text.deinit(allocator);
+    var state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = 106,
+    };
+    defer allocator.free(state.emitted_text);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{7},
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("", capture.text.items);
+    try std.testing.expect(!state.saw_final_channel);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("", capture.text.items);
+    try std.testing.expect(!state.saw_final_channel);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("", capture.text.items);
+    try std.testing.expect(!state.saw_final_channel);
+
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103, 104, 101, 8 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("answer", capture.text.items);
+    try std.testing.expect(state.saw_final_channel);
+
+    // The normal autoregressive decoder consumes the turn token as EOS without
+    // appending it, while speculative paths may retain it. Neither path should
+    // delay or duplicate the final streamed text.
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103, 104, 101, 8, 9, 106 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("answer follows", capture.text.items);
+
+    // A malformed continuation after the final channel must fail closed before
+    // any subsequent channel name or private content reaches the callback.
+    var trailing_capture = Capture{ .allocator = allocator };
+    defer trailing_capture.text.deinit(allocator);
+    var trailing_state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = 106,
+    };
+    defer allocator.free(trailing_state.emitted_text);
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 102, 103, 104, 101, 8, 9, 102, 103, 104, 101, 7 },
+        &trailing_state,
+        Capture.callback,
+        &trailing_capture,
+    ));
+    try std.testing.expectEqualStrings("answer follows", trailing_capture.text.items);
+
+    // Tokenizer metadata is part of the security boundary. A channel-aware
+    // model with an incomplete protocol vocabulary must buffer indefinitely
+    // rather than falling back to raw reasoning text.
+    var incomplete_capture = Capture{ .allocator = allocator };
+    defer incomplete_capture.text.deinit(allocator);
+    var incomplete_state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = null,
+    };
+    defer allocator.free(incomplete_state.emitted_text);
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8 },
+        &incomplete_state,
+        Capture.callback,
+        &incomplete_capture,
+    ));
+    try std.testing.expectEqualStrings("", incomplete_capture.text.items);
 }
 
 test "shouldAddBosToken keeps bos when prompt lacks literal prefix" {
@@ -7901,7 +8571,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
 
     var work_byte: u8 = 1;
     coordinator.beginDecode(&lease, 4);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0, .{});
 
     const StubDriver = struct {
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -8026,8 +8696,8 @@ test "runStepLoop drains a multi-item step from a stub driver" {
 
     coordinator.beginDecode(&lease_a, 4);
     coordinator.beginDecode(&lease_b, 4);
-    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&work_a), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&work_b), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&work_a), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&work_b), 5, 5, 0, .{});
 
     const StubDriver = struct {
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -8149,7 +8819,7 @@ test "notePendingKvBlocksFromState plumbs estimate to scheduler" {
     defer coordinator.release(lease);
 
     var work_a: u8 = 0;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_a), 7, 7, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_a), 7, 7, 0, .{});
 
     notePendingKvBlocksFromState(&coordinator, &decode_state, @ptrCast(&work_a), .decode, 1);
 
@@ -8158,7 +8828,7 @@ test "notePendingKvBlocksFromState plumbs estimate to scheduler" {
 
     // A larger overflow: 5 tokens vs 2-token slack → 1 new block.
     var work_b: u8 = 1;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_b), 11, 11, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_b), 11, 11, 0, .{});
     notePendingKvBlocksFromState(&coordinator, &decode_state, @ptrCast(&work_b), .decode, 5);
     try std.testing.expectEqual(@as(?usize, 1), coordinator.pendingKvBlocksEstimate(@ptrCast(&work_b), .decode));
 }
@@ -8179,14 +8849,14 @@ test "notePendingExclusiveStepFromState marks DeepSeek V4 compressed cache work"
     defer coordinator.release(lease);
 
     var normal_work: u8 = 0;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_work), 7, 7, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_work), 7, 7, 0, .{});
     notePendingExclusiveStepFromState(&coordinator, &decode_state, @ptrCast(&normal_work), .decode);
     try std.testing.expectEqual(@as(?bool, false), coordinator.pendingRequiresExclusiveStep(@ptrCast(&normal_work), .decode));
 
     decode_state.deepseek_v4_compressed_cache = try gpt_arch.DeepSeekV4CompressedCache.init(allocator, 1);
 
     var compressed_work: u8 = 1;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&compressed_work), 8, 8, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&compressed_work), 8, 8, 0, .{});
     notePendingExclusiveStepFromState(&coordinator, &decode_state, @ptrCast(&compressed_work), .decode);
     try std.testing.expectEqual(@as(?bool, true), coordinator.pendingRequiresExclusiveStep(@ptrCast(&compressed_work), .decode));
 }
@@ -8625,11 +9295,12 @@ test "native decode state deinit releases paged sequence" {
     });
     var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
     try state.notePrefill(5);
-    try std.testing.expect(manager.tokenCount(state.sequence_id.?).? > 0);
+    const sequence_id = state.sequence_id.?;
+    try std.testing.expect(manager.tokenCount(sequence_id).? > 0);
 
     state.deinit();
     try std.testing.expectEqual(@as(?runtime.kv.manager.SequenceId, null), state.sequence_id);
-    try std.testing.expectEqual(@as(usize, 0), manager.tokenCount(1).?);
+    try std.testing.expectEqual(@as(?usize, null), manager.tokenCount(sequence_id));
 }
 
 test "native decode state reports retained kv window offsets after trim" {
@@ -8676,10 +9347,21 @@ test "owned batch decode context captures per-item kv bindings" {
         .num_kv_heads = 8,
         .head_dim = 64,
     });
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 2,
+        .num_kv_heads = 8,
+        .head_dim = 64,
+    });
+    defer storage.deinit();
 
     var first = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    first.kv_storage = &storage;
     defer first.deinit();
     var second = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    second.kv_storage = &storage;
     defer second.deinit();
 
     try first.notePrefill(6);
@@ -8693,6 +9375,9 @@ test "owned batch decode context captures per-item kv bindings" {
     try std.testing.expect(owned.context.kv_batch != null);
     try std.testing.expectEqual(first.sequence_id.?, owned.kv_batch.?[0].kv_cache.sequence_id);
     try std.testing.expectEqual(second.sequence_id.?, owned.kv_batch.?[1].kv_cache.sequence_id);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_cache.kv_storage);
 }
 
 test "mixed batch decode context captures per-item overrides" {
@@ -8708,10 +9393,21 @@ test "mixed batch decode context captures per-item overrides" {
         .num_kv_heads = 8,
         .head_dim = 64,
     });
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 2,
+        .num_kv_heads = 8,
+        .head_dim = 64,
+    });
+    defer storage.deinit();
 
     var prefill = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    prefill.kv_storage = &storage;
     defer prefill.deinit();
     var decode = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    decode.kv_storage = &storage;
     defer decode.deinit();
 
     try prefill.notePrefill(8);
@@ -8743,6 +9439,9 @@ test "mixed batch decode context captures per-item overrides" {
     try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_prefill, owned.context.attention_mode);
     try std.testing.expectEqual(@as(?contracts.AttentionMode, .paged_decode), owned.kv_batch.?[0].per_item_mode);
     try std.testing.expectEqual(@as(?contracts.AttentionMode, .paged_prefill), owned.kv_batch.?[1].per_item_mode);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[1].kv_cache.kv_storage);
 }
 
 test "mixed batch decode context keeps single item on direct kv cache path" {

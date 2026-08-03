@@ -175,6 +175,8 @@ pub fn estimateStructuredFilterSample(
 
     const filter_query_json = try buildStructuredFilterSampleQueryJsonAlloc(alloc, req) orelse return null;
     defer alloc.free(filter_query_json);
+    var prepared_filter = try graph_exec.PreparedPatternFilter.init(alloc, filter_query_json);
+    defer prepared_filter.deinit();
 
     const byte_range = core.byteRange();
     const lower = try core.documentRangeLowerAlloc(byte_range.start);
@@ -198,7 +200,7 @@ pub fn estimateStructuredFilterSample(
             try mapper.materializeDocumentValueAlloc(alloc, doc.value);
         defer alloc.free(doc_json);
         sampled += 1;
-        if (try graph_exec.storedDocMatchesPatternFilter(alloc, raw_key, doc_json, filter_query_json)) {
+        if (try prepared_filter.matchesStored(alloc, raw_key, doc_json)) {
             matched += 1;
         }
         if (sampled >= sample_size) break;

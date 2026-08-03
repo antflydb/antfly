@@ -160,39 +160,11 @@ pub const MatchPhraseQuery = struct {
     fuzziness: ?Fuzziness = null,
 };
 
-pub const MatchQueryOperator = enum {
-    @"or",
-    @"and",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"or" => "or",
-            .@"and" => "and",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "or", .@"or" },
-            .{ "and", .@"and" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    operator: ?MatchQueryOperator = null,
 };
 
 pub const MultiMatchBodyType = enum {
@@ -259,7 +231,6 @@ pub const PrefixQuery = struct {
 
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
-    match_query: *MatchQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     numeric_range_query: *NumericRangeQuery,
     term_range_query: *TermRangeQuery,
@@ -267,6 +238,7 @@ pub const Query = union(enum) {
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
     geo_distance_query: *GeoDistanceQuery,
+    match_query: *MatchQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
@@ -288,7 +260,9 @@ pub const Query = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -322,16 +296,6 @@ pub const Query = union(enum) {
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "match",
-            "field",
-            "analyzer",
-            "prefix_length",
-            "fuzziness",
-            "operator",
-        })) {
-            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "field",
@@ -390,6 +354,13 @@ pub const Query = union(enum) {
             "field",
         })) {
             if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "field",
+            "analyzer",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "terms",
@@ -500,7 +471,6 @@ pub const Query = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
-            .match_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
             .term_range_query => |v| try jw.write(v.*),
@@ -508,6 +478,7 @@ pub const Query = union(enum) {
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),

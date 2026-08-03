@@ -28,6 +28,19 @@ pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
 };
 
+/// Process-local hook used by composed runtimes to replace a filesystem DB
+/// open with another storage implementation. The options pointer is opaque here
+/// to keep the executor layer independent of the DB module; DB.open is the sole
+/// caller and passes a `*db.OpenOptions`.
+pub const DbOpenConfigurator = struct {
+    ptr: *anyopaque,
+    configure_fn: *const fn (ptr: *anyopaque, path: []const u8, options: *anyopaque) anyerror!void,
+
+    pub fn configure(self: @This(), path: []const u8, options: anytype) !void {
+        try self.configure_fn(self.ptr, path, @ptrCast(options));
+    }
+};
+
 pub const DurableJobLane = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -90,27 +103,128 @@ fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
     alloc.destroy(io_impl);
 }
 
+const OwnerRegistry = struct {
+    const State = struct {
+        closing: bool = false,
+        in_flight: usize = 0,
+    };
+
+    alloc: Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    states: std.AutoHashMapUnmanaged(u64, State) = .empty,
+
+    fn init(alloc: Allocator) OwnerRegistry {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *OwnerRegistry) void {
+        var iterator = self.states.valueIterator();
+        while (iterator.next()) |state| std.debug.assert(state.in_flight == 0);
+        self.states.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn register(self: *OwnerRegistry, owner_id: u64) !void {
+        if (owner_id == 0) return error.InvalidBackgroundOwner;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.states.contains(owner_id)) return error.BackgroundOwnerIdExhausted;
+        try self.states.putNoClobber(self.alloc, owner_id, .{});
+    }
+
+    fn beginJob(self: *OwnerRegistry, owner_id: u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.states.getPtr(owner_id) orelse return error.BackgroundOwnerClosed;
+        if (state.closing) return error.BackgroundOwnerClosing;
+        if (state.in_flight == std.math.maxInt(usize)) return error.BackgroundOwnerCapacityExceeded;
+        state.in_flight += 1;
+    }
+
+    fn finishJob(self: *OwnerRegistry, owner_id: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.states.getPtr(owner_id) orelse {
+            std.debug.panic("background owner {} retired with a job in flight", .{owner_id});
+        };
+        std.debug.assert(state.in_flight > 0);
+        state.in_flight -= 1;
+    }
+
+    fn beginClose(self: *OwnerRegistry, owner_id: u64) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.states.getPtr(owner_id) orelse return false;
+        state.closing = true;
+        return true;
+    }
+
+    fn waitIdle(self: *OwnerRegistry, owner_id: u64) void {
+        while (true) {
+            lockAtomic(&self.mutex);
+            const idle = if (self.states.getPtr(owner_id)) |state|
+                state.in_flight == 0
+            else
+                true;
+            self.mutex.unlock();
+            if (idle) return;
+            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+
+    fn retireClosed(self: *OwnerRegistry, owner_id: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.states.getPtr(owner_id) orelse return;
+        std.debug.assert(state.closing);
+        std.debug.assert(state.in_flight == 0);
+        _ = self.states.remove(owner_id);
+    }
+
+    fn close(self: *OwnerRegistry, owner_id: u64) void {
+        if (!self.beginClose(owner_id)) return;
+        self.waitIdle(owner_id);
+        self.retireClosed(owner_id);
+    }
+};
+
 pub const BackendRuntime = struct {
     alloc: Allocator,
     backend: Backend,
-    next_owner_id: AtomicU64 = .init(1),
+    next_owner_id: AtomicU64,
+    retired_generation_cleanup_owner_id: u64,
+    owner_registry: *OwnerRegistry,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
     api_io_impl: ?*IoImpl = null,
-    inline_jobs: InlineDurableJobLane = .{},
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
+    db_open_configurator: ?DbOpenConfigurator = null,
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);
 
+        const owner_registry = try alloc.create(OwnerRegistry);
+        errdefer alloc.destroy(owner_registry);
+        owner_registry.* = OwnerRegistry.init(alloc);
+        errdefer owner_registry.deinit();
+        const retired_generation_cleanup_owner_id: u64 = 1;
+        try owner_registry.register(retired_generation_cleanup_owner_id);
+
         var runtime = BackendRuntime{
             .alloc = alloc,
             .backend = config.backend,
+            .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
+            .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
+            .owner_registry = owner_registry,
             .durable_jobs = undefined,
         };
-        runtime.durable_jobs = runtime.inline_jobs.lane();
+        runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
 
         if (config.backend != .manual) {
             if (comptime builtin.os.tag == .freestanding) {
@@ -127,7 +241,7 @@ pub const BackendRuntime = struct {
 
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
-                threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl);
+                threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
                 try threaded_jobs.start();
                 errdefer threaded_jobs.deinit();
 
@@ -165,6 +279,8 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
             self.io_impl = null;
         }
+        self.owner_registry.deinit();
+        self.alloc.destroy(self.owner_registry);
         self.* = undefined;
     }
 
@@ -198,8 +314,13 @@ pub const BackendRuntime = struct {
         return self.api_io_impl orelse self.io_impl;
     }
 
-    pub fn allocOwnerId(self: *BackendRuntime) u64 {
-        return self.next_owner_id.fetchAdd(1, .monotonic);
+    pub fn allocOwnerId(self: *BackendRuntime) !u64 {
+        while (true) {
+            const owner_id = self.next_owner_id.fetchAdd(1, .monotonic);
+            if (owner_id == 0) continue;
+            try self.owner_registry.register(owner_id);
+            return owner_id;
+        }
     }
 };
 
@@ -229,21 +350,30 @@ pub const BackendRuntimeHandle = struct {
 };
 
 const InlineDurableJobLane = struct {
-    fn lane(self: *InlineDurableJobLane) DurableJobLane {
+    fn lane(owners: *OwnerRegistry) DurableJobLane {
         return .{
-            .ptr = self,
+            .ptr = owners,
             .vtable = &inline_vtable,
         };
     }
 
-    fn submit(_: *anyopaque, job: Job) !void {
+    fn submit(ptr: *anyopaque, job: Job) !void {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        try owners.beginJob(job.owner_id);
+        defer owners.finishJob(job.owner_id);
         try job.run(job.ptr);
         job.deinit(job.ptr);
     }
 
-    fn drainOwner(_: *anyopaque, _: u64) void {}
+    fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        owners.waitIdle(owner_id);
+    }
 
-    fn closeOwner(_: *anyopaque, _: u64) void {}
+    fn closeOwner(ptr: *anyopaque, owner_id: u64) void {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        owners.close(owner_id);
+    }
 
     fn poll(_: *anyopaque, _: usize) !usize {
         return 0;
@@ -258,7 +388,7 @@ const inline_vtable = DurableJobLane.VTable{
 };
 
 const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
-    fn init(_: Allocator, _: *IoImpl) ThreadedDurableJobLane {
+    fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
 
@@ -286,33 +416,36 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 } else struct {
     const Entry = struct {
+        lane: *ThreadedDurableJobLane,
         job: Job,
         future: Io.Future(void),
         completed: std.atomic.Value(bool) = .init(false),
+        job_deinited: std.atomic.Value(bool) = .init(false),
 
         fn deinitJobOnce(self: *Entry) void {
+            if (self.job_deinited.swap(true, .acq_rel)) return;
             self.job.deinit(self.job.ptr);
         }
     };
 
-    const OwnerState = struct {
-        owner_id: u64,
-        closing: bool = false,
-    };
+    const reap_batch_limit: usize = 4096;
+    const idle_reap_interval_ms: u64 = 10;
 
     alloc: Allocator,
     io_impl: *IoImpl,
+    owners: *OwnerRegistry,
     mutex: std.atomic.Mutex = .unlocked,
     reap_mutex: std.atomic.Mutex = .unlocked,
     shutdown_reaper: std.atomic.Value(bool) = .init(false),
+    completed_count: std.atomic.Value(usize) = .init(0),
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
-    owner_states: std.ArrayListUnmanaged(OwnerState) = .empty,
 
-    fn init(alloc: Allocator, io_impl: *IoImpl) ThreadedDurableJobLane {
+    fn init(alloc: Allocator, io_impl: *IoImpl, owners: *OwnerRegistry) ThreadedDurableJobLane {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .owners = owners,
         };
     }
 
@@ -334,15 +467,17 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
             self.reaper_future = null;
         }
         self.drainAll();
-        self.owner_states.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.* = undefined;
     }
 
     fn submit(ptr: *anyopaque, job: Job) !void {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        try self.owners.beginJob(job.owner_id);
+        errdefer self.owners.finishJob(job.owner_id);
         const entry = try self.alloc.create(Entry);
         entry.* = .{
+            .lane = self,
             .job = job,
             .future = undefined,
         };
@@ -350,7 +485,6 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.ownerIsClosingLocked(job.owner_id)) return error.BackgroundOwnerClosing;
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
         entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
         self.entries.appendAssumeCapacity(entry);
@@ -363,10 +497,10 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     fn closeOwner(ptr: *anyopaque, owner_id: u64) void {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
-        self.markOwnerClosing(owner_id) catch |err| {
-            std.log.warn("background durable job owner close state allocation failed owner={} err={s}", .{ owner_id, @errorName(err) });
-        };
+        if (!self.owners.beginClose(owner_id)) return;
         self.drainMatching(owner_id);
+        self.owners.waitIdle(owner_id);
+        self.owners.retireClosed(owner_id);
     }
 
     fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
@@ -382,15 +516,30 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
                 @errorName(err),
             });
         };
+        // The payload often owns the transaction state and buffers that make
+        // a durable job large. Release it on the worker at the actual lifetime
+        // boundary instead of retaining it until the bookkeeping reaper joins
+        // the already-completed future. `deinitJobOnce` also makes concurrent
+        // owner drains safe.
+        entry.deinitJobOnce();
+        // Publish the count first. It is only a wake/drain hint; the release
+        // store below remains authoritative. Publishing in this order also
+        // prevents a reaper from freeing `entry` before this worker's last
+        // access to it.
+        entry.lane.owners.finishJob(entry.job.owner_id);
+        _ = entry.lane.completed_count.fetchAdd(1, .monotonic);
         entry.completed.store(true, .release);
     }
 
     fn reaperLoop(self: *ThreadedDurableJobLane) void {
         while (!self.shutdown_reaper.load(.acquire)) {
-            _ = self.reapCompleted(32);
-            self.io_impl.io().sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+            const reaped = self.reapCompleted(reap_batch_limit);
+            // Drain a backlog without an artificial rate cap. At idle, a
+            // short sleep avoids scanning the active set continuously.
+            if (reaped == reap_batch_limit or self.completed_count.load(.monotonic) > 0) continue;
+            self.io_impl.io().sleep(Io.Duration.fromMilliseconds(idle_reap_interval_ms), .awake) catch {};
         }
-        while (self.reapCompleted(32) > 0) {}
+        while (self.reapCompleted(reap_batch_limit) > 0) {}
     }
 
     fn drainAll(self: *ThreadedDurableJobLane) void {
@@ -411,69 +560,57 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         }
     }
 
-    fn markOwnerClosing(self: *ThreadedDurableJobLane, owner_id: u64) !void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.findOwnerStateLocked(owner_id)) |idx| {
-            self.owner_states.items[idx].closing = true;
-            return;
-        }
-        try self.owner_states.append(self.alloc, .{
-            .owner_id = owner_id,
-            .closing = true,
-        });
-    }
-
-    fn ownerIsClosingLocked(self: *ThreadedDurableJobLane, owner_id: u64) bool {
-        if (self.findOwnerStateLocked(owner_id)) |idx| return self.owner_states.items[idx].closing;
-        return false;
-    }
-
-    fn findOwnerStateLocked(self: *ThreadedDurableJobLane, owner_id: u64) ?usize {
-        for (self.owner_states.items, 0..) |state, idx| {
-            if (state.owner_id == owner_id) return idx;
-        }
-        return null;
-    }
-
     fn reapCompleted(self: *ThreadedDurableJobLane, max_jobs: usize) usize {
+        if (max_jobs == 0 or self.completed_count.load(.monotonic) == 0) return 0;
         lockAtomic(&self.reap_mutex);
         defer self.reap_mutex.unlock();
-        var reaped: usize = 0;
-        while (reaped < max_jobs) : (reaped += 1) {
-            const entry = self.popCompleted() orelse return reaped;
-            self.awaitAndDestroy(entry);
+
+        // Detach completed entries in one pass. The previous implementation
+        // repeatedly called orderedRemove, shifting the entire tail for every
+        // completed job. A large ingest could therefore retain millions of
+        // finished payloads while spending most of a core in memmove.
+        var detached: [reap_batch_limit]*Entry = undefined;
+        const target = @min(max_jobs, detached.len);
+        var detached_count: usize = 0;
+        lockAtomic(&self.mutex);
+        var idx: usize = 0;
+        while (idx < self.entries.items.len and detached_count < target) {
+            const entry = self.entries.items[idx];
+            if (!entry.completed.load(.acquire)) {
+                idx += 1;
+                continue;
+            }
+            detached[detached_count] = entry;
+            detached_count += 1;
+            _ = self.entries.swapRemove(idx);
         }
-        return reaped;
+        self.mutex.unlock();
+
+        for (detached[0..detached_count]) |entry| self.awaitAndDestroy(entry);
+        return detached_count;
     }
 
     fn popAny(self: *ThreadedDurableJobLane) ?*Entry {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.entries.items.len == 0) return null;
-        return self.entries.orderedRemove(0);
+        return self.entries.swapRemove(0);
     }
 
     fn popOwner(self: *ThreadedDurableJobLane, owner_id: u64) ?*Entry {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (self.entries.items, 0..) |entry, idx| {
-            if (entry.job.owner_id == owner_id) return self.entries.orderedRemove(idx);
-        }
-        return null;
-    }
-
-    fn popCompleted(self: *ThreadedDurableJobLane) ?*Entry {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.entries.items, 0..) |entry, idx| {
-            if (entry.completed.load(.acquire)) return self.entries.orderedRemove(idx);
+            if (entry.job.owner_id == owner_id) return self.entries.swapRemove(idx);
         }
         return null;
     }
 
     fn awaitAndDestroy(self: *ThreadedDurableJobLane, entry: *Entry) void {
         _ = entry.future.await(self.io_impl.io());
+        if (entry.completed.swap(false, .acq_rel)) {
+            _ = self.completed_count.fetchSub(1, .monotonic);
+        }
         entry.deinitJobOnce();
         self.alloc.destroy(entry);
     }
@@ -526,9 +663,10 @@ test "backend runtime durable lane runs inline jobs" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
-        .owner_id = 1,
+        .owner_id = owner_id,
         .class = .maintenance,
         .ptr = &ctx,
         .run = Fns.run,
@@ -560,9 +698,10 @@ test "backend runtime durable lane leaves inline failed jobs owned by caller" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try std.testing.expectError(error.ExpectedFailure, handle.ptr().durable_jobs.submit(.{
-        .owner_id = 1,
+        .owner_id = owner_id,
         .class = .maintenance,
         .ptr = &ctx,
         .run = Fns.run,
@@ -597,17 +736,18 @@ test "backend runtime threaded durable lane sees initialized jobs" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
     for (&ctxs) |*ctx| {
         try handle.ptr().durable_jobs.submit(.{
-            .owner_id = 77,
+            .owner_id = owner_id,
             .class = .commit_durable,
             .ptr = ctx,
             .run = Fns.run,
             .deinit = Fns.deinit,
         });
     }
-    handle.ptr().durable_jobs.drainOwner(77);
+    handle.ptr().durable_jobs.drainOwner(owner_id);
 
     for (&ctxs) |*ctx| {
         try std.testing.expect(ctx.ran.load(.acquire));
@@ -619,11 +759,23 @@ test "backend runtime allocates stable nonzero owner ids" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
-    const first = handle.ptr().allocOwnerId();
-    const second = handle.ptr().allocOwnerId();
+    const first = try handle.ptr().allocOwnerId();
+    const second = try handle.ptr().allocOwnerId();
 
     try std.testing.expect(first != 0);
     try std.testing.expectEqual(first + 1, second);
+}
+
+test "backend runtime retires closed owner registry state" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+
+    const shared_owner_count = handle.ptr().owner_registry.states.count();
+    for (0..1024) |_| {
+        const owner_id = try handle.ptr().allocOwnerId();
+        handle.ptr().durable_jobs.closeOwner(owner_id);
+    }
+    try std.testing.expectEqual(shared_owner_count, handle.ptr().owner_registry.states.count());
 }
 
 test "backend runtime durable lane drains threaded jobs by owner" {
@@ -648,28 +800,30 @@ test "backend runtime durable lane drains threaded jobs by owner" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
+    const first_owner_id = try handle.ptr().allocOwnerId();
+    const second_owner_id = try handle.ptr().allocOwnerId();
     var first = Ctx{};
     var second = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
-        .owner_id = 7,
+        .owner_id = first_owner_id,
         .class = .cleanup,
         .ptr = &first,
         .run = Fns.run,
         .deinit = Fns.deinit,
     });
     try handle.ptr().durable_jobs.submit(.{
-        .owner_id = 8,
+        .owner_id = second_owner_id,
         .class = .cleanup,
         .ptr = &second,
         .run = Fns.run,
         .deinit = Fns.deinit,
     });
 
-    handle.ptr().durable_jobs.drainOwner(7);
+    handle.ptr().durable_jobs.drainOwner(first_owner_id);
     try std.testing.expectEqual(@as(u32, 1), first.value.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), first.deinits.load(.monotonic));
 
-    handle.ptr().durable_jobs.drainOwner(8);
+    handle.ptr().durable_jobs.drainOwner(second_owner_id);
     try std.testing.expectEqual(@as(u32, 1), second.value.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), second.deinits.load(.monotonic));
 }
@@ -696,20 +850,22 @@ test "backend runtime threaded durable lane rejects jobs after owner close" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
-        .owner_id = 91,
+        .owner_id = owner_id,
         .class = .maintenance,
         .ptr = &ctx,
         .run = Fns.run,
         .deinit = Fns.deinit,
     });
-    handle.ptr().durable_jobs.closeOwner(91);
+    handle.ptr().durable_jobs.closeOwner(owner_id);
 
     try std.testing.expectEqual(@as(u32, 1), ctx.ran.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
-    try std.testing.expectError(error.BackgroundOwnerClosing, handle.ptr().durable_jobs.submit(.{
-        .owner_id = 91,
+    try std.testing.expect(!handle.ptr().owner_registry.states.contains(owner_id));
+    try std.testing.expectError(error.BackgroundOwnerClosed, handle.ptr().durable_jobs.submit(.{
+        .owner_id = owner_id,
         .class = .maintenance,
         .ptr = &ctx,
         .run = Fns.run,
@@ -723,6 +879,7 @@ test "backend runtime owner close rejects recursive submit from draining job" {
 
     const Ctx = struct {
         lane: DurableJobLane,
+        owner_id: u64,
         started: std.atomic.Value(bool) = .init(false),
         allow_submit: std.atomic.Value(bool) = .init(false),
         submit_rejected: std.atomic.Value(bool) = .init(false),
@@ -738,7 +895,7 @@ test "backend runtime owner close rejects recursive submit from draining job" {
                 std.atomic.spinLoopHint();
             }
             ctx.lane.submit(.{
-                .owner_id = 92,
+                .owner_id = ctx.owner_id,
                 .class = .maintenance,
                 .ptr = ctx,
                 .run = run,
@@ -761,9 +918,10 @@ test "backend runtime owner close rejects recursive submit from draining job" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    var ctx = Ctx{ .lane = handle.ptr().durable_jobs };
+    const owner_id = try handle.ptr().allocOwnerId();
+    var ctx = Ctx{ .lane = handle.ptr().durable_jobs, .owner_id = owner_id };
     try handle.ptr().durable_jobs.submit(.{
-        .owner_id = 92,
+        .owner_id = owner_id,
         .class = .maintenance,
         .ptr = &ctx,
         .run = Fns.run,
@@ -772,9 +930,11 @@ test "backend runtime owner close rejects recursive submit from draining job" {
     while (!ctx.started.load(.acquire)) {
         std.atomic.spinLoopHint();
     }
-    try handle.ptr().threaded_jobs.?.markOwnerClosing(92);
+    try std.testing.expect(handle.ptr().owner_registry.beginClose(owner_id));
     ctx.allow_submit.store(true, .release);
-    handle.ptr().durable_jobs.drainOwner(92);
+    handle.ptr().durable_jobs.drainOwner(owner_id);
+    handle.ptr().owner_registry.waitIdle(owner_id);
+    handle.ptr().owner_registry.retireClosed(owner_id);
 
     try std.testing.expect(ctx.submit_rejected.load(.acquire));
     const run_count = ctx.run_count.load(.acquire);
@@ -804,9 +964,10 @@ test "backend runtime durable lane deinits threaded job payload after completion
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
-        .owner_id = 9,
+        .owner_id = owner_id,
         .class = .maintenance,
         .ptr = &ctx,
         .run = Fns.run,
@@ -818,8 +979,54 @@ test "backend runtime durable lane deinits threaded job payload after completion
         _ = try handle.ptr().durable_jobs.poll(8);
         if (handle.ptr().io()) |io| io.sleep(Io.Duration.fromMilliseconds(2), .awake) catch {};
     }
-    handle.ptr().durable_jobs.drainOwner(9);
+    handle.ptr().durable_jobs.drainOwner(owner_id);
 
     try std.testing.expectEqual(@as(u32, 1), ctx.ran.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
+}
+
+test "backend runtime threaded worker releases payload before reaper joins" {
+    if (builtin.os.tag == .freestanding) return;
+
+    const Ctx = struct {
+        ran: std.atomic.Value(bool) = .init(false),
+        deinit_called: std.atomic.Value(bool) = .init(false),
+    };
+    const Fns = struct {
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.ran.store(true, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.deinit_called.store(true, .release);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    // Prevent both the background reaper and explicit poll from joining the
+    // future. The worker must still release the owned payload promptly.
+    const jobs = handle.ptr().threaded_jobs.?;
+    lockAtomic(&jobs.reap_mutex);
+    defer jobs.reap_mutex.unlock();
+
+    const owner_id = try handle.ptr().allocOwnerId();
+    var ctx = Ctx{};
+    try handle.ptr().durable_jobs.submit(.{
+        .owner_id = owner_id,
+        .class = .commit_durable,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    });
+
+    var attempts: usize = 0;
+    while (!ctx.deinit_called.load(.acquire) and attempts < 200) : (attempts += 1) {
+        if (handle.ptr().io()) |io| io.sleep(Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(ctx.ran.load(.acquire));
+    try std.testing.expect(ctx.deinit_called.load(.acquire));
 }

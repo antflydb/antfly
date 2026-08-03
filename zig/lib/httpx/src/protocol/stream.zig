@@ -107,6 +107,8 @@ pub const Stream = struct {
     /// Used for content-length validation instead of data_buf.items.len,
     /// which shrinks when compactDataBuf() discards consumed bytes.
     total_data_received: u64 = 0,
+    /// Per-stream body ceiling. Null inherits the connection-wide ceiling.
+    max_data_size: ?usize = null,
 
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_window_update: u32 = 0,
@@ -180,8 +182,7 @@ pub const Stream = struct {
         if (self.read_offset == 0) return;
         const remaining = self.data_buf.items.len - self.read_offset;
         if (remaining > 0) {
-            std.mem.copyForwards(u8, self.data_buf.items[0..remaining],
-                self.data_buf.items[self.read_offset..]);
+            std.mem.copyForwards(u8, self.data_buf.items[0..remaining], self.data_buf.items[self.read_offset..]);
         }
         self.data_buf.items.len = remaining;
         self.read_offset = 0;
@@ -235,7 +236,6 @@ pub const StreamManager = struct {
     /// Highest stream ID that has been removed. Used to distinguish late
     /// frames for closed streams from truly invalid stream IDs.
     max_closed_stream_id: u31 = 0,
-
 
     /// Separate HPACK contexts for encoder and decoder (RFC 7541 §2.2).
     /// Each endpoint maintains two independent dynamic tables: one for

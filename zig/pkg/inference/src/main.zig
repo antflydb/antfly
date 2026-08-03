@@ -47,6 +47,14 @@ const RunConfig = struct {
         quantization: ?[]const u8 = null,
     };
 
+    const PromptCacheConfig = struct {
+        enabled: bool = false,
+        mode: inference.runtime.kv.prompt_cache.Mode = .block_hash,
+        max_bytes_mb: usize = 512,
+        min_tokens: usize = 64,
+        ttl_ms: u64 = 300_000,
+    };
+
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
@@ -56,6 +64,7 @@ const RunConfig = struct {
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
     pool_size: ?usize = null,
+    prompt_cache: ?PromptCacheConfig = null,
 };
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
@@ -113,6 +122,12 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
 
 fn parsePositiveUsize(value: []const u8) !usize {
     const parsed = try std.fmt.parseInt(usize, value, 10);
+    if (parsed == 0) return error.InvalidArguments;
+    return parsed;
+}
+
+fn parsePositiveU64(value: []const u8) !u64 {
+    const parsed = try std.fmt.parseInt(u64, value, 10);
     if (parsed == 0) return error.InvalidArguments;
     return parsed;
 }
@@ -233,6 +248,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?usize = null;
+    var allow_unknown_models = false;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -263,6 +279,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--allow-unknown-models")) {
+            allow_unknown_models = true;
         }
     }
 
@@ -298,6 +316,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .preload = preload_models.items,
+        .allow_unknown_models = allow_unknown_models,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
@@ -310,11 +329,19 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
+        if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
+            .enabled = value.enabled,
+            .mode = value.mode,
+            .max_bytes_mb = value.max_bytes_mb,
+            .min_tokens = value.min_tokens,
+            .ttl_ms = value.ttl_ms,
+        };
     }
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
+    node.attachIo(io);
 
     try node.warmConfiguredModels(allocator);
     print("listening on {s}:{d}\n", .{ host, port });
@@ -342,7 +369,7 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
 
 fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>]\n", .{usage_name});
+        print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>] [--max-artifact-bytes <n>] [--max-model-bytes <n>]\n", .{usage_name});
         print("       {s} pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
         print("       {s} pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
         print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
@@ -361,6 +388,8 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
     var capabilities_csv: ?[]const u8 = null;
     var models_dir: []const u8 = defaultModelsDir(allocator);
     var projector_selection: inference.registry.download.ProjectorSelection = .auto;
+    var max_artifact_bytes = inference.registry.download.default_max_artifact_bytes;
+    var max_model_bytes = inference.registry.download.default_max_model_bytes;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--token") and i + 1 < args.len) {
@@ -380,6 +409,12 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
         } else if (std.mem.eql(u8, args[i], "--projector") and i + 1 < args.len) {
             projector_selection = inference.registry.download.parseProjectorSelection(args[i + 1]) orelse return error.InvalidArguments;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--max-artifact-bytes") and i + 1 < args.len) {
+            max_artifact_bytes = try parsePositiveU64(args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--max-model-bytes") and i + 1 < args.len) {
+            max_model_bytes = try parsePositiveU64(args[i + 1]);
+            i += 1;
         }
     }
 
@@ -392,7 +427,11 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
 
     var reg = inference.registry.ModelRegistry.init(allocator, models_dir);
     defer reg.deinit();
-    try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+    try reg.pull(io, ref, .{
+        .token = token,
+        .max_artifact_bytes = max_artifact_bytes,
+        .max_model_bytes = max_model_bytes,
+    }, tasks_csv, capabilities_csv, projector_selection);
 
     print("done.\n", .{});
 }
@@ -454,6 +493,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
+        \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
@@ -461,6 +501,8 @@ fn printUsage(usage_name: []const u8) void {
         \\  --tasks <list>    Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
+        \\  --max-artifact-bytes <n> Maximum bytes accepted for one model artifact (default: 68719476736)
+        \\  --max-model-bytes <n> Maximum aggregate bytes accepted for one pull (default: 137438953472)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors
@@ -486,7 +528,8 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\  ],
         \\  "max_loaded_models": 8,
-        \\  "pool_size": 4
+        \\  "pool_size": 4,
+        \\  "prompt_cache": { "enabled": true, "mode": "block_hash", "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
         \\}
     ;
     const parsed = try std.json.parseFromSlice(RunConfig, std.testing.allocator, raw, .{
@@ -507,10 +550,17 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
+    try std.testing.expectEqual(true, parsed.value.prompt_cache.?.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.block_hash, parsed.value.prompt_cache.?.mode);
+    try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
+    try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
 }
 
 test "run max concurrent request parser rejects zero" {
     try std.testing.expectEqual(@as(usize, 6), try parsePositiveUsize("6"));
     try std.testing.expectError(error.InvalidArguments, parsePositiveUsize("0"));
     try std.testing.expectError(error.InvalidCharacter, parsePositiveUsize("six"));
+    try std.testing.expectEqual(@as(u64, 137438953472), try parsePositiveU64("137438953472"));
+    try std.testing.expectError(error.InvalidArguments, parsePositiveU64("0"));
 }

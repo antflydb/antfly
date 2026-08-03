@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "status": "accepted",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "segment_mode": "production",
+  "antfly": {
+    "format_version": 27,
+    "segments": 10,
+    "total_bytes": 5065897930,
+    "bytes_per_document": 1006.715466,
+    "components": {
+      "stored": 207305058,
+      "inverted": 4838463282,
+      "norms": 5032155,
+      "dictionary": 84761344,
+      "bloom": 22282440,
+      "postings": 4726387013,
+      "postings_terms": 12123285,
+      "single_document_postings_terms": 7509083,
+      "document_term_postings": 622897189,
+      "stored_chunks": 128939383,
+      "projected_posting_count_blocks": {
+        "64": 21072316,
+        "128": 16482197,
+        "256": 14225415
+      },
+      "ordinals": 20128470,
+      "postings_detail": {
+        "header": 75005885,
+        "block_max": 386818149,
+        "chunk_index": 446186925,
+        "doc_frequency_payload": 1309283728,
+        "positions": 2414333782,
+        "skip": 94758544,
+        "headers_block_max_chunk_index_and_skip": 1002769503
+      }
+    }
+  },
+  "tantivy": {
+    "version": "0.25",
+    "segments": 20,
+    "total_bytes": 3251494143,
+    "bytes_per_document": 646.149900,
+    "extensions": {
+      "idx": 1139437639,
+      "pos": 1930203456,
+      "term": 150510429,
+      "store": 20251519,
+      "fast": 6049005,
+      "fieldnorm": 5034197,
+      "metadata_and_locks": 7898
+    }
+  },
+  "difference": {
+    "bytes": 1814403787,
+    "antfly_to_tantivy_ratio": 1.558022,
+    "bytes_per_document": 360.565566,
+    "boundary_aligned_attribution": {
+      "postings_and_index_structures_excluding_positions": {
+        "antfly_bytes": 2312053231,
+        "tantivy_bytes": 1139437639,
+        "delta_bytes": 1172615592,
+        "percent_of_total_gap": 64.628
+      },
+      "positions": {
+        "antfly_bytes": 2414333782,
+        "tantivy_bytes": 1930203456,
+        "delta_bytes": 484130326,
+        "percent_of_total_gap": 26.683
+      },
+      "stored_records": {
+        "antfly_bytes": 207305058,
+        "tantivy_bytes": 20251519,
+        "delta_bytes": 187053539,
+        "percent_of_total_gap": 10.309
+      },
+      "term_dictionary_and_bloom": {
+        "antfly_bytes": 107043784,
+        "tantivy_bytes": 150510429,
+        "delta_bytes": -43466645,
+        "percent_of_total_gap": -2.396
+      },
+      "norms": {
+        "antfly_bytes": 5032155,
+        "tantivy_bytes": 5034197,
+        "delta_bytes": -2042,
+        "percent_of_total_gap": -0.0001
+      },
+      "ordinal_fast_field": {
+        "antfly_bytes": 20128470,
+        "tantivy_bytes": 6049005,
+        "delta_bytes": 14079465,
+        "percent_of_total_gap": 0.776
+      },
+      "framing_and_metadata_residual": {
+        "antfly_bytes": 1450,
+        "tantivy_bytes": 7898,
+        "delta_bytes": -6448,
+        "percent_of_total_gap": -0.0004
+      }
+    }
+  },
+  "interpretation": {
+    "category_mapping": "boundary-aligned, not proof of identical codec semantics; Tantivy .idx combines postings and index structures",
+    "antfly_postings_shape": {
+      "average_chunks_per_postings_term": 10.635680,
+      "single_document_postings_percent": 61.939342,
+      "single_document_chunk_percent": 5.823731,
+      "average_document_frequency": 51.380231,
+      "current_to_projected_128_block_ratio": 7.822949,
+      "projected_128_block_reduction_percent": 87.217096,
+      "projected_128_block_max_bytes_at_three_bytes_each": 49446591,
+      "projected_128_block_max_saving_bytes": 337371558,
+      "metadata_bytes_per_postings_term": 82.714339,
+      "block_chunk_and_skip_bytes_per_chunk": 7.195347,
+      "payload_bytes_per_postings_term": 107.997439,
+      "positions_bytes_per_postings_term": 199.148480
+    },
+    "excluded": [
+      "Antfly primary LSM",
+      "Antfly primary WAL",
+      "server request state",
+      "transient merge files",
+      "Quickwit metastore, cache, and staging files"
+    ],
+    "priority": [
+      "postings/index structures excluding positions",
+      "positions",
+      "stored-record encoding",
+      "ordinal sidecar"
+    ]
+  }
+}

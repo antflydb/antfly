@@ -44,6 +44,35 @@ pub const SearchResults = struct {
     total_relation: TotalHitsRelation = .exact,
 };
 
+/// Optional per-query work accounting. Production requests pass no diagnostics
+/// pointer; benchmark/profile calls opt in and aggregate existing scorer-local
+/// counters without global atomics.
+pub const SearchDiagnostics = struct {
+    segments_considered: u64 = 0,
+    segments_searched: u64 = 0,
+    segments_pruned: u64 = 0,
+    postings_iterators_opened: u64 = 0,
+    wand_next_in_score: u64 = 0,
+    wand_next_in_advance: u64 = 0,
+    wand_pivots_scored: u64 = 0,
+    wand_pivots_advanced: u64 = 0,
+    wand_chunks_skipped: u64 = 0,
+    boolean_candidates_scored: u64 = 0,
+    boolean_chunks_skipped: u64 = 0,
+    phrase_candidates_verified: u64 = 0,
+    phrase_position_records_decoded: u64 = 0,
+    phrase_matches_scored: u64 = 0,
+
+    pub fn addWand(self: *SearchDiagnostics, wand: *const WANDScorer) void {
+        self.postings_iterators_opened +|= @intCast(wand.terms.items.len);
+        self.wand_next_in_score +|= wand.next_in_score;
+        self.wand_next_in_advance +|= wand.next_in_advance;
+        self.wand_pivots_scored +|= wand.pivots_scored;
+        self.wand_pivots_advanced +|= wand.pivots_advanced;
+        self.wand_chunks_skipped +|= wand.chunks_skipped;
+    }
+};
+
 pub fn scoredHitLessThan(_: void, a: ScoredHit, b: ScoredHit) bool {
     if (a.score == b.score) return a.doc_id < b.doc_id;
     return a.score > b.score;
@@ -101,6 +130,7 @@ pub const TopKCollector = struct {
     hits: std.ArrayListUnmanaged(ScoredHit) = .empty,
     total_count: u32 = 0,
     total_relation: TotalHitsRelation = .exact,
+    worst_index: usize = 0,
 
     pub fn init(alloc: Allocator, k: u32) TopKCollector {
         return .{ .alloc = alloc, .k = k };
@@ -115,7 +145,13 @@ pub const TopKCollector = struct {
     }
 
     pub fn minCompetitiveScore(self: *const TopKCollector) f32 {
-        return minTopKScore(self.hits.items, self.k);
+        if (self.k == 0 or self.hits.items.len < self.k) return 0;
+        return self.hits.items[self.worst_index].score;
+    }
+
+    pub fn worstCompetitiveDocId(self: *const TopKCollector) ?u32 {
+        if (self.k == 0 or self.hits.items.len < self.k) return null;
+        return self.hits.items[self.worst_index].doc_id;
     }
 
     pub fn markLowerBound(self: *TopKCollector) void {
@@ -129,7 +165,23 @@ pub const TopKCollector = struct {
 
     pub fn collect(self: *TopKCollector, hit: ScoredHit) !void {
         self.total_count += 1;
-        try insertTopK(self.alloc, &self.hits, self.k, hit);
+        if (self.k == 0) return;
+        if (self.hits.items.len < self.k) {
+            try self.hits.append(self.alloc, hit);
+            if (self.hits.items.len == self.k) self.refreshWorst();
+            return;
+        }
+        if (scoredHitBetterThan(hit, self.hits.items[self.worst_index])) {
+            self.hits.items[self.worst_index] = hit;
+            self.refreshWorst();
+        }
+    }
+
+    fn refreshWorst(self: *TopKCollector) void {
+        self.worst_index = 0;
+        for (self.hits.items[1..], 1..) |candidate, i| {
+            if (scoredHitWorseThan(candidate, self.hits.items[self.worst_index])) self.worst_index = i;
+        }
     }
 
     pub fn finishOwned(self: *TopKCollector) !SearchResults {
@@ -148,6 +200,7 @@ const TermState = struct {
     iter: inverted.PostingsIterator,
     current: ?inverted.PostingsIterator.Hit,
     idf: f32,
+    bm25_scorer: inverted.BM25TermScorer,
     doc_freq: u32,
     block_max: ?inverted.BlockMaxInfo,
     chunk_size: u32,
@@ -162,7 +215,17 @@ const TermState = struct {
     /// terms' positions which can change between calls.
     skip_check_chunk: u32 = std.math.maxInt(u32),
     skip_check_threshold: f32 = 0,
+    block_cursor: ?inverted.PostingsIterator.BlockCursor = null,
 };
+
+fn termIndexBefore(terms: []const TermState, left: usize, right: usize) bool {
+    if (terms[left].exhausted) return false;
+    if (terms[right].exhausted) return true;
+    const left_doc = terms[left].current.?.doc_id;
+    const right_doc = terms[right].current.?.doc_id;
+    if (left_doc != right_doc) return left_doc < right_doc;
+    return left < right;
+}
 
 /// Block-Max WAND scorer for top-k BM25 queries.
 ///
@@ -178,6 +241,7 @@ pub const WANDScorer = struct {
     global_doc_count: u32,
     global_avg_dl: f32,
     bm25_config: inverted.BM25Config,
+    bound_table: ?*const inverted.BM25BoundTable = null,
     /// Diagnostics — populated during `execute*`. Useful for benchmarking
     /// where the WAND inner loop spends time. `next_in_score` is the count
     /// of `iter.next()` calls made when fully scoring a pivot doc;
@@ -204,6 +268,16 @@ pub const WANDScorer = struct {
     pub fn deinit(self: *WANDScorer) void {
         for (self.terms.items) |*t| t.iter.deinit();
         self.terms.deinit(self.alloc);
+    }
+
+    pub fn setBoundTable(self: *WANDScorer, table: *const inverted.BM25BoundTable) void {
+        self.bound_table = table;
+    }
+
+    pub fn decodedChunkMetadataHeapBytes(self: *const WANDScorer) usize {
+        var total: usize = 0;
+        for (self.terms.items) |*term| total +|= term.iter.decodedChunkMetadataHeapBytes();
+        return total;
     }
 
     /// Add a term's postings to the scorer. Takes ownership of the iterator.
@@ -233,6 +307,7 @@ pub const WANDScorer = struct {
             .iter = iter_owned,
             .current = null,
             .idf = idf,
+            .bm25_scorer = inverted.BM25TermScorer.init(self.global_avg_dl, idf, self.bm25_config),
             .doc_freq = effective_doc_freq,
             .block_max = block_max,
             .chunk_size = chunk_size,
@@ -258,7 +333,7 @@ pub const WANDScorer = struct {
     pub fn executeInto(self: *WANDScorer, collector: anytype) !void {
         // Advance all iterators to their first hit, applying doc offset
         for (self.terms.items) |*t| {
-            t.current = try t.iter.next();
+            t.current = try t.iter.nextScoring();
             if (t.current) |*hit| {
                 hit.doc_id += t.doc_offset;
             } else {
@@ -277,9 +352,71 @@ pub const WANDScorer = struct {
 
         if (has_block_max) {
             if (collector.topKLimit() > 0) collector.markLowerBound();
-            try self.executeWAND(collector);
+            if (self.terms.items.len == 1) {
+                try self.executeSingleTermWAND(collector);
+            } else {
+                try self.executeWAND(collector);
+            }
         } else {
             try self.executeBruteForce(collector);
+        }
+    }
+
+    /// Single-term Block-Max top-k does not need pivot ordering, cumulative
+    /// bounds, or the generic multi-term front-interval sweep. Score the
+    /// current posting directly and feed the raised threshold into the same
+    /// conservative competitive-block advance used by WAND. Besides removing
+    /// control flow, this avoids decoding the current impact bound once for
+    /// pivot selection and again for post-collection skipping on every hit.
+    fn executeSingleTermWAND(self: *WANDScorer, collector: anytype) !void {
+        const term = &self.terms.items[0];
+        const block_max = term.block_max.?;
+
+        while (!term.exhausted) {
+            const hit = term.current orelse break;
+            self.pivots_scored += 1;
+            self.next_in_score += 1;
+            try collector.collect(.{
+                .doc_id = hit.doc_id,
+                .score = term.bm25_scorer.score(hit.freq, hit.norm),
+            });
+
+            if (hit.doc_id == std.math.maxInt(u32)) {
+                term.current = null;
+                term.exhausted = true;
+                break;
+            }
+
+            const threshold = collector.minCompetitiveScore();
+            const current_bound = term.iter.currentBlockMaxImpactWithScorer(
+                block_max,
+                term.bm25_scorer,
+                term.idf,
+                self.bound_table,
+            );
+            const worst_doc_id = collector.worstCompetitiveDocId();
+            const ordered_tie_is_worse = current_bound == threshold and
+                worst_doc_id != null and hit.doc_id >= worst_doc_id.?;
+            if (current_bound < threshold or ordered_tie_is_worse) {
+                const advanced = try term.iter.advanceToCompetitiveBlockWithScorer(
+                    block_max,
+                    threshold,
+                    term.bm25_scorer,
+                    term.idf,
+                    self.bound_table,
+                    true,
+                );
+                self.next_in_advance += 1;
+                self.chunks_skipped +|= advanced.chunks_skipped;
+                term.current = advanced.hit;
+            } else {
+                term.current = try term.iter.nextScoring();
+            }
+            if (term.current) |*next_hit| {
+                next_hit.doc_id += term.doc_offset;
+            } else {
+                term.exhausted = true;
+            }
         }
     }
 
@@ -303,8 +440,8 @@ pub const WANDScorer = struct {
                 if (t.exhausted) continue;
                 if (t.current.?.doc_id == min_doc.?) {
                     const hit = t.current.?;
-                    score += t.idf * tfScore(hit.freq, hit.norm, self.global_avg_dl, self.bm25_config);
-                    t.current = try t.iter.next();
+                    score += t.bm25_scorer.score(hit.freq, hit.norm);
+                    t.current = try t.iter.nextScoring();
                     if (t.current) |*h| {
                         h.doc_id += t.doc_offset;
                     } else {
@@ -320,9 +457,15 @@ pub const WANDScorer = struct {
     /// Block-Max WAND: skip blocks whose max impact can't beat the threshold.
     /// Uses index-based sorting to avoid moving self-referential TermState structs.
     fn executeWAND(self: *WANDScorer, collector: anytype) !void {
-        // Allocate sorted index array
-        var sorted = try self.alloc.alloc(usize, self.terms.items.len);
-        defer self.alloc.free(sorted);
+        // Most search queries contain only a handful of terms. Keep their
+        // ordering workspace on the stack so a multi-segment query does not
+        // allocate and free one tiny slice per segment.
+        var sorted_stack: [16]usize = undefined;
+        const sorted = if (self.terms.items.len <= sorted_stack.len)
+            sorted_stack[0..self.terms.items.len]
+        else
+            try self.alloc.alloc(usize, self.terms.items.len);
+        defer if (self.terms.items.len > sorted_stack.len) self.alloc.free(sorted);
         for (sorted, 0..) |*s, i| s.* = i;
 
         var counted_skipped_lower_bound = false;
@@ -334,15 +477,21 @@ pub const WANDScorer = struct {
             }
             if (active == 0) break;
 
+            // Pivot advances usually move one iterator forward, so the prior
+            // order is almost sorted. Insertion repair avoids a general sort
+            // and its comparator setup on every WAND iteration.
             const terms = self.terms.items;
-            std.mem.sort(usize, sorted, terms, struct {
-                fn cmp(ts: []TermState, a: usize, b: usize) bool {
-                    if (ts[a].exhausted and ts[b].exhausted) return false;
-                    if (ts[a].exhausted) return false;
-                    if (ts[b].exhausted) return true;
-                    return ts[a].current.?.doc_id < ts[b].current.?.doc_id;
+            var sort_pos: usize = 1;
+            while (sort_pos < sorted.len) : (sort_pos += 1) {
+                const moving = sorted[sort_pos];
+                var insert_pos = sort_pos;
+                while (insert_pos > 0 and termIndexBefore(terms, moving, sorted[insert_pos - 1])) : (insert_pos -= 1) {
+                    sorted[insert_pos] = sorted[insert_pos - 1];
                 }
-            }.cmp);
+                sorted[insert_pos] = moving;
+            }
+
+            if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) continue;
 
             // Find pivot: smallest position where sum of max-impacts reaches
             // the collector's current competitive score.
@@ -387,17 +536,25 @@ pub const WANDScorer = struct {
                     if (t.exhausted) continue;
                     if (t.current.?.doc_id == pivot_doc) {
                         const hit = t.current.?;
-                        score += t.idf * tfScore(hit.freq, hit.norm, self.global_avg_dl, self.bm25_config);
+                        score += t.bm25_scorer.score(hit.freq, hit.norm);
                         self.next_in_score += 1;
-                        t.current = try t.iter.next();
-                        if (t.current) |*h| {
-                            h.doc_id += t.doc_offset;
-                        } else {
-                            t.exhausted = true;
-                        }
                     }
                 }
                 try collector.collect(.{ .doc_id = pivot_doc, .score = score });
+
+                // Multi-term WAND already reaches the chunk-skip path on
+                // pivot advances. Calling advanceTo for every scored term adds
+                // measurable overhead to balanced disjunctions where the
+                // combined global bound prevents chunk pruning.
+                for (self.terms.items) |*t| {
+                    if (t.exhausted or t.current.?.doc_id != pivot_doc) continue;
+                    t.current = try t.iter.nextScoring();
+                    if (t.current) |*hit| {
+                        hit.doc_id += t.doc_offset;
+                    } else {
+                        t.exhausted = true;
+                    }
+                }
             } else {
                 // Advance the first term that's not at pivot_doc past pivot_doc.
                 // Then apply Block-Max chunk skipping: if the chunk this term
@@ -409,7 +566,7 @@ pub const WANDScorer = struct {
                 for (sorted[0 .. pivot_pos.? + 1]) |idx| {
                     const t = &self.terms.items[idx];
                     if (!t.exhausted and t.current.?.doc_id < pivot_doc) {
-                        try self.advancePastWithChunkSkip(t, pivot_doc, threshold);
+                        try self.advancePastWithChunkSkip(t, pivot_doc, threshold, false);
                         break;
                     }
                 }
@@ -420,15 +577,199 @@ pub const WANDScorer = struct {
         }
     }
 
-    /// Compute the maximum possible impact for a term at its current position.
-    fn termMaxImpact(self: *const WANDScorer, t: *const TermState) f32 {
-        if (t.block_max) |bm| {
-            const local_doc_id = t.current.?.doc_id - t.doc_offset;
-            const chunk_idx = local_doc_id / t.chunk_size;
-            return bm.maxImpact(chunk_idx, self.global_doc_count, t.doc_freq, self.global_avg_dl, self.bm25_config);
+    /// Apply an aligned Block-Max test to the lowest logical document block.
+    /// Every active iterator is in the same segment for a WAND instance. If
+    /// the sum of ceilings for terms that can occur in this block cannot beat
+    /// top-k, advance all of them to the next block boundary at once.
+    fn skipNonCompetitiveFrontBlock(self: *WANDScorer, collector: anytype, sorted: []const usize) !bool {
+        const threshold = collector.minCompetitiveScore();
+        const worst_doc_id = collector.worstCompetitiveDocId() orelse return false;
+        if (threshold <= 0 or sorted.len == 0) return false;
+
+        const front = &self.terms.items[sorted[0]];
+        if (front.exhausted or front.current == null or front.chunk_size == 0) return false;
+        if (!front.iter.doc_range_aligned) return self.skipNonCompetitivePostingBlockInterval(collector);
+        for (self.terms.items) |*term| {
+            if (term.exhausted or term.current == null) continue;
+            if (term.block_max == null) return false;
+            if (!term.iter.doc_range_aligned) return false;
+            if (term.doc_offset != front.doc_offset or term.chunk_size != front.chunk_size) return false;
+            term.block_cursor = term.iter.currentBlockCursor() orelse return false;
         }
-        // No block-max: use a generous upper bound (max possible TF score * IDF)
-        return t.idf * (self.bm25_config.k1 + 1.0);
+
+        var skipped_blocks: u64 = 0;
+        while (true) {
+            var candidate_chunk: ?u32 = null;
+            for (self.terms.items) |*term| {
+                if (term.block_cursor) |cursor| candidate_chunk = if (candidate_chunk) |current| @min(current, cursor.chunk_id) else cursor.chunk_id;
+            }
+            const chunk_id = candidate_chunk orelse {
+                for (self.terms.items) |*term| {
+                    term.current = null;
+                    term.exhausted = true;
+                }
+                self.chunks_skipped +|= skipped_blocks;
+                return skipped_blocks > 0;
+            };
+
+            var bound: f32 = 0;
+            for (self.terms.items) |*term| {
+                const cursor = term.block_cursor orelse continue;
+                if (cursor.chunk_id != chunk_id) continue;
+                bound += term.iter.blockCursorImpactWithScorer(
+                    term.block_max.?,
+                    cursor,
+                    term.bm25_scorer,
+                    term.idf,
+                    self.bound_table,
+                );
+            }
+            const chunk_start_u64 = @as(u64, front.doc_offset) + @as(u64, chunk_id) * @as(u64, front.chunk_size);
+            const tie_can_beat = chunk_start_u64 < worst_doc_id;
+            if (bound > threshold or (bound == threshold and tie_can_beat)) {
+                if (skipped_blocks == 0) return false;
+                for (self.terms.items) |*term| {
+                    const cursor = term.block_cursor orelse {
+                        term.current = null;
+                        term.exhausted = true;
+                        continue;
+                    };
+                    self.next_in_advance += 1;
+                    term.current = try term.iter.loadBlockCursor(cursor);
+                    if (term.current) |*hit| {
+                        hit.doc_id += term.doc_offset;
+                    } else {
+                        term.exhausted = true;
+                    }
+                }
+                self.chunks_skipped +|= skipped_blocks;
+                return true;
+            }
+
+            skipped_blocks +|= 1;
+            for (self.terms.items) |*term| {
+                if (term.block_cursor) |*cursor| {
+                    if (cursor.chunk_id == chunk_id and !try term.iter.advanceBlockCursor(cursor)) term.block_cursor = null;
+                }
+            }
+        }
+    }
+
+    /// Posting-count blocks do not share logical document-range IDs across
+    /// terms. Sweep conservative block intervals instead: for each interval
+    /// ending at the earliest active max-doc, sum every term block that could
+    /// overlap it. A rejected interval can be skipped without decoding any of
+    /// its postings; blocks spanning the boundary remain active in the next
+    /// interval. This deliberately overestimates mixed-block scores.
+    fn skipNonCompetitivePostingBlockInterval(self: *WANDScorer, collector: anytype) !bool {
+        const threshold = collector.minCompetitiveScore();
+        const worst_doc_id = collector.worstCompetitiveDocId() orelse return false;
+        if (threshold <= 0) return false;
+
+        var doc_offset: ?u32 = null;
+        var scan_floor: u32 = std.math.maxInt(u32);
+        for (self.terms.items) |*term| {
+            if (term.exhausted or term.current == null) {
+                term.block_cursor = null;
+                continue;
+            }
+            if (term.block_max == null or term.iter.doc_range_aligned) return false;
+            if (doc_offset) |offset| {
+                if (term.doc_offset != offset) return false;
+            } else {
+                doc_offset = term.doc_offset;
+            }
+            var cursor = term.iter.currentBlockCursor() orelse return false;
+            const local_doc = term.current.?.doc_id - term.doc_offset;
+            cursor.min_doc = @max(cursor.min_doc, local_doc);
+            scan_floor = @min(scan_floor, cursor.min_doc);
+            term.block_cursor = cursor;
+        }
+        const offset = doc_offset orelse return false;
+
+        var skipped_intervals: u64 = 0;
+        var skipped_blocks: u64 = 0;
+        while (true) {
+            var interval_end: ?u32 = null;
+            for (self.terms.items) |term| {
+                const cursor = term.block_cursor orelse continue;
+                interval_end = if (interval_end) |end| @min(end, cursor.max_doc) else cursor.max_doc;
+            }
+            const end = interval_end orelse {
+                for (self.terms.items) |*term| {
+                    term.current = null;
+                    term.exhausted = true;
+                }
+                self.chunks_skipped +|= skipped_blocks;
+                return skipped_intervals > 0;
+            };
+
+            var bound: f32 = 0;
+            for (self.terms.items) |*term| {
+                const cursor = term.block_cursor orelse continue;
+                if (cursor.min_doc > end) continue;
+                bound += term.iter.blockCursorImpactWithScorer(
+                    term.block_max.?,
+                    cursor,
+                    term.bm25_scorer,
+                    term.idf,
+                    self.bound_table,
+                );
+            }
+            const earliest_global = @as(u64, offset) + scan_floor;
+            const competitive = bound > threshold or
+                (bound == threshold and earliest_global < worst_doc_id);
+            if (competitive) {
+                if (skipped_intervals == 0) return false;
+                for (self.terms.items) |*term| {
+                    const cursor = term.block_cursor orelse {
+                        term.current = null;
+                        term.exhausted = true;
+                        continue;
+                    };
+                    self.next_in_advance += 1;
+                    term.current = try term.iter.loadBlockCursor(cursor);
+                    if (term.current) |hit| {
+                        if (hit.doc_id < scan_floor) term.current = try term.iter.advanceTo(scan_floor);
+                    }
+                    if (term.current) |*hit| {
+                        hit.doc_id += term.doc_offset;
+                    } else {
+                        term.exhausted = true;
+                    }
+                }
+                self.chunks_skipped +|= skipped_blocks;
+                return true;
+            }
+
+            skipped_intervals +|= 1;
+            if (end == std.math.maxInt(u32)) {
+                for (self.terms.items) |*term| {
+                    term.current = null;
+                    term.exhausted = true;
+                }
+                self.chunks_skipped +|= skipped_blocks;
+                return true;
+            }
+            scan_floor = end + 1;
+            for (self.terms.items) |*term| {
+                if (term.block_cursor) |*cursor| {
+                    if (cursor.max_doc == end) {
+                        skipped_blocks +|= 1;
+                        if (!try term.iter.advanceBlockCursor(cursor)) term.block_cursor = null;
+                    } else {
+                        cursor.min_doc = @max(cursor.min_doc, scan_floor);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Global maximum possible impact for a term. Pivot selection must not use
+    /// only the current block's maximum: a later block can have a higher
+    /// impact, so doing so could terminate before a competitive later hit.
+    fn termMaxImpact(_: *const WANDScorer, t: *const TermState) f32 {
+        return t.bm25_scorer.maxScore();
     }
 
     /// Advance a term iterator to the first doc whose ID (with offset
@@ -461,7 +802,7 @@ pub const WANDScorer = struct {
     /// outer-loop level, but advances within the loop still walk into them
     /// once before re-pivoting kicks them out. The hop straight to the next
     /// chunk start saves the per-doc work for those throwaway chunks.
-    fn advancePastWithChunkSkip(self: *WANDScorer, t: *TermState, target: u32, threshold: f32) !void {
+    fn advancePastWithChunkSkip(self: *WANDScorer, t: *TermState, target: u32, threshold: f32, allow_equal_prune: bool) !void {
         try self.advancePast(t, target);
         if (t.block_max == null) return;
         // No threshold yet (collector still filling): can't compute a useful
@@ -478,24 +819,23 @@ pub const WANDScorer = struct {
         var others_max: ?f32 = null;
 
         while (!t.exhausted) {
-            const local_doc: u32 = t.current.?.doc_id - t.doc_offset;
-            const chunk_idx: u32 = @intCast(local_doc / t.chunk_size);
+            const current_cursor = t.iter.currentBlockCursor() orelse return;
+            const chunk_idx: u32 = @intCast(current_cursor.ordinal);
 
             // Per-term cache: if this same chunk already passed the solo
             // check at a threshold ≥ the current one, the verdict still
             // holds (a smaller threshold can only widen the pass set).
             // Avoids re-reading block-max metadata + recomputing BM25 on
             // every same-chunk re-advance.
-            if (chunk_idx == t.skip_check_chunk and threshold <= t.skip_check_threshold) return;
+            if (!allow_equal_prune and chunk_idx == t.skip_check_chunk and threshold <= t.skip_check_threshold) return;
 
-            const my_max = t.block_max.?.maxImpact(
-                chunk_idx,
-                self.global_doc_count,
-                t.doc_freq,
-                self.global_avg_dl,
-                self.bm25_config,
+            const my_max = t.iter.currentBlockMaxImpactWithScorer(
+                t.block_max.?,
+                t.bm25_scorer,
+                t.idf,
+                self.bound_table,
             );
-            if (my_max >= threshold) {
+            if (my_max > threshold or (!allow_equal_prune and my_max == threshold)) {
                 // Chunk passes solo. Cache the verdict — only the solo case
                 // is safe to memoize because the combined check below depends
                 // on other terms' positions, which can move between calls.
@@ -509,37 +849,27 @@ pub const WANDScorer = struct {
                 for (self.terms.items) |*other| {
                     if (other == t) continue;
                     if (other.exhausted) continue;
+                    // Other iterators can move into later chunks while this
+                    // term remains in its current chunk. Their global maxima
+                    // are the conservative bound for the combined check.
                     sum += self.termMaxImpact(other);
                 }
                 others_max = sum;
             }
-            if (my_max + others_max.? >= threshold) return; // combined: don't cache
+            const combined_bound = my_max + others_max.?;
+            if (combined_bound > threshold or (!allow_equal_prune and combined_bound == threshold)) return; // combined: don't cache
 
-            // This chunk can't help even at its most favorable doc — jump to
-            // the start of the next chunk in this term's local doc space and
-            // re-evaluate. If the term has no doc in that chunk or any later
-            // chunk, advancePast will mark it exhausted and we'll exit.
-            const next_chunk_start_local: u64 = (@as(u64, chunk_idx) + 1) * @as(u64, t.chunk_size);
-            // Cap at u32 to stay inside the iterator's address space; if it
-            // overflows there's nothing further to advance to.
-            if (next_chunk_start_local > std.math.maxInt(u32) - t.doc_offset) {
-                t.exhausted = true;
-                t.current = null;
-                return;
-            }
-            const next_target_global: u32 = @intCast(next_chunk_start_local + @as(u64, t.doc_offset));
             self.chunks_skipped += 1;
-            try self.advancePast(t, next_target_global);
+            self.next_in_advance += 1;
+            t.current = try t.iter.advanceToNextStoredChunk();
+            if (t.current) |*hit| {
+                hit.doc_id += t.doc_offset;
+            } else {
+                t.exhausted = true;
+            }
         }
     }
 };
-
-/// TF component of BM25 (without IDF).
-fn tfScore(freq: u32, doc_len: u32, avg_dl: f32, config: inverted.BM25Config) f32 {
-    const f: f32 = @floatFromInt(freq);
-    const dl: f32 = @floatFromInt(doc_len);
-    return (f * (config.k1 + 1.0)) / (f + config.k1 * (1.0 - config.b + config.b * dl / avg_dl));
-}
 
 // ============================================================================
 // Tests
@@ -581,7 +911,7 @@ test "brute-force scorer ranks by BM25" {
             .one_hit => null,
         };
         const cs = switch (lookup) {
-            .postings => |p| p.chunk_size,
+            .postings => |p| p.scoringChunkSize(),
             .one_hit => 1024,
         };
         try scorer.addTerm(iter, lookup.docFreq(), bm, cs, 0);
@@ -634,7 +964,7 @@ test "multi-term scorer combines scores" {
         .one_hit => null,
     };
     const alpha_cs = switch (alpha_lookup) {
-        .postings => |p| p.chunk_size,
+        .postings => |p| p.scoringChunkSize(),
         .one_hit => 1024,
     };
     const beta_bm = switch (beta_lookup) {
@@ -642,7 +972,7 @@ test "multi-term scorer combines scores" {
         .one_hit => null,
     };
     const beta_cs = switch (beta_lookup) {
-        .postings => |p| p.chunk_size,
+        .postings => |p| p.scoringChunkSize(),
         .one_hit => 1024,
     };
     try scorer.addTerm(alpha_iter, alpha_lookup.docFreq(), alpha_bm, alpha_cs, 0);
@@ -682,7 +1012,7 @@ test "top-k limits results" {
         .one_hit => null,
     };
     const cs = switch (lookup) {
-        .postings => |p| p.chunk_size,
+        .postings => |p| p.scoringChunkSize(),
         .one_hit => 1024,
     };
     try scorer.addTerm(iter, lookup.docFreq(), bm, cs, 0);
@@ -695,6 +1025,105 @@ test "top-k limits results" {
     for (0..results.hits.len - 1) |i| {
         try std.testing.expect(results.hits[i].score >= results.hits[i + 1].score);
     }
+}
+
+test "WAND pivot bound remains conservative across later high-impact blocks" {
+    const alloc = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
+    defer builder.deinit();
+    try builder.addDocument(0, &.{.{ .term = "alpha", .freq = 1, .norm = 50 }});
+    try builder.addDocument(1, &.{.{ .term = "beta", .freq = 1, .norm = 200 }});
+    try builder.addDocument(2, &.{});
+    try builder.addDocument(3, &.{});
+    try builder.addDocument(4, &.{.{ .term = "beta", .freq = 100, .norm = 1 }});
+    const section = try builder.build();
+    defer alloc.free(section);
+    var reader = try inverted.InvertedIndexReader.init(alloc, section);
+    var scorer = WANDScorer.init(alloc, 1, reader.doc_count, reader.avgDocLen(), .{});
+    defer scorer.deinit();
+    for ([_][]const u8{ "alpha", "beta" }) |term| {
+        const lookup = reader.lookup(term) orelse return error.TestExpectedEqual;
+        try scorer.addTerm(
+            try lookup.iterator(alloc),
+            lookup.docFreq(),
+            switch (lookup) {
+                .postings => |postings| postings.block_max,
+                .one_hit => null,
+            },
+            switch (lookup) {
+                .postings => |postings| postings.scoringChunkSize(),
+                .one_hit => 2,
+            },
+            0,
+        );
+    }
+    const results = try scorer.execute();
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    try std.testing.expectEqual(@as(u32, 4), results.hits[0].doc_id);
+}
+
+test "single-term block scan preserves a later higher-impact chunk" {
+    const alloc = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
+    defer builder.deinit();
+    try builder.addDocument(0, &.{.{ .term = "term", .freq = 1, .norm = 100 }});
+    try builder.addDocument(1, &.{.{ .term = "term", .freq = 1, .norm = 100 }});
+    try builder.addDocument(2, &.{});
+    try builder.addDocument(3, &.{});
+    try builder.addDocument(4, &.{.{ .term = "term", .freq = 100, .norm = 1 }});
+    try builder.addDocument(5, &.{.{ .term = "term", .freq = 1, .norm = 100 }});
+    const section = try builder.build();
+    defer alloc.free(section);
+    var reader = try inverted.InvertedIndexReader.init(alloc, section);
+    const lookup = reader.lookup("term") orelse return error.TestExpectedEqual;
+    var scorer = WANDScorer.init(alloc, 1, reader.doc_count, reader.avgDocLen(), .{});
+    defer scorer.deinit();
+    try scorer.addTerm(
+        try lookup.iterator(alloc),
+        lookup.docFreq(),
+        switch (lookup) {
+            .postings => |postings| postings.block_max,
+            .one_hit => null,
+        },
+        2,
+        0,
+    );
+    const results = try scorer.execute();
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    try std.testing.expectEqual(@as(u32, 4), results.hits[0].doc_id);
+}
+
+test "single-term equality pruning retains earliest cutoff ties" {
+    const alloc = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
+    defer builder.deinit();
+    for (0..20) |doc| {
+        try builder.addDocument(@intCast(doc), &.{.{ .term = "tie", .freq = 1, .norm = 10 }});
+    }
+    const section = try builder.build();
+    defer alloc.free(section);
+    var reader = try inverted.InvertedIndexReader.init(alloc, section);
+    const lookup = reader.lookup("tie") orelse return error.TestExpectedEqual;
+    var scorer = WANDScorer.init(alloc, 2, reader.doc_count, reader.avgDocLen(), .{});
+    defer scorer.deinit();
+    try scorer.addTerm(
+        try lookup.iterator(alloc),
+        lookup.docFreq(),
+        switch (lookup) {
+            .postings => |postings| postings.block_max,
+            .one_hit => null,
+        },
+        2,
+        0,
+    );
+    const results = try scorer.execute();
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 2), results.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 1), results.hits[1].doc_id);
+    try std.testing.expect(scorer.chunks_skipped > 0);
 }
 
 test "shared top-k helper keeps best score with doc-id tie break" {
@@ -740,7 +1169,7 @@ test "scorer executes into external top-k collector" {
         .one_hit => null,
     };
     const cs = switch (lookup) {
-        .postings => |p| p.chunk_size,
+        .postings => |p| p.scoringChunkSize(),
         .one_hit => 1024,
     };
     try scorer.addTerm(iter, lookup.docFreq(), bm, cs, 0);

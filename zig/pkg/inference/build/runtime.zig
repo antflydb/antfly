@@ -139,7 +139,7 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly-json", json_mod);
         break :blk mod;
     };
-    const platform_mod = shared.platform orelse createSharedModule(config, "lib/platform/src/root.zig");
+    const platform_mod = shared.platform orelse @panic("inference runtime requires a configured antfly_platform module");
     const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
     const google_mod = shared.google orelse blk: {
         const mod = createSharedModule(config, "lib/google/src/root.zig");
@@ -318,7 +318,8 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
     inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
-    configureOnnxRuntime(b, inference_internal_mod, backend.enable_onnx, backend.onnx_root);
+    configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
+    inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
 
@@ -674,6 +675,9 @@ fn configureRuntimeLinks(
     backend: BackendOptions,
     paths: Paths,
 ) void {
+    if (backend.link_libc) {
+        addMacosSdkPaths(b, module, target);
+    }
     if (backend.enable_system_blas) {
         configureSystemBlas(b, module, target, backend.blas_root);
     }

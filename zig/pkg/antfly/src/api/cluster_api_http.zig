@@ -15,6 +15,7 @@
 const std = @import("std");
 const backups_api = @import("backups.zig");
 const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("../common/config.zig");
 
 pub const ClusterApi = struct {
     ptr: *anyopaque,
@@ -29,6 +30,11 @@ pub const ClusterApi = struct {
 
     pub const ExecuteBackupError = error{
         NotLeader,
+        InvalidRequest,
+        NoTables,
+        BackupAlreadyExists,
+        BackupRepositoryBusy,
+        BackupManifestTooLarge,
         MethodNotAllowed,
         InternalFailure,
     };
@@ -36,9 +42,18 @@ pub const ClusterApi = struct {
     pub const ExecuteRestoreError = error{
         NotLeader,
         InvalidRequest,
+        BackupRepositoryBusy,
+        BackupManifestTooLarge,
+        BackupIntegrityFailure,
         TableAlreadyExists,
         MethodNotAllowed,
+        Cancelled,
         InternalFailure,
+    };
+
+    pub const RestoreExecution = struct {
+        status: u16,
+        body: []u8,
     };
 
     pub const VTable = struct {
@@ -46,6 +61,8 @@ pub const ClusterApi = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             location_uri: []const u8,
+            location: *backups_api.BackupLocation,
+            options: backups_api.BackupListOptions,
         ) ExecuteListError![]u8,
         execute_cluster_backup: *const fn (
             ptr: *anyopaque,
@@ -59,15 +76,17 @@ pub const ClusterApi = struct {
             req: backups_api.ClusterRestoreRequest,
             location: *backups_api.BackupLocation,
             restore_mode: []const u8,
-        ) ExecuteRestoreError![]u8,
+        ) ExecuteRestoreError!RestoreExecution,
     };
 
     pub fn executeClusterBackupList(
         self: ClusterApi,
         alloc: std.mem.Allocator,
         location_uri: []const u8,
+        location: *backups_api.BackupLocation,
+        options: backups_api.BackupListOptions,
     ) ExecuteListError![]u8 {
-        return try self.vtable.execute_cluster_backup_list(self.ptr, alloc, location_uri);
+        return try self.vtable.execute_cluster_backup_list(self.ptr, alloc, location_uri, location, options);
     }
 
     pub fn executeClusterBackup(
@@ -85,7 +104,7 @@ pub const ClusterApi = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
-    ) ExecuteRestoreError![]u8 {
+    ) ExecuteRestoreError!RestoreExecution {
         return try self.vtable.execute_cluster_restore(self.ptr, alloc, req, location, restore_mode);
     }
 };
@@ -103,9 +122,28 @@ pub const OwnedResponse = struct {
 pub fn handleClusterBackupList(
     alloc: std.mem.Allocator,
     location_uri: []const u8,
+    connection: ?[]const u8,
     api: ClusterApi,
+    secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
+    io: ?std.Io,
+    options: backups_api.BackupListOptions,
 ) !OwnedResponse {
-    const body = api.executeClusterBackupList(alloc, location_uri) catch |err| switch (err) {
+    if (connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "backup listing requires a named external_io connection") };
+    }
+    var location = backups_api.openBackupLocationWithOptions(alloc, location_uri, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = connection,
+        .required_capability = "restore.read",
+        .io = io,
+    }) catch |err| {
+        if (backups_api.backupLocationErrorMessage(err)) |msg| return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
+        return err;
+    };
+    defer location.deinit(alloc);
+    const body = api.executeClusterBackupList(alloc, location_uri, &location, options) catch |err| switch (err) {
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
         error.UnsupportedBackupLocation => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup location") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -119,14 +157,23 @@ pub fn handleClusterBackup(
     body: []const u8,
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
-    var req = backups_api.parseClusterBackupRequest(alloc, body) catch |err| switch (err) {
-        error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") },
-        else => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
-    };
+    var req = backups_api.parseClusterBackupRequest(alloc, body) catch
+        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     defer backups_api.freeClusterBackupRequest(alloc, &req);
+    if (req.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "backup requires a named external_io connection") };
+    }
 
-    var location = backups_api.openBackupLocationWithSecrets(alloc, req.location, secret_store) catch |err| {
+    var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = req.connection,
+        .required_capability = "backup.write",
+        .io = io,
+    }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -136,6 +183,11 @@ pub fn handleClusterBackup(
 
     const response_body = api.executeClusterBackup(alloc, req, &location) catch |err| switch (err) {
         error.NotLeader => return err,
+        error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
+        error.NoTables => return .{ .status = 400, .body = try alloc.dupe(u8, "no tables to backup") },
+        error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
+        error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
+        error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
     };
@@ -147,13 +199,24 @@ pub fn handleClusterRestore(
     body: []const u8,
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch |err| switch (err) {
         else => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
     };
     defer backups_api.freeClusterRestoreRequest(alloc, &req);
+    if (req.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "restore requires a named external_io connection") };
+    }
 
-    var location = backups_api.openBackupLocationWithSecrets(alloc, req.location, secret_store) catch |err| {
+    var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = req.connection,
+        .required_capability = "restore.read",
+        .io = io,
+    }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -165,12 +228,46 @@ pub fn handleClusterRestore(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
 
-    const response_body = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
+    const result = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
+        error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
+        error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
+        error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.Cancelled => return .{ .status = 409, .body = try alloc.dupe(u8, "restore cancelled") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
-    return .{ .status = 202, .body = response_body };
+    return .{ .status = result.status, .body = result.body };
+}
+
+test "cluster backup APIs require named connections" {
+    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null, null, .{});
+    defer list.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), list.status);
+
+    var backup = try handleClusterBackup(
+        std.testing.allocator,
+        "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
+        undefined,
+        null,
+        null,
+        null,
+    );
+    defer backup.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), backup.status);
+    try std.testing.expectEqualStrings("invalid backup request", backup.body);
+
+    var restore = try handleClusterRestore(
+        std.testing.allocator,
+        "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
+        undefined,
+        null,
+        null,
+        null,
+    );
+    defer restore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), restore.status);
+    try std.testing.expectEqualStrings("invalid restore request", restore.body);
 }

@@ -55,6 +55,8 @@ spec:
                 type: object
               destination:
                 properties:
+                  connection:
+                    type: string
                   credentialsSecret:
                     properties:
                       name:

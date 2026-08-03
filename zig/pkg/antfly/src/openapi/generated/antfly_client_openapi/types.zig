@@ -504,6 +504,7 @@ pub const AlgebraicIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the sidecar is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the sidecar is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Backfill progress as a ratio from 0.0 to 1.0
@@ -562,7 +563,7 @@ pub const AlgebraicIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -1031,8 +1032,10 @@ pub const BackupInfo = struct {
 };
 
 pub const BackupListResponse = struct {
-    /// List of available backups
+    /// One page of available backups in stable manifest-key order.
     backups: []const BackupInfo,
+    /// Opaque continuation cursor. Omitted when no additional backups remain.
+    next_cursor: ?[]const u8 = null,
 };
 
 /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
@@ -1064,8 +1067,10 @@ pub const BackupRequestFormat = enum {
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
+    /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?BackupRequestFormat = null,
 };
@@ -1076,7 +1081,7 @@ pub const BatchRequest = struct {
     inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
@@ -1598,11 +1603,13 @@ pub const ClusterBackupRequestFormat = enum {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
+    /// Required configured `external_io` connection with the `backup.write` capability.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?ClusterBackupRequestFormat = null,
-    /// Optional list of tables to backup. If omitted, all tables are backed up.
+    /// Optional list of tables to backup. If omitted, all tables are backed up, up to the cluster backup limit of 4096 tables. Requests above that limit fail before any table backup is created.
     table_names: ?[]const []const u8 = null,
 };
 
@@ -1750,7 +1757,7 @@ pub const ClusterHealth = enum {
     }
 };
 
-/// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+/// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
 pub const ClusterRestoreRequestRestoreMode = enum {
     fail_if_exists,
     skip_if_exists,
@@ -1784,21 +1791,27 @@ pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location where the backup is stored.
     location: []const u8,
-    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
+    /// Required configured `external_io` connection with the `restore.read` capability.
+    connection: []const u8,
+    /// Optional list of tables to restore. If omitted, all tables in the backup are restored, up to the cluster restore limit of 4096 tables. Larger backups must be restored in explicit batches of at most 256 tables.
     table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?ClusterRestoreRequestRestoreMode = null,
 };
 
 /// Overall restore status
 pub const ClusterRestoreResponseStatus = enum {
+    completed,
     triggered,
+    durability_pending,
     partial,
     failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .completed => "completed",
             .triggered => "triggered",
+            .durability_pending => "durability_pending",
             .partial => "partial",
             .failed => "failed",
         };
@@ -1811,7 +1824,9 @@ pub const ClusterRestoreResponseStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
             .{ "triggered", .triggered },
+            .{ "durability_pending", .durability_pending },
             .{ "partial", .partial },
             .{ "failed", .failed },
         });
@@ -1826,15 +1841,81 @@ pub const ClusterRestoreResponse = struct {
     status: ClusterRestoreResponseStatus,
 };
 
+/// Runtime deployment topology
+pub const ClusterStatusDeploymentMode = enum {
+    embedded,
+    distributed,
+    standalone,
+    serverless,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedded => "embedded",
+            .distributed => "distributed",
+            .standalone => "standalone",
+            .serverless => "serverless",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedded", .embedded },
+            .{ "distributed", .distributed },
+            .{ "standalone", .standalone },
+            .{ "serverless", .serverless },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ClusterStatus = struct {
     health: ClusterHealth,
     /// Optional message providing details about the health status
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?ClusterStatusDeploymentMode = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
+    storage: ?StorageRuntimeStatus = null,
+};
+
+/// Runtime deployment topology
+pub const ClusterTopologyDeploymentMode = enum {
+    embedded,
+    distributed,
+    standalone,
+    serverless,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedded => "embedded",
+            .distributed => "distributed",
+            .standalone => "standalone",
+            .serverless => "serverless",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedded", .embedded },
+            .{ "distributed", .distributed },
+            .{ "standalone", .standalone },
+            .{ "serverless", .serverless },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterTopology = struct {
@@ -1843,9 +1924,11 @@ pub const ClusterTopology = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?ClusterTopologyDeploymentMode = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
+    storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
 
@@ -2094,7 +2177,7 @@ pub const ConnectionKind = enum {
     }
 };
 
-/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
+/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider. For S3, connected means an authenticated HeadBucket request succeeded for every explicitly allowlisted bucket. It verifies bucket discovery permission, not mutation permissions such as PutObject.
 pub const ConnectionStatus = enum {
     connected,
     @"error",
@@ -2139,7 +2222,9 @@ pub const ContentPart = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -2252,11 +2337,11 @@ pub const Credentials = struct {
     endpoint: ?[]const u8 = null,
     /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
     use_ssl: ?bool = null,
-    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+    /// AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
     access_key_id: ?[]const u8 = null,
-    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+    /// AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
     secret_access_key: ?[]const u8 = null,
-    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+    /// Optional AWS session token for temporary credentials. Supports secret-store references.
     session_token: ?[]const u8 = null,
 };
 
@@ -2325,6 +2410,173 @@ pub const DateRangeStringQuery = struct {
     field: ?[]const u8 = null,
     boost: ?Boost = null,
     datetime_parser: ?[]const u8 = null,
+};
+
+pub const DenseRepairBackpressureErrorCode = enum {
+    dense_repair_backpressure,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .dense_repair_backpressure => "dense_repair_backpressure",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "dense_repair_backpressure", .dense_repair_backpressure },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
+pub const DenseRepairBackpressureError = struct {
+    code: DenseRepairBackpressureErrorCode,
+    message: []const u8,
+    retryable: bool,
+    /// Suggested delay before retrying the write.
+    retry_after_ms: i64,
+};
+
+/// A structured reason why the coverage projection cannot be treated as globally complete.
+pub const DerivedCoverageObservationIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    unknown_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+    counter_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .runtime_unavailable => "runtime_unavailable",
+            .missing_group => "missing_group",
+            .unknown_group => "unknown_group",
+            .remote_unknown_group => "remote_unknown_group",
+            .stale_group => "stale_group",
+            .summary_unavailable => "summary_unavailable",
+            .config_mismatch => "config_mismatch",
+            .counter_mismatch => "counter_mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "missing_group", .missing_group },
+            .{ "unknown_group", .unknown_group },
+            .{ "remote_unknown_group", .remote_unknown_group },
+            .{ "stale_group", .stale_group },
+            .{ "summary_unavailable", .summary_unavailable },
+            .{ "config_mismatch", .config_mismatch },
+            .{ "counter_mismatch", .counter_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How generation-scoped source outcomes determine derived-index completeness.
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DerivedCoverageStatus = struct {
+    policy: DerivedCoverageStatusPolicy,
+    /// Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality.
+    observation_complete: bool,
+    /// Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete.
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it.
+    config_fingerprint: []const u8,
+    /// Whether all observed shard-local coverage summaries were read atomically and completely.
+    summary_ready: bool,
+    /// Freshly observed shard groups reporting a different semantic configuration fingerprint.
+    config_mismatch_group_count: i64,
+    /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
+    source_total: i64,
+    /// Source documents with a durable produced outcome for this index generation.
+    produced: i64,
+    /// Source documents intentionally producing no indexable output.
+    skipped: i64,
+    /// Source documents whose generation failed non-retryably.
+    terminal_failed: i64,
+    /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
+    covered: i64,
+    /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+    pending: ?i64,
+    /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
+    complete: bool,
+    /// Whether coverage is complete without terminal failures.
+    healthy: bool,
+    /// Whether coverage is complete under best_effort but includes terminal failures.
+    degraded: bool,
+};
+
+pub const DerivedCoverageStatusPolicy = enum {
+    strict,
+    partial,
+    best_effort,
+    external,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+            .external => "external",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+            .{ "external", .external },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const DisjunctionQuery = struct {
@@ -3040,6 +3292,8 @@ pub const Embedding = std.json.Value;
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -3069,6 +3323,8 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -3110,6 +3366,7 @@ pub const EmbeddingsIndexStats = struct {
     total_terms: ?i64 = null,
     /// Whether the index enricher is currently backfilling
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
@@ -3120,8 +3377,10 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
     /// Operational readiness state such as ready, running, retrying, or failed.
     backfill_state: ?[]const u8 = null,
-    /// Number of documents visible to the index.
+    /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
+    /// Generation-scoped source-document coverage, separate from physical index cardinality.
+    coverage: ?DerivedCoverageStatus = null,
     /// Documents currently visible to queries.
     query_visible_doc_count: ?i64 = null,
     published_doc_count: ?i64 = null,
@@ -3132,8 +3391,6 @@ pub const EmbeddingsIndexStats = struct {
     dense_replay_target_sequence: ?i64 = null,
     /// Whether dense/vector artifacts still need publication before queries see the latest data.
     dense_publish_pending: ?bool = null,
-    /// Source document coverage accounting for embeddings indexes.
-    coverage: ?std.json.Value = null,
     replay_applied_sequence: ?i64 = null,
     replay_target_sequence: ?i64 = null,
     replay_catch_up_required: ?bool = null,
@@ -3145,8 +3402,7 @@ pub const EmbeddingsIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    /// Embedding enrichment worker runtime diagnostics.
-    enrichment_runtime: ?std.json.Value = null,
+    enrichment_runtime: ?EnrichmentRuntimeStatus = null,
     hbc_cache: ?std.json.Value = null,
     hbc_posting: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
@@ -3157,7 +3413,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -3206,6 +3462,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.
     producer_json: ?[]const u8 = null,
+    /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Managed generated artifact kind.
@@ -3235,6 +3493,50 @@ pub const EnrichmentKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Runtime state for the durable embeddings enrichment worker.
+pub const EnrichmentRuntimeStatus = struct {
+    enabled: bool,
+    target_sequence: i64,
+    applied_sequence: i64,
+    pending_sequence_count: i64,
+    projection_checkpoint_status: []const u8,
+    projection_checkpoint_applied_sequence: i64,
+    projection_checkpoint_generation: i64,
+    projection_checkpoint_config_fingerprint: []const u8,
+    /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
+    projection_checkpoint_identity_consistent: bool,
+    checkpoint_replay_tail_sequence_count: i64,
+    processed_requests: i64,
+    error_count: i64,
+    retryable_error_count: i64,
+    fatal_error_count: i64,
+    retrying: bool,
+    worker_failed: bool,
+    /// Whether the background enrichment worker is currently running.
+    worker_started: bool,
+    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    stalled: bool,
+    skip_by_hash_count: i64,
+    skipped_source_count: i64,
+    codec_decode_failures: i64,
+    embed_batches_started: i64,
+    embed_batches_completed: i64,
+    embed_items_started: i64,
+    embed_items_completed: i64,
+    active_embed_batch_items: i64,
+    active_embed_batch_bytes: i64,
+    active_embed_batch_max_bytes: i64,
+    active_embed_batch_started_ms: i64,
+    last_embed_batch_items: i64,
+    last_embed_batch_bytes: i64,
+    last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
+    last_embed_batch_ns: i64,
+    total_embed_ns: i64,
 };
 
 pub const Error = struct {
@@ -3474,6 +3776,14 @@ pub const ExactSortError = struct {
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: []const u8,
     status: i32,
+};
+
+/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+pub const ExecutionPolicy = struct {
+    /// Maximum items to process in one batch for this operation.
+    batch_items: ?i64 = null,
+    /// Approximate maximum source bytes to process in one batch for this operation.
+    batch_bytes: ?i64 = null,
 };
 
 pub const ExtensionError = struct {
@@ -4206,7 +4516,7 @@ pub const ForeignSourceType = enum {
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
     type: ForeignSourceType,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
@@ -4253,6 +4563,7 @@ pub const FullTextIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Progress of ongoing rebuild as fraction [0.0, 1.0]
@@ -4290,7 +4601,7 @@ pub const FullTextIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -4589,6 +4900,7 @@ pub const GraphIndexStats = struct {
     edge_types: ?std.json.ArrayHashMap(i64) = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, materializing, or catching up.
     backfill_active: ?bool = null,
     /// Rebuild progress as a ratio from 0.0 to 1.0
@@ -4626,7 +4938,7 @@ pub const GraphIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -5363,6 +5675,8 @@ pub const GraphQueryType = enum {
 pub const GraphResultNode = struct {
     /// Document key
     key: []const u8,
+    /// Owning table for a cross-table node; omitted for nodes in the queried table
+    table: ?[]const u8 = null,
     /// Distance from start node
     depth: ?i64 = null,
     /// Weighted distance
@@ -5482,6 +5796,8 @@ pub const IndexConfig = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -5509,6 +5825,8 @@ pub const IndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -5536,6 +5854,10 @@ pub const IndexConfig = struct {
         }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
             try jw.write(value);
         }
         if (self.external) |value| {
@@ -5594,6 +5916,10 @@ pub const IndexConfig = struct {
             try jw.objectField("chunk_size");
             try jw.write(value);
         }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -5610,6 +5936,54 @@ pub const IndexConfig = struct {
     }
 };
 
+/// Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted.
+pub const IndexExecutionConfig = struct {
+    /// Chunk producer batching for shorthand-created chunk enrichments.
+    chunking: ?ExecutionPolicy = null,
+    /// Embedding producer batching for shorthand-created embedding enrichments.
+    embedding: ?ExecutionPolicy = null,
+};
+
+/// Stable repair state. Internal state-machine phases are intentionally not exposed here.
+pub const IndexRepairStatusState = enum {
+    rebuilding,
+    waiting,
+    paused,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rebuilding => "rebuilding",
+            .waiting => "waiting",
+            .paused => "paused",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rebuilding", .rebuilding },
+            .{ "waiting", .waiting },
+            .{ "paused", .paused },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
+pub const IndexRepairStatus = struct {
+    /// Stable repair state. Internal state-machine phases are intentionally not exposed here.
+    state: IndexRepairStatusState,
+    /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
+    action_required: bool,
+};
+
 /// Statistics for an index
 pub const IndexStats = union(enum) {
     full_text_index_stats: FullTextIndexStats,
@@ -5621,7 +5995,9 @@ pub const IndexStats = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -5801,7 +6177,9 @@ pub const InferenceChunkContentPart = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -5958,12 +6336,14 @@ pub const InferenceConfig = struct {
     content_security: ?InferenceContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?InferencePromptCacheConfig = null,
     /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const InferenceBackendPriorityEntry = null,
     /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
@@ -5976,9 +6356,9 @@ pub const InferenceConfig = struct {
     preload: ?[]const InferenceModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?InferenceschemasConfig = null,
 };
@@ -6138,6 +6518,32 @@ pub const InferenceEmbedRequestInputType = enum {
     }
 };
 
+/// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
+pub const InferenceEmbedRequestErrorPolicy = enum {
+    fail_fast,
+    per_item,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .fail_fast => "fail_fast",
+            .per_item => "per_item",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "fail_fast", .fail_fast },
+            .{ "per_item", .per_item },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
 pub const InferenceEmbedRequest = struct {
     /// Model name to use for embedding generation
@@ -6152,6 +6558,8 @@ pub const InferenceEmbedRequest = struct {
     task_type: ?InferenceEmbedRequestTaskType = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?InferenceEmbedRequestInputType = null,
+    /// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
+    error_policy: ?InferenceEmbedRequestErrorPolicy = null,
 };
 
 /// Object type, always "list"
@@ -6186,6 +6594,76 @@ pub const InferenceEmbedResponse = struct {
     /// Model used for embedding generation
     model: []const u8,
     usage: InferenceEmbeddingUsage,
+    /// Indexed per-input failures. Only populated when request error_policy is per_item.
+    errors: ?[]const InferenceEmbeddingItemError = null,
+    summary: ?InferenceEmbeddingBatchSummary = null,
+};
+
+/// Counts for per-item embedding responses
+pub const InferenceEmbeddingBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
+/// Pipeline stage that classified the failure
+pub const InferenceEmbeddingItemErrorStage = enum {
+    parse,
+    fetch,
+    image_decode,
+    audio_decode,
+    text_inference,
+    image_inference,
+    audio_inference,
+    inference,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .parse => "parse",
+            .fetch => "fetch",
+            .image_decode => "image_decode",
+            .audio_decode => "audio_decode",
+            .text_inference => "text_inference",
+            .image_inference => "image_inference",
+            .audio_inference => "audio_inference",
+            .inference => "inference",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "parse", .parse },
+            .{ "fetch", .fetch },
+            .{ "image_decode", .image_decode },
+            .{ "audio_decode", .audio_decode },
+            .{ "text_inference", .text_inference },
+            .{ "image_inference", .image_inference },
+            .{ "audio_inference", .audio_inference },
+            .{ "inference", .inference },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Per-input embedding failure for error_policy=per_item responses
+pub const InferenceEmbeddingItemError = struct {
+    /// Original input index that failed
+    index: i64,
+    /// Stable machine-readable failure code
+    code: []const u8,
+    /// Human-readable failure message
+    message: []const u8,
+    /// Pipeline stage that classified the failure
+    stage: InferenceEmbeddingItemErrorStage,
+    /// Whether retrying the same item may succeed
+    retryable: bool,
+    /// HTTP-style status classification for this item
+    status: i64,
 };
 
 /// Object type, always "embedding"
@@ -6279,6 +6757,88 @@ pub const InferenceFunctionDefinition = struct {
     parameters: ?std.json.Value = null,
     /// Whether to enforce strict parameter validation
     strict: ?bool = null,
+};
+
+pub const InferenceGenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const InferenceGenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceGenerateBatchRequest = struct {
+    mode: ?InferenceGenerateBatchMode = null,
+    requests: []const InferenceGenerateBatchRequestItem,
+};
+
+pub const InferenceGenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: InferenceGenerateRequest,
+};
+
+pub const InferenceGenerateBatchResponseObject = enum {
+    generate_batch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .generate_batch => "generate.batch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "generate.batch", .generate_batch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceGenerateBatchResponse = struct {
+    object: InferenceGenerateBatchResponseObject,
+    data: []const InferenceGenerateBatchResultItem,
+    summary: InferenceGenerateBatchSummary,
+};
+
+pub const InferenceGenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?InferenceGenerateResponse = null,
+    @"error": ?InferenceGenerateBatchError = null,
+};
+
+pub const InferenceGenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
 };
 
 pub const InferenceGenerateChoice = struct {
@@ -6477,6 +7037,10 @@ pub const InferenceGenerateRequest = struct {
     cache_dtype: ?InferenceGenerateRequestCacheDtype = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
+    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
+    prompt_cache_key: ?[]const u8 = null,
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    prompt_cache: ?bool = null,
     backend: ?InferenceModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
     mode: ?InferenceGenerateRequestMode = null,
@@ -6567,6 +7131,8 @@ pub const InferenceGenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Prompt tokens served from inference-native prefix KV cache
+    cached_prompt_tokens: ?i64 = null,
 };
 
 pub const InferenceImageURL = ImageURL;
@@ -6920,6 +7486,46 @@ pub const InferencePredictorsResponse = struct {
     object: InferencePredictorsResponseObject,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(InferencePredictorInfo),
+};
+
+/// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+pub const InferencePromptCacheConfigMode = enum {
+    simple,
+    block_hash,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .block_hash => "block_hash",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "block_hash", .block_hash },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Native generator prompt KV cache configuration.
+pub const InferencePromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?InferencePromptCacheConfigMode = null,
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
 };
 
 /// Inference provider type for a connection.
@@ -7917,39 +8523,11 @@ pub const MatchPhraseQuery = struct {
     fuzziness: ?Fuzziness = null,
 };
 
-pub const MatchQueryOperator = enum {
-    @"or",
-    @"and",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"or" => "or",
-            .@"and" => "and",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "or", .@"or" },
-            .{ "and", .@"and" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    operator: ?MatchQueryOperator = null,
 };
 
 pub const MediaContentPartType = enum {
@@ -8538,7 +9116,6 @@ pub const Pruner = struct {
 
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
-    match_query: *MatchQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     numeric_range_query: *NumericRangeQuery,
     term_range_query: *TermRangeQuery,
@@ -8546,6 +9123,7 @@ pub const Query = union(enum) {
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
     geo_distance_query: *GeoDistanceQuery,
+    match_query: *MatchQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
@@ -8567,7 +9145,9 @@ pub const Query = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -8601,16 +9181,6 @@ pub const Query = union(enum) {
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "match",
-            "field",
-            "analyzer",
-            "prefix_length",
-            "fuzziness",
-            "operator",
-        })) {
-            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "field",
@@ -8669,6 +9239,13 @@ pub const Query = union(enum) {
             "field",
         })) {
             if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "field",
+            "analyzer",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "terms",
@@ -8779,7 +9356,6 @@ pub const Query = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
-            .match_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
             .term_range_query => |v| try jw.write(v.*),
@@ -8787,6 +9363,7 @@ pub const Query = union(enum) {
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
@@ -8978,13 +9555,13 @@ pub const QueryRequestExpandStrategy = enum {
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -9006,7 +9583,7 @@ pub const QueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -9607,6 +10184,35 @@ pub const RepairIssueListRequest = struct {
     limit: ?i64 = null,
 };
 
+/// Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+pub const RepairRunRequestControl = enum {
+    pause_automatic,
+    resume_automatic,
+    cancel_current_attempt,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pause_automatic => "pause_automatic",
+            .resume_automatic => "resume_automatic",
+            .cancel_current_attempt => "cancel_current_attempt",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pause_automatic", .pause_automatic },
+            .{ "resume_automatic", .resume_automatic },
+            .{ "cancel_current_attempt", .cancel_current_attempt },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Bounded request to run a table repair pass.
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
@@ -9615,8 +10221,12 @@ pub const RepairRunRequest = struct {
     index: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    /// Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
     force: ?bool = null,
+    /// Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+    control: ?RepairRunRequestControl = null,
+    /// Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair.
+    repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
     limit: ?i64 = null,
 };
@@ -9686,7 +10296,7 @@ pub const ReplicationSourceType = enum {
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
     type: ReplicationSourceType,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
@@ -9744,7 +10354,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -9855,15 +10465,14 @@ pub const ResourceType = enum {
     }
 };
 
-/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-pub const RestoreRequestFormat = enum {
-    native,
-    portable,
+pub const RestoreJobScope = enum {
+    table,
+    cluster,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .native => "native",
-            .portable => "portable",
+            .table => "table",
+            .cluster => "cluster",
         };
         try jw.write(s);
     }
@@ -9874,35 +10483,101 @@ pub const RestoreRequestFormat = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "native", .native },
-            .{ "portable", .portable },
+            .{ "table", .table },
+            .{ "cluster", .cluster },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
-    backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
-    location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?RestoreRequestFormat = null,
+pub const RestoreJobPhase = enum {
+    queued,
+    running,
+    succeeded,
+    failed,
+    cancelled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .queued => "queued",
+            .running => "running",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .cancelled => "cancelled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "queued", .queued },
+            .{ "running", .running },
+            .{ "succeeded", .succeeded },
+            .{ "failed", .failed },
+            .{ "cancelled", .cancelled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
+pub const RestoreJob = struct {
+    /// Opaque durable restore-job identifier. Clients must not parse it as a number.
+    job_id: []const u8,
+    attempt_id: i64,
+    scope: RestoreJobScope,
+    table_name: ?[]const u8 = null,
+    backup_id: []const u8,
+    phase: RestoreJobPhase,
+    cancel_requested: bool,
+    /// Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+    durability_pending_table_count: i64,
+    /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+    published_table_count: i64,
+    /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
+    completed_table_count: i64,
+    /// Requested table count when known before execution.
+    total_table_count: ?i64 = null,
+    /// Bounded terminal result. A committed result with durability pending means publication is visible but parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed, durability-pending, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
+    result: ?std.json.Value = null,
+    @"error": ?[]const u8 = null,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    expires_at_ms: ?i64 = null,
+};
+
+pub const RestoreJobList = struct {
+    jobs: []const RestoreJob,
+    /// Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
+    next_cursor: ?[]const u8 = null,
+};
+
+pub const RestoreRequest = struct {
+    /// Identifier of the published backup to restore.
+    backup_id: []const u8,
+    /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
+    location: []const u8,
+    /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
+};
+
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
-    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
+    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
-    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
+    /// Mandatory filters from prior interactions. These are converted to structured Antfly predicates and applied to every table and every search tool invocation, including generated follow-ups, graph/tree traversal, aggregations, and root scans.
     accumulated_filters: ?[]const FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    /// Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
     decisions: ?[]const AgentDecision = null,
@@ -10048,13 +10723,13 @@ pub const RetrievalQueryRequestExpandStrategy = enum {
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -10076,7 +10751,7 @@ pub const RetrievalQueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -10577,7 +11252,9 @@ pub const RowsCoalesceOperand = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -10707,7 +11384,9 @@ pub const RowsExpression = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -11730,7 +12409,9 @@ pub const RowsPlanRequest = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -11823,7 +12504,9 @@ pub const RowsQueryOrder = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -12221,7 +12904,9 @@ pub const RowsWhere = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -12358,7 +13043,9 @@ pub const RowsWhereBranch = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -12635,6 +13322,20 @@ pub const RowsWindowSpec = struct {
     frame: ?RowsWindowFrame = null,
 };
 
+/// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
+pub const RuntimeConfigStatus = struct {
+    /// Generation of the fully validated and atomically published configuration.
+    generation: ?i64 = null,
+    /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
+    hash: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
+    last_reload_failed: ?bool = null,
+    /// Whether requests are using the last-known-good snapshot after a failed reload.
+    stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
+};
+
 pub const RuntimeDeclMode = enum {
     manifest_only,
     antfly_api_template,
@@ -12806,7 +13507,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
@@ -12828,13 +13529,13 @@ pub const SecretList = struct {
 
 /// Source of the secret configuration
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .configured_keystore => "configured_keystore",
+            .configured_file => "configured_file",
             .configured_env => "configured_env",
             .configured_both => "configured_both",
         };
@@ -12847,7 +13548,7 @@ pub const SecretStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_file", .configured_file },
             .{ "configured_env", .configured_env },
             .{ "configured_both", .configured_both },
         });
@@ -12857,12 +13558,22 @@ pub const SecretStatus = enum {
 
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
+    /// Generation of the currently published secret-store snapshot.
+    generation: ?i64 = null,
+    /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
+    supports_source_generation: ?bool = null,
+    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
+    source_generation: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed to load.
+    last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
 };
 
 pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
+    /// Secret value (stored in the configured protected secret store and never returned)
     value: []const u8,
 };
 
@@ -13244,6 +13955,49 @@ pub const SqlStatementResponse = struct {
     result: ?std.json.Value = null,
 };
 
+pub const StorageMaintenanceCapabilities = struct {
+    check: bool,
+    compact: bool,
+    vacuum: bool,
+    online: bool,
+    asynchronous: bool,
+};
+
+pub const StorageRuntimeStatusEngine = enum {
+    lite,
+    local,
+    object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lite => "lite",
+            .local => "local",
+            .object => "object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lite", .lite },
+            .{ "local", .local },
+            .{ "object", .object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const StorageRuntimeStatus = struct {
+    engine: StorageRuntimeStatusEngine,
+    format: ?[]const u8 = null,
+    fsync: ?bool = null,
+    maintenance: StorageMaintenanceCapabilities,
+};
+
 pub const StorageStatus = struct {
     /// Disk usage in bytes.
     disk_usage: ?i64 = null,
@@ -13522,12 +14276,12 @@ pub const TableRepairJob = struct {
     cursor: ?[]const u8 = null,
     /// Effective per-pass repair limit.
     limit: i64,
-    /// Whether the job forces a named index rebuild.
+    /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
@@ -13587,6 +14341,8 @@ pub const TableRepairRunResult = struct {
     indexes_rebuilt: i64,
     /// Number of selected indexes that were already degraded or quarantined before repair.
     indexes_degraded: i64,
+    /// Number of existing index repairs that accepted the requested control.
+    controls_applied: i64,
     /// Effective repair limit.
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
@@ -13600,12 +14356,16 @@ pub const TableRepairRunResult = struct {
 /// Restore status for this table
 pub const TableRestoreStatusStatus = enum {
     triggered,
+    committed,
+    durability_pending,
     skipped,
     failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .triggered => "triggered",
+            .committed => "committed",
+            .durability_pending => "durability_pending",
             .skipped => "skipped",
             .failed => "failed",
         };
@@ -13619,6 +14379,8 @@ pub const TableRestoreStatusStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "triggered", .triggered },
+            .{ "committed", .committed },
+            .{ "durability_pending", .durability_pending },
             .{ "skipped", .skipped },
             .{ "failed", .failed },
         });
@@ -14160,7 +14922,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+    /// Value for operation (not required for $unset). Type depends on the supported operator.
     value: ?std.json.Value = null,
 };
 
@@ -14170,15 +14932,8 @@ pub const TransformOpType = enum {
     @"$set_on_insert",
     @"$unset",
     @"$inc",
-    @"$push",
-    @"$pull",
     @"$add_to_set",
-    @"$pop",
-    @"$mul",
-    @"$min",
     @"$max",
-    @"$current_date",
-    @"$rename",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -14186,15 +14941,8 @@ pub const TransformOpType = enum {
             .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
-            .@"$push" => "$push",
-            .@"$pull" => "$pull",
             .@"$add_to_set" => "$addToSet",
-            .@"$pop" => "$pop",
-            .@"$mul" => "$mul",
-            .@"$min" => "$min",
             .@"$max" => "$max",
-            .@"$current_date" => "$currentDate",
-            .@"$rename" => "$rename",
         };
         try jw.write(s);
     }
@@ -14209,15 +14957,8 @@ pub const TransformOpType = enum {
             .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
-            .{ "$push", .@"$push" },
-            .{ "$pull", .@"$pull" },
             .{ "$addToSet", .@"$add_to_set" },
-            .{ "$pop", .@"$pop" },
-            .{ "$mul", .@"$mul" },
-            .{ "$min", .@"$min" },
             .{ "$max", .@"$max" },
-            .{ "$currentDate", .@"$current_date" },
-            .{ "$rename", .@"$rename" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

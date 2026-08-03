@@ -69,6 +69,7 @@ pub const TableEmptyingGroupRequest = table_write_schema_jobs.TableEmptyingGroup
 
 pub const TableWriteSource = table_write_core.TableWriteSource;
 pub const RaftBatcher = table_write_core.RaftBatcher;
+pub const StartupCatchUpMetadata = table_write_core.StartupCatchUpMetadata;
 pub const freeForeignKeyRefChildrenPage = table_write_core.freeForeignKeyRefChildrenPage;
 pub const freeRelationalIndexRepairJobRecord = table_write_core.freeRelationalIndexRepairJobRecord;
 pub const freeRelationalIndexRepairJobRecords = table_write_core.freeRelationalIndexRepairJobRecords;

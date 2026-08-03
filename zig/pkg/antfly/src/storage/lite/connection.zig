@@ -16,6 +16,7 @@ const std = @import("std");
 
 const backend = @import("backend.zig");
 const db_mod = @import("../db/mod.zig");
+const group_ids = @import("../../common/group_ids.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -24,20 +25,53 @@ pub const Connection = struct {
     db: db_mod.DB,
     open_mode: db_mod.OpenOptions.OpenMode,
 
+    pub const Options = struct {
+        fsync: bool = true,
+    };
+
     pub fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !Connection {
+        return try openWithOptions(allocator, path, open_mode, .{});
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, opts: Options) !Connection {
         var lite_backend = try backend.Handle.open(allocator, path, .{
             .read_only = openModeRequiresReadOnlyBackends(open_mode),
+            .no_sync = !opts.fsync,
         });
         errdefer lite_backend.deinit();
 
         return try openWithBackend(allocator, path, open_mode, &lite_backend);
     }
 
+    /// Opens an existing Lite database or atomically creates a new one. The
+    /// exclusive create closes the existence-check race; if another process
+    /// wins creation, this process retries the normal writer open and therefore
+    /// still respects the single-writer file lock.
+    pub fn openOrCreateWithOptions(allocator: Allocator, path: []const u8, opts: Options) !Connection {
+        return openWithOptions(allocator, path, .writer, opts) catch |open_err| switch (open_err) {
+            error.FileNotFound => createWithOptions(allocator, path, true, opts) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => openWithOptions(allocator, path, .writer, opts),
+                else => create_err,
+            },
+            else => open_err,
+        };
+    }
+
     pub fn create(allocator: Allocator, path: []const u8, exclusive: bool) !Connection {
-        var lite_backend = try backend.Handle.create(allocator, path, exclusive);
+        return try createWithOptions(allocator, path, exclusive, .{});
+    }
+
+    pub fn createWithOptions(allocator: Allocator, path: []const u8, exclusive: bool, opts: Options) !Connection {
+        var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{
+            .exclusive = exclusive,
+            .no_sync = !opts.fsync,
+        });
         errdefer lite_backend.deinit();
 
-        return try openWithBackend(allocator, path, .writer, &lite_backend);
+        var connection = try openWithBackend(allocator, path, .writer, &lite_backend);
+        errdefer connection.close();
+        try connection.backend.markEmbeddedArtifact();
+        return connection;
     }
 
     pub fn close(self: *Connection) void {
@@ -51,6 +85,20 @@ pub const Connection = struct {
     }
 };
 
+/// Embedded Lite's root is the future standalone `default` table. Assigning
+/// that deterministic identity at file creation avoids an O(live documents)
+/// namespace rewrite when the artifact is first served through `/db/v1`.
+pub fn embeddedRootIdentity() db_mod.DocIdentityNamespace {
+    const table_name = "default";
+    const table_id = std.hash.Wyhash.hash(0x54424c45, table_name);
+    const group_id = group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(0x47525031, table_name));
+    return .{
+        .table_id = if (table_id == 0) 1 else table_id,
+        .shard_id = group_id,
+        .range_id = group_id,
+    };
+}
+
 fn openWithBackend(
     allocator: Allocator,
     path: []const u8,
@@ -60,6 +108,7 @@ fn openWithBackend(
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
         .external_derived_checkpoints = false,
+        .identity_namespace = embeddedRootIdentity(),
     };
     try lite_backend.configureDbOpenOptions(&opts);
 
@@ -100,4 +149,35 @@ test "lite connection write modes sync on close" {
     try std.testing.expect(openModeCanWrite(.writer_no_replay));
     try std.testing.expect(!openModeCanWrite(.query_readonly));
     try std.testing.expect(!openModeCanWrite(.status_only));
+}
+
+test "lite connection propagates fsync policy to native file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/fsync.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var created = try Connection.create(allocator, path, true);
+    created.close();
+
+    var connection = try Connection.openWithOptions(allocator, path, .writer, .{ .fsync = false });
+    defer connection.close();
+    try std.testing.expect(connection.backend.native_docstore.?.file.no_sync);
+}
+
+test "lite connection open or create initializes a missing file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/new.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var created = try Connection.openOrCreateWithOptions(allocator, path, .{ .fsync = false });
+    try std.testing.expect(created.backend.native_docstore.?.file.no_sync);
+    created.close();
+
+    var reopened = try Connection.openOrCreateWithOptions(allocator, path, .{ .fsync = true });
+    defer reopened.close();
+    try std.testing.expect(!reopened.backend.native_docstore.?.file.no_sync);
 }

@@ -1,0 +1,13 @@
+{
+  "method": "POST",
+  "path": "/tables/antfly-benchmark/batch",
+  "body": {
+    "inserts": {
+      "freshness:{marker}": {
+        "corpus_ordinal": 9000000000000000001,
+        "body": "freshness {marker}"
+      }
+    },
+    "sync_level": "write"
+  }
+}

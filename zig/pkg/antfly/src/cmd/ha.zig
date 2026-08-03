@@ -1008,7 +1008,7 @@ fn value(argv: []const []const u8, idx: *usize, flag: []const u8) ![]const u8 {
 }
 
 fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[]u8 {
-    const env_var = options.remote_token_env orelse return null;
+    const env_var = try validateHAAdminTokenEnvName(options.remote_token_env orelse return null);
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -1350,7 +1350,7 @@ test "ha cmd remote commands prefer typed admin routes" {
         "seed",
         "begin",
         "--slot",
-        "standby-json",
+        "standby-seed",
         "--manifest-id",
         "base-standby-json-1",
     }, recorder.executor());
@@ -1514,9 +1514,9 @@ test "ha cmd remote commands prefer typed admin routes" {
         "--new-epoch",
         "3",
         "--required-lsn",
-        "0",
+        "1",
         "--observed-lsn",
-        "0",
+        "1",
         "--reason",
         "operator-approved",
     }, recorder.executor());
@@ -1572,7 +1572,8 @@ test "ha cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_assess);
 
-    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+    // Route selection is under test; this server has no matching former-primary log.
+    try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "rejoin",                     "rewind",
         "--node-id",                  "primary-a",
         "--cluster-id",               "10",
@@ -1580,19 +1581,19 @@ test "ha cmd remote commands prefer typed admin routes" {
         "--table-id",                 "30",
         "--timeline-id",              "1",
         "--epoch",                    "2",
-        "--last-lsn",                 "12",
-        "--retained-from-lsn",        "8",
+        "--last-lsn",                 "4",
+        "--retained-from-lsn",        "0",
         "--fence-old-primary-id",     "primary-a",
-        "--fence-promoted-node-id",   "standby-b",
+        "--fence-promoted-node-id",   "standby-a",
         "--fence-parent-timeline-id", "1",
         "--fence-parent-epoch",       "2",
         "--fence-new-timeline-id",    "2",
         "--fence-new-epoch",          "3",
-        "--fence-required-lsn",       "10",
-        "--fence-observed-lsn",       "10",
+        "--fence-required-lsn",       "1",
+        "--fence-observed-lsn",       "1",
         "--fence-generation",         "1",
-        "--fence-token",              "token",
-    }, recorder.executor());
+        "--fence-token",              "ha-fence:10:20:30:2:3:1:standby-a",
+    }, recorder.executor()));
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_rewind);
 
@@ -1604,7 +1605,7 @@ test "ha cmd remote commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "rejoin",                     "reseed",
         "--node-id",                  "primary-a",
         "--cluster-id",               "10",
@@ -1612,19 +1613,19 @@ test "ha cmd remote commands prefer typed admin routes" {
         "--table-id",                 "30",
         "--timeline-id",              "1",
         "--epoch",                    "2",
-        "--last-lsn",                 "12",
-        "--retained-from-lsn",        "11",
+        "--last-lsn",                 "4",
+        "--retained-from-lsn",        "2",
         "--fence-old-primary-id",     "primary-a",
-        "--fence-promoted-node-id",   "standby-b",
+        "--fence-promoted-node-id",   "standby-a",
         "--fence-parent-timeline-id", "1",
         "--fence-parent-epoch",       "2",
         "--fence-new-timeline-id",    "2",
         "--fence-new-epoch",          "3",
-        "--fence-required-lsn",       "10",
-        "--fence-observed-lsn",       "10",
+        "--fence-required-lsn",       "1",
+        "--fence-observed-lsn",       "1",
         "--fence-generation",         "1",
-        "--fence-token",              "token",
-    }, recorder.executor());
+        "--fence-token",              "ha-fence:10:20:30:2:3:1:standby-a",
+    }, recorder.executor()));
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
 }
@@ -1705,9 +1706,10 @@ test "ha cmd remote direct promotion uses typed admin route" {
         "--new-epoch",
         "3",
         "--required-lsn",
-        "0",
+        "1",
         "--observed-lsn",
         "0",
+        "--force",
         "--reason",
         "operator-approved",
     }, recorder.executor());
@@ -1842,7 +1844,7 @@ test "ha cmd streams local primary WAL into durable standby state" {
         defer primary.close();
         const slot = primary.slot("standby-cli") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 1), slot.timeline_id);
-        try std.testing.expectEqual(@as(u64, 0), slot.restart_lsn);
+        try std.testing.expectEqual(@as(u64, 1), slot.restart_lsn);
         try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
         try std.testing.expect(slot.active);

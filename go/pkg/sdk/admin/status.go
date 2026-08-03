@@ -383,7 +383,7 @@ func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionSt
 	if oldestRestartLSN > primaryLSN {
 		return fmt.Errorf("primary retention snapshot inconsistent: oldest_restart_lsn=%d primary_lsn=%d", oldestRestartLSN, primaryLSN)
 	}
-	if retainedLSNCount != primaryLSN-oldestRestartLSN {
+	if !haRetainedLSNCountConsistent(primaryLSN, oldestRestartLSN, retainedLSNCount, slotCount) {
 		return fmt.Errorf("primary retention snapshot inconsistent: retained_lsn_count=%d expected=%d", retainedLSNCount, primaryLSN-oldestRestartLSN)
 	}
 	if activeSlots > uint64(slotCount) {
@@ -475,9 +475,6 @@ func haDurabilityStatusJSONConsistent(durability haDurabilityStatusJSON) error {
 	}
 	if satisfiedCount > candidateCount {
 		return fmt.Errorf("durability status inconsistent: satisfied_count=%d candidate_count=%d", satisfiedCount, candidateCount)
-	}
-	if requiredCount > candidateCount {
-		return fmt.Errorf("durability status inconsistent: required_count=%d candidate_count=%d", requiredCount, candidateCount)
 	}
 	if HADurabilityDecisionStatus(strings.TrimSpace(durability.Status)) == HADurabilityStatusSatisfied && satisfiedCount < requiredCount {
 		return fmt.Errorf("durability status inconsistent: satisfied_count=%d required_count=%d", satisfiedCount, requiredCount)

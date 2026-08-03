@@ -585,8 +585,10 @@ pub const BackupInfo = struct {
 };
 
 pub const BackupListResponse = struct {
-    /// List of available backups
+    /// One page of available backups in stable manifest-key order.
     backups: []const BackupInfo,
+    /// Opaque continuation cursor. Omitted when no additional backups remain.
+    next_cursor: ?[]const u8 = null,
 };
 
 /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
@@ -618,8 +620,10 @@ pub const BackupRequestFormat = enum {
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
+    /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?BackupRequestFormat = null,
 };
@@ -630,7 +634,7 @@ pub const BatchRequest = struct {
     inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
@@ -777,11 +781,13 @@ pub const ClusterBackupRequestFormat = enum {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
+    /// Required configured `external_io` connection with the `backup.write` capability.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?ClusterBackupRequestFormat = null,
-    /// Optional list of tables to backup. If omitted, all tables are backed up.
+    /// Optional list of tables to backup. If omitted, all tables are backed up, up to the cluster backup limit of 4096 tables. Requests above that limit fail before any table backup is created.
     table_names: ?[]const []const u8 = null,
 };
 
@@ -929,7 +935,7 @@ pub const ClusterHealth = enum {
     }
 };
 
-/// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+/// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
 pub const ClusterRestoreRequestRestoreMode = enum {
     fail_if_exists,
     skip_if_exists,
@@ -963,21 +969,27 @@ pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location where the backup is stored.
     location: []const u8,
-    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
+    /// Required configured `external_io` connection with the `restore.read` capability.
+    connection: []const u8,
+    /// Optional list of tables to restore. If omitted, all tables in the backup are restored, up to the cluster restore limit of 4096 tables. Larger backups must be restored in explicit batches of at most 256 tables.
     table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?ClusterRestoreRequestRestoreMode = null,
 };
 
 /// Overall restore status
 pub const ClusterRestoreResponseStatus = enum {
+    completed,
     triggered,
+    durability_pending,
     partial,
     failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .completed => "completed",
             .triggered => "triggered",
+            .durability_pending => "durability_pending",
             .partial => "partial",
             .failed => "failed",
         };
@@ -990,7 +1002,9 @@ pub const ClusterRestoreResponseStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
             .{ "triggered", .triggered },
+            .{ "durability_pending", .durability_pending },
             .{ "partial", .partial },
             .{ "failed", .failed },
         });
@@ -1005,15 +1019,81 @@ pub const ClusterRestoreResponse = struct {
     status: ClusterRestoreResponseStatus,
 };
 
+/// Runtime deployment topology
+pub const ClusterStatusDeploymentMode = enum {
+    embedded,
+    distributed,
+    standalone,
+    serverless,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedded => "embedded",
+            .distributed => "distributed",
+            .standalone => "standalone",
+            .serverless => "serverless",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedded", .embedded },
+            .{ "distributed", .distributed },
+            .{ "standalone", .standalone },
+            .{ "serverless", .serverless },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ClusterStatus = struct {
     health: ClusterHealth,
     /// Optional message providing details about the health status
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?ClusterStatusDeploymentMode = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
+    storage: ?StorageRuntimeStatus = null,
+};
+
+/// Runtime deployment topology
+pub const ClusterTopologyDeploymentMode = enum {
+    embedded,
+    distributed,
+    standalone,
+    serverless,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedded => "embedded",
+            .distributed => "distributed",
+            .standalone => "standalone",
+            .serverless => "serverless",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedded", .embedded },
+            .{ "distributed", .distributed },
+            .{ "standalone", .standalone },
+            .{ "serverless", .serverless },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterTopology = struct {
@@ -1022,9 +1102,11 @@ pub const ClusterTopology = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?ClusterTopologyDeploymentMode = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
+    storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
 
@@ -1147,7 +1229,7 @@ pub const ConnectionKind = enum {
     }
 };
 
-/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
+/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider. For S3, connected means an authenticated HeadBucket request succeeded for every explicitly allowlisted bucket. It verifies bucket discovery permission, not mutation permissions such as PutObject.
 pub const ConnectionStatus = enum {
     connected,
     @"error",
@@ -1218,6 +1300,37 @@ pub const DatabaseCatalogRecord = struct {
     settings_json: []const u8,
     /// Optional durable tablespace binding inherited by new namespace/table placement policy.
     tablespace_name: ?[]const u8 = null,
+};
+
+pub const DenseRepairBackpressureErrorCode = enum {
+    dense_repair_backpressure,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .dense_repair_backpressure => "dense_repair_backpressure",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "dense_repair_backpressure", .dense_repair_backpressure },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
+pub const DenseRepairBackpressureError = struct {
+    code: DenseRepairBackpressureErrorCode,
+    message: []const u8,
+    retryable: bool,
+    /// Suggested delay before retrying the write.
+    retry_after_ms: i64,
 };
 
 pub const DistanceRange = struct {
@@ -1870,7 +1983,7 @@ pub const ForeignSourceType = enum {
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
     type: ForeignSourceType,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
@@ -2572,13 +2685,13 @@ pub const QueryRequestExpandStrategy = enum {
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -2600,7 +2713,7 @@ pub const QueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -2750,6 +2863,35 @@ pub const RepairIssueListRequest = struct {
     limit: ?i64 = null,
 };
 
+/// Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+pub const RepairRunRequestControl = enum {
+    pause_automatic,
+    resume_automatic,
+    cancel_current_attempt,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pause_automatic => "pause_automatic",
+            .resume_automatic => "resume_automatic",
+            .cancel_current_attempt => "cancel_current_attempt",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pause_automatic", .pause_automatic },
+            .{ "resume_automatic", .resume_automatic },
+            .{ "cancel_current_attempt", .cancel_current_attempt },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Bounded request to run a table repair pass.
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
@@ -2758,8 +2900,12 @@ pub const RepairRunRequest = struct {
     index: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    /// Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
     force: ?bool = null,
+    /// Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+    control: ?RepairRunRequestControl = null,
+    /// Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair.
+    repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
     limit: ?i64 = null,
 };
@@ -2829,7 +2975,7 @@ pub const ReplicationSourceType = enum {
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
     type: ReplicationSourceType,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
@@ -2887,7 +3033,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -2905,15 +3051,14 @@ pub const RerankerProfile = struct {
     duration_ms: ?i64 = null,
 };
 
-/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-pub const RestoreRequestFormat = enum {
-    native,
-    portable,
+pub const RestoreJobScope = enum {
+    table,
+    cluster,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .native => "native",
-            .portable => "portable",
+            .table => "table",
+            .cluster => "cluster",
         };
         try jw.write(s);
     }
@@ -2924,35 +3069,101 @@ pub const RestoreRequestFormat = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "native", .native },
-            .{ "portable", .portable },
+            .{ "table", .table },
+            .{ "cluster", .cluster },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
-    backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
-    location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?RestoreRequestFormat = null,
+pub const RestoreJobPhase = enum {
+    queued,
+    running,
+    succeeded,
+    failed,
+    cancelled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .queued => "queued",
+            .running => "running",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .cancelled => "cancelled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "queued", .queued },
+            .{ "running", .running },
+            .{ "succeeded", .succeeded },
+            .{ "failed", .failed },
+            .{ "cancelled", .cancelled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
+pub const RestoreJob = struct {
+    /// Opaque durable restore-job identifier. Clients must not parse it as a number.
+    job_id: []const u8,
+    attempt_id: i64,
+    scope: RestoreJobScope,
+    table_name: ?[]const u8 = null,
+    backup_id: []const u8,
+    phase: RestoreJobPhase,
+    cancel_requested: bool,
+    /// Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+    durability_pending_table_count: i64,
+    /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+    published_table_count: i64,
+    /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
+    completed_table_count: i64,
+    /// Requested table count when known before execution.
+    total_table_count: ?i64 = null,
+    /// Bounded terminal result. A committed result with durability pending means publication is visible but parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed, durability-pending, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
+    result: ?std.json.Value = null,
+    @"error": ?[]const u8 = null,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    expires_at_ms: ?i64 = null,
+};
+
+pub const RestoreJobList = struct {
+    jobs: []const RestoreJob,
+    /// Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
+    next_cursor: ?[]const u8 = null,
+};
+
+pub const RestoreRequest = struct {
+    /// Identifier of the published backup to restore.
+    backup_id: []const u8,
+    /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
+    location: []const u8,
+    /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
+};
+
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
-    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
+    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
-    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
+    /// Mandatory filters from prior interactions. These are converted to structured Antfly predicates and applied to every table and every search tool invocation, including generated follow-ups, graph/tree traversal, aggregations, and root scans.
     accumulated_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    /// Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
     decisions: ?[]const AgentDecision = null,
@@ -3098,13 +3309,13 @@ pub const RetrievalQueryRequestExpandStrategy = enum {
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -3126,7 +3337,7 @@ pub const RetrievalQueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -3576,7 +3787,9 @@ pub const RowsCoalesceOperand = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -3706,7 +3919,9 @@ pub const RowsExpression = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -4729,7 +4944,9 @@ pub const RowsPlanRequest = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -4822,7 +5039,9 @@ pub const RowsQueryOrder = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -5220,7 +5439,9 @@ pub const RowsWhere = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -5357,7 +5578,9 @@ pub const RowsWhereBranch = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -5634,6 +5857,20 @@ pub const RowsWindowSpec = struct {
     frame: ?RowsWindowFrame = null,
 };
 
+/// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
+pub const RuntimeConfigStatus = struct {
+    /// Generation of the fully validated and atomically published configuration.
+    generation: ?i64 = null,
+    /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
+    hash: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
+    last_reload_failed: ?bool = null,
+    /// Whether requests are using the last-known-good snapshot after a failed reload.
+    stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
+};
+
 /// Emitted when an error occurs during retrieval
 pub const SSEError = struct {
     /// Error message
@@ -5761,7 +5998,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
@@ -5783,13 +6020,13 @@ pub const SecretList = struct {
 
 /// Source of the secret configuration
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .configured_keystore => "configured_keystore",
+            .configured_file => "configured_file",
             .configured_env => "configured_env",
             .configured_both => "configured_both",
         };
@@ -5802,7 +6039,7 @@ pub const SecretStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_file", .configured_file },
             .{ "configured_env", .configured_env },
             .{ "configured_both", .configured_both },
         });
@@ -5812,12 +6049,22 @@ pub const SecretStatus = enum {
 
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
+    /// Generation of the currently published secret-store snapshot.
+    generation: ?i64 = null,
+    /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
+    supports_source_generation: ?bool = null,
+    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
+    source_generation: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed to load.
+    last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
 };
 
 pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
+    /// Secret value (stored in the configured protected secret store and never returned)
     value: []const u8,
 };
 
@@ -6060,6 +6307,49 @@ pub const SqlStatementResponse = struct {
     statement_kind: ?[]const u8 = null,
     /// Typed relational row-plan, row-batch, or mutation-source response for data statements.
     result: ?std.json.Value = null,
+};
+
+pub const StorageMaintenanceCapabilities = struct {
+    check: bool,
+    compact: bool,
+    vacuum: bool,
+    online: bool,
+    asynchronous: bool,
+};
+
+pub const StorageRuntimeStatusEngine = enum {
+    lite,
+    local,
+    object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lite => "lite",
+            .local => "local",
+            .object => "object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lite", .lite },
+            .{ "local", .local },
+            .{ "object", .object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const StorageRuntimeStatus = struct {
+    engine: StorageRuntimeStatusEngine,
+    format: ?[]const u8 = null,
+    fsync: ?bool = null,
+    maintenance: StorageMaintenanceCapabilities,
 };
 
 pub const StorageStatus = struct {
@@ -6336,12 +6626,12 @@ pub const TableRepairJob = struct {
     cursor: ?[]const u8 = null,
     /// Effective per-pass repair limit.
     limit: i64,
-    /// Whether the job forces a named index rebuild.
+    /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
@@ -6401,6 +6691,8 @@ pub const TableRepairRunResult = struct {
     indexes_rebuilt: i64,
     /// Number of selected indexes that were already degraded or quarantined before repair.
     indexes_degraded: i64,
+    /// Number of existing index repairs that accepted the requested control.
+    controls_applied: i64,
     /// Effective repair limit.
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
@@ -6414,12 +6706,16 @@ pub const TableRepairRunResult = struct {
 /// Restore status for this table
 pub const TableRestoreStatusStatus = enum {
     triggered,
+    committed,
+    durability_pending,
     skipped,
     failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .triggered => "triggered",
+            .committed => "committed",
+            .durability_pending => "durability_pending",
             .skipped => "skipped",
             .failed => "failed",
         };
@@ -6433,6 +6729,8 @@ pub const TableRestoreStatusStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "triggered", .triggered },
+            .{ "committed", .committed },
+            .{ "durability_pending", .durability_pending },
             .{ "skipped", .skipped },
             .{ "failed", .failed },
         });
@@ -6717,7 +7015,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+    /// Value for operation (not required for $unset). Type depends on the supported operator.
     value: ?std.json.Value = null,
 };
 
@@ -6727,15 +7025,8 @@ pub const TransformOpType = enum {
     @"$set_on_insert",
     @"$unset",
     @"$inc",
-    @"$push",
-    @"$pull",
     @"$add_to_set",
-    @"$pop",
-    @"$mul",
-    @"$min",
     @"$max",
-    @"$current_date",
-    @"$rename",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -6743,15 +7034,8 @@ pub const TransformOpType = enum {
             .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
-            .@"$push" => "$push",
-            .@"$pull" => "$pull",
             .@"$add_to_set" => "$addToSet",
-            .@"$pop" => "$pop",
-            .@"$mul" => "$mul",
-            .@"$min" => "$min",
             .@"$max" => "$max",
-            .@"$current_date" => "$currentDate",
-            .@"$rename" => "$rename",
         };
         try jw.write(s);
     }
@@ -6766,15 +7050,8 @@ pub const TransformOpType = enum {
             .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
-            .{ "$push", .@"$push" },
-            .{ "$pull", .@"$pull" },
             .{ "$addToSet", .@"$add_to_set" },
-            .{ "$pop", .@"$pop" },
-            .{ "$mul", .@"$mul" },
-            .{ "$min", .@"$min" },
             .{ "$max", .@"$max" },
-            .{ "$currentDate", .@"$current_date" },
-            .{ "$rename", .@"$rename" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

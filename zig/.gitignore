@@ -10,6 +10,7 @@ specs/tla/*_TTrace_*.tla
 specs/tla/*_TTrace_*.bin
 /states/
 /antflydb/
+/api-restore-jobs/
 deps/logs/
 .claude/
 /logs/

@@ -65,11 +65,13 @@ def segment_trace(lines):
     current = []
     init_nodes = set()  # nodes with InitState in current segment
 
-    for line in lines:
+    for line_number, line in enumerate(lines, 1):
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{line_number}: invalid JSON trace event: {exc.msg}"
+            ) from exc
         if obj.get("tag") != "trace":
             continue
 
@@ -136,7 +138,11 @@ def main():
     with open(trace_file) as f:
         lines = [l.strip() for l in f if l.strip()]
 
-    segments = segment_trace(lines)
+    try:
+        segments = segment_trace(lines)
+    except ValueError as exc:
+        print(f"{trace_file}:{exc}", file=sys.stderr)
+        sys.exit(1)
     for i, seg in enumerate(segments):
         # Skip segments with no non-bootstrap events (empty runs)
         has_activity = any(
@@ -149,6 +155,26 @@ def main():
         first_event = json.loads(seg[0])["event"]["name"]
         if first_event != "InitState":
             print(f"  SKIP nseg-{i} ({len(seg)} events, starts with {first_event})")
+            continue
+        # Traceetcdraft currently models one-at-a-time membership changes.
+        # Keep joint-consensus traces visible but do not validate them against
+        # the narrower simple-change action as if they were ordinary values.
+        unsupported_conf_changes = []
+        for l in seg:
+            event = json.loads(l)["event"]
+            if event["name"] != "ChangeConf":
+                continue
+            cc = event.get("prop", {}).get("cc", {})
+            changes = cc.get("changes", [])
+            transition = cc.get("transition", "auto")
+            if len(changes) != 1 or transition != "auto":
+                unsupported_conf_changes.append((transition, len(changes)))
+        if unsupported_conf_changes:
+            details = ", ".join(
+                f"{transition}/{count}-change"
+                for transition, count in unsupported_conf_changes
+            )
+            print(f"  SKIP nseg-{i} ({len(seg)} events, unsupported joint config: {details})")
             continue
         # Skip segments where the bootstrap config references nodes not in
         # the trace. The TLA+ spec (BootstrappedConfig) uses the LAST

@@ -26,6 +26,8 @@ type HTTPError struct {
 	Status     string
 }
 
+var ErrDownloadTooLarge = errors.New("download content exceeds max_download_size_bytes")
+
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("HTTP error: %d %s", e.StatusCode, e.Status)
 }
@@ -40,7 +42,7 @@ func DownloadContent(
 ) (string, []byte, error) {
 	// Parse data URIs
 	if strings.HasPrefix(uri, "data:") {
-		contentType, data, err := ParseDataURI(uri)
+		contentType, data, err := ParseDataURIWithLimit(uri, maxDownloadSizeBytes(securityConfig))
 		if err != nil {
 			return "", nil, err
 		}
@@ -87,12 +89,22 @@ func DownloadContent(
 	if err != nil {
 		return "", nil, err
 	}
+	if err := enforceDownloadSize(data, securityConfig); err != nil {
+		return "", nil, err
+	}
 
 	return mimeType, data, nil
 }
 
 // ParseDataURI returns the content type and bytes of the data uri.
 func ParseDataURI(uri string) (string, []byte, error) {
+	return ParseDataURIWithLimit(uri, 0)
+}
+
+// ParseDataURIWithLimit returns the content type and bytes of the data URI,
+// rejecting payloads that would decode beyond maxBytes before allocating them.
+// A maxBytes value of zero or less disables the limit.
+func ParseDataURIWithLimit(uri string, maxBytes int64) (string, []byte, error) {
 	if contents, isData := strings.CutPrefix(uri, "data:"); isData {
 		prefix, data, found := strings.Cut(contents, ",")
 		if !found {
@@ -103,6 +115,9 @@ func ParseDataURI(uri string) (string, []byte, error) {
 		var contentType string
 		if p, isBase64 := strings.CutSuffix(prefix, ";base64"); isBase64 {
 			contentType = p
+			if maxBytes > 0 && base64DecodedLen(data) > maxBytes {
+				return "", nil, ErrDownloadTooLarge
+			}
 			var err error
 			dataBytes, err = base64.StdEncoding.DecodeString(data)
 			if err != nil {
@@ -110,6 +125,9 @@ func ParseDataURI(uri string) (string, []byte, error) {
 			}
 		} else {
 			contentType = prefix
+			if maxBytes > 0 && int64(len(data)) > maxBytes {
+				return "", nil, ErrDownloadTooLarge
+			}
 			dataBytes = []byte(data)
 		}
 
@@ -117,6 +135,19 @@ func ParseDataURI(uri string) (string, []byte, error) {
 	}
 
 	return "", nil, errors.New("could not parse uri: missing file data")
+}
+
+func base64DecodedLen(encoded string) int64 {
+	decodedLen := base64.StdEncoding.DecodedLen(len(encoded))
+	if strings.HasSuffix(encoded, "==") {
+		decodedLen -= 2
+	} else if strings.HasSuffix(encoded, "=") {
+		decodedLen--
+	}
+	if decodedLen < 0 {
+		return 0
+	}
+	return int64(decodedLen)
 }
 
 // downloadHTTPWithMime downloads content via HTTP and returns full MIME type
@@ -149,13 +180,17 @@ func downloadHTTPWithMime(
 
 	// Read with size limit if configured
 	var reader io.Reader = resp.Body
-	if securityConfig != nil && securityConfig.MaxDownloadSizeBytes > 0 {
-		reader = io.LimitReader(resp.Body, securityConfig.MaxDownloadSizeBytes)
+	maxBytes := maxDownloadSizeBytes(securityConfig)
+	if maxBytes > 0 {
+		reader = io.LimitReader(resp.Body, maxBytes+1)
 	}
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to read content: %w", err)
+	}
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return "", nil, ErrDownloadTooLarge
 	}
 
 	mimeType := resp.Header.Get("Content-Type")
@@ -169,6 +204,21 @@ func downloadHTTPWithMime(
 	}
 
 	return mimeType, data, nil
+}
+
+func maxDownloadSizeBytes(securityConfig *ContentSecurityConfig) int64 {
+	if securityConfig == nil || securityConfig.MaxDownloadSizeBytes <= 0 {
+		return 0
+	}
+	return securityConfig.MaxDownloadSizeBytes
+}
+
+func enforceDownloadSize(data []byte, securityConfig *ContentSecurityConfig) error {
+	maxBytes := maxDownloadSizeBytes(securityConfig)
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return ErrDownloadTooLarge
+	}
+	return nil
 }
 
 // downloadFileWithMime reads a local file and guesses MIME type

@@ -45,19 +45,19 @@ type HTTPCredentialConfig struct {
 	// BaseUrl Base URL prefix this credential applies to.
 	BaseUrl string `json:"base_url,omitempty,omitzero"`
 
-	// Headers HTTP headers to include. Supports keystore syntax (e.g., "${secret:token}").
+	// Headers HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
 	Headers  map[string]string     `json:"headers,omitempty,omitzero"`
 	Security ContentSecurityConfig `json:"security,omitempty,omitzero"`
 }
 
-// RemoteContentConfig Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates).
+// RemoteContentConfig Configuration for remote content fetching (`remoteMedia`, `remoteText`, and the deprecated
+// `remotePDF` compatibility helper). Durable PDF ingestion uses a `document_extraction` asset producer.
 // Consolidates S3 credentials and security settings separate from backup storage.
 //
 // **Credential Resolution Order:**
 // 1. Explicit `credentials="name"` parameter in template
 // 2. First credential where `buckets` glob pattern matches URL's bucket
 // 3. `default_s3` credential
-// 4. Legacy fallback: `storage.s3` credentials (backward compatibility)
 type RemoteContentConfig struct {
 	// DefaultS3 Default S3 credential name when no bucket pattern matches.
 	DefaultS3 string `json:"default_s3,omitempty,omitzero"`
@@ -72,7 +72,7 @@ type RemoteContentConfig struct {
 
 // S3CredentialConfig defines model for S3CredentialConfig.
 type S3CredentialConfig struct {
-	// AccessKeyId AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+	// AccessKeyId AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
 	AccessKeyId string `json:"access_key_id,omitempty,omitzero"`
 
 	// Buckets Glob patterns for bucket names this credential handles. When a URL matches a pattern, this credential is auto-selected.
@@ -81,11 +81,11 @@ type S3CredentialConfig struct {
 	// Endpoint S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
-	// SecretAccessKey AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+	// SecretAccessKey AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
 	SecretAccessKey string                `json:"secret_access_key,omitempty,omitzero"`
 	Security        ContentSecurityConfig `json:"security,omitempty,omitzero"`
 
-	// SessionToken Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+	// SessionToken Optional AWS session token for temporary credentials. Supports secret-store references.
 	SessionToken string `json:"session_token,omitempty,omitzero"`
 
 	// UseSsl Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
@@ -95,37 +95,37 @@ type S3CredentialConfig struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/6xYe2/bOBL/KgPeAnnAlu04m7YG7o80Se+CS69FnUVwWC8UWhrbPFOkjqSSuEG++2FI",
-	"ydbDTbsP+B9TImd+8/rNUM8s0VmuFSpn2eSZ2WSFGfd/L7RyqNwUk8IIt7nQaiGW9CI3OkfjBPptXEr9",
-	"iGm80jaISNEmRuROaMUm7G4lHEphHegFlHuB9iqeoR1cf7aw0AakUGtI9aOSmqc2gusFYJa7TY/O+P0W",
-	"uMGthEN8SjB3kBvxwB0CyRELmEudrOPyYSxyC8KCMwUeRazH8IlnuUQ2+bX6GyU6Yz2WpCpqPhm9O4mG",
-	"0Uk0Yr/1mHCYedPcJkc2YdYZoZbspVc94MbwDa0rZ+TcrX7UGbQXcoML8YTBGQshcTIYAFcp2DH9++XL",
-	"TccpXkfdKRF8qB0uLAKfWy0Lh+XeQ4yWUQ8Gv1g0dpByxwdH4VDQQkfmRbJGNwh4qhPZpl8+L3IfoEHb",
-	"n3WZrMe6B36fHztxDL5c8EI6NqGA9lqufU8nwOD/CqRccbqWGmC4WqKFw9HJm2hIv8HbHoyGtf9vTqLR",
-	"mV+NTnpA0R+dvQ3rsx6Mzt5FJz+flusjtgU811oiVwS5St7YiQx14WKLiVZpE/l42MZ9G3b7uAuVigeR",
-	"FlxuSwGo1DjttSAUVDJrvieRmVAiKzI2GW2RCeVwiYaQZfwp3qKz4ivG843DJrDR8PTtz2/Ohh18H/kT",
-	"iQY6R1lbCcIUkkAQhCsIrKGqyduCG3bA9dhTf6n7u6dnpxVgkfElxqnIUFmPpAb2ZHj69ls4/Tl4FKlb",
-	"DVYoliuPLxdPKC0c+rcWHoWUMEcwSGalR3XkQfjrHi0smpgvUblujVMh9M/pHayQp2h8aP95e/u5zm+X",
-	"wRafqAfnyi3k5vL9YBQND4jGlHZg0UUw1RmCRfOAZlu+d2ItckwFPwKD/8XE7bL+UbgVJROHHYpGobK6",
-	"ql0aV4W4q0Q9J8lkKyG/MJiicoLLXRdoWu3tS7bbvM28cCtaJtxhCqjSXAvlLAFqtpA5txgXRnbFvucW",
-	"ifxKfgS3Erauhue5FEheJKkLbTLu2IQVRnSN67EQj9C10lSQDi4/N6B0zuwxsxRDoRMqkUWKEUyLPNfG",
-	"WVjjxjptEOxGOb5l0Bn76dliYtBNnF6jepkxT6Edd9uy3RKYnwwu2IT9bbDr0YOyQQ/2d+e9EfyCmXZY",
-	"HvhWAMPzInCND5/xx7ZVvkCXrIRawmF48fnyQ6/c85GysVrc4pMDh1kuuUN7FM3UhVZWS5HSGqbjWvxs",
-	"aHGlDZTyTqilBYs5N8TdC6MzmPNkXeRAbuVLjGZqpo6PdykJX9B3OcL9yaRoJsfHMzWK4OoplyIRDu5r",
-	"Gv8+YzR5zNg9kI4MHRLxbhHP1EkEH4Sxrp5njys0CPehp9l7WEo9p6bq0CjIuEtWaClPD2zZQGdqHMF9",
-	"yVixHd/XpM3UaQQ3uOTJBhZcSrJvAveVfc3NFg7p/SM3RLhZzp2YCync5mimOoW009cNcMk4zQAA+YKs",
-	"U6B0Cb1tV5NAciMybjZ7y8u5/LXaei2d97JMp/z+zTNMocU19ntkswX/7DncKC77PBdN5vHo7WQwSHVi",
-	"o2pfOQ3WiOO8cCttxFdeMRRygwZa1c1e9lZiiMsf8c90/KPeaRXYK5Xc8k0VWUKYJGhtvMZNLFI22XEX",
-	"f7TRGjcvdLJ0MaXAOOIZ/6oVvQ4eC/vjnaC2lPD3xXdT5UxhHaavqi4HyUp9WYo0e1I37pev+8dUFMVc",
-	"iqR/TDPnn4BZaaygNsn5m1NVNfp8IwX+en7fkxvhXvZpwSa/vq7GjuPdYcteeu3r3dbPbT75R40CQ5qV",
-	"9OEvdp1OveIqlWgjuCOy4b6pV8TJKzm9zjFhqbJ136LExGHaunZ0Qp9RKwqR//Hbxl8ek9/apdkkXRrT",
-	"QOeBA1qs22qJ+gGNEWlg4T180ohe927eLKZ2CM/vphC20NgC15evzDEU4FAIILVeF3kEH7iU1ndnGoXO",
-	"76bx+cXF1XQa/+vqP/H1JaB6EEarjDjngRvB5xLr022jr2x0YfoBTH+Nm75I97WYXTU/dzzcr9qjxC3/",
-	"V+PXQbv2D0AbOJA64XKlrZu8Gw6HB97Ij0Jdf2rcCPYRRybUDaqlW9VvCDuce3hln/NLh+5i8GcDML26",
-	"+HJ1W4vDHwhCUFKLBdtroKVrWezbXde4T1VyByv9XvB7vR00bGnDzabeqn6X7ftgey39gGgP5MJibK38",
-	"7peEK+V9NJ3eDG5vpl43la9WCpNwET8sz0/8pyW/4/xu2qNhzoalT6xdKrW/FnQZgx4JtdDfG8wDFXkd",
-	"VTvfcgURx/a7QTVLe94Qzvtpmhie0wjfkMl6jK6XQdswGkYj8pbOUfkhiY2jYTSmrhq+aalCypf/BwAA",
-	"//9P7OXbNxQAAA==",
+	"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",
+	"9aMhdcTw4UqVUj7/NwAA//+/9+bIHBQAAA==",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

@@ -108,6 +108,17 @@ pub const NativeArchHint = enum {
     layoutlmv3,
 };
 
+/// Primary native weight source selected consistently by compatibility,
+/// admission, export, and runtime loading. Explicit GGUF bundles retain their
+/// declared route. Otherwise the canonical safetensors artifacts take
+/// precedence over colocated GGUF exports, so writing `export.gguf` into a
+/// model directory cannot silently change the model loaded on the next run.
+pub const NativeWeightArtifactKind = enum {
+    gguf,
+    safetensors,
+    sharded_safetensors,
+};
+
 /// SafeTensors file candidates in priority order.
 pub const safetensors_candidates = [_][]const u8{
     "model.safetensors",
@@ -117,6 +128,19 @@ pub const safetensors_candidates = [_][]const u8{
 pub const safetensors_index_candidates = [_][]const u8{
     "model.safetensors.index.json",
     "pytorch_model.safetensors.index.json",
+};
+
+/// Files read by `loadListingFromDir` whose paths are not necessarily retained
+/// on ModelManifest. Compatibility caches must include every entry so their
+/// decision describes the same metadata snapshot that listing parsed.
+pub const listing_compatibility_sidecars = [_][]const u8{
+    "antfly_inference_bundle.json",
+    "antfly_inference_variants.json",
+    "gliner_config.json",
+    "added_tokens.json",
+    "clip_config.json",
+    "special_tokens_map.json",
+    "1_SpladePooling/config.json",
 };
 
 /// Resolved model configuration loaded from a model directory.
@@ -272,6 +296,26 @@ pub const ModelManifest = struct {
             if (std.mem.eql(u8, candidate, task)) return true;
         }
         return false;
+    }
+
+    pub fn nativeWeightArtifactKind(self: *const ModelManifest) ?NativeWeightArtifactKind {
+        if (self.gguf_path != null and self.hasExplicitGgufBundleRoute()) return .gguf;
+        if (self.safetensors_path != null) return .safetensors;
+        if (self.safetensors_index_path != null) return .sharded_safetensors;
+        if (self.gguf_path != null) return .gguf;
+        return null;
+    }
+
+    pub fn usesGgufWeights(self: *const ModelManifest) bool {
+        const artifact = self.nativeWeightArtifactKind() orelse return false;
+        return artifact == .gguf;
+    }
+
+    fn hasExplicitGgufBundleRoute(self: *const ModelManifest) bool {
+        return self.isSplitGlinerBundle() or
+            std.mem.eql(u8, self.inference_bundle_family, "colqwen2_gguf_bundle/v1") or
+            self.isClipclapGgufBundle() or
+            self.isFlorence2GgufBundle();
     }
 
     pub fn prefersGenerationEncodingForLateInteraction(self: *const ModelManifest) bool {
@@ -1879,6 +1923,49 @@ fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.
             }
         }
     }
+}
+
+test "native weight artifact selection has one deterministic precedence" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    manifest.gguf_path = try allocator.dupe(u8, "export.gguf");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.gguf,
+        manifest.nativeWeightArtifactKind().?,
+    );
+    try std.testing.expect(manifest.usesGgufWeights());
+
+    manifest.safetensors_index_path = try allocator.dupe(u8, "model.safetensors.index.json");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.sharded_safetensors,
+        manifest.nativeWeightArtifactKind().?,
+    );
+    try std.testing.expect(!manifest.usesGgufWeights());
+
+    manifest.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.safetensors,
+        manifest.nativeWeightArtifactKind().?,
+    );
+}
+
+test "explicit GGUF bundles retain their declared artifact route" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{
+        .allocator = allocator,
+        .inference_bundle_family = try allocator.dupe(u8, "florence2_gguf_bundle/v1"),
+        .gguf_path = try allocator.dupe(u8, "model.gguf"),
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+    };
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.gguf,
+        manifest.nativeWeightArtifactKind().?,
+    );
+    try std.testing.expect(manifest.usesGgufWeights());
 }
 
 test "inferModelTypeFromPath detects classifier directory" {

@@ -39,6 +39,7 @@ import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { useEvalSets } from "@/hooks/use-eval-sets";
 import { fetchWithRetry } from "@/lib/utils";
 
@@ -46,15 +47,6 @@ import { fetchWithRetry } from "@/lib/utils";
 interface RewriteResponse {
   model: string;
   texts: string[][];
-}
-
-interface ModelInfo {
-  capabilities?: string[];
-}
-
-interface ModelsResponse {
-  rewriters: Record<string, ModelInfo>;
-  [key: string]: Record<string, ModelInfo>;
 }
 
 const STORAGE_KEY = "antfarm-playground-question";
@@ -91,7 +83,7 @@ function formatInput(ctx: string, ans: string): string {
 }
 
 const RewritingPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -128,6 +120,8 @@ const RewritingPlaygroundPage: React.FC = () => {
   const [processingTime, setProcessingTime] = useState<number | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("rewriter");
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Eval set integration
@@ -143,32 +137,13 @@ const RewritingPlaygroundPage: React.FC = () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ context, answer, selectedModel }));
   }, [context, answer, selectedModel]);
 
-  // Fetch available models on mount — use rewriters, not generators
   useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
-          signal: controller.signal,
-        });
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const rewriters = Object.keys(data.rewriters || {});
-          setAvailableModels(rewriters);
-          setSelectedModel((prev: string) =>
-            prev && rewriters.includes(prev) ? prev : rewriters[0] || ""
-          );
-        }
-      } catch {
-        // Ignore fetch errors
-      } finally {
-        if (!controller.signal.aborted) {
-          setModelsLoaded(true);
-        }
-      }
-    })();
-    return () => controller.abort();
-  }, [inferenceApiUrl]);
+    setAvailableModels(connectionModels);
+    setSelectedModel((current: string) =>
+      current && connectionModels.includes(current) ? current : connectionModels[0] || ""
+    );
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -222,7 +197,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     try {
       const formattedInput = formatInput(context, answer);
 
-      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/rewrite`, {
+      const response = await fetchWithRetry(inferenceUrl("rewrite"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -254,7 +229,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [context, answer, selectedModel, inferenceApiUrl]);
+  }, [context, answer, selectedModel, inferenceUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

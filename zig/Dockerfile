@@ -18,6 +18,8 @@ RUN case "${BUILDARCH}" in \
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
 
 ARG TARGETARCH
+ARG ZIG_OPTIMIZE=ReleaseFast
+ARG ZIG_BUILD_JOBS=1
 
 RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers
 
@@ -33,7 +35,7 @@ RUN case "${TARGETARCH}" in \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
     cd zig && \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseFast -Dedition=full install --prefix /out
+    zig build -j"${ZIG_BUILD_JOBS}" -Dtarget="${zig_target}" -Doptimize="${ZIG_OPTIMIZE}" -Dedition=full install --prefix /out
 
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS wasmtime
 
@@ -59,7 +61,7 @@ LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
-RUN addgroup -S antfly && adduser -S -G antfly -h /home/antfly antfly
+RUN addgroup -S -g 10001 antfly && adduser -S -u 10001 -G antfly -h /home/antfly antfly
 
 WORKDIR /
 COPY --from=builder /out/bin/antfly /antfly
@@ -78,4 +80,4 @@ USER antfly
 EXPOSE 8080 11433 4200
 
 ENTRYPOINT ["/antfly"]
-CMD ["swarm"]
+CMD ["standalone"]

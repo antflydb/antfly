@@ -21,8 +21,9 @@ const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
-const platform_clock = @import("../../platform/clock.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
+const range_cardinality = @import("range_cardinality.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
@@ -748,6 +749,11 @@ pub fn Impl(comptime DB: type) type {
                 }
                 identity_writes.deinit(self.alloc);
             }
+            var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (identity_visibility_deletes.items) |key| self.alloc.free(key);
+                identity_visibility_deletes.deinit(self.alloc);
+            }
             var relational_extra_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
             defer {
                 for (relational_extra_writes.items) |item| {
@@ -808,15 +814,27 @@ pub fn Impl(comptime DB: type) type {
                         metadata_key_owned = false;
                     }
                 }
-                try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+                const identity_live_before = (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals;
+                try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
                     self.alloc,
                     self.core.store,
                     self.core.identity_namespace,
                     self.core.nextDerivedSequence(),
                     &identity_writes,
+                    &identity_visibility_deletes,
                     identity_upserts.items,
                     identity_deletes.items,
                 );
+                if (try doc_identity.visibilitySummaryFromWrites(identity_writes.items)) |summary| {
+                    try range_cardinality.appendIdentityTransitionAlloc(
+                        self.alloc,
+                        self.core.store,
+                        self.core.byteRange(),
+                        identity_live_before,
+                        summary.live_ordinals,
+                        &identity_writes,
+                    );
+                }
                 if (relationalColumnsForStore(self) != null) {
                     const mutations = try self.core.collectTransactionIntentMutations(self.alloc, txn_id);
                     defer {
@@ -1040,6 +1058,11 @@ pub fn Impl(comptime DB: type) type {
             const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
             try identity_writes.appendSlice(self.alloc, relational_extra_writes.items);
             relational_extra_writes.clearRetainingCapacity();
+            try relational_extra_deletes.ensureUnusedCapacity(self.alloc, identity_visibility_deletes.items.len);
+            for (identity_visibility_deletes.items) |key| {
+                relational_extra_deletes.appendAssumeCapacity(key);
+            }
+            identity_visibility_deletes.items.len = 0;
             try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                 .writes = identity_writes.items,
                 .deletes = relational_extra_deletes.items,
@@ -1048,6 +1071,7 @@ pub fn Impl(comptime DB: type) type {
             if (pending_identity_visibility_summary) |summary| {
                 self.identity_visibility_summary_cache = summary;
                 self.clearLiveDocSetCache();
+                self.clearNonVisibleDocSetCache();
             }
         }
 
@@ -1341,6 +1365,7 @@ test "db transactions local lifecycle exposes committed and deleted documents" {
     try db.commitTransaction(txn_id, commit_ts);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
     try std.testing.expectEqual(commit_ts, try db.getCommitVersion(txn_id));
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
 
     const raw = (try db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
@@ -1362,6 +1387,7 @@ test "db transactions local lifecycle exposes committed and deleted documents" {
     }, &.{});
     try db.commitTransaction(delete_txn, commit_ts + 2);
     try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
+    try std.testing.expectEqual(@as(?u64, 0), try range_cardinality.load(alloc, db.core.store));
 
     {
         const stats = try db.diagnosticStats(alloc);
@@ -2840,6 +2866,7 @@ test "db transactions recovery runtime appends identity rows for committed orpha
     const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
 
     const stats = try db.diagnosticStats(alloc);
     defer types.freeDBStats(alloc, stats);

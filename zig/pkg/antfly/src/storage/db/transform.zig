@@ -21,6 +21,8 @@ pub fn resolveDocumentTransform(
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
+    var prepared = try prepareDocumentTransform(alloc, transform);
+    defer prepared.deinit(alloc);
     if (existing_json == null and !transform.upsert) return null;
     const is_insert = existing_json == null;
 
@@ -32,11 +34,27 @@ pub fn resolveDocumentTransform(
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
     defer freeJsonValue(alloc, &root);
 
-    for (transform.operations) |op| {
-        applyTransformOp(alloc, &root, op, is_insert) catch continue;
-    }
+    for (prepared.operations) |*op| try applyPreparedTransformOp(alloc, &root, op, is_insert);
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+/// Validates the complete transform at admission and storage boundaries.
+///
+/// Keep this independent of document state so an unsupported request cannot
+/// become an acknowledged no-op merely because its target is absent.
+pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTransform) !void {
+    for (transform.operations) |op| {
+        var prepared = try prepareTransformOp(alloc, op, false);
+        prepared.deinit(alloc);
+    }
+}
+
+pub fn validateTransformOpType(op: types.TransformOpType) !void {
+    switch (op) {
+        .set, .set_on_insert, .unset, .inc, .push, .pull, .add_to_set, .max => {},
+        else => return error.UnsupportedTransformOperation,
+    }
 }
 
 pub fn transformOpText(op: types.TransformOpType) []const u8 {
@@ -57,17 +75,151 @@ pub fn transformOpText(op: types.TransformOpType) []const u8 {
     };
 }
 
-fn applyTransformOp(alloc: Allocator, root: *std.json.Value, op: types.TransformOp, is_insert: bool) !void {
-    if (root.* != .object) return error.InvalidArgument;
+const PreparedValue = union(enum) {
+    none,
+    json: std.json.Value,
+    number: f64,
+};
+
+const PreparedTransformOp = struct {
+    op: types.TransformOpType,
+    path: NormalizedJsonPath,
+    value: PreparedValue = .none,
+
+    fn deinit(self: *PreparedTransformOp, alloc: Allocator) void {
+        if (self.value == .json) freeJsonValue(alloc, &self.value.json);
+        self.* = undefined;
+    }
+
+    fn takeJson(self: *PreparedTransformOp) !std.json.Value {
+        const value = switch (self.value) {
+            .json => |value| value,
+            else => return error.InvalidArgument,
+        };
+        self.value = .none;
+        return value;
+    }
+
+    fn number(self: PreparedTransformOp) !f64 {
+        return switch (self.value) {
+            .number => |value| value,
+            else => error.InvalidArgument,
+        };
+    }
+};
+
+const PreparedDocumentTransform = struct {
+    operations: []PreparedTransformOp,
+
+    fn deinit(self: *PreparedDocumentTransform, alloc: Allocator) void {
+        for (self.operations) |*op| op.deinit(alloc);
+        if (self.operations.len > 0) alloc.free(self.operations);
+        self.* = undefined;
+    }
+};
+
+fn prepareDocumentTransform(
+    alloc: Allocator,
+    transform: types.DocumentTransform,
+) !PreparedDocumentTransform {
+    const operations = try alloc.alloc(PreparedTransformOp, transform.operations.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (operations[0..initialized]) |*op| op.deinit(alloc);
+        if (operations.len > 0) alloc.free(operations);
+    }
+
+    for (transform.operations, operations) |op, *prepared| {
+        prepared.* = try prepareTransformOp(alloc, op, true);
+        initialized += 1;
+    }
+    return .{ .operations = operations };
+}
+
+fn prepareTransformOp(
+    alloc: Allocator,
+    op: types.TransformOp,
+    retain_json: bool,
+) !PreparedTransformOp {
+    try validateTransformOpType(op.op);
+    const path = try normalizeJsonPath(op.path);
+    if (path.len == 0) return error.InvalidArgument;
+
+    var prepared = PreparedTransformOp{ .op = op.op, .path = path };
+    errdefer prepared.deinit(alloc);
     switch (op.op) {
-        .set => try setOp(alloc, &root.object, op.path, op.value_json),
-        .set_on_insert => if (is_insert) try setOp(alloc, &root.object, op.path, op.value_json),
-        .unset => try unsetOp(alloc, &root.object, op.path),
-        .inc => try incOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
-        .push => try pushOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
-        .pull => try pullOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
-        .add_to_set => try addToSetOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
-        .max => try maxOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
+        .unset => {
+            if (op.value_json != null) return error.InvalidArgument;
+        },
+        .set, .set_on_insert, .push, .pull, .add_to_set => {
+            const value_json = op.value_json orelse return error.InvalidArgument;
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                alloc,
+                value_json,
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidArgument,
+            };
+            defer parsed.deinit();
+            if (retain_json) {
+                prepared.value = .{ .json = try cloneJsonValue(alloc, parsed.value) };
+            }
+        },
+        .inc, .max => {
+            const value_json = op.value_json orelse return error.InvalidArgument;
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                alloc,
+                value_json,
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidArgument,
+            };
+            defer parsed.deinit();
+            prepared.value = .{ .number = try jsonNumberFromValue(parsed.value) };
+        },
+        else => unreachable,
+    }
+    return prepared;
+}
+
+fn applyPreparedTransformOp(
+    alloc: Allocator,
+    root: *std.json.Value,
+    op: *PreparedTransformOp,
+    is_insert: bool,
+) !void {
+    if (root.* != .object) return error.InvalidArgument;
+    const path = op.path.slice();
+    switch (op.op) {
+        .set => {
+            var value = try op.takeJson();
+            errdefer freeJsonValue(alloc, &value);
+            try setNestedValue(alloc, &root.object, path, value);
+        },
+        .set_on_insert => if (is_insert) {
+            var value = try op.takeJson();
+            errdefer freeJsonValue(alloc, &value);
+            try setNestedValue(alloc, &root.object, path, value);
+        },
+        .unset => removeNestedValue(alloc, &root.object, path),
+        .inc => try applyNumericOp(alloc, &root.object, path, try op.number(), .add),
+        .push => {
+            var value = try op.takeJson();
+            try pushPreparedValue(alloc, &root.object, path, &value);
+        },
+        .pull => {
+            var value = try op.takeJson();
+            try pullPreparedValue(alloc, &root.object, path, &value);
+        },
+        .add_to_set => {
+            var value = try op.takeJson();
+            try addPreparedValueToSet(alloc, &root.object, path, &value);
+        },
+        .max => try applyNumericOp(alloc, &root.object, path, try op.number(), .max),
         else => return error.UnsupportedTransformOperation,
     }
 }
@@ -105,85 +257,49 @@ fn normalizeJsonPath(path: []const u8) !NormalizedJsonPath {
     return parts;
 }
 
-fn setOp(
+const NumericTransform = enum { add, max };
+
+fn applyNumericOp(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
-    path: []const u8,
-    value_json: ?[]const u8,
+    parts: []const []const u8,
+    operand: f64,
+    operation: NumericTransform,
 ) !void {
-    const normalized = try normalizeJsonPath(path);
-    var value: std.json.Value = if (value_json) |json| blk: {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-        defer parsed.deinit();
-        break :blk try cloneJsonValue(alloc, parsed.value);
-    } else .null;
-    errdefer freeJsonValue(alloc, &value);
-    try setNestedValue(alloc, obj, normalized.slice(), value);
-}
-
-fn unsetOp(alloc: Allocator, obj: *std.json.ObjectMap, path: []const u8) !void {
-    const normalized = try normalizeJsonPath(path);
-    removeNestedValue(alloc, obj, normalized.slice());
-}
-
-fn incOp(
-    alloc: Allocator,
-    obj: *std.json.ObjectMap,
-    path: []const u8,
-    value_json: []const u8,
-) !void {
-    const normalized = try normalizeJsonPath(path);
-    const parts = normalized.slice();
-    const delta = try parseNumericValue(alloc, value_json);
     if (parts.len == 0) return error.InvalidArgument;
     if (getNestedValue(obj, parts)) |current| {
         const current_num = try jsonNumberFromValue(current.*);
-        try setNestedValue(alloc, obj, parts, .{ .float = current_num + delta });
+        const next = switch (operation) {
+            .add => current_num + operand,
+            .max => if (operand > current_num) operand else return,
+        };
+        if (!std.math.isFinite(next)) return error.InvalidArgument;
+        try setNestedValue(alloc, obj, parts, .{ .float = next });
         return;
     }
-    try setNestedValue(alloc, obj, parts, .{ .float = delta });
+    try setNestedValue(alloc, obj, parts, .{ .float = operand });
 }
 
-fn maxOp(
+fn addPreparedValueToSet(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
-    path: []const u8,
-    value_json: []const u8,
+    parts: []const []const u8,
+    value: *std.json.Value,
 ) !void {
-    const normalized = try normalizeJsonPath(path);
-    const parts = normalized.slice();
-    const candidate = try parseNumericValue(alloc, value_json);
-    if (parts.len == 0) return error.InvalidArgument;
-    if (getNestedValue(obj, parts)) |current| {
-        const current_num = try jsonNumberFromValue(current.*);
-        if (candidate <= current_num) return;
-    }
-    try setNestedValue(alloc, obj, parts, .{ .float = candidate });
-}
-
-fn addToSetOp(
-    alloc: Allocator,
-    obj: *std.json.ObjectMap,
-    path: []const u8,
-    value_json: []const u8,
-) !void {
-    const normalized = try normalizeJsonPath(path);
-    const parts = normalized.slice();
-    var value = blk: {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
-        defer parsed.deinit();
-        break :blk try cloneJsonValue(alloc, parsed.value);
-    };
-    errdefer freeJsonValue(alloc, &value);
+    errdefer freeJsonValue(alloc, value);
 
     if (parts.len == 0) return error.InvalidArgument;
     if (getNestedValue(obj, parts)) |existing| {
         switch (existing.*) {
             .array => |*arr| {
                 for (arr.items) |item| {
-                    if (jsonValuesEqual(item, value)) return;
+                    if (jsonValuesEqual(item, value.*)) {
+                        freeJsonValue(alloc, value);
+                        return;
+                    }
                 }
-                try arr.append(value);
+                try arr.append(value.*);
+                value.* = .null;
                 return;
             },
             else => return error.InvalidArgument,
@@ -195,30 +311,25 @@ fn addToSetOp(
         for (arr.items) |*item| freeJsonValue(alloc, item);
         arr.deinit();
     }
-    try arr.append(value);
+    try arr.append(value.*);
+    value.* = .null;
     try setNestedValue(alloc, obj, parts, .{ .array = arr });
 }
 
-fn pushOp(
+fn pushPreparedValue(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
-    path: []const u8,
-    value_json: []const u8,
+    parts: []const []const u8,
+    value: *std.json.Value,
 ) !void {
-    const normalized = try normalizeJsonPath(path);
-    const parts = normalized.slice();
-    var value = blk: {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
-        defer parsed.deinit();
-        break :blk try cloneJsonValue(alloc, parsed.value);
-    };
-    errdefer freeJsonValue(alloc, &value);
+    errdefer freeJsonValue(alloc, value);
 
     if (parts.len == 0) return error.InvalidArgument;
     if (getNestedValue(obj, parts)) |existing| {
         switch (existing.*) {
             .array => |*arr| {
-                try arr.append(value);
+                try arr.append(value.*);
+                value.* = .null;
                 return;
             },
             else => return error.InvalidArgument,
@@ -230,24 +341,18 @@ fn pushOp(
         for (arr.items) |*item| freeJsonValue(alloc, item);
         arr.deinit();
     }
-    try arr.append(value);
+    try arr.append(value.*);
+    value.* = .null;
     try setNestedValue(alloc, obj, parts, .{ .array = arr });
 }
 
-fn pullOp(
+fn pullPreparedValue(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
-    path: []const u8,
-    value_json: []const u8,
+    parts: []const []const u8,
+    value: *std.json.Value,
 ) !void {
-    const normalized = try normalizeJsonPath(path);
-    const parts = normalized.slice();
-    var value = blk: {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
-        defer parsed.deinit();
-        break :blk try cloneJsonValue(alloc, parsed.value);
-    };
-    defer freeJsonValue(alloc, &value);
+    defer freeJsonValue(alloc, value);
 
     if (parts.len == 0) return error.InvalidArgument;
     const existing = getNestedValue(obj, parts) orelse return;
@@ -255,7 +360,7 @@ fn pullOp(
         .array => |*arr| {
             var i: usize = 0;
             while (i < arr.items.len) {
-                if (jsonValuesEqual(arr.items[i], value)) {
+                if (jsonValuesEqual(arr.items[i], value.*)) {
                     var removed = arr.orderedRemove(i);
                     freeJsonValue(alloc, &removed);
                     continue;
@@ -292,15 +397,23 @@ fn setNestedValue(
         var idx: usize = 0;
         while (idx < parts.len - 1) : (idx += 1) {
             const part = parts[idx];
-            const gop = try current.getOrPut(alloc, part);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try alloc.dupe(u8, part);
-                gop.value_ptr.* = .{ .object = std.json.ObjectMap.empty };
-            } else if (gop.value_ptr.* != .object) {
-                freeJsonValue(alloc, gop.value_ptr);
-                gop.value_ptr.* = .{ .object = std.json.ObjectMap.empty };
+            if (current.getPtr(part)) |existing| {
+                if (existing.* != .object) {
+                    freeJsonValue(alloc, existing);
+                    existing.* = .{ .object = std.json.ObjectMap.empty };
+                }
+                current = &existing.object;
+                continue;
             }
-            current = &gop.value_ptr.object;
+
+            const owned_part = try alloc.dupe(u8, part);
+            errdefer alloc.free(owned_part);
+            try current.putNoClobber(
+                alloc,
+                owned_part,
+                .{ .object = std.json.ObjectMap.empty },
+            );
+            current = &current.getPtr(part).?.object;
         }
     }
     const leaf = parts[parts.len - 1];
@@ -309,7 +422,9 @@ fn setNestedValue(
         existing.* = value;
         return;
     }
-    try current.put(alloc, try alloc.dupe(u8, leaf), value);
+    const owned_leaf = try alloc.dupe(u8, leaf);
+    errdefer alloc.free(owned_leaf);
+    try current.putNoClobber(alloc, owned_leaf, value);
 }
 
 fn removeNestedValue(alloc: Allocator, obj: *std.json.ObjectMap, parts: []const []const u8) void {
@@ -339,18 +454,14 @@ fn removeNestedValue(alloc: Allocator, obj: *std.json.ObjectMap, parts: []const 
     }
 }
 
-fn parseNumericValue(alloc: Allocator, value_json: []const u8) !f64 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
-    defer parsed.deinit();
-    return try jsonNumberFromValue(parsed.value);
-}
-
 fn jsonNumberFromValue(value: std.json.Value) !f64 {
-    return switch (value) {
+    const number: f64 = switch (value) {
         .integer => |number| @floatFromInt(number),
         .float => |number| number,
-        else => error.InvalidArgument,
+        else => return error.InvalidArgument,
     };
+    if (!std.math.isFinite(number)) return error.InvalidArgument;
+    return number;
 }
 
 fn jsonValuesEqual(left: std.json.Value, right: std.json.Value) bool {
@@ -522,4 +633,107 @@ test "resolve document transform skips missing document without upsert" {
     };
     const resolved = try resolveDocumentTransform(alloc, null, transform);
     try std.testing.expect(resolved == null);
+}
+
+test "unsupported transforms fail atomically instead of reporting success" {
+    const alloc = std.testing.allocator;
+    const unsupported = [_]types.TransformOpType{
+        .pop, .mul, .min, .current_date, .rename,
+    };
+    for (unsupported) |op| {
+        const operations = [_]types.TransformOp{
+            .{ .op = .set, .path = "changed", .value_json = "true" },
+            .{ .op = op, .path = "n", .value_json = "3" },
+        };
+        try std.testing.expectError(
+            error.UnsupportedTransformOperation,
+            resolveDocumentTransform(alloc, "{\"n\":9}", .{
+                .key = "doc",
+                .operations = &operations,
+            }),
+        );
+    }
+}
+
+test "unsupported transform on a missing document is rejected before no-op resolution" {
+    const operations = [_]types.TransformOp{
+        .{ .op = .pop, .path = "tags" },
+    };
+    try std.testing.expectError(
+        error.UnsupportedTransformOperation,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &operations,
+        }),
+    );
+}
+
+test "invalid transform shape is rejected before missing-document no-op resolution" {
+    const missing_value = [_]types.TransformOp{
+        .{ .op = .set, .path = "status" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &missing_value,
+        }),
+    );
+
+    const unset_value = [_]types.TransformOp{
+        .{ .op = .unset, .path = "status", .value_json = "true" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &unset_value,
+        }),
+    );
+
+    const invalid_path = [_]types.TransformOp{
+        .{ .op = .set, .path = "$", .value_json = "true" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &invalid_path,
+        }),
+    );
+}
+
+test "invalid transform operands are rejected before missing-document no-op resolution" {
+    const malformed_json = [_]types.TransformOp{
+        .{ .op = .set, .path = "status", .value_json = "{\"unterminated\":" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &malformed_json,
+        }),
+    );
+
+    const non_numeric_increment = [_]types.TransformOp{
+        .{ .op = .inc, .path = "count", .value_json = "\"one\"" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &non_numeric_increment,
+        }),
+    );
+
+    const overflowing_increment = [_]types.TransformOp{
+        .{ .op = .inc, .path = "count", .value_json = "1e308" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, "{\"count\":1e308}", .{
+            .key = "doc:overflow",
+            .operations = &overflowing_increment,
+        }),
+    );
 }

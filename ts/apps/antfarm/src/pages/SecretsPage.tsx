@@ -44,7 +44,7 @@ import { useApiConfig } from "../hooks/use-api-config";
 
 interface SecretEntry {
   key: string;
-  status: "configured_keystore" | "configured_env" | "configured_both";
+  status: "configured_file" | "configured_env" | "configured_both";
   env_var?: string;
   created_at?: string;
   updated_at?: string;
@@ -64,7 +64,7 @@ const COMMON_SECRETS = [
 
 function statusBadge(status: SecretEntry["status"]) {
   switch (status) {
-    case "configured_keystore":
+    case "configured_file":
       return <Badge className="af-status-badge-success">Keystore</Badge>;
     case "configured_env":
       return <Badge className="af-status-badge-info">Env Var</Badge>;
@@ -78,7 +78,7 @@ export function SecretsPage() {
   const [secrets, setSecrets] = useState<SecretEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
-  const [swarmMode, setSwarmMode] = useState(false);
+  const [standaloneMode, setStandaloneMode] = useState(false);
 
   // Add secret dialog state
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -107,14 +107,14 @@ export function SecretsPage() {
     return headers;
   }, []);
 
-  // Check swarm mode from status endpoint
+  // Check standalone mode from status endpoint
   useEffect(() => {
     const checkMode = async () => {
       try {
         const response = await fetch(`${apiUrl}/status`, { headers: authHeaders });
         if (response.ok) {
           const data = await response.json();
-          setSwarmMode(data.swarm_mode === true);
+          setStandaloneMode(data.deployment_mode === "standalone");
         }
       } catch {
         // ignore
@@ -248,12 +248,12 @@ export function SecretsPage() {
         ),
       },
     ];
-    if (swarmMode) {
+    if (standaloneMode) {
       cols.push({
         id: "actions",
         header: "",
         cell: ({ row }) =>
-          row.original.status === "configured_keystore" ||
+          row.original.status === "configured_file" ||
           row.original.status === "configured_both" ? (
             <div className="text-right">
               <Button
@@ -269,7 +269,7 @@ export function SecretsPage() {
       });
     }
     return cols;
-  }, [swarmMode, handleDeleteSecret]);
+  }, [standaloneMode, handleDeleteSecret]);
 
   const isHttpNonLocal =
     typeof window !== "undefined" &&
@@ -286,7 +286,7 @@ export function SecretsPage() {
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
-          {swarmMode && (
+          {standaloneMode && (
             <Dialog open={addDialogOpen} onOpenChange={setAddDialogOpen}>
               <DialogTrigger asChild>
                 <Button>
@@ -383,11 +383,11 @@ export function SecretsPage() {
         </DashboardPageActions>
       </DashboardPageHeader>
 
-      {!swarmMode && (
+      {!standaloneMode && (
         <Alert>
           <AlertTriangle className="size-4" />
           <p className="text-sm">
-            Secret management via the dashboard is only available in single-node (swarm) mode. In
+            Secret management via the dashboard is only available in single-node (standalone) mode. In
             multi-node deployments, configure secrets using environment variables, Kubernetes
             secrets, or the <code>antfly keystore add</code> CLI on each node.
           </p>
@@ -427,7 +427,7 @@ export function SecretsPage() {
         </CardContent>
       </Card>
 
-      {swarmMode && (
+      {standaloneMode && (
         <Card>
           <CardHeader>
             <CardTitle className="text-sm font-medium">Quick Add</CardTitle>

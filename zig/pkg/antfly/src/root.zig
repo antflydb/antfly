@@ -19,6 +19,7 @@ pub const roaring = @import("encoding/roaring.zig");
 pub const vellum = @import("antfly_vellum");
 pub const snappy = @import("encoding/snappy.zig");
 pub const streamvbyte = @import("encoding/streamvbyte.zig");
+pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
 pub const chunked_coder = @import("encoding/chunked_coder.zig");
 
 // Vector math & quantization
@@ -111,7 +112,7 @@ pub const metadata_table_workflow = @import("metadata/table_workflow.zig");
 pub const metadata_replication_backfill = @import("metadata/replication_backfill.zig");
 pub const metadata_placement_planner = @import("metadata/placement_planner.zig");
 pub const data = @import("data/mod.zig");
-pub const swarm = @import("swarm/mod.zig");
+pub const standalone = @import("standalone/mod.zig");
 pub const inference_runtime = @import("inference_runtime/runtime.zig");
 pub const usermgr = @import("usermgr/mod.zig");
 
@@ -133,10 +134,11 @@ pub const synthesizing = @import("antfly_synthesizing");
 pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
-pub const platform_clock = @import("platform/clock.zig");
-pub const platform_time = @import("platform/time.zig");
+pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const storage_backend_scan = @import("storage/backend_scan.zig");
 pub const storage_sim_runtime = @import("storage/sim_runtime.zig");
 pub const object_storage = @import("storage/object_storage.zig");
@@ -169,8 +171,8 @@ pub const schema = @import("storage/schema.zig");
 pub const db = @import("storage/db/mod.zig");
 
 test {
-    if (comptime build_options.swarm_runtime_focused_test) {
-        _ = swarm;
+    if (comptime build_options.standalone_runtime_focused_test) {
+        _ = standalone;
         return;
     }
 
@@ -179,6 +181,7 @@ test {
     _ = vellum;
     _ = snappy;
     _ = streamvbyte;
+    _ = simd_bitpack;
     _ = chunked_coder;
 
     // Vector
@@ -224,6 +227,7 @@ test {
     _ = fusion;
     _ = regex;
     _ = query_string;
+    _ = @import("search/pattern_filter.zig");
     _ = @import("hbc_recall_test.zig");
 
     // Graph
@@ -239,6 +243,7 @@ test {
     // Inference
     _ = inference;
     _ = table_schema;
+    _ = @import("chunking/mod.zig");
     _ = pdf;
 
     // Serverless
@@ -261,6 +266,7 @@ test {
 
     // Raft integration
     _ = raft;
+    _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = metadata;
     _ = metadata_api;
@@ -275,7 +281,7 @@ test {
     _ = metadata_replication_backfill;
     _ = metadata_placement_planner;
     _ = data;
-    _ = swarm;
+    _ = standalone;
     _ = inference_runtime;
 
     // Template
@@ -317,6 +323,7 @@ test {
     _ = storage_backend_scan;
     _ = mem_backend;
     _ = lsm_backend;
+    _ = storage_maintenance;
     _ = backend_conformance_test;
     _ = lsm_backend_sim_test;
     _ = db;

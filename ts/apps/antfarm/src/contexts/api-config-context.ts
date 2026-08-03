@@ -9,6 +9,9 @@ export interface ApiConfigContextType {
   inferenceApiUrl: string;
   setInferenceApiUrl: (url: string) => void;
   resetInferenceApiUrl: () => void;
+  inferenceConnectionId: string;
+  setInferenceConnectionId: (id: string) => void;
+  inferenceUrl: (operation: string) => string;
 }
 
 export const ApiConfigContext = createContext<ApiConfigContextType | undefined>(undefined);

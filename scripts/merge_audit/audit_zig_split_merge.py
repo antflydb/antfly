@@ -412,7 +412,7 @@ def text_file_has_conflict_markers(path: str) -> bool:
 
 
 def pub_fns(text: str) -> set[str]:
-    return set(re.findall(r"\bpub\s+(?:extern\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
+    return set(re.findall(r"\bpub\s+(?:(?:extern|inline|noinline)\s+)*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
 
 
 def fn_ptr_fields(text: str) -> set[str]:
@@ -485,6 +485,9 @@ TEST_NAME_PREFIXES = (
 )
 
 DB_TEST_MOVE_PREFIXES = (
+    "db generation repair ",
+    "db artifact repair ",
+    "db split restore ",
     "db derived async replay ",
     "db derived async dense artifact rebuild ",
     "db derived async ",
@@ -1375,11 +1378,11 @@ def check_known_merge_risk_wiring() -> list[CheckResult]:
         ],
         "zig/pkg/antfly/src/storage/db/search_runtime.zig": [
             "fn freeConstDocIdsAlloc",
-            "storedDocMatchesPatternFilter(alloc, raw_key, doc_json, opts.filter_query_json)",
+            "db_query_graph.executeSinglePatternQueryWithSets",
             "composedQueryMetricIndexName(req)",
             "observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns)",
             "db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile)",
-            "execution_req.resolved_text_doc_filter = filter",
+            "execution_req.resolved_text_doc_filter = &resolved_text_filter_storage",
             "resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req",
         ],
         "zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig": [
@@ -1436,8 +1439,8 @@ def check_known_merge_risk_wiring() -> list[CheckResult]:
             "fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates",
             "fn denseEmbeddingArtifactRepairReason",
             "fn sparseEmbeddingArtifactRepairReason",
-            "fn recordDenseEmbeddingArtifactRepairIssuesForReplay",
-            "fn recordSparseEmbeddingArtifactRepairIssuesForReplay",
+            "fn filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay",
+            "fn filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay",
             "fn storeHasReplayRecordForHintAfter",
             "fn managedIndexRecordApplicability",
             "fn replayRangeHasManagedIndexApplicableRecord",
@@ -1447,10 +1450,10 @@ def check_known_merge_risk_wiring() -> list[CheckResult]:
             "pub fn noteTargetAdvanceRepairRun",
             "artifact_replay.graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)",
             "artifact_replay.decodeEmbeddingArtifactWriteIdentityAlloc(state.ctx.alloc, key, state.expected_name)",
-            "fn deleteDerivedCoverageSkippedForDocKeys",
-            "deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys)",
-            "deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys)",
-            "test \"db derived async deletes skipped coverage markers for replay deletes once\"",
+            "fn deleteDerivedCoverageForDocKeys",
+            "deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys)",
+            "deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys)",
+            "test \"db derived async deletes coverage outcome markers for replay deletes once\"",
             "test \"db derived async graph replay ignores document extraction parent asset but tracks units\"",
             "derivedAsyncBatchAffectsManagedIndexForReplay(parent_batch, graph_ref)",
             "derivedAsyncBatchAffectsManagedIndexForReplay(unit_batch, graph_ref)",
@@ -1468,7 +1471,8 @@ def check_known_merge_risk_wiring() -> list[CheckResult]:
             "fn cachedBestEffortStartupPlaceholderSource",
             "fn markClearedStartupRuntimeStatus",
             "fn startupRuntimeStatusFreshness",
-            "try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status)",
+            "fn publishRuntimeStatusGroupAfterObservation",
+            "const publication_fence = try snapshot_cache.capturePublicationToken(table_name)",
             "test \"runtime status best effort preserves startup placeholder freshness transitions\"",
             "fn entryActiveLeasesLocked",
             "fn tableHasOnlyInactiveAdoptableEntriesLocked",
@@ -1500,10 +1504,12 @@ def check_known_merge_risk_wiring() -> list[CheckResult]:
             "fn publishRuntimeStatusSnapshotWithStartupPhaseMode",
             "fn preserveNonReplayBackfill",
             "const createManagedDbEnrichments = table_write_managed_db.createManagedDbEnrichments",
-            "try cached.db.reconfigureEnrichmentRuntime(enrichments.config())",
             "self.preemptStartupWriteCacheForLocalMutation(group_id, table_name)",
             "test \"write cache local mutation preempts stale startup writer\"",
             "test \"write cache metadata refresh preserves inactive adoptable seed\"",
+        ],
+        "zig/pkg/antfly/src/api/table_writes/managed_db.zig": [
+            "try db.reconfigureEnrichmentRuntime(enrichments.takeConfig())",
         ],
         "zig/pkg/antfly/src/api/table_reads.zig": [
             "pub const appendScanLine = table_read_core.appendScanLine;",
@@ -2485,9 +2491,9 @@ def check_db_restore_runtime_repair_drain_hygiene() -> list[CheckResult]:
     failures: list[str] = []
     required_tokens = [
         "restore runtime repair drain async work",
+        "drain_replay_stages_until_stable_without_truncation",
         "flush_applied_sequences_for_idle",
-        "Do not",
-        "call runUntilIdle here",
+        'updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_replayed_artifacts", false)',
     ]
     for token in required_tokens:
         if token not in text:
@@ -2777,8 +2783,7 @@ def check_ci_build_harness_hygiene() -> list[CheckResult]:
             "pub var selected_test_filter: ?[]const u8 = null;",
             '.name = "db-artifact-repair-test"',
             "fn addSelectedRunTestFilter",
-            "fn argsSelectRunTestFilter",
-            "if (argsSelectRunTestFilter(args)) return default_filters;",
+            "build_test_filters.select",
             'run.addArgs(&.{ "--test-filter", filter });',
         ],
     }
@@ -2926,9 +2931,11 @@ def check_same_path_public_surface(origin: str, files: list[ChangedFile]) -> lis
         if not path.endswith(".zig"):
             continue
         if path in {
+            "zig/pkg/antfly/src/api/table_catalog.zig",
             "zig/pkg/antfly/src/api/table_reads.zig",
             "zig/pkg/antfly/src/api/table_writes.zig",
             "zig/pkg/antfly/src/api/query_contract.zig",
+            "zig/pkg/antfly/src/storage/db/db.zig",
         }:
             continue
         if not file_exists_at_origin(origin, path):
@@ -3201,7 +3208,7 @@ def check_current_imported_function_refs(files: list[ChangedFile]) -> list[Check
     missing: dict[str, list[str]] = {}
     member_cache: dict[str, set[str]] = {}
     import_re = re.compile(
-        r"\b(?:const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*@import\(\"([^\"]+)\"\)"
+        r"(?m)^\s*(?:const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*@import\(\"([^\"]+)\"\)\s*;\s*$"
     )
 
     for item in files:

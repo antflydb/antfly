@@ -58,6 +58,7 @@ pub const OwnedDenseEmbeddingWrites = struct {
     alloc: Allocator,
     owns_doc_keys: bool = false,
     writes: []mapper.DenseEmbeddingWrite = &.{},
+    allocation_len: usize = 0,
 
     pub fn deinit(self: *@This()) void {
         if (self.owns_doc_keys) {
@@ -66,7 +67,7 @@ pub const OwnedDenseEmbeddingWrites = struct {
                 if (write.parent_doc_key) |parent_doc_key| self.alloc.free(@constCast(parent_doc_key));
             }
         }
-        if (self.writes.len > 0) self.alloc.free(self.writes);
+        if (self.allocation_len > 0) self.alloc.free(self.writes.ptr[0..self.allocation_len]);
         self.* = undefined;
     }
 };
@@ -75,11 +76,12 @@ pub const OwnedSparseEmbeddingWrites = struct {
     alloc: Allocator,
     owned_doc_keys: []const []const u8 = &.{},
     writes: []mapper.SparseEmbeddingWrite = &.{},
+    allocation_len: usize = 0,
 
     pub fn deinit(self: *@This()) void {
         for (self.owned_doc_keys) |doc_key| self.alloc.free(@constCast(doc_key));
         if (self.owned_doc_keys.len > 0) self.alloc.free(self.owned_doc_keys);
-        if (self.writes.len > 0) self.alloc.free(self.writes);
+        if (self.allocation_len > 0) self.alloc.free(self.writes.ptr[0..self.allocation_len]);
         self.* = undefined;
     }
 };
@@ -185,10 +187,12 @@ pub fn collectDenseEmbeddingWritesForArtifacts(
 
     try appendDenseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, artifact_keys, index_name);
 
+    const writes = try filtered.toOwnedSlice(alloc);
     return .{
         .alloc = alloc,
         .owns_doc_keys = true,
-        .writes = try filtered.toOwnedSlice(alloc),
+        .writes = writes,
+        .allocation_len = writes.len,
     };
 }
 
@@ -231,10 +235,14 @@ pub fn collectSparseEmbeddingWritesForArtifacts(
 
     try appendSparseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, &owned_doc_keys, artifact_keys, index_name);
 
+    const writes = try filtered.toOwnedSlice(alloc);
+    errdefer if (writes.len > 0) alloc.free(writes);
+    const owned_keys = try owned_doc_keys.toOwnedSlice(alloc);
     return .{
         .alloc = alloc,
-        .owned_doc_keys = try owned_doc_keys.toOwnedSlice(alloc),
-        .writes = try filtered.toOwnedSlice(alloc),
+        .owned_doc_keys = owned_keys,
+        .writes = writes,
+        .allocation_len = writes.len,
     };
 }
 
@@ -392,7 +400,7 @@ pub const GraphReplayRepairOptions = struct {
     sequence: u64 = 0,
 };
 
-fn graphArtifactSourceConsumesRef(
+pub fn graphArtifactSourceConsumesRef(
     index_manager: *index_manager_mod.IndexManager,
     source: index_manager_mod.GraphArtifactSource,
     artifact_ref: types.ArtifactRef,
@@ -509,6 +517,71 @@ fn graphAssetSourceConsumesAssetRef(index_manager: *index_manager_mod.IndexManag
     return producer_cfg.type != .document_extraction;
 }
 
+pub fn graphArtifactRefUsesDocumentWideFallback(artifact_ref: types.ArtifactRef) bool {
+    return artifact_ref.kind == .asset and artifact_ref.unit_id == null and artifact_ref.chunk_id == null and artifact_ref.source == null;
+}
+
+pub fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
+    if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) return try alloc.dupe(u8, artifact_ref.name);
+
+    var state_name = std.ArrayListUnmanaged(u8).empty;
+    errdefer state_name.deinit(alloc);
+    try state_name.appendSlice(alloc, artifact_ref.name);
+    try state_name.append(alloc, '\x1f');
+    try state_name.appendSlice(alloc, @tagName(artifact_ref.kind));
+    if (artifact_ref.unit_id) |unit_id| {
+        try state_name.append(alloc, '\x1f');
+        try state_name.appendSlice(alloc, "unit:");
+        try state_name.appendSlice(alloc, unit_id);
+    }
+    if (artifact_ref.chunk_id) |chunk_id| {
+        const chunk_part = try std.fmt.allocPrint(alloc, "chunk:{d}", .{chunk_id});
+        defer alloc.free(chunk_part);
+        try state_name.append(alloc, '\x1f');
+        try state_name.appendSlice(alloc, chunk_part);
+    }
+    return try state_name.toOwnedSlice(alloc);
+}
+
+test "graph artifact state identity separates document unit and chunk provenance" {
+    const alloc = std.testing.allocator;
+
+    const document_wide: types.ArtifactRef = .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("artifact"),
+        .kind = .asset,
+    };
+    const unit: types.ArtifactRef = .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("artifact"),
+        .kind = .asset,
+        .unit_id = @constCast("1"),
+    };
+    const chunk: types.ArtifactRef = .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("artifact"),
+        .kind = .chunk,
+        .chunk_id = 7,
+        .unit_id = @constCast("1"),
+    };
+
+    const document_wide_name = try graphArtifactStateNameAlloc(alloc, document_wide);
+    defer alloc.free(document_wide_name);
+    const unit_name = try graphArtifactStateNameAlloc(alloc, unit);
+    defer alloc.free(unit_name);
+    const chunk_name = try graphArtifactStateNameAlloc(alloc, chunk);
+    defer alloc.free(chunk_name);
+
+    try std.testing.expect(graphArtifactRefUsesDocumentWideFallback(document_wide));
+    try std.testing.expect(!graphArtifactRefUsesDocumentWideFallback(unit));
+    try std.testing.expect(!graphArtifactRefUsesDocumentWideFallback(chunk));
+    try std.testing.expectEqualStrings("artifact", document_wide_name);
+    try std.testing.expect(!std.mem.eql(u8, document_wide_name, unit_name));
+    try std.testing.expect(!std.mem.eql(u8, unit_name, chunk_name));
+    try std.testing.expect(std.mem.indexOf(u8, unit_name, "unit:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_name, "chunk:7") != null);
+}
+
 pub const GraphMaterializationOptions = struct {
     relational_base_rows: bool = false,
     require_resolution_contract: bool = false,
@@ -586,7 +659,9 @@ pub fn materializeGraphSourceArtifactsForIndex(
             }
         }
 
-        const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, artifact_ref.name);
+        const state_name = try graphArtifactStateNameAlloc(alloc, artifact_ref);
+        defer alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
         defer alloc.free(state_key);
         if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
             defer freeOwnedConstKeySlice(alloc, previous_keys);
@@ -595,7 +670,7 @@ pub fn materializeGraphSourceArtifactsForIndex(
                 try deletes.append(alloc, try alloc.dupe(u8, previous_key));
                 try appendUniqueOwnedKey(alloc, &changed, previous_key);
             }
-        } else {
+        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
             defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);

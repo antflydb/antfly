@@ -77,16 +77,16 @@ class BatchRequest:
                 Transform operations allow you to modify documents without read-modify-write races:
                 - Operations are applied atomically on the server
                 - Multiple operations per document are applied in sequence
-                - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+                - Supports numeric and set-like operations ($inc, $max, $addToSet)
 
                 Common use cases:
                 - Increment counters (views, likes, votes)
-                - Update timestamps ($currentDate)
-                - Manage arrays (add/remove tags, items)
+                - Update timestamps ($set)
+                - Add unique array values ($addToSet)
                 - Update nested fields without overwriting the entire document
-                 Example: [{'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op':
-                '$currentDate', 'path': '$.lastViewed'}]}, {'key': 'user:456', 'operations': [{'op': '$push', 'path': '$.tags',
-                'value': 'vip'}]}].
+                 Example: [{'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op': '$set',
+                'path': '$.lastViewed', 'value': '2026-07-28T12:00:00Z'}]}, {'key': 'user:456', 'operations': [{'op':
+                '$addToSet', 'path': '$.tags', 'value': 'vip'}]}].
             sync_level (SyncLevel | Unset): Synchronization level for batch operations:
                 - "propose": Wait for Raft proposal acceptance (fastest, default)
                 - "write": Wait for Pebble KV write

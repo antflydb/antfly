@@ -18,9 +18,10 @@ const backups_api = @import("../backups.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const distributed_txn = @import("../distributed_txn.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const backend_types = @import("../../storage/backend_types.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const doc_identity = @import("../../storage/db/doc_identity.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const runtime_status = @import("../runtime_status.zig");
@@ -52,6 +53,26 @@ const TableEmptyingWorkerResult = table_write_schema_jobs.TableEmptyingWorkerRes
 const TableEmptyingWorkerPassResult = table_write_schema_jobs.TableEmptyingWorkerPassResult;
 
 pub const backend_current_root_generation: u64 = 0;
+
+pub const StartupCatchUpMetadata = struct {
+    pub const MetadataSource = enum { supplied, local_persisted };
+    pub const IdentityValidation = enum {
+        exact,
+        reassign_same_table,
+    };
+
+    indexes_json: ?[]const u8 = null,
+    schema_json: ?[]const u8 = null,
+    identity_namespace: ?doc_identity.Namespace = null,
+    identity_validation: IdentityValidation = .exact,
+    target_index_name: ?[]const u8 = null,
+    metadata_source: MetadataSource = .supplied,
+    /// Internal owner-side executor mode. Normal startup inspection only
+    /// discovers durable repair debt; the bounded repair worker sets this to
+    /// advance at most one admitted intent.
+    advance_index_repairs: bool = false,
+    index_repair_options: db_mod.types.ArtifactRepairRunOptions = .{},
+};
 
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
 
@@ -355,6 +376,7 @@ pub const TableWriteSource = struct {
             backup_id: []const u8,
             format: backups_api.BackupFormat,
             location_uri: []const u8,
+            connection: []const u8,
             location: *backups_api.BackupLocation,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
         backup_catalog_table: ?*const fn (
@@ -369,6 +391,14 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             plan: backups_api.TableRestorePlan,
         ) anyerror!?void = null,
+        begin_restore_lifecycle: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+        ) anyerror!void = null,
+        finish_restore_lifecycle: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+        ) void = null,
         restore_catalog_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1476,10 +1506,11 @@ pub const TableWriteSource = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location);
     }
 
     pub fn backupCatalogTable(
@@ -1498,8 +1529,9 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         plan: backups_api.TableRestorePlan,
     ) !?void {
-        const fn_ptr = self.vtable.restore_table orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, plan);
+        const lifecycle_active = try self.beginRestoreLifecycle(table_name);
+        defer if (lifecycle_active) self.finishRestoreLifecycle(table_name);
+        return try self.restoreTableReserved(alloc, table_name, plan);
     }
 
     pub fn restoreCatalogTable(
@@ -1510,6 +1542,27 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.restore_catalog_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, target, plan);
+    }
+
+    pub fn restoreTableReserved(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const fn_ptr = self.vtable.restore_table orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn beginRestoreLifecycle(self: TableWriteSource, table_name: []const u8) !bool {
+        const fn_ptr = self.vtable.begin_restore_lifecycle orelse return false;
+        try fn_ptr(self.ptr, table_name);
+        return true;
+    }
+
+    pub fn finishRestoreLifecycle(self: TableWriteSource, table_name: []const u8) void {
+        const fn_ptr = self.vtable.finish_restore_lifecycle orelse return;
+        fn_ptr(self.ptr, table_name);
     }
 
     pub fn commitTransaction(

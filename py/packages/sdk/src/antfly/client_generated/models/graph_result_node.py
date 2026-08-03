@@ -25,6 +25,7 @@ class GraphResultNode:
 
     Attributes:
         key (str): Document key
+        table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
         depth (int | Unset): Distance from start node
         distance (float | Unset): Weighted distance
         document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
@@ -39,6 +40,7 @@ class GraphResultNode:
     """
 
     key: str
+    table: str | Unset = UNSET
     depth: int | Unset = UNSET
     distance: float | Unset = UNSET
     document: GraphResultNodeDocument | Unset = UNSET
@@ -52,6 +54,8 @@ class GraphResultNode:
 
     def to_dict(self) -> dict[str, Any]:
         key = self.key
+
+        table = self.table
 
         depth = self.depth
 
@@ -98,6 +102,8 @@ class GraphResultNode:
                 "key": key,
             }
         )
+        if table is not UNSET:
+            field_dict["table"] = table
         if depth is not UNSET:
             field_dict["depth"] = depth
         if distance is not UNSET:
@@ -129,6 +135,8 @@ class GraphResultNode:
 
         d = dict(src_dict)
         key = d.pop("key")
+
+        table = d.pop("table", UNSET)
 
         depth = d.pop("depth", UNSET)
 
@@ -179,6 +187,7 @@ class GraphResultNode:
 
         graph_result_node = cls(
             key=key,
+            table=table,
             depth=depth,
             distance=distance,
             document=document,

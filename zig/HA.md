@@ -580,7 +580,7 @@ error, then layer type checks on top of the shared classifier:
   whitespace instead of relying on implicit trimming.
 
 Admin authentication should be explicit but operationally simple. The Antfly
-runtime may be started with `--ha-admin-token-env <name>`; when set, the Zig
+runtime may be started with `--admin-token-env <name>`; when set, the Zig
 process reads a bearer token from that environment variable at startup and
 requires `Authorization: Bearer <token>` on typed `/admin/v1/ha` routes. Health
 checks and node-to-node `/internal/v1` replication traffic are separate from
@@ -588,7 +588,7 @@ this control-plane auth path. The operator should read its outbound bearer token
 from `spec.highAvailability.admin.tokenEnvVar`, defaulting to
 `ANTFLY_HA_ADMIN_TOKEN`, and the Antfly pods should receive the same token
 through `spec.highAvailability.runtime.adminTokenEnvVar`, with pod injection
-from `spec.highAvailability.runtime.adminTokenSecretRef` or `spec.swarm.envFrom`.
+from `spec.highAvailability.runtime.adminTokenSecretRef` or `spec.standalone.envFrom`.
 When `adminTokenSecretRef` is used, the referenced Secret key should be required
 (`optional: false`) so pods do not start without the admin token. Kubernetes
 should inject both process environments from Secrets; the operator should not
@@ -809,7 +809,7 @@ Treat the e2e work as a set of concrete product-path gates:
   standby startup, primary writes, standby catch-up, read-only enforcement, and
   standby restart/replay using real processes and durable files;
 - the admin-auth gate proves typed `/admin/v1/ha` calls require bearer auth when
-  `--ha-admin-token-env` is configured, while health checks and replication
+  `--admin-token-env` is configured, while health checks and replication
   traffic remain separate from that control-plane auth;
 - the freshness gate proves standby reads report stale, `at_least_lsn`, and
   primary-only routing decisions instead of serving ambiguous read-after-write
@@ -991,7 +991,7 @@ and either rewind or reseed.
   local/offline helpers only where direct filesystem access is required.
 - Keep CLI table and JSON output aligned with admin API response schemas so
   humans, tests, and the operator observe the same fields.
-- Wire the supported Zig `antfly swarm` runtime so a primary can be started with
+- Wire the supported Zig `antfly standalone` runtime so a primary can be started with
   durable HA replication log, slot store, promotion fence WAL, optional
   former-primary rewind log, optional admin bearer-token env var, node id, and
   identity flags. That runtime path should attach the same `/admin/v1/ha`
@@ -999,7 +999,7 @@ and either rewind or reseed.
   enforcement, and `/internal/v1/ha/replication` executor used by tests and the
   CLI, rather than requiring a bespoke harness to expose primary-side HA
   operations or rejoin/rewind workflows.
-- Wire the supported Zig `antfly swarm` runtime so a standby can also be started
+- Wire the supported Zig `antfly standalone` runtime so a standby can also be started
   with a durable received-WAL log, progress WAL, promotion fence WAL, optional
   former-primary rewind log, optional admin bearer-token env var, node id, and
   identity flags. The standby runtime path should expose `/admin/v1/ha` status,
@@ -1061,15 +1061,15 @@ be validated against that operator package.
   `ANTFLY_HA_ADMIN_TOKEN`. Kubernetes should inject that variable into the
   operator pod from a Secret; the operator should not require broad direct
   Secret read permissions just to make HA admin API calls.
-- Support runtime-side admin auth by passing `--ha-admin-token-env` from
+- Support runtime-side admin auth by passing `--admin-token-env` from
   `spec.highAvailability.runtime.adminTokenEnvVar`. Antfly pods should receive
-  the same token through `spec.swarm.envFrom` or the explicit
+  the same token through `spec.standalone.envFrom` or the explicit
   `spec.highAvailability.runtime.adminTokenSecretRef` secret-key injection.
   Admission should reject `adminTokenSecretRef.optional=true`, and the process
   should fail closed if the configured env var is missing or empty.
-- Scope `spec.highAvailability.runtime` to operator Swarm mode until the
+- Scope `spec.highAvailability.runtime` to operator Standalone mode until the
   split metadata/data topology has first-class HA process wiring. Admission
-  should reject runtime fields outside Swarm mode instead of accepting settings
+  should reject runtime fields outside Standalone mode instead of accepting settings
   that are never passed to the Zig process.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
@@ -1079,7 +1079,7 @@ be validated against that operator package.
   then run any data-replacement step through a pod-local helper on the node being
   reseeded.
 - Expose a `highAvailability.runtime.formerPrimaryLogPath` operator field and
-  pass it to `antfly swarm --ha-former-primary-log` on nodes that may need
+  pass it to `antfly standalone --ha-former-primary-log` on nodes that may need
   rewind/rejoin. For the original primary, this should usually be the same
   durable file as `highAvailability.runtime.primary.logPath`; after failover it
   becomes the former primary's local evidence for timeline divergence checks and
@@ -1177,7 +1177,7 @@ stream from one process to another. The production bar is that ordinary and
 adverse operational workflows are typed, observable, restartable, and fenced.
 The remaining work before this mode has the bulk of Postgres-style HA parity is:
 
-- real `antfly swarm` primary and standby runtime wiring, including durable
+- real `antfly standalone` primary and standby runtime wiring, including durable
   replication logs, received-WAL logs, slot stores, progress WALs, fence WALs,
   former-primary logs, read/write gates, admin auth, and background-job gating;
 - a stable `/admin/v1/ha` OpenAPI contract generated into Zig admin bindings

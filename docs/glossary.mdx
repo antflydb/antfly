@@ -189,6 +189,14 @@ See: [Shard (Wikipedia)](https://en.wikipedia.org/wiki/Shard_(database_architect
 
 ## Data Storage
 
+### Document Extraction
+
+The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. PDF pages with no native text use OCR by default with the local `antflydb/Florence-2-base` model. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to opt out. This durable ingestion path is distinct from template helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
+
+### remotePDF (deprecated)
+
+`remotePDF` is a deprecated Handlebars helper retained for compatibility. Use `remoteMedia` for template-time multimodal inference, or `document_extraction` when PDF pages and chunks should be durable and reprocessable.
+
 ### Document Storage
 
 Storing data as self-contained JSON documents rather than rows in tables. Documents can have flexible schemas and nested structures. Antfly stores documents with automatic indexing of fields and efficient MessagePack serialization.

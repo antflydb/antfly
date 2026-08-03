@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "status": "accepted_with_remaining_impact_header_and_query_cpu_gap",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 34,
+    "accepted_reader_versions": [23, 34],
+    "branch_only_rejected_versions": [24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+    "postings_per_payload_block": 128,
+    "impact_range_documents": 1024,
+    "impact_max_frequency_bits": 5,
+    "impact_min_norm_bits": 8,
+    "impact_frequency_semantics": "conservative_upper_bound_bucket",
+    "impact_frequency_decoder": "bounded_16_bit_window_shift_mask",
+    "single_document_postings": "inline_frequency_and_positions",
+    "stored_fields": "omitted_for_index_only_kernel_segments",
+    "merge_output": "term_streamed_through_1MiB_file_sink_buffer"
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 5,
+    "tie_aware_matches": 0
+  },
+  "settled_layout": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_segments": 0,
+    "in_flight_merges": 0,
+    "failed_merges": 0,
+    "quarantined_merges": 0
+  },
+  "index_size": {
+    "antfly_bytes": 3406622680,
+    "tantivy_bytes": 3251494143,
+    "gap_bytes": 155128537,
+    "antfly_to_tantivy_ratio": 1.047709924,
+    "v33_bytes": 3435521272,
+    "reduction_from_v33_bytes": 28898592,
+    "reduction_from_v33_percent": 0.841171
+  },
+  "antfly_components": {
+    "stored_fields": 50,
+    "inverted": 3386492176,
+    "norms": 5032155,
+    "term_dictionary": 87411937,
+    "bloom": 23331016,
+    "postings": 3270716738,
+    "postings_header": 78864456,
+    "impact_records": 141577908,
+    "chunk_metadata": 44124753,
+    "doc_frequency_payload": 1128113090,
+    "positions": 1845486240,
+    "skip": 3068160,
+    "ordinals": 20128470,
+    "section_index": 1170,
+    "postings_terms": 12671902,
+    "single_document_postings_terms": 7890726,
+    "document_term_postings": 622897189
+  },
+  "indexing": {
+    "antfly_elapsed_ns": 421933973000,
+    "antfly_cpu_ns": 407927734000,
+    "antfly_peak_rss_bytes": 2141044736,
+    "tantivy_reference_elapsed_ns": 550244512584,
+    "tantivy_reference_peak_rss_bytes": 2810429440,
+    "antfly_to_tantivy_elapsed_ratio": 0.766812,
+    "antfly_to_tantivy_peak_rss_ratio": 0.761821,
+    "peak_rss_advantage_bytes": 669384704,
+    "merge_input_bytes": 18213962011,
+    "merge_output_bytes": 17451600920
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_class": 3,
+    "antfly_cpu_per_query_ns": {
+      "term": 104949,
+      "union": 302754,
+      "intersection": 262216,
+      "phrase": 576185
+    },
+    "tantivy_reference_cpu_per_query_ns": {
+      "term": 40028,
+      "union": 213284,
+      "intersection": 248616,
+      "phrase": 344910
+    },
+    "antfly_to_tantivy_cpu_ratio": {
+      "term": 2.621890,
+      "union": 1.419488,
+      "intersection": 1.054703,
+      "phrase": 1.670537
+    },
+    "antfly_peak_rss_bytes": 23232512,
+    "v33_cpu_per_query_ns": {
+      "term": 104444,
+      "union": 293364,
+      "intersection": 253603,
+      "phrase": 591504
+    }
+  },
+  "rejected_candidates": {
+    "density_global_low_df_impact": {
+      "index_bytes": 3279495439,
+      "gap_to_tantivy_bytes": 28001296,
+      "reason": "Collapsing differentiated low-DF range bounds nearly closed the disk gap but destroyed pruning: sustained term, union, and intersection CPU rose to 216272, 742855, and 430071 ns/query."
+    },
+    "shared_constant_impact_frequency": {
+      "index_bytes": 3435546016,
+      "reason": "The tagged count and per-term control cost cancelled the rare shared-column savings; the same-layout result was 24744 bytes larger than v33."
+    },
+    "four_bit_impact_frequency": {
+      "index_bytes": 3396387573,
+      "reason": "The extra 10.2 MB saving versus five-bit weakened high-frequency bounds; sustained term, union, and intersection CPU rose to 115645, 316987, and 283013 ns/query before decoder specialization."
+    }
+  },
+  "decision": {
+    "production_default": "accept_v34_five_bit_conservative_impact_frequency",
+    "remaining_gap": "The net persisted gap is 155.1 MB (4.77 percent). Positions remain about 84.7 MB smaller than Tantivy and dictionary/bloom about 39.8 MB smaller, while postings/index structures remain larger. Remaining Antfly-specific overhead is led by 141.6 MB of impact metadata, 78.9 MB of per-term headers, and 44.1 MB of chunk metadata, partly offset by denser positions and the omitted Tantivy store.",
+    "cpu_tradeoff": "Relative to v33 sustained CPU changes are +0.5 percent term, +3.2 percent union, +3.4 percent intersection, and -2.6 percent phrase after specializing the fixed five-bit decoder.",
+    "next_size_priority": "Reduce per-term header and range-ID overhead without removing differentiated WAND bounds; do not revive global low-DF impact collapse.",
+    "query_priority": "Term and phrase remain 2.62x and 1.67x Tantivy; keep profiling iterator setup/doc-frequency decode and arbitrary-bit positional decode independently of impact density.",
+    "source_artifact": "/private/tmp/antfly-wiki-full-production-v34-five-bit-impact",
+    "query_requalification_artifact": "/private/tmp/antfly-wiki-full-production-v34-five-bit-impact-fast-decode",
+    "cross_engine_artifact": "/private/tmp/antfly-wiki-full-production-v34-five-bit-impact-cross-engine"
+  }
+}

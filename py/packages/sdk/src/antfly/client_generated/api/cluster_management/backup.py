@@ -43,6 +43,11 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -76,8 +81,15 @@ def sync_detailed(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
+
+    Backup IDs are immutable. Reusing an ID that already has a published
+    cluster manifest returns `409` and leaves the existing backup unchanged.
 
     **Storage Locations:**
     - Local filesystem: `file:///path/to/backup`
@@ -87,11 +99,7 @@ def sync_detailed(
     ```
     {location}/
     ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-    ├── {table1}-{backup_id}-metadata.json  (table metadata)
-    ├── shard-1-{table1}-{backup_id}.tar.zst
-    ├── shard-2-{table1}-{backup_id}.tar.zst
-    ├── {table2}-{backup_id}-metadata.json
-    └── ...
+    └── generation-scoped table manifests and payloads
     ```
 
     Args:
@@ -127,8 +135,15 @@ def sync(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
+
+    Backup IDs are immutable. Reusing an ID that already has a published
+    cluster manifest returns `409` and leaves the existing backup unchanged.
 
     **Storage Locations:**
     - Local filesystem: `file:///path/to/backup`
@@ -138,11 +153,7 @@ def sync(
     ```
     {location}/
     ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-    ├── {table1}-{backup_id}-metadata.json  (table metadata)
-    ├── shard-1-{table1}-{backup_id}.tar.zst
-    ├── shard-2-{table1}-{backup_id}.tar.zst
-    ├── {table2}-{backup_id}-metadata.json
-    └── ...
+    └── generation-scoped table manifests and payloads
     ```
 
     Args:
@@ -173,8 +184,15 @@ async def asyncio_detailed(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
+
+    Backup IDs are immutable. Reusing an ID that already has a published
+    cluster manifest returns `409` and leaves the existing backup unchanged.
 
     **Storage Locations:**
     - Local filesystem: `file:///path/to/backup`
@@ -184,11 +202,7 @@ async def asyncio_detailed(
     ```
     {location}/
     ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-    ├── {table1}-{backup_id}-metadata.json  (table metadata)
-    ├── shard-1-{table1}-{backup_id}.tar.zst
-    ├── shard-2-{table1}-{backup_id}.tar.zst
-    ├── {table2}-{backup_id}-metadata.json
-    └── ...
+    └── generation-scoped table manifests and payloads
     ```
 
     Args:
@@ -222,8 +236,15 @@ async def asyncio(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
+
+    Backup IDs are immutable. Reusing an ID that already has a published
+    cluster manifest returns `409` and leaves the existing backup unchanged.
 
     **Storage Locations:**
     - Local filesystem: `file:///path/to/backup`
@@ -233,11 +254,7 @@ async def asyncio(
     ```
     {location}/
     ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-    ├── {table1}-{backup_id}-metadata.json  (table metadata)
-    ├── shard-1-{table1}-{backup_id}.tar.zst
-    ├── shard-2-{table1}-{backup_id}.tar.zst
-    ├── {table2}-{backup_id}-metadata.json
-    └── ...
+    └── generation-scoped table manifests and payloads
     ```
 
     Args:

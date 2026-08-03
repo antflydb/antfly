@@ -63,6 +63,7 @@ const export_source_mod = @import("../models/export_source.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
+const cuda_load_plan = @import("../ops/cuda/load_plan.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
@@ -236,20 +237,41 @@ fn estimateGpuHostedResidentTensorBytes(tensor: *const Tensor, force_f32: bool) 
     return tensor.data.len;
 }
 
-fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest) !u64 {
-    if (mf.gguf_path) |path| {
-        var total = try c_file.fileSize(allocator, path);
-        if (mf.gliner_head_gguf_path) |head_path| {
-            total += try c_file.fileSize(allocator, head_path);
-        }
-        if (mf.gliner_head_safetensors_path) |head_path| {
-            total += try c_file.fileSize(allocator, head_path);
-        }
-        return total;
-    }
-    if (mf.safetensors_index_path) |path| return shardedSafetensorsTotalBytes(allocator, path);
-    if (mf.safetensors_path) |path| return c_file.fileSize(allocator, path);
-    return 0;
+pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest) !u64 {
+    return switch (mf.nativeWeightArtifactKind() orelse return 0) {
+        .gguf => blk: {
+            var total = try c_file.fileSize(allocator, mf.gguf_path.?);
+            if (mf.gliner_head_gguf_path) |head_path| {
+                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
+                    return error.ResourceLimitExceeded;
+            }
+            if (mf.gliner_head_safetensors_path) |head_path| {
+                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
+                    return error.ResourceLimitExceeded;
+            }
+            break :blk total;
+        },
+        .safetensors => c_file.fileSize(allocator, mf.safetensors_path.?),
+        .sharded_safetensors => shardedSafetensorsTotalBytes(
+            allocator,
+            mf.safetensors_index_path.?,
+        ),
+    };
+}
+
+/// Keep backend-specific materialization policy behind the session factory.
+/// ModelManager owns admission orchestration, while each backend owns the
+/// physical representation it will create.
+pub fn estimateBackendWeightResidencyBytes(
+    backend: BackendType,
+    encoded_bytes: usize,
+) !usize {
+    return switch (backend) {
+        .cuda => cuda_load_plan.estimateEncodedArtifactDeviceBytes(encoded_bytes),
+        .metal => encoded_bytes,
+        .native, .onnx, .wasm => 0,
+        .pjrt => error.UnsupportedBackend,
+    };
 }
 
 fn glinerBaseWeightKey(full_name: []const u8) []const u8 {
@@ -394,12 +416,34 @@ pub const GgufInspectionReport = struct {
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
-    if (mf.gguf_path == null) return null;
+    if (!mf.usesGgufWeights()) return null;
 
     const arch_config = try detectArchitecture(allocator, model_path, mf);
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     defer store.deinit();
     return try buildGgufInspectionReport(allocator, arch_config, store);
+}
+
+/// Cold-listing inspection reads only GGUF metadata and tensor headers. In
+/// particular, tokenizer vocabulary arrays are skipped rather than allocated.
+pub fn inspectGgufModelForListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    mf: manifest_mod.ModelManifest,
+) !?GgufInspectionReport {
+    if (!mf.usesGgufWeights()) return null;
+    const gguf_path = mf.gguf_path.?;
+    var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
+    defer mapped.deinit();
+
+    var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
+    defer file.deinit(allocator);
+    try gguf_mod.format.validateTensorDataRanges(&file, mapped.data.len);
+    const parsed_prefix_len = std.math.cast(usize, file.data_region_offset) orelse mapped.data.len;
+    mapped.adviseSequentialPrefix(@min(parsed_prefix_len, mapped.data.len));
+
+    const arch_config = try detectArchitectureWithGgufFile(allocator, model_path, mf, &file);
+    return @as(?GgufInspectionReport, try buildGgufInspectionReportFromFile(allocator, arch_config, &file));
 }
 
 /// Create a native CPU session from a model directory.
@@ -417,12 +461,14 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     var arch_config = try detectArchitecture(allocator, model_path, mf);
     // Determine weight prefix for the native backend (strip from source tensor names)
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
-    if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
-        defer {
-            var r = report;
-            r.deinit();
+    if (mf.usesGgufWeights()) {
+        if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
+            defer {
+                var r = report;
+                r.deinit();
+            }
+            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
         }
-        try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
     }
     const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
 
@@ -679,12 +725,14 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
-    if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
-        defer {
-            var r = report;
-            r.deinit();
+    if (mf.usesGgufWeights()) {
+        if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
+            defer {
+                var r = report;
+                r.deinit();
+            }
+            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
         }
-        try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
     }
     const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
 
@@ -1148,11 +1196,14 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
-    if (mf.gguf_path) |_| {
+    if (mf.usesGgufWeights()) {
         var report_opt = try inspectGgufModel(allocator, model_path);
         defer if (report_opt) |*report| report.deinit();
         if (report_opt) |report| {
             try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
+            if (backend_type == .metal) {
+                try ensureMetalGgufInspectionCompatible(report, mf.gguf_path.?);
+            }
         }
     }
 
@@ -1323,6 +1374,15 @@ fn createGpuHostedSessionWithTaskOverride(
 
 /// Detect the model architecture from config.json.
 fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest) !ArchConfig {
+    return detectArchitectureWithGgufFile(allocator, model_path, mf, null);
+}
+
+fn detectArchitectureWithGgufFile(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    mf: manifest_mod.ModelManifest,
+    parsed_gguf: ?*const gguf_mod.format.File,
+) !ArchConfig {
     // Try to read config.json for model_type
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path});
     defer allocator.free(config_path);
@@ -1359,8 +1419,9 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
                 std.mem.eql(u8, model_type, "jina_embeddings_v5"))
             {
                 var cfg = try gpt_mod.parseConfig(allocator, config_bytes);
-                if (mf.gguf_path) |gguf_path| {
-                    if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
+                if (mf.usesGgufWeights()) {
+                    const gguf_path = mf.gguf_path.?;
+                    if (try detectArchitectureFromOptionalGgufFile(allocator, gguf_path, parsed_gguf)) |gguf_config| {
                         switch (gguf_config) {
                             .gpt => |gguf_cfg| overlayGptStructuralConfig(&cfg, gguf_cfg),
                             else => {},
@@ -1387,14 +1448,44 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
         }
     } else |_| {}
 
-    if (mf.gguf_path) |gguf_path| {
-        if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
+    if (mf.usesGgufWeights()) {
+        const gguf_path = mf.gguf_path.?;
+        if (try detectArchitectureFromOptionalGgufFile(allocator, gguf_path, parsed_gguf)) |gguf_config| {
             return gguf_config;
         }
     }
 
     // Default: BERT
     return .{ .bert = makeBertConfig(mf) };
+}
+
+fn detectArchitectureFromOptionalGgufFile(
+    allocator: std.mem.Allocator,
+    gguf_path: []const u8,
+    parsed_gguf: ?*const gguf_mod.format.File,
+) !?ArchConfig {
+    if (parsed_gguf) |file| return detectArchitectureFromGgufFile(file);
+    return detectArchitectureFromGguf(allocator, gguf_path);
+}
+
+test "architecture detection ignores an unselected colocated GGUF" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+        // If architecture detection attempts to inspect this optional export,
+        // the deliberately missing path makes the regression fail immediately.
+        .gguf_path = try allocator.dupe(u8, "missing-export.gguf"),
+    };
+    defer manifest.deinit();
+
+    const detected = try detectArchitectureWithGgufFile(
+        allocator,
+        "missing-model-directory",
+        manifest,
+        null,
+    );
+    try std.testing.expect(detected == .bert);
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
@@ -1425,13 +1516,24 @@ fn detectArchitectureFromGguf(allocator: std.mem.Allocator, gguf_path: []const u
     defer store.tensorStore().deinit();
 
     const file = store.tensorStore().ggufFile() orelse return null;
+    const detected = (try detectArchitectureFromGgufFile(file)) orelse return null;
+    return switch (detected) {
+        .gpt => |cfg| blk: {
+            var refined = cfg;
+            if (store.mmap_region) |region| {
+                refineRopeDimFromFreqs(&refined, file, region.data);
+            }
+            break :blk .{ .gpt = refined };
+        },
+        else => detected,
+    };
+}
+
+fn detectArchitectureFromGgufFile(file: *const gguf_mod.format.File) !?ArchConfig {
     const meta = gguf_mod.metadata.View.init(file);
     if (gpt_mod.parseGgufMetadata(meta)) |cfg| {
         var refined = cfg;
         refineGptConfigFromGgufFile(&refined, file);
-        if (store.mmap_region) |region| {
-            refineRopeDimFromFreqs(&refined, file, region.data);
-        }
         return .{ .gpt = refined };
     }
     if (bert.parseGgufMetadata(meta)) |cfg| {
@@ -1548,7 +1650,12 @@ fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) v
     if (source.num_kv_shared_layers > 0) target.num_kv_shared_layers = source.num_kv_shared_layers;
     if (source.global_head_dim > 0) target.global_head_dim = source.global_head_dim;
     if (source.num_global_key_value_heads > 0) target.num_global_key_value_heads = source.num_global_key_value_heads;
-    if (source.shared_layer_intermediate_size > 0) target.shared_layer_intermediate_size = source.shared_layer_intermediate_size;
+    // A scalar GGUF feed_forward_length means every layer uses the same size.
+    // Keep zero authoritative here: HF Gemma 4 config.json derives a doubled
+    // shared-tail size, but some valid GGUF conversions store uniform 10240-wide
+    // FFNs. Retaining the sidecar's 20480 makes quant kernels read past the
+    // 10240-wide weight and can crash the Metal backend.
+    target.shared_layer_intermediate_size = source.shared_layer_intermediate_size;
     if (source.sliding_window_pattern != 6) target.sliding_window_pattern = source.sliding_window_pattern;
     if (source.rope_local_theta != 10000.0 or target.rope_local_theta == 10000.0) {
         target.rope_local_theta = source.rope_local_theta;
@@ -1557,6 +1664,22 @@ fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) v
     if (source.ple_hidden_size > 0) target.ple_hidden_size = source.ple_hidden_size;
     // RoPE dim override from rope_freqs.weight tensor.
     if (source.rope_dim_override > 0) target.rope_dim_override = source.rope_dim_override;
+
+    // Fields below describe the GGUF artifact itself rather than a preference, so the
+    // GGUF-derived value wins over config.json. `source` is always a fully GGUF-derived
+    // config here; the alternative is silently running weights under a description that
+    // does not match them.
+    //
+    // weight_tying is set by observing whether the file carries a separate output.weight.
+    // Gemma 3 GGUFs have no output.weight, and their config.json omits tie_word_embeddings,
+    // so without this the runtime looks for a lm_head.weight that does not exist.
+    target.weight_tying = source.weight_tying;
+    // rope_partial_factor is derived from rope.dimension_count against the head dim, which
+    // is how llama.cpp reads the same file. unsloth's Gemma 4 config.json claims 0.25 while
+    // its GGUF declares full-width rotation, and honoring config.json produced empty output.
+    target.rope_partial_factor = source.rope_partial_factor;
+    // Softcapping is often absent from GGUF metadata, so only a positive value is authoritative.
+    if (source.final_logit_softcapping != 0.0) target.final_logit_softcapping = source.final_logit_softcapping;
 }
 
 pub fn refineGptConfigFromGgufTensorInfo(config: *gpt_mod.Config, file: *const gguf_mod.format.File) void {
@@ -1657,6 +1780,14 @@ fn buildGgufInspectionReport(
 ) !?GgufInspectionReport {
     if (store.kind() != .gguf) return null;
     const file = store.ggufFile() orelse return null;
+    return @as(?GgufInspectionReport, try buildGgufInspectionReportFromFile(allocator, arch_config, file));
+}
+
+fn buildGgufInspectionReportFromFile(
+    allocator: std.mem.Allocator,
+    arch_config: ArchConfig,
+    file: *const gguf_mod.format.File,
+) !GgufInspectionReport {
     const meta = gguf_mod.metadata.View.init(file);
     const architecture = try allocator.dupe(u8, meta.getString("general.architecture") orelse "unknown");
 
@@ -1664,7 +1795,7 @@ fn buildGgufInspectionReport(
         .allocator = allocator,
         .architecture = architecture,
         .tensor_count = file.tensors.len,
-        .metadata_count = file.metadata.len,
+        .metadata_count = std.math.cast(usize, file.header.metadata_count) orelse file.metadata.len,
         .gpt_config = switch (arch_config) {
             .gpt => |cfg| cfg,
             else => null,
@@ -2122,11 +2253,34 @@ fn tensorTypeSupported(tensor_type: gguf_mod.tensor_types.TensorType) bool {
             .TL1,
             .IQ4_NL,
             .IQ4_XS,
+            // Integer index tables rather than weights. DeepSeek V4 stores its hash-MoE
+            // token-to-expert routing (ffn_gate_tid2eid) as I32, and quant_codec already
+            // materializes it via materializePassthrough; only this gate was missing, so
+            // inspection rejected the file before the runtime ever saw it.
+            .I32,
             => true,
             else => false,
         },
         .bitnet_tl2 => true,
         .unknown => false,
+    };
+}
+
+/// Whether a backend can consume a tensor encoding after the generic GGUF
+/// loader has decoded or retained it. Companion-artifact preflight uses this
+/// same gate as whole-model inspection so admission and runtime cannot diverge.
+pub fn ggufTensorTypeSupportsBackend(
+    tensor_type: gguf_mod.tensor_types.TensorType,
+    backend: BackendType,
+) bool {
+    if (!tensorTypeSupported(tensor_type)) return false;
+    return switch (backend) {
+        .metal => if (comptime build_options.enable_metal)
+            metal_runtime.isMetalNativeSupported(tensor_type)
+        else
+            true,
+        .native, .cuda, .onnx, .wasm => true,
+        .pjrt => false,
     };
 }
 
@@ -2149,6 +2303,35 @@ fn ensureGgufInspectionCompatible(report: GgufInspectionReport, gguf_path: []con
         }
         return error.MissingRequiredWeights;
     }
+}
+
+fn ensureMetalGgufInspectionCompatible(report: GgufInspectionReport, gguf_path: []const u8) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (metalGgufIncompatibleTensorType(report)) |entry| {
+        std.log.err(
+            "GGUF {s} uses {d} {s} tensors that are not release-safe on Metal; rejecting Metal backend",
+            .{ gguf_path, entry.count, entry.tensor_type.name() },
+        );
+        return error.UnsupportedQuantFormatForMetalOnly;
+    }
+}
+
+fn metalGgufIncompatibleTensorType(report: GgufInspectionReport) ?UnsupportedTensorTypeCount {
+    if (comptime !build_options.enable_metal) return null;
+    for (report.all_tensor_types) |entry| {
+        if (!metal_runtime.isMetalNativeSupported(entry.tensor_type)) return entry;
+    }
+    return null;
+}
+
+pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: BackendType) bool {
+    if (report.unsupported_tensor_types.len > 0 or report.missing_required_tensors.len > 0)
+        return false;
+    return switch (backend) {
+        .metal => metalGgufIncompatibleTensorType(report) == null,
+        .native, .cuda, .onnx, .wasm => true,
+        .pjrt => false,
+    };
 }
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
@@ -2270,10 +2453,7 @@ fn leadingTensorDim(
 }
 
 fn normalizeGgufGptWeightKey(config: gpt_mod.Config, key: []const u8, buf: *[256]u8) ?[]const u8 {
-    switch (config.family) {
-        .llama, .mistral, .qwen2, .gemma, .bitnet, .phi, .deepseek_v4 => {},
-        else => return null,
-    }
+    if (!gpt_mod.ggufWeightMappingSupported(config.family)) return null;
 
     if (std.mem.eql(u8, key, "token_embd.weight")) return "model.embed_tokens.weight";
     if (std.mem.eql(u8, key, "output_norm.weight")) return "model.norm.weight";
@@ -3045,7 +3225,7 @@ fn shouldUseLargeGpuHostedLazyQuantBudgets(
     quant_mode: GpuHostedQuantExecutionMode,
     eager_dense: bool,
 ) bool {
-    return manifest.gguf_path != null and
+    return manifest.usesGgufWeights() and
         !eager_dense and
         quant_mode == .device_native and
         model_weight_bytes > gpuHostedEagerDenseMaxBytes();
@@ -5647,6 +5827,117 @@ test "overlay gpt structural config keeps gguf gemma norm offset" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), target.norm_weight_offset, 1e-6);
 }
 
+test "overlay gpt structural config takes weight tying from gguf" {
+    // Gemma 3 config.json omits tie_word_embeddings, so the HF-derived config says false
+    // while the GGUF (which has no output.weight tensor) says true. Honoring config.json
+    // sent the runtime looking for a lm_head.weight that is not in the file.
+    var target: gpt_mod.Config = .{ .family = .gemma, .weight_tying = false };
+    const source: gpt_mod.Config = .{ .family = .gemma, .weight_tying = true };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expect(target.weight_tying);
+}
+
+test "overlay gpt structural config takes rope partial factor from gguf" {
+    // unsloth's Gemma 4 config.json claims partial_rotary_factor 0.25 while its GGUF
+    // declares rope.dimension_count equal to the head dim (full rotation). Following
+    // config.json produced empty completions from an otherwise-identical artifact.
+    var target: gpt_mod.Config = .{ .family = .gemma, .rope_partial_factor = 0.25 };
+    const source: gpt_mod.Config = .{ .family = .gemma, .rope_partial_factor = 1.0 };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), target.rope_partial_factor, 1e-6);
+}
+
+test "overlay gpt structural config clears sidecar-only shared tail ffn size" {
+    var target: gpt_mod.Config = .{
+        .family = .gemma,
+        .intermediate_size = 10240,
+        .shared_layer_intermediate_size = 20480,
+    };
+    const source: gpt_mod.Config = .{
+        .family = .gemma,
+        .intermediate_size = 10240,
+        .shared_layer_intermediate_size = 0,
+    };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expectEqual(@as(u32, 0), target.shared_layer_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 10240), target.intermediateSize(41));
+}
+
+test "metal gguf preflight rejects release-unsafe iq4 xs tensors" {
+    var tensor_types = [_]UnsupportedTensorTypeCount{
+        .{ .tensor_type = .{ .known = .IQ4_XS }, .count = 15 },
+    };
+    const report = GgufInspectionReport{
+        .allocator = std.testing.allocator,
+        .architecture = "gemma4",
+        .tensor_count = 15,
+        .metadata_count = 0,
+        .all_tensor_types = tensor_types[0..],
+    };
+
+    if (comptime build_options.enable_metal) {
+        const incompatible = metalGgufIncompatibleTensorType(report) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(gguf_mod.tensor_types.KnownTensorType.IQ4_XS, incompatible.tensor_type.known);
+        try std.testing.expectEqual(@as(usize, 15), incompatible.count);
+    } else try std.testing.expect(metalGgufIncompatibleTensorType(report) == null);
+}
+
+test "overlay gpt structural config keeps config softcapping when gguf omits it" {
+    var target: gpt_mod.Config = .{ .family = .gemma, .final_logit_softcapping = 30.0 };
+    const source: gpt_mod.Config = .{ .family = .gemma, .final_logit_softcapping = 0.0 };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0), target.final_logit_softcapping, 1e-6);
+}
+
+test "qwen3 gguf weights normalize onto hf names" {
+    var buf: [256]u8 = undefined;
+    const config = gpt_mod.Config{ .family = .qwen3 };
+
+    try std.testing.expectEqualStrings(
+        "model.layers.7.self_attn.q_norm.weight",
+        normalizeGgufGptWeightKey(config, "blk.7.attn_q_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "model.layers.7.self_attn.k_norm.weight",
+        normalizeGgufGptWeightKey(config, "blk.7.attn_k_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "model.layers.0.self_attn.q_proj.weight",
+        normalizeGgufGptWeightKey(config, "blk.0.attn_q.weight", &buf).?,
+    );
+    // Qwen3 has no qkv bias, so ffn_norm must land on post_attention_layernorm rather
+    // than the Gemma-style pre_feedforward_layernorm.
+    try std.testing.expectEqualStrings(
+        "model.layers.0.post_attention_layernorm.weight",
+        normalizeGgufGptWeightKey(config, "blk.0.ffn_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "model.embed_tokens.weight",
+        normalizeGgufGptWeightKey(config, "token_embd.weight", &buf).?,
+    );
+}
+
+test "qwen3_5 gguf weights are not claimed as mappable" {
+    // qwen3_5 carries ssm_*/attn_qkv/attn_gate tensors with no mapping to the
+    // linear-attention runtime. Claiming support would fail late with a wall of
+    // missing tensors instead of a clear unsupported-architecture error.
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(!gpt_mod.ggufWeightMappingSupported(.qwen3_5));
+    try std.testing.expect(normalizeGgufGptWeightKey(
+        .{ .family = .qwen3_5 },
+        "blk.0.attn_q.weight",
+        &buf,
+    ) == null);
+}
+
 test "mistral gguf ffn norm maps to post-attention layernorm" {
     var buf: [256]u8 = undefined;
     const mapped = normalizeGgufGptWeightKey(.{
@@ -6193,4 +6484,43 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
 
     const llama_cfg: gpt_mod.Config = .{ .family = .llama };
     try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
+}
+
+test "serving policy does not disable existing gguf weight mappings" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.layers.3.self_attn.q_proj.weight",
+        normalizeGgufGptWeightKey(.{ .family = .mistral }, "blk.3.attn_q.weight", &buf).?,
+    );
+    try std.testing.expect(normalizeGgufGptWeightKey(
+        .{ .family = .falcon },
+        "blk.3.attn_q.weight",
+        &buf,
+    ) == null);
+}
+
+test "deepseek v4 gguf architecture name is recognized" {
+    // llama.cpp writes "deepseek4", not any of the HF config.json spellings. Without
+    // this the whole deepseek_v4 implementation is unreachable from GGUF.
+    try std.testing.expectEqual(gpt_mod.ModelFamily.deepseek_v4, gpt_mod.detectFamily("deepseek4"));
+    try std.testing.expect(gpt_mod.isGenerativeModel("deepseek4"));
+}
+
+test "i32 index tables pass gguf tensor type inspection" {
+    // DeepSeek V4 stores hash-MoE routing tables as I32. They are indices, not weights,
+    // and quant_codec materializes them; inspection must not reject the file.
+    try std.testing.expect(tensorTypeSupported(.{ .known = .I32 }));
+}
+
+test "unsupported families keep their gguf weight mapping" {
+    // The mapping predicate is independent of the support tier. deepseek_v4 is blocked
+    // for generation but its tensor names must still resolve, both because its mapping
+    // tests depend on them and because blocking a family should not silently change what
+    // the loader can parse.
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(gpt_mod.ggufWeightMappingSupported(.deepseek_v4));
+    try std.testing.expectEqualStrings(
+        "model.layers.0.self_attn.q_a_proj.weight",
+        normalizeGgufGptWeightKey(.{ .family = .deepseek_v4 }, "blk.0.attn_q_a.weight", &buf).?,
+    );
 }

@@ -2076,6 +2076,81 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
     return MetalTensor.owned(output, &shape);
 }
 
+pub fn decoderRuntimeApplyAttentionF32DeviceBatched(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!request.q.isDevice() or !request.k.isDevice() or !request.v.isDevice()) return null;
+    if (request.batch == 0 or request.q_len == 0 or request.kv_len == 0 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return null;
+    if (request.num_heads % request.num_kv_heads != 0) return null;
+
+    const attention_width = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    const kv_width = std.math.mul(usize, request.num_kv_heads, request.head_dim) catch return null;
+    const q_rows = std.math.mul(usize, request.batch, request.q_len) catch return null;
+    const kv_rows = std.math.mul(usize, request.batch, request.kv_len) catch return null;
+    const q_elem_count = std.math.mul(usize, q_rows, attention_width) catch return null;
+    const kv_elem_count = std.math.mul(usize, kv_rows, kv_width) catch return null;
+    if (request.q.elemCount() != q_elem_count) return null;
+    if (request.k.elemCount() != kv_elem_count) return null;
+    if (request.v.elemCount() != kv_elem_count) return null;
+
+    const max_i32_usize = @as(usize, @intCast(std.math.maxInt(i32)));
+    if (q_rows > max_i32_usize or attention_width > max_i32_usize) return null;
+    const max_u32_usize = @as(usize, @intCast(std.math.maxInt(u32)));
+    const total_sequence_len: usize = if (@hasField(@TypeOf(request), "total_sequence_len")) request.total_sequence_len else std.math.add(usize, request.query_position_offset, request.q_len) catch return null;
+    if (q_elem_count > max_u32_usize or
+        kv_elem_count > max_u32_usize or
+        request.batch > max_u32_usize or
+        request.q_len > max_u32_usize or
+        request.kv_len > max_u32_usize or
+        request.num_heads > max_u32_usize or
+        request.num_kv_heads > max_u32_usize or
+        request.head_dim > max_u32_usize or
+        request.query_position_offset > max_u32_usize or
+        request.kv_position_offset > max_u32_usize or
+        request.sliding_window > max_u32_usize or
+        total_sequence_len > max_u32_usize)
+    {
+        return null;
+    }
+
+    const shape = [_]i32{ @intCast(q_rows), @intCast(attention_width) };
+    const output_byte_len = std.math.mul(usize, q_elem_count, @sizeOf(f32)) catch return null;
+    var output = try MetalTensor.deviceAllocate(
+        runtime,
+        output_byte_len,
+        .private,
+        &shape,
+    );
+    errdefer output.deinit();
+
+    const rc = termite_metal_decode_runtime_apply_attention_f32_device_batched(
+        runtime,
+        request.q.deviceHandle(),
+        request.q.deviceByteOffset(),
+        request.k.deviceHandle(),
+        request.k.deviceByteOffset(),
+        request.v.deviceHandle(),
+        request.v.deviceByteOffset(),
+        request.batch,
+        request.q_len,
+        request.kv_len,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        total_sequence_len,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
+}
+
 pub fn decoderRuntimeApplyPagedKvAttentionSlot(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     return decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime, request);
@@ -4140,6 +4215,17 @@ pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, ki
     return output_device;
 }
 
+fn metalSdpaRuntimeSucceeded(rc: c_int) !bool {
+    if (rc == -18) return error.MetalSdpaThreadgroupRequired;
+    return rc == 0;
+}
+
+test "metal runtime SDPA required threadgroup failure does not fall back" {
+    try std.testing.expect(try metalSdpaRuntimeSucceeded(0));
+    try std.testing.expect(!(try metalSdpaRuntimeSucceeded(-1)));
+    try std.testing.expectError(error.MetalSdpaThreadgroupRequired, metalSdpaRuntimeSucceeded(-18));
+}
+
 pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -4204,7 +4290,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (!try metalSdpaRuntimeSucceeded(rc)) return null;
     return output_device;
 }
 
@@ -7422,6 +7508,27 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_device(
     bias_offset: usize,
     bias_host: [*c]const f32,
     mask: [*c]const u8,
+    total_sequence_len: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_attention_f32_device_batched(
+    runtime: ?*RawMetalDecodeRuntime,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    batch: usize,
+    q_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    sliding_window: usize,
     total_sequence_len: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
@@ -10834,7 +10941,12 @@ pub fn isMetalNativeSupported(tensor_type: gguf_tensor_types.TensorType) bool {
             .F32, .F16, .BF16 => true,
             .Q1_0, .Q4_0, .Q4_1, .Q5_0, .Q5_1, .Q8_0, .Q8_1, .Q2_K, .Q3_K, .Q4_K, .Q5_K, .Q6_K, .Q8_K => true,
             .I8_S => true,
-            .IQ4_NL, .IQ4_XS => true,
+            .IQ4_NL => true,
+            // The current IQ4_XS Metal paths (including the reference dequantize +
+            // SGEMM path) produce incorrect logits for a real Gemma 4
+            // UD-Q4_K_XL artifact. Fail closed so automatic backend selection can
+            // fall back to the native implementation instead of returning token soup.
+            .IQ4_XS => false,
             .MXFP4, .NVFP4, .IQ2_XS => true,
             .I2_S, .TL1 => true,
             else => false,
@@ -18099,7 +18211,6 @@ test "metal native quant support map matches direct runtime slot coverage" {
         .{ .known = .Q8_1 },
         .{ .known = .Q8_K },
         .{ .known = .IQ4_NL },
-        .{ .known = .IQ4_XS },
         .{ .known = .MXFP4 },
         .{ .known = .NVFP4 },
         .{ .known = .IQ2_XS },
@@ -18111,6 +18222,7 @@ test "metal native quant support map matches direct runtime slot coverage" {
     }
 
     const unsupported = [_]gguf_tensor_types.TensorType{
+        .{ .known = .IQ4_XS },
         .{ .known = .TQ1_0 },
         .{ .unknown = 0xffff },
     };

@@ -50,22 +50,32 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator) HttpxTransport {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+    fn init(alloc: Allocator, shared_io: ?std.Io) !HttpxTransport {
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = httpx.Client.init(alloc, io_impl.io()),
+            .client = httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
         };
     }
 
     fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
-        self.io_impl.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -98,6 +108,20 @@ const HttpxTransport = struct {
         };
     }
 };
+
+test "google auth transport borrows a shared io runtime" {
+    const alloc = std.testing.allocator;
+    var shared = std.Io.Threaded.init(alloc, .{});
+    defer shared.deinit();
+    var transport = try HttpxTransport.init(alloc, shared.io());
+    defer transport.deinit();
+    try std.testing.expect(transport.io_impl == null);
+
+    var fallback = try HttpxTransport.init(alloc, null);
+    defer fallback.deinit();
+    try std.testing.expect(fallback.io_impl != null);
+    try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
+}
 
 pub const ServiceAccount = struct {
     project_id: ?[]u8 = null,
@@ -133,18 +157,25 @@ pub const CachedTokenSource = struct {
     request_ctx: ?*anyopaque,
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
+    io: ?std.Io,
+    mutex: std.Io.Mutex = .init,
     cached_token: ?AccessToken = null,
 
     pub fn init(alloc: Allocator, cfg: Config) !CachedTokenSource {
+        return try initWithIo(alloc, cfg, null);
+    }
+
+    pub fn initWithIo(alloc: Allocator, cfg: Config, shared_io: ?std.Io) !CachedTokenSource {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc);
+        transport.* = try HttpxTransport.init(alloc, shared_io);
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .request_ctx = transport,
             .request_fn = HttpxTransport.request,
             .owned_httpx = transport,
+            .io = transport.client.io,
         };
     }
 
@@ -160,6 +191,7 @@ pub const CachedTokenSource = struct {
             .request_ctx = request_ctx,
             .request_fn = request_fn,
             .owned_httpx = null,
+            .io = null,
         };
     }
 
@@ -180,12 +212,27 @@ pub const CachedTokenSource = struct {
     }
 
     pub fn accessTokenAlloc(self: *CachedTokenSource, alloc: Allocator) ![]u8 {
+        const io = self.io;
+        if (io) |runtime_io| self.mutex.lockUncancelable(runtime_io);
+        defer if (io) |runtime_io| self.mutex.unlock(runtime_io);
+        return try self.accessTokenAllocLocked(alloc);
+    }
+
+    fn accessTokenAllocLocked(self: *CachedTokenSource, alloc: Allocator) ![]u8 {
         const now = nowSeconds();
+        var unexpired_fallback: ?[]const u8 = null;
         if (self.cached_token) |token| {
             if (token.expires_at_s > now + 30) return try alloc.dupe(u8, token.value);
+            if (token.expires_at_s > now) unexpired_fallback = token.value;
         }
 
-        var minted = try self.mintTokenAlloc(self.alloc, now);
+        var minted = self.mintTokenAlloc(self.alloc, now) catch |err| {
+            // A proactive refresh failure must not turn a still-valid token
+            // into an outage. Once expired, fail closed and surface the auth
+            // provider error.
+            if (unexpired_fallback) |token| return try alloc.dupe(u8, token);
+            return err;
+        };
         errdefer minted.deinit(self.alloc);
 
         if (self.cached_token) |*existing| existing.deinit(self.alloc);
@@ -277,9 +324,14 @@ pub fn parseServiceAccountJsonAlloc(alloc: Allocator, raw: []const u8) !ServiceA
 }
 
 pub fn serviceAccountFromFileAlloc(alloc: Allocator, path: []const u8) !ServiceAccount {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(std.math.maxInt(usize)));
+    return try serviceAccountFromFileAllocWithIo(alloc, path, null);
+}
+
+pub fn serviceAccountFromFileAllocWithIo(alloc: Allocator, path: []const u8, shared_io: ?std.Io) !ServiceAccount {
+    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = shared_io orelse io_impl.?.io();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(std.math.maxInt(usize)));
     defer alloc.free(raw);
     return try parseServiceAccountJsonAlloc(alloc, raw);
 }
@@ -510,6 +562,7 @@ test "google auth token source exchanges and caches access token" {
 
     const State = struct {
         calls: usize = 0,
+        fail: bool = false,
 
         fn request(
             ptr: ?*anyopaque,
@@ -522,6 +575,7 @@ test "google auth token source exchanges and caches access token" {
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
+            if (self.fail) return error.TokenEndpointUnavailable;
             try std.testing.expectEqual(HttpMethod.POST, method);
             try std.testing.expectEqualStrings("https://oauth2.googleapis.com/token", url);
             try std.testing.expectEqualStrings("application/x-www-form-urlencoded", content_type.?);
@@ -539,15 +593,48 @@ test "google auth token source exchanges and caches access token" {
     var state = State{};
     var source = CachedTokenSource.initWithRequestFn(alloc, cfg, &state, State.request);
     defer source.deinit();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    source.io = io_impl.io();
 
-    const auth_value_1 = try source.authorizationValueAlloc(alloc);
-    defer alloc.free(auth_value_1);
-    try std.testing.expectEqualStrings("Bearer token-123", auth_value_1);
+    const Job = struct {
+        source: *CachedTokenSource,
+        alloc: Allocator,
+        value: ?[]u8 = null,
+        err: ?anyerror = null,
 
-    const auth_value_2 = try source.authorizationValueAlloc(alloc);
-    defer alloc.free(auth_value_2);
-    try std.testing.expectEqualStrings("Bearer token-123", auth_value_2);
+        fn run(job: *@This()) std.Io.Cancelable!void {
+            job.value = job.source.authorizationValueAlloc(job.alloc) catch |err| {
+                job.err = err;
+                return;
+            };
+        }
+    };
+    var jobs: [8]Job = undefined;
+    var group: std.Io.Group = .init;
+    for (&jobs) |*job| {
+        job.* = .{ .source = &source, .alloc = alloc };
+        try group.concurrent(io_impl.io(), Job.run, .{job});
+    }
+    try group.await(io_impl.io());
+    for (&jobs) |*job| {
+        if (job.err) |err| return err;
+        const value = job.value.?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("Bearer token-123", value);
+    }
     try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+    source.cached_token.?.expires_at_s = nowSeconds() + 10;
+    state.fail = true;
+    const fallback = try source.authorizationValueAlloc(alloc);
+    defer alloc.free(fallback);
+    try std.testing.expectEqualStrings("Bearer token-123", fallback);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+    source.cached_token.?.expires_at_s = 0;
+    try std.testing.expectError(error.TokenEndpointUnavailable, source.authorizationValueAlloc(alloc));
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8) !void {

@@ -52,6 +52,11 @@ def _parse_response(
 
         return response_404
 
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -81,6 +86,9 @@ def sync_detailed(
     body: BackupRequest,
 ) -> Response[BackupTableResponse201 | Error]:
     """Backup a table
+
+     Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
+    existing backup.
 
     Args:
         table_name (str):
@@ -114,6 +122,9 @@ def sync(
 ) -> BackupTableResponse201 | Error | None:
     """Backup a table
 
+     Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
+    existing backup.
+
     Args:
         table_name (str):
         body (BackupRequest):
@@ -140,6 +151,9 @@ async def asyncio_detailed(
     body: BackupRequest,
 ) -> Response[BackupTableResponse201 | Error]:
     """Backup a table
+
+     Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
+    existing backup.
 
     Args:
         table_name (str):
@@ -170,6 +184,9 @@ async def asyncio(
     body: BackupRequest,
 ) -> BackupTableResponse201 | Error | None:
     """Backup a table
+
+     Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
+    existing backup.
 
     Args:
         table_name (str):

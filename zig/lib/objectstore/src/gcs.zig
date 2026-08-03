@@ -22,6 +22,11 @@ const s3 = @import("s3.zig");
 const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
+const resumable_upload_threshold: u64 = 64 * 1024 * 1024;
+const resumable_upload_min_chunk_bytes: u64 = 16 * 1024 * 1024;
+const resumable_upload_max_chunk_bytes: u64 = 512 * 1024 * 1024;
+const resumable_upload_chunk_alignment: u64 = 256 * 1024;
+const resumable_upload_target_chunks: u64 = 10_000;
 
 pub const Transport = enum {
     s3_compatible,
@@ -60,6 +65,12 @@ pub const JsonApiConfig = struct {
     upload_endpoint: []u8,
     project_id: ?[]u8 = null,
     auth: Auth = .none,
+    /// Optional end-to-end HTTP deadline. Object transfers leave this unset;
+    /// control-plane probes set a bounded deadline explicitly.
+    request_timeout_ms: ?u64 = null,
+    /// Optional borrowed application runtime. When absent, the client owns a
+    /// threaded fallback for standalone library use.
+    io: ?std.Io = null,
 
     pub fn deinit(self: *JsonApiConfig, alloc: Allocator) void {
         alloc.free(self.endpoint);
@@ -87,12 +98,14 @@ pub const Config = struct {
 pub const HttpMethod = enum {
     GET,
     POST,
+    PUT,
     DELETE,
 
     fn toHttpx(self: HttpMethod) httpx.Method {
         return switch (self) {
             .GET => .GET,
             .POST => .POST,
+            .PUT => .PUT,
             .DELETE => .DELETE,
         };
     }
@@ -105,35 +118,55 @@ pub const TransportResponse = struct {
     body: []u8,
     etag: ?[]u8 = null,
     content_type: ?[]u8 = null,
+    location: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
         alloc.free(self.body);
         if (self.etag) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
+        if (self.location) |value| alloc.free(value);
         self.* = undefined;
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8) anyerror!TransportResponse;
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator) HttpxTransport {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+    fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = httpx.Client.init(alloc, io_impl.io()),
+            .client = if (request_timeout_ms) |timeout_ms|
+                httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
+                    .connect_ms = timeout_ms,
+                    .read_ms = timeout_ms,
+                    .write_ms = timeout_ms,
+                    .request_ms = timeout_ms,
+                } })
+            else
+                httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
         };
     }
 
     fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
-        self.io_impl.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -145,6 +178,7 @@ const HttpxTransport = struct {
         headers: []const HeaderPair,
         body: ?[]const u8,
         content_type: ?[]const u8,
+        max_response_size: ?usize,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
 
@@ -158,6 +192,7 @@ const HttpxTransport = struct {
         var response = try self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
+            .max_response_size = max_response_size,
         });
         defer response.deinit();
 
@@ -166,9 +201,24 @@ const HttpxTransport = struct {
             .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
             .etag = if (response.headers.get("ETag")) |value| try alloc.dupe(u8, value) else null,
             .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
+            .location = if (response.headers.get("Location")) |value| try alloc.dupe(u8, value) else null,
         };
     }
 };
+
+test "gcs http transport borrows a shared io runtime" {
+    const alloc = std.testing.allocator;
+    var shared = std.Io.Threaded.init(alloc, .{});
+    defer shared.deinit();
+    var transport = try HttpxTransport.init(alloc, null, shared.io());
+    defer transport.deinit();
+    try std.testing.expect(transport.io_impl == null);
+
+    var fallback = try HttpxTransport.init(alloc, null, null);
+    defer fallback.deinit();
+    try std.testing.expect(fallback.io_impl != null);
+    try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
+}
 
 pub const JsonApiClient = struct {
     alloc: Allocator,
@@ -180,7 +230,7 @@ pub const JsonApiClient = struct {
     pub fn init(alloc: Allocator, cfg: JsonApiConfig) !JsonApiClient {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc);
+        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -284,6 +334,106 @@ pub const JsonApiClient = struct {
         };
     }
 
+    fn putFile(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+    ) !types.PutResult {
+        return try self.putFileWithThreshold(alloc, io, bucket, key, src_path, opts, resumable_upload_threshold);
+    }
+
+    fn putFileWithThreshold(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+        resumable_threshold: u64,
+    ) !types.PutResult {
+        const source = try openFilePath(io, src_path);
+        defer source.close(io);
+        const stat = try source.stat(io);
+        if (stat.size <= resumable_threshold) {
+            const body = try alloc.alloc(u8, @intCast(stat.size));
+            defer alloc.free(body);
+            if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+            var extra: [1]u8 = undefined;
+            if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            return try self.putObject(alloc, bucket, key, body, opts);
+        }
+        if (opts.if_match_etag != null) return error.ConditionalResumableUploadUnsupported;
+        const required_chunk_bytes = ((stat.size - 1) / resumable_upload_target_chunks) + 1;
+        const aligned_chunk_bytes = std.mem.alignForward(u64, required_chunk_bytes, resumable_upload_chunk_alignment);
+        const chunk_bytes = @max(resumable_upload_min_chunk_bytes, aligned_chunk_bytes);
+        if (chunk_bytes > resumable_upload_max_chunk_bytes) return error.ObjectTooLarge;
+
+        const initiate_url = try uploadResumableUrlAlloc(alloc, self.cfg, bucket, key, opts);
+        defer alloc.free(initiate_url);
+        const size_text = try std.fmt.allocPrint(alloc, "{d}", .{stat.size});
+        defer alloc.free(size_text);
+        const upload_type = opts.content_type orelse "application/octet-stream";
+        const initiate_headers = [_]HeaderPair{
+            .{ "X-Upload-Content-Length", size_text },
+            .{ "X-Upload-Content-Type", upload_type },
+        };
+        var initiated = try self.perform(.POST, initiate_url, &initiate_headers, "{}", "application/json");
+        defer initiated.deinit(alloc);
+        if (initiated.status != 200 and initiated.status != 201) return mapUnexpectedStatus(initiated.status);
+        const session_url = initiated.location orelse return error.MissingResumableUploadLocation;
+
+        var completed = false;
+        defer if (!completed) self.cancelResumableUpload(session_url) catch {};
+        const buffer = try alloc.alloc(u8, @intCast(chunk_bytes));
+        defer alloc.free(buffer);
+        var offset: u64 = 0;
+        var final_response: ?TransportResponse = null;
+        defer if (final_response) |*response| response.deinit(alloc);
+        while (offset < stat.size) {
+            const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
+            if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            const last = offset + wanted - 1;
+            const content_range = try std.fmt.allocPrint(alloc, "bytes {d}-{d}/{d}", .{ offset, last, stat.size });
+            defer alloc.free(content_range);
+            const headers = [_]HeaderPair{.{ "Content-Range", content_range }};
+            var response = try self.perform(.PUT, session_url, &headers, buffer[0..wanted], upload_type);
+            if (offset + wanted < stat.size) {
+                defer response.deinit(alloc);
+                if (response.status != 308) return mapUnexpectedStatus(response.status);
+            } else {
+                if (response.status != 200 and response.status != 201) {
+                    defer response.deinit(alloc);
+                    return mapUnexpectedStatus(response.status);
+                }
+                final_response = response;
+            }
+            offset += wanted;
+        }
+        var extra: [1]u8 = undefined;
+        if (try source.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
+        const response = &final_response.?;
+        var metadata = try parseObjectMetadataResponse(alloc, bucket, response.body);
+        defer metadata.deinit(alloc);
+        completed = true;
+        return .{ .etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null };
+    }
+
+    fn cancelResumableUpload(self: *JsonApiClient, session_url: []const u8) !void {
+        var response = try self.perform(.DELETE, session_url, &.{}, null, null);
+        defer response.deinit(self.alloc);
+        if (response.status != 200 and response.status != 204 and response.status != 404 and response.status != 499)
+            return mapUnexpectedStatus(response.status);
+    }
+
     fn getObject(
         self: *JsonApiClient,
         alloc: Allocator,
@@ -295,7 +445,16 @@ pub const JsonApiClient = struct {
             if (part_number != 1) return error.InvalidPartNumber;
         }
 
-        var meta = try self.statObject(alloc, bucket, key);
+        var meta = if (opts.skip_metadata_probe) blk: {
+            const owned_bucket = try alloc.dupe(u8, bucket);
+            errdefer alloc.free(owned_bucket);
+            const owned_key = try alloc.dupe(u8, key);
+            break :blk types.ObjectMetadata{
+                .bucket = owned_bucket,
+                .key = owned_key,
+                .content_length = 0,
+            };
+        } else try self.statObject(alloc, bucket, key);
         errdefer meta.deinit(alloc);
 
         const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, opts.version_id);
@@ -315,7 +474,14 @@ pub const JsonApiClient = struct {
             }
         }
 
-        var response = try self.perform(.GET, url, headers.items, null, null);
+        var response = try self.performWithResponseLimit(
+            .GET,
+            url,
+            headers.items,
+            null,
+            null,
+            opts.max_response_bytes,
+        );
         errdefer response.deinit(alloc);
 
         switch (response.status) {
@@ -327,6 +493,9 @@ pub const JsonApiClient = struct {
         }
 
         meta.content_length = @intCast(response.body.len);
+        if (opts.skip_metadata_probe) {
+            if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
+        }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);
             meta.content_type = try alloc.dupe(u8, value);
@@ -404,7 +573,19 @@ pub const JsonApiClient = struct {
         defer response.deinit(alloc);
 
         switch (response.status) {
-            200 => return try parseListResponse(alloc, response.body),
+            200 => {
+                var result = try parseListResponse(alloc, response.body);
+                errdefer result.deinit(alloc);
+                // GCS JSON API's `startOffset` is inclusive, while the shared
+                // object-store contract deliberately models S3's exclusive
+                // `start-after`. Normalize the first GCS page here so callers
+                // cannot repeat a cursor forever. Page tokens are already
+                // exclusive and must not be filtered against start_after.
+                if (opts.start_after != null and opts.continuation_token == null) {
+                    try enforceExclusiveStartAfter(alloc, &result, opts.start_after.?);
+                }
+                return result;
+            },
             404 => return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),
                 .common_prefixes = try alloc.alloc([]u8, 0),
@@ -421,6 +602,18 @@ pub const JsonApiClient = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) !TransportResponse {
+        return try self.performWithResponseLimit(method, url, headers, body, content_type, null);
+    }
+
+    fn performWithResponseLimit(
+        self: *JsonApiClient,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+    ) !TransportResponse {
         var merged = std.ArrayListUnmanaged(HeaderPair).empty;
         defer merged.deinit(self.alloc);
         try merged.appendSlice(self.alloc, headers);
@@ -429,7 +622,16 @@ pub const JsonApiClient = struct {
         defer if (auth_value) |value| self.alloc.free(value);
         if (auth_value) |value| try merged.append(self.alloc, .{ "Authorization", value });
 
-        return try self.request_fn(self.request_ctx, self.alloc, method, url, merged.items, body, content_type);
+        return try self.request_fn(
+            self.request_ctx,
+            self.alloc,
+            method,
+            url,
+            merged.items,
+            body,
+            content_type,
+            max_response_size,
+        );
     }
 
     const vtable: client_mod.Client.VTable = .{
@@ -437,6 +639,7 @@ pub const JsonApiClient = struct {
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
         .put_object = erasedPutObject,
+        .put_file = erasedPutFile,
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
@@ -462,6 +665,11 @@ pub const JsonApiClient = struct {
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
         const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
         return try self.putObject(alloc, bucket, key, body, opts);
+    }
+
+    fn erasedPutFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return try self.putFile(alloc, io, bucket, key, src_path, opts);
     }
 
     fn erasedGetObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
@@ -512,6 +720,46 @@ pub fn s3CompatibleConfigAlloc(
             .addressing_style = .path,
         },
     };
+}
+
+fn enforceExclusiveStartAfter(alloc: Allocator, result: *types.ListResult, start_after: []const u8) !void {
+    var entry_count: usize = 0;
+    for (result.entries) |entry| {
+        if (std.mem.order(u8, entry.key, start_after) == .gt) entry_count += 1;
+    }
+    var prefix_count: usize = 0;
+    for (result.common_prefixes) |prefix| {
+        if (std.mem.order(u8, prefix, start_after) == .gt) prefix_count += 1;
+    }
+
+    const entries = try alloc.alloc(types.ListEntry, entry_count);
+    errdefer alloc.free(entries);
+    const prefixes = try alloc.alloc([]u8, prefix_count);
+    errdefer alloc.free(prefixes);
+
+    var entry_index: usize = 0;
+    for (result.entries) |*entry| {
+        if (std.mem.order(u8, entry.key, start_after) == .gt) {
+            entries[entry_index] = entry.*;
+            entry_index += 1;
+        } else {
+            entry.deinit(alloc);
+        }
+    }
+    alloc.free(result.entries);
+    result.entries = entries;
+
+    var prefix_index: usize = 0;
+    for (result.common_prefixes) |prefix| {
+        if (std.mem.order(u8, prefix, start_after) == .gt) {
+            prefixes[prefix_index] = prefix;
+            prefix_index += 1;
+        } else {
+            alloc.free(prefix);
+        }
+    }
+    alloc.free(result.common_prefixes);
+    result.common_prefixes = prefixes;
 }
 
 pub fn jsonApiConfigAlloc(alloc: Allocator, bucket: []const u8) !Config {
@@ -719,6 +967,34 @@ fn uploadMediaUrlAlloc(
     return url;
 }
 
+fn uploadResumableUrlAlloc(
+    alloc: Allocator,
+    cfg: JsonApiConfig,
+    bucket: []const u8,
+    key: []const u8,
+    opts: types.PutOptions,
+) ![]u8 {
+    const escaped_bucket = try percentEncodeAlloc(alloc, bucket);
+    defer alloc.free(escaped_bucket);
+    const escaped_key = try percentEncodeAlloc(alloc, key);
+    defer alloc.free(escaped_key);
+    var url = try std.fmt.allocPrint(alloc, "{s}/b/{s}/o?uploadType=resumable&name={s}", .{ cfg.upload_endpoint, escaped_bucket, escaped_key });
+    errdefer alloc.free(url);
+    if (opts.if_none_match) {
+        const next = try std.fmt.allocPrint(alloc, "{s}&ifGenerationMatch=0", .{url});
+        alloc.free(url);
+        url = next;
+    }
+    return url;
+}
+
+fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+}
+
 fn objectListUrlAlloc(alloc: Allocator, cfg: JsonApiConfig, bucket: []const u8, opts: types.ListOptions) ![]u8 {
     const escaped_bucket = try percentEncodeAlloc(alloc, bucket);
     defer alloc.free(escaped_bucket);
@@ -773,17 +1049,27 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
     var parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
+    const content_length = if (parsed.value.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0;
+    const owned_bucket = try alloc.dupe(u8, parsed.value.bucket orelse bucket);
+    errdefer alloc.free(owned_bucket);
+    const key = try alloc.dupe(u8, parsed.value.name);
+    errdefer alloc.free(key);
+    const etag = if (parsed.value.etag) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (etag) |value| alloc.free(value);
+    const version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (version_id) |value| alloc.free(value);
+    const content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null;
     return .{
-        .bucket = try alloc.dupe(u8, parsed.value.bucket orelse bucket),
-        .key = try alloc.dupe(u8, parsed.value.name),
-        .etag = if (parsed.value.etag) |value| try alloc.dupe(u8, value) else null,
-        .version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null,
+        .bucket = owned_bucket,
+        .key = key,
+        .etag = etag,
+        .version_id = version_id,
         .checksum = if (parsed.value.md5Hash) |value| .{
             .algorithm = .md5_base64,
             .value = try alloc.dupe(u8, value),
         } else null,
-        .content_length = if (parsed.value.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0,
-        .content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null,
+        .content_length = content_length,
+        .content_type = content_type,
         .last_modified_unix_ms = null,
     };
 }
@@ -803,34 +1089,43 @@ fn parseListResponse(alloc: Allocator, body: []const u8) !types.ListResult {
     defer parsed.deinit();
 
     const items = parsed.value.items orelse &.{};
-    var entries = try alloc.alloc(types.ListEntry, items.len);
+    const entries = try alloc.alloc(types.ListEntry, items.len);
+    var entries_initialized: usize = 0;
     errdefer {
-        for (entries) |*entry| entry.deinit(alloc);
+        for (entries[0..entries_initialized]) |*entry| entry.deinit(alloc);
         alloc.free(entries);
     }
     for (items, 0..) |item, idx| {
+        const size = if (item.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0;
+        const key = try alloc.dupe(u8, item.name);
+        errdefer alloc.free(key);
+        const etag = if (item.etag) |value| try alloc.dupe(u8, value) else null;
         entries[idx] = .{
-            .key = try alloc.dupe(u8, item.name),
-            .etag = if (item.etag) |value| try alloc.dupe(u8, value) else null,
-            .size = if (item.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0,
+            .key = key,
+            .etag = etag,
+            .size = size,
             .last_modified_unix_ms = null,
         };
+        entries_initialized += 1;
     }
 
     const prefixes_in = parsed.value.prefixes orelse &.{};
-    var prefixes = try alloc.alloc([]u8, prefixes_in.len);
+    const prefixes = try alloc.alloc([]u8, prefixes_in.len);
+    var prefixes_initialized: usize = 0;
     errdefer {
-        for (prefixes) |prefix| alloc.free(prefix);
+        for (prefixes[0..prefixes_initialized]) |prefix| alloc.free(prefix);
         alloc.free(prefixes);
     }
     for (prefixes_in, 0..) |prefix, idx| {
         prefixes[idx] = try alloc.dupe(u8, prefix);
+        prefixes_initialized += 1;
     }
 
+    const next_token = if (parsed.value.nextPageToken) |value| try alloc.dupe(u8, value) else null;
     return .{
         .entries = entries,
         .common_prefixes = prefixes,
-        .next_continuation_token = if (parsed.value.nextPageToken) |value| try alloc.dupe(u8, value) else null,
+        .next_continuation_token = next_token,
     };
 }
 
@@ -936,6 +1231,90 @@ test "gcs json api media url encodes object path as one segment" {
     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/a%20b%2Fc.txt?alt=media", url);
 }
 
+test "gcs resumable upload url preserves create-only semantics" {
+    const alloc = std.testing.allocator;
+    var cfg = try jsonApiConfigAlloc(alloc, "bucket");
+    defer cfg.deinit(alloc);
+    const url = try uploadResumableUrlAlloc(alloc, cfg.json_api.?, "bucket", "folder/doc.txt", .{ .if_none_match = true });
+    defer alloc.free(url);
+    try std.testing.expectEqualStrings(
+        "https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=resumable&name=folder%2Fdoc.txt&ifGenerationMatch=0",
+        url,
+    );
+}
+
+test "gcs response parsers clean up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var metadata = try parseObjectMetadataResponse(
+                alloc,
+                "fallback",
+                "{\"bucket\":\"bucket\",\"name\":\"backup/a\",\"etag\":\"etag\",\"generation\":\"7\",\"size\":\"42\",\"contentType\":\"application/octet-stream\"}",
+            );
+            defer metadata.deinit(alloc);
+            var listed = try parseListResponse(
+                alloc,
+                "{\"items\":[{\"name\":\"backup/a\",\"etag\":\"a\",\"size\":\"1\"},{\"name\":\"backup/b\",\"etag\":\"b\",\"size\":\"2\"}],\"prefixes\":[\"backup/nested/\"],\"nextPageToken\":\"next\"}",
+            );
+            defer listed.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "gcs file upload completes a resumable lifecycle with bounded chunks" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const source_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-gcs-resumable-{d}", .{test_support.integrationNonce()});
+    defer alloc.free(source_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, source_path) catch {};
+    {
+        var source = try std.Io.Dir.createFileAbsolute(io, source_path, .{ .truncate = true });
+        defer source.close(io);
+        try source.writePositionalAll(io, "resumable-payload", 0);
+        try source.sync(io);
+    }
+
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            defer self.calls += 1;
+            return switch (self.calls) {
+                0 => blk: {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "uploadType=resumable") != null);
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.alloc(u8, 0),
+                        .location = try request_alloc.dupe(u8, "https://upload.example/session-1"),
+                    };
+                },
+                1 => blk: {
+                    try std.testing.expectEqual(HttpMethod.PUT, method);
+                    try std.testing.expectEqualStrings("https://upload.example/session-1", url);
+                    try std.testing.expectEqualStrings("resumable-payload", body.?);
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"backup/segment\",\"etag\":\"final-etag\",\"generation\":\"7\",\"size\":\"17\"}"),
+                    };
+                },
+                else => error.UnexpectedCall,
+            };
+        }
+    };
+    const cfg = try jsonApiClientConfigWithBearerTokenAlloc(alloc, "token", null);
+    var state = State{};
+    var gcs_client = JsonApiClient.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = gcs_client.client();
+    defer client.deinit();
+    var result = try gcs_client.putFileWithThreshold(alloc, io, "bucket", "backup/segment", source_path, .{}, 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("final-etag", result.etag.?);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
 test "gcs local grpc reference path can be discovered when present" {
     const alloc = std.testing.allocator;
     const path = try localGrpcReferencePathAlloc(alloc);
@@ -958,6 +1337,7 @@ test "json api client get object uses metadata then media with auth and range" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            max_response_size: ?usize,
         ) !TransportResponse {
             _ = body;
             _ = content_type;
@@ -966,6 +1346,7 @@ test "json api client get object uses metadata then media with auth and range" {
 
             switch (self.calls) {
                 0 => {
+                    try std.testing.expectEqual(@as(?usize, null), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
@@ -975,6 +1356,7 @@ test "json api client get object uses metadata then media with auth and range" {
                     };
                 },
                 1 => {
+                    try std.testing.expectEqual(@as(?usize, null), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
@@ -983,6 +1365,20 @@ test "json api client get object uses metadata then media with auth and range" {
                     return .{
                         .status = 206,
                         .body = try request_alloc.dupe(u8, "cdef"),
+                        .content_type = try request_alloc.dupe(u8, "text/plain"),
+                    };
+                },
+                2 => {
+                    try std.testing.expectEqual(@as(?usize, 4), max_response_size);
+                    try std.testing.expectEqual(HttpMethod.GET, method);
+                    try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
+                    try expectHeader(headers, "Authorization", "Bearer token-123");
+                    try expectHeader(headers, "If-Match", "etag-1");
+                    try expectHeader(headers, "Range", "bytes=2-5");
+                    return .{
+                        .status = 206,
+                        .body = try request_alloc.dupe(u8, "cdef"),
+                        .etag = try request_alloc.dupe(u8, "etag-media"),
                         .content_type = try request_alloc.dupe(u8, "text/plain"),
                     };
                 },
@@ -1013,6 +1409,21 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqual(types.ObjectChecksumAlgorithm.md5_base64, result.metadata.checksum.?.algorithm);
     try std.testing.expectEqualStrings("md5-body", result.metadata.checksum.?.value);
     try std.testing.expectEqualStrings("text/plain", result.metadata.content_type.?);
+
+    var direct = try client.getObject("bucket", "folder/doc.txt", .{
+        .version_id = "42",
+        .range = .{ .offset = 2, .length = 4 },
+        .if_match_etag = "etag-1",
+        .skip_metadata_probe = true,
+        .max_response_bytes = 4,
+    });
+    defer direct.deinit(alloc);
+    try std.testing.expectEqualStrings("cdef", direct.body);
+    try std.testing.expectEqualStrings("bucket", direct.metadata.bucket);
+    try std.testing.expectEqualStrings("folder/doc.txt", direct.metadata.key);
+    try std.testing.expectEqualStrings("etag-media", direct.metadata.etag.?);
+    try std.testing.expectEqualStrings("text/plain", direct.metadata.content_type.?);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 test "json api client put object encodes upload url and returns etag" {
@@ -1026,6 +1437,7 @@ test "json api client put object encodes upload url and returns etag" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.POST, method);
             try std.testing.expectEqualStrings("https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=media&name=folder%2Fdoc.txt&ifGenerationMatch=0", url);
@@ -1065,6 +1477,7 @@ test "json api client lists objects and prefixes" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             _ = headers;
             _ = body;
@@ -1074,7 +1487,7 @@ test "json api client lists objects and prefixes" {
             return .{
                 .status = 200,
                 .body = try request_alloc.dupe(u8,
-                    \\{"items":[{"name":"docs/a.txt","etag":"e1","size":"5"}],"prefixes":["docs/sub/"],"nextPageToken":"next-1"}
+                    \\{"items":[{"name":"docs/a","etag":"cursor","size":"1"},{"name":"docs/a.txt","etag":"e1","size":"5"}],"prefixes":["docs/a","docs/sub/"],"nextPageToken":"next-1"}
                 ),
             };
         }
@@ -1113,6 +1526,7 @@ test "json api client make bucket requires project id" {
             _: []const HeaderPair,
             _: ?[]const u8,
             _: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             return error.Unreachable;
         }

@@ -191,7 +191,9 @@ pub const HttpServer = struct {
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const self: *HttpServer = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        var response = try self.handle(req);
+        if (response.owner_allocator == null) response.owner_allocator = self.alloc;
+        return response;
     }
 };
 

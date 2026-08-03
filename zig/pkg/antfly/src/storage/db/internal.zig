@@ -19,6 +19,7 @@ const platform = @import("antfly_platform");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
+const index_repair_state = @import("derived/index_repair_state.zig");
 const db_config = @import("config.zig");
 const db_core = @import("core.zig");
 const derived_types = @import("derived/derived_types.zig");
@@ -44,7 +45,7 @@ const schema_mod = @import("../schema.zig");
 const ttl_mod = @import("../ttl.zig");
 const types = @import("types.zig");
 const artifact_ids = @import("artifact_ids.zig");
-const platform_clock = @import("../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
@@ -59,6 +60,30 @@ pub const IndexStatusSnapshot = struct {
     updated_at_ns: u64 = 0,
 };
 
+fn appendDerivedTargetRefAlloc(
+    alloc: Allocator,
+    targets: *std.ArrayListUnmanaged(derived_types.DerivedTargetRef),
+    kind: derived_types.DerivedTarget,
+    index_name: []const u8,
+) !void {
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    try targets.append(alloc, .{
+        .kind = kind,
+        .index_name = owned_index_name,
+    });
+}
+
+fn appendOwnedConstBytes(
+    alloc: Allocator,
+    values: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try values.append(alloc, owned);
+}
+
 pub fn buildDerivedBatch(
     alloc: Allocator,
     req: types.BatchRequest,
@@ -69,52 +94,41 @@ pub fn buildDerivedBatch(
     var documents = try alloc.alloc(derived_types.DerivedDocument, req.writes.len);
     var initialized: usize = 0;
     errdefer {
-        var tmp = derived_types.DerivedBatch{ .documents = documents[0..initialized] };
-        derived_types.deinitDerivedBatch(alloc, &tmp);
+        for (documents[0..initialized]) |doc| derived_types.deinitDerivedDocument(alloc, doc);
+        if (documents.len > 0) alloc.free(documents);
     }
 
     for (req.writes, 0..) |write, i| {
         var targets = std.ArrayListUnmanaged(derived_types.DerivedTargetRef).empty;
         defer targets.deinit(alloc);
+        errdefer for (targets.items) |target| alloc.free(target.index_name);
 
         if (extracted[i].cleaned_value != null) {
-            try targets.append(alloc, .{
-                .kind = .full_text,
-                .index_name = try alloc.dupe(u8, "*"),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .full_text, "*");
         }
         for (extracted[i].dense_embeddings) |embedding| {
-            try targets.append(alloc, .{
-                .kind = .dense_vector,
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .dense_vector, embedding.index_name);
         }
         for (extracted[i].sparse_embeddings) |embedding| {
-            try targets.append(alloc, .{
-                .kind = .sparse_vector,
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .sparse_vector, embedding.index_name);
         }
         for (extracted[i].mentioned_graph_indexes) |index_name| {
-            try targets.append(alloc, .{
-                .kind = .graph,
-                .index_name = try alloc.dupe(u8, index_name),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .graph, index_name);
         }
         for (req.graph_writes) |graph_write| {
             if (std.mem.eql(u8, graph_write.source, write.key)) {
-                try targets.append(alloc, .{
-                    .kind = .graph,
-                    .index_name = try alloc.dupe(u8, graph_write.index_name),
-                });
+                try appendDerivedTargetRefAlloc(alloc, &targets, .graph, graph_write.index_name);
             }
         }
 
+        const key = try alloc.dupe(u8, write.key);
+        errdefer alloc.free(key);
+        const owned_targets = try targets.toOwnedSlice(alloc);
         documents[i] = .{
-            .key = try alloc.dupe(u8, write.key),
+            .key = key,
             .action = if (extracted[i].cleaned_value == null) .preserve_base_document else .upsert,
             .cleaned_value = null,
-            .targets = try targets.toOwnedSlice(alloc),
+            .targets = owned_targets,
         };
         initialized += 1;
     }
@@ -136,9 +150,10 @@ pub fn buildDerivedBatch(
 
     var overwritten_doc_keys_list = std.ArrayListUnmanaged([]const u8).empty;
     defer overwritten_doc_keys_list.deinit(alloc);
+    errdefer for (overwritten_doc_keys_list.items) |key| alloc.free(@constCast(key));
     for (req.writes, 0..) |write, i| {
         if (extracted[i].cleaned_value != null) {
-            try overwritten_doc_keys_list.append(alloc, try alloc.dupe(u8, write.key));
+            try appendOwnedConstBytes(alloc, &overwritten_doc_keys_list, write.key);
         }
     }
 
@@ -148,153 +163,152 @@ pub fn buildDerivedBatch(
         changed_artifact_keys_list.deinit(alloc);
     }
     for (changed_artifact_keys) |key| {
-        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+        try appendOwnedConstBytes(alloc, &changed_artifact_keys_list, key);
     }
     for (deleted_artifact_keys) |key| {
         if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
-        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+        try appendOwnedConstBytes(alloc, &changed_artifact_keys_list, key);
     }
 
     var graph_doc_clears = std.ArrayListUnmanaged(derived_types.DerivedGraphDocClear).empty;
     errdefer {
-        for (graph_doc_clears.items) |clear| {
-            alloc.free(clear.key);
-            for (clear.index_names) |index_name| alloc.free(index_name);
-            if (clear.index_names.len > 0) alloc.free(clear.index_names);
-        }
+        for (graph_doc_clears.items) |clear| derived_types.deinitDerivedGraphDocClear(alloc, clear);
         graph_doc_clears.deinit(alloc);
     }
     for (req.writes, 0..) |write, i| {
         if (extracted[i].mentioned_graph_indexes.len == 0) continue;
-        var index_names = try alloc.alloc([]const u8, extracted[i].mentioned_graph_indexes.len);
-        for (extracted[i].mentioned_graph_indexes, 0..) |index_name, j| {
-            index_names[j] = try alloc.dupe(u8, index_name);
-        }
-        try graph_doc_clears.append(alloc, .{
-            .key = try alloc.dupe(u8, write.key),
-            .index_names = index_names,
+        const clear = try derived_types.cloneDerivedGraphDocClear(alloc, .{
+            .key = write.key,
+            .index_names = extracted[i].mentioned_graph_indexes,
         });
+        errdefer derived_types.deinitDerivedGraphDocClear(alloc, clear);
+        try graph_doc_clears.append(alloc, clear);
     }
 
     var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
-        for (graph_writes.items) |write| {
-            alloc.free(@constCast(write.index_name));
-            alloc.free(@constCast(write.source));
-            alloc.free(@constCast(write.target));
-            alloc.free(@constCast(write.edge_type));
-            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-        }
+        for (graph_writes.items) |write| derived_types.deinitDerivedGraphWrite(alloc, write);
         graph_writes.deinit(alloc);
     }
     for (extracted) |item| {
         for (item.graph_writes) |write| {
-            try graph_writes.append(alloc, .{
-                .index_name = try alloc.dupe(u8, write.index_name),
-                .source = try alloc.dupe(u8, write.source),
-                .target = try alloc.dupe(u8, write.target),
-                .edge_type = try alloc.dupe(u8, write.edge_type),
-                .weight = write.weight,
-                .created_at = write.created_at,
-                .updated_at = write.updated_at,
-                .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-            });
+            const cloned = try derived_types.cloneDerivedGraphWrite(alloc, write);
+            errdefer derived_types.deinitDerivedGraphWrite(alloc, cloned);
+            try graph_writes.append(alloc, cloned);
         }
     }
     for (req.graph_writes) |write| {
-        try graph_writes.append(alloc, .{
-            .index_name = try alloc.dupe(u8, write.index_name),
-            .source = try alloc.dupe(u8, write.source),
-            .target = try alloc.dupe(u8, write.target),
-            .edge_type = try alloc.dupe(u8, write.edge_type),
-            .weight = write.weight,
-            .created_at = write.created_at,
-            .updated_at = write.updated_at,
-            .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-        });
+        const cloned = try derived_types.cloneDerivedGraphWrite(alloc, write);
+        errdefer derived_types.deinitDerivedGraphWrite(alloc, cloned);
+        try graph_writes.append(alloc, cloned);
     }
 
     var graph_deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
     errdefer {
-        for (graph_deletes.items) |delete| {
-            alloc.free(@constCast(delete.index_name));
-            alloc.free(@constCast(delete.source));
-            alloc.free(@constCast(delete.target));
-            alloc.free(@constCast(delete.edge_type));
-        }
+        for (graph_deletes.items) |delete| derived_types.deinitDerivedGraphDelete(alloc, delete);
         graph_deletes.deinit(alloc);
     }
     for (req.graph_deletes) |delete| {
-        try graph_deletes.append(alloc, .{
-            .index_name = try alloc.dupe(u8, delete.index_name),
-            .source = try alloc.dupe(u8, delete.source),
-            .target = try alloc.dupe(u8, delete.target),
-            .edge_type = try alloc.dupe(u8, delete.edge_type),
-        });
+        const cloned = try derived_types.cloneDerivedGraphDelete(alloc, delete);
+        errdefer derived_types.deinitDerivedGraphDelete(alloc, cloned);
+        try graph_deletes.append(alloc, cloned);
     }
 
     var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
-        for (dense_embeddings.items) |embedding| {
-            alloc.free(embedding.index_name);
-            if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.vector.len > 0) alloc.free(embedding.vector);
-        }
+        for (dense_embeddings.items) |embedding|
+            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
         dense_embeddings.deinit(alloc);
     }
     for (extracted) |item| {
         for (item.dense_embeddings) |embedding| {
-            try dense_embeddings.append(alloc, .{
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-                .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-                .vector = if (embedding.artifact_key != null) &.{} else try alloc.dupe(f32, embedding.vector),
+            const cloned = try derived_types.cloneDerivedDenseEmbedding(alloc, .{
+                .index_name = embedding.index_name,
+                .doc_key = embedding.doc_key,
+                .artifact_key = embedding.artifact_key,
+                .vector = if (embedding.artifact_key != null) &.{} else embedding.vector,
             });
+            errdefer derived_types.deinitDerivedDenseEmbedding(alloc, cloned);
+            try dense_embeddings.append(alloc, cloned);
         }
     }
 
     var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
-        for (sparse_embeddings.items) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.indices.len > 0) alloc.free(embedding.indices);
-            if (embedding.values.len > 0) alloc.free(embedding.values);
-        }
+        for (sparse_embeddings.items) |embedding|
+            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
         sparse_embeddings.deinit(alloc);
     }
     for (extracted) |item| {
         for (item.sparse_embeddings) |embedding| {
-            try sparse_embeddings.append(alloc, .{
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-                .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-                .indices = try alloc.dupe(u32, embedding.indices),
-                .values = try alloc.dupe(f32, embedding.values),
+            const cloned = try derived_types.cloneDerivedSparseEmbedding(alloc, .{
+                .index_name = embedding.index_name,
+                .doc_key = embedding.doc_key,
+                .artifact_key = embedding.artifact_key,
+                .indices = embedding.indices,
+                .values = embedding.values,
             });
+            errdefer derived_types.deinitDerivedSparseEmbedding(alloc, cloned);
+            try sparse_embeddings.append(alloc, cloned);
         }
+    }
+
+    const overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc);
+    errdefer {
+        for (overwritten_doc_keys) |key| alloc.free(@constCast(key));
+        if (overwritten_doc_keys.len > 0) alloc.free(overwritten_doc_keys);
+    }
+    const owned_changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_changed_artifact_keys) |key| alloc.free(@constCast(key));
+        if (owned_changed_artifact_keys.len > 0) alloc.free(owned_changed_artifact_keys);
+    }
+    const owned_graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_graph_doc_clears) |clear| derived_types.deinitDerivedGraphDocClear(alloc, clear);
+        if (owned_graph_doc_clears.len > 0) alloc.free(owned_graph_doc_clears);
+    }
+    const owned_dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_dense_embeddings) |embedding|
+            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
+        if (owned_dense_embeddings.len > 0) alloc.free(owned_dense_embeddings);
+    }
+    const owned_sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_sparse_embeddings) |embedding|
+            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
+        if (owned_sparse_embeddings.len > 0) alloc.free(owned_sparse_embeddings);
+    }
+    const owned_graph_writes = try graph_writes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_graph_writes) |write| derived_types.deinitDerivedGraphWrite(alloc, write);
+        if (owned_graph_writes.len > 0) alloc.free(owned_graph_writes);
+    }
+    const owned_graph_deletes = try graph_deletes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_graph_deletes) |delete| derived_types.deinitDerivedGraphDelete(alloc, delete);
+        if (owned_graph_deletes.len > 0) alloc.free(owned_graph_deletes);
     }
 
     return .{
         .sequence = 0,
         .documents = documents,
         .deleted_keys = deleted_keys,
-        .overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc),
-        .changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc),
-        .graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc),
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
+        .overwritten_doc_keys = overwritten_doc_keys,
+        .changed_artifact_keys = owned_changed_artifact_keys,
+        .graph_doc_clears = owned_graph_doc_clears,
+        .dense_embeddings = owned_dense_embeddings,
+        .sparse_embeddings = owned_sparse_embeddings,
         .generated_enrichment_refs = &.{},
-        .graph_writes = try graph_writes.toOwnedSlice(alloc),
-        .graph_deletes = try graph_deletes.toOwnedSlice(alloc),
+        .graph_writes = owned_graph_writes,
+        .graph_deletes = owned_graph_deletes,
     };
 }
 
 const index_status_prefix = "\x00\x00__metadata__:index_status:";
 const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
-const index_status_encoded_len = 8 * 8;
+pub const index_status_encoded_len = 8 * 8;
 
 pub fn getenv(name: [*:0]const u8) ?[]const u8 {
     if (comptime builtin.os.tag == .freestanding) return null;
@@ -439,8 +453,7 @@ pub fn textIndexTermCount(entry: anytype) u64 {
     defer snap.release();
     var terms: u64 = 0;
     for (snap.segments) |*seg| {
-        const layout = seg.layoutStats(true);
-        terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+        terms +|= seg.layoutStats(false).inverted_term_count;
     }
     return terms;
 }
@@ -545,8 +558,8 @@ fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
             },
         },
         .mem => |mem_opts| .{ .mem = mem_opts },
-        .lsm_memory => |lsm_opts| .{ .lsm_memory = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
-        .lsm => |lsm_opts| .{ .lsm = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
+        .lsm_memory => |lsm_opts| .{ .lsm_memory = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.bind_cache_resource_manager, opts.no_sync, lsm_opts) },
+        .lsm => |lsm_opts| .{ .lsm = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.bind_cache_resource_manager, opts.no_sync, lsm_opts) },
     };
 }
 
@@ -649,11 +662,13 @@ pub fn waitForAtomicU8(flag: *const std.atomic.Value(u8), expected: u8, max_atte
 }
 
 pub const QueryVisibilityChange = enum {
-    status,
     invalidate,
+    status,
     publish,
     publish_consistent,
     publish_blocking,
+    index_repair_pending,
+    index_repair_cleared,
 };
 
 pub const ReplayProgress = struct {
@@ -921,19 +936,38 @@ pub fn AsyncContext(comptime DB: type) type {
         store: *docstore_mod.DocStore,
         snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
         applied_sequence_checkpoint_path: ?[]const u8 = null,
+        index_repair_checkpoint: ?index_repair_state.Location = null,
         index_manager: *index_manager_mod.IndexManager,
         apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        repair_replay_mutex: ?*std.atomic.Mutex = null,
         repair_sequence: u64 = 0,
+        repair_issue_counter: ?*AtomicU64 = null,
         allow_graph_materialization: bool = true,
         require_graph_resolution_contract: bool = false,
+        query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
         query_visibility_hook: ?QueryVisibilityHook(DB) = null,
+        query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        index_repair_notification_pending: bool = false,
         text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         applied_sequence_mutex: std.atomic.Mutex = .unlocked,
         dense_finish_mutex: std.atomic.Mutex = .unlocked,
         active_dense_catch_up_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         active_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        waiting_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        dense_projection_finalizing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        dense_projection_finalization_requested: bool = false,
+        pending_dense_projection_finalizations: std.StringHashMapUnmanaged(u64) = .empty,
         deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
         dense_bulk_session_scope: DenseBulkSessionScope = .auto,
+        index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
+        index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
+        index_artifact_cleanup_mutex: std.atomic.Mutex = .unlocked,
+        index_artifact_finalization_mutex: std.atomic.Mutex = .unlocked,
+        background_closing: std.atomic.Value(bool) = .init(false),
+        enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
+        enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+        enrichment_desired_running: std.atomic.Value(bool) = .init(false),
+        enrichment_restart_state: std.atomic.Value(u8) = .init(0),
         dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
         target_advance_repair_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
         text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
@@ -947,6 +981,9 @@ pub fn AsyncContext(comptime DB: type) type {
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.applied_sequence_coalescer.deinit(alloc);
+            var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
+            while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
+            self.pending_dense_projection_finalizations.deinit(alloc);
             var maintenance_it = self.dense_maintenance_last_ns.iterator();
             while (maintenance_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
             self.dense_maintenance_last_ns.deinit(alloc);
@@ -961,8 +998,18 @@ pub fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !vo
     if (options.cancelled()) return error.Canceled;
 }
 
+pub fn checkArtifactRepairActivationOwner(options: types.ArtifactRepairRunOptions) !void {
+    if (options.activation_check) |check| {
+        if (!try check.current()) return error.RepairOwnershipLost;
+    }
+}
+
 pub fn checkAsyncRepairCancelled(ctx: anytype) !void {
     try checkArtifactRepairCancelled(ctx.repair_options);
+}
+
+pub fn checkAsyncRepairCapacityBoundary(ctx: anytype) !void {
+    if (ctx.repair_options.capacity_check) |check| try check.boundary();
 }
 
 pub fn BatchExecutionContext(comptime DB: type) type {
@@ -971,11 +1018,13 @@ pub fn BatchExecutionContext(comptime DB: type) type {
         io: ?std.Io = null,
         store: *docstore_mod.DocStore,
         applied_sequence_checkpoint_path: ?[]const u8,
+        index_repair_checkpoint: ?index_repair_state.Location = null,
         shard_manager: *shard_mod.ShardManager,
         change_journal: *change_journal_mod.Journal,
         replay_source: replay_source_mod.Source,
         index_manager: *index_manager_mod.IndexManager,
         apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        repair_replay_mutex: ?*std.atomic.Mutex = null,
         log_mutex: *std.atomic.Mutex,
         identity_namespace: doc_identity.Namespace,
         artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
@@ -990,6 +1039,7 @@ pub fn BatchExecutionContext(comptime DB: type) type {
         ha_async_batch_mirror: ?ha_types.AsyncBatchMirror = null,
         ha_async_metadata_mirror: ?ha_types.AsyncMetadataMirror = null,
         ha_write_gate: ?ha_types.WriteGate = null,
+        identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
     };
 }
 
@@ -998,18 +1048,22 @@ pub fn EnrichmentAppendContext(comptime DB: type) type {
         alloc: Allocator,
         store: *docstore_mod.DocStore,
         applied_sequence_checkpoint_path: ?[]const u8,
+        index_repair_checkpoint: ?index_repair_state.Location = null,
         shard_manager: *shard_mod.ShardManager,
         index_manager: *index_manager_mod.IndexManager,
         apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        repair_replay_mutex: ?*std.atomic.Mutex = null,
         change_journal: *change_journal_mod.Journal,
         replay_source: replay_source_mod.Source,
         executor: *derived_executor_mod.Executor,
         async_context: ?*AsyncContext(DB),
         log_mutex: *std.atomic.Mutex,
+        identity_namespace: doc_identity.Namespace,
         ha_async_effect_mirror: ?ha_types.AsyncEffectMirror = null,
         ha_async_batch_mirror: ?ha_types.AsyncBatchMirror = null,
         ha_async_metadata_mirror: ?ha_types.AsyncMetadataMirror = null,
         ha_write_gate: ?ha_types.WriteGate = null,
+        identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
         resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
         promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -1018,13 +1072,15 @@ pub fn EnrichmentAppendContext(comptime DB: type) type {
                 .alloc = self.alloc,
                 .store = self.store,
                 .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
+                .index_repair_checkpoint = self.index_repair_checkpoint,
                 .shard_manager = self.shard_manager,
                 .change_journal = self.change_journal,
                 .replay_source = self.replay_source,
                 .index_manager = self.index_manager,
                 .apply_mutex = self.apply_mutex,
+                .repair_replay_mutex = self.repair_replay_mutex,
                 .log_mutex = self.log_mutex,
-                .identity_namespace = doc_identity.default_namespace,
+                .identity_namespace = self.identity_namespace,
                 .artifact_cleanup_maybe = null,
                 .executor = self.executor,
                 .io = if (self.async_context) |ctx| ctx.io else null,
@@ -1033,6 +1089,7 @@ pub fn EnrichmentAppendContext(comptime DB: type) type {
                 .ha_async_batch_mirror = self.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
                 .ha_write_gate = self.ha_write_gate,
+                .identity_visibility_owner_slot = self.identity_visibility_owner_slot,
                 .enrichment_runtime = null,
                 .resolution_runtime = self.resolution_runtime,
                 .promotion_runtime = self.promotion_runtime,
@@ -1045,6 +1102,7 @@ pub fn TtlCleanupContext(comptime DB: type) type {
     return struct {
         batch: BatchExecutionContext(DB),
         grace_period_ns: u64,
+        identity_visibility_owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
     };
 }
 
@@ -1333,52 +1391,97 @@ test "cloneManagedSyncTargetsAll duplicates names independently" {
 
 pub fn beginDenseCatchUpSessionTracked(ctx: anytype, index_name: []const u8) !void {
     _ = index_name;
+    var session_lock = lockAtomicWithBackoffProfiled(
+        &ctx.dense_finish_mutex,
+        &ctx.stats.dense_finish_mutex,
+        asyncIndexProfileEnabled(),
+    );
+    defer session_lock.unlock();
+    if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
+        ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0 or
+        ctx.dense_projection_finalizing.load(.acquire))
+        return error.ReplayDocumentNotVisible;
     ctx.text_merge_deferred.store(true, .release);
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
     ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
-    _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .monotonic);
+    _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .release);
 }
 
 pub fn finishDenseCatchUpSessionTracked(ctx: anytype, index_name: []const u8) void {
-    var active = ctx.active_dense_catch_up_sessions.load(.monotonic);
-    while (active != 0) {
-        if (ctx.active_dense_catch_up_sessions.cmpxchgWeak(active, active - 1, .monotonic, .monotonic) == null) {
-            if (active == 1) {
-                ctx.stats.dense_catch_up.active.store(0, .monotonic);
-                ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
-                ctx.stats.dense_catch_up.bulk_finish_current_window.store(0, .monotonic);
-                ctx.stats.dense_catch_up.bulk_finish_current_window_split_steps.store(0, .monotonic);
-                ctx.stats.dense_catch_up.bulk_finish_deferred_leaf_splits.store(0, .monotonic);
-                ctx.stats.dense_catch_up.bulk_finish_current_window_ns.store(0, .monotonic);
-            }
-            resumeDeferredBackgroundMaintenanceIfIdle(ctx);
-            return;
-        }
-        active = ctx.active_dense_catch_up_sessions.load(.monotonic);
-    }
-    std.log.warn("dense catch-up session finish without active session index={s}", .{index_name});
+    var session_lock = lockAtomicWithBackoffProfiled(
+        &ctx.dense_finish_mutex,
+        &ctx.stats.dense_finish_mutex,
+        asyncIndexProfileEnabled(),
+    );
+    const finished = finishDenseCatchUpSessionLocked(ctx, index_name);
+    session_lock.unlock();
+    if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
 }
 
-pub fn beginExternalDenseBulkSessionTracked(ctx: anytype) void {
+pub fn finishDenseCatchUpSessionLocked(ctx: anytype, index_name: []const u8) bool {
+    const active = ctx.active_dense_catch_up_sessions.load(.acquire);
+    if (active == 0) {
+        std.log.warn("dense catch-up session finish without active session index={s}", .{index_name});
+        return false;
+    }
+    ctx.active_dense_catch_up_sessions.store(active - 1, .release);
+    if (active == 1) {
+        ctx.stats.dense_catch_up.active.store(0, .monotonic);
+        ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
+        ctx.stats.dense_catch_up.bulk_finish_current_window.store(0, .monotonic);
+        ctx.stats.dense_catch_up.bulk_finish_current_window_split_steps.store(0, .monotonic);
+        ctx.stats.dense_catch_up.bulk_finish_deferred_leaf_splits.store(0, .monotonic);
+        ctx.stats.dense_catch_up.bulk_finish_current_window_ns.store(0, .monotonic);
+    }
+    return true;
+}
+
+pub fn beginExternalDenseBulkSessionTracked(ctx: anytype) !void {
+    var session_lock = lockAtomicWithBackoffProfiled(
+        &ctx.dense_finish_mutex,
+        &ctx.stats.dense_finish_mutex,
+        asyncIndexProfileEnabled(),
+    );
+    defer session_lock.unlock();
+    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
+        ctx.dense_projection_finalizing.load(.acquire))
+    {
+        return error.ReplayDocumentNotVisible;
+    }
     ctx.text_merge_deferred.store(true, .release);
     _ = ctx.active_external_dense_bulk_sessions.fetchAdd(1, .release);
 }
 
 pub fn finishExternalDenseBulkSessionTracked(ctx: anytype) void {
-    var active = ctx.active_external_dense_bulk_sessions.load(.acquire);
-    while (active != 0) {
-        if (ctx.active_external_dense_bulk_sessions.cmpxchgWeak(active, active - 1, .acq_rel, .acquire) == null) {
-            resumeDeferredBackgroundMaintenanceIfIdle(ctx);
-            return;
-        }
-        active = ctx.active_external_dense_bulk_sessions.load(.acquire);
+    var session_lock = lockAtomicWithBackoffProfiled(
+        &ctx.dense_finish_mutex,
+        &ctx.stats.dense_finish_mutex,
+        asyncIndexProfileEnabled(),
+    );
+    const finished = finishExternalDenseBulkSessionLocked(ctx);
+    session_lock.unlock();
+    if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
+}
+
+pub fn finishExternalDenseBulkSessionLocked(ctx: anytype) bool {
+    const active = ctx.active_external_dense_bulk_sessions.load(.acquire);
+    if (active == 0) {
+        std.log.warn("dense external bulk session finish without active session", .{});
+        return false;
     }
-    std.log.warn("dense external bulk session finish without active session", .{});
+    ctx.active_external_dense_bulk_sessions.store(active - 1, .release);
+    return true;
+}
+
+pub fn asyncContextHasDenseSessionsOrWaiters(ctx: anytype) bool {
+    return ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
+        ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
+        ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0;
 }
 
 pub fn asyncContextHasActiveDenseBulkWork(ctx: anytype) bool {
-    return ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
-        ctx.active_external_dense_bulk_sessions.load(.acquire) != 0;
+    return asyncContextHasDenseSessionsOrWaiters(ctx) or
+        ctx.dense_projection_finalizing.load(.acquire);
 }
 
 pub fn resumeDeferredBackgroundMaintenanceIfIdle(ctx: anytype) void {
@@ -1450,7 +1553,7 @@ pub fn flushDeferredExternalBulkExecutorNotificationOrTarget(
     executor.notifySequence(sequence);
 }
 
-pub fn denseApplyUsesLocalBulkSession(ctx: anytype, index_name: []const u8) bool {
+pub fn denseApplyUsesLocalStreamingSession(ctx: anytype, index_name: []const u8) bool {
     _ = index_name;
     if (ctx.dense_bulk_session_scope == .external) return false;
     if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) return false;
@@ -1477,7 +1580,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
 
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
-    try std.testing.expect(denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
     try std.testing.expectEqual(@as(u32, 1), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
@@ -1485,19 +1588,21 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, true));
-    try std.testing.expect(!denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
+    try std.testing.expectError(error.ReplayDocumentNotVisible, beginExternalDenseBulkSessionTracked(&ctx));
     finishDenseCatchUpSessionTracked(&ctx, "vec");
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
-    try std.testing.expect(denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 
-    beginExternalDenseBulkSessionTracked(&ctx);
+    try beginExternalDenseBulkSessionTracked(&ctx);
     try std.testing.expectEqual(@as(u32, 1), ctx.active_external_dense_bulk_sessions.load(.monotonic));
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
-    try std.testing.expect(!denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
+    try std.testing.expectError(error.ReplayDocumentNotVisible, beginDenseCatchUpSessionTracked(&ctx, "vec"));
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .write, 7));
     try std.testing.expectEqual(@as(u64, 7), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .propose, 11));
@@ -1512,11 +1617,11 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 0), ctx.active_external_dense_bulk_sessions.load(.monotonic));
     try std.testing.expect(!asyncContextHasActiveDenseBulkWork(&ctx));
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
-    try std.testing.expect(denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .write, 13));
 
     ctx.dense_bulk_session_scope = .external;
-    try std.testing.expect(!denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 }
 
 test "async context dense catch-up session finish is idempotent when already closed" {
@@ -1544,7 +1649,7 @@ test "async context dense catch-up session finish is idempotent when already clo
     finishDenseCatchUpSessionTracked(&ctx, "vec");
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
-    try std.testing.expect(denseApplyUsesLocalBulkSession(&ctx, "vec"));
+    try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 }
 
 fn storeMaxAtomicU64(value: *AtomicU64, candidate: u64) void {
@@ -1608,7 +1713,42 @@ pub fn Impl(comptime DB: type) type {
     return struct {
         pub fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
             const ctx: *AsyncContext(DB) = @ptrCast(@alignCast(ptr));
-            if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
+            notifyQueryVisibilityHook(ctx, .status);
+        }
+
+        pub fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, _: u64) void {
+            const ctx: *AsyncContext(DB) = @ptrCast(@alignCast(ptr));
+            notifyQueryVisibilityHook(
+                ctx,
+                if (ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null)
+                    .publish_blocking
+                else
+                    .status,
+            );
+        }
+
+        pub fn hasQueryVisibilityHook(ctx: *AsyncContext(DB)) bool {
+            lockAtomicWithBackoff(&ctx.query_visibility_hook_mutex);
+            defer ctx.query_visibility_hook_mutex.unlock();
+            return ctx.query_visibility_hook != null;
+        }
+
+        pub fn notifyQueryVisibilityHook(ctx: *AsyncContext(DB), change: QueryVisibilityChange) void {
+            lockAtomicWithBackoff(&ctx.query_visibility_hook_mutex);
+            const hook = ctx.query_visibility_hook orelse {
+                if (change == .index_repair_pending) {
+                    ctx.index_repair_notification_pending = true;
+                }
+                ctx.query_visibility_hook_mutex.unlock();
+                return;
+            };
+            if (change == .index_repair_pending or change == .index_repair_cleared) {
+                ctx.index_repair_notification_pending = false;
+            }
+            _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
+            ctx.query_visibility_hook_mutex.unlock();
+            defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
+            hook.notify(change);
         }
 
         pub fn lockApply(db: *DB) void {
@@ -1643,11 +1783,13 @@ pub fn Impl(comptime DB: type) type {
                 .alloc = self.alloc,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+                .index_repair_checkpoint = resources.index_repair_checkpoint,
                 .shard_manager = resources.shard_manager,
                 .change_journal = resources.change_journal,
                 .replay_source = resources.replay_source,
                 .index_manager = resources.index_manager,
                 .apply_mutex = resources.apply_mutex,
+                .repair_replay_mutex = resources.repair_replay_mutex,
                 .log_mutex = resources.log_mutex,
                 .identity_namespace = resources.identity_namespace,
                 .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
@@ -1847,9 +1989,26 @@ pub fn Impl(comptime DB: type) type {
             req: types.SearchRequest,
             hits: []types.SearchHit,
         ) !void {
+            var missing_ids = std.ArrayListUnmanaged([]const u8).empty;
+            defer missing_ids.deinit(alloc);
+            for (hits) |hit| {
+                if (hit.doc_ordinal == null) try missing_ids.append(alloc, hit.id);
+            }
+            if (missing_ids.items.len == 0) return;
+
+            const ordinals = try Self.lookupLiveDocOrdinalsNoLock(
+                self,
+                alloc,
+                missing_ids.items,
+                req.identity_read_generation,
+            );
+            defer alloc.free(ordinals);
+
+            var ordinal_index: usize = 0;
             for (hits) |*hit| {
                 if (hit.doc_ordinal != null) continue;
-                hit.doc_ordinal = try Self.lookupLiveDocOrdinalNoLock(self, alloc, hit.id, req.identity_read_generation);
+                hit.doc_ordinal = ordinals[ordinal_index];
+                ordinal_index += 1;
             }
         }
 

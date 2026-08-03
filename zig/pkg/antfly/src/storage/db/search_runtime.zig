@@ -28,6 +28,7 @@ const docstore_mod = @import("../docstore.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const index_mod = @import("../../index.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -44,6 +45,7 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const internal_keys = @import("../internal_keys.zig");
+const range_cardinality = @import("range_cardinality.zig");
 const search_geo_mod = @import("../../search/geo.zig");
 const search_mod = @import("../../search/search.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -56,8 +58,8 @@ const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
-const platform_clock = @import("../../platform/clock.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const vectorindex_mod = @import("antfly_vectorindex");
 const mapper = @import("document_mapper.zig");
 const backfill_state_mod = @import("backfill_state.zig");
@@ -67,6 +69,8 @@ const NamedResultSet = db_query_graph.NamedResultSet;
 const applyGraphUnion = db_query_graph.applyGraphUnion;
 const applyGraphIntersection = db_query_graph.applyGraphIntersection;
 const AlgebraicIndex = @import("algebraic/index.zig").Index;
+const GraphNodeRef = @import("../../graph/node_admission.zig").NodeRef;
+const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
 
 pub const Edge = graph_mod.Edge;
 pub const EdgeDirection = graph_mod.EdgeDirection;
@@ -88,9 +92,72 @@ pub const TextFieldStats = distributed_stats_mod.TextFieldStats;
 pub const RuntimePreflightSummary = db_query_search.RuntimePreflightSummary;
 pub const ExplicitTextStatRequest = db_query_search.ExplicitTextStatRequest;
 pub const ExplicitBackgroundTextStatRequest = db_query_search.ExplicitBackgroundTextStatRequest;
+
+pub const VisibilityRuntimeStats = struct {
+    cache_hits_total: platform.atomic.Value(u64) = .init(0),
+    cache_misses_total: platform.atomic.Value(u64) = .init(0),
+    mask_build_ns_total: platform.atomic.Value(u64) = .init(0),
+    mask_builds_total: platform.atomic.Value(u64) = .init(0),
+    full_scan_fallbacks_total: platform.atomic.Value(u64) = .init(0),
+    overflow_total: platform.atomic.Value(u64) = .init(0),
+
+    pub fn recordCacheHit(self: *@This()) void {
+        _ = self.cache_hits_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCacheMiss(self: *@This()) void {
+        _ = self.cache_misses_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordBuild(self: *@This(), duration_ns: u64) void {
+        _ = self.mask_builds_total.fetchAdd(1, .monotonic);
+        _ = self.mask_build_ns_total.fetchAdd(duration_ns, .monotonic);
+    }
+
+    pub fn recordOverflow(self: *@This()) void {
+        _ = self.overflow_total.fetchAdd(1, .monotonic);
+        _ = self.full_scan_fallbacks_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn snapshot(self: *@This(), cache_entries: u64) types.VisibilityStats {
+        return .{
+            .cache_entries = cache_entries,
+            .cache_hits_total = self.cache_hits_total.load(.monotonic),
+            .cache_misses_total = self.cache_misses_total.load(.monotonic),
+            .mask_build_ns_total = self.mask_build_ns_total.load(.monotonic),
+            .mask_builds_total = self.mask_builds_total.load(.monotonic),
+            .full_scan_fallbacks_total = self.full_scan_fallbacks_total.load(.monotonic),
+            .overflow_total = self.overflow_total.load(.monotonic),
+        };
+    }
+};
 pub const ProfiledDenseSearchResult = db_query_search.ProfiledDenseSearchResult;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+
+test "db search runtime query repair gate revalidates stale debt" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const SearchRuntime = Impl(DB);
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "stale_repair",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Model a reader that loaded repair debt immediately before its durable
+    // intent was removed. The rejected request proves absence and heals the
+    // process-local gate instead of wedging the reader indefinitely.
+    try db.core.index_manager.markRepairUnavailable("stale_repair");
+    try SearchRuntime.failIfIndexQuarantined(&db, "stale_repair");
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("stale_repair"));
+}
 
 pub const AlgebraicDocFilterRequest = struct {
     req: types.SearchRequest,
@@ -117,6 +184,496 @@ pub const AlgebraicDocFilterRequest = struct {
 fn freeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) void {
     for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
     if (doc_ids.len > 0) alloc.free(@constCast(doc_ids));
+}
+
+test "db search runtime full-text backfill retires segment fanout at durable batch boundaries" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..24) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"bulk backfill {d}\"}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        }});
+    }
+
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const entry = reopened.core.index_manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(entry.persistent.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .term = .{ .field = "title", .term = "bulk" } },
+        .limit = 32,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 24), result.total_hits);
+}
+
+test "db search runtime sparse backfill restarts safely from a legacy cursor after interrupted reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..10) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try alloc.dupe(u8, "{\"sparse\":{\"indices\":[0,1],\"values\":[1.0,0.5]}}"),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "sp_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse\"}",
+        }});
+    }
+
+    index_manager_mod.test_sparse_backfill_batch_size = 4;
+    defer index_manager_mod.test_sparse_backfill_batch_size = null;
+    index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
+    defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
+    const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1", .{std.mem.span(path)});
+    defer alloc.free(rebuild_root);
+    var owned_state_path: ?[]u8 = null;
+    defer if (owned_state_path) |owned| alloc.free(owned);
+    var resume_key: ?[]u8 = null;
+    defer if (resume_key) |owned| alloc.free(owned);
+    {
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("sp_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+
+        const cfg = interrupted.core.index_manager.get("sp_v1") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
+        owned_state_path = try rebuild_state.pathAlloc(alloc);
+        resume_key = (try rebuild_state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+        try std.testing.expect(resume_key.?.len > 0);
+    }
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, owned_state_path.?);
+    const legacy_rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root);
+    const legacy_state_path = try legacy_rebuild_state.pathAlloc(alloc);
+    defer alloc.free(legacy_state_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = legacy_state_path, .data = resume_key.? });
+
+    index_manager_mod.test_abort_sparse_backfill_after_batches = null;
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, owned_state_path.?, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_state_path, alloc, .limited(1024)));
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{0},
+            .values = &.{1.0},
+            .k = 10,
+        } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expect(result.total_hits > 0);
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |entry| {
+        if (std.mem.eql(u8, entry.name, "sp_v1")) {
+            try std.testing.expectEqual(false, entry.backfill_active);
+            try std.testing.expectEqual(@as(u64, 10), entry.doc_count);
+            return;
+        }
+    }
+    return error.TestExpectedEqual;
+}
+
+test "db search runtime unfiltered graph search retains algebraic execution" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    });
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "gr_alg", .source = "n:a", .target = "n:b", .edge_type = "links" },
+            .{ .index_name = "gr_alg", .source = "n:a", .target = "n:c", .edge_type = "links" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{.{
+            .name = "neighbors",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "gr_alg",
+                .start_nodes = .{ .keys = &.{"n:a"} },
+                .params = .{
+                    .direction = .out,
+                    .edge_types = &.{"links"},
+                    .max_results = 0,
+                },
+            },
+        }},
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.graph_results[0].total_hits);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "gr_alg")) continue;
+        try std.testing.expectEqual(@as(u64, 1), item.algebraic_graph_traversal_attempt_count);
+        try std.testing.expectEqual(@as(u64, 1), item.algebraic_graph_traversal_proven_count);
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+test "db search runtime graph search filters result nodes and hidden traversal intermediates" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const SearchRuntime = Impl(DB);
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "n:a", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"},{\"target\":\"n:d\"}]}}}" },
+            .{ .key = "n:b", .value = "{\"tenant\":\"hidden\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:c\"}]}}}" },
+            .{ .key = "n:c", .value = "{\"tenant\":\"visible\"}" },
+            .{ .key = "n:d", .value = "{\"tenant\":\"visible\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var visible = try db.search(alloc, .{
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer visible.deinit();
+    try std.testing.expectEqual(@as(u32, 3), visible.total_hits);
+
+    const graph_key_mask = try SearchRuntime.filterGraphKeysCallback(
+        &db,
+        alloc,
+        .{ .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}" },
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer alloc.free(graph_key_mask);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, true, false }, graph_key_mask);
+
+    const hydrated = try db.graphHydrateKeysForInternalRead(
+        alloc,
+        .{
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+            .include_stored = false,
+        },
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer {
+        for (hydrated) |*hit| hit.deinit(alloc);
+        alloc.free(hydrated);
+    }
+    try std.testing.expectEqual(@as(usize, 3), hydrated.len);
+    try std.testing.expectEqualStrings("n:a", hydrated[0].id);
+    try std.testing.expectEqualStrings("n:c", hydrated[1].id);
+    try std.testing.expectEqualStrings("n:d", hydrated[2].id);
+    for (hydrated) |hit| {
+        try std.testing.expect(hit.doc_ordinal != null);
+        try std.testing.expect(hit.stored_data == null);
+    }
+
+    const hydrated_with_stored = try db.graphHydrateKeysForInternalRead(
+        alloc,
+        .{
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+            .include_stored = true,
+        },
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer {
+        for (hydrated_with_stored) |*hit| hit.deinit(alloc);
+        alloc.free(hydrated_with_stored);
+    }
+    try std.testing.expectEqual(@as(usize, 3), hydrated_with_stored.len);
+    for (hydrated_with_stored) |hit| {
+        try std.testing.expect(hit.doc_ordinal != null);
+        try std.testing.expect(hit.stored_data != null);
+        try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"tenant\":\"visible\"") != null);
+    }
+
+    const incoming = try db.graphHasIncomingEdgesForInternalRead(
+        alloc,
+        "gr_v1",
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer alloc.free(incoming);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, incoming);
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{.{
+            .name = "links",
+            .query = .{
+                .query_type = .traverse,
+                .index_name = "gr_v1",
+                .start_nodes = .{ .keys = &.{"n:a"} },
+                .params = .{
+                    .direction = .out,
+                    .edge_types = &.{"links"},
+                    .max_depth = 2,
+                    .include_paths = false,
+                },
+                .include_documents = true,
+            },
+        }},
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    const graph_result = result.graph_results[0];
+    try std.testing.expectEqual(@as(u32, 1), graph_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.nodes.len);
+    try std.testing.expectEqualStrings("n:d", graph_result.nodes[0].key);
+    try std.testing.expect(graph_result.nodes[0].path == null);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.hits.len);
+    try std.testing.expectEqualStrings("n:d", graph_result.hits[0].id);
+    try std.testing.expect(graph_result.hits[0].stored_data != null);
+
+    var direct = try db.search(alloc, .{
+        .query = .{ .graph = .{
+            .query_type = .traverse,
+            .index_name = "gr_v1",
+            .start_nodes = .{ .keys = &.{"n:a"} },
+            .params = .{
+                .direction = .out,
+                .edge_types = &.{"links"},
+                .max_depth = 2,
+                .include_paths = false,
+            },
+            .include_documents = true,
+        } },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer direct.deinit();
+    try std.testing.expectEqual(@as(u32, 1), direct.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), direct.hits.len);
+    try std.testing.expectEqualStrings("n:d", direct.hits[0].id);
+    try std.testing.expect(direct.hits[0].stored_data != null);
+
+    var query_scoped = try db.search(alloc, .{
+        .graph_queries = &.{.{
+            .name = "query_scoped_visible",
+            .query = .{
+                .query_type = .traverse,
+                .index_name = "gr_v1",
+                .start_nodes = .{ .keys = &.{"n:a"} },
+                .params = .{
+                    .direction = .out,
+                    .edge_types = &.{"links"},
+                    .max_depth = 2,
+                    .node_filter = .{ .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}" },
+                },
+            },
+        }},
+        .limit = 10,
+    });
+    defer query_scoped.deinit();
+    try std.testing.expectEqual(@as(u32, 1), query_scoped.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("n:d", query_scoped.graph_results[0].nodes[0].key);
+
+    var bounded = try db.search(alloc, .{
+        .graph_queries = &.{.{
+            .name = "bounded_links",
+            .query = .{
+                .query_type = .traverse,
+                .index_name = "gr_v1",
+                .start_nodes = .{ .keys = &.{"n:a"} },
+                .params = .{
+                    .direction = .out,
+                    .edge_types = &.{"links"},
+                    .max_depth = 1,
+                    .max_results = 1,
+                },
+            },
+        }},
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bounded.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("n:d", bounded.graph_results[0].nodes[0].key);
+
+    var pattern = try db.search(alloc, .{
+        .graph_queries = &.{.{
+            .name = "bounded_pattern",
+            .query = .{
+                .query_type = .pattern,
+                .index_name = "gr_v1",
+                .start_nodes = .{ .keys = &.{"n:a"} },
+                .params = .{ .max_results = 1 },
+                .pattern = &.{
+                    .{ .alias = "source" },
+                    .{ .alias = "target", .edge = .{ .direction = .out, .types = &.{"links"} } },
+                },
+                .return_aliases = &.{ "source", "target" },
+            },
+        }},
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer pattern.deinit();
+    try std.testing.expectEqual(@as(u32, 1), pattern.graph_results[0].total_hits);
+    try std.testing.expectEqual(@as(usize, 1), pattern.graph_results[0].matches.len);
+    var matched_visible_target = false;
+    for (pattern.graph_results[0].matches[0].bindings) |binding| {
+        if (std.mem.eql(u8, binding.alias, "target")) {
+            try std.testing.expectEqualStrings("n:d", binding.node.key);
+            matched_visible_target = true;
+        }
+    }
+    try std.testing.expect(matched_visible_target);
+
+    var hidden_start = try db.search(alloc, .{
+        .graph_queries = &.{.{
+            .name = "hidden_start",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "gr_v1",
+                .start_nodes = .{ .keys = &.{"n:b"} },
+                .params = .{ .direction = .out, .edge_types = &.{"links"} },
+            },
+        }},
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer hidden_start.deinit();
+    try std.testing.expectEqual(@as(u32, 0), hidden_start.graph_results[0].total_hits);
+}
+
+test "db search runtime graph shortest path searches through admitted alternatives" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "n:a", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"},{\"target\":\"n:d\"}]}}}" },
+            .{ .key = "n:b", .value = "{\"tenant\":\"hidden\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:c\"}]}}}" },
+            .{ .key = "n:c", .value = "{\"tenant\":\"visible\"}" },
+            .{ .key = "n:d", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:e\"}]}}}" },
+            .{ .key = "n:e", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:c\"}]}}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "visible_path",
+                .query = .{
+                    .query_type = .shortest_path,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .keys = &.{"n:a"} },
+                    .target_nodes = .{ .keys = &.{"n:c"} },
+                    .params = .{
+                        .direction = .out,
+                        .edge_types = &.{"links"},
+                        .max_depth = 4,
+                    },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
+    try std.testing.expectEqual(@as(u32, 3), result.graph_results[0].paths[0].length);
+    try std.testing.expectEqual(@as(usize, 4), result.graph_results[0].paths[0].nodes.len);
+    try std.testing.expectEqualStrings("n:a", result.graph_results[0].paths[0].nodes[0]);
+    try std.testing.expectEqualStrings("n:d", result.graph_results[0].paths[0].nodes[1]);
+    try std.testing.expectEqualStrings("n:e", result.graph_results[0].paths[0].nodes[2]);
+    try std.testing.expectEqualStrings("n:c", result.graph_results[0].paths[0].nodes[3]);
 }
 
 fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
@@ -283,6 +840,81 @@ test "resolved doc set from search hits uses complete hit ordinals" {
         .{ .id = @constCast("doc:b") },
     };
     try std.testing.expect((try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &mixed)) == null);
+}
+
+test "db text kernel search matches projected search without stored bodies" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"type\":\"full_text\",\"analysis_config\":{\"field_analyzers\":{\"text\":\"simple\"}}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "benchmark:0", .value = "{\"text\":\"alpha beta\"}" },
+            .{ .key = "benchmark:1", .value = "{\"text\":\"alpha gamma\"}" },
+            .{ .key = "benchmark:2", .value = "{\"text\":\"beta gamma\"}" },
+            .{ .key = "benchmark:3", .value = "{\"text\":\"alpha beta gamma\"}" },
+        },
+        .sync_level = .full_text,
+    });
+    try db.forceCompactTextIndexes();
+
+    const should = [_]types.TextQuery{
+        .{ .term = .{ .field = "text", .term = "alpha" } },
+        .{ .term = .{ .field = "text", .term = "beta" } },
+    };
+    const query = types.TextQuery{ .bool_query = .{ .should = &should, .min_should = 1 } };
+
+    var projected = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = query,
+        .limit = 3,
+        .include_stored = false,
+        .include_all_fields = false,
+    });
+    defer projected.deinit();
+    var kernel = try db.searchTextKernel(alloc, "ft_v1", query, .{ .limit = 3 });
+    defer kernel.deinit(alloc);
+    var custom_bm25 = try db.searchTextKernel(alloc, "ft_v1", query, .{
+        .limit = 3,
+        .bm25 = .{ .k1 = 2.0, .b = 0.0 },
+    });
+    defer custom_bm25.deinit(alloc);
+    var profiled = try db.searchTextKernel(alloc, "ft_v1", query, .{
+        .limit = 3,
+        .collect_diagnostics = true,
+    });
+    defer profiled.deinit(alloc);
+
+    try std.testing.expectEqual(projected.hits.len, kernel.hits.len);
+    for (projected.hits, kernel.hits) |projected_hit, kernel_hit| {
+        try std.testing.expectEqual(projected_hit.doc_ordinal.?, kernel_hit.doc_ordinal);
+        try std.testing.expectApproxEqRel(projected_hit.score.?, kernel_hit.score, 0.00001);
+    }
+    try std.testing.expectEqual(kernel.hits.len, custom_bm25.hits.len);
+    try std.testing.expectEqual(kernel.hits[0].doc_ordinal, custom_bm25.hits[0].doc_ordinal);
+    try std.testing.expect(@abs(kernel.hits[0].score - custom_bm25.hits[0].score) > 0.0001);
+    try std.testing.expect(profiled.diagnostics.segments_considered > 0);
+    try std.testing.expect(profiled.diagnostics.postings_iterators_opened > 0);
+    try std.testing.expectEqual(@as(u32, 4), try db.countTextKernel(alloc, "ft_v1", query));
+
+    var layout = try db.textIndexLayoutStats(alloc, "ft_v1");
+    defer layout.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), layout.segments.len);
+    try std.testing.expectEqual(@as(u32, 4), layout.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 4), layout.segments[0].live_doc_count);
+    try std.testing.expect(layout.total_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 10), layout.merge_policy.max_segments_per_tier);
+    try std.testing.expect(layout.merge_policy.max_segment_size > layout.merge_policy.floor_segment_size);
 }
 
 test "db text compaction preserves index sort acceleration" {
@@ -604,12 +1236,12 @@ test "relational table full-text search loads stored_data from base rows" {
     const snapshot = text_entry.persistent.snapshot();
     try std.testing.expect(snapshot.segments.len > 0);
     for (snapshot.segments) |*segment| {
-        try std.testing.expect(segment.reader.getSection("status", .typed_doc_values) == null);
-        try std.testing.expect(segment.reader.getSection("amount", .typed_doc_values) == null);
-        try std.testing.expect(segment.reader.getSection("created_at", .typed_doc_values) == null);
-        try std.testing.expect(segment.reader.getSection("active", .typed_doc_values) == null);
-        try std.testing.expect(segment.reader.getSection("location", .typed_doc_values) == null);
-        try std.testing.expect(segment.reader.getSection("attrs", .typed_doc_values) == null);
+        try std.testing.expect((try segment.reader.getSection("status", .typed_doc_values)) == null);
+        try std.testing.expect((try segment.reader.getSection("amount", .typed_doc_values)) == null);
+        try std.testing.expect((try segment.reader.getSection("created_at", .typed_doc_values)) == null);
+        try std.testing.expect((try segment.reader.getSection("active", .typed_doc_values)) == null);
+        try std.testing.expect((try segment.reader.getSection("location", .typed_doc_values)) == null);
+        try std.testing.expect((try segment.reader.getSection("attrs", .typed_doc_values)) == null);
     }
 
     const replacement_json =
@@ -1776,6 +2408,161 @@ fn cloneGraphMetricBuildPageStatusesFromGraph(
 
 pub fn Impl(comptime DB: type) type {
     return struct {
+        pub fn searchTextKernel(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            text_query: types.TextQuery,
+            options: types.TextKernelSearchOptions,
+        ) !types.TextKernelResult {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+            const text_snapshot = entry.persistent.acquireSnapshot();
+            defer text_snapshot.release();
+
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const query = try db_query_search.textQueryToSearchQuery(
+                arena_state.allocator(),
+                text_query,
+                entry.text_analysis,
+                entry.runtime_schema,
+            );
+            var search_diagnostics = search_mod.SearchDiagnostics{};
+            var result = try search_mod.execute(alloc, text_snapshot, .{
+                .query = query,
+                .k = options.limit,
+                .include_stored = false,
+                .bm25_config = .{ .k1 = options.bm25.k1, .b = options.bm25.b },
+                .diagnostics = if (options.collect_diagnostics) &search_diagnostics else null,
+            });
+            defer result.deinit();
+
+            const hits = try alloc.alloc(types.TextKernelHit, result.hits.len);
+            errdefer alloc.free(hits);
+            for (result.hits, 0..) |hit, i| {
+                hits[i] = .{
+                    .doc_ordinal = (try text_snapshot.docOrdinal(hit.doc_id)) orelse return error.MissingTextDocOrdinal,
+                    .score = hit.score,
+                };
+            }
+            return .{
+                .hits = hits,
+                .total_hits = result.total_hits,
+                .total_hits_relation = switch (result.total_hits_relation) {
+                    .exact => .exact,
+                    .gte => .gte,
+                },
+                .diagnostics = .{
+                    .segments_considered = search_diagnostics.segments_considered,
+                    .segments_searched = search_diagnostics.segments_searched,
+                    .segments_pruned = search_diagnostics.segments_pruned,
+                    .postings_iterators_opened = search_diagnostics.postings_iterators_opened,
+                    .wand_next_in_score = search_diagnostics.wand_next_in_score,
+                    .wand_next_in_advance = search_diagnostics.wand_next_in_advance,
+                    .wand_pivots_scored = search_diagnostics.wand_pivots_scored,
+                    .wand_pivots_advanced = search_diagnostics.wand_pivots_advanced,
+                    .wand_chunks_skipped = search_diagnostics.wand_chunks_skipped,
+                    .boolean_candidates_scored = search_diagnostics.boolean_candidates_scored,
+                    .boolean_chunks_skipped = search_diagnostics.boolean_chunks_skipped,
+                    .phrase_candidates_verified = search_diagnostics.phrase_candidates_verified,
+                    .phrase_position_records_decoded = search_diagnostics.phrase_position_records_decoded,
+                    .phrase_matches_scored = search_diagnostics.phrase_matches_scored,
+                },
+            };
+        }
+
+        pub fn countTextKernel(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            text_query: types.TextQuery,
+        ) !u32 {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+            const text_snapshot = entry.persistent.acquireSnapshot();
+            defer text_snapshot.release();
+
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const query = try db_query_search.textQueryToSearchQuery(
+                arena,
+                text_query,
+                entry.text_analysis,
+                entry.runtime_schema,
+            );
+            const filter = try search_mod.searchQueryToFilterArena(arena, query);
+            return std.math.cast(u32, try text_snapshot.countFilter(alloc, filter)) orelse
+                error.CountOverflow;
+        }
+
+        /// Inspect the exact BM25 inputs for one term/document pair without
+        /// loading stored source. Ordinals use Antfly's one-based convention.
+        pub fn textKernelTermStats(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            field: []const u8,
+            term: []const u8,
+            doc_ordinal: u32,
+        ) !?index_mod.TextTermStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const entry = self.core.textIndexEntry(index_name) orelse
+                return error.IndexNotFound;
+            const text_snapshot = entry.persistent.acquireSnapshot();
+            defer text_snapshot.release();
+            return try text_snapshot.textTermStats(
+                alloc,
+                field,
+                term,
+                doc_ordinal,
+            );
+        }
+
+        pub fn textIndexLayoutStats(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+        ) !types.TextIndexLayoutStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const index = self.core.textIndex(index_name) orelse return error.IndexNotFound;
+            const text_snapshot = index.acquireSnapshot();
+            defer text_snapshot.release();
+
+            const segments = try alloc.alloc(types.TextSegmentLayoutStats, text_snapshot.segments.len);
+            errdefer alloc.free(segments);
+            var total_bytes: u64 = 0;
+            for (text_snapshot.segments, 0..) |*segment, i| {
+                const bytes: u64 = @intCast(segment.data.bytes().len);
+                const live_doc_count = segment.liveDocCount();
+                total_bytes +|= bytes;
+                segments[i] = .{
+                    .segment_id = segment.id,
+                    .doc_count = segment.reader.doc_count,
+                    .live_doc_count = live_doc_count,
+                    .deleted_count = segment.reader.doc_count -| live_doc_count,
+                    .bytes = bytes,
+                    .file_backed = segment.data.isFileBacked(),
+                };
+            }
+            return .{
+                .global_doc_count = text_snapshot.global_doc_count,
+                .total_bytes = total_bytes,
+                .segments = segments,
+                .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
+                .merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name),
+            };
+        }
+
         const Self = @This();
 
         pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
@@ -1927,6 +2714,16 @@ pub fn Impl(comptime DB: type) type {
             self.live_doc_set_cache_generation = null;
         }
 
+        pub fn clearNonVisibleDocSetCache(self: *DB) void {
+            db_internal.lockAtomicWithBackoff(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
+            self.nonvisible_doc_set_cache_set = null;
+            self.nonvisible_doc_set_cache_generation = null;
+            self.nonvisible_doc_set_cache_overflow = false;
+            self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+        }
+
         pub fn liveFilterDocSet(
             self: *DB,
             alloc: Allocator,
@@ -2023,6 +2820,68 @@ pub fn Impl(comptime DB: type) type {
                 if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
                 self.live_doc_set_cache_set = cloned;
                 self.live_doc_set_cache_generation = gen;
+            } else |_| {
+                // Caching is best-effort; the computed set is still returned.
+            }
+            return computed;
+        }
+
+        fn nonVisibleDocSetCachedAlloc(
+            self: *DB,
+            alloc: Allocator,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const gen = generation orelse {
+                return try doc_identity.nonVisibleDocSetFromStoreAlloc(
+                    alloc,
+                    self.core.store,
+                    generation,
+                    doc_identity.default_max_nonvisible_doc_set_entries,
+                );
+            };
+            {
+                db_internal.lockAtomicWithBackoff(&self.nonvisible_doc_set_cache_mutex);
+                defer self.nonvisible_doc_set_cache_mutex.unlock();
+                if (self.nonvisible_doc_set_cache_generation == gen) {
+                    if (self.nonvisible_doc_set_cache_overflow) {
+                        self.visibility_runtime_stats.recordCacheHit();
+                        return null;
+                    }
+                    if (self.nonvisible_doc_set_cache_set) |*cached| {
+                        self.visibility_runtime_stats.recordCacheHit();
+                        return try doc_set.cloneAlloc(alloc, cached);
+                    }
+                }
+            }
+            self.visibility_runtime_stats.recordCacheMiss();
+            const build_start_ns = platform_time.monotonicNs();
+            var computed = (try doc_identity.nonVisibleDocSetFromStoreAlloc(
+                alloc,
+                self.core.store,
+                generation,
+                doc_identity.default_max_nonvisible_doc_set_entries,
+            )) orelse {
+                self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
+                self.visibility_runtime_stats.recordOverflow();
+                db_internal.lockAtomicWithBackoff(&self.nonvisible_doc_set_cache_mutex);
+                defer self.nonvisible_doc_set_cache_mutex.unlock();
+                if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
+                self.nonvisible_doc_set_cache_set = null;
+                self.nonvisible_doc_set_cache_generation = gen;
+                self.nonvisible_doc_set_cache_overflow = true;
+                self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+                return null;
+            };
+            self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
+            errdefer computed.deinit(alloc);
+            if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+                db_internal.lockAtomicWithBackoff(&self.nonvisible_doc_set_cache_mutex);
+                defer self.nonvisible_doc_set_cache_mutex.unlock();
+                if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
+                self.nonvisible_doc_set_cache_set = cloned;
+                self.nonvisible_doc_set_cache_generation = gen;
+                self.nonvisible_doc_set_cache_overflow = false;
+                self.nonvisible_doc_set_cache_entries.store(1, .monotonic);
             } else |_| {
                 // Caching is best-effort; the computed set is still returned.
             }
@@ -2698,6 +3557,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .project_ordinals_to_doc_ids = false,
                 .identity_read_generation = req.identity_read_generation,
             })) orelse return null;
@@ -2710,6 +3570,8 @@ pub fn Impl(comptime DB: type) type {
 
             var next = req;
             next.resolved_doc_filter = resolved_filter;
+            next.filter_text = null;
+            next.exclusion_text = null;
             next.filter_query_json = "";
             next.exclusion_query_json = "";
             return .{
@@ -3116,6 +3978,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .load_projected_document = Self.loadRequiredProjectedSearchDocumentCallback,
                 .load_projected_documents = Self.loadProjectedSearchDocumentManyCallback,
                 .load_stored = Self.loadStoredSearchDocumentCallback,
@@ -3124,13 +3987,44 @@ pub fn Impl(comptime DB: type) type {
             });
         }
 
+        fn executeSearchGraphQueryWithAdmissionCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            graph_query: graph_query_mod.GraphQuery,
+            start_key_refs: []const []const u8,
+            target_keys: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try executeGraphQueryWithAdmission(
+                execution.db,
+                alloc,
+                graph_query,
+                start_key_refs,
+                target_keys,
+                execution.admission.iface(),
+            );
+        }
+
         fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
             _ = req.index_name;
+            const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
+            var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name, graph_query.params.node_filter);
+            defer admission.deinit();
+            var execution = GraphPredicateExecutionContext{
+                .db = self,
+                .admission = &admission,
+            };
             var raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
                 .ctx = self,
-                .execute_graph_query = Self.executeSearchGraphQueryCallback,
+                .graph_ctx = if (predicate_aware) &execution else null,
+                .predicate_aware = predicate_aware,
+                .execute_graph_query = if (predicate_aware)
+                    Self.executeSearchGraphQueryWithAdmissionCallback
+                else
+                    Self.executeSearchGraphQueryCallback,
                 .load_projected_document = Self.loadProjectedSearchDocumentCallback,
                 .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+                .filter_keys = Self.filterGraphKeysCallback,
             });
             errdefer raw.deinit();
             try Self.annotateSearchHitOrdinalsNoLock(self, alloc, req, raw.hits);
@@ -3183,16 +4077,43 @@ pub fn Impl(comptime DB: type) type {
             named: *const types.NamedGraphQuery,
             named_sets: []const NamedResultSet,
         ) !types.GraphSearchResult {
+            const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
+            var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
+            defer admission.deinit();
+            var execution = GraphPredicateExecutionContext{
+                .db = self,
+                .admission = &admission,
+            };
             var result = switch (named.query.query_type) {
-                .pattern => try Self.executeSinglePatternQueryWithSets(self, alloc, req, named, named_sets),
+                .pattern => try Self.executeSinglePatternQueryWithSetsWithContext(
+                    self,
+                    alloc,
+                    req,
+                    named,
+                    named_sets,
+                    &execution,
+                    predicate_aware,
+                ),
                 else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
                     .ctx = self,
-                    .find_shortest_path = Self.executeShortestPathCallback,
-                    .find_k_shortest_paths = Self.executeKShortestPathsCallback,
-                    .execute_graph_query = Self.executeGraphQueryCallback,
+                    .graph_ctx = if (predicate_aware) &execution else null,
+                    .predicate_aware = predicate_aware,
+                    .find_shortest_path = if (predicate_aware)
+                        Self.executeShortestPathWithAdmissionCallback
+                    else
+                        Self.executeShortestPathCallback,
+                    .find_k_shortest_paths = if (predicate_aware)
+                        Self.executeKShortestPathsWithAdmissionCallback
+                    else
+                        Self.executeKShortestPathsCallback,
+                    .execute_graph_query = if (predicate_aware)
+                        Self.executeGraphQueryWithAdmissionCallback
+                    else
+                        Self.executeGraphQueryCallback,
                     .load_projected_document = Self.loadProjectedSearchDocumentCallback,
                     .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsForGraphCallback,
                     .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+                    .filter_keys = Self.filterGraphKeysCallback,
                 }),
             };
             errdefer result.deinit(alloc);
@@ -3207,35 +4128,49 @@ pub fn Impl(comptime DB: type) type {
             named: *const types.NamedGraphQuery,
             named_sets: []const NamedResultSet,
         ) !types.GraphSearchResult {
-            return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
-                .ctx = self,
-                .match_pattern = Self.executePatternMatchCallback,
-                .load_projected_document = Self.loadPatternProjectedDocumentCallback,
-                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsForGraphCallback,
-                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
-            });
+            const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
+            var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
+            defer admission.deinit();
+            var execution = GraphPredicateExecutionContext{
+                .db = self,
+                .admission = &admission,
+            };
+            return try Self.executeSinglePatternQueryWithSetsWithContext(
+                self,
+                alloc,
+                req,
+                named,
+                named_sets,
+                &execution,
+                predicate_aware,
+            );
         }
 
         fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
             var algebraic_filter = try self.searchRuntimeSearchRequestWithTextAlgebraicDocFilterAlloc(req);
             defer algebraic_filter.deinit();
             var execution_req = algebraic_filter.req;
-            var resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+            const maybe_resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
                 .ctx = self,
                 .text_index_entry = Self.textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .all_docs_visible = Self.allDocsVisibleCallback,
                 .project_ordinals_to_doc_ids = false,
                 .identity_read_generation = execution_req.identity_read_generation,
             });
+            var resolved_text_filter_storage: db_query_search.ResolvedTextDocNumFilter = undefined;
+            var has_resolved_text_filter = false;
             defer {
-                if (resolved_text_filter) |*filter| filter.deinit(alloc);
+                if (has_resolved_text_filter) resolved_text_filter_storage.deinit(alloc);
             }
-            if (resolved_text_filter) |*filter| {
-                execution_req.resolved_text_doc_filter = filter;
+            if (maybe_resolved_text_filter) |filter| {
+                resolved_text_filter_storage = filter;
+                has_resolved_text_filter = true;
+                execution_req.resolved_text_doc_filter = &resolved_text_filter_storage;
                 execution_req.filter_query_json = "";
                 execution_req.exclusion_query_json = "";
             }
@@ -3256,6 +4191,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .all_docs_visible = Self.allDocsVisibleCallback,
                 .requires_full_candidate_visibility_filter = Self.requiresFullCandidateVisibilityFilterCallback,
                 .postprocess = Self.postprocessTextSearchResultCallback,
@@ -3356,6 +4292,7 @@ pub fn Impl(comptime DB: type) type {
                     .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
                 );
             }
+            db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
             return result;
         }
 
@@ -3385,6 +4322,7 @@ pub fn Impl(comptime DB: type) type {
                     .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
                 );
             }
+            db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
             return result;
         }
 
@@ -3426,9 +4364,7 @@ pub fn Impl(comptime DB: type) type {
                 else => null,
             };
             const access_path = selected_path orelse {
-                if (index_name) |name| {
-                    if (self.core.index_manager.loadFailure(name) != null) return error.IndexUnavailable;
-                }
+                try Self.failIfIndexQuarantined(self, index_name);
                 return error.IndexNotFound;
             };
             var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
@@ -3479,6 +4415,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .load_projected_document = Self.loadRequiredProjectedSearchDocumentCallback,
                 .hbc_search = Self.hbcSearchCallback,
                 .hbc_search_profiled = Self.hbcSearchProfiledCallback,
@@ -3496,6 +4433,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .lookup_doc_nums_for_ordinals = Self.sparseDocNumsForOrdinalsCallback,
                 .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
                 .lookup_doc_ordinals = Self.lookupLiveDocOrdinalsNoLockCallback,
@@ -3614,6 +4552,7 @@ pub fn Impl(comptime DB: type) type {
             return try db_query_search.collectExplicitTextStats(alloc, requests, .{
                 .ctx = self,
                 .text_index_entry = Self.textIndexEntryCallback,
+                .load_many_stored = Self.loadStoredSearchDocumentManyCallback,
             });
         }
 
@@ -4401,6 +5340,37 @@ pub fn Impl(comptime DB: type) type {
             return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
         }
 
+        fn executeGraphQueryWithAdmission(
+            self: *DB,
+            alloc: Allocator,
+            graph_query: graph_query_mod.GraphQuery,
+            start_key_refs: []const []const u8,
+            target_keys: [][]u8,
+            admission: NodeAdmission,
+        ) !graph_query_mod.GraphQueryResult {
+            const entry = self.core.graphIndex(graph_query.index_name) orelse {
+                try Self.failIfIndexQuarantined(self, graph_query.index_name);
+                return error.IndexNotFound;
+            };
+
+            var resolved_query = graph_query;
+            if (graph_query.target_nodes != null) {
+                resolved_query.target_nodes = .{ .keys = try castOwnedKeysToConst(alloc, target_keys) };
+            }
+            defer if (graph_query.target_nodes != null) {
+                switch (resolved_query.target_nodes.?) {
+                    .keys => |owned| alloc.free(owned),
+                    .result_ref => unreachable,
+                }
+            };
+
+            var graph_engine = graph_query_mod.GraphQueryEngine{
+                .alloc = alloc,
+                .node_admission = admission,
+            };
+            return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
+        }
+
         pub fn proveGraphTraversalProgram(self: *DB, index_name: []const u8, constrained_targets: bool) !void {
             const graph_access_path = self.core.index_manager.graphTraversalAccessPath(index_name) orelse return error.InvalidIndexConfig;
             var tensor_program = (try algebraic_mod.planner.planGraphTraversalTensorProgramAlloc(self.alloc, index_name, constrained_targets)) orelse return error.InvalidIndexConfig;
@@ -4419,6 +5389,10 @@ pub fn Impl(comptime DB: type) type {
 
         fn failIfIndexQuarantined(self: *DB, index_name: ?[]const u8) !void {
             const name = index_name orelse return;
+            if (self.core.index_manager.repairUnavailable(name)) {
+                DB.ArtifactRepairCallbacks.refresh_index_repair_availability_for_index(self, self.alloc, name) catch return error.IndexRebuilding;
+                if (self.core.index_manager.repairUnavailable(name)) return error.IndexRebuilding;
+            }
             if (self.core.index_manager.loadFailure(name) != null) return error.IndexUnavailable;
         }
 
@@ -4526,6 +5500,7 @@ pub fn Impl(comptime DB: type) type {
                 max_depth,
                 min_weight,
                 max_weight,
+                null,
             );
         }
 
@@ -4564,6 +5539,7 @@ pub fn Impl(comptime DB: type) type {
                 max_depth,
                 min_weight,
                 max_weight,
+                null,
             );
         }
 
@@ -4661,6 +5637,23 @@ pub fn Impl(comptime DB: type) type {
             return out;
         }
 
+        const PatternNodeFilterContext = struct {
+            db: *DB,
+            cache: db_query_graph.PreparedPatternFilterCache,
+
+            fn init(db: *DB, alloc: Allocator) PatternNodeFilterContext {
+                return .{
+                    .db = db,
+                    .cache = db_query_graph.PreparedPatternFilterCache.init(alloc),
+                };
+            }
+
+            fn deinit(self: *PatternNodeFilterContext) void {
+                self.cache.deinit();
+                self.* = undefined;
+            }
+        };
+
         pub fn matchPattern(
             self: *DB,
             alloc: Allocator,
@@ -4671,13 +5664,39 @@ pub fn Impl(comptime DB: type) type {
             return_aliases: []const []const u8,
         ) ![]graph_pattern_mod.PatternMatch {
             if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
+            var filter_ctx = PatternNodeFilterContext.init(self, alloc);
+            defer filter_ctx.deinit();
             return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
                 .max_results = max_results,
                 .return_aliases = return_aliases,
                 .evaluator = .{
-                    .ctx = self,
+                    .ctx = &filter_ctx,
                     .func = Self.patternNodeFilterEvaluator,
                 },
+            });
+        }
+
+        fn matchPatternWithNodeAdmission(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            start_keys: []const []const u8,
+            pattern: []const graph_pattern_mod.PatternStep,
+            max_results: u32,
+            return_aliases: []const []const u8,
+            node_admission: ?NodeAdmission,
+        ) ![]graph_pattern_mod.PatternMatch {
+            if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
+            var filter_ctx = PatternNodeFilterContext.init(self, alloc);
+            defer filter_ctx.deinit();
+            return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
+                .max_results = max_results,
+                .return_aliases = return_aliases,
+                .evaluator = .{
+                    .ctx = &filter_ctx,
+                    .func = Self.patternNodeFilterEvaluator,
+                },
+                .node_admission = node_admission,
             });
         }
 
@@ -4687,6 +5706,9 @@ pub fn Impl(comptime DB: type) type {
             hit_ids: []const []const u8,
             generation: ?u64,
         ) ![]types.SearchHit {
+            const ordinals = try self.searchRuntimeLookupLiveDocOrdinalsNoLock(alloc, hit_ids, generation);
+            defer alloc.free(ordinals);
+
             const hits = try alloc.alloc(types.SearchHit, hit_ids.len);
             var initialized: usize = 0;
             errdefer {
@@ -4696,7 +5718,7 @@ pub fn Impl(comptime DB: type) type {
             for (hit_ids, 0..) |hit_id, j| {
                 hits[j] = .{
                     .id = try alloc.dupe(u8, hit_id),
-                    .doc_ordinal = try self.searchRuntimeLookupLiveDocOrdinalNoLock(alloc, hit_id, generation),
+                    .doc_ordinal = ordinals[j],
                     .score = null,
                     .stored_data = null,
                     .chunk_hits = &.{},
@@ -5073,15 +6095,16 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn patternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
-            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-            return try Self.matchesPatternNodeFilter(self, key, filter);
+            const active: *PatternNodeFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+            return try Self.matchesPatternNodeFilter(active, key, filter);
         }
 
-        fn matchesPatternNodeFilter(self: *DB, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
+        fn matchesPatternNodeFilter(active: *PatternNodeFilterContext, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
             if (filter.filter_query_json == null) return true;
-            const stored = (try Self.loadStoredSearchDocument(self, self.alloc, key)) orelse return false;
-            defer self.alloc.free(stored);
-            return try db_query_graph.storedDocMatchesPatternFilter(self.alloc, key, stored, filter.filter_query_json.?);
+            const stored = (try Self.loadStoredSearchDocument(active.db, active.db.alloc, key)) orelse return false;
+            defer active.db.alloc.free(stored);
+            const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
+            return try prepared.matchesStored(active.db.alloc, key, stored);
         }
 
         pub fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, doc_key: []const u8, raw: []const u8) ![]u8 {
@@ -5250,6 +6273,12 @@ pub fn Impl(comptime DB: type) type {
                 documents.deinit(alloc);
             }
 
+            var prepared_filter = if (opts.filter_query_json.len > 0)
+                try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json)
+            else
+                null;
+            defer if (prepared_filter) |*filter| filter.deinit();
+
             var count: u32 = 0;
             const relational_base_rows = Self.hasRelationalBaseRows(self);
             for (docs) |doc| {
@@ -5275,8 +6304,8 @@ pub fn Impl(comptime DB: type) type {
                     try mapper.materializeDocumentValueAlloc(alloc, doc.value);
                 defer alloc.free(doc_json);
 
-                if (opts.filter_query_json.len > 0) {
-                    if (!(try db_query_graph.storedDocMatchesPatternFilter(alloc, raw_key, doc_json, opts.filter_query_json))) continue;
+                if (prepared_filter) |*filter| {
+                    if (!(try filter.matchesStored(alloc, raw_key, doc_json))) continue;
                 }
 
                 const hash = std.hash.Wyhash.hash(0, doc_json);
@@ -5851,6 +6880,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .project_ordinals_to_doc_ids = false,
                 .identity_read_generation = req.identity_read_generation,
             });
@@ -5869,6 +6899,7 @@ pub fn Impl(comptime DB: type) type {
                 .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
                 .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
                 .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .nonvisible_doc_set = Self.nonVisibleDocSetCallback,
                 .all_docs_visible = Self.allDocsVisibleCallback,
                 .project_ordinals_to_doc_ids = false,
                 .identity_read_generation = req.identity_read_generation,
@@ -6034,6 +7065,16 @@ pub fn Impl(comptime DB: type) type {
             return try self.searchRuntimeLiveFilterDocSet(alloc, set, generation);
         }
 
+        fn nonVisibleDocSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            generation: ?u64,
+        ) anyerror!?doc_set.ResolvedDocSet {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (Self.ttlDurationNs(self) != 0) return null;
+            return try Self.nonVisibleDocSetCachedAlloc(self, alloc, generation);
+        }
+
         fn allDocsVisibleCallback(
             ctx: ?*anyopaque,
             generation: ?u64,
@@ -6078,6 +7119,24 @@ pub fn Impl(comptime DB: type) type {
         ) anyerror![]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             return try Self.projectStoredBytesForSearch(self, alloc, req, doc_key, raw);
+        }
+
+        fn executeGraphQueryWithAdmissionCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            start_key_refs: []const []const u8,
+            target_keys: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try executeGraphQueryWithAdmission(
+                execution.db,
+                alloc,
+                named.query,
+                start_key_refs,
+                target_keys,
+                execution.admission.iface(),
+            );
         }
 
         fn loadProjectedSearchDocumentCallback(
@@ -6373,6 +7432,61 @@ pub fn Impl(comptime DB: type) type {
             }, options, consumer_ctx, consumer);
         }
 
+        pub fn graphHydrateKeysForInternalRead(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]types.SearchHit {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+            var admission = try Self.filterGraphKeysWithOrdinalsAlloc(
+                self,
+                alloc,
+                snapshot_req,
+                keys,
+            );
+            defer admission.deinit(alloc);
+
+            var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
+            errdefer {
+                for (hits.items) |*hit| hit.deinit(alloc);
+                hits.deinit(alloc);
+            }
+            try hits.ensureTotalCapacity(alloc, keys.len);
+            for (keys, admission.allowed, admission.ordinals, 0..) |key, admitted, maybe_ordinal, i| {
+                if (!admitted) continue;
+                const ordinal = maybe_ordinal orelse return error.InvalidGraphNodeAdmissionResult;
+                var stored_data: ?[]u8 = null;
+                if (admission.stored_data) |items| {
+                    stored_data = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
+                    items[i] = null;
+                }
+                const id = try alloc.dupe(u8, key);
+                errdefer alloc.free(id);
+                hits.appendAssumeCapacity(.{
+                    .id = id,
+                    .doc_ordinal = ordinal,
+                    .stored_data = stored_data,
+                });
+            }
+            return try hits.toOwnedSlice(alloc);
+        }
+
+        pub fn graphHasIncomingEdgesForInternalRead(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            keys: []const []const u8,
+        ) ![]bool {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            const graph_entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+            return try graph_entry.index.hasIncomingEdgesManyAlloc(alloc, keys);
+        }
+
         fn scanStoreRangeCallback(
             ctx: ?*anyopaque,
             alloc: Allocator,
@@ -6432,6 +7546,322 @@ pub fn Impl(comptime DB: type) type {
             return try Self.loadStoredSearchDocumentMany(self, alloc, keys);
         }
 
+        fn executeSinglePatternQueryWithSetsWithContext(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            named: *const types.NamedGraphQuery,
+            named_sets: []const NamedResultSet,
+            execution: *GraphPredicateExecutionContext,
+            predicate_aware: bool,
+        ) !types.GraphSearchResult {
+            return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
+                .ctx = self,
+                .graph_ctx = if (predicate_aware) execution else null,
+                .predicate_aware = predicate_aware,
+                .match_pattern = if (predicate_aware)
+                    executePatternMatchWithAdmissionCallback
+                else
+                    executePatternMatchCallback,
+                .load_projected_document = loadPatternProjectedDocumentCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+                .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+                .filter_keys = filterGraphKeysCallback,
+            });
+        }
+
+        fn filterGraphKeysCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) anyerror![]bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.filterGraphKeysAlloc(self, alloc, req, keys);
+        }
+
+        fn filterGraphKeysAlloc(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]bool {
+            var filter_req = req;
+            filter_req.include_stored = false;
+            const admission = try Self.filterGraphKeysWithOrdinalsAlloc(self, alloc, filter_req, keys);
+            alloc.free(admission.ordinals);
+            return admission.allowed;
+        }
+
+        const GraphKeyAdmission = struct {
+            allowed: []bool,
+            ordinals: []?doc_set.DocOrdinal,
+            stored_data: ?[]?[]u8 = null,
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                alloc.free(self.allowed);
+                alloc.free(self.ordinals);
+                if (self.stored_data) |items| freeOptionalOwnedBytes(alloc, items);
+                self.* = undefined;
+            }
+        };
+
+        fn filterGraphKeysWithOrdinalsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) !GraphKeyAdmission {
+            const ordinals = try Self.lookupLiveDocOrdinalsNoLock(
+                self,
+                alloc,
+                keys,
+                req.identity_read_generation,
+            );
+            errdefer alloc.free(ordinals);
+
+            var live_count: usize = 0;
+            for (ordinals) |ordinal| {
+                if (ordinal != null) live_count += 1;
+            }
+
+            const mask = try alloc.alloc(bool, keys.len);
+            errdefer alloc.free(mask);
+            @memset(mask, false);
+            if (live_count == 0) return .{
+                .allowed = mask,
+                .ordinals = ordinals,
+            };
+
+            const loaded = if (req.include_stored)
+                try Self.loadStoredSearchDocumentMany(self, alloc, keys)
+            else
+                null;
+            defer if (loaded) |items| freeOptionalOwnedBytes(alloc, items);
+
+            var hits = try alloc.alloc(types.SearchHit, live_count);
+            var initialized: usize = 0;
+            var hits_owned = true;
+            errdefer if (hits_owned) {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                if (hits.len > 0) alloc.free(hits);
+            };
+            for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
+                const ordinal = maybe_ordinal orelse continue;
+                const id = try alloc.dupe(u8, key);
+                errdefer alloc.free(id);
+                const stored_data = if (loaded) |items| blk: {
+                    const value = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
+                    items[i] = null;
+                    break :blk value;
+                } else null;
+                hits[initialized] = .{
+                    .id = id,
+                    .doc_ordinal = ordinal,
+                    .score = 1.0,
+                    .stored_data = stored_data,
+                };
+                initialized += 1;
+            }
+
+            var filtered = try db_query_result_shape.applyStoredSearchPatternFilters(alloc, req, .{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = @intCast(hits.len),
+                .graph_results = &.{},
+            }, .{
+                .ctx = self,
+                .load_stored = loadStoredSearchDocumentCallback,
+                .load_many_stored = loadStoredSearchDocumentManyCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            });
+            hits_owned = false;
+            defer filtered.deinit();
+
+            const stored_data = if (req.include_stored) blk: {
+                const values = try alloc.alloc(?[]u8, keys.len);
+                @memset(values, null);
+                break :blk values;
+            } else null;
+            errdefer if (stored_data) |items| freeOptionalOwnedBytes(alloc, items);
+
+            var filtered_index: usize = 0;
+            for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
+                if (maybe_ordinal == null) continue;
+                const allowed = filtered_index < filtered.hits.len and
+                    std.mem.eql(u8, key, filtered.hits[filtered_index].id);
+                mask[i] = allowed;
+                if (!allowed) continue;
+                if (stored_data) |items| {
+                    items[i] = filtered.hits[filtered_index].stored_data orelse
+                        return error.InvalidGraphNodeAdmissionResult;
+                    filtered.hits[filtered_index].stored_data = null;
+                }
+                filtered_index += 1;
+            }
+            if (filtered_index != filtered.hits.len) return error.InvalidQueryResult;
+            return .{
+                .allowed = mask,
+                .ordinals = ordinals,
+                .stored_data = stored_data,
+            };
+        }
+
+        const GraphPredicateExecutionContext = struct {
+            db: *DB,
+            admission: *GraphNodeAdmissionCache,
+        };
+
+        fn graphRequestRequiresAdmission(
+            req: types.SearchRequest,
+            node_filter: graph_pattern_mod.NodeFilter,
+        ) bool {
+            return db_query_graph.searchRequestHasGraphPredicates(req) or
+                req.graph_table_read_authorizer != null or
+                graph_query_mod.nodeFilterActive(node_filter);
+        }
+
+        const GraphNodeAdmissionCache = struct {
+            db: *DB,
+            req: types.SearchRequest,
+            alloc: Allocator,
+            external_targets: bool,
+            node_filter: graph_pattern_mod.NodeFilter,
+            prepared_filters: db_query_graph.PreparedPatternFilterCache,
+            decisions: std.StringHashMapUnmanaged(bool) = .empty,
+
+            fn init(
+                db: *DB,
+                alloc: Allocator,
+                req: types.SearchRequest,
+                index_name: []const u8,
+                node_filter: graph_pattern_mod.NodeFilter,
+            ) GraphNodeAdmissionCache {
+                const artifact_source = db.core.index_manager.graphArtifactSource(index_name);
+                return .{
+                    .db = db,
+                    .req = req,
+                    .alloc = alloc,
+                    .external_targets = artifact_source != null and
+                        artifact_source.?.mapping.node_model == .external,
+                    .node_filter = node_filter,
+                    .prepared_filters = db_query_graph.PreparedPatternFilterCache.init(alloc),
+                };
+            }
+
+            fn deinit(self: *GraphNodeAdmissionCache) void {
+                var it = self.decisions.keyIterator();
+                while (it.next()) |key| self.alloc.free(key.*);
+                self.decisions.deinit(self.alloc);
+                self.prepared_filters.deinit();
+                self.* = undefined;
+            }
+
+            fn iface(self: *GraphNodeAdmissionCache) NodeAdmission {
+                return .{
+                    .ctx = self,
+                    .external_targets = self.external_targets,
+                    .filter_many = filterMany,
+                };
+            }
+
+            fn filterMany(
+                ctx: ?*anyopaque,
+                result_alloc: Allocator,
+                nodes: []const GraphNodeRef,
+            ) anyerror![]bool {
+                const self: *GraphNodeAdmissionCache = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                const result = try result_alloc.alloc(bool, nodes.len);
+                errdefer result_alloc.free(result);
+
+                var missing_by_key = std.StringHashMapUnmanaged(void).empty;
+                defer missing_by_key.deinit(result_alloc);
+                var missing_keys = std.ArrayListUnmanaged([]const u8).empty;
+                defer missing_keys.deinit(result_alloc);
+
+                for (nodes) |node| {
+                    // A DB-local graph engine has no target-table catalog or
+                    // owner-routed reader. Authenticated cross-table reads must
+                    // execute through the distributed coordinator.
+                    if (node.table != null and self.req.graph_table_read_authorizer != null) {
+                        return error.UnsupportedQueryRequest;
+                    }
+                    if (node.external or node.table != null) continue;
+                    const key = node.key;
+                    if (self.decisions.contains(key)) continue;
+                    const entry = try missing_by_key.getOrPut(result_alloc, key);
+                    if (entry.found_existing) continue;
+                    entry.value_ptr.* = {};
+                    try missing_keys.append(result_alloc, key);
+                }
+
+                if (missing_keys.items.len > 0) {
+                    const missing_mask = try Self.filterGraphKeysAlloc(
+                        self.db,
+                        result_alloc,
+                        self.req,
+                        missing_keys.items,
+                    );
+                    defer result_alloc.free(missing_mask);
+                    if (missing_mask.len != missing_keys.items.len) {
+                        return error.InvalidGraphNodeAdmissionResult;
+                    }
+
+                    for (missing_keys.items, missing_mask) |key, *allowed| {
+                        if (allowed.* and self.node_filter.filter_prefix.len > 0 and
+                            !std.mem.startsWith(u8, key, self.node_filter.filter_prefix))
+                        {
+                            allowed.* = false;
+                        }
+                    }
+
+                    if (self.node_filter.filter_query_json) |filter_query_json| {
+                        var query_keys = std.ArrayListUnmanaged([]const u8).empty;
+                        defer query_keys.deinit(result_alloc);
+                        var query_positions = std.ArrayListUnmanaged(usize).empty;
+                        defer query_positions.deinit(result_alloc);
+                        for (missing_keys.items, missing_mask, 0..) |key, allowed, i| {
+                            if (!allowed) continue;
+                            try query_keys.append(result_alloc, key);
+                            try query_positions.append(result_alloc, i);
+                        }
+                        if (query_keys.items.len > 0) {
+                            const loaded = try Self.loadStoredSearchDocumentMany(
+                                self.db,
+                                result_alloc,
+                                query_keys.items,
+                            );
+                            defer freeOptionalOwnedBytes(result_alloc, loaded);
+                            const prepared = try self.prepared_filters.getOrPrepare(filter_query_json);
+                            for (query_keys.items, query_positions.items, loaded) |key, position, maybe_stored| {
+                                missing_mask[position] = if (maybe_stored) |stored|
+                                    try prepared.matchesStored(result_alloc, key, stored)
+                                else
+                                    false;
+                            }
+                        }
+                    }
+
+                    for (missing_keys.items, missing_mask) |key, allowed| {
+                        const owned_key = try self.alloc.dupe(u8, key);
+                        self.decisions.putNoClobber(self.alloc, owned_key, allowed) catch |err| {
+                            self.alloc.free(owned_key);
+                            return err;
+                        };
+                    }
+                }
+
+                for (nodes, 0..) |node, i| {
+                    result[i] = if (node.external or node.table != null)
+                        !graph_query_mod.nodeFilterActive(self.node_filter)
+                    else
+                        self.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult;
+                }
+                return result;
+            }
+        };
+
         fn executePatternMatchCallback(
             ctx: ?*anyopaque,
             alloc: Allocator,
@@ -6440,6 +7870,25 @@ pub fn Impl(comptime DB: type) type {
         ) anyerror![]graph_pattern_mod.PatternMatch {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             return try Self.matchNamedPattern(self, alloc, named, start_key_refs);
+        }
+
+        fn executePatternMatchWithAdmissionCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            start_key_refs: []const []const u8,
+        ) anyerror![]graph_pattern_mod.PatternMatch {
+            const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.matchPatternWithNodeAdmission(
+                execution.db,
+                alloc,
+                named.query.index_name,
+                start_key_refs,
+                named.query.pattern,
+                named.query.params.max_results,
+                named.query.return_aliases,
+                execution.admission.iface(),
+            );
         }
 
         fn loadPatternProjectedDocumentCallback(
@@ -6475,6 +7924,29 @@ pub fn Impl(comptime DB: type) type {
             );
         }
 
+        fn executeShortestPathWithAdmissionCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            source: []const u8,
+            target: []const u8,
+        ) anyerror!?types.GraphPath {
+            const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try execution.db.core.graphFindShortestPath(
+                alloc,
+                named.query.index_name,
+                source,
+                target,
+                named.query.params.edge_types,
+                named.query.params.direction,
+                named.query.params.weight_mode,
+                named.query.params.max_depth,
+                named.query.params.min_weight,
+                named.query.params.max_weight,
+                execution.admission.iface(),
+            );
+        }
+
         fn executeKShortestPathsCallback(
             ctx: ?*anyopaque,
             alloc: Allocator,
@@ -6496,6 +7968,30 @@ pub fn Impl(comptime DB: type) type {
                 named.query.params.max_depth,
                 named.query.params.min_weight,
                 named.query.params.max_weight,
+            );
+        }
+
+        fn executeKShortestPathsWithAdmissionCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            source: []const u8,
+            target: []const u8,
+        ) anyerror![]types.GraphPath {
+            const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try execution.db.core.graphFindKShortestPaths(
+                alloc,
+                named.query.index_name,
+                source,
+                target,
+                named.query.k,
+                named.query.params.edge_types,
+                named.query.params.direction,
+                named.query.params.weight_mode,
+                named.query.params.max_depth,
+                named.query.params.min_weight,
+                named.query.params.max_weight,
+                execution.admission.iface(),
             );
         }
 
@@ -7387,6 +8883,7 @@ test "db search runtime reopen updateRange constrains index backfill" {
     try db.core.store.put(doc_c_key, "{\"title\":\"gamma\"}");
 
     try db.updateRange(.{ .start = "doc:b", .end = "doc:c\xff" });
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
     try db.addIndex(.{
         .name = "ft_range",
         .kind = .full_text,
@@ -10026,6 +11523,8 @@ test "db search runtime indexing full-text backfill resumes after interrupted re
 
     index_manager_mod.test_abort_text_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+    var state_path: ?[]u8 = null;
+    defer if (state_path) |owned| alloc.free(owned);
     {
         var interrupted = try DB.open(alloc, std.mem.span(path), .{});
         defer interrupted.close();
@@ -10034,11 +11533,15 @@ test "db search runtime indexing full-text backfill resumes after interrupted re
             "TestInjectedBackfillFailure",
             interrupted.core.index_manager.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
         );
+
+        const cfg = interrupted.core.index_manager.get("ft_v1") orelse return error.IndexNotFound;
+        const rebuild_root = try interrupted.derivedAsyncDenseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root);
+        const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
+        state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -10047,7 +11550,7 @@ test "db search runtime indexing full-text backfill resumes after interrupted re
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "ft_v1",
@@ -11339,15 +12842,32 @@ test "db search runtime indexing dense and sparse field-backed vector indexes st
         .kind = .dense_vector,
         .config_json = "{\"field\":\"body\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
     });
+    try std.testing.expect(db.core.index_manager.denseIndexUsesManagedDirectField("dv_v1"));
+    try std.testing.expect(db.core.index_manager.sparseIndexUsesManagedDirectField("sp_v1"));
+    try std.testing.expect(!db.core.index_manager.denseIndexUsesManagedDirectField("semantic_idx"));
 
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[0,1,0],\"sparse\":{\"indices\":[3],\"values\":[1.0]}}" },
             .{ .key = "doc:c", .value = "{\"embedding\":[0,0,1],\"sparse\":{\"indices\":[11],\"values\":[1.0]}}" },
+            .{ .key = "doc:missing", .value = "{\"title\":\"no vectors\"}" },
         },
         .sync_level = .full_index,
     });
+
+    const coverage_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, coverage_stats);
+    try std.testing.expectEqual(@as(u64, 4), coverage_stats.source_doc_count);
+    var checked_direct_indexes: usize = 0;
+    for (coverage_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_v1") and !std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 3), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_skipped_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        checked_direct_indexes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked_direct_indexes);
 
     const stored = (try db.get(alloc, "doc:a")).?;
     defer alloc.free(stored);
@@ -11428,6 +12948,32 @@ test "db search runtime indexing dense and sparse field-backed vector indexes st
     });
     defer dense_after.deinit();
     try std.testing.expectEqualStrings("doc:a", dense_after.hits[0].id);
+
+    const ExpectCoverage = struct {
+        fn run(db_value: *DB, source: u64, produced: u64, skipped: u64) !void {
+            const stats = try db_value.stats(std.testing.allocator);
+            defer types.freeDBStats(std.testing.allocator, stats);
+            try std.testing.expectEqual(source, stats.source_doc_count);
+            var checked: usize = 0;
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "dv_v1") and !std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+                try std.testing.expectEqual(produced, index_stats.coverage_produced_count);
+                try std.testing.expectEqual(skipped, index_stats.coverage_skipped_count);
+                checked += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 2), checked);
+        }
+    };
+    try ExpectCoverage.run(&db, 5, 4, 1);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"now missing vectors\"}" }}, .sync_level = .full_index });
+    try ExpectCoverage.run(&db, 5, 3, 2);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:missing", .value = "{\"embedding\":[1,1,0],\"sparse\":{\"indices\":[17],\"values\":[1.0]}}" }}, .sync_level = .full_index });
+    try ExpectCoverage.run(&db, 5, 4, 1);
+
+    try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .full_index });
+    try ExpectCoverage.run(&db, 4, 3, 1);
 }
 
 test "db search runtime indexing document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
@@ -11886,7 +13432,7 @@ test "db search runtime graph composition named graph input sets carry resolved 
         .identity_read_generation = current_generation,
     }, &graph_queries, &paged_input_sets));
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.executeNamedGraphQueries(alloc, .{
         .identity_read_generation = current_generation -| 1,
     }, &graph_queries, &input_sets));
 }
@@ -12774,6 +14320,8 @@ test "db search runtime graph composition graph reverse rebuild resumes after in
 
     graph_mod.test_abort_reverse_rebuild_after_batches = 1;
     defer graph_mod.test_abort_reverse_rebuild_after_batches = null;
+    var state_path: ?[]u8 = null;
+    defer if (state_path) |owned| alloc.free(owned);
     {
         var interrupted = try DB.open(alloc, std.mem.span(path), .{});
         defer interrupted.close();
@@ -12782,11 +14330,15 @@ test "db search runtime graph composition graph reverse rebuild resumes after in
             "TestInjectedBackfillFailure",
             interrupted.core.index_manager.loadFailure("gr_v1") orelse return error.TestExpectedEqual,
         );
+
+        const cfg = interrupted.core.index_manager.get("gr_v1") orelse return error.IndexNotFound;
+        const rebuild_root = try interrupted.derivedAsyncDenseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root);
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.graph, rebuild_root, cfg.*);
+        state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/gr_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -12795,7 +14347,7 @@ test "db search runtime graph composition graph reverse rebuild resumes after in
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
 
     const incoming = try reopened.getEdges(alloc, "gr_v1", "doc:target", "links", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, incoming);
@@ -12846,6 +14398,10 @@ test "db search runtime text schema runUntilIdle drains scheduled text merges af
     }
 
     try db.runUntilIdle();
+
+    const merge_stats = db.pendingWorkStats().text_merge;
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.pending_indexes);
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
     try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
@@ -14650,24 +16206,24 @@ test "db search runtime identity search requests default to current identity gen
     const explicit = try db.searchRequestAtCurrentIdentityGeneration(.{ .identity_read_generation = current_generation });
     try std.testing.expectEqual(@as(?u64, current_generation), explicit.identity_read_generation);
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.searchRequestAtCurrentIdentityGeneration(.{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(.{
         .identity_read_generation = current_generation -| 1,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.search(alloc, .{
         .identity_read_generation = current_generation + 1,
     }));
 
     var preflight = try db.preflightSearchRequest(alloc, .{ .identity_read_generation = current_generation }, 0);
     defer preflight.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.preflightSearchRequest(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.preflightSearchRequest(alloc, .{
         .identity_read_generation = current_generation -| 1,
     }, 0));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectPlanningStats(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.collectPlanningStats(alloc, .{
         .identity_read_generation = current_generation + 1,
     }, 0));
     const text_stats = try db.collectSearchRequestTextStats(alloc, .{ .identity_read_generation = current_generation });
     defer alloc.free(text_stats);
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectSearchRequestTextStats(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.collectSearchRequestTextStats(alloc, .{
         .identity_read_generation = current_generation + 1,
     }));
 
@@ -14915,6 +16471,9 @@ test "db search runtime identity sparse hits resolve doc ordinals through identi
             .k = 1,
         } },
         .limit = 1,
+        // Qualification validates persistence/reopen correctness rather than
+        // the default approximate-recall operating point.
+        .search_effort = 1.0,
     });
     defer result.deinit();
 
@@ -15244,6 +16803,27 @@ test "db search runtime identity default dynamic schema vector term filters proj
     try std.testing.expectEqualStrings("doc:c", dense_text_exclusion_filter.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 1), dense_text_exclusion_filter.profile.raw_hit_count);
 
+    var dense_native_text_filters = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .filter_text = .{ .match_phrase = .{
+            .field = "body",
+            .text = "alpha winner",
+        } },
+        .exclusion_text = .{ .term = .{
+            .field = "status.keyword",
+            .term = "draft",
+        } },
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_native_text_filters.result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), dense_native_text_filters.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), dense_native_text_filters.result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", dense_native_text_filters.result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", dense_native_text_filters.result.hits[1].id);
+    try std.testing.expectEqual(@as(u32, 2), dense_native_text_filters.profile.raw_hit_count);
+
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "status.keyword", "active"));
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
@@ -15295,7 +16875,7 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
         .limit = 1,
         .offset = 1024,
         .include_stored = false,
-        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+        .filter_query_json = "{\"term\":{\"field\":\"body\",\"term\":\"keep\"}}",
     }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
     defer dense_result.result.deinit();
 
@@ -15303,6 +16883,90 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
     try std.testing.expectEqual(@as(u32, 1025), dense_result.result.total_hits);
     try std.testing.expectEqual(types.TotalHitsRelation.gte, dense_result.result.total_hits_relation);
     try std.testing.expectEqual(@as(u32, 1025), dense_result.profile.raw_hit_count);
+}
+
+test "db dense default dynamic one percent filters exact score top one hundred" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const default_schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, default_schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    const doc_count: usize = 10_000;
+    const eligible_count: usize = 100;
+    const writes = try alloc.alloc(types.BatchWrite, doc_count);
+    defer {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i}),
+            .value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"id\":{d},\"bucket\":\"{s}\",\"embedding\":[{d},0]}}",
+                .{ i, if (i >= doc_count - eligible_count) "selected" else "other", i },
+            ),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .full_index,
+    });
+
+    const filters = [_][]const u8{
+        "{\"numeric_range\":{\"field\":\"id\",\"min\":9900,\"inclusive_min\":true}}",
+        "{\"term\":{\"bucket\":\"selected\"}}",
+    };
+    for (filters) |filter_query_json| {
+        var profiled = try db.searchDenseProfiled(alloc, .{
+            .index_name = "dv_v1",
+            .primary_text_index_name = "ft_v1",
+            .limit = eligible_count,
+            .include_stored = false,
+            .filter_query_json = filter_query_json,
+        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = eligible_count });
+        defer profiled.result.deinit();
+
+        try std.testing.expectEqual(@as(u32, eligible_count), profiled.result.total_hits);
+        try std.testing.expectEqual(eligible_count, profiled.result.hits.len);
+        try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.native_filter_candidate_count);
+        try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
+        try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
+        for (profiled.result.hits, 0..) |hit, rank| {
+            const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
+            defer alloc.free(expected);
+            try std.testing.expectEqualStrings(expected, hit.id);
+        }
+    }
 }
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
@@ -16142,6 +17806,75 @@ test "db search runtime preflight surfaces structured filter probe counts when c
     try std.testing.expect(geo_summary.structured_filter_doc_count_sample_estimate != null);
     try std.testing.expectEqual(@as(u32, 2), geo_summary.structured_filter_count_sample_size);
     try std.testing.expect(geo_summary.structured_filter_doc_count_lower_bound != null or geo_summary.structured_filter_doc_count_estimate != null);
+}
+
+test "db provisioning schema is persisted before configured full text indexes open" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    // Persist the target-generation catalog entry while the shard still has
+    // no target schema. This is the state an interrupted migration presents
+    // to the next provisioning open.
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "full_text_index_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+    }
+
+    const schema_json =
+        \\{
+        \\  "version": 1,
+        \\  "default_type": "doc",
+        \\  "enforce_types": true,
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": false,
+        \\        "properties": {
+        \\          "body": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["text"],
+        \\            "x-antfly-include-in-all": false
+        \\          }
+        \\        },
+        \\        "required": ["body"]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .schema_before_index_load = runtime_schema,
+    });
+    defer reopened.close();
+
+    const entry = reopened.core.index_manager.textIndexEntry("full_text_index_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), entry.runtime_schema.?.version);
+    try reopened.batch(.{
+        .writes = &.{.{ .key = "doc:1", .value = "{\"body\":\"alpha beta\"}" }},
+        .sync_level = .full_text,
+    });
+
+    const snapshot = entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "body", "alpha"));
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "body.keyword", "alpha beta"));
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "_all", "alpha"));
 }
 
 test "db search runtime writes and reads timestamp metadata" {

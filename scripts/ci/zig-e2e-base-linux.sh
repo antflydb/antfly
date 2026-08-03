@@ -64,16 +64,31 @@ if [[ "$#" -gt 0 ]]; then
   run_inference="${RUN_INFERENCE_E2E:-0}"
 else
   antfly_args=(
-    -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow"
+    -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow"
     e2e/antfly
   )
   run_inference="${RUN_INFERENCE_E2E:-1}"
 fi
 
-UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q -x "${antfly_args[@]}"
+antfly_status=0
+UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q --continue-on-collection-errors "${antfly_args[@]}" || antfly_status=$?
 
+inference_status=0
 if [[ "$run_inference" == "1" ]]; then
-  UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q -x \
+  UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q --continue-on-collection-errors \
     -m "not slow and not multimodal and not model_integration and not browser_integration" \
-    e2e/inference
+    e2e/inference || inference_status=$?
 fi
+
+overall_status=0
+if [[ "$antfly_status" -ne 0 ]]; then
+  echo "Antfly E2E suite failed with exit code $antfly_status" >&2
+  overall_status=$antfly_status
+fi
+if [[ "$inference_status" -ne 0 ]]; then
+  echo "Inference E2E suite failed with exit code $inference_status" >&2
+  if [[ "$overall_status" -eq 0 ]]; then
+    overall_status=$inference_status
+  fi
+fi
+exit "$overall_status"

@@ -25,7 +25,7 @@ const raft_mod = @import("../../raft/mod.zig");
 const core = @import("core.zig");
 const cache = @import("cache.zig");
 const remote_wire = @import("remote_wire.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const RuntimeSourceAdapter = struct {
     source: core.TableReadSource,
@@ -199,6 +199,33 @@ pub fn aggregationContextForDb(
     };
 }
 
+pub fn aggregationContextForCapturedResultDb(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    db: *db_mod.DB,
+) !db_mod.aggregations.Context {
+    const identity_read_generation = currentIdentityReadGenerationForDb(req.identity_read_generation, db) catch |err| switch (err) {
+        // A complete result is already an immutable, exact aggregation input.
+        // If background derived work advanced the DB after that search, do not
+        // mix the captured rows with acceleration state from a newer identity
+        // generation. Stored-row aggregations can still execute exactly; any
+        // aggregation that requires index state remains unsupported and can be
+        // retried by the caller against one coherent generation.
+        error.IdentityReadGenerationChanged => return .{
+            .identity_read_generation = req.identity_read_generation,
+        },
+        else => return err,
+    };
+    return .{
+        .index_manager = db.core.index_manager,
+        .doc_store = db.core.store,
+        .full_text_index_name = req.index_name,
+        .algebraic_index_name = req.index_name,
+        .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
+        .identity_read_generation = identity_read_generation,
+    };
+}
+
 pub fn currentIdentityReadGenerationForDb(requested: ?u64, db: *db_mod.DB) !u64 {
     return try db.currentIdentityReadGenerationForRequest(requested);
 }
@@ -231,6 +258,8 @@ pub fn algebraicIndexFreshEnoughForName(
 
 pub fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
     return req.full_text == null and
+        req.filter_text == null and
+        req.exclusion_text == null and
         req.exclusion_query_json.len == 0 and
         req.full_text_queries.len == 0 and
         req.dense == null and
@@ -268,7 +297,8 @@ pub fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
     const slice = std.mem.span(value);
     if (slice.len == 0) return default_aggregation_full_result_budget;
     const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
-    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+    if (parsed == 0) return default_aggregation_full_result_budget;
+    return @min(parsed, @as(u32, @intCast(db_mod.aggregations.max_aggregation_source_hits)));
 }
 
 pub fn aggregationFullResultBudget() u32 {
@@ -317,8 +347,11 @@ pub fn aggregationFirstPassIsComplete(
 
 pub fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
     try checkQueryDeadline(req);
-    if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
     const budget = aggregationFullResultBudget();
+    // An inexact first page is a lower bound, not a safe allocation size.
+    // Rerun up to the configured budget and require that execution to prove
+    // completeness before computing aggregations.
+    if (result.total_hits_relation != .exact) return budget;
     if (result.total_hits > budget) {
         std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
             operation,
@@ -328,6 +361,26 @@ pub fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mo
         return error.QueryCandidateBudgetExceeded;
     }
     return result.total_hits;
+}
+
+pub fn requireCompleteAggregationFullResult(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+    operation: []const u8,
+) !void {
+    try checkQueryDeadline(req);
+    if (aggregationCanUseCurrentResult(req, result)) return;
+    std.log.warn("query aggregation bounded full-result rerun remained incomplete operation={s} relation={s} total_hits={d} returned_hits={d} budget={d}", .{
+        operation,
+        @tagName(result.total_hits_relation),
+        result.total_hits,
+        result.hits.len,
+        aggregationFullResultBudget(),
+    });
+    if (result.total_hits_relation == .gte or result.total_hits >= aggregationFullResultBudget()) {
+        return error.QueryCandidateBudgetExceeded;
+    }
+    return error.UnsupportedQueryRequest;
 }
 
 pub fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
@@ -383,9 +436,21 @@ test "aggregation context rejects non-current identity generation" {
     const current = db.core.nextDerivedSequence();
     const ctx = try aggregationContextForDb(alloc, .{ .identity_read_generation = current }, &db);
     try std.testing.expectEqual(@as(?u64, current), ctx.identity_read_generation);
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationContextForDb(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, aggregationContextForDb(alloc, .{
         .identity_read_generation = current + 1,
     }, &db));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"v\":2}" }},
+        .sync_level = .write,
+    });
+    const captured = try aggregationContextForCapturedResultDb(alloc, .{
+        .identity_read_generation = current,
+    }, &db);
+    try std.testing.expectEqual(@as(?u64, current), captured.identity_read_generation);
+    try std.testing.expect(captured.index_manager == null);
+    try std.testing.expect(captured.doc_store == null);
+    try std.testing.expect(!captured.algebraic_available);
 }
 
 test "aggregation completeness requires exact total relation" {
@@ -416,7 +481,7 @@ test "aggregation completeness requires exact total relation" {
         .total_hits = 1,
         .total_hits_relation = .gte,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, .{
+    try std.testing.expectEqual(aggregationFullResultBudget(), try aggregationFullResultLimit(.{}, .{
         .alloc = std.testing.allocator,
         .hits = @constCast(hits[0..]),
         .total_hits = 1,
@@ -460,7 +525,7 @@ test "aggregation full-result rerun can reuse snapped result identity generation
     result.total_hits_relation = .gte;
     try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 10 }, result));
     try std.testing.expect(!aggregationCanUseCurrentResult(.{}, result));
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, result, "test"));
+    try std.testing.expectEqual(aggregationFullResultBudget(), try aggregationFullResultLimit(.{}, result, "test"));
 
     result.total_hits_relation = .exact;
     result.total_hits = default_aggregation_full_result_budget + 1;

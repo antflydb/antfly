@@ -21,13 +21,15 @@ const db_mod = @import("../storage/db/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const raft_routes = @import("../raft/transport/routes.zig");
 const txn_api = @import("distributed_txn.zig");
 const table_writes_api = @import("table_writes.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+
+const transition_control_rpc_timeout_ms: u32 = 5_000;
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
@@ -224,6 +226,17 @@ pub const TablesResponse = struct {
     body: []u8,
 
     pub fn deinit(self: *TablesResponse, alloc: std.mem.Allocator) void {
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
+pub const LoadBalancedTablesResponse = struct {
+    body: []u8,
+    endpoint_index: usize,
+    attempts: usize,
+
+    pub fn deinit(self: *LoadBalancedTablesResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.body);
         self.* = undefined;
     }
@@ -449,6 +462,41 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 200) return error.UnexpectedHttpStatus;
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    /// Tries each endpoint at most once, advancing only when an endpoint
+    /// explicitly reports the retry-safe metadata-leader-unavailable response.
+    /// Other failures are returned immediately so a POST is never replayed
+    /// after an ambiguous transport or application failure.
+    pub fn fetchClusterBackupFromEndpoints(
+        self: *ApiHttpClient,
+        base_uris: []const []const u8,
+        body: []const u8,
+    ) !LoadBalancedTablesResponse {
+        if (base_uris.len == 0) return error.NoApiEndpoints;
+        const path = routes.Routes.backup;
+
+        for (base_uris, 0..) |base_uri, endpoint_index| {
+            const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+            defer self.alloc.free(uri);
+
+            var resp = try self.executor.execute(self.alloc, .{
+                .method = .POST,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(self.alloc);
+            if (resp.status == 200) {
+                return .{
+                    .body = try self.alloc.dupe(u8, resp.body),
+                    .endpoint_index = endpoint_index,
+                    .attempts = endpoint_index + 1,
+                };
+            }
+            if (!isRetryableMetadataLeaderResponse(resp)) return error.UnexpectedHttpStatus;
+        }
+        return error.MetadataLeaderUnavailable;
     }
 
     pub fn fetchClusterRestore(
@@ -828,6 +876,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupJoinPartitionWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinPartitionWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -844,10 +903,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -861,6 +922,17 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupJoinRowsWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinRowsWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -878,10 +950,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -895,6 +969,17 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupJoinUnmatchedWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinUnmatchedWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -912,10 +997,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1035,6 +1122,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupJoinFinalizeWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinFinalizeWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1051,10 +1149,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1580,6 +1680,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !BatchResponse {
+        return self.fetchGroupBatchWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupBatchWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !BatchResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1595,12 +1706,16 @@ pub const ApiHttpClient = struct {
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
+            .timeout_ms = timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
+            if (resp.status == 404) return error.UnknownGroup;
             if (resp.status == 503) return error.LeaderUnavailable;
+            const preview = resp.body[0..@min(resp.body.len, 256)];
+            std.log.warn("internal group batch returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
             return error.UnexpectedHttpStatus;
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2705,6 +2820,11 @@ pub const ApiHttpClient = struct {
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
+            // Transition RPCs run from a persistent control loop. A peer that
+            // accepts a connection but never responds must not monopolize that
+            // loop indefinitely; TransitionService retries idempotent actions
+            // with bounded backoff after this deadline.
+            .timeout_ms = transition_control_rpc_timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
@@ -2713,7 +2833,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
-            503 => return error.LeaderUnavailable,
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2947,6 +3067,7 @@ const EncodedTransitionAction = struct {
         rollback_merge,
     },
     transition_id: u64,
+    attempt_epoch: u64 = 0,
     source_group_id: ?u64 = null,
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
@@ -2954,48 +3075,73 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
+    table_contract: metadata_mod.TransitionTableContract,
 };
 
 fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.TransitionAction) ![]u8 {
-    const encoded: EncodedTransitionAction = switch (action) {
+    switch (action) {
         .none => return error.UnsupportedOperation,
+        inline else => |op| {
+            if (@hasField(@TypeOf(op), "allow_doc_identity_reassignment")) {
+                try op.table_contract.validateForMerge(
+                    op.allow_doc_identity_reassignment,
+                );
+            } else {
+                try op.table_contract.validateForSplit();
+            }
+        },
+    }
+    const encoded: EncodedTransitionAction = switch (action) {
+        .none => unreachable,
         .prepare_split_source => |op| .{
             .kind = .prepare_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
             .split_key = op.split_key,
             .source_range_end = op.source_range_end,
+            .table_contract = op.table_contract,
         },
         .start_split_source => |op| .{
             .kind = .start_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .bootstrap_split_destination => |op| .{
             .kind = .bootstrap_split_destination,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .rollback_split => |op| .{
             .kind = .rollback_split,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .accept_merge_receiver => |op| .{
             .kind = .accept_merge_receiver,
@@ -3003,6 +3149,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
             .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
         .catch_up_merge_receiver => |op| .{
             .kind = .catch_up_merge_receiver,
@@ -3010,6 +3157,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
             .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
         .finalize_merge => |op| .{
             .kind = .finalize_merge,
@@ -3017,12 +3165,15 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
             .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
         .rollback_merge => |op| .{
             .kind = .rollback_merge,
             .transition_id = op.transition_id,
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
+            .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
     };
     return try jsonStringifyAlloc(alloc, encoded);
@@ -3156,8 +3307,11 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
-    if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "IdentityReadGenerationChanged") or
+        std.mem.eql(u8, body, "identity read generation changed")) return error.IdentityReadGenerationChanged;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     if (std.mem.eql(u8, body, "foreign key action limit exceeded")) return error.ForeignKeyActionLimitExceeded;
     if (std.mem.eql(u8, body, "foreign key action job claim busy")) return error.ForeignKeyIntegrityClaimBusy;
     return error.UnexpectedHttpStatus;
@@ -3178,6 +3332,18 @@ fn remoteDocumentAlgebraicAggregateNotFoundError(body: []const u8) anyerror {
     if (std.mem.eql(u8, body, "TableNotFound")) return error.TableNotFound;
     if (std.mem.eql(u8, body, "UnknownGroup")) return error.UnknownGroup;
     return error.NotFound;
+}
+
+fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
+    if (resp.status != 503) return false;
+    for (resp.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header) and
+            std.ascii.eqlIgnoreCase(header.value, http_common.metadata_not_leader_value))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
@@ -3223,6 +3389,77 @@ pub fn expectGroupArtifactRepairRunMapsCancelUnavailableForTest() !void {
         error.RepairCancelUnavailable,
         client.fetchGroupArtifactRepairRun("http://127.0.0.1:1", 7, "docs", "{\"target\":\"index\"}"),
     );
+}
+
+test "api http client maps remote repair cancel unavailable" {
+    try expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
+}
+
+test "api http client bounds transition control RPCs" {
+    const TimeoutExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(transition_control_rpc_timeout_ms, req.timeout_ms.?);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/groups/7/shard-ops/observe-split",
+            ));
+            return error.Timeout;
+        }
+    };
+
+    var executor = TimeoutExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.Timeout, client.fetchGroupShardObserveSplit(
+        "http://127.0.0.1:1",
+        7,
+        .{
+            .transition_id = 77,
+            .attempt_epoch = 1,
+            .source_group_id = 7,
+            .destination_group_id = 8,
+        },
+    ));
+}
+
+test "api http client forwards distributed join budgets and maps remote timeout" {
+    const TimeoutExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 37), req.timeout_ms.?);
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            return .{
+                .status = 408,
+                .body = try alloc.dupe(u8, "query timeout"),
+            };
+        }
+    };
+
+    var executor = TimeoutExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    const base_uri = "http://127.0.0.1:1";
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
 pub fn expectTableRepairCancelCallbackEncodesTableNameForTest() !void {
@@ -3327,6 +3564,11 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsJoinedMutationSourceCollect(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsJoinedMutationSourceInputs(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupRowsJoinedMutationSourceStage(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.body = "identity read generation changed";
+    try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";
@@ -3421,15 +3663,35 @@ test "api http client preserves public service unavailable response classes" {
 
 test "api http client encodes merge doc identity reassignment action flag" {
     const alloc = std.testing.allocator;
+    const table_contract: metadata_mod.TransitionTableContract = .{
+        .table_id = 7,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .source_identity = .{ .shard_id = 70, .range_id = 700 },
+        .target_identity = .{ .shard_id = 71, .range_id = 701 },
+    };
     const body = try encodeTransitionAction(alloc, .{ .finalize_merge = .{
         .transition_id = 8,
         .donor_group_id = 10,
         .receiver_group_id = 9,
         .allow_doc_identity_reassignment = true,
+        .table_contract = table_contract,
     } });
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"allow_doc_identity_reassignment\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"source_identity\":{\"shard_id\":70,\"range_id\":700}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"target_identity\":{\"shard_id\":71,\"range_id\":701}") != null);
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        encodeTransitionAction(alloc, .{ .finalize_merge = .{
+            .transition_id = 8,
+            .donor_group_id = 10,
+            .receiver_group_id = 9,
+            .table_contract = table_contract,
+        } }),
+    );
 }
 
 test "api http client round-trips public status route" {

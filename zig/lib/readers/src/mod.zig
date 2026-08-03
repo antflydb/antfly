@@ -335,16 +335,36 @@ const AntflyReaderState = struct {
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
+        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
 
-        const out = try alloc.alloc(Result, parsed.value.data.len);
-        errdefer alloc.free(out);
-        for (parsed.value.data, 0..) |item, i| {
-            out[i] = .{
-                .text = try alloc.dupe(u8, item.text),
-                .fields_json = if (item.fields) |fields| try std.json.Stringify.valueAlloc(alloc, fields, .{}) else null,
-                .regions_json = if (item.regions) |regions| try std.json.Stringify.valueAlloc(alloc, regions, .{}) else null,
-            };
+        const out = try alloc.alloc(Result, req.images.len);
+        const assigned = try alloc.alloc(bool, req.images.len);
+        defer alloc.free(assigned);
+        @memset(assigned, false);
+        errdefer {
+            for (out, assigned) |*item, was_assigned| {
+                if (was_assigned) deinitResult(alloc, item);
+            }
+            alloc.free(out);
         }
+        var initialized: usize = 0;
+        for (parsed.value.data) |item| {
+            if (item.index < 0) return error.InvalidReadResultCount;
+            const result_index = std.math.cast(usize, item.index) orelse return error.InvalidReadResultCount;
+            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
+            var result = Result{
+                .text = try alloc.dupe(u8, item.text),
+                .fields_json = null,
+                .regions_json = null,
+            };
+            errdefer deinitResult(alloc, &result);
+            if (item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
+            if (item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
+            out[result_index] = result;
+            assigned[result_index] = true;
+            initialized += 1;
+        }
+        if (initialized != req.images.len) return error.InvalidReadResultCount;
         return out;
     }
 };
@@ -732,6 +752,114 @@ test "antfly reader sends configured bearer auth" {
     try std.testing.expectEqualStrings("read with auth", results.?[0].text);
 }
 
+test "antfly reader sends batched images and request max tokens" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/read", .assert_request = expectAntflyReaderBatchRequest, .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read_result\",\"index\":1,\"text\":\"second\"},{\"object\":\"read_result\",\"index\":0,\"text\":\"first\"}],\"model\":\"reader\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const reader = try initReader(alloc, &client, .{
+        .provider = .antfly,
+        .api_url = server.baseUrl(),
+        .model = "reader",
+        .max_tokens = 16,
+    });
+    defer reader.deinit();
+
+    var results: ?[]Result = null;
+    defer if (results) |items| {
+        for (items) |*item| deinitResult(alloc, item);
+        alloc.free(items);
+    };
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(a: Allocator, r: Reader, out: *?[]Result, err_out: *?anyerror) std.Io.Cancelable!void {
+            const images = [_][]const u8{
+                "data:image/png;base64,ZmFrZTE=",
+                "data:image/png;base64,ZmFrZTI=",
+            };
+            out.* = r.read(a, .{ .images = &images, .prompt = "read pages", .max_tokens = 42 }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, reader, &results, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 2), results.?.len);
+    try std.testing.expectEqualStrings("first", results.?[0].text);
+    try std.testing.expectEqualStrings("second", results.?[1].text);
+}
+
+test "antfly reader rejects mismatched batch result count" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/read", .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read_result\",\"index\":0,\"text\":\"only one\"}],\"model\":\"reader\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const reader = try initReader(alloc, &client, .{
+        .provider = .antfly,
+        .api_url = server.baseUrl(),
+        .model = "reader",
+    });
+    defer reader.deinit();
+
+    var results: ?[]Result = null;
+    defer if (results) |items| {
+        for (items) |*item| deinitResult(alloc, item);
+        alloc.free(items);
+    };
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(a: Allocator, r: Reader, out: *?[]Result, err_out: *?anyerror) std.Io.Cancelable!void {
+            const images = [_][]const u8{
+                "data:image/png;base64,ZmFrZTE=",
+                "data:image/png;base64,ZmFrZTI=",
+            };
+            out.* = r.read(a, .{ .images = &images }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, reader, &results, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+
+    try std.testing.expect(results == null);
+    try std.testing.expect(run_err != null);
+    try std.testing.expect(run_err.? == error.InvalidReadResultCount);
+}
+
 test "vertex reader exchanges service account credentials and sends bearer auth" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -905,4 +1033,20 @@ fn expectExplicitVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
 fn expectAntflyReaderBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer reader-bearer", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+
+    var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, std.testing.allocator, req.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("reader", parsed.value.model);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.images.len);
+    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTE=", parsed.value.images[0].url);
+    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTI=", parsed.value.images[1].url);
+    try std.testing.expectEqualStrings("read pages", parsed.value.prompt orelse return error.MissingPrompt);
+    try std.testing.expectEqual(@as(?i64, 42), parsed.value.max_tokens);
 }

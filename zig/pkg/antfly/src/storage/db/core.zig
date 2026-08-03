@@ -19,7 +19,9 @@ const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const apply_state = @import("derived/apply_state.zig");
+const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
+const range_cardinality = @import("range_cardinality.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -38,6 +40,7 @@ const ttl_mod = @import("../ttl.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -246,15 +249,38 @@ pub const OpenedPrimaryStore = struct {
     owner: PrimaryStoreOwner = .none,
 };
 
+pub const IndexRepairCheckpoint = struct {
+    lock_key: []u8,
+    path: []u8,
+    storage: ?lsm_backend_mod.Storage = null,
+
+    pub fn location(self: *const @This()) index_repair_state.Location {
+        return .{
+            .lock_key = self.lock_key,
+            .path = self.path,
+            .storage = self.storage,
+        };
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.lock_key);
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
 pub const OpenedCoreResources = struct {
     path: []u8,
+    root_generation: u64,
     applied_sequence_checkpoint_path: ?[]u8,
+    index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     identity_namespace: doc_identity.Namespace,
@@ -266,6 +292,8 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         alloc.destroy(self.apply_mutex);
+        self.repair_replay_mutex.* = undefined;
+        alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
         alloc.destroy(self.index_manager);
         self.shard_manager.deinit();
@@ -276,6 +304,7 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.store);
         self.primary_store_owner.close(alloc);
         if (self.applied_sequence_checkpoint_path) |checkpoint_path| alloc.free(checkpoint_path);
+        if (self.index_repair_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         alloc.free(self.path);
         self.* = undefined;
     }
@@ -284,18 +313,22 @@ pub const OpenedCoreResources = struct {
 pub const AsyncResources = struct {
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
+    index_repair_checkpoint: ?index_repair_state.Location,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
 };
 
 pub const BatchExecutionResources = struct {
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
+    index_repair_checkpoint: ?index_repair_state.Location,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: *std.atomic.Value(bool),
@@ -320,13 +353,16 @@ pub const SplitIndexHandoffs = struct {
 pub const DBCore = struct {
     alloc: Allocator,
     path: []u8,
+    root_generation: u64,
     applied_sequence_checkpoint_path: ?[]u8,
+    index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     identity_namespace: doc_identity.Namespace,
@@ -336,13 +372,16 @@ pub const DBCore = struct {
         return .{
             .alloc = alloc,
             .path = opened.path,
+            .root_generation = opened.root_generation,
             .applied_sequence_checkpoint_path = opened.applied_sequence_checkpoint_path,
+            .index_repair_checkpoint = opened.index_repair_checkpoint,
             .store = opened.store,
             .primary_store_owner = opened.primary_store_owner,
             .change_journal = opened.change_journal,
             .shard_manager = opened.shard_manager,
             .index_manager = opened.index_manager,
             .apply_mutex = opened.apply_mutex,
+            .repair_replay_mutex = opened.repair_replay_mutex,
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
             .identity_namespace = opened.identity_namespace,
@@ -356,6 +395,8 @@ pub const DBCore = struct {
         self.alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         self.alloc.destroy(self.apply_mutex);
+        self.repair_replay_mutex.* = undefined;
+        self.alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
         self.alloc.destroy(self.index_manager);
         self.shard_manager.deinit();
@@ -366,6 +407,7 @@ pub const DBCore = struct {
         self.alloc.destroy(self.store);
         self.primary_store_owner.close(self.alloc);
         if (self.applied_sequence_checkpoint_path) |checkpoint_path| self.alloc.free(checkpoint_path);
+        if (self.index_repair_checkpoint) |*checkpoint| checkpoint.deinit(self.alloc);
         self.alloc.free(self.path);
         self.* = undefined;
     }
@@ -382,8 +424,10 @@ pub const DBCore = struct {
         return .{
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
+            .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .repair_replay_mutex = self.repair_replay_mutex,
         };
     }
 
@@ -391,11 +435,13 @@ pub const DBCore = struct {
         return .{
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
+            .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
             .replay_source = self.replaySource(),
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = self.identity_namespace,
             .artifact_cleanup_maybe = &self.artifact_cleanup_maybe,
@@ -451,9 +497,27 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
-        try self.shard_manager.setByteRange(byte_range);
+        const start = try self.alloc.dupe(u8, byte_range.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, byte_range.end);
+        errdefer self.alloc.free(end);
+        try range_state_mod.saveRange(self.store, .{ .start = start, .end = end });
+        self.adoptRangeInMemoryOwned(start, end);
+    }
+
+    pub fn adoptRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
         self.refreshIndexRange();
-        try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
+    }
+
+    pub fn adoptPersistedRangeOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.adoptOwnedByteRange(start, end);
+        self.refreshIndexRange();
+    }
+
+    pub fn replaceRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
+        self.refreshIndexRange();
     }
 
     pub fn nextDerivedSequence(self: *DBCore) u64 {
@@ -526,13 +590,41 @@ pub const DBCore = struct {
         try range_state_mod.clearSplitDeltaFinalSeq(self.store);
     }
 
-    pub fn addIndex(self: *DBCore, cfg: types.IndexConfig) !u64 {
-        try self.index_manager.add(self.store, cfg);
+    pub fn loadSplitBootstrapMarker(self: *DBCore, alloc: Allocator) !?range_state_mod.SplitBootstrapMarker {
+        return try range_state_mod.loadSplitBootstrapMarker(alloc, self.store);
+    }
+
+    pub fn saveSplitBootstrapMarker(self: *DBCore, marker: range_state_mod.SplitBootstrapMarker) !void {
+        try range_state_mod.saveSplitBootstrapMarker(self.store, marker);
+    }
+
+    pub fn clearSplitBootstrapMarker(self: *DBCore) !void {
+        try range_state_mod.clearSplitBootstrapMarker(self.store);
+    }
+
+    pub fn addIndex(
+        self: *DBCore,
+        cfg: types.IndexConfig,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
+    ) !u64 {
+        try self.index_manager.addWithAtomicMutation(self.store, cfg, admission);
         const applied = if (try self.index_manager.requiresEnrichmentReplay(cfg.name))
             0
         else
             self.nextDerivedSequence();
-        try self.saveAppliedSequence(cfg.name, applied);
+        return applied;
+    }
+
+    pub fn addManagedIndex(
+        self: *DBCore,
+        cfg: types.IndexConfig,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
+    ) !u64 {
+        try self.index_manager.addManaged(self.store, cfg, admission);
+        // A managed generation with an admission marker is rebuilt from a
+        // stable source snapshot before replay catch-up. Starting at zero is
+        // fail-closed if the process exits before the outbox is materialized.
+        const applied = if (admission == null) self.nextDerivedSequence() else 0;
         return applied;
     }
 
@@ -610,6 +702,10 @@ pub const DBCore = struct {
 
     pub fn deleteIndex(self: *DBCore, name: []const u8) !bool {
         return try self.index_manager.remove(self.store, name);
+    }
+
+    pub fn deleteManagedIndex(self: *DBCore, name: []const u8, admission_key: []const u8) !bool {
+        return try self.index_manager.removeManaged(self.store, name, admission_key);
     }
 
     pub fn deleteEnrichment(self: *DBCore, kind: types.EnrichmentKind, name: []const u8) !bool {
@@ -713,6 +809,7 @@ pub const DBCore = struct {
         }
         return apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -728,6 +825,7 @@ pub const DBCore = struct {
         }
         return apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -745,9 +843,28 @@ pub const DBCore = struct {
     }
 
     pub fn saveAppliedSequence(self: *DBCore, index_name: []const u8, sequence: u64) !void {
-        const config_hash = if (self.index_manager.get(index_name)) |cfg| types.indexConfigHash(cfg.*) else 0;
+        const cfg = self.index_manager.get(index_name);
+        const config_hash = if (cfg) |value| types.indexConfigHash(value.*) else 0;
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
+                .applied_sequence = sequence,
+                .status = checkpoint.status,
+                .generation = checkpoint.generation,
+                .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
+            });
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
+        } else if (cfg) |value| {
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = value.kind,
+            });
+        }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             .{
@@ -774,6 +891,7 @@ pub const DBCore = struct {
         }
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -800,61 +918,6 @@ pub const DBCore = struct {
     pub fn putArtifactPresenceMarker(self: *DBCore) !void {
         self.artifact_cleanup_maybe.store(true, .release);
         try self.store.put(internal_keys.artifact_presence_key[0..], "1");
-    }
-
-    pub fn collectAndDeleteEnrichmentArtifactsForDocContext(
-        self: *DBCore,
-        alloc: Allocator,
-        doc_key: []const u8,
-        deleted: *std.ArrayListUnmanaged([]u8),
-    ) !void {
-        if (!self.hasArtifactCleanupMaybe()) return;
-
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(alloc);
-        var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (unrecorded_delete_keys.items) |key| alloc.free(key);
-            unrecorded_delete_keys.deinit(alloc);
-        }
-
-        const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(artifact_prefix);
-        try self.collectDeleteKeysForPrefix(alloc, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
-
-        const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(asset_state_prefix);
-        try self.collectDeleteKeysForPrefix(alloc, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
-
-        const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(graph_asset_state_prefix);
-        try self.collectDeleteKeysForPrefix(alloc, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
-
-        if (deletes.items.len > 0) {
-            try self.putStoreBatch(&.{}, deletes.items);
-        }
-    }
-
-    fn collectDeleteKeysForPrefix(
-        self: *DBCore,
-        alloc: Allocator,
-        prefix: []const u8,
-        deletes: *std.ArrayListUnmanaged([]const u8),
-        recorded: ?*std.ArrayListUnmanaged([]u8),
-        unrecorded: *std.ArrayListUnmanaged([]u8),
-    ) !void {
-        const existing = try self.scanStorePrefix(alloc, prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, existing);
-        for (existing) |entry| {
-            const owned = try alloc.dupe(u8, entry.key);
-            errdefer alloc.free(owned);
-            try deletes.append(alloc, owned);
-            if (recorded) |out| {
-                try out.append(alloc, owned);
-            } else {
-                try unrecorded.append(alloc, owned);
-            }
-        }
     }
 
     pub fn loadIndexes(self: *DBCore) !void {
@@ -946,9 +1009,10 @@ pub const DBCore = struct {
     }
 
     pub fn setSchemaWithMetadata(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_puts: []const schema_mod.SchemaMetadataPut) !void {
-        try schema_mod.saveSchemaWithMetadata(self.store, self.alloc, table_schema, metadata_puts);
+        if (!try schema_mod.saveSchemaWithMetadata(self.store, self.alloc, table_schema, metadata_puts)) return;
+        const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
-        self.schema = try schema_mod.loadSchema(self.store, self.alloc);
+        self.schema = next_schema;
         self.index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(self.schema));
     }
 
@@ -1056,6 +1120,7 @@ pub const DBCore = struct {
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
+        node_admission: ?NodeAdmission,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findShortestPath(alloc, &entry.index, source, target, .{
@@ -1065,6 +1130,7 @@ pub const DBCore = struct {
             .max_depth = max_depth,
             .min_weight = min_weight,
             .max_weight = max_weight,
+            .node_admission = node_admission,
         });
     }
 
@@ -1081,6 +1147,7 @@ pub const DBCore = struct {
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
+        node_admission: ?NodeAdmission,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, .{
@@ -1090,6 +1157,7 @@ pub const DBCore = struct {
             .max_depth = max_depth,
             .min_weight = min_weight,
             .max_weight = max_weight,
+            .node_admission = node_admission,
         });
     }
 
@@ -1356,12 +1424,19 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         }
         extra_writes.deinit(alloc);
     }
-    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+    var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (identity_visibility_deletes.items) |key| alloc.free(key);
+        identity_visibility_deletes.deinit(alloc);
+    }
+    const identity_live_before = (try doc_identity.fastStatsFromStore(identity_ctx.store)).live_ordinals;
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         alloc,
         identity_ctx.store,
         identity_ctx.identity_namespace,
         identity_ctx.store.lastReplaySequence(0),
         &extra_writes,
+        &identity_visibility_deletes,
         identity_upserts.items,
         identity_deletes.items,
     );
@@ -1370,6 +1445,28 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         for (extra_deletes.items) |key| alloc.free(@constCast(key));
         extra_deletes.deinit(alloc);
     }
+    try extra_deletes.ensureUnusedCapacity(alloc, identity_visibility_deletes.items.len);
+    for (identity_visibility_deletes.items) |key| {
+        extra_deletes.appendAssumeCapacity(key);
+    }
+    identity_visibility_deletes.items.len = 0;
+
+    if (try doc_identity.visibilitySummaryFromWrites(extra_writes.items)) |summary| {
+        const byte_range = try range_state_mod.loadRange(alloc, identity_ctx.store);
+        defer {
+            alloc.free(@constCast(byte_range.start));
+            alloc.free(@constCast(byte_range.end));
+        }
+        try range_cardinality.appendIdentityTransitionAlloc(
+            alloc,
+            identity_ctx.store,
+            byte_range,
+            identity_live_before,
+            summary.live_ordinals,
+            &extra_writes,
+        );
+    }
+
     var extra_skip_intent_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (extra_skip_intent_keys.items) |key| alloc.free(@constCast(key));
@@ -1555,19 +1652,24 @@ pub fn openCoreResourcesFromPrimaryStore(
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
     external_derived_checkpoints: bool,
+    index_repair_checkpoint_storage: ?lsm_backend_mod.Storage,
+    root_generation: u64,
     read_only: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
+    var owned_index_repair_checkpoint: ?IndexRepairCheckpoint = null;
     var owned_store: ?*docstore_mod.DocStore = null;
     var owned_primary_store_owner = opened_primary.owner;
     var owned_change_journal: ?*change_journal_mod.Journal = null;
     var owned_shard_manager: ?*shard_mod.ShardManager = null;
     var owned_index_manager: ?*index_manager_mod.IndexManager = null;
     var owned_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null;
+    var owned_repair_replay_mutex: ?*std.atomic.Mutex = null;
     var owned_log_mutex: ?*std.atomic.Mutex = null;
     errdefer {
         if (owned_log_mutex) |ptr| alloc.destroy(ptr);
+        if (owned_repair_replay_mutex) |ptr| alloc.destroy(ptr);
         if (owned_apply_mutex) |ptr| alloc.destroy(ptr);
         if (owned_index_manager) |ptr| alloc.destroy(ptr);
         if (owned_shard_manager) |ptr| alloc.destroy(ptr);
@@ -1578,6 +1680,7 @@ pub fn openCoreResourcesFromPrimaryStore(
         }
         owned_primary_store_owner.close(alloc);
         if (owned_applied_sequence_checkpoint_path) |buf| alloc.free(buf);
+        if (owned_index_repair_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         if (owned_path) |buf| alloc.free(buf);
     }
 
@@ -1594,6 +1697,9 @@ pub fn openCoreResourcesFromPrimaryStore(
     const apply_mutex = try alloc.create(apply_rw_lock_mod.ApplyRwLock);
     apply_mutex.* = .{};
     owned_apply_mutex = apply_mutex;
+    const repair_replay_mutex = try alloc.create(std.atomic.Mutex);
+    repair_replay_mutex.* = .unlocked;
+    owned_repair_replay_mutex = repair_replay_mutex;
     const log_mutex = try alloc.create(std.atomic.Mutex);
     log_mutex.* = .unlocked;
     owned_log_mutex = log_mutex;
@@ -1604,6 +1710,27 @@ pub fn openCoreResourcesFromPrimaryStore(
         .mem, .lsm_memory => null,
     } else null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
+    const index_repair_checkpoint = if (index_repair_checkpoint_storage) |storage| checkpoint_blk: {
+        const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, index_base_path);
+        errdefer alloc.free(checkpoint_path);
+        const lock_key = try storage.rootIdentityAlloc(alloc, checkpoint_path);
+        break :checkpoint_blk IndexRepairCheckpoint{
+            .lock_key = lock_key,
+            .path = checkpoint_path,
+            .storage = storage,
+        };
+    } else switch (primary_backend_kind) {
+        .lmdb, .lsm => checkpoint_blk: {
+            const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, path);
+            errdefer alloc.free(checkpoint_path);
+            break :checkpoint_blk IndexRepairCheckpoint{
+                .lock_key = try alloc.dupe(u8, checkpoint_path),
+                .path = checkpoint_path,
+            };
+        },
+        .mem, .lsm_memory => null,
+    };
+    owned_index_repair_checkpoint = index_repair_checkpoint;
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
     defer alloc.free(change_journal_path);
@@ -1648,23 +1775,28 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     owned_path = null;
     owned_applied_sequence_checkpoint_path = null;
+    owned_index_repair_checkpoint = null;
     owned_store = null;
     owned_primary_store_owner = .none;
     owned_change_journal = null;
     owned_shard_manager = null;
     owned_index_manager = null;
     owned_apply_mutex = null;
+    owned_repair_replay_mutex = null;
     owned_log_mutex = null;
 
     return .{
         .path = path_copy,
+        .root_generation = root_generation,
         .applied_sequence_checkpoint_path = applied_sequence_checkpoint_path,
+        .index_repair_checkpoint = index_repair_checkpoint,
         .store = store,
         .primary_store_owner = opened_primary.owner,
         .change_journal = change_journal,
         .shard_manager = shard_manager,
         .index_manager = index_manager,
         .apply_mutex = apply_mutex,
+        .repair_replay_mutex = repair_replay_mutex,
         .log_mutex = log_mutex,
         .schema = schema,
         .identity_namespace = identity_namespace,
@@ -1743,15 +1875,23 @@ pub fn importStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snap
     var decoded = try lsm_table_file.decodeAlloc(alloc, raw);
     defer decoded.deinit(alloc);
 
-    var writes = try alloc.alloc(docstore_mod.KVPair, decoded.entries.len);
-    defer alloc.free(writes);
-    for (decoded.entries, 0..) |entry, i| {
-        writes[i] = .{
-            .key = entry.key,
-            .value = entry.value,
-        };
+    const batch_size = 8192;
+    var offset: usize = 0;
+    while (offset < decoded.entries.len) {
+        const end = @min(offset + batch_size, decoded.entries.len);
+        const writes = try alloc.alloc(docstore_mod.KVPair, end - offset);
+        defer alloc.free(writes);
+        for (decoded.entries[offset..end], 0..) |entry, i| {
+            writes[i] = .{
+                .key = entry.key,
+                .value = entry.value,
+            };
+        }
+        try store.putBatch(writes, &.{});
+        offset = end;
     }
-    try store.putBatch(writes, &.{});
+
+    try store.sync(true);
 }
 
 pub fn importChangeJournalSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !void {
@@ -1794,25 +1934,43 @@ fn writeStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_
     const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
     defer alloc.free(snapshot_path);
 
-    const docs = try store.scanRange(alloc, "", "");
-    defer docstore_mod.DocStore.freeResults(alloc, docs);
+    var builder = StoreSnapshotEntryBuilder{ .alloc = alloc };
+    defer builder.deinit();
+    try store.scanWithContext("", "", .{}, &builder, StoreSnapshotEntryBuilder.scanEntry);
 
-    var entries = try alloc.alloc(lsm_table_file.Entry, docs.len);
-    defer alloc.free(entries);
-    for (docs, 0..) |doc, i| {
-        entries[i] = .{
-            .namespace_name = null,
-            .key = doc.key,
-            .value = doc.value,
-            .tombstone = false,
-        };
-    }
-
-    const encoded = try lsm_table_file.encodeAlloc(alloc, entries);
+    const encoded = try lsm_table_file.encodeAlloc(alloc, builder.entries.items);
     defer alloc.free(encoded);
     try writeFileAbsolute(snapshot_path, encoded);
     return encoded.len;
 }
+
+const StoreSnapshotEntryBuilder = struct {
+    alloc: Allocator,
+    entries: std.ArrayListUnmanaged(lsm_table_file.Entry) = .empty,
+
+    fn deinit(self: *@This()) void {
+        for (self.entries.items) |entry| {
+            self.alloc.free(@constCast(entry.key));
+            self.alloc.free(@constCast(entry.value));
+        }
+        self.entries.deinit(self.alloc);
+    }
+
+    fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        const owned_value = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(owned_value);
+        try self.entries.append(self.alloc, .{
+            .namespace_name = null,
+            .key = owned_key,
+            .value = owned_value,
+            .tombstone = false,
+        });
+        return .@"continue";
+    }
+};
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;

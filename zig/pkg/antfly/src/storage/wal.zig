@@ -34,7 +34,7 @@ const lsm_backend = @import("lsm_backend/mod.zig");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
 const lmdb_backend = @import("lmdb_backend.zig");
 const platform = @import("antfly_platform");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const lmdb = @import("lmdb.zig");
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
@@ -118,6 +118,10 @@ pub const WalStats = struct {
     total_txn_open_ns: u64 = 0,
     total_put_ns: u64 = 0,
     total_commit_ns: u64 = 0,
+    inner_segment_syncs: u64 = 0,
+    inner_index_syncs: u64 = 0,
+    post_commit_segment_syncs: u64 = 0,
+    post_commit_index_syncs: u64 = 0,
 };
 
 pub const FullStats = struct {
@@ -138,6 +142,10 @@ const CommitRunStats = struct {
     txn_open_ns: u64 = 0,
     put_ns: u64 = 0,
     commit_ns: u64 = 0,
+    inner_segment_syncs: u64 = 0,
+    inner_index_syncs: u64 = 0,
+    post_commit_segment_syncs: u64 = 0,
+    post_commit_index_syncs: u64 = 0,
 };
 
 const CommitBatchResult = union(enum) {
@@ -156,6 +164,11 @@ const AppendRequest = struct {
     result: BatchAppendResult = .{ .first_lsn = 0, .count = 0 },
     err: ?anyerror = null,
     done: bool = false,
+};
+
+const DurabilitySyncStats = struct {
+    segment_syncs: u64 = 0,
+    index_syncs: u64 = 0,
 };
 
 const default_namespace: backend_types.Namespace = .{};
@@ -191,6 +204,39 @@ const StoreOwner = union(enum) {
             .lmdb => |backend| try backend.sync(force),
             .lsm => |*handle| try handle.backend.sync(force),
         }
+    }
+
+    fn syncCommitDurability(self: *StoreOwner) !DurabilitySyncStats {
+        return switch (self.*) {
+            .lmdb => |backend| blk: {
+                try backend.sync(true);
+                break :blk .{};
+            },
+            // The LSM transaction has already appended and fsynced its replay
+            // WAL. Sync that durable boundary without forcing an unrelated
+            // memtable flush and compaction build on every outer WAL append.
+            .lsm => |*handle| blk: {
+                const stats = try handle.backend.syncReplayStateWithStats();
+                break :blk .{
+                    .segment_syncs = stats.segment_syncs,
+                    .index_syncs = stats.index_syncs,
+                };
+            },
+        };
+    }
+
+    fn commitProvidesDurability(self: *const StoreOwner) bool {
+        return switch (self.*) {
+            .lmdb => true,
+            .lsm => |*handle| handle.backend.commitProvidesDurability(),
+        };
+    }
+
+    fn lsmWriteStatsSnapshot(self: *const StoreOwner) ?lsm_backend.Backend.WriteStats {
+        return switch (self.*) {
+            .lmdb => null,
+            .lsm => |*handle| handle.backend.snapshotWriteStats(),
+        };
     }
 
     fn commitStatsSnapshot(self: *StoreOwner) ?lmdb.CommitStats {
@@ -382,6 +428,7 @@ pub const WAL = struct {
                 next_lsn = @max(next_lsn, lsn + 1);
             }
         }
+        const sync_after_commit = !opts.no_sync and !store_owner.commitProvidesDurability();
 
         return .{
             .store = store,
@@ -390,7 +437,7 @@ pub const WAL = struct {
             .group_commit_window_ns = opts.group_commit_window_ns,
             .group_commit_max_requests = @max(@as(usize, 1), opts.group_commit_max_requests),
             .commit_completion_delay_ns = resolvedCommitCompletionDelayNs(opts),
-            .sync_after_commit = opts.resolvedBackend() != .lmdb and !opts.no_sync,
+            .sync_after_commit = sync_after_commit,
             .clock = opts.clock,
             .commit_scheduler = opts.commit_scheduler,
         };
@@ -402,7 +449,11 @@ pub const WAL = struct {
         self.* = undefined;
     }
 
-    fn abandonAfterModeledCrash(self: *WAL) void {
+    /// Releases in-memory ownership without flushing or finalizing storage.
+    /// Crash simulators must use this after rolling storage back to its last
+    /// durable state; a normal close would let the stale pre-crash owner write
+    /// into the recovered generation.
+    pub fn abandonAfterCrash(self: *WAL) void {
         self.store.deinit();
         self.store_owner.abandonAfterCrash(std.heap.page_allocator);
         self.* = undefined;
@@ -866,6 +917,7 @@ pub const WAL = struct {
             };
         };
 
+        const lsm_stats_before = self.store_owner.lsmWriteStatsSnapshot();
         const commit_started = self.nowNs();
         txn.commit() catch |err| {
             stats.commit_ns = self.elapsedSince(commit_started);
@@ -874,15 +926,22 @@ pub const WAL = struct {
                 .stats = stats,
             };
         };
+        if (lsm_stats_before) |before| {
+            const after = self.store_owner.lsmWriteStatsSnapshot().?;
+            stats.inner_segment_syncs = after.wal_segment_syncs -| before.wal_segment_syncs;
+            stats.inner_index_syncs = after.wal_index_syncs -| before.wal_index_syncs;
+        }
         self.next_lsn = lsn;
         if (self.sync_after_commit) {
-            self.store_owner.sync(true) catch |err| {
+            const sync_stats = self.store_owner.syncCommitDurability() catch |err| {
                 stats.commit_ns = self.elapsedSince(commit_started);
                 return .{
                     .result = .{ .failure = err },
                     .stats = stats,
                 };
             };
+            stats.post_commit_segment_syncs += sync_stats.segment_syncs;
+            stats.post_commit_index_syncs += sync_stats.index_syncs;
         }
         self.waitForCommitCompletion(self.commit_completion_delay_ns) catch |err| {
             stats.commit_ns = self.elapsedSince(commit_started);
@@ -917,6 +976,10 @@ pub const WAL = struct {
         self.stats.total_txn_open_ns += stats.txn_open_ns;
         self.stats.total_put_ns += stats.put_ns;
         self.stats.total_commit_ns += stats.commit_ns;
+        self.stats.inner_segment_syncs += stats.inner_segment_syncs;
+        self.stats.inner_index_syncs += stats.inner_index_syncs;
+        self.stats.post_commit_segment_syncs += stats.post_commit_segment_syncs;
+        self.stats.post_commit_index_syncs += stats.post_commit_index_syncs;
     }
 
     fn nowNs(self: *const WAL) u64 {
@@ -1364,7 +1427,7 @@ fn reopenWalSim(wal: *WAL, wal_open: *bool, path: [*:0]const u8, opts: WalOption
 
 fn abandonWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool) void {
     if (!wal_open.*) return;
-    wal.abandonAfterModeledCrash();
+    wal.abandonAfterCrash();
     wal_open.* = false;
 }
 
@@ -2744,7 +2807,7 @@ test "wal modeled storage survives crash before close after acknowledged append"
     var crashed_wal = try WAL.open(path, opts);
     try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("committed-before-crash"));
     try device_model.device().crash();
-    crashed_wal.abandonAfterModeledCrash();
+    crashed_wal.abandonAfterCrash();
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2758,6 +2821,107 @@ test "wal modeled storage survives crash before close after acknowledged append"
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 1), entries[0].lsn);
     try std.testing.expectEqualStrings("committed-before-crash", entries[0].data);
+}
+
+test "wal modeled storage preserves acknowledged append across segment rotation crash" {
+    var runtime = storage_sim.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    var device_model = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+
+    const path: [*:0]const u8 = "/wal-modeled-rotation-crash";
+    const opts = WalOptions{
+        .backend = .lsm,
+        .storage = device_model.storage(),
+        .clock = runtime.clock(),
+        .commit_scheduler = runtime.completionScheduler(),
+        .model_commit_backend_completions = true,
+        .lsm_options = .{ .wal_segment_bytes = 32 },
+    };
+
+    var crashed_wal = try WAL.open(path, opts);
+    try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("first-segment-record"));
+    try std.testing.expectEqual(@as(u64, 2), try crashed_wal.append("rotated-segment-record"));
+    try std.testing.expect((try device_model.fileSize("/wal-modeled-rotation-crash/wal/00000000000000000002.log")) > 0);
+
+    try device_model.device().crash();
+    crashed_wal.abandonAfterCrash();
+
+    var reopened = try WAL.open(path, opts);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 3), reopened.next_lsn);
+
+    const entries = try reopened.iterateFrom(std.testing.allocator, 1);
+    defer {
+        for (entries) |entry| std.testing.allocator.free(entry.data);
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("first-segment-record", entries[0].data);
+    try std.testing.expectEqualStrings("rotated-segment-record", entries[1].data);
+}
+
+test "wal lsm sync boundary failures recover a valid acknowledged prefix" {
+    const sync_failure_needles = [_][]const u8{
+        "/wal/00000000000000000001.log",
+        "/wal/index",
+    };
+
+    for (sync_failure_needles, 0..) |needle, case_index| {
+        var runtime = storage_sim.Runtime.init(std.testing.allocator);
+        defer runtime.deinit();
+
+        var device_model = storage_sim.ModeledDevice.init(std.testing.allocator);
+        defer device_model.deinit();
+
+        const path = try std.fmt.allocPrintSentinel(
+            std.testing.allocator,
+            "/wal-modeled-sync-failure-{d}",
+            .{case_index},
+            0,
+        );
+        defer std.testing.allocator.free(path);
+        const opts = WalOptions{
+            .backend = .lsm,
+            .storage = device_model.storage(),
+            .clock = runtime.clock(),
+            .commit_scheduler = runtime.completionScheduler(),
+            .lsm_options = .{
+                // Index publication is segment-scoped, so force the index
+                // boundary case through a real rotation.
+                .wal_segment_bytes = if (case_index == 1) 32 else 64 * 1024 * 1024,
+            },
+        };
+
+        var crashed_wal = try WAL.open(path, opts);
+        try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("committed"));
+        try device_model.injectSyncFailureForPathContains(needle);
+        try std.testing.expectError(error.InjectedSyncFault, crashed_wal.append("uncertain"));
+        try device_model.device().crash();
+        crashed_wal.abandonAfterCrash();
+
+        var reopened = try WAL.open(path, opts);
+        defer reopened.close();
+        const entries = try reopened.iterateFrom(std.testing.allocator, 1);
+        defer {
+            for (entries) |entry| std.testing.allocator.free(entry.data);
+            std.testing.allocator.free(entries);
+        }
+        // A failure may happen after the new record reached durable storage but
+        // before the final durability boundary completed. Recovery may therefore
+        // include the uncertain record, but it must never lose the previously
+        // acknowledged prefix or expose anything other than that valid suffix.
+        try std.testing.expect(entries.len == 1 or entries.len == 2);
+        try std.testing.expectEqualStrings("committed", entries[0].data);
+        if (entries.len == 2) {
+            try std.testing.expectEqual(@as(u64, 2), entries[1].lsn);
+            try std.testing.expectEqualStrings("uncertain", entries[1].data);
+        }
+
+        const recovered_lsn = try reopened.append("after-recovery");
+        try std.testing.expectEqual(@as(u64, @intCast(entries.len + 1)), recovered_lsn);
+    }
 }
 
 test "wal modeled replay runner uses virtual storage and time" {
@@ -3818,9 +3982,13 @@ test "wal backend adapters expose txn cursor operations" {
         errdefer txn.abort();
         var write = txn.writeAdapter();
         try write.put(&key, "value");
-        var cur = try write.openCursor();
-        defer cur.close();
-        try std.testing.expectEqualStrings(&key, (try cur.start(.{})).?.key);
+        {
+            // Cursors must close before commit: committing with an open
+            // cursor fails closed with error.TransactionCursorActive.
+            var cur = try write.openCursor();
+            defer cur.close();
+            try std.testing.expectEqualStrings(&key, (try cur.start(.{})).?.key);
+        }
         try write.commit();
     }
 
@@ -3900,6 +4068,50 @@ test "wal can use lsm backend for append reopen and truncate" {
         try std.testing.expectEqual(@as(u64, 3), entries[0].lsn);
         try std.testing.expectEqualStrings("gamma", entries[0].data);
     }
+}
+
+test "wal full durability does not repeat an already durable lsm commit" {
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "lsm-single-durable-boundary");
+    defer cleanupWalDir(path);
+
+    var wal = try WAL.open(path, .{ .backend = .lsm });
+    defer wal.close();
+
+    _ = try wal.append("warmup");
+    const before = wal.statsSnapshot();
+    _ = try wal.append("measured");
+    const after = wal.statsSnapshot();
+
+    try std.testing.expectEqual(@as(u64, 1), after.inner_segment_syncs - before.inner_segment_syncs);
+    try std.testing.expectEqual(@as(u64, 0), after.inner_index_syncs - before.inner_index_syncs);
+    try std.testing.expectEqual(@as(u64, 0), after.post_commit_segment_syncs - before.post_commit_segment_syncs);
+    try std.testing.expectEqual(@as(u64, 0), after.post_commit_index_syncs - before.post_commit_index_syncs);
+}
+
+test "wal retains post commit sync when lsm commit is not durable" {
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "lsm-post-commit-durable-boundary");
+    defer cleanupWalDir(path);
+
+    var wal = try WAL.open(path, .{
+        .backend = .lsm,
+        .lsm_options = .{
+            .backend = .{ .durability = .none },
+            .wal_sync_on_commit = false,
+        },
+    });
+    defer wal.close();
+
+    _ = try wal.append("warmup");
+    const before = wal.statsSnapshot();
+    _ = try wal.append("measured");
+    const after = wal.statsSnapshot();
+
+    try std.testing.expectEqual(@as(u64, 0), after.inner_segment_syncs - before.inner_segment_syncs);
+    try std.testing.expectEqual(@as(u64, 0), after.inner_index_syncs - before.inner_index_syncs);
+    try std.testing.expectEqual(@as(u64, 1), after.post_commit_segment_syncs - before.post_commit_segment_syncs);
+    try std.testing.expectEqual(@as(u64, 1), after.post_commit_index_syncs - before.post_commit_index_syncs);
 }
 
 test "wal read-only lsm backend does not create missing root" {

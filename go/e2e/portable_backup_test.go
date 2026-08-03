@@ -42,17 +42,17 @@ func TestE2E_PortableBackupRestore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Start Antfly swarm without Antfly inference (no ML models needed)
-	t.Log("Starting Antfly swarm...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	defer swarm.Cleanup()
+	// Start Antfly standalone without Antfly inference (no ML models needed)
+	t.Log("Starting Antfly standalone...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	defer standalone.Cleanup()
 
 	tableName := "portable_backup_test"
 	backupID := "portable-backup-e2e"
 
 	// Step 1: Create a simple table
 	t.Log("Creating table...")
-	createSimpleTable(t, ctx, swarm.Client, tableName)
+	createSimpleTable(t, ctx, standalone.Client, tableName)
 
 	// Step 2: Insert test documents
 	t.Log("Inserting test documents...")
@@ -63,10 +63,10 @@ func TestE2E_PortableBackupRestore(t *testing.T) {
 		"delta":   {"title": "Delta Document", "content": "Fourth document for portable backup test"},
 		"epsilon": {"title": "Epsilon Document", "content": "Fifth document for portable backup test"},
 	}
-	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelQuery)
+	insertTestDocuments(t, ctx, standalone.Client, tableName, testDocs, antfly.SyncLevelQuery)
 
 	// Step 3: Verify document count before backup
-	countBefore := getDocumentCount(t, ctx, swarm.Client, tableName)
+	countBefore := getDocumentCount(t, ctx, standalone.Client, tableName)
 	t.Logf("Document count before backup: %d", countBefore)
 	require.Equal(t, len(testDocs), countBefore, "Expected all documents to be present")
 
@@ -74,7 +74,7 @@ func TestE2E_PortableBackupRestore(t *testing.T) {
 	t.Log("Creating portable backup...")
 	backupDir := GetBackupDir(t)
 	location := "file://" + backupDir
-	err := backupTableWithFormat(t, swarm.MetadataAPIURL, tableName, backupID, location, "portable")
+	err := backupTableWithFormat(t, standalone.MetadataAPIURL, tableName, backupID, location, "portable")
 	require.NoError(t, err, "Failed to create portable backup")
 
 	// Step 5: Verify .afb files were created
@@ -100,28 +100,28 @@ func TestE2E_PortableBackupRestore(t *testing.T) {
 
 	// Step 6: Drop the table
 	t.Log("Dropping table...")
-	err = swarm.Client.DropTable(ctx, tableName)
+	err = standalone.Client.DropTable(ctx, tableName)
 	require.NoError(t, err, "Failed to drop table")
 	time.Sleep(2 * time.Second)
 
 	// Step 7: Restore from portable backup
 	t.Log("Restoring from portable backup...")
-	err = restoreTableWithFormat(t, swarm.MetadataAPIURL, tableName, backupID, location, "portable")
+	err = restoreTableWithFormat(t, standalone.MetadataAPIURL, tableName, backupID, location, "portable")
 	require.NoError(t, err, "Failed to restore from portable backup")
 
 	// Step 8: Wait for shards to be ready
 	t.Log("Waiting for shards to be ready after restore...")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 60*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 60*time.Second)
 
 	// Step 9: Verify document count after restore
-	countAfter := getDocumentCount(t, ctx, swarm.Client, tableName)
+	countAfter := getDocumentCount(t, ctx, standalone.Client, tableName)
 	t.Logf("Document count after restore: %d", countAfter)
 	require.Equal(t, countBefore, countAfter, "Document count mismatch after portable restore")
 
 	// Step 10: Verify individual documents
 	t.Log("Verifying individual documents...")
 	for docID, expected := range testDocs {
-		docMap, err := swarm.Client.LookupKey(ctx, tableName, docID)
+		docMap, err := standalone.Client.LookupKey(ctx, tableName, docID)
 		require.NoError(t, err, "Failed to get document %s after restore", docID)
 		require.NotNil(t, docMap, "Document %s should exist after restore", docID)
 

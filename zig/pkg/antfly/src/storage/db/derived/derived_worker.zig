@@ -24,7 +24,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const docstore_mod = @import("../../docstore.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;
@@ -122,6 +122,10 @@ pub const CatchUpOptions = struct {
     max_windows_per_call: usize = 0,
     estimated_dense_vector_bytes: u64 = 0,
     target_sequence: u64 = 0,
+    /// Optional absolute monotonic deadline. Collection stops before opening a
+    /// new apply window once this deadline is reached. Callers must still size
+    /// windows so an individual backend apply fits within their service SLO.
+    deadline_ns: ?u64 = null,
 };
 
 pub const catch_up_max_records_per_window_default: usize = 2048;
@@ -147,8 +151,10 @@ fn logCatchUpError(
     err: anyerror,
 ) void {
     if (err == error.WriterLocked) return;
+    if (err == error.ResourceBudgetExceeded) return;
     if (err == error.ReplayDocumentNotVisible) return;
     if (err == error.ArtifactRepairRequired) return;
+    if (err == error.CatchUpDeadlineExceeded) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",
@@ -242,6 +248,9 @@ pub fn catchUpIndexFromMatchingCursor(
     var stats = CatchUpStats{};
     var completed_windows: usize = 0;
     while (true) {
+        if (options.deadline_ns) |deadline| {
+            if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
+        }
         var builder = ReplayChunkBuilder.init(alloc, index_ref, options.resource_manager, options.max_chunk_bytes);
         builder.max_items = options.max_items_per_window;
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
@@ -257,6 +266,12 @@ pub fn catchUpIndexFromMatchingCursor(
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
             break;
+        }
+        // Never begin a storage mutation after the caller's deadline. The
+        // replay cursor is disposable; a retry reopens it from the last
+        // durably persisted applied sequence.
+        if (options.deadline_ns) |deadline| {
+            if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
         }
         stats.scanned_entries += if (chunk_stats.scanned_entries != 0) chunk_stats.scanned_entries else chunk_stats.matched_entries;
         stats.replay_scan_batches += chunk_stats.scan_batches;
@@ -289,7 +304,7 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const apply_started_ns = monotonicTimeNs();
-        const applied = apply_fn(apply_ctx, batch, index_ref) catch |err| {
+        const applied = applyBatchBounded(apply_ctx, apply_fn, batch, index_ref, options.max_items_per_window) catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             derived_types.deinitDerivedBatch(alloc, &batch);
@@ -330,9 +345,67 @@ pub fn catchUpIndexFromMatchingCursor(
         }
         derived_types.deinitDerivedBatch(alloc, &batch);
         completed_windows += 1;
+        if (options.deadline_ns) |deadline| {
+            if (monotonicTimeNs() >= deadline) break;
+        }
         if (options.max_windows_per_call > 0 and completed_windows >= options.max_windows_per_call) break;
     }
     return stats;
+}
+
+fn applyBatchBounded(
+    apply_ctx: *anyopaque,
+    apply_fn: ApplyFn,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    max_items: usize,
+) !bool {
+    if (index_ref.kind != .full_text or max_items == 0) return try apply_fn(apply_ctx, batch, index_ref);
+    if (batch.changed_artifact_keys.len != 0 or
+        batch.graph_doc_clears.len != 0 or
+        batch.dense_embeddings.len != 0 or
+        batch.sparse_embeddings.len != 0 or
+        batch.generated_enrichment_refs.len != 0 or
+        batch.graph_writes.len != 0 or
+        batch.graph_deletes.len != 0)
+    {
+        return try apply_fn(apply_ctx, batch, index_ref);
+    }
+
+    const total_items = batch.deleted_keys.len +| batch.overwritten_doc_keys.len +| batch.documents.len;
+    if (total_items <= max_items) return try apply_fn(apply_ctx, batch, index_ref);
+
+    var applied_any = false;
+    var start: usize = 0;
+    while (start < batch.deleted_keys.len) {
+        const end = @min(start + max_items, batch.deleted_keys.len);
+        applied_any = (try apply_fn(apply_ctx, .{
+            .sequence = batch.sequence,
+            .deleted_keys = batch.deleted_keys[start..end],
+        }, index_ref)) or applied_any;
+        start = end;
+    }
+
+    start = 0;
+    while (start < batch.overwritten_doc_keys.len) {
+        const end = @min(start + max_items, batch.overwritten_doc_keys.len);
+        applied_any = (try apply_fn(apply_ctx, .{
+            .sequence = batch.sequence,
+            .overwritten_doc_keys = batch.overwritten_doc_keys[start..end],
+        }, index_ref)) or applied_any;
+        start = end;
+    }
+
+    start = 0;
+    while (start < batch.documents.len) {
+        const end = @min(start + max_items, batch.documents.len);
+        applied_any = (try apply_fn(apply_ctx, .{
+            .sequence = batch.sequence,
+            .documents = batch.documents[start..end],
+        }, index_ref)) or applied_any;
+        start = end;
+    }
+    return applied_any;
 }
 
 fn monotonicTimeNs() u64 {
@@ -472,24 +545,30 @@ const ReplayChunkBuilder = struct {
 
     fn finish(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
         const changed_doc_keys = try self.changed_doc_keys.toOwnedSlice(self.alloc);
-        errdefer {
-            for (changed_doc_keys) |key| self.alloc.free(key);
+        var transferred_changed_doc_keys: usize = 0;
+        var changed_doc_keys_owned = true;
+        errdefer if (changed_doc_keys_owned) {
+            for (changed_doc_keys[transferred_changed_doc_keys..]) |key| self.alloc.free(key);
             if (changed_doc_keys.len > 0) self.alloc.free(changed_doc_keys);
-        }
+        };
 
         var documents = try self.alloc.alloc(derived_types.DerivedDocument, changed_doc_keys.len);
         var initialized_docs: usize = 0;
         errdefer {
-            var tmp = derived_types.DerivedBatch{ .documents = documents[0..initialized_docs] };
-            derived_types.deinitDerivedBatch(self.alloc, &tmp);
+            for (documents[0..initialized_docs]) |doc|
+                derived_types.deinitDerivedDocument(self.alloc, doc);
+            if (documents.len > 0) self.alloc.free(documents);
         }
         for (changed_doc_keys, 0..) |key, i| {
             const targets: []const derived_types.DerivedTargetRef = switch (self.index_ref.kind) {
                 .full_text, .algebraic => blk: {
                     const refs = try self.alloc.alloc(derived_types.DerivedTargetRef, 1);
+                    errdefer self.alloc.free(refs);
+                    const index_name = try self.alloc.dupe(u8, self.index_ref.name);
+                    errdefer self.alloc.free(index_name);
                     refs[0] = .{
                         .kind = if (self.index_ref.kind == .full_text) .full_text else .algebraic,
-                        .index_name = try self.alloc.dupe(u8, self.index_ref.name),
+                        .index_name = index_name,
                     };
                     break :blk refs;
                 },
@@ -501,8 +580,10 @@ const ReplayChunkBuilder = struct {
                 .targets = targets,
             };
             initialized_docs += 1;
+            transferred_changed_doc_keys += 1;
         }
         if (changed_doc_keys.len > 0) self.alloc.free(changed_doc_keys);
+        changed_doc_keys_owned = false;
 
         const deleted_keys = try self.deleted_doc_keys.toOwnedSlice(self.alloc);
         errdefer {
@@ -921,6 +1002,32 @@ test "catchUpIndex window hooks fire once per replay window" {
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_finishes);
 }
 
+test "catchUpIndex refuses to open an apply window after its deadline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-expired-deadline-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(error.CatchUpDeadlineExceeded, catchUpIndexWithOptions(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        .{ .name = "dv_v1", .kind = .dense_vector },
+        0,
+        &capture,
+        testApplyCapture,
+        .{ .deadline_ns = 1 },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), capture.call_count);
+}
+
 test "catchUpIndex can stop after bounded replay windows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1278,6 +1385,43 @@ test "catchUpIndex chunks dense replay by item budget" {
     try std.testing.expectEqual(@as(usize, 2), stats.applied_entries);
     try std.testing.expectEqual(@as(usize, 2), capture.call_count);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, capture.sequences.items);
+}
+
+test "catchUpIndex subchunks one oversized full text record before advancing its sequence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-item-chunked-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{ "doc:a", "doc:b", "doc:c", "doc:d", "doc:e" },
+        .target_hints = &.{.full_text},
+    });
+
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const stats = try catchUpIndexWithOptions(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        .{ .name = "text", .kind = .full_text },
+        0,
+        &capture,
+        testApplyCapture,
+        .{ .max_items_per_window = 2 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
+    try std.testing.expectEqual(@as(usize, 3), capture.call_count);
+    try std.testing.expectEqual(@as(usize, 5), capture.applied_documents);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 1, 1 }, capture.sequences.items);
 }
 
 test "catchUpIndex chunks dense replay by estimated vector byte budget" {

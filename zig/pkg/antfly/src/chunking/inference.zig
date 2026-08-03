@@ -16,7 +16,8 @@ const std = @import("std");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const chunking_types = @import("types.zig");
-const Chunk = @import("chunk.zig").Chunk;
+const chunk_mod = @import("chunk.zig");
+const Chunk = chunk_mod.Chunk;
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
@@ -32,19 +33,22 @@ pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8)
     defer freeRemoteChunks(alloc, shared_chunks);
 
     var chunks = try alloc.alloc(Chunk, shared_chunks.len);
+    var initialized: usize = 0;
     errdefer {
-        for (chunks) |*chunk| chunk.deinit(alloc);
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
         alloc.free(chunks);
     }
     for (shared_chunks, 0..) |shared, i| {
         if (!std.mem.eql(u8, shared.mime_type, "text/plain")) return error.UnsupportedChunkMediaType;
         const shared_text = shared.text orelse return error.InvalidChunkerResponse;
+        const offsets = chunk_mod.completeTextOffsetPair(shared.start_char, shared.end_char, text.len);
         chunks[i] = .{
             .chunk_id = shared.id,
             .text = try alloc.dupe(u8, shared_text),
-            .start_offset = shared.start_char,
-            .end_offset = shared.end_char orelse std.math.cast(u32, shared_text.len),
+            .start_offset = offsets.start,
+            .end_offset = offsets.end,
         };
+        initialized += 1;
     }
     return chunks;
 }
@@ -310,6 +314,67 @@ test "antfly chunker text round trip" {
     try std.testing.expectEqual(@as(usize, 2), chunks.len);
     try std.testing.expectEqualStrings("alpha body", chunks[0].text.?);
     try std.testing.expectEqual(@as(?u32, 11), chunks[1].start_offset);
+}
+
+test "antfly chunker omits incomplete and invalid provenance spans" {
+    const alloc = std.testing.allocator;
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/chunk"));
+            return .{
+                .status = 200,
+                .content_type = try req_alloc.dupe(u8, "application/json"),
+                .body = try req_alloc.dupe(u8,
+                    \\{"object":"list","data":[
+                    \\  {"object":"chunk","index":0,"id":0,"mime_type":"text/plain","text":"alpha","start_char":0},
+                    \\  {"object":"chunk","index":1,"id":1,"mime_type":"text/plain","text":"beta","end_char":9},
+                    \\  {"object":"chunk","index":2,"id":2,"mime_type":"text/plain","text":"gamma","start_char":8,"end_char":2},
+                    \\  {"object":"chunk","index":3,"id":3,"mime_type":"text/plain","text":"delta","start_char":0,"end_char":99}
+                    \\],"model":"chunker-v1","usage":{"prompt_tokens":2,"completion_tokens":0,"total_tokens":2},"cache_hit":false}
+                ),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const cfg = chunking_types.Config{
+        .provider = .antfly,
+        .api_url = base_uri,
+        .model = "chunker-v1",
+        .text = .{ .target_tokens = 8, .overlap_tokens = 2 },
+    };
+
+    const chunks = try chunkText(alloc, cfg, "alpha beta");
+    defer {
+        for (chunks) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), chunks.len);
+    try std.testing.expectEqual(@as(?u32, null), chunks[0].start_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[0].end_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[1].start_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[1].end_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[2].start_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[2].end_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[3].start_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[3].end_offset);
 }
 
 test "antfly chunker binary round trip" {

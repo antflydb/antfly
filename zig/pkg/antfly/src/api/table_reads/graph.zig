@@ -22,8 +22,7 @@ const metadata_transition_state = @import("../../metadata/transition_state.zig")
 const raft_mod = @import("../../raft/mod.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const db_mod = @import("../../storage/db/mod.zig");
-const doc_set = @import("../../storage/db/doc_set.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const distributed_graph = @import("../distributed_graph.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
@@ -85,38 +84,75 @@ pub fn graphHydrateRequestHasResolvedDocFilter(req: distributed_graph.GraphHydra
     return req.resolved_doc_filter != null;
 }
 
+pub fn requiresDistributedGraphCoordinator(
+    group_count: usize,
+    req: db_mod.types.SearchRequest,
+) bool {
+    return distributed_graph.supportsCrossRange(req) and
+        (group_count > 1 or req.graph_table_read_authorizer != null);
+}
+
 pub fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
     if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
     if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
     const generation = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
-    if (generation != ctx.identity_read_generation) return error.UnsupportedQueryRequest;
+    if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
 }
 
-pub fn graphHydrateResolvedDocFilterAllows(req: distributed_graph.GraphHydrateRequest, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    const ptr = req.resolved_doc_filter orelse return true;
-    const filter: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
-    return graphHydrateResolvedDocSetIncludes(&filter.include, key, ordinal) and
-        !graphHydrateResolvedDocSetIncludes(&filter.exclude, key, ordinal);
+pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
+    return .{
+        .query = .{ .match_all = {} },
+        .filter_query_json = req.filter_query_json,
+        .exclusion_query_json = req.exclusion_query_json,
+        .include_stored = req.include_stored,
+        .resolved_doc_filter = req.resolved_doc_filter,
+        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
+        .identity_read_generation = req.identity_read_generation,
+    };
 }
 
-fn graphHydrateResolvedDocSetIncludes(set: *const doc_set.ResolvedDocSet, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    return switch (set.*) {
-        .all => true,
-        .none => false,
-        .doc_keys => |keys| blk: {
-            for (keys) |candidate| {
-                if (std.mem.eql(u8, candidate, key)) break :blk true;
-            }
-            break :blk false;
+pub fn graphHydrateOnOpenDb(
+    alloc: std.mem.Allocator,
+    reads: raft_mod.FeatureDBReads,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphHydrateRequest,
+    consistency: raft_mod.ReadConsistency,
+    fallback_to_stale_on_not_leader: bool,
+) !distributed_graph.GraphHydrateResponse {
+    const search_req = graphHydrateSearchRequest(req);
+    reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, consistency) catch |err| switch (err) {
+        error.NotLeader => {
+            if (!fallback_to_stale_on_not_leader or consistency == .stale) return err;
+            try reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, .stale);
         },
-        .ordinals, .ordinal_bitmap => if (ordinal) |value| set.containsOrdinal(value) else false,
+        else => return err,
+    };
+    const hits = if (req.include_hits)
+        try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
+    else
+        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+    errdefer {
+        for (hits) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
+    return .{
+        .hits = hits,
+        .has_incoming = if (req.incoming_index_name.len > 0)
+            try db.graphHasIncomingEdgesForInternalRead(
+                alloc,
+                req.incoming_index_name,
+                req.keys,
+            )
+        else
+            @constCast((&[_]bool{})[0..]),
     };
 }
 
 pub fn graphExpandWithSearch(
     comptime Context: type,
     alloc: std.mem.Allocator,
+    table_name: []const u8,
     req: distributed_graph.GraphExpandRequest,
     context: Context,
     comptime search: fn (Context, std.mem.Allocator, db_mod.types.SearchRequest) anyerror!db_mod.types.SearchResult,
@@ -138,7 +174,7 @@ pub fn graphExpandWithSearch(
                 var result = try search(context, alloc, search_req);
                 defer result.deinit();
                 var graph_result = if (result.graph_results.len > 0)
-                    try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                    try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                 else
                     try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                 for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -225,26 +261,6 @@ test "graph metric fan-in shard request carries internal status without mutating
     try std.testing.expect(!req.graph_queries[1].query.include_metric_status);
 }
 
-test "graph hydrate resolved doc filter applies include and exclude sets" {
-    const alloc = std.testing.allocator;
-    var include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2, 3 });
-    defer include.deinit(alloc);
-    var filter = doc_set.ResolvedDocFilter{
-        .include = include,
-        .exclude = .{ .doc_keys = &.{"doc:hidden"} },
-    };
-    var keys = [_][]u8{};
-    const req = distributed_graph.GraphHydrateRequest{
-        .keys = keys[0..],
-        .resolved_doc_filter = &filter,
-    };
-
-    try std.testing.expect(graphHydrateResolvedDocFilterAllows(req, "doc:a", 1));
-    try std.testing.expect(!graphHydrateResolvedDocFilterAllows(req, "doc:a", 9));
-    try std.testing.expect(!graphHydrateResolvedDocFilterAllows(req, "doc:hidden", 1));
-    try std.testing.expect(graphHydrateResolvedDocFilterAllows(.{ .keys = keys[0..] }, "doc:any", null));
-}
-
 test "graph edge local read rejects stale identity generation" {
     const alloc = std.testing.allocator;
     const root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-graph-edge-stale-identity-generation");
@@ -314,7 +330,7 @@ test "graph edge local read rejects stale identity generation" {
     defer req.deinit(alloc);
 
     var catalog_state = CatalogState{};
-    try std.testing.expectError(error.UnsupportedQueryRequest, graphGetEdgesLocal(
+    try std.testing.expectError(error.IdentityReadGenerationChanged, graphGetEdgesLocal(
         alloc,
         root,
         catalog_state.iface(),

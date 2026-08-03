@@ -74,10 +74,10 @@ const (
 	// TypeDataReady indicates whether data pods are ready.
 	TypeDataReady = "DataReady"
 
-	// TypeSwarmReady indicates whether swarm pods are ready.
-	TypeSwarmReady = "SwarmReady"
+	// TypeStandaloneReady indicates whether standalone pods are ready.
+	TypeStandaloneReady = "StandaloneReady"
 
-	// TypeInferenceReady indicates whether inference is ready when managed in swarm mode.
+	// TypeInferenceReady indicates whether inference is ready when managed in standalone mode.
 	TypeInferenceReady = "InferenceReady"
 
 	// TypeHAAvailable indicates whether hot-standby HA has an available standby.
@@ -307,19 +307,19 @@ const (
 type ClusterMode string
 
 const (
-	// ClusterModeClustered is the existing split metadata/data topology.
-	ClusterModeClustered ClusterMode = "Clustered"
+	// ClusterModeDistributed is the existing split metadata/data topology.
+	ClusterModeDistributed ClusterMode = "Distributed"
 
-	// ClusterModeSwarm is the single-node operator-managed swarm topology.
-	ClusterModeSwarm ClusterMode = "Swarm"
+	// ClusterModeStandalone is the single-node operator-managed standalone topology.
+	ClusterModeStandalone ClusterMode = "Standalone"
 )
 
 // AntflyClusterSpec defines the desired state of AntflyCluster
 type AntflyClusterSpec struct {
 	// Mode selects the runtime topology managed by the operator.
 	// +optional
-	// +kubebuilder:validation:Enum=Clustered;Swarm
-	// +kubebuilder:default=Clustered
+	// +kubebuilder:validation:Enum=Distributed;Standalone
+	// +kubebuilder:default=Distributed
 	Mode ClusterMode `json:"mode,omitempty"`
 
 	// Image is the container image to use for Antfly
@@ -328,9 +328,9 @@ type AntflyClusterSpec struct {
 	// ImagePullPolicy defines the image pull policy
 	ImagePullPolicy string `json:"imagePullPolicy,omitempty"`
 
-	// Swarm defines the single-node swarm topology when Mode=Swarm.
+	// Standalone defines the single-node standalone topology when Mode=Standalone.
 	// +optional
-	Swarm *SwarmSpec `json:"swarm,omitempty"`
+	Standalone *StandaloneSpec `json:"standalone,omitempty"`
 
 	// Inference configures inference pools used by this cluster.
 	// Pools may be owned by this cluster, referenced as customer-managed shared
@@ -351,12 +351,12 @@ type AntflyClusterSpec struct {
 	ProductTier *ProductTierSpec `json:"productTier,omitempty"`
 
 	// MetadataNodes defines the configuration for metadata nodes (StatefulSet).
-	// Required for Clustered mode and must be omitted in Swarm mode.
+	// Required for Distributed mode and must be omitted in Standalone mode.
 	// +optional
 	MetadataNodes MetadataNodesSpec `json:"metadataNodes,omitempty"`
 
 	// DataNodes defines the configuration for data nodes (StatefulSet).
-	// Required for Clustered mode and must be omitted in Swarm mode.
+	// Required for Distributed mode and must be omitted in Standalone mode.
 	// +optional
 	DataNodes DataNodesSpec `json:"dataNodes,omitempty"`
 
@@ -424,17 +424,17 @@ type ProductTierSpec struct {
 	// +optional
 	ManagedBy string `json:"managedBy,omitempty"`
 
-	// SwarmTier optionally records the swarm sub-tier name when Mode=Swarm.
+	// StandaloneTier optionally records the standalone sub-tier name when Mode=Standalone.
 	// +optional
-	SwarmTier string `json:"swarmTier,omitempty"`
+	StandaloneTier string `json:"standaloneTier,omitempty"`
 
 	// MetadataTier optionally records the metadata-node sub-tier name when
-	// Mode=Clustered.
+	// Mode=Distributed.
 	// +optional
 	MetadataTier string `json:"metadataTier,omitempty"`
 
 	// DataTier optionally records the data-node sub-tier name when
-	// Mode=Clustered.
+	// Mode=Distributed.
 	// +optional
 	DataTier string `json:"dataTier,omitempty"`
 
@@ -593,8 +593,8 @@ type HighAvailabilitySpec struct {
 	// +optional
 	Admin *HAAdminSpec `json:"admin,omitempty"`
 
-	// Runtime configures the local Zig antfly swarm HA runtime role and durable WAL paths.
-	// Supported only when spec.mode=Swarm; split metadata/data topology HA process wiring is not yet modeled here.
+	// Runtime configures the local Zig antfly standalone HA runtime role and durable WAL paths.
+	// Supported only when spec.mode=Standalone; split metadata/data topology HA process wiring is not yet modeled here.
 	// +optional
 	Runtime *HARuntimeSpec `json:"runtime,omitempty"`
 
@@ -655,7 +655,7 @@ type HAStandbySpec struct {
 }
 
 // HARuntimeSpec configures how the operator starts this Antfly process in the HA runtime.
-// It is only supported when spec.mode=Swarm because those flags are currently wired through the Swarm StatefulSet.
+// It is only supported when spec.mode=Standalone because those flags are currently wired through the Standalone StatefulSet.
 type HARuntimeSpec struct {
 	// Role selects whether this process opens primary or standby HA runtime state.
 	// +kubebuilder:validation:Enum=Primary;Standby
@@ -672,19 +672,21 @@ type HARuntimeSpec struct {
 
 	// FormerPrimaryLogPath is the durable HA replication log used by former-primary rewind admin workflows.
 	// Set this on nodes that may need to rejoin after failover; for a primary this is usually the same path
-	// as primary.logPath, and the Swarm runtime wiring defaults it to primary.logPath when omitted.
+	// as primary.logPath, and the Standalone runtime wiring defaults it to primary.logPath when omitted.
 	// +optional
 	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
 
 	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
-	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
-	// Populate it with adminTokenSecretRef or spec.swarm.envFrom.
+	// When set, the operator passes --admin-token-env and the runtime rejects typed admin requests without a matching Authorization header.
+	// Populate it with adminTokenSecretRef or spec.standalone.envFrom for Antfly runtime pods and CLI fallback Jobs.
+	// The operator does not read this Secret; operator status probes and typed admin actions use spec.highAvailability.admin.tokenEnvVar.
 	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z_][A-Za-z0-9_]*$`
 	// +optional
 	AdminTokenEnvVar string `json:"adminTokenEnvVar,omitempty"`
 
-	// AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into the Antfly runtime container.
-	// Use this when the token is not already provided by spec.swarm.envFrom. optional must not be true.
+	// AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into Antfly runtime pods and CLI fallback Jobs.
+	// Use this when the token is not already provided by spec.standalone.envFrom. optional must not be true.
+	// This Secret is passed as a Kubernetes SecretKeySelector and is not read by the operator process.
 	// +optional
 	AdminTokenSecretRef *corev1.SecretKeySelector `json:"adminTokenSecretRef,omitempty"`
 
@@ -1007,12 +1009,12 @@ type DataNodesSpec struct {
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
 
-// SwarmSpec defines the configuration for operator-managed swarm mode.
-type SwarmSpec struct {
-	// Replicas is the number of swarm replicas. MVP only supports 1.
+// StandaloneSpec defines the configuration for operator-managed standalone mode.
+type StandaloneSpec struct {
+	// Replicas is the number of standalone replicas. MVP only supports 1.
 	Replicas int32 `json:"replicas,omitempty"`
 
-	// NodeID is the swarm node ID used for local orchestration URLs.
+	// NodeID is the standalone node ID used for local orchestration URLs.
 	NodeID int32 `json:"nodeID,omitempty"`
 
 	// Resources defines the resource requirements.
@@ -1033,13 +1035,13 @@ type SwarmSpec struct {
 	// Health defines the health endpoint configuration.
 	Health APISpec `json:"health,omitempty"`
 
-	// StartupProbe defines the startup probe budget for swarm node recovery.
+	// StartupProbe defines the startup probe budget for standalone node recovery.
 	// +optional
 	StartupProbe *ProbeConfig `json:"startupProbe,omitempty"`
 
-	// Inference controls the optional inference sidecar runtime integrated into swarm mode.
+	// Inference controls the optional inference sidecar runtime integrated into standalone mode.
 	// +optional
-	Inference *SwarmInferenceSpec `json:"inference,omitempty"`
+	Inference *StandaloneInferenceSpec `json:"inference,omitempty"`
 
 	// EnvFrom is a list of sources to populate environment variables in the container.
 	// +optional
@@ -1062,9 +1064,9 @@ type SwarmSpec struct {
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
 
-// SwarmInferenceSpec defines inference configuration for swarm mode.
-type SwarmInferenceSpec struct {
-	// Enabled controls whether inference runs alongside the swarm node.
+// StandaloneInferenceSpec defines inference configuration for standalone mode.
+type StandaloneInferenceSpec struct {
+	// Enabled controls whether inference runs alongside the standalone node.
 	Enabled bool `json:"enabled,omitempty"`
 
 	// APIURL is the inference API URL.
@@ -1157,10 +1159,23 @@ type StorageSpec struct {
 	// DataStorage defines storage for data nodes
 	DataStorage string `json:"dataStorage,omitempty"`
 
-	// SwarmStorage defines storage for the swarm topology.
-	// Used when spec.mode=Swarm.
+	// StandaloneStorage defines storage for the standalone topology.
+	// Used when spec.mode=Standalone.
 	// +optional
-	SwarmStorage string `json:"swarmStorage,omitempty"`
+	StandaloneStorage string `json:"standaloneStorage,omitempty"`
+
+	// Engine selects the persistence engine. Local stores a directory tree on
+	// PVCs. Lite stores the complete database in one .aflite file and is valid
+	// only with spec.mode=Standalone.
+	// +optional
+	// +kubebuilder:validation:Enum=local;lite
+	// +kubebuilder:default=local
+	Engine string `json:"engine,omitempty"`
+
+	// LiteFileName is the basename of the Lite database on the standalone PVC.
+	// It must not contain path separators and must end in .aflite.
+	// +optional
+	LiteFileName string `json:"liteFileName,omitempty"`
 
 	// PVCRetentionPolicy controls what happens to PVCs when the cluster is deleted or scaled down.
 	// Maps to StatefulSet's persistentVolumeClaimRetentionPolicy (beta in K8s 1.27, GA in 1.32).
@@ -1170,8 +1185,8 @@ type StorageSpec struct {
 	PVCRetentionPolicy *PVCRetentionPolicy `json:"pvcRetentionPolicy,omitempty"`
 
 	// StorageAutoGrow configures operator-owned grow-only disk autoscaling.
-	// Clustered mode currently applies this policy only to data PVCs. Swarm
-	// mode applies it to the swarm PVC.
+	// Distributed mode currently applies this policy only to data PVCs. Standalone
+	// mode applies it to the standalone PVC.
 	// +optional
 	StorageAutoGrow *StorageAutoGrowSpec `json:"storageAutoGrow,omitempty"`
 }
@@ -1181,12 +1196,12 @@ type StorageAutoGrowSpec struct {
 	// Enabled controls whether the operator automatically grows storage.
 	Enabled bool `json:"enabled,omitempty"`
 
-	// MaxDataStorage is the maximum size for clustered data PVC auto-grow.
+	// MaxDataStorage is the maximum size for distributed data PVC auto-grow.
 	MaxDataStorage string `json:"maxDataStorage,omitempty"`
 
-	// MaxSwarmStorage is the maximum size for swarm PVC auto-grow. If omitted
-	// in swarm mode, MaxDataStorage is used as the limit.
-	MaxSwarmStorage string `json:"maxSwarmStorage,omitempty"`
+	// MaxStandaloneStorage is the maximum size for standalone PVC auto-grow. If omitted
+	// in standalone mode, MaxDataStorage is used as the limit.
+	MaxStandaloneStorage string `json:"maxStandaloneStorage,omitempty"`
 
 	// GrowThresholdPercent is the percent-used threshold that triggers growth.
 	// Defaults to 85 when omitted.
@@ -1380,6 +1395,13 @@ type AntflyClusterStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// ConfigPublication identifies the exact non-secret config.json image most
+	// recently generated by the operator. Controllers can bind reconciliation
+	// acknowledgements to a specific AntflyCluster generation without reading
+	// the generated ConfigMap.
+	// +optional
+	ConfigPublication *ConfigPublicationStatus `json:"configPublication,omitempty"`
+
 	// Conditions represent the current conditions of the cluster
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
@@ -1393,9 +1415,9 @@ type AntflyClusterStatus struct {
 	// DataNodesReady represents the number of ready data nodes
 	DataNodesReady int32 `json:"dataNodesReady,omitempty"`
 
-	// SwarmNodesReady represents the number of ready swarm nodes.
+	// StandaloneNodesReady represents the number of ready standalone nodes.
 	// +optional
-	SwarmNodesReady int32 `json:"swarmNodesReady,omitempty"`
+	StandaloneNodesReady int32 `json:"standaloneNodesReady,omitempty"`
 
 	// AutoScalingStatus tracks autoscaling state
 	AutoScalingStatus *AutoScalingStatus `json:"autoScalingStatus,omitempty"`
@@ -1416,13 +1438,26 @@ type AntflyClusterStatus struct {
 	// +optional
 	ProductTierStatus *ProductTierStatus `json:"productTierStatus,omitempty"`
 
-	// SwarmStatus reports swarm-specific operational state.
+	// StandaloneStatus reports standalone-specific operational state.
 	// +optional
-	SwarmStatus *SwarmStatus `json:"swarmStatus,omitempty"`
+	StandaloneStatus *StandaloneStatus `json:"standaloneStatus,omitempty"`
 
 	// ServiceMeshStatus reports service mesh operational state
 	// +optional
 	ServiceMeshStatus *ServiceMeshStatus `json:"serviceMeshStatus,omitempty"`
+}
+
+// ConfigPublicationStatus identifies an operator-generated config.json image.
+// SHA256 is computed over the complete generated bytes; those bytes contain
+// secret references but never Kubernetes Secret values.
+type ConfigPublicationStatus struct {
+	// ObservedGeneration is the AntflyCluster metadata.generation from which the
+	// config image was generated.
+	ObservedGeneration int64 `json:"observedGeneration"`
+
+	// SHA256 is the lowercase full SHA-256 of the generated config.json bytes.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	SHA256 string `json:"sha256"`
 }
 
 // AutoScalingStatus tracks the current autoscaling state
@@ -2174,8 +2209,8 @@ type ProductTierStatus struct {
 	// Mode is the topology mode for this tier shape.
 	Mode ClusterMode `json:"mode,omitempty"`
 
-	// SwarmTier records the observed swarm sub-tier name.
-	SwarmTier string `json:"swarmTier,omitempty"`
+	// StandaloneTier records the observed standalone sub-tier name.
+	StandaloneTier string `json:"standaloneTier,omitempty"`
 
 	// MetadataTier records the observed metadata sub-tier name.
 	MetadataTier string `json:"metadataTier,omitempty"`
@@ -2186,11 +2221,11 @@ type ProductTierStatus struct {
 	// InferenceTier records the observed inference sub-tier name.
 	InferenceTier string `json:"inferenceTier,omitempty"`
 
-	// SwarmResources summarizes swarm CPU/memory requests and limits.
-	SwarmResources string `json:"swarmResources,omitempty"`
+	// StandaloneResources summarizes standalone CPU/memory requests and limits.
+	StandaloneResources string `json:"standaloneResources,omitempty"`
 
-	// SwarmStorage is the observed swarm storage size.
-	SwarmStorage string `json:"swarmStorage,omitempty"`
+	// StandaloneStorage is the observed standalone storage size.
+	StandaloneStorage string `json:"standaloneStorage,omitempty"`
 
 	// MetadataReplicas is the observed metadata replica count.
 	MetadataReplicas int32 `json:"metadataReplicas,omitempty"`
@@ -2242,9 +2277,9 @@ type ServiceMeshStatus struct {
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 
-// SwarmStatus reports swarm mode operational status.
-type SwarmStatus struct {
-	// Ready indicates that the combined swarm workload is ready.
+// StandaloneStatus reports standalone mode operational status.
+type StandaloneStatus struct {
+	// Ready indicates that the combined standalone workload is ready.
 	Ready bool `json:"ready,omitempty"`
 
 	// MetadataReady indicates that the metadata API is ready.
@@ -2256,19 +2291,19 @@ type SwarmStatus struct {
 	// InferenceReady indicates that inference is ready when enabled.
 	InferenceReady bool `json:"inferenceReady,omitempty"`
 
-	// NodeID is the configured swarm node ID.
+	// NodeID is the configured standalone node ID.
 	NodeID int32 `json:"nodeID,omitempty"`
 
-	// PodName is the name of the backing swarm pod.
+	// PodName is the name of the backing standalone pod.
 	PodName string `json:"podName,omitempty"`
 
-	// PodIP is the IP of the backing swarm pod.
+	// PodIP is the IP of the backing standalone pod.
 	PodIP string `json:"podIP,omitempty"`
 
 	// ObservedConfigHash records the config hash seen by the controller.
 	ObservedConfigHash string `json:"observedConfigHash,omitempty"`
 
-	// LastTransitionTime records the last swarm status transition.
+	// LastTransitionTime records the last standalone status transition.
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 

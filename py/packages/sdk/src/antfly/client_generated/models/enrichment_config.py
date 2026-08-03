@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.execution_policy import ExecutionPolicy
+
 
 T = TypeVar("T", bound="EnrichmentConfig")
 
@@ -32,6 +36,8 @@ class EnrichmentConfig:
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
             producer_json (str | Unset): Serialized asset producer configuration.
+            execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
+                operation. These fields tune how work is batched and do not change generated artifact identity.
     """
 
     name: str
@@ -46,6 +52,7 @@ class EnrichmentConfig:
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
     producer_json: str | Unset = UNSET
+    execution: ExecutionPolicy | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,6 +79,10 @@ class EnrichmentConfig:
         content_type = self.content_type
 
         producer_json = self.producer_json
+
+        execution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.execution, Unset):
+            execution = self.execution.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -101,11 +112,15 @@ class EnrichmentConfig:
             field_dict["content_type"] = content_type
         if producer_json is not UNSET:
             field_dict["producer_json"] = producer_json
+        if execution is not UNSET:
+            field_dict["execution"] = execution
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.execution_policy import ExecutionPolicy
+
         d = dict(src_dict)
         name = d.pop("name")
 
@@ -131,6 +146,13 @@ class EnrichmentConfig:
 
         producer_json = d.pop("producer_json", UNSET)
 
+        _execution = d.pop("execution", UNSET)
+        execution: ExecutionPolicy | Unset
+        if isinstance(_execution, Unset):
+            execution = UNSET
+        else:
+            execution = ExecutionPolicy.from_dict(_execution)
+
         enrichment_config = cls(
             name=name,
             kind=kind,
@@ -144,6 +166,7 @@ class EnrichmentConfig:
             full_text_index=full_text_index,
             content_type=content_type,
             producer_json=producer_json,
+            execution=execution,
         )
 
         enrichment_config.additional_properties = d

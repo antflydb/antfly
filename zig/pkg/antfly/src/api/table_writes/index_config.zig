@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const coverage_policy_mod = @import("../coverage_policy.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
@@ -72,6 +73,7 @@ pub fn parseIndexConfigWithOptions(
         .name = try alloc.dupe(u8, index_name),
         .kind = kind,
         .config_json = config_json,
+        .coverage_generation = coverage_policy_mod.incarnation(parsed.value) orelse 0,
     };
 }
 

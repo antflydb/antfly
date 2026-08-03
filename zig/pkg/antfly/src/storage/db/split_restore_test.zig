@@ -26,6 +26,8 @@ const graph_mod = @import("../../graph/graph.zig");
 const internal_keys = @import("../internal_keys.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
+const range_cardinality = @import("range_cardinality.zig");
+const range_state_mod = @import("range_state.zig");
 const schema_mod = @import("../schema.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const split_restore = @import("split_restore.zig");
@@ -386,11 +388,13 @@ test "db split prepare and finalize produce destination shard and trim parent ra
         },
         .sync_level = .full_index,
     });
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
     try db.split(db.getRange(), "doc:m", "", std.mem.span(dest), true);
 
     var split_db = try DB.open(alloc, std.mem.span(dest), .{});
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, split_db.core.store));
     try std.testing.expect((try split_db.getSplitState(alloc)) == null);
     {
         const split_stats = try split_db.diagnosticStats(alloc);
@@ -457,6 +461,7 @@ test "db split prepare and finalize produce destination shard and trim parent ra
 
     try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
     try std.testing.expectEqualStrings("doc:m", db.getRange().end);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
     try std.testing.expect((try db.get(alloc, "doc:z")) == null);
     {
         const parent_stats = try db.diagnosticStats(alloc);
@@ -961,6 +966,93 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "db restore snapshot repeatedly validates run-backed doc identity metadata" {
+    // Exercise the allocator used by the server process. Darwin's malloc
+    // diagnostics only poison and guard allocations that cross this boundary.
+    const alloc = platform.allocator.processAllocator(std.testing.allocator);
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = TestHelpers.tempPath(&src_buf);
+    defer TestHelpers.cleanupTempDir(src_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const identity_namespace = doc_identity.Namespace{
+        .table_id = 21,
+        .shard_id = 22,
+        .range_id = 23,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .identity_namespace = identity_namespace,
+        });
+        defer db.close();
+
+        for (0..96) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:restore-chaos-{d:0>3}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"restore chaos {d}\",\"ordinal\":{d}}}", .{ i, i });
+            defer alloc.free(value);
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .full_index,
+            });
+        }
+
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer TestHelpers.cleanupSnapshotDirForPath(src_path);
+
+    for (0..32) |i| {
+        var restore_buf: [256]u8 = undefined;
+        const restore_path = TestHelpers.tempPath(&restore_buf);
+        defer TestHelpers.cleanupTempDir(restore_path);
+
+        var transition = try db_mod.generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+        defer transition.deinit();
+        var staged_generation = try transition.beginStaging();
+        defer staged_generation.deinit();
+        try DB.restoreSnapshotToDeferredRuntimeRepair(
+            &staged_generation,
+            alloc,
+            snapshot_root,
+            staged_generation.path(),
+            .{
+                .primary_backend = primary_backend,
+                .identity_namespace = identity_namespace,
+            },
+            .{
+                .backup_id = "restore-chaos",
+                .location = "local",
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                .snapshot_path = "snap1",
+                .group_id = @intCast(i + 1),
+            },
+        );
+        _ = try staged_generation.publish();
+        // Release the staged generation and the exclusive transition before
+        // reopening the live path: published-generation reads fail closed with
+        // GenerationTransitionActive while an exclusive transition is active.
+        staged_generation.deinit();
+        transition.deinit();
+
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer restored.close();
+
+        const doc = (try restored.get(alloc, "doc:restore-chaos-095")) orelse return error.TestExpectedEqual;
+        defer alloc.free(doc);
+        try std.testing.expect(std.mem.indexOf(u8, doc, "restore chaos 95") != null);
+    }
+}
+
 test "db split restore doc identity snapshot rejects invalid metadata" {
     const alloc = std.testing.allocator;
 
@@ -1044,10 +1136,15 @@ test "db split restore doc identity deferred restore rejects strict namespace mi
     defer alloc.free(snapshot_root);
     defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
     try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
+        &staged,
         alloc,
         snapshot_root,
-        std.mem.span(restore_path),
+        staged.path(),
         .{
             .primary_backend = primary_backend,
             .identity_namespace = target_namespace,
@@ -1055,6 +1152,7 @@ test "db split restore doc identity deferred restore rejects strict namespace mi
         .{
             .backup_id = "backup-a",
             .location = "local",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             .snapshot_path = "snap1",
             .group_id = 99,
         },
@@ -1190,14 +1288,20 @@ test "db deferred restore runtime repair rebuilds graph indexes from artifacts" 
     defer alloc.free(snapshot_root);
     defer TestHelpers.cleanupSnapshotDirForPath(src_path);
 
-    try DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, std.mem.span(restore_path), .{
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    try DB.restoreSnapshotToDeferredRuntimeRepair(&staged, alloc, snapshot_root, staged.path(), .{
         .primary_backend = primary_backend,
     }, .{
         .backup_id = "snap1",
         .location = "file:///tmp/backups",
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         .snapshot_path = "snapshots/snap1",
         .group_id = 7001,
     });
+    _ = try staged.publish();
     try std.testing.expect(try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path)));
 
     {
@@ -1206,7 +1310,10 @@ test "db deferred restore runtime repair rebuilds graph indexes from artifacts" 
         });
         defer restored.close();
 
+        const target_count_before = try DB.loadDenseArtifactTargetCounter(alloc, restored.core.store, "dv_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expect(try restored.repairRestoreRuntimeStateIfNeeded(alloc));
+        const target_count_after = try DB.loadDenseArtifactTargetCounter(alloc, restored.core.store, "dv_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(target_count_before, target_count_after);
 
         const incoming = try restored.getEdges(alloc, "graph_v1", "doc:b", "cites", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, incoming);
@@ -1358,11 +1465,12 @@ test "db split restore doc identity runtime repair repairs managed chunked dense
         .primary_backend = primary_backend,
     });
 
-    try DB.markRestorePrimaryRestoredForPath(
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
         alloc,
         std.mem.span(restore_path),
         "snap1",
         "file:///tmp/backups",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "snapshots/snap1",
         7001,
     );
@@ -1380,7 +1488,12 @@ test "db split restore doc identity runtime repair repairs managed chunked dense
         });
         defer restored.close();
 
+        const target_count_before = try DB.loadDenseArtifactTargetCounter(alloc, restored.core.store, "dv_v1") orelse
+            return error.TestUnexpectedResult;
         try std.testing.expect(try restored.repairRestoreRuntimeStateIfNeeded(alloc));
+        const target_count_after = try DB.loadDenseArtifactTargetCounter(alloc, restored.core.store, "dv_v1") orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(target_count_before, target_count_after);
 
         const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
         defer alloc.free(query_vec);
@@ -1392,6 +1505,47 @@ test "db split restore doc identity runtime repair repairs managed chunked dense
         defer after.deinit();
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
     }
+
+    {
+        var status_db = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .status_only,
+        });
+        defer status_db.close();
+
+        const stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        try std.testing.expectEqualStrings("dv_v1", stats.indexes[0].name);
+        try std.testing.expectEqual(types.IndexKind.dense_vector, stats.indexes[0].kind);
+        try std.testing.expect(stats.indexes[0].doc_count > 0);
+        try std.testing.expectEqual(stats.indexes[0].replay_target_sequence, stats.indexes[0].replay_applied_sequence);
+        try std.testing.expect(!stats.indexes[0].replay_catch_up_required);
+    }
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var reopened = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .query_readonly,
+        });
+        defer reopened.close();
+
+        const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+        defer alloc.free(query_vec);
+        var after = try waitForSearchResult(alloc, &reopened, .{
+            .index_name = "dv_v1",
+            .dense = .{ .vector = query_vec, .k = 3 },
+            .return_mode = .parent,
+        }, 1);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+    }
+
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(restore_path))).?;
+    defer restore_state.deinit(alloc);
+    try std.testing.expect(restore_state.runtime_repair_complete);
+    try std.testing.expectEqualStrings("complete", restore_state.phase);
 
     const repair_marker_path = try split_restore.restoreRepairMarkerPathAlloc(alloc, std.mem.span(restore_path));
     defer alloc.free(repair_marker_path);
@@ -1428,6 +1582,7 @@ test "db split restore doc identity incomplete deferred restore import recovers 
     try DB.beginRestoreImport(alloc, std.mem.span(restore_path), snapshot_root, .{
         .backup_id = "snap1",
         .location = "file:///tmp/backups",
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         .snapshot_path = "snapshots/snap1",
         .group_id = 7001,
     });
@@ -1439,6 +1594,7 @@ test "db split restore doc identity incomplete deferred restore import recovers 
         defer state.deinit(alloc);
         try std.testing.expectEqualStrings("snap1", state.backup_id);
         try std.testing.expectEqualStrings("file:///tmp/backups", state.location);
+        try std.testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", state.artifact_sha256);
         try std.testing.expectEqualStrings("snapshots/snap1", state.snapshot_path);
         try std.testing.expectEqual(@as(u64, 7001), state.group_id);
         try std.testing.expect(state.primary_restored);
@@ -2724,6 +2880,205 @@ test "db merge-style cutover routes relational rows and column scans across reop
     defer donor_filtered.deinit();
     try std.testing.expectEqual(@as(u32, 0), donor_filtered.total_hits);
     try expectNoOrderedTupleEntriesForDocKey(alloc, reopened_donor.core.store, "row:z");
+}
+
+test "db split restore raft snapshot replacement preserves overlapping incoming documents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:keep", .value = "{\"version\":1}" },
+        .{ .key = "doc:stale", .value = "{\"stale\":true}" },
+    } });
+
+    try db.replaceRaftDocumentSnapshot(alloc, .{ .start = "", .end = "" }, &.{
+        .{ .key = "doc:keep", .value = "{\"version\":2}" },
+        .{ .key = "doc:new", .value = "{\"new\":true}" },
+    });
+
+    const retained = (try db.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try db.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db split restore staged raft snapshot chunks atomically replace the live generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var live = try DB.open(alloc, std.mem.span(path), .{});
+        defer live.close();
+        try live.batch(.{ .writes = &.{.{ .key = "doc:stale", .value = "{\"stale\":true}" }} });
+    }
+
+    var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(std.mem.span(path), null);
+    defer preparation.deinit();
+    var staged = try preparation.beginStaging();
+    defer staged.deinit();
+    {
+        var candidate = try DB.open(alloc, staged.path(), .{
+            .staged_generation = &staged,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer candidate.close();
+        const byte_range: types.ByteRange = .{ .start = "doc:a", .end = "doc:z" };
+        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+            .key = "doc:keep",
+            .value = "{\"version\":2}",
+        }});
+        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+            .key = "doc:new",
+            .value = "{\"new\":true}",
+        }});
+        try candidate.finishRaftDocumentSnapshot(&staged, byte_range);
+        try candidate.sync(true);
+    }
+    try staged.seal();
+    var exclusive = try preparation.promote();
+    defer exclusive.deinit();
+    _ = try staged.publish();
+    exclusive.deinit();
+    staged.deinit();
+    preparation.deinit();
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const retained = (try reopened.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try reopened.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try reopened.get(alloc, "doc:stale")) == null);
+    try std.testing.expectEqualStrings("doc:a", reopened.getRange().start);
+    try std.testing.expectEqualStrings("doc:z", reopened.getRange().end);
+}
+
+test "db split restore split bootstrap replacement preserves overlapping incoming documents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:keep", .value = "{\"version\":1}" },
+        .{ .key = "doc:stale", .value = "{\"stale\":true}" },
+    } });
+
+    try std.testing.expect(try db.replaceSplitBootstrap(
+        alloc,
+        .{ .start = "", .end = "" },
+        &.{
+            .{ .key = "doc:keep", .value = "{\"version\":2}" },
+            .{ .key = "doc:new", .value = "{\"new\":true}" },
+        },
+        17,
+        .{
+            .transition_id = 11,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 102,
+            .bootstrap_complete = false,
+        },
+    ));
+
+    const retained = (try db.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try db.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db split restore split bootstrap retries preserve reserved data and exact sequence" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const byte_range: types.ByteRange = .{ .start = "doc:m", .end = "doc:z" };
+    const incomplete: range_state_mod.SplitBootstrapMarker = .{
+        .transition_id = 11,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .bootstrap_complete = false,
+    };
+    try std.testing.expect(try db.replaceSplitBootstrap(
+        alloc,
+        byte_range,
+        &.{.{ .key = "doc:m", .value = "{\"version\":1}" }},
+        17,
+        incomplete,
+    ));
+    try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));
+    const reserved = (try db.get(alloc, "doc:m")).?;
+    defer alloc.free(reserved);
+    try std.testing.expectEqualStrings("{\"version\":1}", reserved);
+
+    var complete = incomplete;
+    complete.bootstrap_complete = true;
+    try std.testing.expectError(error.StaleSplitBootstrap, db.completeSplitBootstrap(alloc, byte_range, 18, complete));
+    try std.testing.expect(try db.completeSplitBootstrap(alloc, byte_range, 17, complete));
+
+    try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));
+    const retained = (try db.get(alloc, "doc:m")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":1}", retained);
+    try std.testing.expect((try db.getSplitBootstrapMarker(alloc)).?.bootstrap_complete);
+    try std.testing.expectError(error.SplitBootstrapComplete, db.replaceSplitBootstrap(alloc, byte_range, &.{}, 18, incomplete));
+}
+
+test "db split restore restore state uses strict structured content identity markers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    const location = "file:///tmp/backups?note=line\nphase=complete";
+    const artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        std.mem.span(path),
+        "snap1",
+        location,
+        artifact_sha256,
+        "snapshots/snap1",
+        7001,
+    );
+    {
+        var state = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqualStrings(location, state.location);
+        try std.testing.expectEqualStrings(artifact_sha256, state.artifact_sha256);
+        try std.testing.expectEqualStrings("runtime_repair", state.phase);
+    }
+
+    const state_path = try split_restore.restoreStateMarkerPathAlloc(alloc, std.mem.span(path));
+    defer alloc.free(state_path);
+    var io_impl = db_internal.threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = state_path,
+        .data = "restore_state_v2\nbackup_id=snap1\nlocation=file:///tmp/backups\n",
+    });
+    try std.testing.expectError(error.InvalidRestoreState, DB.readRestoreStateForPath(alloc, std.mem.span(path)));
 }
 
 test "db snapshot exports logical store only" {

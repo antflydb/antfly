@@ -37,5 +37,4 @@ pub const TermQuery = types.TermQuery;
 pub const TermRangeQuery = types.TermRangeQuery;
 pub const WildcardQuery = types.WildcardQuery;
 pub const GeoShapeGeometryRelation = types.GeoShapeGeometryRelation;
-pub const MatchQueryOperator = types.MatchQueryOperator;
 pub const MultiMatchBodyType = types.MultiMatchBodyType;

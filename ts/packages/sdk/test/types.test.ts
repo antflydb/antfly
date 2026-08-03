@@ -79,12 +79,13 @@ import {
   queryResultHitsTotal,
   queryResultTotalHits,
 } from "../src/types.js";
+import { match as matchQuery } from "../src/query-helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function generatedSortProfileDeclaration(): string {
   const generatedApi = readFileSync(join(__dirname, "../src/public-api.d.ts"), "utf8");
-  const match = generatedApi.match(/SortProfile: \{[\s\S]*?\n        \};/);
+  const match = generatedApi.match(/SortProfile: \{[\s\S]*?\n {8}\};/);
   if (!match) {
     throw new Error("generated SortProfile declaration not found");
   }
@@ -201,24 +202,15 @@ describe("Antfly Query Type Integration", () => {
       expect(query.field).toBe("name");
     });
 
-    it("should support fuzziness", () => {
-      const query: MatchQuery = {
-        match: "laptop",
-        field: "name",
-        fuzziness: "auto",
-      };
+    it("should keep the match helper aligned with the generated schema", () => {
+      const query = matchQuery("laptop computer", "description", {
+        analyzer: "standard",
+        boost: 1.5,
+      });
 
-      expect(query.fuzziness).toBe("auto");
-    });
-
-    it("should support operator", () => {
-      const query: MatchQuery = {
-        match: "laptop computer",
-        field: "description",
-        operator: "and",
-      };
-
-      expect(query.operator).toBe("and");
+      expectTypeOf(query).toEqualTypeOf<MatchQuery>();
+      expect(query.analyzer).toBe("standard");
+      expect(query.boost).toBe(1.5);
     });
   });
 

@@ -16,7 +16,7 @@ const std = @import("std");
 const api = @import("serverless_api.zig");
 const query = @import("serverless_query.zig");
 const maintenance = @import("serverless_maintenance.zig");
-const swarm = @import("serverless_swarm.zig");
+const combined = @import("serverless_combined.zig");
 
 pub fn run(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -43,17 +43,21 @@ fn dispatch(init: std.process.Init, argv0: []const u8, subcommand: []const u8, a
         return;
     }
 
-    var nested_argv0_buf: [128]u8 = undefined;
-    const nested_argv0 = try std.fmt.bufPrint(&nested_argv0_buf, "{s} serverless {s}", .{ argv0, subcommand });
+    const nested_argv0 = try nestedArgv0Alloc(init.gpa, argv0, subcommand);
+    defer init.gpa.free(nested_argv0);
 
     if (std.mem.eql(u8, subcommand, "api")) return try api.runFromIterator(init, nested_argv0, args);
     if (std.mem.eql(u8, subcommand, "query")) return try query.runFromIterator(init, nested_argv0, args);
     if (std.mem.eql(u8, subcommand, "maintenance")) return try maintenance.runFromIterator(init, nested_argv0, args);
-    if (std.mem.eql(u8, subcommand, "swarm")) return try swarm.runFromIterator(init, nested_argv0, args);
+    if (std.mem.eql(u8, subcommand, "combined")) return try combined.runFromIterator(init, nested_argv0, args);
 
     std.debug.print("unknown serverless subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn nestedArgv0Alloc(alloc: std.mem.Allocator, argv0: []const u8, subcommand: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s} serverless {s}", .{ argv0, subcommand });
 }
 
 fn printUsage(argv0: []const u8) void {
@@ -64,7 +68,7 @@ fn printUsage(argv0: []const u8) void {
         \\  api
         \\  query
         \\  maintenance
-        \\  swarm
+        \\  combined
         \\
     , .{argv0});
 }
@@ -72,4 +76,15 @@ fn printUsage(argv0: []const u8) void {
 test "serverless cmd compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "serverless cmd accepts long executable paths" {
+    const argv0 = try std.testing.allocator.alloc(u8, 512);
+    defer std.testing.allocator.free(argv0);
+    @memset(argv0, 'a');
+
+    const nested = try nestedArgv0Alloc(std.testing.allocator, argv0, "combined");
+    defer std.testing.allocator.free(nested);
+    try std.testing.expectEqual(argv0.len + " serverless combined".len, nested.len);
+    try std.testing.expect(std.mem.endsWith(u8, nested, " serverless combined"));
 }

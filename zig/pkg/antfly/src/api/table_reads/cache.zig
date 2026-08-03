@@ -20,19 +20,22 @@ const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const common_secrets = @import("../../common/secrets.zig");
+const introducer_mod = @import("../../introducer.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
-const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
+const index_manager_mod = @import("../../storage/db/catalog/index_manager.zig");
 const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
+const storage_schema = @import("../../storage/schema.zig");
 const runtime_status = @import("../runtime_status.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const Io = std.Io;
 
 const backend_current_root_generation: u64 = 0;
+const ManagedReadRuntimeConfig = @import("core.zig").ManagedReadRuntimeConfig;
 
 fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
@@ -54,6 +57,8 @@ pub const ProvisionedTableReadCache = struct {
     mutex: Io.Mutex = .init,
     ready: Io.Condition = .init,
     table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
+    exclusive_table_access: std.StringHashMapUnmanaged(usize) = .empty,
+    exclusive_group_access: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
@@ -61,6 +66,8 @@ pub const ProvisionedTableReadCache = struct {
     const max_cached_tables = 64;
     const pending_open_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
     const pending_open_wait_timeout_ns: u64 = 5 * std.time.ns_per_s;
+    const exclusive_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
+    const exclusive_wait_timeout_ns: u64 = 30 * std.time.ns_per_s;
 
     fn epochForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) !u64 {
         const gop = try self.table_epochs.getOrPut(self.alloc, table_name);
@@ -111,6 +118,30 @@ pub const ProvisionedTableReadCache = struct {
         }
     };
 
+    pub const ExclusiveTableAccess = struct {
+        cache: *ProvisionedTableReadCache,
+        table_name: []const u8,
+        active: bool = true,
+
+        pub fn deinit(self: *ExclusiveTableAccess) void {
+            if (!self.active) return;
+            self.cache.endExclusiveTableAccess(self.table_name);
+            self.active = false;
+        }
+    };
+
+    pub const ExclusiveGroupAccess = struct {
+        cache: *ProvisionedTableReadCache,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn deinit(self: *ExclusiveGroupAccess) void {
+            if (!self.active) return;
+            self.cache.endExclusiveGroupAccess(self.group_id);
+            self.active = false;
+        }
+    };
+
     const PendingOpen = struct {
         group_id: u64,
         identity_namespace: ?db_mod.DocIdentityNamespace = null,
@@ -147,6 +178,10 @@ pub const ProvisionedTableReadCache = struct {
         var epoch_keys = self.table_epochs.keyIterator();
         while (epoch_keys.next()) |key| self.alloc.free(key.*);
         self.table_epochs.deinit(self.alloc);
+        var exclusive_keys = self.exclusive_table_access.keyIterator();
+        while (exclusive_keys.next()) |key| self.alloc.free(key.*);
+        self.exclusive_table_access.deinit(self.alloc);
+        self.exclusive_group_access.deinit(self.alloc);
         self.mutex.unlock(io);
         self.threaded.deinit();
         self.* = undefined;
@@ -156,6 +191,16 @@ pub const ProvisionedTableReadCache = struct {
         return .{
             .hit_count = self.hit_count.load(.monotonic),
             .miss_count = self.miss_count.load(.monotonic),
+        };
+    }
+
+    fn managedReadRuntimeConfig(self: *const ProvisionedTableReadCache) ManagedReadRuntimeConfig {
+        return .{
+            .backend_runtime = self.backend_runtime,
+            .antfly_provider = self.antfly_provider,
+            .inference_api_url = self.inference_api_url,
+            .secret_store = self.secret_store,
+            .remote_content = self.remote_content,
         };
     }
 
@@ -170,10 +215,23 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         var stale_epoch_retries: u8 = 0;
         var pending_open_wait_started_ns: u64 = 0;
+        var exclusive_wait_started_ns: u64 = 0;
         while (true) {
+            // Reload every attempt because a stale-epoch retry can mean the
+            // table identity changed while the previous open was in flight.
             const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
-            const open_epoch = self.epochForTableLocked(table_name) catch |err| {
+            if (self.hasExclusiveTableAccessLocked(table_name) or self.hasExclusiveGroupAccessLocked(group_id)) {
+                self.mutex.unlock(io);
+                const now_ns = platform_time.monotonicNs();
+                if (exclusive_wait_started_ns == 0) exclusive_wait_started_ns = now_ns;
+                const waited_ns = now_ns -| exclusive_wait_started_ns;
+                if (waited_ns >= exclusive_wait_timeout_ns) return error.TableReadTransitionTimeout;
+                io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+                continue;
+            }
+            exclusive_wait_started_ns = 0;
+            const open_table_epoch = self.epochForTableLocked(table_name) catch |err| {
                 self.mutex.unlock(io);
                 return err;
             };
@@ -218,11 +276,7 @@ pub const ProvisionedTableReadCache = struct {
                 self.hbc_cache,
                 lsm_root_generation,
                 self.resource_manager,
-                self.backend_runtime,
-                self.antfly_provider,
-                self.inference_api_url,
-                self.secret_store,
-                self.remote_content,
+                self.managedReadRuntimeConfig(),
                 identity_namespace,
             ) catch |err| {
                 self.mutex.lockUncancelable(io);
@@ -235,7 +289,9 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if ((self.table_epochs.get(table_name) orelse open_epoch +% 1) != open_epoch) {
+            if ((self.table_epochs.get(table_name) orelse open_table_epoch +% 1) != open_table_epoch or
+                self.hasExclusiveGroupAccessLocked(group_id))
+            {
                 stale_epoch_retries += 1;
                 self.ready.broadcast(io);
                 if (stale_epoch_retries > 2) {
@@ -262,7 +318,12 @@ pub const ProvisionedTableReadCache = struct {
             if (!self.hasTableLocked(table_name) and self.cachedTableCountLocked() >= max_cached_tables) self.evictOldestTableLocked();
             const owned_table_name = try self.alloc.dupe(u8, table_name);
             errdefer self.alloc.free(owned_table_name);
-            try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+            const retirement_capacity = try std.math.add(
+                usize,
+                try std.math.add(usize, self.entries.items.len, self.retired_entries.items.len),
+                1,
+            );
+            try self.retired_entries.ensureTotalCapacity(self.alloc, retirement_capacity);
             const owned_entry = try self.alloc.create(Entry);
             errdefer self.alloc.destroy(owned_entry);
             owned_entry.* = .{
@@ -317,6 +378,87 @@ pub const ProvisionedTableReadCache = struct {
         table_name: []const u8,
     ) !Lease {
         return self.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+    }
+
+    pub fn beginExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) !ExclusiveTableAccess {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        errdefer self.mutex.unlock(io);
+
+        const gop = try self.exclusive_table_access.getOrPut(self.alloc, table_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.alloc.dupe(u8, table_name) catch |err| {
+                self.exclusive_table_access.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* += 1;
+
+        self.bumpEpochLocked(table_name);
+        self.removeEntriesForTableLocked(table_name);
+        self.ready.broadcast(io);
+        const drain_started_ns = platform_time.monotonicNs();
+        while (self.hasPendingOpenForTableLocked(table_name) or
+            self.hasTableLocked(table_name) or
+            self.hasRetiredEntryForTableLocked(table_name))
+        {
+            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
+            if (waited_ns >= exclusive_wait_timeout_ns) {
+                const pending_opens = self.pendingOpenCountForTableLocked(table_name);
+                const retired_entries = self.retiredEntryCountForTableLocked(table_name);
+                const active_leases = self.activeLeaseCountForTableLocked(table_name);
+                self.releaseExclusiveTableAccessLocked(table_name);
+                self.ready.broadcast(io);
+                std.log.err("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
+                    table_name,
+                    pending_opens,
+                    retired_entries,
+                    active_leases,
+                    @divTrunc(waited_ns, std.time.ns_per_ms),
+                });
+                return error.TableReadDrainTimeout;
+            }
+            self.mutex.unlock(io);
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            self.mutex.lockUncancelable(io);
+        }
+        self.mutex.unlock(io);
+
+        return .{
+            .cache = self,
+            .table_name = table_name,
+        };
+    }
+
+    pub fn beginExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) !ExclusiveGroupAccess {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        errdefer self.mutex.unlock(io);
+
+        const gop = try self.exclusive_group_access.getOrPut(self.alloc, group_id);
+        if (gop.found_existing) {
+            gop.value_ptr.* = std.math.add(usize, gop.value_ptr.*, 1) catch return error.TooManyExclusiveReaders;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+        self.removeEntriesForGroupLocked(group_id);
+        self.ready.broadcast(io);
+
+        const drain_started_ns = platform_time.monotonicNs();
+        while (self.hasPendingOpenForGroupLocked(group_id) or self.hasGroupLocked(group_id) or self.hasRetiredEntryForGroupLocked(group_id)) {
+            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
+            if (waited_ns >= exclusive_wait_timeout_ns) {
+                self.releaseExclusiveGroupAccessLocked(group_id);
+                self.ready.broadcast(io);
+                return error.TableReadDrainTimeout;
+            }
+            self.mutex.unlock(io);
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            self.mutex.lockUncancelable(io);
+        }
+        self.mutex.unlock(io);
+        return .{ .cache = self, .group_id = group_id };
     }
 
     pub fn invalidateTable(self: *ProvisionedTableReadCache, table_name: []const u8) void {
@@ -403,6 +545,42 @@ pub const ProvisionedTableReadCache = struct {
         return false;
     }
 
+    fn hasPendingOpenForTableLocked(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        for (self.pending_opens.items) |pending| {
+            if (std.mem.eql(u8, pending.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
+    fn hasExclusiveTableAccessLocked(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        return self.exclusive_table_access.get(table_name) != null;
+    }
+
+    fn hasExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        return self.exclusive_group_access.get(group_id) != null;
+    }
+
+    fn hasPendingOpenForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.pending_opens.items) |pending| if (pending.group_id == group_id) return true;
+        return false;
+    }
+
+    fn hasGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.entries.items) |entry| if (entry.group_id == group_id) return true;
+        return false;
+    }
+
+    fn hasRetiredEntryForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.retired_entries.items) |entry| if (entry.group_id == group_id) return true;
+        return false;
+    }
+
     fn removePendingOpenLocked(
         self: *ProvisionedTableReadCache,
         group_id: u64,
@@ -448,6 +626,40 @@ pub const ProvisionedTableReadCache = struct {
         return false;
     }
 
+    fn hasRetiredEntryForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) bool {
+        for (self.retired_entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
+    fn pendingOpenCountForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.pending_opens.items) |pending| {
+            if (std.mem.eql(u8, pending.table_name, table_name)) count += 1;
+        }
+        return count;
+    }
+
+    fn retiredEntryCountForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.retired_entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) count += 1;
+        }
+        return count;
+    }
+
+    fn activeLeaseCountForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) count +|= entry.active_leases;
+        }
+        for (self.retired_entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) count +|= entry.active_leases;
+        }
+        return count;
+    }
+
     fn cachedTableCountLocked(self: *ProvisionedTableReadCache) usize {
         var count: usize = 0;
         for (self.entries.items, 0..) |entry, i| {
@@ -467,6 +679,18 @@ pub const ProvisionedTableReadCache = struct {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             if (!std.mem.eql(u8, self.entries.items[i].table_name, table_name)) {
+                i += 1;
+                continue;
+            }
+            const removed = self.entries.orderedRemove(i);
+            self.retireEntryLocked(removed);
+        }
+    }
+
+    fn removeEntriesForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (self.entries.items[i].group_id != group_id) {
                 i += 1;
                 continue;
             }
@@ -527,6 +751,39 @@ pub const ProvisionedTableReadCache = struct {
         entry.active_leases -= 1;
         if (entry.active_leases == 0 and entry.retired) {
             self.destroyRetiredEntryLocked(entry);
+            self.ready.broadcast(io);
+        }
+    }
+
+    fn endExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        self.releaseExclusiveTableAccessLocked(table_name);
+        self.ready.broadcast(io);
+    }
+
+    fn endExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.releaseExclusiveGroupAccessLocked(group_id);
+        self.ready.broadcast(io);
+    }
+
+    fn releaseExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const count = self.exclusive_group_access.getPtr(group_id) orelse unreachable;
+        if (count.* > 1) count.* -= 1 else _ = self.exclusive_group_access.remove(group_id);
+    }
+
+    fn releaseExclusiveTableAccessLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
+        const count = self.exclusive_table_access.getPtr(table_name) orelse unreachable;
+        if (count.* > 1) {
+            count.* -= 1;
+        } else {
+            const removed = self.exclusive_table_access.fetchRemove(table_name) orelse unreachable;
+            self.alloc.free(removed.key);
         }
     }
 
@@ -538,7 +795,10 @@ pub const ProvisionedTableReadCache = struct {
             self.alloc.destroy(entry);
             return;
         }
-        self.retired_entries.appendAssumeCapacity(entry);
+        self.retired_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue retired read-cache entry table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue retired read-cache entry");
+        };
     }
 
     fn destroyRetiredEntryLocked(self: *ProvisionedTableReadCache, entry: *Entry) void {
@@ -566,7 +826,7 @@ pub fn openProvisionedQueryDbForTable(
     table_name: []const u8,
     lsm_root_generation: u64,
 ) !db_mod.DB {
-    return try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, null, null, null, null, null);
+    return try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, .{}, null);
 }
 
 pub fn openProvisionedQueryDbForTableWithRuntime(
@@ -587,11 +847,7 @@ pub fn openProvisionedQueryDbForTableWithRuntime(
         null,
         lsm_root_generation,
         null,
-        backend_runtime,
-        null,
-        null,
-        null,
-        null,
+        .{ .backend_runtime = backend_runtime },
         try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
     );
 }
@@ -605,11 +861,7 @@ pub fn openProvisionedQueryDbForTableWithCache(
     hbc_cache: ?*hbc_mod.Cache,
     lsm_root_generation: u64,
     resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    inference_api_url: ?[]const u8,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
+    runtime_cfg: ManagedReadRuntimeConfig,
     identity_namespace: ?db_mod.DocIdentityNamespace,
 ) !db_mod.DB {
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
@@ -619,9 +871,9 @@ pub fn openProvisionedQueryDbForTableWithCache(
             .hbc_cache = hbc_cache,
             .lsm_root_generation = lsm_root_generation,
             .resource_manager = resource_manager,
-            .backend_runtime = backend_runtime,
-            .secret_store = secret_store,
-            .remote_content = remote_content,
+            .backend_runtime = runtime_cfg.backend_runtime,
+            .secret_store = runtime_cfg.secret_store,
+            .remote_content = runtime_cfg.remote_content,
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
         });
@@ -631,89 +883,17 @@ pub fn openProvisionedQueryDbForTableWithCache(
     };
     defer alloc.free(indexes_json);
 
-    const EnrichmentSet = struct {
-        dense: ?db_embedder.DenseEmbedder = null,
-        sparse: ?db_embedder.SparseEmbedder = null,
-        generated: bool = false,
-
-        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-            if (self.dense) |owned| owned.deinit(allocator);
-            if (self.sparse) |owned| owned.deinit(allocator);
-        }
-
-        fn enabled(self: @This()) bool {
-            return self.dense != null or self.sparse != null or self.generated;
-        }
-
-        fn config(self: @This()) db_mod.enrichment_runtime.Config {
-            return .{
-                .dense_embedder = self.dense,
-                .sparse_embedder = self.sparse,
-                .asset_producer = null,
-                .enable_without_producers = self.generated,
-            };
-        }
-
-        fn take(self: *@This()) void {
-            self.dense = null;
-            self.sparse = null;
-            self.generated = false;
-        }
-    };
-
-    const createEnrichments = struct {
-        fn run(
-            allocator: std.mem.Allocator,
-            raw_indexes_json: []const u8,
-            runtime: ?*db_mod.background_runtime.BackendRuntime,
-            local_provider: ?managed_embedder.AntflyProvider,
-            local_inference_api_url: ?[]const u8,
-            store: ?*common_secrets.FileStore,
-            remote: ?*const scraping.RemoteContentConfig,
-        ) !EnrichmentSet {
-            _ = runtime;
-            const dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url });
-            errdefer if (dense) |owned| owned.deinit(allocator);
-            const sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url });
-            errdefer if (sparse) |owned| owned.deinit(allocator);
-            const generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json);
-            return .{
-                .dense = dense,
-                .sparse = sparse,
-                .generated = generated,
-            };
-        }
-    }.run;
-
-    var enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, inference_api_url, secret_store, remote_content);
-    defer enrichments.deinit(alloc);
-
-    var db = if (enrichments.enabled()) blk: {
-        const enrichment_cfg = enrichments.config();
-        const opened = try db_mod.DB.open(alloc, path, .{
-            .open_mode = .query_readonly,
-            .lsm_cache = lsm_cache,
-            .hbc_cache = hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = resource_manager,
-            .backend_runtime = backend_runtime,
-            .secret_store = secret_store,
-            .remote_content = remote_content,
-            .identity_namespace = identity_namespace,
-            .prefer_existing_identity_namespace = identity_namespace != null,
-            .enrichment = enrichment_cfg,
-        });
-        if (opened.enrichment_runtime != null) enrichments.take();
-        break :blk opened;
-    } else try db_mod.DB.open(alloc, path, .{
+    // Query-readonly DBs never initialize optional enrichment runtimes. Those
+    // workers produce derived artifacts and remain writer-owned.
+    var db = try db_mod.DB.open(alloc, path, .{
         .open_mode = .query_readonly,
         .lsm_cache = lsm_cache,
         .hbc_cache = hbc_cache,
         .lsm_root_generation = lsm_root_generation,
         .resource_manager = resource_manager,
-        .backend_runtime = backend_runtime,
-        .secret_store = secret_store,
-        .remote_content = remote_content,
+        .backend_runtime = runtime_cfg.backend_runtime,
+        .secret_store = runtime_cfg.secret_store,
+        .remote_content = runtime_cfg.remote_content,
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
     });
@@ -779,33 +959,58 @@ pub fn loadTableIndexesJson(
     return try alloc.dupe(u8, table.indexes_json);
 }
 
-fn indexesJsonHasGeneratedEnrichment(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
-    if (indexes_json.len == 0) return false;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    return jsonValueHasGeneratedEnrichment(parsed.value);
+fn catalogValueIsFullTextIndex(value: std.json.Value) !bool {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    const kind = value.object.get("type") orelse return true;
+    if (kind != .string) return error.InvalidTableIndexMetadata;
+    return std.mem.eql(u8, kind.string, "full_text");
 }
 
-fn jsonValueHasGeneratedEnrichment(value: std.json.Value) bool {
-    switch (value) {
-        .object => |object| {
-            if (object.get("kind")) |kind| {
-                if (kind == .string and (std.mem.eql(u8, kind.string, "asset") or std.mem.eql(u8, kind.string, "chunk"))) return true;
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (jsonValueHasGeneratedEnrichment(entry.value_ptr.*)) return true;
-            }
-            return false;
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                if (jsonValueHasGeneratedEnrichment(item)) return true;
-            }
-            return false;
-        },
-        else => return false,
+pub fn loadTableAggregationTextAnalysis(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    requested_index_name: ?[]const u8,
+) !introducer_mod.TextAnalysisConfig {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, table.indexes_json, .{});
+    defer parsed_indexes.deinit();
+    if (parsed_indexes.value != .object) return error.InvalidTableIndexMetadata;
+    const indexes = parsed_indexes.value.object;
+
+    var selected: ?std.json.Value = null;
+    if (requested_index_name) |name| {
+        if (indexes.get(name)) |value| {
+            if (try catalogValueIsFullTextIndex(value)) selected = value;
+        }
     }
+    if (selected == null) {
+        if (indexes.get(tables_api.default_full_text_index_name)) |value| {
+            if (try catalogValueIsFullTextIndex(value)) selected = value;
+        }
+    }
+    if (selected == null) {
+        var it = indexes.iterator();
+        while (it.next()) |entry| {
+            if (!try catalogValueIsFullTextIndex(entry.value_ptr.*)) continue;
+            if (selected != null) return error.InvalidQueryRequest;
+            selected = entry.value_ptr.*;
+        }
+    }
+    const config_json = try std.json.Stringify.valueAlloc(alloc, selected orelse return error.IndexNotFound, .{});
+    defer alloc.free(config_json);
+
+    if (table.schema_json.len == 0) {
+        return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, null);
+    }
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, runtime_schema);
 }
 
 pub fn loadTableIdentityNamespaceForGroup(
@@ -1495,7 +1700,222 @@ test "provisioned read cache retires invalidated entries until the last lease is
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
 }
 
-test "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
+test "provisioned read cache clear preserves in-flight pending opens and bumps epoch" {
+    const alloc = std.testing.allocator;
+
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+
+    try cache.pending_opens.append(alloc, .{
+        .group_id = 7001,
+        .table_name = try alloc.dupe(u8, "docs"),
+    });
+
+    // Seed the table's epoch slot the way an in-flight open would, then
+    // verify clear() bumps it (epochs are per-table, not global).
+    const io = cache.threaded.io();
+    cache.mutex.lockUncancelable(io);
+    const before_epoch = try cache.epochForTableLocked("docs");
+    cache.mutex.unlock(io);
+    cache.clear();
+
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
+    try std.testing.expectEqual(@as(usize, 1), cache.pending_opens.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
+}
+
+test "provisioned read cache exclusive access drains active read leases" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-read-cache-exclusive-drain";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ExclusiveThread = struct {
+        cache: *ProvisionedTableReadCache,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var exclusive = self.cache.beginExclusiveTableAccess("docs") catch |err| {
+                self.err = err;
+                return;
+            };
+            exclusive.deinit();
+        }
+    };
+
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.lsm_cache = &lsm_cache;
+
+    var lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs");
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    var ctx = ExclusiveThread{ .cache = &cache };
+    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+
+    var observed_exclusive = false;
+    var observed_retired_count: usize = 0;
+    for (0..100) |_| {
+        const io = cache.threaded.io();
+        cache.mutex.lockUncancelable(io);
+        observed_exclusive = cache.hasExclusiveTableAccessLocked("docs");
+        observed_retired_count = cache.retired_entries.items.len;
+        cache.mutex.unlock(io);
+        if (observed_exclusive and observed_retired_count == 1) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    lease.release();
+    thread.join();
+    if (ctx.err) |err| return err;
+    try std.testing.expect(observed_exclusive);
+    try std.testing.expectEqual(@as(usize, 1), observed_retired_count);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+}
+
+test "provisioned read cache group exclusive drains only the published group" {
+    const alloc = std.testing.allocator;
+    const root = "/tmp/antfly-api-provisioned-read-cache-group-exclusive";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ExclusiveThread = struct {
+        cache: *ProvisionedTableReadCache,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var exclusive = self.cache.beginExclusiveGroupAccess(7001) catch |err| {
+                self.err = err;
+                return;
+            };
+            exclusive.deinit();
+        }
+    };
+
+    const path_one = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+    defer alloc.free(path_one);
+    const path_two = try std.fmt.allocPrint(alloc, "{s}/group-7002", .{root});
+    defer alloc.free(path_two);
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.lsm_cache = &lsm_cache;
+
+    var lease_one = try cache.getOrOpen(path_one, FakeCatalog.iface(), 7001, 1, "docs");
+    var lease_two = try cache.getOrOpen(path_two, FakeCatalog.iface(), 7002, 1, "docs");
+    defer lease_two.release();
+    const table_epoch = cache.table_epochs.get("docs").?;
+
+    var ctx = ExclusiveThread{ .cache = &cache };
+    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+    var observed = false;
+    for (0..100) |_| {
+        const io = cache.threaded.io();
+        cache.mutex.lockUncancelable(io);
+        observed = cache.hasExclusiveGroupAccessLocked(7001) and
+            cache.entries.items.len == 1 and cache.entries.items[0].group_id == 7002 and
+            cache.retired_entries.items.len == 1;
+        cache.mutex.unlock(io);
+        if (observed) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    lease_one.release();
+    thread.join();
+    if (ctx.err) |err| return err;
+    try std.testing.expect(observed);
+    try std.testing.expectEqual(table_epoch, cache.table_epochs.get("docs").?);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
+}
+
+test "provisioned read cache retirement is allocation-free after entry installation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
     const path = try uniqueTestTmpPathAlloc(std.testing.allocator, "antfly-api-provisioned-read-cache-retire-oom");
@@ -1559,10 +1979,11 @@ test "provisioned read cache keeps leased entry cleanup reachable when retiremen
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     cache.invalidateTable("docs");
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
 
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len + cache.retired_entries.items.len);
 
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);

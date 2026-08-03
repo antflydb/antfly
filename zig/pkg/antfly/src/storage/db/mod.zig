@@ -32,6 +32,7 @@ pub const types = @import("types.zig");
 pub const docstore = @import("../docstore.zig");
 pub const lease = @import("lease.zig");
 pub const ownership = @import("ownership.zig");
+pub const generation_lifecycle = @import("generation_lifecycle.zig");
 pub const transaction_resolution = @import("transaction_resolution.zig");
 pub const apply_state = @import("derived/apply_state.zig");
 pub const embedder = @import("enrichment/embedder.zig");
@@ -43,9 +44,11 @@ pub const enrichment_state = @import("enrichment/enrichment_state.zig");
 pub const enrichment_runtime = @import("enrichment/enrichment_runtime.zig");
 pub const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 pub const chunker = @import("enrichment/chunker.zig");
+pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const derived_types = @import("derived/derived_types.zig");
 pub const derived_worker = @import("derived/derived_worker.zig");
 pub const derived_executor = @import("derived/derived_executor.zig");
+pub const derived_backlog_tracker = @import("derived/backlog_tracker.zig");
 pub const replay_stream = @import("derived/replay_stream.zig");
 pub const replay_source = @import("derived/replay_source.zig");
 pub const runtime_backend = @import("../runtime_backend.zig");
@@ -72,6 +75,7 @@ pub const apply_rw_lock = @import("apply_rw_lock.zig");
 pub const ChangeJournal = @import("derived/change_journal.zig").Journal;
 pub const DerivedLog = @import("derived/derived_log.zig").DerivedLog;
 pub const IndexManager = @import("catalog/index_manager.zig").IndexManager;
+pub const setBenchmarkTextMergePolicyOverride = @import("catalog/index_manager.zig").setBenchmarkTextMergePolicyOverride;
 pub const TextMemoryAttributionStats = @import("catalog/index_manager.zig").TextMemoryAttributionStats;
 pub const DenseSplitHandoff = @import("catalog/index_manager.zig").DenseSplitHandoff;
 pub const TextSplitHandoff = @import("catalog/index_manager.zig").TextSplitHandoff;
@@ -146,6 +150,13 @@ pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
     return query_search.searchRequestHasScoreBearingSource(req);
 }
 
+pub fn validateStructuredFilterValueAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    return query_search.validateStructuredFilterValueAlloc(alloc, value);
+}
+
 pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
     return query_search.requestHasVectorScoreOrderOnly(req);
 }
@@ -191,6 +202,7 @@ test {
     _ = derived_types;
     _ = derived_worker;
     _ = derived_executor;
+    _ = derived_backlog_tracker;
     _ = replay_stream;
     _ = replay_source;
     _ = runtime_backend;

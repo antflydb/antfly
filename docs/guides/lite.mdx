@@ -57,7 +57,7 @@ The status output includes the live format and engine:
   "storage": {
     "format": "aflite",
     "engine": "native_single_file",
-    "format_version": 1
+    "format_version": 2
   },
   "inference": {
     "mode": "caller_supplied_or_disabled",
@@ -213,25 +213,25 @@ as well; status then reports `mode: "local_embedded"`,
 Use `antfly lite run-until-idle app.aflite` after writes when you want the CLI
 to drain available local maintenance work before querying or backing up.
 
-## Local HTTP Serve Mode
+## Standalone HTTP Serve Mode
 
-For SDK smoke tests or local tools, Lite can expose a narrow single-node API:
+For SDKs and local tools, Lite runs the full standalone API:
 
 ```bash
 antfly lite serve app.aflite --addr 127.0.0.1:8080
 ```
 
-The local API is under `/lite/v1`, for example:
+Use the normal database API, for example:
 
 ```bash
-curl http://127.0.0.1:8080/lite/v1/status
-curl http://127.0.0.1:8080/lite/v1/capabilities
+curl http://127.0.0.1:8080/db/v1/status
 ```
 
-This is not the clustered `/db/v1` service API. Treat it as a local convenience
-surface for Lite, not as a distributed Antfly compatibility mode. In v1,
-`serve` only accepts loopback listen hosts such as `127.0.0.1`, `localhost`, or
-`::1`; wildcard and LAN binds are rejected.
+This is exactly the same runtime as `antfly standalone --storage-engine lite
+--storage-path app.aflite`. The `lite serve` spelling is an artifact-oriented
+convenience, not a separate protocol. It accepts loopback listen hosts such as
+`127.0.0.1`, `localhost`, or `::1`; use the canonical standalone command when
+configuring a non-loopback production listener.
 
 ## Back Up And Restore Lite
 
@@ -427,7 +427,7 @@ zig build lite-test
 zig build lite-dev
 ```
 
-`lite-core` builds the embedded database, CLI, narrow `/lite/v1` serve mode,
+`lite-core` builds the embedded database and maintenance CLI,
 and `libantfly` without a heavyweight local inference runtime. `lite-full`
 builds the full Antfly CLI with Lite support and requires the local inference
 runtime capability flag so Lite status, C ABI, and bindings advertise

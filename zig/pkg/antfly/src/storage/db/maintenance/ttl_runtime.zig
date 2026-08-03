@@ -28,7 +28,7 @@ const db_config = @import("../config.zig");
 const relational_store_mod = @import("../relational_store.zig");
 const ownership_mod = @import("../ownership.zig");
 const platform = @import("antfly_platform");
-const platform_clock = @import("../../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 
 const TestHelpers = if (builtin.is_test) @import("../test_support.zig") else struct {};
@@ -442,7 +442,7 @@ test "ttl runtime runOnce works with memory backend store" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime_store.deinit();
 
-    try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
+    _ = try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
     try putTestDoc(&runtime_store, alloc, "doc1", "value", 1_000);
 
     var delete_ctx = TestDeleteContext{ .alloc = alloc, .store = &runtime_store };
@@ -474,7 +474,7 @@ test "ttl runtime runOnce works with lsm backend store" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime_store.deinit();
 
-    try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
+    _ = try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
     try putTestDoc(&runtime_store, alloc, "doc1", "value", 1_000);
 
     var delete_ctx = TestDeleteContext{ .alloc = alloc, .store = &runtime_store };
@@ -588,6 +588,58 @@ test "db search filters expired documents when ttl schema is configured" {
     try std.testing.expectEqualStrings("doc:fresh", text.hits[0].id);
 }
 
+test "db dense broad visibility filtering does not bypass ttl" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"embedding\":[1,0]}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:fresh", .value = "{\"embedding\":[0,1]}" },
+            .{ .key = "doc:deleted", .value = "{\"embedding\":[0.5,0.5]}" },
+        },
+        .timestamp_ns = now_ns,
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    // A cheap identity complement must not suppress the independent TTL live set.
+    try db.batch(.{
+        .deletes = &.{"doc:deleted"},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:fresh", result.hits[0].id);
+}
+
 test "db ttl falls back to write timestamp when ttl field is missing" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
@@ -685,6 +737,12 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
     {
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 0), stats.source_doc_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+    }
+    {
         const stats = try db.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
@@ -708,6 +766,70 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     });
     defer text.deinit();
     try std.testing.expectEqual(@as(u32, 0), text.total_hits);
+}
+
+test "db ttl runtime moved wrapper binds visibility owner before deterministic cleanup" {
+    const db_mod = @import("../mod.zig");
+    const DB = db_mod.DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const ttl_cfg: Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = ttl_cfg,
+    });
+    defer db.close();
+    const runtime = db.ttl_runtime orelse return error.TestUnexpectedResult;
+
+    const NoopVisibilityHook = struct {
+        fn onChange(
+            _: *anyopaque,
+            _: []const u8,
+            _: u64,
+            _: ?*DB,
+            _: db_mod.QueryVisibilityChange,
+        ) void {}
+    };
+    db.setQueryVisibilityHook(.{
+        .ptr = &db,
+        .table_name = "docs",
+        .db = &db,
+        .on_change = NoopVisibilityHook.onChange,
+    });
+    defer db.setQueryVisibilityHook(null);
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 1_000_000_000,
+    });
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try runtime.runOnce();
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
+    const stats = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
 }
 
 test "db ttl cleanup deletes relational base rows" {

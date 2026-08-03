@@ -40,6 +40,22 @@ from conftest import (
 )
 from helpers import wait_until
 
+BACKUP_CONNECTION = "e2e-backups"
+
+
+def _wait_for_terminal_restore_job(backup_api, response: requests.Response, *, timeout_s: float = 30.0) -> dict:
+    assert response.status_code == 202
+    accepted = response.json()
+    job_id = accepted["job_id"]
+
+    def terminal() -> dict | None:
+        job = backup_api.get(f"/restore/jobs/{job_id}")
+        return job if job.get("phase") in {"succeeded", "failed", "cancelled"} else None
+
+    job = wait_until(terminal, timeout_s=timeout_s, interval_s=0.1)
+    assert job is not None
+    return job
+
 
 def _lookup_doc(stateful_api, table_name: str, key: str) -> dict | None:
     try:
@@ -270,6 +286,13 @@ class MultiMetadataBackupCluster:
                 {
                     "metadata": metadata,
                     "remote_content": {"security": {"block_private_ips": False}},
+                    "connections": {
+                        BACKUP_CONNECTION: {
+                            "kind": "external_io",
+                            "capabilities": ["backup.write", "restore.read"],
+                            "external_io": {"protocol": "filesystem", "root": "/"},
+                        }
+                    },
                     "replication_factor": 1,
                     "default_shards_per_table": 1,
                 }
@@ -295,7 +318,9 @@ class MultiMetadataBackupCluster:
             str(self.metadata_admin_ports[node_id - 1]),
             "--health",
             "false",
-            "--tick-ms",
+            "--raft-tick-ms",
+            "5",
+            "--control-tick-ms",
             "5",
             "--data-dir",
             str(self.root / f"metadata-{node_id}"),
@@ -329,7 +354,9 @@ class MultiMetadataBackupCluster:
             "data",
             "--health",
             "false",
-            "--tick-ms",
+            "--raft-tick-ms",
+            "5",
+            "--control-tick-ms",
             "5",
             "--data-dir",
             str(self.root / "data"),
@@ -526,7 +553,7 @@ def test_table_backup_restore_round_trip(backup_api):
         _wait_until_absent(backup_api, table_name, "doc:db", timeout_s=10.0, interval_s=0.5)
 
         restore = backup_api.restore_table(table_name, backup_id=backup_id, location=location)
-        assert restore["restore"] == "triggered"
+        assert restore == {"restore": "triggered"}
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:db"),
@@ -626,7 +653,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         _wait_until_absent(backup_api, table_name, "doc:a", timeout_s=10.0, interval_s=0.5)
 
         restore = backup_api.restore_table(table_name, backup_id=backup_id, location=location)
-        assert restore["restore"] == "triggered"
+        assert restore == {"restore": "triggered"}
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:a"),
@@ -740,8 +767,11 @@ def test_cluster_backup_restore_round_trip(backup_api):
             location=location,
             restore_mode="fail_if_exists",
         )
-        assert restore["status"] == "triggered"
-        assert {table["status"] for table in restore["tables"]} == {"triggered"}
+        assert restore["status"] == "completed"
+        assert restore["committed_table_count"] == 2
+        assert restore["triggered_table_count"] == 0
+        assert restore["skipped_table_count"] == 0
+        assert restore["failed_table_count"] == 0
 
         for table_name, expected_title in (
             (table_a, "Cluster Backup Alpha"),
@@ -806,6 +836,7 @@ def test_cluster_backup_through_metadata_leader_public_api(
                 json={
                     "backup_id": backup_id,
                     "location": f"file://{backup_dir}",
+                    "connection": BACKUP_CONNECTION,
                     "table_names": [table_name],
                 },
                 timeout=120,
@@ -878,8 +909,11 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
         location=location,
         restore_mode="fail_if_exists",
     )
-    assert restore["status"] == "triggered"
-    assert {table["status"] for table in restore["tables"]} == {"triggered"}
+    assert restore["status"] == "completed"
+    assert restore["committed_table_count"] == 2
+    assert restore["triggered_table_count"] == 0
+    assert restore["skipped_table_count"] == 0
+    assert restore["failed_table_count"] == 0
 
     for table_name, expected_title in (
         (table_a, f"{backend.upper()} Backup Alpha"),
@@ -924,11 +958,13 @@ def test_cluster_restore_modes(backup_api):
             {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": BACKUP_CONNECTION,
                 "restore_mode": "fail_if_exists",
             },
         )
-        assert fail_resp.status_code == 400
-        assert "already exists" in fail_resp.text
+        failed_job = _wait_for_terminal_restore_job(backup_api, fail_resp)
+        assert failed_job["phase"] == "failed"
+        assert failed_job["error"] == "TableAlreadyExists"
 
         _write_single_doc(backup_api, table_a, "doc:1", title="Mutated Alpha", content="mutated alpha")
         _write_single_doc(backup_api, table_b, "doc:1", title="Mutated Beta", content="mutated beta")
@@ -950,8 +986,11 @@ def test_cluster_restore_modes(backup_api):
             location=location,
             restore_mode="skip_if_exists",
         )
-        assert skip_restore["status"] == "triggered"
-        assert {table["status"] for table in skip_restore["tables"]} == {"skipped"}
+        assert skip_restore["status"] == "completed"
+        assert skip_restore["committed_table_count"] == 0
+        assert skip_restore["triggered_table_count"] == 0
+        assert skip_restore["skipped_table_count"] == 2
+        assert skip_restore["failed_table_count"] == 0
 
         skipped_a = _lookup_doc(backup_api, table_a, "doc:1")
         skipped_b = _lookup_doc(backup_api, table_b, "doc:1")
@@ -963,8 +1002,11 @@ def test_cluster_restore_modes(backup_api):
             location=location,
             restore_mode="overwrite",
         )
-        assert overwrite_restore["status"] == "triggered"
-        assert {table["status"] for table in overwrite_restore["tables"]} == {"triggered"}
+        assert overwrite_restore["status"] == "completed", overwrite_restore
+        assert overwrite_restore["committed_table_count"] == 2, overwrite_restore
+        assert overwrite_restore["triggered_table_count"] == 0, overwrite_restore
+        assert overwrite_restore["skipped_table_count"] == 0, overwrite_restore
+        assert overwrite_restore["failed_table_count"] == 0, overwrite_restore
 
         restored_docs = wait_until(
             lambda: _lookup_docs(backup_api, (table_a, table_b), "doc:1"),
@@ -976,8 +1018,9 @@ def test_cluster_restore_modes(backup_api):
         assert restored_docs[table_b]["title"] == "Original Beta"
 
 
-def test_cluster_backup_restore_partial_statuses(backup_api):
+def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
     table_name = f"cluster_partial_{time.time_ns()}"
+    missing_table = f"cluster_partial_missing_{time.time_ns()}"
     backup_id = f"cluster-partial-{time.time_ns()}"
 
     created = backup_api.create_table(table_name, num_shards=1, description="partial backup docs")
@@ -995,33 +1038,65 @@ def test_cluster_backup_restore_partial_statuses(backup_api):
         backup = backup_api.cluster_backup(
             backup_id=backup_id,
             location=location,
-            table_names=[table_name, "missing"],
+            table_names=[table_name, missing_table],
         )
         assert backup["status"] == "partial"
         by_name = {table["name"]: table for table in backup["tables"]}
         assert by_name[table_name]["status"] == "completed"
-        assert by_name["missing"]["status"] == "failed"
-        assert "not found" in by_name["missing"]["error"]
+        assert by_name[missing_table]["status"] == "failed"
+        assert "not found" in by_name[missing_table]["error"]
+
+        # A partial attempt is diagnostic output, not a restorable aggregate.
+        # It must remain absent from discovery, and cleanup must release the
+        # reservation and all per-table artifacts so the same id is reusable.
+        listed = backup_api.list_backups(location=location)
+        matched = [item for item in listed["backups"] if item["backup_id"] == backup_id]
+        assert matched == []
+
+        created = backup_api.create_table(missing_table, num_shards=1, description="retry backup docs")
+        assert created["name"] == missing_table
+        _write_single_doc(
+            backup_api,
+            missing_table,
+            "doc:2",
+            title="Recovered Missing Table",
+            content="Recovered Missing Table retry publishes a complete aggregate",
+        )
+        assert wait_until(
+            lambda: _top_hit(backup_api, missing_table, "recovered missing table", "doc:2"),
+            timeout_s=60.0,
+            interval_s=1.0,
+        )
+
+        retried = backup_api.cluster_backup(
+            backup_id=backup_id,
+            location=location,
+            table_names=[table_name, missing_table],
+        )
+        assert retried["status"] == "completed"
+        assert {table["name"] for table in retried["tables"]} == {table_name, missing_table}
 
         listed = backup_api.list_backups(location=location)
         matched = [item for item in listed["backups"] if item["backup_id"] == backup_id]
         assert len(matched) == 1
-        assert matched[0]["tables"] == [table_name]
+        assert set(matched[0]["tables"]) == {table_name, missing_table}
 
         backup_api.delete_table(table_name)
-        _wait_until_table_absent(backup_api, table_name, timeout_s=10.0, interval_s=0.5)
-        _wait_until_absent(backup_api, table_name, "doc:1", timeout_s=10.0, interval_s=0.5)
+        backup_api.delete_table(missing_table)
+        for deleted_table, doc_id in ((table_name, "doc:1"), (missing_table, "doc:2")):
+            _wait_until_table_absent(backup_api, deleted_table, timeout_s=10.0, interval_s=0.5)
+            _wait_until_absent(backup_api, deleted_table, doc_id, timeout_s=10.0, interval_s=0.5)
 
         restore = backup_api.cluster_restore(
             backup_id=backup_id,
             location=location,
-            table_names=[table_name, "missing"],
+            restore_mode="fail_if_exists",
         )
-        assert restore["status"] == "partial"
-        restore_by_name = {table["name"]: table for table in restore["tables"]}
-        assert restore_by_name[table_name]["status"] == "triggered"
-        assert restore_by_name["missing"]["status"] == "failed"
-        assert "backup does not include table" in restore_by_name["missing"]["error"]
+        assert restore["status"] == "completed"
+        assert restore["committed_table_count"] == 2
+        assert restore["triggered_table_count"] == 0
+        assert restore["skipped_table_count"] == 0
+        assert restore["failed_table_count"] == 0
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:1"),
@@ -1030,6 +1105,13 @@ def test_cluster_backup_restore_partial_statuses(backup_api):
         )
         assert restored_doc is not None
         assert restored_doc["title"] == "Partial Table"
+        restored_missing_doc = wait_until(
+            lambda: _lookup_doc(backup_api, missing_table, "doc:2"),
+            timeout_s=60.0,
+            interval_s=1.0,
+        )
+        assert restored_missing_doc is not None
+        assert restored_missing_doc["title"] == "Recovered Missing Table"
 
 
 def test_backup_restore_request_validation(backup_api):
@@ -1048,32 +1130,32 @@ def test_backup_restore_request_validation(backup_api):
             (
                 "POST",
                 f"/tables/{table_name}/backup",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 f"/tables/{table_name}/restore",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/backup",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/restore",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/restore",
-                {"backup_id": "snap", "location": location, "restore_mode": "bogus"},
-                "invalid restore request",
+                {"backup_id": "snap", "location": location, "connection": BACKUP_CONNECTION, "restore_mode": "bogus"},
+                "invalid restore mode",
             ),
         )
 
@@ -1087,11 +1169,22 @@ def test_backup_restore_request_validation(backup_api):
         assert "Missing required query parameter: location" in missing_location.text
 
         unsupported_location = backup_api.s.get(
-            f"{backup_api.url}/backups?location=ftp://bucket/path",
+            f"{backup_api.url}/backups?location=ftp://bucket/path&connection={BACKUP_CONNECTION}",
             timeout=30,
         )
         assert unsupported_location.status_code == 400
         assert "unsupported backup location" in unsupported_location.text
+
+        encoded_location = backup_api.s.get(
+            f"{backup_api.url}/backups",
+            params={
+                "location": "ftp://bucket/path",
+                "connection": BACKUP_CONNECTION,
+            },
+            timeout=30,
+        )
+        assert encoded_location.status_code == 400
+        assert "unsupported backup location" in encoded_location.text
 
 
 def test_list_backups_empty_location(backup_api):
@@ -1117,10 +1210,12 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
             {
                 "backup_id": missing_backup_id,
                 "location": location,
+                "connection": BACKUP_CONNECTION,
             },
         )
-        assert table_restore.status_code == 400
-        assert "restore target already exists" in table_restore.text
+        table_job = _wait_for_terminal_restore_job(backup_api, table_restore)
+        assert table_job["phase"] == "failed"
+        assert table_job["error"] == "TableAlreadyExists"
 
         cluster_restore = backup_api._request(
             "POST",
@@ -1128,8 +1223,10 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
             {
                 "backup_id": missing_backup_id,
                 "location": location,
+                "connection": BACKUP_CONNECTION,
                 "restore_mode": "fail_if_exists",
             },
         )
-        assert cluster_restore.status_code == 400
-        assert "invalid restore request" in cluster_restore.text
+        cluster_job = _wait_for_terminal_restore_job(backup_api, cluster_restore)
+        assert cluster_job["phase"] == "failed"
+        assert cluster_job["error"] == "InvalidRequest"

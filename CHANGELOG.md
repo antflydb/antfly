@@ -21,11 +21,24 @@ All notable changes to Antfly will be documented in this file.
 
 ## Releases
 
+### [0.2.0] - Unreleased
+
+#### Upgrade compatibility
+
+Antfly 0.2.0 is not an in-place data-directory upgrade from 0.1.x. Durable
+formats changed without a 0.1.x compatibility path. Replace or wipe 0.1.x pods
+and create fresh 0.2.0 data directories; export and restore any data that must
+be retained.
+
+The Python SDK now exposes transform operators with stable semantic enum names
+(`SET`, `SET_ON_INSERT`, `UNSET`, `INC`, `ADD_TO_SET`, and `MAX`). Positional
+`VALUE_n` names are not part of the 0.2 API.
+
 ### [0.1.1] - 2026-03-31
 
 #### Highlights
 
-- **Faster Swarm Mode** — local shard bypass eliminates network hops and JSON serialization for single-node deployments, significantly reducing query latency
+- **Faster Standalone Mode** — local shard bypass eliminates network hops and JSON serialization for single-node deployments, significantly reducing query latency
 - **Smarter Vector Search** — automatic reranking and size-aware search effort tuning deliver better recall out of the box
 - **Friendlier Errors** — LLM generation failures now return clear, actionable error messages with appropriate HTTP status codes
 - **Automatic Shard Management** — Antfly now automatically splits large shards and merges underutilized ones, keeping cluster performance balanced without manual intervention
@@ -35,7 +48,7 @@ All notable changes to Antfly will be documented in this file.
 
 - Automatic shard split policy keeps individual shards from growing too large
 - Online shard merges consolidate underutilized shards without downtime
-- Local shard bypass skips HTTP and serialization overhead in swarm mode
+- Local shard bypass skips HTTP and serialization overhead in standalone mode
 - Single-shard fast path and index caching speed up common query patterns
 - Automatic reranking for HBC vector search improves recall without configuration
 - Size-aware search effort defaults adapt to index size automatically

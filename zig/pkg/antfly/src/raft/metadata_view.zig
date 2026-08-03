@@ -87,13 +87,7 @@ pub const MetadataUpdate = union(enum) {
         return switch (self) {
             .replica_intent => |intent| .{
                 .replica_intent = switch (intent) {
-                    .upsert => |value| .{
-                        .upsert = .{
-                            .record = value.record,
-                            .store_id = value.store_id,
-                            .peer_node_ids = if (value.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, value.peer_node_ids),
-                        },
-                    },
+                    .upsert => |value| .{ .upsert = try reconciler.cloneIntentOwned(alloc, value) },
                     .remove_group => |group_id| .{ .remove_group = group_id },
                 },
             },
@@ -115,9 +109,7 @@ pub const MetadataUpdate = union(enum) {
     pub fn deinit(self: *MetadataUpdate, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .replica_intent => |*intent| switch (intent.*) {
-                .upsert => |*value| {
-                    if (value.peer_node_ids.len > 0) alloc.free(value.peer_node_ids);
-                },
+                .upsert => |value| reconciler.freeIntentOwned(alloc, value),
                 .remove_group => {},
             },
             .peer_route => |*route| switch (route.*) {
@@ -269,37 +261,20 @@ fn deinitTransitionRecord(alloc: std.mem.Allocator, record: *metadata.Transition
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .source_group_id = record.source_group_id,
-        .destination_group_id = record.destination_group_id,
-        .phase = record.phase,
-        .split_key = if (record.split_key) |split_key| try alloc.dupe(u8, split_key) else null,
-        .source_range_end = if (record.source_range_end) |end| try alloc.dupe(u8, end) else null,
-        .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
-    };
+    return try metadata.table_manager.cloneSplitTransitionRecord(alloc, record);
 }
 
 fn cloneMergeRecord(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) !metadata.MergeTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .donor_group_id = record.donor_group_id,
-        .receiver_group_id = record.receiver_group_id,
-        .phase = record.phase,
-        .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
-        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
-    };
+    return try metadata.table_manager.cloneMergeTransitionRecord(alloc, record);
 }
 
 fn deinitSplitRecord(alloc: std.mem.Allocator, record: *metadata.SplitTransitionRecord) void {
-    if (record.split_key) |split_key| alloc.free(split_key);
-    if (record.source_range_end) |end| alloc.free(end);
-    if (record.rollback_reason) |reason| alloc.free(reason);
+    metadata.table_manager.freeSplitTransitionRecord(alloc, record.*);
     record.* = undefined;
 }
 
 fn deinitMergeRecord(alloc: std.mem.Allocator, record: *metadata.MergeTransitionRecord) void {
-    if (record.rollback_reason) |reason| alloc.free(reason);
+    metadata.table_manager.freeMergeTransitionRecord(alloc, record.*);
     record.* = undefined;
 }
 
@@ -338,9 +313,7 @@ test "metadata view applies placement and peer updates" {
 
     const intents = try view.placementProvider().listLocalIntents(std.testing.allocator, 7);
     defer {
-        for (intents) |intent| {
-            if (intent.peer_node_ids.len > 0) std.testing.allocator.free(intent.peer_node_ids);
-        }
+        for (intents) |intent| reconciler.freeIntentOwned(std.testing.allocator, intent);
         std.testing.allocator.free(intents);
     }
     try std.testing.expectEqual(@as(usize, 1), intents.len);

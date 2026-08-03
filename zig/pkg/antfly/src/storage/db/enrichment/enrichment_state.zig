@@ -278,6 +278,18 @@ test "enrichment projection checkpoint persists status and identity fields" {
     try std.testing.expectEqual(@as(u64, 41), try loadAppliedSequence(std.testing.allocator, runtime, "generated"));
 }
 
+test "enrichment projection checkpoint rejects malformed structured state" {
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeProjectionCheckpoint("short"));
+
+    var encoded = encodeProjectionCheckpoint(.{ .applied_sequence = 7 });
+    encoded[0] = 'X';
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeProjectionCheckpoint(&encoded));
+
+    encoded = encodeProjectionCheckpoint(.{ .applied_sequence = 7 });
+    encoded[checkpoint_magic.len] = 2;
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeProjectionCheckpoint(&encoded));
+}
+
 test "enrichment state lsm point loads do not clone mutable snapshot" {
     var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();

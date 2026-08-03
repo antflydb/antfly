@@ -77,10 +77,10 @@ go test -race -v ./... > /tmp/test.log 2>&1
 ## Running Antfly
 
 ```bash
-cd go/pkg/antfly && go run ./cmd swarm        # Single-node dev
+cd go/pkg/antfly && go run ./cmd standalone        # Single-node dev
 ```
 
-**Antfly inference**: ML service for embeddings/chunking/reranking, enabled by default in swarm mode. Models auto-discovered from `~/.antfly/inference/models/`.
+**Antfly inference**: ML service for embeddings/chunking/reranking, enabled by default in standalone mode. Models auto-discovered from `~/.antfly/inference/models/`.
 
 **Model Registry**: Export HuggingFace models to ONNX via `scripts/export_model_to_registry.py`. Supports embedders, rerankers, chunkers, and multimodal (CLIP).
 

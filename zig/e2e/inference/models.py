@@ -29,12 +29,17 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN_CANDIDATES = (
     REPO_ROOT / "zig-out" / "bin" / "antfly",
 )
+MANAGED_DOWNLOAD_IN_PROGRESS = ".antfly-download-in-progress"
+MANAGED_DOWNLOAD_PLAN = ".antfly-download-plan.json"
+MANAGED_DOWNLOAD_COMPLETE = ".antfly-download-complete.json"
+MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES = 16 * 1024 * 1024
+SUPPORTED_MODEL_SUFFIXES = (".gguf", ".onnx", ".safetensors")
 
 MODEL_TASKS = (
     "embedders",
@@ -74,6 +79,8 @@ class ModelSpec:
         return f"hf:{self.repo}:{self.variant}"
 
 
+# Models added while verifying the capability surface the website implies. Each is here
+# because a claim needed evidence, not because CI needs breadth for its own sake.
 EMBEDDER_MODELS = [
     ModelSpec(
         name="bge-small-en-v1.5",
@@ -96,15 +103,55 @@ EMBEDDER_MODELS = [
         dim=512,
         large=True,
     ),
+    ModelSpec(
+        name="bge-base-en-v1.5",
+        repo="BAAI/bge-base-en-v1.5",
+        task="embedders",
+        dim=768,
+    ),
+    ModelSpec(
+        name="bge-large-en-v1.5",
+        repo="BAAI/bge-large-en-v1.5",
+        task="embedders",
+        dim=1024,
+        large=True,
+    ),
+    ModelSpec(
+        name="mxbai-embed-large-v1",
+        repo="mixedbread-ai/mxbai-embed-large-v1",
+        task="embedders",
+        dim=1024,
+    ),
+    ModelSpec(
+        name="all-MiniLM-L6-v2",
+        repo="sentence-transformers/all-MiniLM-L6-v2",
+        task="embedders",
+        dim=384,
+    ),
 ]
 
 RERANKER_MODELS = [
+    ModelSpec(
+        name="ms-marco-MiniLM-L6-v2",
+        repo="cross-encoder/ms-marco-MiniLM-L6-v2",
+        task="rerankers",
+    ),
     ModelSpec(
         name="mxbai-rerank-base-v1",
         repo="mixedbread-ai/mxbai-rerank-base-v1",
         task="rerankers",
     ),
 ]
+
+# Chunking had no model in the curated set at all, despite chunkers being a declared task.
+CHUNKER_MODELS = [
+    ModelSpec(
+        name="chonky_mmbert_small_multilingual_1",
+        repo="mirth/chonky_mmbert_small_multilingual_1",
+        task="chunkers",
+    ),
+]
+
 
 CLASSIFIER_MODELS = [
     ModelSpec(
@@ -128,6 +175,8 @@ RECOGNIZER_MODELS = [
         task="recognizers",
         variant="native",
     ),
+    # CC-BY-NC-SA: non-commercial only, and ~3GB. Kept for relation-extraction coverage,
+    # but it must not appear in any default bundle. GLiNER2 is the recommended extractor.
     ModelSpec(
         name="rebel-large",
         repo="Babelscape/rebel-large",
@@ -163,12 +212,39 @@ TRANSCRIBER_MODELS = [
     ),
 ]
 
-DEFAULT_GENERATOR_MODEL = "openai-community/gpt2"
+# Generator models used to keep the decoder support tiers honest.
+#
+# Each family in models/gpt.zig has a SupportLevel; these are the artifacts those levels
+# were measured against. Without them the tiers are assertions rather than results.
+GENERATOR_MODELS = [
+    ModelSpec(
+        name="gemma-4-e2b-it-gguf",
+        repo="ggml-org/gemma-4-e2b-it-gguf",
+        task="generators",
+        large=True,
+    ),
+    ModelSpec(
+        name="Qwen3-1.7B-GGUF",
+        repo="unsloth/Qwen3-1.7B-GGUF",
+        task="generators",
+    ),
+    ModelSpec(
+        name="Llama-3.2-1B-Instruct-GGUF",
+        repo="unsloth/Llama-3.2-1B-Instruct-GGUF",
+        task="generators",
+        large=True,
+    ),
+]
+
+
+DEFAULT_GENERATOR_MODEL = "unsloth/Qwen3-1.7B-GGUF"
 DEFAULT_TOOL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 DEFAULT_MULTIMODAL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 
 CURATED_MODELS = [
     *EMBEDDER_MODELS,
+    *GENERATOR_MODELS,
+    *CHUNKER_MODELS,
     *RERANKER_MODELS,
     *CLASSIFIER_MODELS,
     *RECOGNIZER_MODELS,
@@ -288,16 +364,76 @@ def _model_path(spec: ModelSpec) -> Path:
 
 
 def _looks_like_model_dir(path: Path) -> bool:
-    if not path.exists():
+    if not path.is_dir():
         return False
-    for filename in ("config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json"):
-        if (path / filename).exists():
-            return True
-    if any(path.glob("*.gguf")):
-        return True
-    if (path / "onnx").is_dir():
-        return True
-    return False
+
+    if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (path / MANAGED_DOWNLOAD_PLAN).exists():
+        return False
+
+    completion_path = path / MANAGED_DOWNLOAD_COMPLETE
+    if completion_path.exists():
+        root = path.resolve()
+        try:
+            with completion_path.open(encoding="utf-8") as receipt:
+                serialized = receipt.read(MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES + 1)
+            if len(serialized) > MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES:
+                return False
+            completion = json.loads(serialized)
+            artifacts = completion["artifacts"]
+        except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+            return False
+        if type(completion.get("version")) is not int or completion["version"] != 1:
+            return False
+        if not isinstance(artifacts, list) or not artifacts:
+            return False
+
+        has_supported_payload = False
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return False
+            artifact_path = artifact.get("path")
+            artifact_size = artifact.get("size")
+            if not isinstance(artifact_path, str) or type(artifact_size) is not int or artifact_size < 0:
+                return False
+            relative = PurePosixPath(artifact_path)
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or any(part in ("", ".", "..") for part in relative.parts)
+                or "\\" in artifact_path
+            ):
+                return False
+            candidate = path.joinpath(*relative.parts)
+            try:
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_relative_to(root) or not resolved.is_file():
+                    return False
+                if resolved.stat().st_size != artifact_size:
+                    return False
+            except OSError:
+                return False
+            if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
+                has_supported_payload = True
+        return has_supported_payload and not (
+            (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
+            or (path / MANAGED_DOWNLOAD_PLAN).exists()
+        )
+
+    # Legacy or externally provisioned model directories do not have Antfly's
+    # completion receipt. Preserve compatibility while still rejecting an
+    # interrupted file that is visibly in progress.
+    has_supported_payload = False
+    for candidate in path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if candidate.name.endswith(".part"):
+            return False
+        if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
+            has_supported_payload = True
+    return has_supported_payload and not (
+        (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
+        or (path / MANAGED_DOWNLOAD_PLAN).exists()
+    )
 
 
 def model_available(spec: ModelSpec) -> bool:

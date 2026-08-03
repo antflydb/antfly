@@ -151,14 +151,51 @@ pub const Primary = struct {
         var primary = try Primary.open(alloc, log_path, slot_store_path, handoff.identity, options);
         errdefer primary.close();
 
-        if (primary.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
-        var switch_entry = (try primary.log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
+        try validatePromotedLog(alloc, &primary.log, handoff);
+
+        return primary;
+    }
+
+    /// Converts the promoted standby's live receive-log owner into the primary
+    /// log owner. The slot store is opened and the handoff is fully validated
+    /// before consuming `standby`, so every error leaves the standby usable.
+    pub fn adoptPromotedStandby(
+        alloc: Allocator,
+        standby: *standby_mod.Standby,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        options: OpenOptions,
+    ) !Primary {
+        if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
+        if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
+
+        var slots = try slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options);
+        errdefer slots.close();
+        try standby.lockExclusive();
+        defer standby.unlockExclusive();
+        if (!std.meta.eql(standby.snapshotLocked().identity, handoff.identity)) return error.InvalidPromotionHandoff;
+        try validatePromotedLog(alloc, &standby.receive_log, handoff);
+
+        const log = standby.consumePromotedReceiveLogLocked();
+        return .{
+            .alloc = alloc,
+            .identity = handoff.identity,
+            .log = log,
+            .slots = slots,
+        };
+    }
+
+    fn validatePromotedLog(
+        alloc: Allocator,
+        log: *replication_log.ReplicationLog,
+        handoff: standby_mod.PromotionHandoff,
+    ) !void {
+        if (log.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
+        var switch_entry = (try log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
         defer switch_entry.deinit(alloc);
         if (switch_entry.record.kind != .timeline_switch) return error.MissingPromotionSwitch;
         try validateRecordIdentity(handoff.identity, switch_entry.record);
-        if (primary.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
-
-        return primary;
+        if (log.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
     }
 
     pub fn close(self: *Primary) void {
@@ -210,6 +247,14 @@ pub const Primary = struct {
     pub fn beginBaseBackup(self: *Primary, request: BaseBackupStart) !BaseBackupStartResult {
         try validateSlotName(request.slot_name);
         if (request.manifest_id.len == 0) return error.InvalidManifestId;
+
+        if (self.slots.get(request.slot_name)) |state| {
+            if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
+            if (!state.reseed_required) {
+                if (try self.existingBaseBackupStart(request, state)) |existing| return existing;
+                if (state.active) return error.BaseBackupSlotInUse;
+            }
+        }
 
         const backup_lsn = self.nextLsn();
         const previous_lsn = backup_lsn - 1;
@@ -482,7 +527,7 @@ pub const Primary = struct {
         try validateSlotName(slot_name);
         if (self.slots.get(slot_name)) |state| {
             if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
-            if (!state.reseed_required) return error.BaseBackupSlotInUse;
+            if (!state.reseed_required and state.active) return error.BaseBackupSlotInUse;
         }
 
         try self.slots.createOrUpdate(.{
@@ -522,6 +567,34 @@ pub const Primary = struct {
         if (!slot_state.active or slot_state.reseed_required) return error.BackupSlotNotRetained;
         if (slot_state.timeline_id != self.identity.timeline_id) return error.BackupSlotNotRetained;
         if (slot_state.restart_lsn > start.backup_lsn) return error.BackupSlotNotRetained;
+    }
+
+    fn existingBaseBackupStart(self: *Primary, request: BaseBackupStart, state: slot_store.SlotState) !?BaseBackupStartResult {
+        if (!state.active or state.restart_lsn == 0) return null;
+
+        var entry = (try self.log.entryAt(self.alloc, state.restart_lsn)) orelse return null;
+        defer entry.deinit(self.alloc);
+        if (entry.record.kind != .backup_start or entry.record.payload_codec != .json) return null;
+
+        var parsed = std.json.parseFromSlice(BackupStartPayload, self.alloc, entry.record.payload, .{}) catch return null;
+        defer parsed.deinit();
+
+        const start = parsed.value;
+        if (start.cluster_id != self.identity.cluster_id) return null;
+        if (start.shard_id != self.identity.shard_id) return null;
+        if (start.table_id != self.identity.table_id) return null;
+        if (start.timeline_id != self.identity.timeline_id) return null;
+        if (start.epoch != self.identity.epoch) return null;
+        if (start.backup_lsn != state.restart_lsn) return null;
+        if (!std.mem.eql(u8, start.slot_name, request.slot_name)) return null;
+        if (!std.mem.eql(u8, start.manifest_id, request.manifest_id)) return null;
+
+        return .{
+            .slot_name = request.slot_name,
+            .manifest_id = request.manifest_id,
+            .backup_lsn = start.backup_lsn,
+            .start_record_lsn = entry.wal_lsn,
+        };
     }
 };
 
@@ -818,6 +891,89 @@ test "storage.ha primary opens from promoted standby handoff and continues write
     try validateRecordIdentity(promoted_identity, appended.record);
     try std.testing.expectEqual(@as(u64, 2), appended.record.previous_lsn);
     try std.testing.expectEqualStrings("after-promotion", appended.record.payload);
+}
+
+test "storage.ha primary adoption serializes standby ownership transfer" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "serialized-adoption");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(.{
+        .kind = .batch_mutation,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "before-promotion",
+    });
+    var apply_ctx: u8 = 0;
+    _ = try standby.applyAvailable(&apply_ctx, noOpApply);
+    _ = try standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .fencing_confirmed = true,
+    });
+    const handoff = try standby.promotedPrimaryHandoff();
+
+    const Adoption = struct {
+        standby: *standby_mod.Standby,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        primary: ?Primary = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.primary = Primary.adoptPromotedStandby(
+                std.testing.allocator,
+                self.standby,
+                self.slot_store_path,
+                self.handoff,
+                .{},
+            ) catch |err| {
+                self.err = err;
+                self.finished.store(true, .release);
+                return;
+            };
+            self.finished.store(true, .release);
+        }
+    };
+
+    try standby.lockExclusive();
+    var adoption = Adoption{
+        .standby = &standby,
+        .slot_store_path = paths.slots.ptr,
+        .handoff = handoff,
+    };
+    var thread = std.Thread.spawn(.{}, Adoption.run, .{&adoption}) catch |err| {
+        standby.unlockExclusive();
+        return err;
+    };
+    while (!adoption.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..10_000) |_| {
+        if (adoption.finished.load(.acquire)) break;
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(!adoption.finished.load(.acquire));
+
+    standby.unlockExclusive();
+    thread.join();
+    if (adoption.err) |err| return err;
+    var primary = adoption.primary orelse return error.TestExpectedEqual;
+    defer primary.close();
+
+    try std.testing.expectError(error.StandbyConsumed, standby.applyAvailable(&apply_ctx, noOpApply));
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 3), try primary.append(.{ .payload = "after-adoption" }));
 }
 
 test "storage.ha primary rejects duplicate slot creation without regressing progress" {

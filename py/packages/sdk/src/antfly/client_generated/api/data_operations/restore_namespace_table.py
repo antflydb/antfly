@@ -6,9 +6,9 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.backup_request import BackupRequest
 from ...models.error import Error
 from ...models.restore_namespace_table_response_202 import RestoreNamespaceTableResponse202
+from ...models.restore_request import RestoreRequest
 from ...types import Response
 
 
@@ -17,7 +17,7 @@ def _get_kwargs(
     namespace_name: str,
     table_name: str,
     *,
-    body: BackupRequest,
+    body: RestoreRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -79,7 +79,7 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
 ) -> Response[Error | RestoreNamespaceTableResponse202]:
     """Restore an explicit namespace table from backup
 
@@ -87,7 +87,7 @@ def sync_detailed(
         database_name (str):
         namespace_name (str):
         table_name (str):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -117,7 +117,7 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
 ) -> Error | RestoreNamespaceTableResponse202 | None:
     """Restore an explicit namespace table from backup
 
@@ -125,7 +125,7 @@ def sync(
         database_name (str):
         namespace_name (str):
         table_name (str):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -150,7 +150,7 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
 ) -> Response[Error | RestoreNamespaceTableResponse202]:
     """Restore an explicit namespace table from backup
 
@@ -158,7 +158,7 @@ async def asyncio_detailed(
         database_name (str):
         namespace_name (str):
         table_name (str):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -186,7 +186,7 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
 ) -> Error | RestoreNamespaceTableResponse202 | None:
     """Restore an explicit namespace table from backup
 
@@ -194,7 +194,7 @@ async def asyncio(
         database_name (str):
         namespace_name (str):
         table_name (str):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

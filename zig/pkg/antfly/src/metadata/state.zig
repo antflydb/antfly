@@ -161,6 +161,12 @@ pub const MetadataState = struct {
         const table_emptying_jobs = try self.projected.listTableEmptyingJobs(self.alloc);
         defer self.projected.freeTableEmptyingJobs(self.alloc, table_emptying_jobs);
         try self.desired.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, schema_rewrite_jobs, table_emptying_jobs);
+        try self.desired.syncProjectedSplitTransitions(self.committed_splits.items);
+        try self.desired.syncProjectedMergeTransitions(self.committed_merges.items);
+        try self.desired.applyProjectedTerminalTransitions(
+            self.committed_splits.items,
+            self.committed_merges.items,
+        );
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
@@ -330,7 +336,7 @@ pub const MetadataState = struct {
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,
-                .reallocate_requested = projected_reallocation_request != null,
+                .reallocation_request = projected_reallocation_request,
                 .schema_progresses = schema_progresses,
                 .split_transitions = self.committed_splits.items,
                 .merge_transitions = self.committed_merges.items,
@@ -743,10 +749,8 @@ const GroupStatusMergeCandidate = struct {
 const GroupStatusMergeState = struct {
     group_id: u64,
     latest: ?GroupStatusMergeCandidate = null,
-    latest_leader: ?GroupStatusMergeCandidate = null,
-    ambiguous_leader: bool = false,
-    observed_voter_count: ?u16 = null,
-    ambiguous_voter_count: bool = false,
+    leader_evidence: metadata_table_manager.GroupLeaderEvidence = .{},
+    voter_set_evidence: metadata_table_manager.VoterSetEvidence = .{},
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
     transition_pending: bool = false,
@@ -755,9 +759,19 @@ const GroupStatusMergeState = struct {
     cutover_ready: bool = false,
     reads_ready_after_cutover: bool = false,
     doc_identity_reassignment_active: bool = false,
-    last_voter_store_id: u64 = 0,
     doc_identity: metadata_table_manager.RuntimeDocIdentityStatusReport = .{},
     doc_identity_namespace_conflict: bool = false,
+};
+
+const PlacementNodeKey = struct {
+    group_id: u64,
+    node_id: u64,
+};
+
+const PlacementMemberEvidence = struct {
+    store_id: u64,
+    relocation_generation: u64,
+    ambiguous: bool = false,
 };
 
 pub fn mergeHealthyGroupStatuses(
@@ -776,13 +790,48 @@ pub fn mergeHealthyGroupStatuses(
     defer states.deinit(alloc);
     var indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
     defer indexes.deinit(alloc);
+    var healthy_voter_reports = std.AutoHashMapUnmanaged(u128, void).empty;
+    defer healthy_voter_reports.deinit(alloc);
+    var placement_members = std.AutoHashMapUnmanaged(
+        PlacementNodeKey,
+        PlacementMemberEvidence,
+    ).empty;
+    defer placement_members.deinit(alloc);
+    try placement_members.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
+    for (placement_intents) |intent| {
+        const member = placement_members.getOrPutAssumeCapacity(.{
+            .group_id = intent.record.group_id,
+            .node_id = intent.record.local_node_id,
+        });
+        if (member.found_existing) {
+            member.value_ptr.ambiguous = true;
+        } else {
+            member.value_ptr.* = .{
+                .store_id = intent.store_id,
+                .relocation_generation = intent.relocation_generation,
+            };
+        }
+    }
 
     for (stores) |store| {
         if (!store.live) continue;
         if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
 
         for (store.group_statuses) |group_status| {
-            if (placement_intents.len > 0 and !storeHasPlacement(placement_intents, group_status.group_id, store.node_id)) continue;
+            if (placement_intents.len > 0) {
+                const placement = placement_members.get(.{
+                    .group_id = group_status.group_id,
+                    .node_id = store.node_id,
+                }) orelse continue;
+                if (placement.ambiguous or
+                    (placement.store_id != 0 and
+                        placement.store_id != store.store_id) or
+                    placement.relocation_generation !=
+                        group_status.relocation_generation)
+                {
+                    continue;
+                }
+            }
             const entry = try indexes.getOrPut(alloc, group_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -796,41 +845,38 @@ pub fn mergeHealthyGroupStatuses(
             if (state.latest == null or moreCompleteGroupStatus(group_status, state.latest.?.report)) {
                 state.latest = candidate;
             }
-            if (group_status.local_voter and state.last_voter_store_id != store.store_id) {
-                state.healthy_voter_reports +|= 1;
-                state.last_voter_store_id = store.store_id;
-            }
-            if (group_status.voter_count > 0) {
-                if (state.observed_voter_count) |existing| {
-                    if (existing != group_status.voter_count) state.ambiguous_voter_count = true;
-                } else {
-                    state.observed_voter_count = group_status.voter_count;
+            if (group_status.local_voter) {
+                const report_key =
+                    (@as(u128, group_status.group_id) << 64) |
+                    @as(u128, store.store_id);
+                const report = try healthy_voter_reports.getOrPut(alloc, report_key);
+                if (!report.found_existing) {
+                    report.value_ptr.* = {};
+                    state.healthy_voter_reports +|= 1;
                 }
             }
+            state.leader_evidence.observe(store.store_id, group_status);
+            state.voter_set_evidence.observe(group_status);
             state.joint_consensus = state.joint_consensus or group_status.joint_consensus;
             state.transition_pending = state.transition_pending or group_status.transition_pending;
             state.replay_required = state.replay_required or group_status.replay_required;
             state.replay_caught_up = state.replay_caught_up or group_status.replay_caught_up;
             state.cutover_ready = state.cutover_ready or group_status.cutover_ready;
             state.reads_ready_after_cutover = state.reads_ready_after_cutover or group_status.reads_ready_after_cutover;
-            if (group_status.local_leader) {
-                if (state.latest_leader) |existing| {
-                    if (group_status.updated_at_millis > existing.report.updated_at_millis) {
-                        state.latest_leader = candidate;
-                        state.ambiguous_leader = false;
-                    } else if (group_status.updated_at_millis == existing.report.updated_at_millis and existing.store_id != store.store_id) {
-                        state.ambiguous_leader = true;
-                    }
-                } else {
-                    state.latest_leader = candidate;
-                    state.ambiguous_leader = false;
-                }
-            }
         }
 
         for (store.runtime_statuses) |runtime_status| {
-            if (!storeHasPlacement(placement_intents, runtime_status.group_id, store.node_id)) continue;
-            if (runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0 and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
+            const placement = placement_members.get(.{
+                .group_id = runtime_status.group_id,
+                .node_id = store.node_id,
+            }) orelse continue;
+            if (placement.ambiguous or
+                (placement.store_id != 0 and
+                    placement.store_id != store.store_id))
+            {
+                continue;
+            }
+            if (runtime_status.doc_count == 0 and !runtime_status.disk_bytes_known and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
             const entry = try indexes.getOrPut(alloc, runtime_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -844,27 +890,14 @@ pub fn mergeHealthyGroupStatuses(
                     .group_id = runtime_status.group_id,
                     .doc_count = runtime_status.doc_count,
                     .disk_bytes = runtime_status.disk_bytes,
+                    .disk_bytes_known = runtime_status.disk_bytes_known,
                     .empty = runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0,
                     .created_at_millis = runtime_status.created_at_millis,
                     .updated_at_millis = updated_at_millis,
-                    .local_voter = true,
-                    .voter_count = countPlacementIntents(placement_intents, runtime_status.group_id),
                 },
             };
             if (state.latest == null or moreCompleteGroupStatus(candidate.report, state.latest.?.report)) {
                 state.latest = candidate;
-            }
-            if (state.last_voter_store_id != store.store_id) {
-                state.healthy_voter_reports +|= 1;
-                state.last_voter_store_id = store.store_id;
-            }
-            const voter_count = countPlacementIntents(placement_intents, runtime_status.group_id);
-            if (voter_count > 0) {
-                if (state.observed_voter_count) |existing| {
-                    if (existing != voter_count) state.ambiguous_voter_count = true;
-                } else {
-                    state.observed_voter_count = voter_count;
-                }
             }
             mergeRuntimeDocIdentity(state, runtime_status.doc_identity);
         }
@@ -875,17 +908,24 @@ pub fn mergeHealthyGroupStatuses(
     for (states.items, 0..) |state, i| {
         const latest = state.latest orelse unreachable;
         const base = latest.report;
+        const authoritative_leader = state.leader_evidence.resolve();
+        const voter_set = state.voter_set_evidence.resolve(
+            if (authoritative_leader) |candidate| candidate.report else null,
+        );
         merged[i] = .{
             .group_id = base.group_id,
             .doc_count = base.doc_count,
             .disk_bytes = base.disk_bytes,
+            .disk_bytes_known = base.disk_bytes_known,
             .empty = base.empty,
             .created_at_millis = base.created_at_millis,
             .updated_at_millis = base.updated_at_millis,
             .leader_known = false,
             .leader_store_id = 0,
-            .voter_count_known = state.observed_voter_count != null and !state.ambiguous_voter_count,
-            .voter_count = if (state.observed_voter_count) |count| count else 0,
+            .voter_count_known = voter_set.voter_count_known,
+            .voter_count = voter_set.voter_count,
+            .voter_set_known = voter_set.voter_set_known,
+            .voter_set_fingerprint = voter_set.voter_set_fingerprint,
             .healthy_voter_reports = state.healthy_voter_reports,
             .joint_consensus = state.joint_consensus,
             .readiness_from_leader = false,
@@ -899,17 +939,18 @@ pub fn mergeHealthyGroupStatuses(
             .doc_identity = state.doc_identity,
             .doc_identity_namespace_conflict = state.doc_identity_namespace_conflict,
         };
-        if (!state.ambiguous_leader) {
-            if (state.latest_leader) |leader| {
-                merged[i].leader_known = true;
-                merged[i].leader_store_id = leader.store_id;
-                merged[i].readiness_from_leader = true;
-                merged[i].transition_pending = leader.report.transition_pending;
-                merged[i].replay_required = leader.report.replay_required;
-                merged[i].replay_caught_up = leader.report.replay_caught_up;
-                merged[i].cutover_ready = leader.report.cutover_ready;
-                merged[i].reads_ready_after_cutover = leader.report.reads_ready_after_cutover;
+        if (authoritative_leader) |leader| {
+            merged[i].leader_known = true;
+            merged[i].leader_store_id = leader.store_id;
+            merged[i].readiness_from_leader = true;
+            if (voter_set.from_leader) {
+                merged[i].joint_consensus = leader.report.joint_consensus;
             }
+            merged[i].transition_pending = leader.report.transition_pending;
+            merged[i].replay_required = leader.report.replay_required;
+            merged[i].replay_caught_up = leader.report.replay_caught_up;
+            merged[i].cutover_ready = leader.report.cutover_ready;
+            merged[i].reads_ready_after_cutover = leader.report.reads_ready_after_cutover;
         }
     }
     overlayDocIdentityNamespaceExpectations(merged, ranges);
@@ -1020,23 +1061,9 @@ fn refreshDocIdentityLifecycles(merged: []metadata_reconciler.MergedGroupStatus)
     for (merged) |*status| metadata_reconciler.refreshDocIdentityLifecycle(status);
 }
 
-fn storeHasPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
-    for (placements) |intent| {
-        if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
-    }
-    return false;
-}
-
-fn countPlacementIntents(placements: []const raft_reconciler.PlacementIntent, group_id: u64) u16 {
-    var count: u16 = 0;
-    for (placements) |intent| {
-        if (intent.record.group_id == group_id) count +|= 1;
-    }
-    return count;
-}
-
 fn moreCompleteGroupStatus(candidate: metadata_table_manager.GroupStatusReport, current: metadata_table_manager.GroupStatusReport) bool {
     if (candidate.doc_count != current.doc_count) return candidate.doc_count > current.doc_count;
+    if (candidate.disk_bytes_known != current.disk_bytes_known) return candidate.disk_bytes_known;
     if (candidate.disk_bytes != current.disk_bytes) return candidate.disk_bytes > current.disk_bytes;
     return candidate.updated_at_millis >= current.updated_at_millis;
 }
@@ -1087,38 +1114,42 @@ fn overlayRestoreReadiness(
     for (merged) |*status| {
         const range = findRangeForGroup(ranges, status.group_id) orelse continue;
         const table = findTableForId(tables, range.table_id) orelse continue;
-        const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        status.restore_pending = groupRestorePending(table.table_id, restore_backup_id, placement_intents, restore_progresses, status.group_id);
+        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+        status.restore_pending = groupRestorePending(
+            table.table_id,
+            range,
+            placement_intents,
+            restore_progresses,
+        );
     }
 }
 
 fn groupRestorePending(
     table_id: u64,
-    restore_backup_id: []const u8,
+    range: metadata_table_manager.RangeRecord,
     placement_intents: []const raft_reconciler.PlacementIntent,
     restore_progresses: []const metadata_table_manager.RestoreProgressRecord,
-    group_id: u64,
 ) bool {
     var expected: usize = 0;
     var restored: usize = 0;
     for (placement_intents) |intent| {
-        if (intent.record.group_id != group_id) continue;
+        if (intent.record.group_id != range.group_id) continue;
         expected += 1;
-        if (findRestoreProgress(restore_progresses, table_id, intent.record.local_node_id, group_id, restore_backup_id)) |progress| {
+        if (findRestoreProgress(
+            restore_progresses,
+            table_id,
+            intent.record.local_node_id,
+            range.group_id,
+            range.restore_backup_id,
+            range.restore_location,
+            range.restore_snapshot_path,
+            range.restore_artifact_sha256,
+        )) |progress| {
             if (!progress.runtime_repair_complete) continue;
             restored += 1;
         }
     }
     return expected > 0 and restored < expected;
-}
-
-fn restoreBackupIdForRange(
-    range: metadata_table_manager.RangeRecord,
-    table: metadata_table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_backup_id.len > 0) return range.restore_backup_id;
-    if (table.restore_backup_id.len > 0) return table.restore_backup_id;
-    return null;
 }
 
 fn findRangeForGroup(
@@ -1147,12 +1178,18 @@ fn findRestoreProgress(
     node_id: u64,
     group_id: u64,
     backup_id: []const u8,
+    location: []const u8,
+    snapshot_path: []const u8,
+    artifact_sha256: []const u8,
 ) ?metadata_table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
         if (record.node_id != node_id) continue;
         if (record.group_id != group_id) continue;
         if (!std.mem.eql(u8, record.backup_id, backup_id)) continue;
+        if (!std.mem.eql(u8, record.location, location)) continue;
+        if (!std.mem.eql(u8, record.snapshot_path, snapshot_path)) continue;
+        if (!std.mem.eql(u8, record.artifact_sha256, artifact_sha256)) continue;
         return record;
     }
     return null;
@@ -1214,42 +1251,15 @@ fn applyMergeObservationReadiness(
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .source_group_id = record.source_group_id,
-        .destination_group_id = record.destination_group_id,
-        .phase = record.phase,
-        .split_key = if (record.split_key) |value| try alloc.dupe(u8, value) else null,
-        .source_range_end = if (record.source_range_end) |value| try alloc.dupe(u8, value) else null,
-        .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
-    };
+    return try metadata_table_manager.cloneSplitTransitionRecord(alloc, record);
 }
 
 fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTransitionRecord) !transition_state.MergeTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .donor_group_id = record.donor_group_id,
-        .receiver_group_id = record.receiver_group_id,
-        .phase = record.phase,
-        .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
-        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
-    };
+    return try metadata_table_manager.cloneMergeTransitionRecord(alloc, record);
 }
 
 fn defaultSplitObservation() transition_state.SplitObservation {
-    return .{
-        .status = .{
-            .phase = .prepare,
-            .source_split_phase = .prepare,
-            .bootstrapped = false,
-            .replay_required = false,
-            .replay_caught_up = false,
-            .cutover_ready = false,
-            .destination_ready_for_reads = false,
-            .source_delta_sequence = 0,
-            .dest_delta_sequence = 0,
-        },
-    };
+    return transition_state.unpreparedSplitObservation();
 }
 
 fn defaultMergeObservation(record: transition_state.MergeTransitionRecord) transition_state.MergeObservation {
@@ -1327,13 +1337,22 @@ test "metadata state captures committed transitions and observations" {
 
         pub fn listProjectedSplitTransitions(_: *@This(), alloc: std.mem.Allocator) ![]transition_state.SplitTransitionRecord {
             const out = try alloc.alloc(transition_state.SplitTransitionRecord, 1);
-            out[0] = .{
+            errdefer alloc.free(out);
+            out[0] = try metadata_table_manager.cloneSplitTransitionRecord(alloc, .{
                 .transition_id = 1,
+                .attempt_epoch = 1,
                 .source_group_id = 11,
                 .destination_group_id = 12,
                 .phase = .prepare,
-                .split_key = try alloc.dupe(u8, "doc:m"),
-            };
+                .split_key = "doc:m",
+                .table_contract = .{
+                    .table_id = 7,
+                    .table_name = "docs",
+                    .indexes_json = "{}",
+                    .source_identity = .{ .shard_id = 71, .range_id = 71 },
+                    .target_identity = .{ .shard_id = 71, .range_id = 71 },
+                },
+            });
             return out;
         }
 
@@ -1344,12 +1363,20 @@ test "metadata state captures committed transitions and observations" {
 
         pub fn listProjectedMergeTransitions(_: *@This(), alloc: std.mem.Allocator) ![]transition_state.MergeTransitionRecord {
             const out = try alloc.alloc(transition_state.MergeTransitionRecord, 1);
-            out[0] = .{
+            errdefer alloc.free(out);
+            out[0] = try metadata_table_manager.cloneMergeTransitionRecord(alloc, .{
                 .transition_id = 2,
                 .donor_group_id = 12,
                 .receiver_group_id = 11,
                 .phase = .prepare,
-            };
+                .table_contract = .{
+                    .table_id = 7,
+                    .table_name = "docs",
+                    .indexes_json = "{}",
+                    .source_identity = .{ .shard_id = 71, .range_id = 71 },
+                    .target_identity = .{ .shard_id = 71, .range_id = 71 },
+                },
+            });
             return out;
         }
 
@@ -1403,6 +1430,82 @@ test "metadata state captures committed transitions and observations" {
     defer state.projectedTableManager().freeRanges(std.testing.allocator, ranges);
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
+}
+
+test "metadata state seeds active projected transitions after authority handoff" {
+    var state = MetadataState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.projected.upsertTable(.{ .table_id = 7, .name = "docs" });
+    try state.projected.upsertRange(.{
+        .group_id = 71,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .split_attempt_epoch = 4,
+    });
+    try state.committed_splits.append(std.testing.allocator, try cloneSplitRecord(std.testing.allocator, .{
+        .transition_id = 7001,
+        .attempt_epoch = 4,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .replay_deltas,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 7,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 71, .range_id = 71 },
+            .target_identity = .{ .shard_id = 71, .range_id = 71 },
+        },
+    }));
+
+    try state.seedDesiredFromProjected();
+    const splits = try state.desired.listDesiredSplitTransitions(std.testing.allocator);
+    defer state.desired.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 1), splits.len);
+    try std.testing.expectEqual(@as(u64, 7001), splits[0].transition_id);
+    try std.testing.expectEqual(@as(u64, 4), splits[0].attempt_epoch);
+    try std.testing.expectEqualStrings("doc:m", splits[0].split_key.?);
+}
+
+test "metadata state folds finalized split before projected topology catches up" {
+    var state = MetadataState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.projected.upsertTable(.{ .table_id = 7, .name = "docs" });
+    try state.projected.upsertRange(.{
+        .group_id = 71,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .split_attempt_epoch = 4,
+    });
+    try state.committed_splits.append(std.testing.allocator, try cloneSplitRecord(std.testing.allocator, .{
+        .transition_id = 7001,
+        .attempt_epoch = 4,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .finalized,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 7,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 71, .range_id = 71 },
+            .target_identity = .{ .shard_id = 71, .range_id = 71 },
+        },
+    }));
+
+    try state.seedDesiredFromProjected();
+    const ranges = try state.desired.listRanges(std.testing.allocator);
+    defer state.desired.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 2), ranges.len);
+    const splits = try state.desired.listDesiredSplitTransitions(std.testing.allocator);
+    defer state.desired.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 0), splits.len);
 }
 
 test "metadata state skips orphan projected ranges during projected sync" {
@@ -1618,6 +1721,96 @@ test "metadata state merges healthy group status and prefers leader readiness" {
     try std.testing.expect(merged[0].reads_ready_after_cutover);
 }
 
+test "metadata state counts each healthy voter store once" {
+    const group_id = 7002;
+    const voter_fingerprint = metadata_table_manager.voterSetFingerprint(
+        &.{ 1, 2, 3 },
+        null,
+    );
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = group_id, .replica_id = 1, .local_node_id = 1 },
+            .store_id = 11,
+            .peer_node_ids = &.{ 1, 2, 3 },
+        },
+        .{
+            .record = .{ .group_id = group_id, .replica_id = 2, .local_node_id = 2 },
+            .store_id = 12,
+            .peer_node_ids = &.{ 1, 2, 3 },
+        },
+        .{
+            .record = .{ .group_id = group_id, .replica_id = 3, .local_node_id = 3 },
+            .store_id = 13,
+            .peer_node_ids = &.{ 1, 2, 3 },
+        },
+    };
+    const leader_report = metadata_table_manager.GroupStatusReport{
+        .group_id = group_id,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = voter_fingerprint,
+        .raft_membership_index = 1,
+    };
+    const follower_report = metadata_table_manager.GroupStatusReport{
+        .group_id = group_id,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = voter_fingerprint,
+        .raft_membership_index = 1,
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                leader_report,
+            })[0..]),
+        },
+        .{
+            .store_id = 12,
+            .node_id = 2,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                follower_report,
+            })[0..]),
+        },
+        // A repeated snapshot for store 11 must not stand in for the missing
+        // report from store 13, even when it is non-adjacent in the input.
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                leader_report,
+            })[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &placements,
+        &.{},
+        &stores,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);
+}
+
 test "metadata state merges runtime document identity facts into group status" {
     const placements = [_]raft_reconciler.PlacementIntent{
         .{ .record = .{ .group_id = 7021, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
@@ -1661,6 +1854,57 @@ test "metadata state merges runtime document identity facts into group status" {
     try std.testing.expectEqual(@as(u64, 11), merged[0].doc_identity.allocated_ordinals);
     try std.testing.expect(!merged[0].doc_identity_namespace_conflict);
     try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_ready, merged[0].doc_identity_lifecycle);
+    try std.testing.expect(!merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 0), merged[0].healthy_voter_reports);
+}
+
+test "metadata state never promotes learner runtime telemetry to voter evidence" {
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7022, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+        .{ .record = .{ .group_id = 7022, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .fetch_snapshot }, .store_id = 12 },
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7022,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 1,
+            }})[0..]),
+        },
+        .{
+            .store_id = 12,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7022,
+                .local_voter = false,
+                .voter_count = 1,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 70,
+                .table_name = "docs",
+                .group_id = 7022,
+                .doc_count = 10,
+                .disk_bytes = 100,
+                .disk_bytes_known = true,
+            }})[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &placements, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(@as(u16, 1), merged[0].healthy_voter_reports);
+    try std.testing.expectEqual(@as(u64, 10), merged[0].doc_count);
 }
 
 test "metadata state marks doc identity rebuild required on range namespace mismatch" {
@@ -1920,6 +2164,7 @@ test "metadata state prefers leader-qualified transition observation over follow
     const split_transitions = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 9101,
+            .attempt_epoch = 1,
             .source_group_id = 7101,
             .destination_group_id = 7102,
             .phase = .bootstrap_peer,
@@ -2106,6 +2351,7 @@ test "metadata state conservatively aggregates readiness across healthy peers wi
 }
 
 test "metadata state tracks authoritative voter count when healthy peers agree" {
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 2, 3 }, null);
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 26,
@@ -2119,6 +2365,8 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
                     .updated_at_millis = 100,
                     .local_voter = true,
                     .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -2134,6 +2382,8 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
                     .updated_at_millis = 101,
                     .local_voter = true,
                     .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -2148,10 +2398,132 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
     try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);
 }
 
+test "metadata state prefers authoritative leader membership over stale peer evidence" {
+    const leader_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3, 4 }, null);
+    const stale_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null);
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 1,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7105,
+                .updated_at_millis = 300,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 4,
+                .voter_set_known = true,
+                .voter_set_fingerprint = leader_fingerprint,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 2,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7105,
+                .updated_at_millis = 200,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = false,
+                .joint_consensus = true,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 3,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7105,
+                .updated_at_millis = 100,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = stale_fingerprint,
+                .joint_consensus = true,
+            }})[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &stores,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(merged[0].leader_known);
+    try std.testing.expect(merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 4), merged[0].voter_count);
+    try std.testing.expect(!merged[0].joint_consensus);
+}
+
+test "metadata state rejects conflicting known voter sets without leader truth" {
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 104,
+            .node_id = 4,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7106,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null),
+            }})[0..]),
+        },
+        .{
+            .store_id = 105,
+            .node_id = 5,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7106,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 4 }, null),
+            }})[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &stores,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(!merged[0].leader_known);
+    try std.testing.expect(!merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 3), merged[0].voter_count);
+}
+
 test "metadata state ignores group status from stores without current placement" {
+    const current_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 2, 3 }, null);
     const placement_intents = [_]raft_reconciler.PlacementIntent{
         .{ .record = .{ .group_id = 7204, .replica_id = 1, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 22, .peer_node_ids = &.{ 2, 3 } },
-        .{ .record = .{ .group_id = 7204, .replica_id = 2, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 33, .peer_node_ids = &.{ 2, 3 } },
+        .{ .record = .{ .group_id = 7204, .replica_id = 2, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 33, .peer_node_ids = &.{ 2, 3 }, .relocation_generation = 7 },
     };
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
@@ -2163,6 +2535,7 @@ test "metadata state ignores group status from stores without current placement"
             .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
                 .{
                     .group_id = 7204,
+                    .relocation_generation = 6,
                     .doc_count = 99,
                     .disk_bytes = 990,
                     .empty = false,
@@ -2189,6 +2562,8 @@ test "metadata state ignores group status from stores without current placement"
                     .local_leader = true,
                     .local_voter = true,
                     .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = current_fingerprint,
                 },
             })[0..]),
         },
@@ -2201,6 +2576,7 @@ test "metadata state ignores group status from stores without current placement"
             .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
                 .{
                     .group_id = 7204,
+                    .relocation_generation = 6,
                     .doc_count = 10,
                     .disk_bytes = 100,
                     .empty = false,
@@ -2221,7 +2597,7 @@ test "metadata state ignores group status from stores without current placement"
     try std.testing.expectEqual(@as(u64, 10), merged[0].doc_count);
     try std.testing.expect(merged[0].voter_count_known);
     try std.testing.expectEqual(@as(u16, 2), merged[0].voter_count);
-    try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);
+    try std.testing.expectEqual(@as(u16, 1), merged[0].healthy_voter_reports);
 }
 
 test "metadata state marks restore-pending groups as not yet ready" {
@@ -2230,19 +2606,45 @@ test "metadata state marks restore-pending groups as not yet ready" {
             .table_id = 88,
             .name = "docs",
             .placement_role = "data",
-            .restore_backup_id = "snap1",
-            .restore_location = "file:///tmp/backups",
         },
     };
     const ranges = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 8801, .table_id = 88, .start_key = "", .end_key = null },
+        .{
+            .group_id = 8801,
+            .table_id = 88,
+            .start_key = "",
+            .end_key = null,
+            .restore_backup_id = "snap1",
+            .restore_location = "file:///tmp/backups",
+            .restore_snapshot_path = "snap1/groups/8801",
+            .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        },
     };
     const placement_intents = [_]raft_reconciler.PlacementIntent{
         .{ .record = .{ .group_id = 8801, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = &.{2} },
         .{ .record = .{ .group_id = 8801, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .peer_node_ids = &.{1} },
     };
     const restore_progresses = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 88, .node_id = 1, .group_id = 8801, .backup_id = "snap1" },
+        .{
+            .table_id = 88,
+            .node_id = 1,
+            .group_id = 8801,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/8801",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .runtime_repair_complete = true,
+        },
+        .{
+            .table_id = 88,
+            .node_id = 2,
+            .group_id = 8801,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/8801",
+            .artifact_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .runtime_repair_complete = true,
+        },
     };
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
@@ -2285,7 +2687,7 @@ test "metadata state marks restore-pending groups as not yet ready" {
     try std.testing.expect(merged[0].restore_pending);
 }
 
-test "metadata state prefers freshest leader report over stale conflicting leader report" {
+test "metadata state prefers higher-term leader despite a larger stale producer clock" {
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 31,
@@ -2299,8 +2701,10 @@ test "metadata state prefers freshest leader report over stale conflicting leade
                     .doc_count = 40,
                     .disk_bytes = 400,
                     .empty = false,
-                    .updated_at_millis = 100,
+                    .updated_at_millis = 10_000,
                     .local_leader = true,
+                    .raft_term = 7,
+                    .raft_membership_index = 70,
                     .transition_pending = true,
                     .replay_required = true,
                 },
@@ -2318,8 +2722,10 @@ test "metadata state prefers freshest leader report over stale conflicting leade
                     .doc_count = 41,
                     .disk_bytes = 410,
                     .empty = false,
-                    .updated_at_millis = 200,
+                    .updated_at_millis = 100,
                     .local_leader = true,
+                    .raft_term = 8,
+                    .raft_membership_index = 80,
                     .transition_pending = false,
                     .replay_required = false,
                     .replay_caught_up = false,
@@ -2336,12 +2742,12 @@ test "metadata state prefers freshest leader report over stale conflicting leade
     try std.testing.expectEqual(@as(usize, 1), merged.len);
     try std.testing.expect(merged[0].leader_known);
     try std.testing.expectEqual(@as(u64, 32), merged[0].leader_store_id);
-    try std.testing.expectEqual(@as(u64, 200), merged[0].updated_at_millis);
+    try std.testing.expectEqual(@as(u64, 100), merged[0].updated_at_millis);
     try std.testing.expect(!merged[0].transition_pending);
     try std.testing.expect(!merged[0].replay_required);
 }
 
-test "metadata state keeps leader unknown when freshest leader reports conflict" {
+test "metadata state keeps leader unknown for same-term claims with different clocks" {
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 41,
@@ -2355,8 +2761,10 @@ test "metadata state keeps leader unknown when freshest leader reports conflict"
                     .doc_count = 50,
                     .disk_bytes = 500,
                     .empty = false,
-                    .updated_at_millis = 300,
+                    .updated_at_millis = 30_000,
                     .local_leader = true,
+                    .raft_term = 9,
+                    .raft_membership_index = 90,
                 },
             })[0..]),
         },
@@ -2374,6 +2782,8 @@ test "metadata state keeps leader unknown when freshest leader reports conflict"
                     .empty = false,
                     .updated_at_millis = 300,
                     .local_leader = true,
+                    .raft_term = 9,
+                    .raft_membership_index = 90,
                 },
             })[0..]),
         },
@@ -2386,4 +2796,56 @@ test "metadata state keeps leader unknown when freshest leader reports conflict"
     try std.testing.expect(!merged[0].leader_known);
     try std.testing.expectEqual(@as(u64, 0), merged[0].leader_store_id);
     try std.testing.expect(!merged[0].readiness_from_leader);
+}
+
+test "metadata state waits for leader membership catch-up before accepting readiness" {
+    var leader_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 7401,
+        .updated_at_millis = 500,
+        .local_leader = true,
+        .raft_term = 10,
+        .raft_membership_index = 100,
+        .transition_pending = false,
+    }};
+    const follower_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 7401,
+        .updated_at_millis = 400,
+        .raft_term = 10,
+        .raft_membership_index = 110,
+        .transition_pending = true,
+    }};
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 51,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = leader_statuses[0..],
+        },
+        .{
+            .store_id = 52,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast(follower_statuses[0..]),
+        },
+    };
+
+    {
+        const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &.{}, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+        defer freeMergedGroupStatuses(std.testing.allocator, merged);
+        try std.testing.expect(!merged[0].leader_known);
+        try std.testing.expect(merged[0].transition_pending);
+    }
+
+    leader_statuses[0].raft_membership_index = 110;
+    {
+        const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &.{}, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+        defer freeMergedGroupStatuses(std.testing.allocator, merged);
+        try std.testing.expect(merged[0].leader_known);
+        try std.testing.expectEqual(@as(u64, 51), merged[0].leader_store_id);
+        try std.testing.expect(!merged[0].transition_pending);
+    }
 }

@@ -65,7 +65,9 @@ pub const Annotation = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -355,7 +357,9 @@ pub const ApplyPatchOperationParam = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -2207,7 +2211,9 @@ pub const ChatCompletionRequestAssistantMessageContentPart = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -2317,7 +2323,9 @@ pub const ChatCompletionRequestMessage = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -2558,7 +2566,9 @@ pub const ChatCompletionRequestSystemMessageContentPart = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -2642,7 +2652,9 @@ pub const ChatCompletionRequestToolMessageContentPart = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -2730,7 +2742,9 @@ pub const ChatCompletionRequestUserMessageContentPart = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -3109,7 +3123,9 @@ pub const ChunkingStrategyRequestParam = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -3798,7 +3814,9 @@ pub const ComputerAction = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -4724,7 +4742,9 @@ pub const ConversationItem = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -5428,7 +5448,9 @@ pub const CreateEvalItem = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -9620,7 +9642,9 @@ pub const FunctionAndCustomToolCallOutput = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -10078,7 +10102,9 @@ pub const FunctionShellCallOutputOutcomeParam = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -12481,7 +12507,9 @@ pub const InputContent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -12688,7 +12716,9 @@ pub const InputItem = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -13220,7 +13250,9 @@ pub const Item = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -13382,7 +13414,9 @@ pub const ItemField = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -13548,7 +13582,9 @@ pub const ItemResource = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -15354,7 +15390,9 @@ pub const MessageStreamEvent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -15793,7 +15831,9 @@ pub const OutputContent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -15862,7 +15902,9 @@ pub const OutputItem = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -16086,7 +16128,9 @@ pub const OutputMessageContent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -26148,7 +26192,9 @@ pub const RunStepStreamEvent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -26188,7 +26234,9 @@ pub const RunStreamEvent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -26987,7 +27035,9 @@ pub const TextResponseFormatConfiguration = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -27094,7 +27144,9 @@ pub const ThreadItem = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -27292,7 +27344,9 @@ pub const ThreadStreamEvent = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };
@@ -27395,7 +27449,9 @@ pub const Tool = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };

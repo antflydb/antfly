@@ -1,0 +1,5 @@
+{"elapsed_ns": 245209, "engine": "comparator", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 243917, "engine": "comparator", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 256833, "engine": "comparator", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 278250, "engine": "comparator", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 267292, "engine": "comparator", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 4, "schema_version": 1}

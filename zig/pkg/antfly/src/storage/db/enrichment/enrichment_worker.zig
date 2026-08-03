@@ -16,7 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("../derived/change_journal.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 pub const PendingDocumentGroup = replay_source_mod.PendingDocumentGroup;
 
 pub fn collectPendingDocumentGroups(
@@ -55,7 +55,7 @@ test "enrichment worker collects changed documents from thin change journal" {
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
         .changed_doc_keys = &.{ "doc:a", "doc:b" },
-        .target_hints = &.{ .enrichment },
+        .target_hints = &.{.enrichment},
     });
     defer alloc.free(first_payload);
     _ = try journal.appendOpaque(first_payload);

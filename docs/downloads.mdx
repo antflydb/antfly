@@ -18,6 +18,16 @@ We are actively working on features and improvements, and we welcome your feedba
 
 Antfly now ships the native Zig runtime as the default `antfly` binary. The previous Go/omni runtime remains available as `antfly-go` for old data directories, rollback, and portable backup creation before restoring into a fresh Zig data directory.
 
+### Back up before upgrading the Zig runtime
+
+Early-access Zig releases may migrate table files in place when opening an
+existing data directory. That migration can be one-way: an older Zig binary
+may subsequently fail to open the directory with `InvalidTableFile`.
+
+Create and verify a portable backup before upgrading, and restore that backup
+into a fresh data directory if you need to roll back. Do not rely on swapping
+the binary while reusing a directory that a newer Zig release has opened.
+
 <DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
 
 ### Installation Instructions
@@ -215,14 +225,14 @@ wait $pid
 services:
   antfly:
     image: ghcr.io/antflydb/antfly:latest
-    command: ["swarm"]
+    command: ["standalone"]
     ports:
       - "8080:8080" # Public API port
       - "9090:9090" # MCP port
     volumes:
       - ./antfly-data:/antflydb
       - ./config.json:/config.json
-    container_name: antfly-swarm
+    container_name: antfly-standalone
     environment:
       - ANTFLY_LOG_LEVEL=info
     restart: always

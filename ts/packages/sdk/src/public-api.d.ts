@@ -73,6 +73,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/connections/{connection_id}/inference/{operation}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Invoke an Antfly-compatible inference connection */
+        post: operations["invokeInferenceConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/secrets": {
         parameters: {
             query?: never;
@@ -82,7 +99,7 @@ export interface paths {
         };
         /**
          * List secrets status
-         * @description List all configured secret names and their status (keystore, env var, or both).
+         * @description List all configured secret names and their status (secret-store file, env var, or both).
          *     Never returns secret values — only names and configuration status.
          */
         get: operations["listSecrets"];
@@ -107,14 +124,14 @@ export interface paths {
         get?: never;
         /**
          * Store a secret
-         * @description Store a secret in the keystore. Only available in swarm (single-node) mode.
+         * @description Store a secret in the configured writable secret-store file. Only available in standalone mode.
          *     Returns 503 in multi-node mode.
          */
         put: operations["putSecret"];
         post?: never;
         /**
          * Delete a secret
-         * @description Remove a secret from the keystore. Only available in swarm (single-node) mode.
+         * @description Remove a secret from the configured writable secret-store file. Only available in standalone mode.
          *     Returns 503 in multi-node mode.
          */
         delete: operations["deleteSecret"];
@@ -439,8 +456,15 @@ export interface paths {
          *     - Table metadata (schema, indexes, shard configuration)
          *     - All shard data (compressed with zstd)
          *
-         *     The backup creates a cluster-level manifest that tracks all included tables
-         *     and their individual backup locations.
+         *     A non-empty backup publishes a cluster-level manifest only after every
+         *     requested table backup is durable. The manifest is the final commit
+         *     point and records complete expected/completed table counts. A `partial`
+         *     or `failed` attempt returns per-table diagnostics but does not publish a
+         *     restorable aggregate manifest. A cluster with no selected tables returns
+         *     `400` without writing a backup artifact.
+         *
+         *     Backup IDs are immutable. Reusing an ID that already has a published
+         *     cluster manifest returns `409` and leaves the existing backup unchanged.
          *
          *     **Storage Locations:**
          *     - Local filesystem: `file:///path/to/backup`
@@ -450,11 +474,7 @@ export interface paths {
          *     ```
          *     {location}/
          *     ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-         *     ├── {table1}-{backup_id}-metadata.json  (table metadata)
-         *     ├── shard-1-{table1}-{backup_id}.tar.zst
-         *     ├── shard-2-{table1}-{backup_id}.tar.zst
-         *     ├── {table2}-{backup_id}-metadata.json
-         *     └── ...
+         *     └── generation-scoped table manifests and payloads
          *     ```
          */
         post: operations["backup"];
@@ -480,14 +500,76 @@ export interface paths {
          *     **Restore Modes:**
          *     - `fail_if_exists`: Abort if any target table already exists (default)
          *     - `skip_if_exists`: Skip existing tables and restore the rest
-         *     - `overwrite`: Drop existing tables and restore from backup
+         *     - `overwrite`: Stage and validate replacement generations, then atomically publish them over existing tables.
          *
-         *     The restore is asynchronous - this endpoint triggers the restore process
-         *     and returns immediately. The actual data restoration happens via the
-         *     reconciliation loop as shards are started.
+         *     The restore is a durable asynchronous job. The request returns after the
+         *     job record is persisted and both a durable job store and asynchronous
+         *     worker are available. Poll the restore job resource for progress.
+         *     Catalog publication is durably checkpointed per table and is not
+         *     repeated after restart. If leadership changes before that checkpoint,
+         *     recovery adopts only an exact, still-active restore intent for the same
+         *     backup and location; unrelated or ambiguous existing tables fail closed.
+         *     A job reaches `succeeded` only after all placement replicas report the
+         *     restore complete and metadata clears the restore intent. Cancellation is
+         *     cooperative between table publication boundaries. Remote transfer and
+         *     staging occur before the per-table write fence. Publication stops new
+         *     admission and drains current readers and writers before swapping the
+         *     direct-path generation.
          */
         post: operations["restore"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/restore/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List durable restore jobs
+         * @description Returns a newest-first, authorization-filtered page of retained restore jobs from the metadata leader.
+         */
+        get: operations["listRestoreJobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/restore/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get durable restore job status
+         * @description Returns replicated restore-job state. A metadata follower may return
+         *     the retryable metadata-not-leader `503` until a newly committed job has
+         *     applied locally; clients should retry instead of treating that response
+         *     as job absence.
+         */
+        get: operations["getRestoreJob"];
+        put?: never;
+        post?: never;
+        /**
+         * Request cooperative restore cancellation
+         * @description Requests best-effort cancellation. Queued work is cancelled immediately
+         *     and running work stops at its next safe boundary. If irreversible restore
+         *     publication completes before cancellation is observed, the job remains
+         *     `succeeded` with `cancel_requested: true`.
+         */
+        delete: operations["cancelRestoreJob"];
         options?: never;
         head?: never;
         patch?: never;
@@ -502,9 +584,10 @@ export interface paths {
         };
         /**
          * List available backups
-         * @description Lists all cluster-level backups available at the specified location.
-         *     Returns metadata about each backup including the tables included,
-         *     timestamp, and Antfly version.
+         * @description Lists one bounded page of cluster-level backups in stable manifest-key
+         *     order at the specified location. Returns metadata about each backup
+         *     including the tables included, timestamp, and Antfly version. Pass the
+         *     returned `next_cursor` unchanged to retrieve the next page.
          */
         get: operations["listBackups"];
         put?: never;
@@ -1746,7 +1829,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Backup a table */
+        /**
+         * Backup a table
+         * @description Backup IDs are immutable. Reusing an already published ID returns `409` without changing the existing backup.
+         */
         post: operations["backupTable"];
         delete?: never;
         options?: never;
@@ -2044,10 +2130,14 @@ export interface paths {
         put?: never;
         /**
          * Cancel a table repair job
-         * @description Cancels a queued table repair job. If a repair pass is already running,
-         *     the response returns the current running state; cancellation is applied
-         *     only at pass boundaries so the API never reports a committed in-flight
-         *     pass as cancelled.
+         * @description Requests cancellation at a bounded repair boundary. For a named-index
+         *     job, the server also traverses the table in bounded passes, durably
+         *     pauses matching automatic repair, and asks an active owner to yield.
+         *     The job remains nonterminal until that traversal completes, so a
+         *     `cancelled` response means detached reconstruction will not restart
+         *     without an explicit resume action. If the API process restarts during
+         *     the traversal, server maintenance resumes it automatically; clients do
+         *     not need to advance or repeat the cancellation request.
          */
         post: operations["cancelTableRepairJob"];
         delete?: never;
@@ -2836,6 +2926,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/generate/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate text for a synchronous batch of requests
+         * @description Runs multiple non-streaming generation requests as one synchronous batch.
+         *     Compatible native requests for the same model are executed through the
+         *     native batched KV decoder; unsupported per-item options are returned as
+         *     per-item errors without failing sibling requests.
+         *
+         *     This endpoint implements the synchronous form only. Future async durable
+         *     batching will use the same request item shape with `mode: async`.
+         */
+        post: operations["generateBatchContent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -3469,9 +3585,14 @@ export interface components {
             message?: string;
             /** @description Indicates whether authentication is enabled for the cluster */
             auth_enabled?: boolean;
-            /** @description Indicates whether the cluster is running in single-node swarm mode */
-            swarm_mode?: boolean;
+            /**
+             * @description Runtime deployment topology
+             * @enum {string}
+             */
+            deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
+            storage?: components["schemas"]["StorageRuntimeStatus"];
         } & {
             [key: string]: unknown;
         };
@@ -3481,9 +3602,14 @@ export interface components {
             message?: string;
             /** @description Indicates whether authentication is enabled for the cluster */
             auth_enabled?: boolean;
-            /** @description Indicates whether the cluster is running in single-node swarm mode */
-            swarm_mode?: boolean;
+            /**
+             * @description Runtime deployment topology
+             * @enum {string}
+             */
+            deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
+            storage?: components["schemas"]["StorageRuntimeStatus"];
             data: components["schemas"]["ClusterDataStatus"];
         } & {
             [key: string]: unknown;
@@ -3504,7 +3630,10 @@ export interface components {
          * @description Connection status. "connected" means a live probe or listing succeeded,
          *     "error" means the probe failed (see the error field), "configured" means
          *     the connection is present but was not probed, and "unsupported" means
-         *     no probe is available for this connection kind or provider.
+         *     no probe is available for this connection kind or provider. For S3,
+         *     connected means an authenticated HeadBucket request succeeded for every
+         *     explicitly allowlisted bucket. It verifies bucket discovery permission,
+         *     not mutation permissions such as PutObject.
          * @enum {string}
          */
         ConnectionStatus: "connected" | "error" | "configured" | "unsupported";
@@ -3922,10 +4051,17 @@ export interface components {
             /** @description Opaque cursor returned by a prior repair response. */
             cursor?: string;
             /**
-             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+             * @description Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
              * @default false
              */
             force?: boolean;
+            /**
+             * @description Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+             * @enum {string}
+             */
+            control?: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
+            /** @description Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair. */
+            repair_id?: string;
             /**
              * Format: uint32
              * @description Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
@@ -3990,6 +4126,11 @@ export interface components {
              * @description Number of selected indexes that were already degraded or quarantined before repair.
              */
             indexes_degraded: number;
+            /**
+             * Format: uint64
+             * @description Number of existing index repairs that accepted the requested control.
+             */
+            controls_applied: number;
             /**
              * Format: uint32
              * @description Effective repair limit.
@@ -4075,12 +4216,12 @@ export interface components {
              * @description Effective per-pass repair limit.
              */
             limit: number;
-            /** @description Whether the job forces a named index rebuild. */
+            /** @description Whether the next bounded pass still needs to dispatch the job's one forced named-index generation. */
             force: boolean;
             result: components["schemas"]["TableRepairRunResult"];
             /** @description Last stable job-level error code. */
             last_error?: string | null;
-            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled. */
+            /** @description Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes. */
             cancel_requested: boolean;
             /**
              * Format: uint64
@@ -4370,14 +4511,29 @@ export interface components {
         };
         /** @description Non-secret status for the local secrets file store, when one is available. */
         SecretStoreStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the currently published secret-store snapshot.
+             */
+            generation?: number;
+            /** @description Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources. */
+            supports_source_generation?: boolean;
+            /** @description Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values. */
+            source_generation?: string | null;
+            /** @description Whether the latest observed replacement failed to load. */
+            last_reload_failed?: boolean;
             /** @description Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh. */
             stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
         };
         /**
          * @description Source of the secret configuration
          * @enum {string}
          */
-        SecretStatus: "configured_keystore" | "configured_env" | "configured_both";
+        SecretStatus: "configured_file" | "configured_env" | "configured_both";
         SecretEntry: {
             /** @description Secret name (e.g., openai.api_key) */
             key: string;
@@ -4393,7 +4549,7 @@ export interface components {
             secrets: components["schemas"]["SecretEntry"][];
         };
         SecretWriteRequest: {
-            /** @description Secret value (stored encrypted, never returned) */
+            /** @description Secret value (stored in the configured protected secret store and never returned) */
             value: string;
         };
         ByteRange: string[];
@@ -5150,7 +5306,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$addToSet" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -5158,7 +5314,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
+            /** @description Value for operation (not required for $unset). Type depends on the supported operator. */
             value?: unknown;
         };
         /**
@@ -5177,8 +5333,9 @@ export interface components {
          *           "value": 1
          *         },
          *         {
-         *           "op": "$currentDate",
-         *           "path": "$.lastViewed"
+         *           "op": "$set",
+         *           "path": "$.lastViewed",
+         *           "value": "2026-07-28T12:00:00Z"
          *         }
          *       ]
          *     }
@@ -5241,14 +5398,16 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Antfly query to filter documents. Only documents matching this query
-             *     are included in results. Uses the sear library for efficient per-document
-             *     matching without requiring a full index.
+             * @description Structured subset of the Antfly query AST used to filter a primary-key
+             *     scan. Only documents matching this query are included in results.
+             *     Because scans do not open a text index, text-index-only variants such
+             *     as phrase and multi-match queries are rejected with a validation error
+             *     instead of being evaluated with slower stored-document semantics.
              *
              *     Examples:
-             *     - Status filtering: `{"query": "status:published"}`
-             *     - Date ranges: `{"query": "created_at:>2023-01-01"}`
-             *     - Field matching: `{"query": "category:technology"}`
+             *     - Status filtering: `{"term":{"path":"/status","value":"published"}}`
+             *     - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
+             *     - Field existence: `{"exists":{"path":"/category"}}`
              */
             filter_query?: components["schemas"]["Query"] & unknown;
             /**
@@ -5364,12 +5523,12 @@ export interface components {
              *     Transform operations allow you to modify documents without read-modify-write races:
              *     - Operations are applied atomically on the server
              *     - Multiple operations per document are applied in sequence
-             *     - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+             *     - Supports numeric and set-like operations ($inc, $max, $addToSet)
              *
              *     Common use cases:
              *     - Increment counters (views, likes, votes)
-             *     - Update timestamps ($currentDate)
-             *     - Manage arrays (add/remove tags, items)
+             *     - Update timestamps ($set)
+             *     - Add unique array values ($addToSet)
              *     - Update nested fields without overwriting the entire document
              * @example [
              *       {
@@ -5381,8 +5540,9 @@ export interface components {
              *             "value": 1
              *           },
              *           {
-             *             "op": "$currentDate",
-             *             "path": "$.lastViewed"
+             *             "op": "$set",
+             *             "path": "$.lastViewed",
+             *             "value": "2026-07-28T12:00:00Z"
              *           }
              *         ]
              *       },
@@ -5390,7 +5550,7 @@ export interface components {
              *         "key": "user:456",
              *         "operations": [
              *           {
-             *             "op": "$push",
+             *             "op": "$addToSet",
              *             "path": "$.tags",
              *             "value": "vip"
              *           }
@@ -6630,13 +6790,20 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Local filesystem: `file:///path/to/backup`
+             *     - Scoped filesystem connection: `file:///logical/path`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
+             *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
              *     The backup includes all table data, indexes, and metadata for the specified table.
              * @example s3://mybucket/antfly-backups/users-table/2025-01-15
              */
             location: string;
+            /**
+             * @description ID of a configured `external_io` connection. Required for every
+             *     network API backup and restore. Object locations enforce bucket and
+             *     prefix scopes; filesystem URI paths resolve beneath the connection root.
+             */
+            connection: string;
             /**
              * @description Backup format to use:
              *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
@@ -6649,7 +6816,25 @@ export interface components {
              */
             format?: "native" | "portable";
         };
-        RestoreRequest: components["schemas"]["BackupRequest"];
+        RestoreRequest: {
+            /**
+             * @description Identifier of the published backup to restore.
+             * @example backup-2025-01-15-v2
+             */
+            backup_id: string;
+            /**
+             * @description Storage location containing the backup. The server detects the
+             *     native or portable format from the published manifest and artifact.
+             * @example s3://mybucket/antfly-backups/users-table/2025-01-15
+             */
+            location: string;
+            /**
+             * @description ID of a configured `external_io` connection with `restore.read`.
+             *     Object locations enforce bucket and prefix scopes; filesystem URI
+             *     paths resolve beneath the connection root.
+             */
+            connection: string;
+        };
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.
@@ -6659,13 +6844,16 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Local filesystem: `file:///path/to/backup`
+             *     - Scoped filesystem connection: `file:///logical/path`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
+             *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
              *     The backup includes all table data, indexes, and metadata.
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
+            /** @description Required configured `external_io` connection with the `backup.write` capability. */
+            connection: string;
             /**
              * @description Backup format to use:
              *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
@@ -6678,7 +6866,9 @@ export interface components {
              */
             format?: "native" | "portable";
             /**
-             * @description Optional list of tables to backup. If omitted, all tables are backed up.
+             * @description Optional list of tables to backup. If omitted, all tables are backed up,
+             *     up to the cluster backup limit of 4096 tables. Requests above that limit
+             *     fail before any table backup is created.
              * @example [
              *       "users",
              *       "products"
@@ -6727,8 +6917,12 @@ export interface components {
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
+            /** @description Required configured `external_io` connection with the `restore.read` capability. */
+            connection: string;
             /**
-             * @description Optional list of tables to restore. If omitted, all tables in the backup are restored.
+             * @description Optional list of tables to restore. If omitted, all tables in the backup are restored,
+             *     up to the cluster restore limit of 4096 tables. Larger backups must be restored
+             *     in explicit batches of at most 256 tables.
              * @example [
              *       "users",
              *       "products"
@@ -6739,7 +6933,7 @@ export interface components {
              * @description How to handle existing tables:
              *     - `fail_if_exists`: Abort if any table already exists (default)
              *     - `skip_if_exists`: Skip existing tables, restore others
-             *     - `overwrite`: Drop and recreate existing tables
+             *     - `overwrite`: Atomically replace existing table generations after staging and validation
              * @default fail_if_exists
              * @example skip_if_exists
              * @enum {string}
@@ -6751,10 +6945,10 @@ export interface components {
             tables: components["schemas"]["TableRestoreStatus"][];
             /**
              * @description Overall restore status
-             * @example triggered
+             * @example completed
              * @enum {string}
              */
-            status: "triggered" | "partial" | "failed";
+            status: "completed" | "triggered" | "durability_pending" | "partial" | "failed";
         };
         TableRestoreStatus: {
             /**
@@ -6767,7 +6961,7 @@ export interface components {
              * @example triggered
              * @enum {string}
              */
-            status: "triggered" | "skipped" | "failed";
+            status: "triggered" | "committed" | "durability_pending" | "skipped" | "failed";
             /** @description Error message if restore failed */
             error?: string;
         };
@@ -6809,8 +7003,10 @@ export interface components {
             format?: "native" | "portable";
         };
         BackupListResponse: {
-            /** @description List of available backups */
+            /** @description One page of available backups in stable manifest-key order. */
             backups: components["schemas"]["BackupInfo"][];
+            /** @description Opaque continuation cursor. Omitted when no additional backups remain. */
+            next_cursor?: string;
         };
         QueryBuilderRequest: {
             /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
@@ -7223,6 +7419,10 @@ export interface components {
          *
          *     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
          *     call, using the queries to determine available tables and indexes.
+         *
+         *     Authenticated row filters are enforced on every initial and generated
+         *     operation in both modes, including scans, aggregates, and graph/tree
+         *     traversal. They cannot be replaced or weakened by model tool arguments.
          */
         RetrievalAgentRequest: {
             /**
@@ -7236,6 +7436,13 @@ export interface components {
              *
              *     In pipeline mode (max_internal_iterations=0), these are executed directly.
              *     In agentic mode, these declare which table and indexes are available.
+             *
+             *     `filter_query` and `exclusion_query` are mandatory table predicates
+             *     for retrieval-agent execution. Predicates declared by any query for
+             *     a table are conjoined (or unioned for exclusions) and applied to
+             *     every initial query, generated refinement, probe, aggregation,
+             *     graph/tree traversal, root scan, and follow-up for that table.
+             *     They cannot be weakened by generated operations.
              * @example [
              *       {
              *         "table": "docs",
@@ -7257,11 +7464,13 @@ export interface components {
              */
             agent_knowledge?: string;
             /**
-             * @description Pre-applied filters from prior interactions. These are applied to
-             *     all search tool invocations.
+             * @description Mandatory filters from prior interactions. These are converted to
+             *     structured Antfly predicates and applied to every table and every
+             *     search tool invocation, including generated follow-ups, graph/tree
+             *     traversal, aggregations, and root scans.
              */
             accumulated_filters?: components["schemas"]["FilterSpec"][];
-            /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
+            /** @description Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence. */
             session_id?: string;
             /** @description Structured answers provided by the user as part of client-carried continuation. */
             decisions?: components["schemas"]["AgentDecision"][];
@@ -7521,12 +7730,12 @@ export interface components {
              *
              *     Boolean clauses are normalized before planning:
              *     - `bool.must` is scoring query input.
-             *     - `bool.filter` is a non-scoring structured filter.
-             *     - `bool.must_not` is a structured exclusion filter.
+             *     - `bool.filter` is non-scoring query input.
+             *     - `bool.must_not` is non-scoring exclusion query input.
              *
-             *     The same AST accepts direct structured filters using `field` or JSON-pointer
-             *     `path`, scalar `term` values, multi-value `terms`, and `exists`.
-             *     Query-string objects remain supported as a full-text escape hatch.
+             *     Filter branches accept the same query variants as `filter_query` and
+             *     `exclusion_query`. Structured clauses use the native document-value
+             *     path; text clauses are resolved through the text index before scoring.
              * @example {
              *       "bool": {
              *         "must": [
@@ -7582,7 +7791,8 @@ export interface components {
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
              *
              *     The semantic_search string is automatically embedded using the configured embedding model
-             *     for the specified indexes. Use `embedding_template` for multimodal queries.
+             *     for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for
+             *     multimodal queries.
              * @example artificial intelligence and machine learning applications
              */
             semantic_search?: string;
@@ -7590,21 +7800,26 @@ export interface components {
              * @description Optional Handlebars template for multimodal embedding of the semantic_search query.
              *     The template has access to `this` which contains the semantic_search string value.
              *
-             *     Use this when you want to embed multimodal content (images, PDFs, etc.) instead of
+             *     UTF-8 template input is limited to 64 KiB.
+             *
+             *     Use this when you want to embed template-time multimodal content instead of
              *     just text. The template is rendered using dotprompt with access to remote content helpers.
              *
              *     **Available Helpers**:
              *     - `remoteMedia url=<url>` - Fetches and embeds remote images/media
-             *     - `remotePDF url=<url>` - Fetches and extracts content from PDFs
+             *     - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs
              *     - `remoteText url=<url>` - Fetches and includes remote text content
              *
+             *     Use a `document_extraction` asset producer when PDF pages and chunks must be persisted
+             *     and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input.
+             *
              *     **Examples**:
-             *     - PDF search: `{{remotePDF url=this}}`
+             *     - Legacy PDF search: `{{remotePDF url=this}}`
              *     - Image search: `{{remoteMedia url=this}}`
              *     - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}`
              *
              *     When not specified, the semantic_search string is embedded as plain text.
-             * @example {{remotePDF url=this}}
+             * @example {{remoteMedia url=this}}
              */
             embedding_template?: string;
             /**
@@ -7745,7 +7960,8 @@ export interface components {
              * @description Optional query execution deadline in milliseconds. The server applies this as a
              *     cooperative deadline across query planning, search execution, aggregation reruns,
              *     sorting, and response post-processing. If the deadline expires before the query
-             *     completes, the HTTP API returns 504.
+             *     completes, the HTTP API returns 504. When omitted, semantic query embedding planning
+             *     and provider I/O use a 30-second default deadline.
              * @example 5000
              */
             timeout_ms?: number;
@@ -8922,7 +9138,7 @@ export interface components {
             type: "postgres";
             /**
              * @description Data source name (connection string) for the foreign database.
-             *     Supports `${secret:key_name}` references that resolve from the Antfly keystore
+             *     Supports `${secret:key_name}` references that resolve from the Antfly secret store
              *     or environment variables.
              * @example ${secret:pg_dsn}
              */
@@ -8965,7 +9181,7 @@ export interface components {
             type: "postgres";
             /**
              * @description Data source name (connection string) for the PostgreSQL database.
-             *     Supports `${secret:key_name}` references that resolve from the Antfly keystore
+             *     Supports `${secret:key_name}` references that resolve from the Antfly secret store
              *     or environment variables. Requires `wal_level=logical` on the source.
              * @example ${secret:pg_dsn}
              */
@@ -9150,8 +9366,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-             *     `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
@@ -9168,6 +9383,141 @@ export interface components {
              *     navigate into decoded JSONB columns.
              */
             value?: unknown;
+        };
+        StorageMaintenanceCapabilities: {
+            check: boolean;
+            compact: boolean;
+            vacuum: boolean;
+            online: boolean;
+            asynchronous: boolean;
+        };
+        StorageRuntimeStatus: {
+            /** @enum {string} */
+            engine: "lite" | "local" | "object";
+            format?: string;
+            fsync?: boolean;
+            maintenance: components["schemas"]["StorageMaintenanceCapabilities"];
+        };
+        /** @description Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart. */
+        RuntimeConfigStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the fully validated and atomically published configuration.
+             */
+            generation?: number;
+            /** @description Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation. */
+            hash?: string;
+            /** @description Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed. */
+            last_reload_failed?: boolean;
+            /** @description Whether requests are using the last-known-good snapshot after a failed reload. */
+            stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
+        };
+        /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
+        DenseRepairBackpressureError: {
+            /** @enum {string} */
+            code: "dense_repair_backpressure";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+            /**
+             * Format: uint32
+             * @description Suggested delay before retrying the write.
+             */
+            retry_after_ms: number;
+        };
+        RestoreJob: {
+            /** @description Opaque durable restore-job identifier. Clients must not parse it as a number. */
+            job_id: string;
+            /** Format: int64 */
+            attempt_id: number;
+            /** @enum {string} */
+            scope: "table" | "cluster";
+            table_name?: string;
+            backup_id: string;
+            /** @enum {string} */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            cancel_requested: boolean;
+            /**
+             * Format: int64
+             * @description Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+             */
+            durability_pending_table_count: number;
+            /**
+             * Format: int64
+             * @description Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+             */
+            published_table_count: number;
+            /**
+             * Format: int64
+             * @description Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
+             */
+            completed_table_count: number;
+            /**
+             * Format: int64
+             * @description Requested table count when known before execution.
+             */
+            total_table_count?: number;
+            /**
+             * @description Bounded terminal result. A committed result with durability pending means publication is visible but
+             *     parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed,
+             *     durability-pending, skipped, and failed table counts plus a bounded sample of failure details.
+             *     `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
+             *     Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
+             *     and use a new idempotency key when retrying a changed request.
+             */
+            result?: {
+                /**
+                 * @description Present for a single-table restore result.
+                 * @enum {string}
+                 */
+                restore?: "triggered" | "committed";
+                /**
+                 * @description Present when table publication is visible but filesystem durability could not be confirmed.
+                 * @enum {string}
+                 */
+                durability?: "pending";
+                /**
+                 * @description Aggregate terminal status for a cluster restore.
+                 * @enum {string}
+                 */
+                status?: "completed" | "durability_pending" | "partial" | "failed";
+                /** Format: int64 */
+                triggered_table_count?: number;
+                /** Format: int64 */
+                committed_table_count?: number;
+                /** Format: int64 */
+                durability_pending_table_count?: number;
+                /** Format: int64 */
+                skipped_table_count?: number;
+                /** Format: int64 */
+                failed_table_count?: number;
+                failure_details?: {
+                    table_name: string;
+                    error: string;
+                    table_name_truncated: boolean;
+                }[];
+                /** @description True when additional failed tables or part of a long table name or error were omitted. */
+                failure_details_truncated?: boolean;
+            };
+            error?: string;
+            /** Format: int64 */
+            created_at_ms: number;
+            /** Format: int64 */
+            updated_at_ms: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+             */
+            expires_at_ms?: number;
+        };
+        RestoreJobList: {
+            jobs: components["schemas"]["RestoreJob"][];
+            /** @description Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted. */
+            next_cursor?: string;
         };
         User: {
             /** @example johndoe */
@@ -9354,6 +9704,16 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        ExecutionPolicy: {
+            /** @description Maximum items to process in one batch for this operation. */
+            batch_items?: number;
+            /**
+             * Format: uint64
+             * @description Approximate maximum source bytes to process in one batch for this operation.
+             */
+            batch_bytes?: number;
+        };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
@@ -9382,11 +9742,19 @@ export interface components {
             content_type?: string;
             /** @description Serialized asset producer configuration. */
             producer_json?: string;
+            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
+            execution?: components["schemas"]["ExecutionPolicy"];
         };
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
         };
+        /**
+         * @description How generation-scoped source outcomes determine derived-index completeness.
+         * @default strict
+         * @enum {string}
+         */
+        DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
         /**
          * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
          * @default l2_squared
@@ -10285,8 +10653,17 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
+        IndexExecutionConfig: {
+            /** @description Chunk producer batching for shorthand-created chunk enrichments. */
+            chunking?: components["schemas"]["ExecutionPolicy"];
+            /** @description Embedding producer batching for shorthand-created embedding enrichments. */
+            embedding?: components["schemas"]["ExecutionPolicy"];
+        };
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
+            /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /**
              * @description When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
              * @default false
@@ -10335,6 +10712,8 @@ export interface components {
              * @default 1024
              */
             chunk_size?: number;
+            /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
+            execution?: components["schemas"]["IndexExecutionConfig"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -10834,18 +11213,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        /** @description The fuzziness of the query. Can be an integer or "auto". */
-        Fuzziness: number | "auto";
         MatchQuery: {
             match: string;
             field?: string;
             analyzer?: string;
             boost?: components["schemas"]["Boost"];
-            /** Format: int32 */
-            prefix_length?: number;
-            fuzziness?: components["schemas"]["Fuzziness"];
-            /** @enum {string} */
-            operator?: "or" | "and";
         };
         MultiMatchBody: {
             query: string;
@@ -10857,6 +11229,8 @@ export interface components {
         MultiMatchQuery: {
             multi_match: components["schemas"]["MultiMatchBody"];
         };
+        /** @description The fuzziness of the query. Can be an integer or "auto". */
+        Fuzziness: number | "auto";
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;
@@ -11032,6 +11406,16 @@ export interface components {
             boost?: components["schemas"]["Boost"];
         };
         Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
+        IndexRepairStatus: {
+            /**
+             * @description Stable repair state. Internal state-machine phases are intentionally not exposed here.
+             * @enum {string}
+             */
+            state: "rebuilding" | "waiting" | "paused" | "failed";
+            /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
+            action_required: boolean;
+        };
         FullTextIndexStats: {
             /**
              * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
@@ -11052,6 +11436,7 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the index is actively rebuilding, replaying, or catching up. */
             backfill_active?: boolean;
             /**
@@ -11118,11 +11503,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -11163,6 +11545,139 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @enum {string} */
+        DerivedCoverageStatusPolicy: "strict" | "partial" | "best_effort" | "external";
+        /**
+         * @description A structured reason why the coverage projection cannot be treated as globally complete.
+         * @enum {string}
+         */
+        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch" | "counter_mismatch";
+        DerivedCoverageStatus: {
+            policy: components["schemas"]["DerivedCoverageStatusPolicy"];
+            /** @description Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality. */
+            observation_complete: boolean;
+            /** @description Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete. */
+            observation_incomplete_reasons: components["schemas"]["DerivedCoverageObservationIncompleteReason"][];
+            /** @description Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it. */
+            config_fingerprint: string;
+            /** @description Whether all observed shard-local coverage summaries were read atomically and completely. */
+            summary_ready: boolean;
+            /**
+             * Format: uint64
+             * @description Freshly observed shard groups reporting a different semantic configuration fingerprint.
+             */
+            config_mismatch_group_count: number;
+            /**
+             * Format: uint64
+             * @description Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
+             */
+            source_total: number;
+            /**
+             * Format: uint64
+             * @description Source documents with a durable produced outcome for this index generation.
+             */
+            produced: number;
+            /**
+             * Format: uint64
+             * @description Source documents intentionally producing no indexable output.
+             */
+            skipped: number;
+            /**
+             * Format: uint64
+             * @description Source documents whose generation failed non-retryably.
+             */
+            terminal_failed: number;
+            /**
+             * Format: uint64
+             * @description Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
+             */
+            covered: number;
+            /**
+             * Format: uint64
+             * @description Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+             */
+            pending: number | null;
+            /** @description Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy. */
+            complete: boolean;
+            /** @description Whether coverage is complete without terminal failures. */
+            healthy: boolean;
+            /** @description Whether coverage is complete under best_effort but includes terminal failures. */
+            degraded: boolean;
+        };
+        /** @description Runtime state for the durable embeddings enrichment worker. */
+        EnrichmentRuntimeStatus: {
+            enabled: boolean;
+            /** Format: uint64 */
+            target_sequence: number;
+            /** Format: uint64 */
+            applied_sequence: number;
+            /** Format: uint64 */
+            pending_sequence_count: number;
+            projection_checkpoint_status: string;
+            /** Format: uint64 */
+            projection_checkpoint_applied_sequence: number;
+            /** Format: uint64 */
+            projection_checkpoint_generation: number;
+            projection_checkpoint_config_fingerprint: string;
+            /** @description Whether every shard contributing to this status reports the same checkpoint generation and configuration identity. */
+            projection_checkpoint_identity_consistent: boolean;
+            /** Format: uint64 */
+            checkpoint_replay_tail_sequence_count: number;
+            /** Format: uint64 */
+            processed_requests: number;
+            /** Format: uint64 */
+            error_count: number;
+            /** Format: uint64 */
+            retryable_error_count: number;
+            /** Format: uint64 */
+            fatal_error_count: number;
+            retrying: boolean;
+            worker_failed: boolean;
+            /** @description Whether the background enrichment worker is currently running. */
+            worker_started: boolean;
+            /** @description Whether work is pending with no running worker, retry, or terminal failure explaining the backlog. */
+            stalled: boolean;
+            /** Format: uint64 */
+            skip_by_hash_count: number;
+            /** Format: uint64 */
+            skipped_source_count: number;
+            /** Format: uint64 */
+            codec_decode_failures: number;
+            /** Format: uint64 */
+            embed_batches_started: number;
+            /** Format: uint64 */
+            embed_batches_completed: number;
+            /** Format: uint64 */
+            embed_items_started: number;
+            /** Format: uint64 */
+            embed_items_completed: number;
+            /** Format: uint64 */
+            active_embed_batch_items: number;
+            /** Format: uint64 */
+            active_embed_batch_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_max_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_started_ms: number;
+            /** Format: uint64 */
+            last_embed_batch_items: number;
+            /** Format: uint64 */
+            last_embed_batch_bytes: number;
+            /** Format: uint64 */
+            last_embed_batch_max_bytes: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_completed_ms: number;
+            /**
+             * Format: uint64
+             * @description Elapsed duration in nanoseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_ns: number;
+            /** Format: uint64 */
+            total_embed_ns: number;
+        };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
             /**
@@ -11194,6 +11709,7 @@ export interface components {
             total_terms?: number;
             /** @description Whether the index enricher is currently backfilling */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /**
              * Format: uint64
              * @description Number of documents pending enrichment in the WAL
@@ -11215,9 +11731,11 @@ export interface components {
             backfill_state?: string;
             /**
              * Format: uint64
-             * @description Number of documents visible to the index.
+             * @description Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
              */
             doc_count?: number;
+            /** @description Generation-scoped source-document coverage, separate from physical index cardinality. */
+            coverage?: components["schemas"]["DerivedCoverageStatus"];
             /**
              * Format: uint64
              * @description Documents currently visible to queries.
@@ -11237,38 +11755,6 @@ export interface components {
             dense_replay_target_sequence?: number;
             /** @description Whether dense/vector artifacts still need publication before queries see the latest data. */
             dense_publish_pending?: boolean;
-            /** @description Source document coverage accounting for embeddings indexes. */
-            coverage?: {
-                /** @description Coverage policy used to decide readiness. */
-                policy?: string;
-                /**
-                 * Format: uint64
-                 * @description Total source documents expected for coverage.
-                 */
-                source_total?: number;
-                /**
-                 * Format: uint64
-                 * @description Source documents with produced embeddings.
-                 */
-                produced?: number;
-                /**
-                 * Format: uint64
-                 * @description Source documents intentionally skipped by coverage policy.
-                 */
-                skipped?: number;
-                /**
-                 * Format: uint64
-                 * @description Source documents that reached a terminal enrichment failure.
-                 */
-                terminal_failed?: number;
-                /**
-                 * Format: uint64
-                 * @description Source documents counted as covered by the coverage policy.
-                 */
-                covered?: number;
-                /** @description Whether the coverage policy considers the index complete. */
-                complete?: boolean;
-            };
             /** Format: uint64 */
             replay_applied_sequence?: number;
             /** Format: uint64 */
@@ -11284,13 +11770,7 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Embedding enrichment worker runtime diagnostics. */
-            enrichment_runtime?: {
-                /** Format: uint64 */
-                pending_sequence_count?: number;
-            } & {
-                [key: string]: unknown;
-            };
+            enrichment_runtime?: components["schemas"]["EnrichmentRuntimeStatus"];
             hbc_cache?: {
                 [key: string]: unknown;
             };
@@ -11312,11 +11792,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -11462,6 +11939,7 @@ export interface components {
             };
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the index is actively rebuilding, materializing, or catching up. */
             backfill_active?: boolean;
             /**
@@ -11529,11 +12007,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -11609,6 +12084,7 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the sidecar is currently rebuilding */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the sidecar is actively rebuilding, replaying, or catching up. */
             backfill_active?: boolean;
             /**
@@ -11712,11 +12188,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -12363,17 +12836,17 @@ export interface components {
              */
             use_ssl?: boolean;
             /**
-             * @description AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+             * @description AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
              * @example your-access-key-id
              */
             access_key_id?: string;
             /**
-             * @description AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+             * @description AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
              * @example your-secret-access-key
              */
             secret_access_key?: string;
             /**
-             * @description Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+             * @description Optional AWS session token for temporary credentials. Supports secret-store references.
              * @example your-session-token
              */
             session_token?: string;
@@ -13240,6 +13713,8 @@ export interface components {
         GraphResultNode: {
             /** @description Document key */
             key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
             /** @description Distance from start node */
             depth?: number;
             /**
@@ -13414,6 +13889,16 @@ export interface components {
              * @enum {string}
              */
             input_type?: "search_query" | "search_document" | "query" | "document" | "classification" | "clustering";
+            /**
+             * @description Controls how dense embedding requests report per-input failures.
+             *     `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+             *     `per_item` returns successful embeddings in `data` and indexed
+             *     permanent/transient failures in `errors` without failing the
+             *     entire HTTP request.
+             * @default fail_fast
+             * @enum {string}
+             */
+            error_policy?: "fail_fast" | "per_item";
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
@@ -13427,6 +13912,33 @@ export interface components {
             /** @description Model used for embedding generation */
             model: string;
             usage: components["schemas"]["InferenceEmbeddingUsage"];
+            /** @description Indexed per-input failures. Only populated when request error_policy is per_item. */
+            errors?: components["schemas"]["InferenceEmbeddingItemError"][];
+            summary?: components["schemas"]["InferenceEmbeddingBatchSummary"];
+        };
+        /** @description Per-input embedding failure for error_policy=per_item responses */
+        InferenceEmbeddingItemError: {
+            /** @description Original input index that failed */
+            index: number;
+            /** @description Stable machine-readable failure code */
+            code: string;
+            /** @description Human-readable failure message */
+            message: string;
+            /**
+             * @description Pipeline stage that classified the failure
+             * @enum {string}
+             */
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            /** @description Whether retrying the same item may succeed */
+            retryable: boolean;
+            /** @description HTTP-style status classification for this item */
+            status: number;
+        };
+        /** @description Counts for per-item embedding responses */
+        InferenceEmbeddingBatchSummary: {
+            total: number;
+            succeeded: number;
+            failed: number;
         };
         /** @description A sparse vector with parallel index/value arrays, sorted by index ascending */
         InferenceSparseVector: {
@@ -13972,6 +14484,14 @@ export interface components {
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
              */
             cache_compaction_ratio?: number;
+            /**
+             * @description inference-native prompt prefix cache namespace key. Requests with the same key can
+             *     reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+             *     requests without a key are never cached.
+             */
+            prompt_cache_key?: string;
+            /** @description inference-native prompt prefix cache control. False bypasses prompt cache for this request. */
+            prompt_cache?: boolean;
             backend?: components["schemas"]["InferenceModelBackend"];
             /**
              * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
@@ -14031,6 +14551,44 @@ export interface components {
             choices: components["schemas"]["InferenceGenerateChoice"][];
             usage: components["schemas"]["InferenceGenerateUsage"];
         };
+        /**
+         * @description Batch execution mode. Only synchronous batches are implemented.
+         * @enum {string}
+         */
+        InferenceGenerateBatchMode: "sync";
+        InferenceGenerateBatchRequest: {
+            mode?: components["schemas"]["InferenceGenerateBatchMode"];
+            requests: components["schemas"]["InferenceGenerateBatchRequestItem"][];
+        };
+        InferenceGenerateBatchRequestItem: {
+            /** @description Caller-supplied identifier echoed in the result item. */
+            custom_id: string;
+            body: components["schemas"]["InferenceGenerateRequest"];
+        };
+        InferenceGenerateBatchError: {
+            code: string;
+            message: string;
+            /** @default false */
+            retryable?: boolean;
+        };
+        InferenceGenerateBatchResultItem: {
+            custom_id: string;
+            /** @description Zero-based request index from the submitted batch. */
+            index: number;
+            response?: components["schemas"]["InferenceGenerateResponse"];
+            error?: components["schemas"]["InferenceGenerateBatchError"];
+        };
+        InferenceGenerateBatchSummary: {
+            total: number;
+            succeeded: number;
+            failed: number;
+        };
+        InferenceGenerateBatchResponse: {
+            /** @enum {string} */
+            object: "generate.batch";
+            data: components["schemas"]["InferenceGenerateBatchResultItem"][];
+            summary: components["schemas"]["InferenceGenerateBatchSummary"];
+        };
         InferenceGenerateChoice: {
             /** @description Index of this choice in the list */
             index: number;
@@ -14053,6 +14611,8 @@ export interface components {
             completion_tokens: number;
             /** @description Total tokens used (prompt + completion) */
             total_tokens: number;
+            /** @description Prompt tokens served from inference-native prefix KV cache */
+            cached_prompt_tokens?: number;
         };
         /** @description Streaming generation chunk (SSE event data) */
         InferenceGenerateChunk: {
@@ -14153,6 +14713,42 @@ export interface components {
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
         };
+        /** @description Native generator prompt KV cache configuration. */
+        InferencePromptCacheConfig: {
+            /**
+             * @description Enable inference-native prompt KV cache reuse for generator requests.
+             * @default false
+             */
+            enabled?: boolean;
+            /**
+             * @description Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+             *     full KV blocks under prompt_cache_key with O(1) block lookup and is the
+             *     scalable production mode. `simple` keeps the linear-scan retained-prefix
+             *     cache and is only suitable for small caches or debugging.
+             * @default block_hash
+             * @enum {string}
+             */
+            mode?: "simple" | "block_hash";
+            /**
+             * @description Node-wide target for live prompt-cache entries. The runtime divides it
+             *     across participating model caches and evicts using estimated metadata
+             *     and logical host/device KV bytes. Backend allocators may retain reusable
+             *     capacity, so this is not a hard cap on process or accelerator memory.
+             * @default 512
+             */
+            max_bytes_mb?: number;
+            /**
+             * @description Minimum prompt length eligible for prompt KV caching.
+             * @default 64
+             */
+            min_tokens?: number;
+            /**
+             * @description Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+             *     hit, so only entries left unused for this duration expire.
+             * @default 300000
+             */
+            ttl_ms?: number;
+        };
         InferenceConfig: {
             /**
              * Format: uri
@@ -14189,9 +14785,9 @@ export interface components {
             /**
              * @description How long to keep models loaded in memory after last use (Ollama-compatible).
              *     Models are automatically unloaded after this duration of inactivity.
-             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-             *     Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-             *     where all models are loaded at startup and never unloaded.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+             *     Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+             *     still be evicted under resource pressure or to enforce max_loaded_models.
              * @default 5m
              * @example 5m
              */
@@ -14199,8 +14795,9 @@ export interface components {
             /**
              * @description Maximum total models loaded across all registry types (embedders, rerankers,
              *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
-             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-             * @default 0
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             *     Defaults to 10.
+             * @default 10
              * @example 3
              */
             max_loaded_models?: number;
@@ -14213,6 +14810,8 @@ export interface components {
              * @example 1
              */
             pool_size?: number;
+            /** @description Native generator prompt KV cache settings. */
+            prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
             /**
              * @description Backend priority order for model loading with optional device specifiers.
              *     Format: `backend` or `backend:device` where device defaults to `auto`.
@@ -14288,9 +14887,8 @@ export interface components {
             max_memory_mb?: number;
             /**
              * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
-             *     Models not in this map use the default strategy based on keep_alive:
-             *     - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-             *     - If keep_alive="0": eager loading (load at startup, never unload)
+             *     Models not in this map load on demand. keep_alive controls their idle
+             *     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
              *
              *     When a model has strategy "eager" in this map:
              *     - It is loaded at startup through the same startup warmup path
@@ -14307,7 +14905,7 @@ export interface components {
             };
             /**
              * @description Whether the dashboard should show model download commands.
-             *     Defaults to true for standalone/swarm mode. Set to false in managed
+             *     Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
              *     deployments (e.g., Kubernetes operator) where models are managed externally.
              * @default true
              */
@@ -14884,6 +15482,17 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Writes are temporarily limited while a dense-index rebuild catches up. */
+        DenseRepairBackpressure: {
+            headers: {
+                /** @description Suggested delay in seconds before retrying. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DenseRepairBackpressureError"];
+            };
+        };
         /** @description Unsupported request media or content encoding */
         UnsupportedMediaType: {
             headers: {
@@ -14997,14 +15606,17 @@ export interface operations {
                  */
                 types?: string;
                 /**
-                 * @description Comma-separated list of expansions. Supported value: "models" —
-                 *     live-query each inference provider's model listing API.
+                 * @description Comma-separated list of expansions. Supported values: `models` to
+                 *     live-query inference model listings and `status` to live-probe
+                 *     external connections. Live work is opt-in and single-flight per
+                 *     server.
                  */
                 include?: string;
                 /**
-                 * @description Set to "true" to bypass the short server-side cache for live
-                 *     provider model listings and probes. This does not force a node
-                 *     config or metadata reload.
+                 * @description Set to "true" to bypass the short server-side cache for requested
+                 *     live expansions. Live expansion passes are serialized to prevent
+                 *     concurrent refresh amplification. This does not force a node config
+                 *     or metadata reload.
                  */
                 refresh?: string;
             };
@@ -15033,6 +15645,66 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    invokeInferenceConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                /** @description Requires the connection capability `models.<operation>`. */
+                operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Inference provider response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid connection or operation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The connection does not declare the capability required by this operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Inference provider request failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listSecrets: {
@@ -15610,7 +16282,12 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Backup completed successfully */
+            /**
+             * @description Backup attempt completed. Inspect the response `status`: `completed`
+             *     is fully successful, while `partial` or `failed` reports per-table
+             *     failures even though the request itself was processed successfully.
+             *     Only `completed` publishes a restorable cluster manifest.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15620,13 +16297,17 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };
     restore: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job. */
+                "Idempotency-Key"?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -15636,17 +16317,98 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Restore triggered successfully */
+            /** @description Restore job durably accepted */
             202: {
+                headers: {
+                    /** @description Relative URL of the durable restore job resource. */
+                    Location?: string;
+                    /** @description Suggested polling delay in seconds. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listRestoreJobs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                /** @description Opaque cursor returned by the preceding page. */
+                cursor?: string;
+                phase?: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+                scope?: "table" | "cluster";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorized restore jobs */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ClusterRestoreResponse"];
+                    "application/json": components["schemas"]["RestoreJobList"];
                 };
             };
             400: components["responses"]["BadRequest"];
-            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getRestoreJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Restore job status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    cancelRestoreJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated restore job status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"];
+                };
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     listBackups: {
@@ -15659,6 +16421,12 @@ export interface operations {
                  * @example s3://mybucket/antfly-backups/
                  */
                 location: string;
+                /** @description Named `external_io` connection authorized for reading this backup location. */
+                connection: string;
+                /** @description Maximum backups returned in one page. */
+                limit?: number;
+                /** @description Continuation cursor returned by the preceding page. */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -17098,6 +17866,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -17501,13 +18270,17 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };
     restoreTable: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Name of the table to restore into */
                 tableName: string;
@@ -17520,20 +18293,23 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Restore process triggered successfully */
+            /** @description Durable restore job accepted */
             202: {
                 headers: {
+                    /** @description Relative URL of the durable restore job resource. */
+                    Location?: string;
+                    /** @description Suggested polling delay in seconds. */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @example triggered */
-                        restore?: string;
-                    };
+                    "application/json": components["schemas"]["RestoreJob"];
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     updateSchema: {
@@ -17902,7 +18678,7 @@ export interface operations {
                     "application/json": components["schemas"]["TableRepairJob"];
                 };
             };
-            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            /** @description Cancellation remains in progress at a running-pass boundary or during the durable named-index pause traversal. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -19733,6 +20509,57 @@ export interface operations {
                 };
             };
             /** @description Generation service unavailable (no models configured) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    generateBatchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceGenerateBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Batch generation results in request order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceGenerateBatchResponse"];
+                };
+            };
+            /** @description Invalid batch envelope */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

@@ -26,8 +26,8 @@ const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
-const platform_time = @import("platform/time.zig");
-const process_memory = @import("platform/process_memory.zig");
+const platform_time = @import("antfly_platform").time;
+const process_memory = @import("antfly_platform").process_memory;
 const resource_manager_mod = @import("storage/resource_manager.zig");
 
 /// A batch of documents to index.
@@ -100,7 +100,7 @@ const FieldPostingsBuilder = struct {
     fn init(alloc: Allocator) !FieldPostingsBuilder {
         return .{
             .active = true,
-            .builder = inverted.InvertedIndexBuilder.init(alloc, .{}),
+            .builder = inverted.InvertedIndexBuilder.init(alloc, inverted.productionIndexConfig()),
         };
     }
 
@@ -287,6 +287,13 @@ pub const BuildTextOptions = struct {
     doc_scratch_retained_bytes: usize = default_doc_scratch_retained_bytes,
     profile_timings: bool = true,
     profile_working_set: bool = true,
+    /// Omit per-document primary keys and stored source. Stable result IDs
+    /// must then be supplied by `doc_ordinal`. This is used by the embedded
+    /// kernel benchmark only; normal database/product segments keep storage.
+    store_documents: bool = true,
+    /// Retain the document key but omit the source body from the text segment.
+    /// The primary database remains authoritative for source projection.
+    store_document_source: bool = true,
 };
 
 pub const BuildTextProfile = struct {
@@ -607,6 +614,8 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
     defer doc_ordinals.deinit(alloc);
     var has_doc_ordinal = false;
+    var min_doc_key: ?[]const u8 = null;
+    var max_doc_key: ?[]const u8 = null;
 
     var typed_fields = std.StringHashMapUnmanaged(TypedFieldCollector).empty;
     defer {
@@ -641,7 +650,17 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const doc_alloc = doc_arena_state.allocator();
 
         const stored_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
-        try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
+        if (options.store_documents) {
+            try seg_writer.addStoredDocBorrowed(
+                text_doc.id,
+                if (options.store_document_source) text_doc.stored_data else "{}",
+            );
+        } else {
+            if (text_doc.doc_ordinal == null) return error.MissingTextDocOrdinal;
+            try seg_writer.addUnstoredDoc();
+            if (min_doc_key == null or std.mem.order(u8, text_doc.id, min_doc_key.?) == .lt) min_doc_key = text_doc.id;
+            if (max_doc_key == null or std.mem.order(u8, text_doc.id, max_doc_key.?) == .gt) max_doc_key = text_doc.id;
+        }
         if (profile_timings) {
             if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
         }
@@ -812,6 +831,9 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
 
     const segment_encode_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+    if (!options.store_documents) {
+        try seg_writer.addDocKeyRange(min_doc_key orelse return error.InvalidSegment, max_doc_key orelse return error.InvalidSegment);
+    }
     if (options.index_sort.len > 0) {
         if (doc_order.len > 0) {
             var bounds = try textIndexSortBoundsAlloc(alloc, doc_order[0].keys, doc_order[doc_order.len - 1].keys);
@@ -2569,7 +2591,7 @@ test "introducer builds and indexes a batch" {
     try std.testing.expectEqual(@as(usize, 2), results.hits.len);
 
     // Verify stored docs accessible
-    const stored = snap.segments[0].reader.storedDoc(0).?;
+    const stored = (try snap.segments[0].reader.storedDoc(0)).?;
     try std.testing.expectEqualStrings("doc1", stored.id);
 }
 
@@ -2791,7 +2813,7 @@ test "buildSegmentFromText omits empty inverted sections" {
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    try std.testing.expect(reader.getSection("title", .inverted_text) == null);
+    try std.testing.expect((try reader.getSection("title", .inverted_text)) == null);
     try std.testing.expect(try reader.invertedIndex("title") == null);
     try std.testing.expect((try reader.invertedIndex("body")) != null);
 }
@@ -2811,24 +2833,24 @@ test "buildSegmentFromText emits typed doc values from stored JSON" {
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
     try std.testing.expectEqual(@as(?f64, 10.5), try price_reader.getF64(0));
 
-    const ts_section = reader.getSection("published_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("published_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expect((try ts_reader.getU64(0)) != null);
 
-    const geo_section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const geo_section = (try reader.getSection("location", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var geo_reader = try typed_dv.TypedDocValuesReader.init(alloc, geo_section);
     try std.testing.expectEqual(typed_dv.ValueType.geo_point, geo_reader.value_type);
     const point = (try geo_reader.getGeoPoint(0)).?;
     try std.testing.expectApproxEqAbs(@as(f64, 37.7749), point.lat, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f64, -122.4194), point.lon, 0.00001);
 
-    const bool_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const bool_section = (try reader.getSection("active", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var bool_reader = try typed_dv.TypedDocValuesReader.init(alloc, bool_section);
     try std.testing.expectEqual(typed_dv.ValueType.bool_val, bool_reader.value_type);
     try std.testing.expectEqual(@as(?bool, true), try bool_reader.getBool(0));
@@ -2860,17 +2882,17 @@ test "buildSegmentFromText indexes caller-supplied relational typed columns and 
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
     try std.testing.expectEqual(@as(?f64, 10.5), try price_reader.getF64(0));
 
-    const active_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const active_section = (try reader.getSection("active", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var active_reader = try typed_dv.TypedDocValuesReader.init(alloc, active_section);
     try std.testing.expectEqual(typed_dv.ValueType.bool_val, active_reader.value_type);
     try std.testing.expectEqual(@as(?bool, true), try active_reader.getBool(0));
 
-    const ts_section = reader.getSection("ts", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("ts", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expectEqual(@as(?u64, 1000), try ts_reader.getU64(0));
@@ -2878,8 +2900,8 @@ test "buildSegmentFromText indexes caller-supplied relational typed columns and 
     // Authoritative + json-excluded: detection is bypassed, so fields that are
     // not supplied as typed columns get no typed doc values even though they
     // would otherwise be detected (object -> geo attempt, number -> f64).
-    try std.testing.expect(reader.getSection("meta", .typed_doc_values) == null);
-    try std.testing.expect(reader.getSection("score", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("meta", .typed_doc_values)) == null);
+    try std.testing.expect((try reader.getSection("score", .typed_doc_values)) == null);
 }
 
 test "buildSegmentFromText omits multi-valued typed doc values" {
@@ -2904,13 +2926,13 @@ test "buildSegmentFromText omits multi-valued typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
     try std.testing.expectEqual(@as(?f64, 10.0), try price_reader.getF64(0));
     try std.testing.expectEqual(@as(?f64, 20.0), try price_reader.getF64(1));
 
-    try std.testing.expect(reader.getSection("scores", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("scores", .typed_doc_values)) == null);
 }
 
 test "buildSegmentFromText rejects multi-valued projected index sort field" {
@@ -2985,7 +3007,7 @@ test "buildSegmentFromText uses configured custom datetime parsers for typed doc
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const ts_section = reader.getSection("published_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("published_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expect((try ts_reader.getU64(0)) != null);

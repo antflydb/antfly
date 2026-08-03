@@ -376,14 +376,21 @@ pub const Raft = struct {
                 },
             }
         }
+        const self_idx = try self.localAppendPeerIndex();
         if (!self.increaseUncommittedSizeEntries(msg.entries)) return;
         for (msg.entries) |entry| {
-            const appended = try self.appendLocalEntryOfTypeUnchecked(entry.entry_type, entry.data);
+            const appended = try self.appendLocalEntryOfTypeUnchecked(self_idx, entry.entry_type, entry.data);
             switch (entry.entry_type) {
-                .normal => {},
-                .conf_change, .conf_change_v2 => self.pending_conf_index = appended,
+                .normal => self.trace(.replicate, null),
+                .conf_change => {
+                    self.pending_conf_index = appended;
+                    self.traceEncodedConfChange(entry.data, false);
+                },
+                .conf_change_v2 => {
+                    self.pending_conf_index = appended;
+                    self.traceEncodedConfChange(entry.data, true);
+                },
             }
-            self.trace(.replicate, null);
         }
         _ = self.maybeCommit();
         try self.bcastAppend();
@@ -492,7 +499,11 @@ pub const Raft = struct {
         defer self.alloc.free(encoded);
 
         self.pending_conf_index = try self.appendLocalEntryOfType(.conf_change, encoded);
-        self.trace(.replicate, null);
+        const changes = [_]types.ConfChangeSingle{.{
+            .change_type = conf_change.change_type,
+            .node_id = conf_change.node_id,
+        }};
+        self.traceConfChange(.change_conf, changes[0..], .auto);
         _ = self.maybeCommit();
         try self.bcastAppend();
     }
@@ -520,7 +531,7 @@ pub const Raft = struct {
         defer self.alloc.free(encoded);
 
         self.pending_conf_index = try self.appendLocalEntryOfType(.conf_change_v2, encoded);
-        self.trace(.replicate, null);
+        self.traceConfChange(.change_conf, conf_change.changes, conf_change.transition);
         _ = self.maybeCommit();
         try self.bcastAppend();
     }
@@ -620,6 +631,11 @@ pub const Raft = struct {
         })) orelse return self.conf_state;
         try self.applyRuntimeConfState(next);
         self.maybeStepDownOnRemoval();
+        const changes = [_]types.ConfChangeSingle{.{
+            .change_type = conf_change.change_type,
+            .node_id = conf_change.node_id,
+        }};
+        self.traceConfChange(.apply_conf_change, changes[0..], .auto);
         return self.conf_state;
     }
 
@@ -628,10 +644,11 @@ pub const Raft = struct {
             conf_change.transition == .joint_implicit and self.soft_state.role == .leader;
         const next = (try replayConfChangeV2(self.alloc, self.conf_state, conf_change)) orelse return self.conf_state;
         try self.applyRuntimeConfState(next);
-        if (should_append_auto_leave) {
+        self.maybeStepDownOnRemoval();
+        if (should_append_auto_leave and self.soft_state.role == .leader) {
             try self.appendAutoLeaveJointEntry();
         }
-        self.maybeStepDownOnRemoval();
+        self.traceConfChange(.apply_conf_change, conf_change.changes, conf_change.transition);
         return self.conf_state;
     }
 
@@ -1264,11 +1281,12 @@ pub const Raft = struct {
     }
 
     fn appendLocalEntryOfType(self: *Raft, entry_type: types.EntryType, data: []const u8) !types.Index {
+        const self_idx = try self.localAppendPeerIndex();
         if (!self.increaseUncommittedSizeEntry(entry_type, data)) return error.ProposalDropped;
-        return try self.appendLocalEntryOfTypeUnchecked(entry_type, data);
+        return try self.appendLocalEntryOfTypeUnchecked(self_idx, entry_type, data);
     }
 
-    fn appendLocalEntryOfTypeUnchecked(self: *Raft, entry_type: types.EntryType, data: []const u8) !types.Index {
+    fn appendLocalEntryOfTypeUnchecked(self: *Raft, self_idx: usize, entry_type: types.EntryType, data: []const u8) !types.Index {
         const next_index = self.log.lastIndex() + 1;
         const entry = types.Entry{
             .term = self.hard_state.current_term,
@@ -1282,10 +1300,14 @@ pub const Raft = struct {
         }
 
         _ = try self.log.appendEntries(&.{entry});
-        const self_idx = peerIndex(self.peers, self.cfg.id).?;
         self.progress[self_idx].match_index = self.log.lastIndex();
         self.progress[self_idx].next_index = self.log.lastIndex() + 1;
         return self.log.lastIndex();
+    }
+
+    fn localAppendPeerIndex(self: *const Raft) !usize {
+        if (self.soft_state.role != .leader or !self.isVotingMember(self.cfg.id)) return error.NotLeader;
+        return peerIndex(self.peers, self.cfg.id) orelse error.NotLeader;
     }
 
     fn increaseUncommittedSizeEntry(self: *Raft, entry_type: types.EntryType, data: []const u8) bool {
@@ -1327,6 +1349,43 @@ pub const Raft = struct {
     }
 
     fn trace(self: *const Raft, event_type: logger_mod.TraceEventType, msg: ?*const message.Message) void {
+        self.traceEvent(event_type, msg, &.{}, .auto);
+    }
+
+    fn traceConfChange(
+        self: *const Raft,
+        event_type: logger_mod.TraceEventType,
+        changes: []const types.ConfChangeSingle,
+        transition: types.ConfChangeTransition,
+    ) void {
+        self.traceEvent(event_type, null, changes, transition);
+    }
+
+    fn traceEncodedConfChange(self: *const Raft, data: []const u8, comptime v2: bool) void {
+        // Trace instrumentation must never change proposal behavior, especially
+        // after the entry has already been appended to the local log.
+        if (self.trace_logger == null) return;
+        if (v2) {
+            var conf_change = types.ConfChangeV2.decode(data, self.alloc) catch return;
+            defer conf_change.deinit(self.alloc);
+            self.traceConfChange(.change_conf, conf_change.changes, conf_change.transition);
+        } else {
+            const conf_change = types.ConfChange.decode(data) catch return;
+            const changes = [_]types.ConfChangeSingle{.{
+                .change_type = conf_change.change_type,
+                .node_id = conf_change.node_id,
+            }};
+            self.traceConfChange(.change_conf, changes[0..], .auto);
+        }
+    }
+
+    fn traceEvent(
+        self: *const Raft,
+        event_type: logger_mod.TraceEventType,
+        msg: ?*const message.Message,
+        conf_changes: []const types.ConfChangeSingle,
+        conf_transition: types.ConfChangeTransition,
+    ) void {
         const trace_logger = self.trace_logger orelse return;
         const event = logger_mod.TraceEvent{
             .event_type = event_type,
@@ -1344,6 +1403,8 @@ pub const Raft = struct {
             .learners_next = self.conf_state.learners_next,
             .auto_leave = self.conf_state.auto_leave,
             .message = msg,
+            .conf_changes = conf_changes,
+            .conf_transition = conf_transition,
         };
         trace_logger.traceEvent(&event);
     }
@@ -1423,6 +1484,11 @@ pub const Raft = struct {
     }
 
     fn applyRuntimeConfState(self: *Raft, next: types.ConfState) !void {
+        // Read-index acknowledgements are indexed by the current peer array.
+        // Configuration changes are rare; fail those transient reads so callers
+        // retry against a single, stable membership layout.
+        self.clearPendingReads();
+
         var added_targets = std.ArrayListUnmanaged(types.NodeId).empty;
         defer added_targets.deinit(self.alloc);
 
@@ -1535,6 +1601,7 @@ pub const Raft = struct {
         const old_peers = self.peers;
         const old_votes = self.votes;
         const old_progress = self.progress;
+        const old_inflights = self.inflights;
 
         const new_len = old_peers.len + 1;
         const new_peers = try self.alloc.alloc(types.NodeId, new_len);
@@ -1557,12 +1624,19 @@ pub const Raft = struct {
             .probe_sent = false,
         };
 
+        const new_inflights = try self.alloc.alloc(std.ArrayListUnmanaged(Inflight), new_len);
+        errdefer self.alloc.free(new_inflights);
+        @memcpy(new_inflights[0..old_inflights.len], old_inflights);
+        new_inflights[old_peers.len] = .empty;
+
         self.peers = new_peers;
         self.votes = new_votes;
         self.progress = new_progress;
+        self.inflights = new_inflights;
         self.alloc.free(old_peers);
         self.alloc.free(old_votes);
         self.alloc.free(old_progress);
+        self.alloc.free(old_inflights);
     }
 
     fn removeReplicationPeer(self: *Raft, node_id: types.NodeId) !void {
@@ -1572,6 +1646,7 @@ pub const Raft = struct {
         const old_peers = self.peers;
         const old_votes = self.votes;
         const old_progress = self.progress;
+        const old_inflights = self.inflights;
 
         const new_len = old_peers.len - 1;
         const new_peers = try self.alloc.alloc(types.NodeId, new_len);
@@ -1580,6 +1655,8 @@ pub const Raft = struct {
         errdefer self.alloc.free(new_votes);
         const new_progress = try self.alloc.alloc(types.Progress, new_len);
         errdefer self.alloc.free(new_progress);
+        const new_inflights = try self.alloc.alloc(std.ArrayListUnmanaged(Inflight), new_len);
+        errdefer self.alloc.free(new_inflights);
 
         var next: usize = 0;
         for (old_peers, 0..) |peer, i| {
@@ -1587,15 +1664,20 @@ pub const Raft = struct {
             new_peers[next] = peer;
             new_votes[next] = old_votes[i];
             new_progress[next] = old_progress[i];
+            new_inflights[next] = old_inflights[i];
             next += 1;
         }
+
+        old_inflights[remove_idx].deinit(self.alloc);
 
         self.peers = new_peers;
         self.votes = new_votes;
         self.progress = new_progress;
+        self.inflights = new_inflights;
         self.alloc.free(old_peers);
         self.alloc.free(old_votes);
         self.alloc.free(old_progress);
+        self.alloc.free(old_inflights);
     }
 
     fn isPromotable(self: *const Raft) bool {
@@ -1714,6 +1796,7 @@ pub const Raft = struct {
                 std.mem.swap(types.NodeId, &self.peers[i], &self.peers[j]);
                 std.mem.swap(VoteState, &self.votes[i], &self.votes[j]);
                 std.mem.swap(types.Progress, &self.progress[i], &self.progress[j]);
+                std.mem.swap(std.ArrayListUnmanaged(Inflight), &self.inflights[i], &self.inflights[j]);
             }
         }
     }

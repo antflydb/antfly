@@ -13,12 +13,14 @@
 // limitations.
 
 const std = @import("std");
+const introducer_mod = @import("../../introducer.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const db_query_search = @import("../../storage/db/query/search_exec.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const json_helpers = @import("../json_helpers.zig");
 const regex_mod = @import("../../search/regex.zig");
 const search_analysis = @import("../../search/analysis.zig");
+const ip_range = @import("ip_range.zig");
 const table_read_remote_wire = @import("remote_wire.zig");
 
 const OwnedTextStatsFieldRequest = table_read_remote_wire.OwnedTextStatsFieldRequest;
@@ -1024,6 +1026,7 @@ pub fn collectSignificantTermsFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]OwnedTextStatsFieldRequest {
     var grouped = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)){};
     defer {
@@ -1037,7 +1040,7 @@ pub fn collectSignificantTermsFieldRequests(
         grouped.deinit(alloc);
     }
 
-    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits);
+    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits, text_analysis);
     if (grouped.count() == 0) return &.{};
 
     const out = try alloc.alloc(OwnedTextStatsFieldRequest, grouped.count());
@@ -1069,13 +1072,14 @@ pub fn collectSignificantTermsBackgroundFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]OwnedBackgroundTextStatsFieldRequest {
     var out = std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest).empty;
     errdefer {
         for (out.items) |*item| item.deinit(alloc);
         out.deinit(alloc);
     }
-    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits);
+    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits, text_analysis);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -1084,16 +1088,19 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
     out: *std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest),
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query != null) {
+            const candidate_limit = try db_mod.aggregations.significantTermsCandidateLimit(@intCast(if (request.size > 0) request.size else 10));
             var seen_terms = std.StringHashMapUnmanaged(void){};
             defer {
                 var term_it = seen_terms.keyIterator();
                 while (term_it.next()) |term| alloc.free(term.*);
                 seen_terms.deinit(alloc);
             }
-            try collectSignificantTermsFromHits(alloc, hits, request.field, &seen_terms);
+            const analyzer = try tableAggregationAnalyzerForField(text_analysis, request.field);
+            try collectSignificantTermsFromHits(alloc, hits, request.field, analyzer, candidate_limit, &seen_terms);
             if (seen_terms.count() > 0) {
                 const terms = try alloc.alloc([]const u8, seen_terms.count());
                 var term_index: usize = 0;
@@ -1110,7 +1117,7 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
                 });
             }
         }
-        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits);
+        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits, text_analysis);
     }
 }
 
@@ -1136,17 +1143,20 @@ fn collectSignificantTermsFieldRequestsRecursive(
     grouped: *std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query == null) {
+            const candidate_limit = try db_mod.aggregations.significantTermsCandidateLimit(@intCast(if (request.size > 0) request.size else 10));
             const gop = try grouped.getOrPut(alloc, request.field);
             if (!gop.found_existing) {
                 gop.key_ptr.* = try alloc.dupe(u8, request.field);
                 gop.value_ptr.* = .{};
             }
-            try collectSignificantTermsFromHits(alloc, hits, request.field, gop.value_ptr);
+            const analyzer = try tableAggregationAnalyzerForField(text_analysis, request.field);
+            try collectSignificantTermsFromHits(alloc, hits, request.field, analyzer, candidate_limit, gop.value_ptr);
         }
-        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits);
+        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits, text_analysis);
     }
 }
 
@@ -1154,33 +1164,41 @@ fn collectSignificantTermsFromHits(
     alloc: std.mem.Allocator,
     hits: []const db_mod.types.SearchHit,
     field: []const u8,
+    analyzer: *const search_analysis.Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
-    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, seen_terms);
+    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, analyzer, candidate_limit, seen_terms);
 }
 
 fn collectSignificantTermsFromStoredAlloc(
     alloc: std.mem.Allocator,
     stored: []const u8,
     field: []const u8,
+    analyzer: *const search_analysis.Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
     var parsed = (try json_helpers.parseJsonPathValueAlloc(alloc, stored, field)) orelse return;
     defer parsed.deinit();
-    try collectSignificantTermsFromValue(alloc, parsed.value, seen_terms);
+    try collectSignificantTermsFromValue(alloc, parsed.value, analyzer, candidate_limit, seen_terms);
 }
 
 fn collectSignificantTermsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
+    analyzer: *const search_analysis.Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
     switch (value) {
-        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, seen_terms),
+        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, analyzer, candidate_limit, seen_terms),
         .string => {
-            const tokens = try search_analysis.default_analyzer.analyze(alloc, value.string);
+            const tokens = try analyzer.analyze(alloc, value.string);
             defer search_analysis.Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
+                if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
+                    return error.QueryCandidateBudgetExceeded;
                 const entry = try seen_terms.getOrPut(alloc, tok.term);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try alloc.dupe(u8, tok.term);
@@ -1188,6 +1206,23 @@ fn collectSignificantTermsFromValue(
         },
         else => {},
     }
+}
+
+fn tableAggregationAnalyzerForField(
+    cfg: *const introducer_mod.TextAnalysisConfig,
+    field: []const u8,
+) !*const search_analysis.Analyzer {
+    var analyzer_name: ?[]const u8 = null;
+    for (cfg.field_analyzers) |item| {
+        if (!std.mem.eql(u8, item.field_name, field)) continue;
+        if (analyzer_name) |existing| {
+            if (!std.mem.eql(u8, existing, item.analyzer_name)) return error.InvalidTableIndexMetadata;
+        } else {
+            analyzer_name = item.analyzer_name;
+        }
+    }
+    return introducer_mod.resolveAnalyzerName(analyzer_name orelse "standard", cfg.*) orelse
+        error.InvalidTableIndexMetadata;
 }
 
 pub fn extractJsonValueAtPath(value: std.json.Value, path: []const u8) ?std.json.Value {
@@ -2504,7 +2539,7 @@ fn algebraicDateBoundTextAlloc(alloc: std.mem.Allocator, value: ?std.json.Value)
 }
 
 fn algebraicValidIpRange(text: []const u8) bool {
-    return algebraicParseIpCidr(text) != null or algebraicParseIPv4(text) != null;
+    return ip_range.isValid(text);
 }
 
 fn algebraicValidLatitude(lat: f64) bool {
@@ -2535,51 +2570,6 @@ fn algebraicGeoShapeRelationSupported(relation: db_mod.types.GeoShapeRelation) b
         .intersects, .within => true,
         .contains => false,
     };
-}
-
-const AlgebraicIpCidr = struct {
-    network: [4]u8,
-    prefix_len: u8,
-};
-
-fn algebraicParseIpCidr(text: []const u8) ?AlgebraicIpCidr {
-    const slash_pos = std.mem.indexOfScalar(u8, text, '/') orelse return null;
-    const ip = algebraicParseIPv4(text[0..slash_pos]) orelse return null;
-    const prefix_len = std.fmt.parseInt(u8, text[slash_pos + 1 ..], 10) catch return null;
-    if (prefix_len > 32) return null;
-    const mask = algebraicIpMask(prefix_len);
-    return .{
-        .network = .{ ip[0] & mask[0], ip[1] & mask[1], ip[2] & mask[2], ip[3] & mask[3] },
-        .prefix_len = prefix_len,
-    };
-}
-
-fn algebraicParseIPv4(text: []const u8) ?[4]u8 {
-    var parts = std.mem.splitScalar(u8, text, '.');
-    var out: [4]u8 = undefined;
-    var i: usize = 0;
-    while (parts.next()) |part| {
-        if (i >= 4 or part.len == 0) return null;
-        out[i] = std.fmt.parseInt(u8, part, 10) catch return null;
-        i += 1;
-    }
-    if (i != 4) return null;
-    return out;
-}
-
-fn algebraicIpMask(prefix_len: u8) [4]u8 {
-    var mask = [_]u8{ 0, 0, 0, 0 };
-    var remaining = prefix_len;
-    for (&mask) |*byte| {
-        if (remaining >= 8) {
-            byte.* = 0xff;
-            remaining -= 8;
-        } else if (remaining > 0) {
-            byte.* = @as(u8, 0xff) << @intCast(8 - remaining);
-            remaining = 0;
-        }
-    }
-    return mask;
 }
 
 fn algebraicParseDateTimeOptionalToNs(text: []const u8) !?u64 {
@@ -4859,7 +4849,8 @@ test "collect significant terms field requests gathers unique field terms from h
         },
     };
 
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits);
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -4880,6 +4871,50 @@ test "collect significant terms field requests gathers unique field terms from h
     try std.testing.expectEqual(@as(usize, 2), nested.terms.len);
     try std.testing.expect(std.mem.eql(u8, nested.terms[0], "beta") or std.mem.eql(u8, nested.terms[1], "beta"));
     try std.testing.expect(std.mem.eql(u8, nested.terms[0], "gamma") or std.mem.eql(u8, nested.terms[1], "gamma"));
+}
+
+test "distributed significant terms candidates use configured analyzers and bounded memory" {
+    const alloc = std.testing.allocator;
+    var text_analysis = try introducer_mod.parseTextAnalysisConfig(
+        alloc,
+        "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}",
+    );
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    defer {
+        hits[0].deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"body\":\"New York\"}"),
+    };
+    const requests = [_]db_mod.aggregations.SearchAggregationRequest{.{
+        .name = "sig_body",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 1,
+    }};
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
+    defer {
+        for (field_requests) |*item| item.deinit(alloc);
+        if (field_requests.len != 0) alloc.free(field_requests);
+    }
+    try std.testing.expectEqual(@as(usize, 1), field_requests.len);
+    try std.testing.expectEqual(@as(usize, 1), field_requests[0].terms.len);
+    try std.testing.expectEqualStrings("New York", field_requests[0].terms[0]);
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |term| alloc.free(term.*);
+        seen.deinit(alloc);
+    }
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &search_analysis.default_analyzer, 1, &seen),
+    );
 }
 
 test "algebraic distributed planner selects derived join tensor program for metric" {

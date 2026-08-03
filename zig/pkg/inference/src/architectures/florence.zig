@@ -79,10 +79,11 @@ pub const DecoderSelfCache = struct {
         cb: *const ComputeBackend,
         allocator: std.mem.Allocator,
         layers: usize,
+        batch: usize,
         capacity: usize,
         d_model: usize,
     ) !?DecoderSelfCache {
-        if (capacity == 0) return null;
+        if (batch == 0 or capacity == 0) return null;
         const keys = try allocator.alloc(?CT, layers);
         errdefer allocator.free(keys);
         const values = try allocator.alloc(?CT, layers);
@@ -98,7 +99,9 @@ pub const DecoderSelfCache = struct {
         };
         errdefer cache.deinit(cb, allocator);
 
-        const shape = [_]i32{ @intCast(capacity), @intCast(d_model) };
+        const rows = std.math.mul(usize, batch, capacity) catch return error.InvalidInputShape;
+        if (rows > @as(usize, @intCast(std.math.maxInt(i32))) or d_model > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidInputShape;
+        const shape = [_]i32{ @intCast(rows), @intCast(d_model) };
         for (0..layers) |layer| {
             cache.keys[layer] = (try cb.allocUninitF32Shape(&shape)) orelse {
                 cache.deinit(cb, allocator);
@@ -181,12 +184,14 @@ pub fn encoderForwardTensor(
         if (profile) logFlorenceProfile("vision_total", vision_start);
         if (debug_cuda_session) std.log.info("florence: device vision encoder done seq={d}", .{image_tensor.seq_len});
         defer cb.free(image_tensor.features);
+        if (debugStatsEnabled()) logDebugStatsTensor(cb, allocator, "vision_features(device)", image_tensor.features);
 
         const total_seq = image_tensor.seq_len + prompt_seq_len;
         const embeddings_start = nowNs();
         const hidden = try applyEncoderImagePromptEmbeddingsTensor(cb, allocator, image_tensor, config, batch, prompt_input_ids, prompt_seq_len);
         if (profile) logFlorenceProfile("encoder_embeddings", embeddings_start);
         if (debug_cuda_session) std.log.info("florence: encoder embeddings done total_seq={d}", .{total_seq});
+        if (debugStatsEnabled()) logDebugStatsTensor(cb, allocator, "post_embeddings(device)", hidden);
 
         return runTextEncoderLayersTensor(cb, allocator, config, hidden, batch, total_seq);
     }
@@ -195,6 +200,7 @@ pub fn encoderForwardTensor(
     if (profile) logFlorenceProfile("vision_total", vision_start);
     if (debug_cuda_session) std.log.info("florence: vision encoder done seq={d}", .{image.seq_len});
     defer allocator.free(image.features);
+    if (debugStatsEnabled()) logDebugStatsF32("vision_features(host)", image.features);
 
     const d_model: usize = config.d_model;
     const total_seq = image.seq_len + prompt_seq_len;
@@ -226,6 +232,7 @@ pub fn encoderForwardTensor(
     const hidden = try applyEncoderEmbeddings(cb, allocator, merged, config, batch, total_seq);
     if (profile) logFlorenceProfile("encoder_embeddings", embeddings_start);
     if (debug_cuda_session) std.log.info("florence: encoder embeddings done total_seq={d}", .{total_seq});
+    if (debugStatsEnabled()) logDebugStatsTensor(cb, allocator, "post_embeddings(host)", hidden);
     allocator.free(merged);
 
     return runTextEncoderLayersTensor(cb, allocator, config, hidden, batch, total_seq);
@@ -258,6 +265,11 @@ fn runTextEncoderLayersTensor(
         if (profile) logFlorenceProfileStep("text_encoder_layer", layer, layer_start);
         cb.free(hidden);
         hidden = next;
+        if (debugStatsEnabled()) {
+            var label_buf: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "text_encoder_layer_{d}", .{layer}) catch "text_encoder_layer";
+            logDebugStatsTensor(cb, allocator, label, hidden);
+        }
         if (debug_cuda_session) std.log.info("florence: text encoder layer done {d}", .{layer});
     }
 
@@ -424,15 +436,17 @@ pub fn buildDecoderIncrementalCache(
 ) !DecoderIncrementalCache {
     var cross = try buildDecoderCrossCache(cb, allocator, config, encoder_hidden, batch, enc_seq);
     errdefer cross.deinit(cb, allocator);
-    var self_cache = if (try DecoderSelfCache.tryInitPreallocated(cb, allocator, config.decoder_layers, max_decode_len, config.d_model)) |preallocated|
+    var self_cache = if (try DecoderSelfCache.tryInitPreallocated(cb, allocator, config.decoder_layers, batch, max_decode_len, config.d_model)) |preallocated|
         preallocated
     else
         try DecoderSelfCache.init(allocator, config.decoder_layers);
     errdefer self_cache.deinit(cb, allocator);
-    const encoder_mask = try allocator.alloc(i64, batch * enc_seq);
+    const encoder_mask_len = std.math.mul(usize, batch, enc_seq) catch return error.InvalidInputShape;
+    const self_mask_len = std.math.mul(usize, batch, max_decode_len) catch return error.InvalidInputShape;
+    const encoder_mask = try allocator.alloc(i64, encoder_mask_len);
     errdefer allocator.free(encoder_mask);
     @memset(encoder_mask, 1);
-    const self_mask = try allocator.alloc(i64, max_decode_len);
+    const self_mask = try allocator.alloc(i64, self_mask_len);
     @memset(self_mask, 1);
     return .{ .cross = cross, .self = self_cache, .encoder_mask = encoder_mask, .self_mask = self_mask, .batch = batch, .enc_seq = enc_seq };
 }
@@ -446,7 +460,7 @@ pub fn decoderForwardIncrementalStepTensor(
 ) !CT {
     const hidden = try decoderForwardIncrementalStepFinalHiddenTensor(cb, allocator, config, token_id, cache);
     errdefer cb.free(hidden);
-    return try decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, config, hidden);
+    return try decoderLmHeadLogitsRowsFromFinalHiddenTensor(cb, allocator, config, hidden, 1);
 }
 
 pub fn decoderForwardIncrementalStepFinalHiddenTensor(
@@ -456,17 +470,30 @@ pub fn decoderForwardIncrementalStepFinalHiddenTensor(
     token_id: i64,
     cache: *DecoderIncrementalCache,
 ) !CT {
+    const ids = [_]i64{token_id};
+    return decoderForwardIncrementalBatchStepFinalHiddenTensor(cb, allocator, config, &ids, cache);
+}
+
+pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_ids: []const i64,
+    cache: *DecoderIncrementalCache,
+) !CT {
     if (cache.cross.keys.len != config.decoder_layers or cache.cross.values.len != config.decoder_layers) return error.InvalidInputShape;
     if (cache.self.keys.len != config.decoder_layers or cache.self.values.len != config.decoder_layers) return error.InvalidInputShape;
 
     const batch = cache.batch;
-    if (batch != 1) return error.UnsupportedOperation;
+    if (token_ids.len != batch) return error.InvalidInputShape;
     const old_len = cache.self.len;
     const new_len = old_len + 1;
     if (cache.self.preallocated and new_len > cache.self.capacity) return error.InvalidInputShape;
-    if (new_len > cache.self_mask.len) return error.InvalidInputShape;
-    const ids = [_]i64{token_id};
-    var hidden = try applyDecoderEmbeddingsAt(cb, allocator, config, &ids, batch, 1, old_len);
+    const active_mask_len = std.math.mul(usize, batch, new_len) catch return error.InvalidInputShape;
+    if (active_mask_len > cache.self_mask.len) return error.InvalidInputShape;
+    var hidden = try applyDecoderEmbeddingsAt(cb, allocator, config, token_ids, batch, 1, old_len);
+    var hidden_live = true;
+    errdefer if (hidden_live) cb.free(hidden);
 
     var buf: [256]u8 = undefined;
     for (0..config.decoder_layers) |layer| {
@@ -475,7 +502,7 @@ pub fn decoderForwardIncrementalStepFinalHiddenTensor(
             allocator,
             config,
             hidden,
-            cache.self_mask[0..new_len],
+            cache.self_mask[0..active_mask_len],
             batch,
             old_len,
             new_len,
@@ -500,6 +527,7 @@ pub fn decoderForwardIncrementalStepFinalHiddenTensor(
         hidden = normed;
     }
 
+    hidden_live = false;
     return hidden;
 }
 
@@ -509,16 +537,25 @@ pub fn decoderLmHeadLogitsFromFinalHiddenTensor(
     config: Config,
     hidden: CT,
 ) !CT {
+    return decoderLmHeadLogitsRowsFromFinalHiddenTensor(cb, allocator, config, hidden, 1);
+}
+
+pub fn decoderLmHeadLogitsRowsFromFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    rows: usize,
+) !CT {
     const lm_w = try lmHeadWeight(cb);
-    var logits = try cb.linearNoBias(hidden, lm_w, 1, config.d_model, config.vocab_size);
-    cb.free(hidden);
+    var logits = try cb.linearNoBias(hidden, lm_w, rows, config.d_model, config.vocab_size);
     errdefer cb.free(logits);
 
     if (try tryOptionalWeight(cb, "language_model.final_logits_bias")) |logits_bias| {
         const bias = try logitsBiasSlice(cb, allocator, logits_bias, config.vocab_size);
         defer if (bias.owned) cb.free(bias.tensor);
 
-        if (try cb.addBiasRowsConsume(logits, bias.tensor, 1, config.vocab_size)) |biased| {
+        if (try cb.addBiasRowsConsume(logits, bias.tensor, rows, config.vocab_size)) |biased| {
             logits = biased;
         } else {
             const biased = try cb.add(logits, bias.tensor);
@@ -526,6 +563,7 @@ pub fn decoderLmHeadLogitsFromFinalHiddenTensor(
             logits = biased;
         }
     }
+    cb.free(hidden);
     return logits;
 }
 
@@ -2066,6 +2104,9 @@ fn encoderBlock(
     const ffn_dim = config.encoder_ffn_dim;
     const total = batch * seq_len;
 
+    const profile = readProfileEnabled();
+
+    const qkv_start = nowNs();
     const q_weights = try encoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
     const k_weights = try encoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
     const v_weights = try encoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
@@ -2073,18 +2114,26 @@ fn encoderBlock(
     defer cb.free(qkv.first);
     defer cb.free(qkv.second);
     defer cb.free(qkv.third);
+    if (profile) logFlorenceProfileStep("enc_qkv_linear", layer, qkv_start);
 
+    const attn_start = nowNs();
     const attn = try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, num_heads, head_dim);
     defer cb.free(attn);
+    if (profile) logFlorenceProfileStep("enc_sdpa", layer, attn_start);
+    const proj_start = nowNs();
     const proj = try encoderLinearProj(cb, attn, layer, "self_attn.out_proj", total, d_model, d_model, buf);
     defer cb.free(proj);
     const attn_res = try cb.add(hidden, proj);
+    if (profile) logFlorenceProfileStep("enc_out_proj_add", layer, proj_start);
 
+    const ln0_start = nowNs();
     const ln0_w = try encoderLayerWeight(cb, layer, "self_attn_layer_norm.weight", buf);
     const ln0_b = try encoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
     const attn_normed = try cb.layerNorm(attn_res, ln0_w, ln0_b, d_model, 1e-5);
     cb.free(attn_res);
+    if (profile) logFlorenceProfileStep("enc_ln0", layer, ln0_start);
 
+    const fc1_start = nowNs();
     const fc1_weights = try encoderLinearWeights(cb, layer, "fc1", buf);
     const activated = if (try cb.linearGelu(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim)) |fused|
         fused
@@ -2094,7 +2143,9 @@ fn encoderBlock(
         break :blk try cb.gelu(fc1);
     };
     defer cb.free(activated);
+    if (profile) logFlorenceProfileStep("enc_fc1_gelu", layer, fc1_start);
 
+    const fc2_start = nowNs();
     const fc2_weights = try encoderLinearWeights(cb, layer, "fc2", buf);
     const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, attn_normed, total, ffn_dim, d_model)) |fused|
         fused
@@ -2104,6 +2155,7 @@ fn encoderBlock(
         break :blk try cb.add(attn_normed, fc2);
     };
     cb.free(attn_normed);
+    if (profile) logFlorenceProfileStep("enc_fc2_add", layer, fc2_start);
 
     const ln1_w = try encoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
     const ln1_b = try encoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
@@ -2308,8 +2360,8 @@ fn decoderBlockIncrementalCached(
     cache: *DecoderIncrementalCache,
     buf: *[256]u8,
 ) !CT {
-    if (batch != 1) return error.UnsupportedOperation;
-    if (new_len != old_len + 1 or self_mask.len != new_len) return error.InvalidInputShape;
+    const expected_mask_len = std.math.mul(usize, batch, new_len) catch return error.InvalidInputShape;
+    if (new_len != old_len + 1 or self_mask.len != expected_mask_len) return error.InvalidInputShape;
 
     const d_model = config.d_model;
     const num_heads = config.decoder_attention_heads;
@@ -2319,17 +2371,17 @@ fn decoderBlockIncrementalCached(
     const q_self_weights = try decoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
     const k_self_weights = try decoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
     const v_self_weights = try decoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
-    const qkv_self = try cb.linearTriple(hidden, q_self_weights.weight, q_self_weights.bias, k_self_weights.weight, k_self_weights.bias, v_self_weights.weight, v_self_weights.bias, 1, d_model, d_model);
+    const qkv_self = try cb.linearTriple(hidden, q_self_weights.weight, q_self_weights.bias, k_self_weights.weight, k_self_weights.bias, v_self_weights.weight, v_self_weights.bias, batch, d_model, d_model);
     defer cb.free(qkv_self.first);
 
-    const cached_k_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.keys[layer], qkv_self.second, old_len, new_len, d_model);
+    const cached_k_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.keys[layer], qkv_self.second, batch, old_len, new_len, d_model);
     defer cached_k_ref.deinit(cb);
-    const cached_v_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.values[layer], qkv_self.third, old_len, new_len, d_model);
+    const cached_v_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.values[layer], qkv_self.third, batch, old_len, new_len, d_model);
     defer cached_v_ref.deinit(cb);
 
     const self_attn = try cb.crossAttention(qkv_self.first, cached_k_ref.tensor, cached_v_ref.tensor, self_mask, batch, 1, new_len, num_heads, head_dim);
     defer cb.free(self_attn);
-    const self_proj = try decoderLinearProj(cb, self_attn, layer, "self_attn.out_proj", 1, d_model, d_model, buf);
+    const self_proj = try decoderLinearProj(cb, self_attn, layer, "self_attn.out_proj", batch, d_model, d_model, buf);
     defer cb.free(self_proj);
     const self_res = try cb.add(hidden, self_proj);
 
@@ -2338,11 +2390,11 @@ fn decoderBlockIncrementalCached(
     const self_normed = try cb.layerNorm(self_res, ln0_w, ln0_b, d_model, 1e-5);
     cb.free(self_res);
 
-    const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", 1, d_model, d_model, buf);
+    const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", batch, d_model, d_model, buf);
     defer cb.free(q_cross);
     const cross_attn = try cb.crossAttention(q_cross, cache.cross.keys[layer], cache.cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
     defer cb.free(cross_attn);
-    const cross_proj = try decoderLinearProj(cb, cross_attn, layer, "encoder_attn.out_proj", 1, d_model, d_model, buf);
+    const cross_proj = try decoderLinearProj(cb, cross_attn, layer, "encoder_attn.out_proj", batch, d_model, d_model, buf);
     defer cb.free(cross_proj);
     const cross_res = try cb.add(self_normed, cross_proj);
     cb.free(self_normed);
@@ -2353,20 +2405,20 @@ fn decoderBlockIncrementalCached(
     cb.free(cross_res);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
-    const activated = if (try cb.linearGelu(cross_normed, fc1_weights.weight, fc1_weights.bias, 1, d_model, ffn_dim)) |fused|
+    const activated = if (try cb.linearGelu(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim)) |fused|
         fused
     else blk: {
-        const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, 1, d_model, ffn_dim);
+        const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim);
         defer cb.free(fc1);
         break :blk try cb.gelu(fc1);
     };
     defer cb.free(activated);
 
     const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
-    const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, cross_normed, 1, ffn_dim, d_model)) |fused|
+    const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, cross_normed, batch, ffn_dim, d_model)) |fused|
         fused
     else blk: {
-        const fc2 = try cb.linear(activated, fc2_weights.weight, fc2_weights.bias, 1, ffn_dim, d_model);
+        const fc2 = try cb.linear(activated, fc2_weights.weight, fc2_weights.bias, batch, ffn_dim, d_model);
         defer cb.free(fc2);
         break :blk try cb.add(cross_normed, fc2);
     };
@@ -2394,12 +2446,17 @@ fn appendSelfCacheTensor(
     self_cache: *DecoderSelfCache,
     slot: *?CT,
     next: CT,
+    batch: usize,
     old_len: usize,
     new_len: usize,
     d_model: usize,
 ) !CachedSelfTensor {
+    if (batch == 0 or new_len != old_len + 1) {
+        cb.free(next);
+        return error.InvalidInputShape;
+    }
     if (self_cache.preallocated) {
-        if (new_len != old_len + 1 or new_len > self_cache.capacity) {
+        if (new_len > self_cache.capacity) {
             cb.free(next);
             return error.InvalidInputShape;
         }
@@ -2407,16 +2464,27 @@ fn appendSelfCacheTensor(
             cb.free(next);
             return error.InvalidInputShape;
         };
-        const copied = cb.copyRows2D(allocator, slab, old_len, next, 0, 1, d_model) catch |err| {
-            cb.free(next);
-            return err;
-        };
+        var copied = true;
+        for (0..batch) |b| {
+            const dst_base = std.math.mul(usize, b, self_cache.capacity) catch {
+                cb.free(next);
+                return error.InvalidInputShape;
+            };
+            const dst_row = std.math.add(usize, dst_base, old_len) catch {
+                cb.free(next);
+                return error.InvalidInputShape;
+            };
+            copied = copied and (cb.copyRows2D(allocator, slab, dst_row, next, b, 1, d_model) catch |err| {
+                cb.free(next);
+                return err;
+            });
+        }
         cb.free(next);
         if (!copied) return error.UnsupportedOperation;
-        const view = try cb.sliceRows2D(allocator, slab, 0, new_len, d_model);
+        const view = try compactSelfCacheRows(cb, allocator, slab, batch, self_cache.capacity, new_len, d_model);
         return .{ .tensor = view, .owned_view = true };
     } else if (slot.*) |old| {
-        const merged = cb.concatRows2D(allocator, old, next, old_len, 1, d_model) catch |err| {
+        const merged = appendBatchSelfRows(cb, allocator, old, next, batch, old_len, d_model) catch |err| {
             cb.free(next);
             return err;
         };
@@ -2432,6 +2500,87 @@ fn appendSelfCacheTensor(
         slot.* = next;
         return .{ .tensor = next };
     }
+}
+
+fn appendBatchSelfRows(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    old: CT,
+    next: CT,
+    batch: usize,
+    old_len: usize,
+    d_model: usize,
+) !CT {
+    if (batch == 1) return cb.concatRows2D(allocator, old, next, old_len, 1, d_model);
+    const new_len = old_len + 1;
+    var acc: ?CT = null;
+    var acc_rows: usize = 0;
+    errdefer if (acc) |tensor| cb.free(tensor);
+
+    for (0..batch) |b| {
+        const old_start = std.math.mul(usize, b, old_len) catch return error.InvalidInputShape;
+        const old_slice = try cb.sliceRows2D(allocator, old, old_start, old_len, d_model);
+        defer cb.free(old_slice);
+        const next_slice = try cb.sliceRows2D(allocator, next, b, 1, d_model);
+        defer cb.free(next_slice);
+        const item = try cb.concatRows2D(allocator, old_slice, next_slice, old_len, 1, d_model);
+        var item_live = true;
+        errdefer if (item_live) cb.free(item);
+
+        if (acc) |current| {
+            const merged = try cb.concatRows2D(allocator, current, item, acc_rows, new_len, d_model);
+            cb.free(current);
+            cb.free(item);
+            item_live = false;
+            acc = merged;
+        } else {
+            acc = item;
+            item_live = false;
+        }
+        acc_rows += new_len;
+    }
+
+    const result = acc orelse return error.InvalidInputShape;
+    acc = null;
+    return result;
+}
+
+fn compactSelfCacheRows(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    slab: CT,
+    batch: usize,
+    capacity: usize,
+    active_len: usize,
+    d_model: usize,
+) !CT {
+    if (batch == 1) return cb.sliceRows2D(allocator, slab, 0, active_len, d_model);
+
+    var acc: ?CT = null;
+    var acc_rows: usize = 0;
+    errdefer if (acc) |tensor| cb.free(tensor);
+
+    for (0..batch) |b| {
+        const start_row = std.math.mul(usize, b, capacity) catch return error.InvalidInputShape;
+        const item = try cb.sliceRows2D(allocator, slab, start_row, active_len, d_model);
+        var item_live = true;
+        errdefer if (item_live) cb.free(item);
+        if (acc) |current| {
+            const merged = try cb.concatRows2D(allocator, current, item, acc_rows, active_len, d_model);
+            cb.free(current);
+            cb.free(item);
+            item_live = false;
+            acc = merged;
+        } else {
+            acc = item;
+            item_live = false;
+        }
+        acc_rows += active_len;
+    }
+
+    const result = acc orelse return error.InvalidInputShape;
+    acc = null;
+    return result;
 }
 
 fn tokenEmbeddingsData(
@@ -3053,6 +3202,38 @@ fn transposeMatrix(allocator: std.mem.Allocator, input: []const f32, rows: usize
 
 fn readProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn debugStatsEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DEBUG_STATS");
+}
+
+fn logDebugStatsF32(label: []const u8, values: []const f32) void {
+    if (values.len == 0) {
+        std.log.info("florence-debug {s}: empty", .{label});
+        return;
+    }
+    var sum: f64 = 0;
+    var absmax: f32 = 0;
+    for (values) |v| {
+        sum += v;
+        const a = @abs(v);
+        if (a > absmax) absmax = a;
+    }
+    const mean = sum / @as(f64, @floatFromInt(values.len));
+    const n_first = @min(values.len, 4);
+    std.log.info("florence-debug {s}: n={d} mean={d:.6} absmax={d:.4} first={any}", .{
+        label, values.len, mean, absmax, values[0..n_first],
+    });
+}
+
+fn logDebugStatsTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, label: []const u8, tensor: CT) void {
+    const host = cb.toFloat32(tensor, allocator) catch |err| {
+        std.log.info("florence-debug {s}: download failed ({t})", .{ label, err });
+        return;
+    };
+    defer allocator.free(host);
+    logDebugStatsF32(label, host);
 }
 
 fn logFlorenceProfile(phase: []const u8, start_ns: u64) void {

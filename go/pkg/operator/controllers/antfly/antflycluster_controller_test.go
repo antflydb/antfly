@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -33,6 +34,358 @@ import (
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Config: `{"remote_content":{"default_s3":"primary","s3":{"primary":{"region":"us-west-2","access_key_id":"${secret:s3.access_key}","secret_access_key":"${secret:s3.secret_key}"}}}}`,
+		},
+	}
+
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	firstHash := first[generatedConfigHashAnnotation]
+	if firstHash == "" {
+		t.Fatal("expected generated config hash annotation")
+	}
+
+	// A value rotation behind either secret reference is not represented in the
+	// AntflyCluster and cannot affect this hash; changing config/routing does.
+	cluster.Spec.Config = `{"remote_content":{"default_s3":"archive","s3":{"archive":{"region":"us-east-1","access_key_id":"${secret:s3.access_key}","secret_access_key":"${secret:s3.secret_key}"}}}}`
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if second[generatedConfigHashAnnotation] == firstHash {
+		t.Fatal("expected remote-content config change to alter pod-template hash")
+	}
+}
+
+func TestReconcileConfigMapPublishesExactGenerationAndFullHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: scheme}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "publication", Namespace: "default", Generation: 9},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{"remote_content":{"default_s3":"primary"}}`},
+	}
+
+	if err := reconciler.reconcileConfigMap(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: "publication-config", Namespace: "default"}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	wantSum := sha256.Sum256([]byte(configMap.Data["config.json"]))
+	if cluster.Status.ConfigPublication == nil {
+		t.Fatal("expected config publication status")
+	}
+	if cluster.Status.ConfigPublication.ObservedGeneration != cluster.Generation {
+		t.Fatalf("published generation %d, want %d", cluster.Status.ConfigPublication.ObservedGeneration, cluster.Generation)
+	}
+	wantHash := fmt.Sprintf("%x", wantSum)
+	if cluster.Status.ConfigPublication.SHA256 != wantHash {
+		t.Fatalf("published hash %q, want %q", cluster.Status.ConfigPublication.SHA256, wantHash)
+	}
+	if configMap.Annotations[generatedConfigHashAnnotation] != wantHash[:16] {
+		t.Fatalf("pod-template hash %q does not match publication prefix", configMap.Annotations[generatedConfigHashAnnotation])
+	}
+}
+
+func TestSecretValueOnlyRotationDoesNotChangePodTemplateHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cloud-secrets-config", Namespace: "default"},
+		Data:       map[string][]byte{"secrets.json": []byte(`{"value":"first"}`)},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: secret.Namespace},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	envFrom := []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: secret.Name},
+	}}}
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+
+	secret.Data["secrets.json"] = []byte(`{"value":"other"}`)
+	if err := client.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+	if !maps.Equal(second, first) {
+		t.Fatalf("secret value rotation changed pod-template annotations: before=%v after=%v", first, second)
+	}
+}
+
+func TestCompatibilityRolloutGenerationPropagatesToPodTemplate(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example",
+			Annotations: map[string]string{
+				compatibilityRolloutGenerationAnnotation: "secret-sha256-0123456789abcdef",
+			},
+		},
+		Spec: antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	annotations := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if got := annotations[compatibilityRolloutGenerationAnnotation]; got != "secret-sha256-0123456789abcdef" {
+		t.Fatalf("compatibility rollout generation = %q", got)
+	}
+}
+
+func TestEffectiveTopologyModeFailsClosedForUnknownStoredMode(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterMode("RemovedMode")}}
+	if got := effectiveTopologyMode(cluster); got != topologyModeInvalid {
+		t.Fatalf("expected invalid topology for unknown stored mode, got %q", got)
+	}
+}
+
+func TestTopologySafetyRejectsUnexpectedOwnedStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec:       antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeStandalone},
+	}
+	oldWorkload := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name:      "example-old-topology",
+		Namespace: "default",
+		Labels:    map[string]string{"app.kubernetes.io/instance": "example"},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+			UID: cluster.UID, Controller: &controller,
+		}},
+	}}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, oldWorkload).Build()}
+	err := reconciler.ensureTopologyResourcesMatchMode(context.Background(), cluster, topologyModeStandalone)
+	if err == nil || !strings.Contains(err.Error(), "migrate or remove") {
+		t.Fatalf("expected explicit migration safety error, got %v", err)
+	}
+}
+
+func TestTopologySafetyRejectsUnownedCanonicalStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec:       antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeStandalone},
+	}
+	conflict := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "example-standalone", Namespace: "default",
+	}}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, conflict).Build()}
+	err := reconciler.ensureTopologyResourcesMatchMode(context.Background(), cluster, topologyModeStandalone)
+	if err == nil || !strings.Contains(err.Error(), "not controlled by AntflyCluster UID") {
+		t.Fatalf("expected canonical-name ownership collision, got %v", err)
+	}
+}
+
+func TestCleanupDeletesUIDBoundPVCFromOwnedStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controller := true
+	replicas := int32(1)
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	historical := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-historical", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+				UID: cluster.UID, Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: "database"},
+			}},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "database-example-historical-0", Namespace: "default",
+		Labels: map[string]string{labelClusterUID: string(cluster.UID)},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	err = client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{})
+	if !errors.IsNotFound(err) {
+		t.Fatalf("expected UID-bound PVC to be deleted, got %v", err)
+	}
+}
+
+func TestCleanupDoesNotDeleteUnownedCanonicalNameStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	unowned := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "example-data", Namespace: "default",
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, unowned).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	err = client.Get(context.Background(), types.NamespacedName{Name: unowned.Name, Namespace: unowned.Namespace}, &appsv1.StatefulSet{})
+	if err != nil {
+		t.Fatalf("unowned canonical-name StatefulSet was deleted: %v", err)
+	}
+}
+
+func TestCleanupDoesNotTreatInstanceLabelAsOwnership(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	foreign := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "another-application", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "foreign-data", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, foreign, foreignPVC).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: foreign.Name, Namespace: foreign.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("label-only StatefulSet was deleted: %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: foreignPVC.Name, Namespace: foreignPVC.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("label-only PVC was deleted: %v", err)
+	}
+}
+
+func TestCleanupFailsClosedBeforeDeletingAnyPVCWithoutUIDOwnership(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	labeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standalone-storage-example-standalone-0", Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": cluster.Name,
+			labelClusterUID:              string(cluster.UID),
+		},
+	}}
+	unlabeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "data-storage-example-data-0", Namespace: "default",
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, labeled, unlabeled).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), labelClusterUID) {
+		t.Fatalf("expected UID ownership failure: result=%v err=%v", result, err)
+	}
+	for _, name := range []string{labeled.Name, unlabeled.Name} {
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, &corev1.PersistentVolumeClaim{})
+		if err != nil {
+			t.Fatalf("PVC %s was deleted before ownership preflight completed: %v", name, err)
+		}
+	}
+}
+
+func TestCleanupFailsClosedOnConflictingDiscoveredPVCLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controller := true
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	historical := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-historical", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+				UID: cluster.UID, Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+			ObjectMeta: metav1.ObjectMeta{Name: "database"},
+		}}},
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "database-example-historical-0", Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": "another-cluster",
+			labelClusterUID:              string(cluster.UID),
+		},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "refusing PVC cleanup") {
+		t.Fatalf("expected fail-closed ownership conflict, result=%v err=%v", result, err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("conflicting PVC was deleted: %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: historical.Name, Namespace: historical.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("historical StatefulSet was deleted before PVC preflight completed: %v", err)
+	}
+	// A second reconcile must fail closed in exactly the same way; this catches
+	// orphaning bugs where the first attempt deletes the workload that supplied
+	// the non-canonical claim prefix.
+	result, err = reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "refusing PVC cleanup") {
+		t.Fatalf("expected retry to preserve fail-closed conflict, result=%v err=%v", result, err)
+	}
+}
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
@@ -431,11 +784,11 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				var payload map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["slot_name"]).To(Equal("standby-a"))
-				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-5"))
+				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
@@ -645,6 +998,365 @@ func TestReconcileHAAdminJobsFailsWhenConfiguredAdminTokenEnvVarMissing(t *testi
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
+}
+
+func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarComesFromEnvFrom(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionResumeSlot),
+					Executor:     string(haActionExecutorAdminAPI),
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
+					AdminMethod:  "PUT",
+					AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+				}},
+			},
+		},
+	}
+
+	called := false
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+			return nil, fmt.Errorf("unexpected direct admin request: %s %s", req.Method, req.URL.String())
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(called).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Args).To(Equal([]string{
+		"ha",
+		"--ha-url", "http://primary-ha.default.svc:8081",
+		"--ha-token-env", "MISSING_HA_ADMIN_TOKEN",
+		"--",
+		"slot", "resume", "--slot", "standby-a",
+	}))
+	g.Expect(container.EnvFrom).To(Equal(cluster.Spec.HighAvailability.Admin.EnvFrom))
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Optional).NotTo(BeNil())
+	g.Expect(*container.Env[0].ValueFrom.SecretKeyRef.Optional).To(BeFalse())
+}
+
+func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarComesFromRuntimeSecret(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionResumeSlot),
+					Executor:     string(haActionExecutorAdminAPI),
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
+					AdminMethod:  "PUT",
+					AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+				}},
+			},
+		},
+	}
+
+	called := false
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+			return nil, fmt.Errorf("unexpected direct admin request: %s %s", req.Method, req.URL.String())
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(called).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.EnvFrom).To(BeEmpty())
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Optional).NotTo(BeNil())
+	g.Expect(*container.Env[0].ValueFrom.SecretKeyRef.Optional).To(BeFalse())
+}
+
+func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFromFallback(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionResumeSlot),
+					Executor:      string(haActionExecutorAdminAPI),
+					SlotName:      "standby-a",
+					AdminCommand:  []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:      "http://primary-ha.default.svc:8081",
+					AdminNodeID:   "primary-a",
+					AdminMethod:   "PUT",
+					AdminPath:     "/admin/v1/ha/replication-slots/standby-a/resume",
+					AdminJobName:  haAdminDirectAPIName,
+					AdminJobPhase: haAdminJobPhaseFailed,
+					AdminError:    "configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+}
+
+func TestHAAdminBearerTokenDoesNotReadRuntimeSecretRef(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Admin: &antflyv1.HAAdminSpec{
+					TokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ha-admin-token", Namespace: "default"},
+		Data:       map[string][]byte{"token": []byte("secret-token")},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, secret).Build(),
+		Scheme: s,
+	}
+
+	_, err := reconciler.haAdminBearerToken(cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
+}
+
+func TestReconcileHAAdminJobsRecreatesMissingFailedFallbackJob(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:         string(haActionResumeSlot),
+		Executor:     string(haActionExecutorAdminAPI),
+		SlotName:     "standby-a",
+		AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+		AdminURL:     "http://primary-ha.default.svc:8081",
+		AdminNodeID:  "primary-a",
+		AdminMethod:  "PUT",
+		AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{action},
+			},
+		},
+	}
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = haAdminJobName(cluster, action)
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseFailed
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminJobName(cluster, action)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
 }
 
 func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
@@ -2673,8 +3385,8 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 					Name:             "standby-a",
 					InitialLSN:       &initial,
 					AdminURL:         "http://standby-a-ha.default.svc:8081",
-					SeedManifestPath: "/backup/base-standby-a-5.afha",
-					SeedContentRoot:  "/backup/base-standby-a-5",
+					SeedManifestPath: "/backup/base-standby-a-10.afha",
+					SeedContentRoot:  "/backup/base-standby-a-10",
 				}},
 			},
 		},
@@ -2700,26 +3412,26 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups/finish":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-10","action_kind":"base_backup_finish","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"end_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/standby/bootstrap":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
-				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-5"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
+				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-10","action_kind":"standby_bootstrap","target":"base-standby-a-10","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
@@ -2741,25 +3453,25 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(10)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(10)))
 	finish := cluster.Status.HAStatus.PlannedActions[2]
 	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(finish.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(finish.AdminResult).NotTo(BeNil())
-	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
-	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
+	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-10"))
+	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(10)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
 	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
 	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(bootstrap.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(bootstrap.AdminResult).NotTo(BeNil())
-	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
-	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(5)))
+	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-10"))
+	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(10)))
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/replication-slots",
 		"POST /admin/v1/ha/base-backups",
@@ -4620,6 +5332,78 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		}
 	}
 
+	demoteCluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					ClusterID:         9002003,
+					ShardID:           1024863633216429947,
+					TableID:           7062478063073158706,
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  1,
+					ParentEpoch:       1,
+					NewTimelineID:     2,
+					NewEpoch:          2,
+					SwitchLSN:         4,
+					RequiredLSN:       3,
+					ObservedLSN:       3,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   1,
+					FenceToken:        "ha-fence-token",
+				},
+			},
+		},
+	}
+	demoteAction := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       4,
+		ObservedLSN:     4,
+		RetainedFromLSN: 3,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 1,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "primary-a",
+	}
+	demoteResponse := adminsdk.HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "rejoin_assess:primary-a",
+			ActionKind: adminsdk.HAActionKindRejoinAssess,
+			Target:     "primary-a",
+			State:      adminsdk.HAActionStateAssessed,
+			NodeId:     "primary-a",
+		},
+		Assessment: adminsdk.HARejoinAssessment{
+			Action:            adminsdk.HARejoinActionRejectUnfenced,
+			Reason:            adminsdk.HARejoinReasonNoFence,
+			FormerNodeId:      "primary-a",
+			TargetTimelineId:  1,
+			TargetEpoch:       1,
+			ParentClusterId:   9002003,
+			ParentShardId:     1024863633216429947,
+			ParentTableId:     7062478063073158706,
+			ParentTimelineId:  1,
+			ParentEpoch:       1,
+			ForkLsn:           4,
+			FormerLastLsn:     4,
+			RetainedFromLsn:   3,
+			DataLossDiscarded: false,
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(demoteCluster, &demoteAction, demoteResponse)).To(BeTrue())
+	demoteAction.AdminJobName = haAdminDirectAPIName
+	demoteAction.AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(demoteAction.AdminResult).NotTo(BeNil())
+	g.Expect(demoteAction.AdminResult.RejoinAction).To(Equal("reject_unfenced"))
+	g.Expect(haAdminActionSucceededWithStatusEvidence(demoteCluster.Status.HAStatus, demoteAction)).To(BeTrue())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionDemoteFormerPrimary)))
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Fenced).To(BeFalse())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("no_fence"))
+
 	cluster := newRejoinCluster()
 	rewindAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionRewindFormerPrimary),
@@ -4670,7 +5454,6 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		},
 	}
 
-	reconciler := &AntflyClusterReconciler{}
 	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &rewindAction, response)).To(BeTrue())
 	g.Expect(rewindAction.AdminResult).NotTo(BeNil())
 	g.Expect(rewindAction.AdminResult.RejoinAction).To(Equal("rewind"))
@@ -4678,6 +5461,21 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionRewindFormerPrimary)))
+
+	staleObservedAction := rewindAction
+	staleObservedAction.AdminResult = nil
+	staleObservedAction.ObservedLSN = 13
+	staleObservedResponse := response
+	staleObservedResponse.Assessment.FormerLastLsn = 12
+	staleObservedResponse.Assessment.DataLossDiscarded = false
+	staleObservedResponse.Rewind.PreviousLastLsn = 12
+	staleObservedResponse.Rewind.CurrentLastLsn = 12
+	staleObservedResponse.Rewind.DiscardedLsnCount = 0
+	staleObservedResponse.Rewind.DataLossDiscarded = false
+	staleObservedCluster := newRejoinCluster()
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(staleObservedCluster, &staleObservedAction, staleObservedResponse)).To(BeTrue())
+	g.Expect(staleObservedAction.AdminResult).NotTo(BeNil())
+	g.Expect(staleObservedAction.AdminResult.FormerLastLSN).To(Equal(uint64(12)))
 
 	reseedAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionReseedFormerPrimary),
@@ -4875,6 +5673,17 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 func TestParseHAAdminActionResultTable(t *testing.T) {
 	g := NewWithT(t)
 
+	slotResume, ok := parseHAAdminActionResultTable(`{"schema_version":1,"action":{"action_id":"replication_slot_resume:standby-a","action_kind":"replication_slot_resume","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"resume","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"last_error":null,"current_lsn":0,"dropped":false}}`)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(slotResume.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(slotResume.ActionID).To(Equal("replication_slot_resume:standby-a"))
+	g.Expect(slotResume.ActionKind).To(Equal("replication_slot_resume"))
+	g.Expect(slotResume.ActionTarget).To(Equal("standby-a"))
+	g.Expect(slotResume.ActionState).To(Equal("applied"))
+	g.Expect(slotResume.ActionNodeID).To(Equal("primary-a"))
+	g.Expect(slotResume.SlotAction).To(Equal("resume"))
+	g.Expect(slotResume.SlotName).To(Equal("standby-a"))
+
 	finish, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=seed_finish",
 		"action.action_id=base_backup_finish:base-standby-a-5",
@@ -5006,6 +5815,31 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(rejoin.FormerLastLSN).To(Equal(uint64(13)))
 	g.Expect(rejoin.RetainedFromLSN).To(Equal(uint64(8)))
 	g.Expect(rejoin.DataLossDiscarded).To(BeTrue())
+}
+
+func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionResumeSlot),
+		SlotName:    "standby-a",
+		AdminNodeID: "primary-a",
+		AdminURL:    "http://primary-ha.default.svc:8081",
+		AdminMethod: "PUT",
+		AdminPath:   "/admin/v1/ha/replication-slots/standby-a/resume",
+	}
+	action.AdminResult = haCompletedSlotAdminJobResult(action)
+
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.ActionID).To(Equal("replication_slot_resume:standby-a"))
+	g.Expect(action.AdminResult.ActionKind).To(Equal("replication_slot_resume"))
+	g.Expect(action.AdminResult.ActionTarget).To(Equal("standby-a"))
+	g.Expect(action.AdminResult.ActionState).To(Equal("applied"))
+	g.Expect(action.AdminResult.ActionNodeID).To(Equal("primary-a"))
+	g.Expect(action.AdminResult.SlotAction).To(Equal("resume"))
+	g.Expect(action.AdminResult.SlotName).To(Equal("standby-a"))
+	g.Expect(haActionHasRequiredAdminResult(action)).To(BeTrue())
+	g.Expect(haDirectAdminActionReceiptMatches(action)).To(BeTrue())
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {
@@ -7121,7 +7955,7 @@ func baseClusterWithInferenceSpec() *antflyv1.AntflyCluster {
 	}
 }
 
-func TestApplyDefaults_SwarmDefaults(t *testing.T) {
+func TestApplyDefaults_StandaloneDefaults(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -7135,33 +7969,33 @@ func TestApplyDefaults_SwarmDefaults(t *testing.T) {
 
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm",
+			Name:      "test-standalone",
 			Namespace: "default",
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeSwarm,
-			Image: "antfly:latest",
-			Swarm: &antflyv1.SwarmSpec{},
+			Mode:       antflyv1.ClusterModeStandalone,
+			Image:      "antfly:latest",
+			Standalone: &antflyv1.StandaloneSpec{},
 			Storage: antflyv1.StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 		},
 	}
 
 	reconciler.applyDefaults(cluster)
 
-	g.Expect(cluster.Spec.Swarm).ToNot(BeNil())
-	g.Expect(cluster.Spec.Swarm.Replicas).To(Equal(int32(1)))
-	g.Expect(cluster.Spec.Swarm.NodeID).To(Equal(int32(1)))
-	g.Expect(cluster.Spec.Swarm.MetadataAPI.Port).To(Equal(int32(8080)))
-	g.Expect(cluster.Spec.Swarm.MetadataRaft.Port).To(Equal(int32(9017)))
-	g.Expect(cluster.Spec.Swarm.StoreAPI.Port).To(Equal(int32(12380)))
-	g.Expect(cluster.Spec.Swarm.StoreRaft.Port).To(Equal(int32(9021)))
-	g.Expect(cluster.Spec.Swarm.Health.Port).To(Equal(int32(4200)))
-	g.Expect(cluster.Spec.Swarm.Inference).ToNot(BeNil())
-	g.Expect(cluster.Spec.Swarm.Inference.Enabled).To(BeTrue())
-	g.Expect(cluster.Spec.Swarm.Inference.APIURL).To(Equal("http://0.0.0.0:11433"))
+	g.Expect(cluster.Spec.Standalone).ToNot(BeNil())
+	g.Expect(cluster.Spec.Standalone.Replicas).To(Equal(int32(1)))
+	g.Expect(cluster.Spec.Standalone.NodeID).To(Equal(int32(1)))
+	g.Expect(cluster.Spec.Standalone.MetadataAPI.Port).To(Equal(int32(8080)))
+	g.Expect(cluster.Spec.Standalone.MetadataRaft.Port).To(Equal(int32(9017)))
+	g.Expect(cluster.Spec.Standalone.StoreAPI.Port).To(Equal(int32(12380)))
+	g.Expect(cluster.Spec.Standalone.StoreRaft.Port).To(Equal(int32(9021)))
+	g.Expect(cluster.Spec.Standalone.Health.Port).To(Equal(int32(4200)))
+	g.Expect(cluster.Spec.Standalone.Inference).ToNot(BeNil())
+	g.Expect(cluster.Spec.Standalone.Inference.Enabled).To(BeTrue())
+	g.Expect(cluster.Spec.Standalone.Inference.APIURL).To(Equal("http://0.0.0.0:11433"))
 }
 
 func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
@@ -7368,12 +8202,12 @@ func TestUpdateRolloutConditionReportsBlockedRevision(t *testing.T) {
 	reconciler := &AntflyClusterReconciler{}
 	replicas := int32(1)
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-swarm", Generation: 2},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-standalone", Generation: 2},
 		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
 		Status: appsv1.StatefulSetStatus{
 			ObservedGeneration: 2,
-			CurrentRevision:    "swarm-old",
-			UpdateRevision:     "swarm-new",
+			CurrentRevision:    "standalone-old",
+			UpdateRevision:     "standalone-new",
 			UpdatedReplicas:    0,
 			ReadyReplicas:      0,
 		},
@@ -7385,7 +8219,7 @@ func TestUpdateRolloutConditionReportsBlockedRevision(t *testing.T) {
 	g.Expect(cond).NotTo(BeNil())
 	g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutBlocked))
-	g.Expect(cond.Message).To(ContainSubstring("test-cluster-swarm has 0/1 updated replicas"))
+	g.Expect(cond.Message).To(ContainSubstring("test-cluster-standalone has 0/1 updated replicas"))
 }
 
 func TestRepairBlockedStatefulSetRolloutDeletesStaleUnhealthyPod(t *testing.T) {
@@ -7452,7 +8286,7 @@ func TestRepairBlockedStatefulSetRolloutDeletesStaleUnhealthyPod(t *testing.T) {
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
-func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthySwarmPod(t *testing.T) {
+func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthyStandalonePod(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := runtime.NewScheme()
@@ -7463,12 +8297,12 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthySwarmPod(t *testin
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode: antflyv1.ClusterModeSwarm,
+			Mode: antflyv1.ClusterModeStandalone,
 		},
 	}
 	replicas := int32(1)
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-swarm", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-standalone", Namespace: "default"},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
 			Template: corev1.PodTemplateSpec{
@@ -7478,18 +8312,18 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthySwarmPod(t *testin
 			},
 		},
 		Status: appsv1.StatefulSetStatus{
-			UpdateRevision:  "swarm-new",
+			UpdateRevision:  "standalone-new",
 			UpdatedReplicas: 0,
 		},
 	}
 	staleUnreadyPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            "test-cluster-swarm-0",
+			Name:            "test-cluster-standalone-0",
 			Namespace:       "default",
 			OwnerReferences: []metav1.OwnerReference{statefulSetOwnerRef(sts.Name)},
 			Labels: mergeStringMaps(
-				serviceSelectorLabels("test-cluster", "swarm"),
-				map[string]string{"controller-revision-hash": "swarm-old"},
+				serviceSelectorLabels("test-cluster", "standalone"),
+				map[string]string{"controller-revision-hash": "standalone-old"},
 			),
 		},
 		Spec: corev1.PodSpec{
@@ -7914,6 +8748,7 @@ func TestReconcileCancelsDataScaleDownWhenOrdinalDesiredAgain(t *testing.T) {
 			Replicas: 5,
 		},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8002,6 +8837,7 @@ func TestReconcileWaitsForDataScaleDownCancellationRecovery(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 5},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8084,6 +8920,7 @@ func TestReconcileFinalizesDataScaleDownAfterStatefulSetShrinks(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 4},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8166,6 +9003,7 @@ func TestReconcileRetriesFailedDataScaleDownFinalization(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 4},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8245,6 +9083,7 @@ func TestReconcileKeepsFailedDataScaleDownFinalizationFailure(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 4},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8282,7 +9121,7 @@ func TestHTTPClientDefaultHasTimeout(t *testing.T) {
 	g.Expect(reconciler.httpClient().Timeout).To(Equal(10 * time.Second))
 }
 
-func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
+func TestUpdateProductTierStatusReportsDistributedShape(t *testing.T) {
 	g := NewWithT(t)
 	reconciler := &AntflyClusterReconciler{}
 	cluster := &antflyv1.AntflyCluster{
@@ -8325,7 +9164,7 @@ func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
 
 	g.Expect(cluster.Status.ProductTierStatus).NotTo(BeNil())
 	g.Expect(cluster.Status.ProductTierStatus.Name).To(Equal("pro"))
-	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeClustered))
+	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeDistributed))
 	g.Expect(cluster.Status.ProductTierStatus.MetadataResources).To(Equal("cpu=500m memory=1Gi"))
 	g.Expect(cluster.Status.ProductTierStatus.DataStorage).To(Equal("100Gi"))
 	g.Expect(cluster.Status.ProductTierStatus.DataAutoscaling).To(Equal("enabled min=3 max=8"))
@@ -8538,6 +9377,27 @@ var _ = Describe("AntflyCluster Controller", func() {
 				}, configMap)
 			}, timeout, interval).Should(Succeed())
 			Expect(configMap.Data).To(HaveKey("config.json"))
+			Expect(configMap.Annotations).To(HaveKey(generatedConfigHashAnnotation))
+			Expect(metadataSts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				generatedConfigHashAnnotation,
+				configMap.Annotations[generatedConfigHashAnnotation],
+			))
+			Expect(dataSts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				generatedConfigHashAnnotation,
+				configMap.Annotations[generatedConfigHashAnnotation],
+			))
+			configSum := sha256.Sum256([]byte(configMap.Data["config.json"]))
+			wantPublicationHash := fmt.Sprintf("%x", configSum)
+			Eventually(func() string {
+				observed := &antflyv1.AntflyCluster{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: namespace}, observed); err != nil {
+					return ""
+				}
+				if observed.Status.ConfigPublication == nil || observed.Status.ConfigPublication.ObservedGeneration != observed.Generation {
+					return ""
+				}
+				return observed.Status.ConfigPublication.SHA256
+			}, timeout, interval).Should(Equal(wantPublicationHash))
 
 			// Verify internal service is created
 			internalSvc := &corev1.Service{}
@@ -8885,7 +9745,7 @@ func TestGenerateCompleteConfig(t *testing.T) {
 	g.Expect(config["max_shards_per_table"]).To(Equal(float64(0)))
 }
 
-func TestGenerateCompleteConfig_Swarm(t *testing.T) {
+func TestGenerateCompleteConfig_Standalone(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -8897,16 +9757,11 @@ func TestGenerateCompleteConfig_Swarm(t *testing.T) {
 		Scheme: s,
 	}
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.Config = `{
-	  "replication_factor": 3,
-	  "swarm_mode": false,
-	  "storage": {
-	    "s3": {
-	      "bucket": "test-bucket"
-	    }
-	  }
-	}`
+		  "replication_factor": 3,
+		  "deployment_mode": "distributed"
+		}`
 
 	configJSON, err := reconciler.generateCompleteConfig(cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -8915,24 +9770,70 @@ func TestGenerateCompleteConfig_Swarm(t *testing.T) {
 	err = json.Unmarshal([]byte(configJSON), &config)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	g.Expect(config["swarm_mode"]).To(Equal(true))
+	g.Expect(config["deployment_mode"]).To(Equal("standalone"))
 	g.Expect(config["replication_factor"]).To(Equal(float64(1)))
 	g.Expect(config["default_shards_per_table"]).To(Equal(float64(1)))
 	g.Expect(config["disable_shard_alloc"]).To(Equal(true))
 
 	storage, ok := config["storage"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
+	g.Expect(storage["engine"]).To(Equal("local"))
 	localStorage, ok := storage["local"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(localStorage["base_dir"]).To(Equal("/antflydb"))
-	_, hasS3 := storage["s3"]
-	g.Expect(hasS3).To(BeTrue(), "expected user-provided S3 storage config to be preserved")
 
 	metadata, ok := config["metadata"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
 	orchestrationURLs, ok := metadata["orchestration_urls"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
-	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-swarm-swarm.default.svc.cluster.local:8080"))
+	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-standalone-standalone.default.svc.cluster.local:8080"))
+}
+
+func TestGenerateCompleteConfig_StandaloneRejectsRawStorageOverride(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme: s,
+	}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Config = `{"storage":{"engine":"lite","lite":{"path":"/antflydb/data.aflite"}}}`
+
+	_, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("spec.config.storage is operator-managed")))
+}
+
+func TestGenerateCompleteConfig_RejectsInvalidTypedStorageWithoutAdmission(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "object"
+
+	_, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("spec.storage.engine must be local or lite")))
+}
+
+func TestGenerateCompleteConfig_StandaloneLite(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "production.aflite"
+
+	configJSON, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	storage := config["storage"].(map[string]any)
+	g.Expect(storage["engine"]).To(Equal("lite"))
+	lite := storage["lite"].(map[string]any)
+	g.Expect(lite["path"]).To(Equal("/antflydb/production.aflite"))
+	g.Expect(lite["fsync"]).To(BeTrue())
 }
 
 func TestGenerateCompleteConfig_ManagedInferenceAPIURL(t *testing.T) {
@@ -8992,7 +9893,7 @@ func TestGenerateCompleteConfig_ManagedInferenceAPIURL(t *testing.T) {
 	g.Expect(inferenceConfig["models_dir"]).To(Equal("/models"))
 }
 
-func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
+func TestReconcileServices_StandaloneCreatesStandaloneAndPublicAPI(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9001,7 +9902,7 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	err = corev1.AddToScheme(s)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
 
 	reconciler := &AntflyClusterReconciler{
@@ -9013,24 +9914,24 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 
 	publicSvc := &corev1.Service{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "standalone"))
 	g.Expect(publicSvc.Spec.Ports).To(HaveLen(1))
 	g.Expect(publicSvc.Spec.Ports[0].TargetPort.IntValue()).To(Equal(8080))
 
-	swarmSvc := &corev1.Service{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, swarmSvc)
+	standaloneSvc := &corev1.Service{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, standaloneSvc)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(swarmSvc.Spec.Ports).To(HaveLen(5))
+	g.Expect(standaloneSvc.Spec.Ports).To(HaveLen(5))
 
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-metadata", Namespace: "default"}, &corev1.Service{})
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-metadata", Namespace: "default"}, &corev1.Service{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-data", Namespace: "default"}, &corev1.Service{})
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-data", Namespace: "default"}, &corev1.Service{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
-func TestCreatePublicAPIService_ClusteredTargetsMetadataAPI(t *testing.T) {
+func TestCreatePublicAPIService_DistributedTargetsMetadataAPI(t *testing.T) {
 	g := NewWithT(t)
 
 	enabled := true
@@ -9069,7 +9970,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Standbys: []antflyv1.HAStandbySpec{{
@@ -9077,7 +9978,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 			RouteSelector: map[string]string{
 				"app.kubernetes.io/name":      "antfly-database",
 				"app.kubernetes.io/component": "standby-a",
-				"app.kubernetes.io/instance":  "test-swarm-standby-a",
+				"app.kubernetes.io/instance":  "test-standalone-standby-a",
 			},
 		}},
 	}
@@ -9095,7 +9996,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
 
 	publicSvc := &corev1.Service{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
 	g.Expect(publicSvc.Spec.Selector).To(Equal(cluster.Spec.HighAvailability.Standbys[0].RouteSelector))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
@@ -9116,10 +10017,10 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-public-api",
+			Name:      "test-standalone-public-api",
 			Namespace: "default",
 			Annotations: map[string]string{
 				haPrimaryRouteTargetAnnotation:          "standby-a",
@@ -9141,8 +10042,8 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
 
 	publicSvc := &corev1.Service{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
-	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
+	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "standalone"))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue("antfly.io/custom", "preserve"))
 	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
 	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteFenceAuthorityAnnotation))
@@ -9150,7 +10051,7 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteSelectorAnnotation))
 }
 
-func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
+func TestReconcileStandaloneStatefulSetMountsSecretStore(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9158,7 +10059,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.SecretStore = &antflyv1.SecretStoreSpec{
 		SecretName: "cloud-secrets-config",
 		Key:        "secrets.json",
@@ -9171,11 +10072,11 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 		Scheme: s,
 	}
 
-	err := reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)
+	err := reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	sts := &appsv1.StatefulSet{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	container := sts.Spec.Template.Spec.Containers[0]
@@ -9204,7 +10105,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	}))
 }
 
-func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
+func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9212,7 +10113,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{
@@ -9248,16 +10149,16 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
-	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	sts := &appsv1.StatefulSet{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	primaryArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/slots'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id 'primary-a'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/ha/fence.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/primary.wal'`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-lag-lsn 50`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-retained-bytes 4096`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-retained-age-ns 1000000`))
@@ -9301,15 +10202,15 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			SlotName:     "standby-a",
 		},
 	}
-	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	standbyArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/standby.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id 'standby-a'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/custom/fence.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/custom/former-primary.wal'`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-lag-lsn`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-retained-bytes`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-retained-age-ns`))
@@ -9327,10 +10228,10 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	}))
 }
 
-func TestSwarmHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
+func TestStandaloneHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 	g := NewWithT(t)
 
-	args := swarmHAArgs(&antflyv1.HighAvailabilitySpec{
+	args := standaloneHAArgs(&antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{
 			ClusterID:        100,
@@ -9356,10 +10257,10 @@ func TestSwarmHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 	g.Expect(args).NotTo(ContainSubstring(`--ha-sync-required`))
 }
 
-func TestSwarmHAArgsShellQuotesRuntimeValues(t *testing.T) {
+func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
 	g := NewWithT(t)
 
-	args := swarmHAArgs(&antflyv1.HighAvailabilitySpec{
+	args := standaloneHAArgs(&antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{
 			ClusterID:        100,
@@ -9475,7 +10376,7 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 	}
 }
 
-func TestUpdateStatus_Swarm(t *testing.T) {
+func TestUpdateStatus_Standalone(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9486,10 +10387,10 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	err = corev1.AddToScheme(s)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	cluster := baseSwarmControllerCluster()
-	swarmSts := &appsv1.StatefulSet{
+	cluster := baseStandaloneControllerCluster()
+	standaloneSts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-swarm",
+			Name:      "test-standalone-standalone",
 			Namespace: "default",
 		},
 		Status: appsv1.StatefulSetStatus{
@@ -9498,9 +10399,9 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-swarm-0",
+			Name:      "test-standalone-standalone-0",
 			Namespace: "default",
-			Labels:    serviceSelectorLabels("test-swarm", "swarm"),
+			Labels:    serviceSelectorLabels("test-standalone", "standalone"),
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -9511,7 +10412,7 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
-		WithObjects(cluster, swarmSts, pod).
+		WithObjects(cluster, standaloneSts, pod).
 		Build()
 
 	reconciler := &AntflyClusterReconciler{
@@ -9523,17 +10424,17 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 
 	updated := &antflyv1.AntflyCluster{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm", Namespace: "default"}, updated)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone", Namespace: "default"}, updated)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(updated.Status.Mode).To(Equal(antflyv1.ClusterModeSwarm))
+	g.Expect(updated.Status.Mode).To(Equal(antflyv1.ClusterModeStandalone))
 	g.Expect(updated.Status.ReadyReplicas).To(Equal(int32(1)))
-	g.Expect(updated.Status.SwarmNodesReady).To(Equal(int32(1)))
+	g.Expect(updated.Status.StandaloneNodesReady).To(Equal(int32(1)))
 	g.Expect(updated.Status.Phase).To(Equal("Running"))
-	g.Expect(updated.Status.SwarmStatus).ToNot(BeNil())
-	g.Expect(updated.Status.SwarmStatus.Ready).To(BeTrue())
-	g.Expect(updated.Status.SwarmStatus.PodName).To(Equal("test-swarm-swarm-0"))
-	g.Expect(updated.Status.SwarmStatus.PodIP).To(Equal("10.0.0.10"))
-	g.Expect(updated.Status.SwarmStatus.ObservedConfigHash).ToNot(BeEmpty())
+	g.Expect(updated.Status.StandaloneStatus).ToNot(BeNil())
+	g.Expect(updated.Status.StandaloneStatus.Ready).To(BeTrue())
+	g.Expect(updated.Status.StandaloneStatus.PodName).To(Equal("test-standalone-standalone-0"))
+	g.Expect(updated.Status.StandaloneStatus.PodIP).To(Equal("10.0.0.10"))
+	g.Expect(updated.Status.StandaloneStatus.ObservedConfigHash).ToNot(BeEmpty())
 }
 
 func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
@@ -9545,14 +10446,14 @@ func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
 	err = corev1.AddToScheme(s)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	clusterPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-swarm-0",
+			Name:      "test-standalone-standalone-0",
 			Namespace: "default",
 			Labels: map[string]string{
 				"app.kubernetes.io/name":     "antfly-database",
-				"app.kubernetes.io/instance": "test-swarm",
+				"app.kubernetes.io/instance": "test-standalone",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -9565,7 +10466,7 @@ func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
 	}
 	otherClusterPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "other-cluster-swarm-0",
+			Name:      "other-cluster-standalone-0",
 			Namespace: "default",
 			Labels: map[string]string{
 				"app.kubernetes.io/name":     "antfly-database",
@@ -9930,19 +10831,19 @@ func TestContainsVolumeAffinityMessage(t *testing.T) {
 	g.Expect(containsVolumeAffinityMessage("")).To(BeFalse())
 }
 
-func baseSwarmControllerCluster() *antflyv1.AntflyCluster {
+func baseStandaloneControllerCluster() *antflyv1.AntflyCluster {
 	enabled := true
 	serviceType := corev1.ServiceTypeClusterIP
 
 	return &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm",
+			Name:      "test-standalone",
 			Namespace: "default",
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeSwarm,
+			Mode:  antflyv1.ClusterModeStandalone,
 			Image: "antfly:latest",
-			Swarm: &antflyv1.SwarmSpec{
+			Standalone: &antflyv1.StandaloneSpec{
 				Replicas:     1,
 				NodeID:       1,
 				Resources:    antflyv1.ResourceSpec{CPU: "500m", Memory: "1Gi"},
@@ -9951,14 +10852,14 @@ func baseSwarmControllerCluster() *antflyv1.AntflyCluster {
 				StoreAPI:     antflyv1.APISpec{Port: 12380},
 				StoreRaft:    antflyv1.APISpec{Port: 9021},
 				Health:       antflyv1.APISpec{Port: 4200},
-				Inference: &antflyv1.SwarmInferenceSpec{
+				Inference: &antflyv1.StandaloneInferenceSpec{
 					Enabled: true,
 					APIURL:  "http://0.0.0.0:11433",
 				},
 			},
 			Storage: antflyv1.StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 			PublicAPI: &antflyv1.PublicAPIConfig{
 				Enabled:     &enabled,

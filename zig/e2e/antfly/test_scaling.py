@@ -465,7 +465,10 @@ class MultiNodeScalingCluster:
             "max_shard_size_bytes": self.max_shard_size_bytes,
             "max_shards_per_table": 64,
             "default_shards_per_table": 1,
-            "storage": {"local": {"base_dir": str(self.root / "config-storage")}},
+            "storage": {
+                "engine": "local",
+                "local": {"base_dir": str(self.root / "config-storage")},
+            },
         }
         self.config_path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -486,7 +489,9 @@ class MultiNodeScalingCluster:
                 str(self.config_path),
                 "--id",
                 str(node["id"]),
-                "--tick-ms",
+                "--raft-tick-ms",
+                "25",
+                "--control-tick-ms",
                 "25",
                 "--replica-root-dir",
                 str(self.root / f"metadata-{node['id']}-replicas"),
@@ -554,7 +559,9 @@ class MultiNodeScalingCluster:
             str(node["id"]),
             "--store-id",
             str(node["store_id"]),
-            "--tick-ms",
+            "--raft-tick-ms",
+            "25",
+            "--control-tick-ms",
             "25",
             "--replica-root-dir",
             str(self.root / f"data-{node['id']}-replicas"),
@@ -847,9 +854,44 @@ class MultiNodeScalingCluster:
             f"{self.debug_logs()}"
         )
 
-    def finalize_node_shutdown(self, node_id: int) -> None:
-        response = self.delete_metadata(f"/internal/v1/nodes/{node_id}")
-        response.raise_for_status()
+    def finalize_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
+        last_error: str | None = None
+
+        def finalized_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
+            nonlocal last_error
+            try:
+                snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
+            except (AssertionError, requests.RequestException) as exc:
+                last_error = repr(exc)
+                return None
+            for snapshot in snapshots:
+                nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
+                stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+                if any(int(node.get("node_id", 0)) == node_id for node in nodes):
+                    return None
+                if any(int(store.get("node_id", 0)) == node_id for store in stores):
+                    return None
+            return snapshots[0]
+
+        def finalize_until_visible() -> dict[str, Any] | None:
+            nonlocal last_error
+            if visible := finalized_visible_on_all_metadata_nodes():
+                return visible
+            try:
+                response = self.delete_metadata(f"/internal/v1/nodes/{node_id}")
+                response.raise_for_status()
+            except (AssertionError, requests.RequestException) as exc:
+                last_error = repr(exc)
+                return None
+            return finalized_visible_on_all_metadata_nodes()
+
+        finalized = wait_until(finalize_until_visible, timeout_s=timeout_s, interval_s=0.5)
+        assert finalized is not None, (
+            f"node shutdown finalization did not become visible on all metadata nodes for {node_id}: {last_error}\n"
+            f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
+            f"snapshot: {self.metadata_snapshot()}\n"
+            f"{self.debug_logs()}"
+        )
 
     def trigger_reallocate(self) -> None:
         response = self.post_metadata("/internal/v1/reallocate")
@@ -916,7 +958,58 @@ class MultiNodeScalingCluster:
                     parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
         return "\n".join(parts)
 
-    def stop(self, *, timeout_s: float = 10.0) -> None:
+    def preserve_failure_diagnostics(self) -> None:
+        diagnostics: dict[str, Any] = {
+            "metadata_snapshots": [],
+            "metadata_statuses": self.metadata_statuses(),
+            "node_shutdown_statuses": [],
+            "processes": {
+                "metadata": [
+                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.metadata_procs
+                ],
+                "data": [
+                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.data_procs
+                ],
+            },
+        }
+        for index, url in enumerate(self.metadata_urls):
+            try:
+                diagnostics["metadata_snapshots"].append(
+                    {"index": index, "url": url, "snapshot": self.metadata_snapshot(index)}
+                )
+            except Exception as exc:
+                diagnostics["metadata_snapshots"].append(
+                    {"index": index, "url": url, "error": repr(exc)}
+                )
+        for node in self.data_nodes:
+            node_id = int(node["id"])
+            try:
+                response = requests.get(
+                    f"{self.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown",
+                    timeout=5,
+                )
+                diagnostics["node_shutdown_statuses"].append(
+                    {
+                        "node_id": node_id,
+                        "status_code": response.status_code,
+                        "body": response.json() if response.ok else response.text,
+                    }
+                )
+            except Exception as exc:
+                diagnostics["node_shutdown_statuses"].append(
+                    {"node_id": node_id, "error": repr(exc)}
+                )
+        try:
+            (self.root / "failure-diagnostics.json").write_text(
+                json.dumps(diagnostics, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"failed to preserve scaling diagnostics: {exc!r}")
+
+    def stop(self, *, timeout_s: float = 10.0, test_failed: bool = False) -> None:
+        if test_failed:
+            self.preserve_failure_diagnostics()
         procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
         for proc in procs:
             proc.send_signal(signal.SIGTERM)
@@ -934,30 +1027,32 @@ class MultiNodeScalingCluster:
         for handle in self.log_files:
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
 @pytest.fixture
-def multi_node_scaling_cluster() -> MultiNodeScalingCluster:
+def multi_node_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(_scaling_antfly_binary())
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 @pytest.fixture
-def compact_scaling_cluster() -> MultiNodeScalingCluster:
+def compact_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(_scaling_antfly_binary(), initial_data_node_count=3)
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 @pytest.fixture
-def split_scaling_cluster() -> MultiNodeScalingCluster:
+def split_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(
         _scaling_antfly_binary(),
         initial_data_node_count=5,
@@ -966,7 +1061,8 @@ def split_scaling_cluster() -> MultiNodeScalingCluster:
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 def _scaling_antfly_binary() -> str:
@@ -994,6 +1090,40 @@ def _table_group_ids(cluster: MultiNodeScalingCluster, table_name: str) -> set[i
         if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
     }
     return group_ids if group_ids else None
+
+
+def _oversized_table_group_ids(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    max_shard_size_bytes: int,
+) -> set[int] | None:
+    snapshot = cluster.metadata_snapshot()
+    table_id = next(
+        (
+            int(table["table_id"])
+            for table in snapshot.get("tables", [])
+            if isinstance(table, dict) and table.get("name") == table_name
+        ),
+        None,
+    )
+    if table_id is None:
+        return None
+
+    table_group_ids = {
+        int(record["group_id"])
+        for record in snapshot.get("ranges", [])
+        if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
+    }
+    oversized_group_ids = {
+        int(status["group_id"])
+        for status in snapshot.get("merged_group_statuses", [])
+        if isinstance(status, dict)
+        and int(status.get("group_id", 0)) in table_group_ids
+        and status.get("leader_known") is True
+        and status.get("disk_bytes_known") is True
+        and int(status.get("disk_bytes", 0)) > max_shard_size_bytes
+    }
+    return oversized_group_ids if oversized_group_ids else None
 
 
 def _placed_nodes_for_groups(cluster: MultiNodeScalingCluster, group_ids: set[int]) -> set[int]:
@@ -1121,7 +1251,7 @@ def _insert_docs(
             api_urls = _data_api_urls_for_table(
                 cluster,
                 table_name,
-                require_all_group_leaders=False,
+                require_all_group_leaders=True,
                 min_group_count=min_group_count,
             )
         except (AssertionError, requests.RequestException, ValueError):
@@ -1360,7 +1490,10 @@ def _wait_node_drained_for_groups(
                     continue
                 if int(record.get("local_node_id", 0)) != node_id:
                     continue
-                if intent.get("serving_state") == "draining":
+                # Both states are excluded from request routing. `retiring`
+                # is the later, safer phase: the survivor set is latched and
+                # the local replica is completing leader transfer/removal.
+                if intent.get("serving_state") in {"draining", "retiring"}:
                     continue
                 return None
         return snapshots[0]
@@ -1560,6 +1693,7 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
         f"node_to_stop: {node_to_stop}\n"
         f"last shutdown status: {complete_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+        f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
     )
 
@@ -1582,7 +1716,11 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
 ) -> None:
     cluster = split_scaling_cluster
     table_name = f"scale_split_{time.time_ns()}"
+    timings = _ScalingPhaseTimings(table_name)
+
+    phase_started = time.monotonic()
     cluster.create_table(table_name, num_shards=1)
+    timings.record("create_table", phase_started)
 
     docs = {
         f"doc:{i:03d}": {
@@ -1592,21 +1730,33 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
         }
         for i in range(48)
     }
+    phase_started = time.monotonic()
     _insert_docs(cluster, table_name, docs, min_group_count=1)
+    timings.record("insert_docs", phase_started)
 
-    last_reallocate_at = 0.0
+    phase_started = time.monotonic()
+    oversized_groups = wait_until(
+        lambda: _oversized_table_group_ids(
+            cluster,
+            table_name,
+            cluster.max_shard_size_bytes,
+        ),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    timings.record("oversized_status_observed", phase_started)
+    assert oversized_groups is not None, (
+        "metadata did not observe the source shard above the configured size threshold\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+        f"{cluster.debug_logs()}"
+    )
 
-    def maybe_trigger_reallocate() -> None:
-        nonlocal last_reallocate_at
-        now = time.monotonic()
-        if now - last_reallocate_at < 5.0:
-            return
-        cluster.trigger_reallocate()
-        last_reallocate_at = now
+    phase_started = time.monotonic()
+    cluster.trigger_reallocate()
+    timings.record("reallocate_requested", phase_started)
 
     def split_completed() -> set[int] | None:
         try:
-            maybe_trigger_reallocate()
             group_ids = _table_group_ids(cluster, table_name)
         except (AssertionError, requests.RequestException):
             return None
@@ -1614,14 +1764,53 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
             return None
         return group_ids if len(group_ids) >= 2 else None
 
+    phase_started = time.monotonic()
     split_groups = wait_until(split_completed, timeout_s=180.0, interval_s=0.5)
+    timings.record("split_finalized", phase_started)
+    native_stacks = (
+        cluster.native_stack_dumps(per_process_timeout_s=5.0)
+        if split_groups is None and os.getenv("ANTFLY_E2E_NATIVE_STACKS") == "1"
+        else "<native stack collection disabled>"
+    )
     assert split_groups is not None, (
         "table did not finalize an automatic split after exceeding the configured shard size threshold\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+        f"native stacks:\n{native_stacks}\n"
         f"{cluster.debug_logs()}"
     )
+    phase_started = time.monotonic()
     _assert_docs_readable(cluster, table_name, docs, timeout_s=60.0)
+    timings.record("post_split_reads", phase_started)
+    timings.finish(cluster)
+
+
+class _ScalingPhaseTimings:
+    def __init__(self, table_name: str):
+        self.table_name = table_name
+        self.started = time.monotonic()
+        self.enabled = os.getenv("ANTFLY_E2E_PHASE_TIMINGS") == "1"
+
+    def record(self, name: str, started: float) -> None:
+        elapsed = time.monotonic() - started
+        if self.enabled:
+            print(f"E2E_PHASE table={self.table_name} phase={name} seconds={elapsed:.3f}", flush=True)
+
+    def finish(self, cluster: MultiNodeScalingCluster) -> None:
+        total = time.monotonic() - self.started
+        if not self.enabled:
+            return
+        print(f"E2E_PHASE table={self.table_name} phase=total seconds={total:.3f}", flush=True)
+        slow_threshold = float(os.getenv("ANTFLY_E2E_SLOW_LOG_THRESHOLD_S", "30"))
+        if total < slow_threshold:
+            return
+        print(
+            "E2E_SLOW_SCALING_DIAGNOSTICS\n"
+            f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+            f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+            f"{cluster.debug_logs()}",
+            flush=True,
+        )
 
 
 def test_autoscaling_node_churn_keeps_reads_available(

@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const lsm_backend = @import("lsm_backend.zig");
@@ -69,7 +69,15 @@ pub const SplitDelta = struct {
 /// Encode SplitState to binary:
 /// [phase:u8][split_key_len:u32 LE][split_key][new_shard_id:u64 LE]
 /// [started_at:u64 LE][orig_end_len:u32 LE][orig_end]
-fn encodeSplitState(buf: []u8, state: *const SplitState) []const u8 {
+fn encodeSplitStateAlloc(alloc: Allocator, state: *const SplitState) ![]u8 {
+    if (state.split_key.len > std.math.maxInt(u32) or state.original_range_end.len > std.math.maxInt(u32))
+        return error.SplitStateTooLarge;
+    const keys_len = std.math.add(usize, state.split_key.len, state.original_range_end.len) catch
+        return error.SplitStateTooLarge;
+    const encoded_len = std.math.add(usize, 1 + 4 + 8 + 8 + 4, keys_len) catch
+        return error.SplitStateTooLarge;
+    const buf = try alloc.alloc(u8, encoded_len);
+    errdefer alloc.free(buf);
     var pos: usize = 0;
     buf[pos] = @intFromEnum(state.phase);
     pos += 1;
@@ -91,7 +99,8 @@ fn encodeSplitState(buf: []u8, state: *const SplitState) []const u8 {
     @memcpy(buf[pos..][0..state.original_range_end.len], state.original_range_end);
     pos += state.original_range_end.len;
 
-    return buf[0..pos];
+    std.debug.assert(pos == buf.len);
+    return buf;
 }
 
 /// Decode SplitState from binary. Returned slices point into `data`.
@@ -99,12 +108,12 @@ fn decodeSplitState(data: []const u8) ?SplitState {
     if (data.len < 1 + 4 + 8 + 8 + 4) return null;
     var pos: usize = 0;
 
-    const phase: SplitPhase = @enumFromInt(data[pos]);
+    const phase = std.enums.fromInt(SplitPhase, data[pos]) orelse return null;
     pos += 1;
 
-    const sk_len = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
+    const sk_len: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
-    if (pos + sk_len > data.len) return null;
+    if (sk_len > data.len - pos) return null;
     const split_key = data[pos..][0..sk_len];
     pos += sk_len;
 
@@ -114,9 +123,9 @@ fn decodeSplitState(data: []const u8) ?SplitState {
     const started_at = std.mem.littleToNative(u64, @as(*align(1) const u64, @ptrCast(data[pos..][0..8])).*);
     pos += 8;
 
-    const oe_len = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
+    const oe_len: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
-    if (pos + oe_len > data.len) return null;
+    if (oe_len != data.len - pos) return null;
     const original_range_end = data[pos..][0..oe_len];
 
     return .{
@@ -195,9 +204,11 @@ pub fn decodeSplitDeltaAlloc(alloc: Allocator, seq: u64, data: []const u8) !Spli
     const nd = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
     pos += 4;
 
+    if (nw > (data.len - pos) / 8 or nd > (data.len - pos) / 4) return error.InvalidDelta;
     var writes = try alloc.alloc(OwnedKVPair, nw);
+    var writes_initialized: usize = 0;
     errdefer {
-        for (writes[0..nw]) |w| {
+        for (writes[0..writes_initialized]) |w| {
             alloc.free(w.key);
             alloc.free(w.value);
         }
@@ -205,29 +216,48 @@ pub fn decodeSplitDeltaAlloc(alloc: Allocator, seq: u64, data: []const u8) !Spli
     }
 
     for (0..nw) |idx| {
+        if (data.len - pos < 4) return error.InvalidDelta;
         const kl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
+        if (kl > data.len - pos) return error.InvalidDelta;
         const key = try alloc.dupe(u8, data[pos..][0..kl]);
         pos += kl;
+        if (data.len - pos < 4) {
+            alloc.free(key);
+            return error.InvalidDelta;
+        }
         const vl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
-        const val = try alloc.dupe(u8, data[pos..][0..vl]);
+        if (vl > data.len - pos) {
+            alloc.free(key);
+            return error.InvalidDelta;
+        }
+        const val = alloc.dupe(u8, data[pos..][0..vl]) catch |err| {
+            alloc.free(key);
+            return err;
+        };
         pos += vl;
         writes[idx] = .{ .key = key, .value = val };
+        writes_initialized += 1;
     }
 
     var del_list = try alloc.alloc([]u8, nd);
+    var deletes_initialized: usize = 0;
     errdefer {
-        for (del_list[0..nd]) |d| alloc.free(d);
+        for (del_list[0..deletes_initialized]) |d| alloc.free(d);
         alloc.free(del_list);
     }
 
     for (0..nd) |idx| {
+        if (data.len - pos < 4) return error.InvalidDelta;
         const kl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
+        if (kl > data.len - pos) return error.InvalidDelta;
         del_list[idx] = try alloc.dupe(u8, data[pos..][0..kl]);
         pos += kl;
+        deletes_initialized += 1;
     }
+    if (pos != data.len) return error.InvalidDelta;
 
     return .{
         .sequence = seq,
@@ -420,8 +450,8 @@ pub const ShardManager = struct {
 
     fn persistSplitState(self: *ShardManager) !void {
         if (self.split_state) |*state| {
-            var buf: [1024]u8 = undefined;
-            const encoded = encodeSplitState(&buf, state);
+            const encoded = try encodeSplitStateAlloc(self.alloc, state);
+            defer self.alloc.free(encoded);
             try storePut(self, split_state_key, encoded);
         }
     }
@@ -452,6 +482,12 @@ pub const ShardManager = struct {
         const end = try self.alloc.dupe(u8, byte_range.end);
         errdefer self.alloc.free(end);
 
+        self.replaceByteRangeOwned(start, end);
+    }
+
+    /// Replaces the in-memory range without allocation. Ownership of both
+    /// buffers transfers to the shard manager.
+    pub fn replaceByteRangeOwned(self: *ShardManager, start: []u8, end: []u8) void {
         self.alloc.free(self.owned_range_start);
         self.alloc.free(self.owned_range_end);
         self.owned_range_start = start;
@@ -460,6 +496,14 @@ pub const ShardManager = struct {
             .start = self.owned_range_start,
             .end = self.owned_range_end,
         };
+    }
+
+    pub fn adoptOwnedByteRange(self: *ShardManager, start: []u8, end: []u8) void {
+        self.alloc.free(self.owned_range_start);
+        self.alloc.free(self.owned_range_end);
+        self.owned_range_start = start;
+        self.owned_range_end = end;
+        self.byte_range = .{ .start = start, .end = end };
     }
 
     pub fn getSplitState(self: *const ShardManager) ?SplitState {
@@ -874,6 +918,34 @@ fn testStoreGetAlloc(alloc: Allocator, store: *backend_erased.Store, key: []cons
     defer txn.abort();
     const raw = try txn.get(key);
     return try alloc.dupe(u8, raw);
+}
+
+test "shard split state codec preserves multi-kibibyte boundaries" {
+    const split_key = try std.testing.allocator.alloc(u8, 8 * 1024);
+    defer std.testing.allocator.free(split_key);
+    @memset(split_key, 'm');
+    const original_range_end = try std.testing.allocator.alloc(u8, 12 * 1024);
+    defer std.testing.allocator.free(original_range_end);
+    @memset(original_range_end, 'z');
+    const state = SplitState{
+        .phase = .splitting,
+        .split_key = split_key,
+        .new_shard_id = 42,
+        .started_at = 17,
+        .original_range_end = original_range_end,
+    };
+
+    const encoded = try encodeSplitStateAlloc(std.testing.allocator, &state);
+    defer std.testing.allocator.free(encoded);
+    const decoded = decodeSplitState(encoded) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, split_key, decoded.split_key);
+    try std.testing.expectEqualSlices(u8, original_range_end, decoded.original_range_end);
+
+    var trailing = try std.testing.allocator.alloc(u8, encoded.len + 1);
+    defer std.testing.allocator.free(trailing);
+    @memcpy(trailing[0..encoded.len], encoded);
+    trailing[encoded.len] = 0;
+    try std.testing.expect(decodeSplitState(trailing) == null);
 }
 
 test "shard split basic lifecycle" {

@@ -16,6 +16,7 @@ const std = @import("std");
 const scraping = @import("antfly_scraping");
 
 const common_secrets = @import("../../common/secrets.zig");
+const metadata_api = @import("../../metadata/api.zig");
 const metadata_mod = @import("../../metadata/mod.zig");
 const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig");
 const asset_producer_mod = @import("../../storage/db/enrichment/asset_producer.zig");
@@ -29,12 +30,16 @@ const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
+const coverage_policy_mod = @import("../coverage_policy.zig");
+const indexes_api = @import("../indexes.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_write_core = @import("core.zig");
 const table_write_index_config = @import("index_config.zig");
 
 const backend_current_root_generation = table_write_core.backend_current_root_generation;
+const StartupCatchUpMetadata = table_write_core.StartupCatchUpMetadata;
+const local_schema_json_key = db_mod.local_schema_json_key;
 const extractIndexConfigJson = table_write_index_config.extractIndexConfigJson;
 const parseIndexKind = table_write_index_config.parseIndexKind;
 
@@ -55,6 +60,8 @@ pub const ManagedDbOpenOptions = struct {
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
+    staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
+    identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
 };
 
 pub const ManagedDbEnrichmentSet = struct {
@@ -90,6 +97,12 @@ pub const ManagedDbEnrichmentSet = struct {
         self.sparse = null;
         self.asset_runtime = null;
         self.generated = false;
+    }
+
+    fn takeConfig(self: *@This()) db_mod.enrichment_runtime.Config {
+        const owned = self.config();
+        self.forgetTransferred();
+        return owned;
     }
 };
 
@@ -136,6 +149,25 @@ pub const TableManagedMetadata = struct {
     }
 };
 
+pub fn managedDbOpenModeDrainsResolverBackfill(mode: ManagedDbOpenMode) bool {
+    // default_async is the Raft apply path. Resolver/promotion catch-up can
+    // issue cross-shard writes whose completion requires future Raft applies,
+    // so waiting here creates a cyclic dependency and wedges every group on
+    // this apply thread. DB.open already starts the background workers that
+    // drain the same backlog without blocking replicated application.
+    return mode != .default_async;
+}
+
+test "managed db open modes never drain resolver backfill on raft apply" {
+    try std.testing.expect(!managedDbOpenModeDrainsResolverBackfill(.default_async));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.default));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.writer_no_replay));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.startup_catch_up));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.restore_repair));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.query_readonly));
+    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.status_only));
+}
+
 pub fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAAsyncEffectMirror) ?db_mod.HAAsyncEffectMirror {
     return switch (mode) {
         .default, .default_async, .writer_no_replay => mirror,
@@ -152,48 +184,16 @@ pub fn applyLocalTableSchemaJson(
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
-    try db.applyTableSchemaJson(alloc, schema_json, .{});
-}
-
-pub fn rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len == 0) "{}" else indexes_json, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    const stats = try db.stats(alloc);
-    defer db_mod.types.freeDBStats(alloc, stats);
-
-    var it = root.iterator();
-    while (it.next()) |entry| {
-        const index_name = entry.key_ptr.*;
-        if (!std.mem.startsWith(u8, index_name, "full_text_index_v")) continue;
-        if ((try parseIndexKind(entry.value_ptr.*)) != .full_text) continue;
-        const current = findDbIndexStats(stats.indexes, index_name) orelse continue;
-        if (current.doc_count != 0) continue;
-
-        _ = try db.deleteIndex(index_name);
-        const config_json = try extractIndexConfigJson(alloc, index_name, entry.value_ptr.*);
-        defer alloc.free(config_json);
-        try db.addIndex(.{
-            .name = index_name,
-            .kind = .full_text,
-            .config_json = config_json,
-        });
-    }
-}
-
-fn findDbIndexStats(indexes: []const db_mod.types.DBIndexStats, index_name: []const u8) ?db_mod.types.DBIndexStats {
-    for (indexes) |index| {
-        if (std.mem.eql(u8, index.name, index_name)) return index;
-    }
-    return null;
+    if (schema_json.len == 0) return;
+    const previous_schema_json = try loadLocalTableSchemaJson(alloc, db);
+    defer if (previous_schema_json) |value| alloc.free(value);
+    const marker_changed = if (previous_schema_json) |value|
+        !std.mem.eql(u8, value, schema_json)
+    else
+        true;
+    try db.applyTableSchemaJson(alloc, schema_json, .{
+        .persist_local_schema_json = marker_changed,
+    });
 }
 
 pub fn corruptEmbeddingArtifactInDb(
@@ -247,16 +247,35 @@ pub fn corruptEmbeddingArtifactInDb(
     return false;
 }
 
+pub const ManagedIndexCreateCatchUp = enum {
+    complete,
+    retry,
+    delegated,
+};
+
 pub fn catchUpManagedIndexCreate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     index_name: []const u8,
-) !void {
+    delegate_durable_generation_repair: bool,
+) !ManagedIndexCreateCatchUp {
     if (db.core.index_manager.get(index_name)) |cfg| {
         if (cfg.kind == .graph) {
             try db.core.index_manager.syncAll(true);
-            return;
+            return .complete;
         }
+    }
+
+    var generation_repair = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .index,
+        .index_name = index_name,
+        .limit = 1,
+    }, .{
+        .defer_durable_index_repair_execution = delegate_durable_generation_repair,
+    });
+    defer generation_repair.deinit(alloc);
+    if (generation_repair.debt_remaining) {
+        return if (delegate_durable_generation_repair) .delegated else .retry;
     }
 
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
@@ -269,20 +288,130 @@ pub fn catchUpManagedIndexCreate(
     }
 
     try db.runUntilIdle();
-    try db.catchUpPendingDerivedReplay();
-    try db.runUntilIdle();
 
     if (try db.hasPendingDenseArtifactRebuild(alloc)) {
         _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-        try db.runUntilIdle();
-        try db.catchUpPendingDerivedReplay();
         try db.runUntilIdle();
     }
     if (requires_enrichment_replay) {
         const debt_remaining = try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
         if (debt_remaining) try markManagedIndexRepairRequired(alloc, db, index_name);
     }
+    try drainManagedIndexReplayUntilConverged(alloc, db, index_name);
     try db.core.index_manager.syncAll(true);
+    return .complete;
+}
+
+pub fn catchUpManagedIndexCreateSynchronously(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    while (true) {
+        switch (try catchUpManagedIndexCreate(alloc, db, index_name, false)) {
+            .complete => return,
+            .retry => continue,
+            .delegated => return error.ManagedIndexRepairDelegatedWithoutOwner,
+        }
+    }
+}
+
+test "managed structural catch-up delegates durable generation repair without rebuilding inline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-structural-repair-delegation",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    _ = (try db.admitManagedFullTextIndex(.{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(
+        ManagedIndexCreateCatchUp.delegated,
+        try catchUpManagedIndexCreate(alloc, &db, "full_text_index_v1", true),
+    );
+
+    const summary = try db.indexRepairIntentSummary(alloc);
+    try std.testing.expectEqual(@as(usize, 1), summary.runnable);
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    const index = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "full_text_index_v1")) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+}
+
+const ManagedIndexReplayPosition = struct {
+    applied_sequence: u64,
+    target_sequence: u64,
+
+    fn caughtUp(self: @This()) bool {
+        return self.applied_sequence >= self.target_sequence;
+    }
+};
+
+fn managedIndexReplayPosition(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !ManagedIndexReplayPosition {
+    const replay_debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (replay_debt) |*status| status.deinit(alloc);
+        alloc.free(replay_debt);
+    }
+    for (replay_debt) |status| {
+        if (!std.mem.eql(u8, status.index_name, index_name)) continue;
+        return .{
+            .applied_sequence = status.applied_sequence,
+            .target_sequence = status.target_sequence,
+        };
+    }
+    return error.IndexNotFound;
+}
+
+fn drainManagedIndexReplayUntilConverged(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    const max_passes: usize = 16;
+    var previous: ?ManagedIndexReplayPosition = null;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        try db.runUntilIdle();
+        const current = try managedIndexReplayPosition(alloc, db, index_name);
+        if (current.caughtUp()) return;
+
+        if (previous) |last| {
+            if (current.applied_sequence <= last.applied_sequence and
+                current.target_sequence <= last.target_sequence)
+            {
+                return error.ManagedIndexReplayDidNotConverge;
+            }
+        }
+        previous = current;
+        try db.catchUpPendingDerivedReplay();
+    }
+    return error.ManagedIndexReplayDidNotConverge;
 }
 
 fn managedIndexEmbeddingArtifactName(db: *db_mod.DB, index_name: []const u8) ?[]const u8 {
@@ -477,7 +606,9 @@ pub fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
 }
 
 pub fn isTransientReplayVisibilityError(err: anyerror) bool {
-    return err == error.WriterLocked or err == error.ReplayDocumentNotVisible;
+    return err == error.WriterLocked or
+        err == error.ReplayDocumentNotVisible or
+        err == error.AutoBulkIngestBusy;
 }
 
 pub fn loadTableIndexesJson(
@@ -499,9 +630,9 @@ pub fn loadTableManagedMetadata(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-    const indexes_json = try alloc.dupe(u8, table.indexes_json);
-    errdefer alloc.free(indexes_json);
-    const schema_json = try alloc.dupe(u8, table.schema_json);
+    const indexes_json = if (table.indexes_json.len == 0) null else try alloc.dupe(u8, table.indexes_json);
+    errdefer if (indexes_json) |value| alloc.free(value);
+    const schema_json = if (table.schema_json.len == 0) null else try alloc.dupe(u8, table.schema_json);
     return .{
         .indexes_json = indexes_json,
         .schema_json = schema_json,
@@ -520,13 +651,90 @@ pub fn loadTableIdentityNamespaceForGroup(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     for (snapshot.ranges) |range| {
         if (range.table_id != table.table_id or range.group_id != group_id) continue;
-        return .{
-            .table_id = table.table_id,
-            .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
-            .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
-        };
+        return tableIdentityNamespaceForRange(table.*, range);
     }
     return null;
+}
+
+fn tableIdentityNamespaceForRange(
+    table: metadata_table_manager.TableRecord,
+    range: metadata_table_manager.RangeRecord,
+) doc_identity.Namespace {
+    return tableIdentityNamespaceForRangeId(table.table_id, range);
+}
+
+pub fn tableIdentityNamespaceForRangeId(
+    table_id: u64,
+    range: metadata_table_manager.RangeRecord,
+) doc_identity.Namespace {
+    return .{
+        .table_id = table_id,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+    };
+}
+
+pub const RaftSnapshotCatalogContract = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: metadata_api.MetadataClusterIncarnation,
+    table_id: u64,
+    table_name: []u8,
+    schema_json: []u8,
+    indexes_json: []u8,
+    range: metadata_table_manager.RangeRecord,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.schema_json);
+        alloc.free(self.indexes_json);
+        metadata_table_manager.freeRange(alloc, self.range);
+        self.* = undefined;
+    }
+
+    pub fn publicationContract(self: *const @This()) metadata_api.CatalogPublicationContract {
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
+            .table_id = self.table_id,
+            .table_name = self.table_name,
+            .schema_json = self.schema_json,
+            .indexes_json = self.indexes_json,
+            .range = self.range,
+        };
+    }
+};
+
+pub fn captureRaftSnapshotCatalogContract(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    group_id: u64,
+    expected_table_id: u64,
+    expected_table_name: []const u8,
+) !RaftSnapshotCatalogContract {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const range = metadata_mod.findAdminRange(&snapshot, group_id) orelse return error.CatalogChanged;
+    if (range.table_id != expected_table_id) return error.CatalogChanged;
+    const table = metadata_mod.findAdminTable(&snapshot, expected_table_id) orelse return error.CatalogChanged;
+    if (!std.mem.eql(u8, table.name, expected_table_name)) return error.CatalogChanged;
+    const metadata_incarnation = snapshot.status.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
+
+    const table_name = try alloc.dupe(u8, table.name);
+    errdefer alloc.free(table_name);
+    const schema_json = try alloc.dupe(u8, table.schema_json);
+    errdefer alloc.free(schema_json);
+    const indexes_json = try alloc.dupe(u8, table.indexes_json);
+    errdefer alloc.free(indexes_json);
+    const owned_range = try metadata_table_manager.cloneRange(alloc, range.*);
+    return .{
+        .metadata_group_id = snapshot.status.metadata_group_id,
+        .metadata_incarnation = metadata_incarnation,
+        .table_id = expected_table_id,
+        .table_name = table_name,
+        .schema_json = schema_json,
+        .indexes_json = indexes_json,
+        .range = owned_range,
+    };
 }
 
 pub fn findTableRecord(tables: []const metadata_table_manager.TableRecord, table_id: u64) ?metadata_table_manager.TableRecord {
@@ -544,8 +752,149 @@ pub fn findRangeRecord(ranges: []const metadata_table_manager.RangeRecord, group
 }
 
 pub fn validateProvisionedDbIdentityNamespaceExpected(expected: ?doc_identity.Namespace, db: *const db_mod.DB) !void {
+    return validateProvisionedDbIdentityNamespaceWithPolicy(expected, .exact, db);
+}
+
+pub fn validateProvisionedDbIdentityNamespaceWithPolicy(
+    expected: ?doc_identity.Namespace,
+    validation: StartupCatchUpMetadata.IdentityValidation,
+    db: *const db_mod.DB,
+) !void {
     const namespace = expected orelse return;
-    if (!db.core.identity_namespace.eql(namespace)) return error.DocIdentityNamespaceMismatch;
+    const valid = switch (validation) {
+        .exact => db.core.identity_namespace.eql(namespace),
+        .reassign_same_table => db.core.identity_namespace.table_id ==
+            namespace.table_id,
+    };
+    if (!valid) return error.DocIdentityNamespaceMismatch;
+}
+
+pub fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u64) !?doc_identity.Namespace {
+    const replication = req.split_replication orelse {
+        if (req.split_checkpoint) |checkpoint| {
+            if (checkpoint.kind != .source_ack) return error.MissingSplitReplicationContext;
+        }
+        return null;
+    };
+    if (replication.transition_id == 0 or replication.attempt_epoch == 0 or
+        replication.source_group_id == replication.destination_group_id or
+        replication.destination_group_id != group_id or
+        replication.identity_namespace.table_id == 0 or
+        replication.identity_namespace.shard_id == 0 or
+        replication.identity_namespace.range_id == 0 or
+        req.split_transition != null)
+    {
+        return error.InvalidBatchRequest;
+    }
+    if (req.split_checkpoint) |checkpoint| {
+        if (checkpoint.kind == .source_ack or
+            replication.operation != .checkpoint or
+            checkpoint.transition_id != replication.transition_id or
+            checkpoint.attempt_epoch != replication.attempt_epoch or
+            checkpoint.source_group_id != replication.source_group_id or
+            checkpoint.destination_group_id != replication.destination_group_id or
+            checkpoint.delta_sequence != replication.sequence)
+        {
+            return error.InvalidBatchRequest;
+        }
+        if (req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or
+            req.graph_deletes.len != 0 or req.predicates.len != 0 or req.writes.len != 0)
+        {
+            return error.InvalidBatchRequest;
+        }
+    } else if (replication.operation == .checkpoint) {
+        return error.MissingSplitReplicationCheckpoint;
+    }
+    return replication.identity_namespace;
+}
+
+pub fn validateSplitCheckpointGroup(checkpoint: ?db_mod.types.SplitReplicationCheckpoint, group_id: u64) !void {
+    const value = checkpoint orelse return;
+    if (value.transition_id == 0) return error.InvalidBatchRequest;
+    switch (value.kind) {
+        .destination_begin, .destination_complete => if (value.destination_group_id != group_id) return error.InvalidBatchRequest,
+        .source_ack => if (value.source_group_id != group_id) return error.InvalidBatchRequest,
+    }
+}
+
+pub fn validateSplitReplicationIdentityAgainstCatalog(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    replication: db_mod.types.SplitReplicationContext,
+) !void {
+    const source_namespace = (try loadTableIdentityNamespaceForGroup(
+        alloc,
+        catalog,
+        table_name,
+        replication.source_group_id,
+    )) orelse return error.MissingIdentityNamespace;
+    if (!source_namespace.eql(replication.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+}
+
+pub fn openManagedDbForReplicatedApply(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    split_identity_namespace: ?doc_identity.Namespace,
+) !db_mod.DB {
+    const namespace = split_identity_namespace orelse
+        return try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+            alloc,
+            path,
+            catalog,
+            table_name,
+            group_id,
+            backend_runtime,
+            ha_write_gate,
+            ha_async_mirror,
+        );
+    const indexes_json = try loadTableIndexesJson(alloc, catalog, table_name);
+    defer if (indexes_json) |value| alloc.free(value);
+    const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
+    var db = if (indexes_json) |value|
+        try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+            alloc,
+            path,
+            value,
+            null,
+            null,
+            backend_current_root_generation,
+            null,
+            .default_async,
+            backend_runtime,
+            null,
+            null,
+            null,
+            namespace,
+            .{
+                .drain_resolver_backfill = false,
+                .ha_write_gate = ha_write_gate,
+                .ha_async_effect_mirror = effective_ha_mirror,
+                .ha_async_batch_mirror = effective_ha_mirror,
+                .ha_async_metadata_mirror = effective_ha_mirror,
+            },
+        )
+    else
+        try db_mod.DB.open(alloc, path, .{
+            .backend_runtime = backend_runtime,
+            .identity_namespace = namespace,
+            .prefer_existing_identity_namespace = true,
+            .ha_write_gate = ha_write_gate,
+            .ha_async_effect_mirror = effective_ha_mirror,
+            .ha_async_batch_mirror = effective_ha_mirror,
+            .ha_async_metadata_mirror = effective_ha_mirror,
+            .open_mode = .writer_no_replay,
+            .index_open_parallelism = 1,
+        });
+    errdefer db.close();
+    try validateProvisionedDbIdentityNamespaceExpected(namespace, &db);
+    return db;
 }
 
 pub fn validateProvisionedDbIdentityNamespace(
@@ -754,7 +1103,7 @@ fn resolveWritesForSchemaValidation(
         defer if (existing_from_db) |body| alloc.free(body);
         const existing = existing_from_request orelse existing_from_db;
         const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
-            error.InvalidArgument => return error.InvalidBatchRequest,
+            error.InvalidArgument, error.UnsupportedTransformOperation => return error.InvalidBatchRequest,
             else => return err,
         } orelse continue;
         var resolved_owned = true;
@@ -1279,6 +1628,58 @@ pub fn openManagedDbForStatusWithCache(
     );
 }
 
+pub fn openManagedDbForStatusWithCacheMode(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    mode: ManagedDbOpenMode,
+) !db_mod.DB {
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
+        var db = try db_mod.DB.open(alloc, path, .{
+            .lsm_cache = lsm_cache,
+            .hbc_cache = hbc_cache,
+            .lsm_root_generation = lsm_root_generation,
+            .resource_manager = resource_manager,
+            .backend_runtime = backend_runtime,
+            .open_mode = switch (mode) {
+                .query_readonly => .query_readonly,
+                else => .status_only,
+            },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .transaction_recovery = .{ .enabled = false },
+            .text_merge = .{ .enabled = false },
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
+        });
+        errdefer db.close();
+        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        return db;
+    };
+    defer alloc.free(indexes_json);
+
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
+        alloc,
+        path,
+        indexes_json,
+        lsm_cache,
+        hbc_cache,
+        lsm_root_generation,
+        resource_manager,
+        mode,
+        backend_runtime,
+        identity_namespace,
+    );
+}
+
 pub fn openManagedDbForStatusWithIndexesJsonAndCache(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -1472,6 +1873,97 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     );
 }
 
+pub fn reconfigureManagedDbEnrichments(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) !void {
+    var enrichments = try createManagedDbEnrichments(
+        db.runtime_alloc,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        inference_api_url,
+        secret_store,
+        remote_content,
+    );
+    errdefer enrichments.deinit(db.runtime_alloc);
+    // An empty replacement is meaningful: dropping the last managed producer
+    // must retire the old provider instead of leaving an unused runtime alive.
+    try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
+}
+
+pub fn applyIndexCreateToCachedDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    index_name: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) !void {
+    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return error.InvalidTableIndexMetadata;
+    defer lookup.deinit();
+
+    const kind = try parseIndexKind(lookup.config);
+    const config_json = try extractIndexConfigJson(alloc, index_name, lookup.config);
+    defer alloc.free(config_json);
+
+    const owned_name = try alloc.dupe(u8, index_name);
+    defer alloc.free(owned_name);
+    try reconfigureManagedDbEnrichments(
+        alloc,
+        db,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        inference_api_url,
+        secret_store,
+        remote_content,
+    );
+    db.addIndex(.{
+        .name = owned_name,
+        .kind = kind,
+        .config_json = config_json,
+        .coverage_generation = coverage_policy_mod.incarnation(lookup.config) orelse 0,
+    }) catch |err| switch (err) {
+        error.IndexAlreadyExists => {},
+        else => return err,
+    };
+}
+
+fn reconcileDbArtifactEnrichmentsFromIndexesJson(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+) !void {
+    const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    indexes_api.sortArtifactEnrichmentsByDependency(enrichments);
+    for (enrichments) |cfg| {
+        _ = try db.upsertEnrichment(cfg);
+    }
+}
+
+pub fn existingPrimaryBackend() @TypeOf((db_mod.OpenOptions{}).primary_backend) {
+    return switch ((db_mod.OpenOptions{}).primary_backend) {
+        .lsm => |default_options| blk: {
+            var options = default_options;
+            options.backend.create_if_missing = false;
+            break :blk .{ .lsm = options };
+        },
+        else => unreachable,
+    };
+}
+
 pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -1489,8 +1981,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
     const mode_consumes_enrichments = switch (mode) {
-        .default, .default_async, .writer_no_replay, .restore_repair => true,
-        .startup_catch_up, .query_readonly, .status_only => false,
+        .default, .default_async, .writer_no_replay, .startup_catch_up, .restore_repair => true,
+        .query_readonly, .status_only => false,
     };
 
     var enrichments = if (mode_consumes_enrichments)
@@ -1600,10 +2092,17 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .ha_write_gate = open_options.ha_write_gate,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
-                    .start_optional_runtimes = false,
+                    .enrichment = if (enrichment_cfg) |configured| blk: {
+                        var bounded = configured;
+                        bounded.inline_retry_max_attempts = 1;
+                        break :blk bounded;
+                    } else null,
+                    .start_optional_runtimes = enrichment_cfg != null,
+                    .start_optional_runtime_workers = false,
                     .ttl_cleanup = .{ .enabled = false },
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
+                    .staged_generation = open_options.staged_generation,
                 }),
                 .restore_repair => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -1619,10 +2118,12 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .enrichment = enrichment_cfg,
                         .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .writer_no_replay,
-                        .start_index_workers = true,
+                        .start_index_workers = false,
+                        .start_optional_runtime_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
+                        .staged_generation = open_options.staged_generation,
                     })
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -1638,9 +2139,11 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
+                        .start_optional_runtimes = false,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
+                        .staged_generation = open_options.staged_generation,
                     }),
                 .query_readonly => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -1721,16 +2224,25 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     }.run;
 
     var db = blk: {
-        const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
+        const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
         const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
-        enrichments.forgetTransferred();
         break :blk opened;
     };
     var db_open = true;
     errdefer if (db_open) db.close();
 
-    try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
-    if (mode == .status_only) return db;
+    try validateProvisionedDbIdentityNamespaceWithPolicy(
+        identity_namespace,
+        options.identity_validation,
+        &db,
+    );
+    if (mode == .status_only or mode == .query_readonly) return db;
+
+    if ((mode == .startup_catch_up or mode == .restore_repair) and
+        db.core.index_manager.hasLoadFailures())
+    {
+        return db;
+    }
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
@@ -1743,13 +2255,16 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         else
             ManagedDbEnrichmentSet{};
         db = blk: {
-            const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
+            const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
-            enrichments.forgetTransferred();
             break :blk opened;
         };
         db_open = true;
-        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        try validateProvisionedDbIdentityNamespaceWithPolicy(
+            identity_namespace,
+            options.identity_validation,
+            &db,
+        );
     }
 
     if ((mode == .default or mode == .default_async) and summary.indexes_added > 0) {

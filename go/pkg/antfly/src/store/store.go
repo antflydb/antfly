@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -283,8 +284,12 @@ func (m *Store) ID() types.ID {
 	return m.config.ID
 }
 
-func (m *Store) S3Info() *common.S3Info {
-	return &m.antflyConfig.Storage.S3
+func (m *Store) ResolveS3Info(connectionID, capability, location string) (common.S3Info, error) {
+	return m.antflyConfig.ResolveS3Info(connectionID, capability, location)
+}
+
+func (m *Store) ResolveFilesystemPath(connectionID, capability, location string) (string, error) {
+	return m.antflyConfig.ResolveFilesystemPath(connectionID, capability, location)
 }
 
 // ErrorcC dynamically receives new error channels from shards and fans them in
@@ -534,6 +539,7 @@ type ShardStartConfig struct {
 
 	Timestamp         []byte // Timestamp of the shard start, used for conf changes
 	InitWithDBArchive string
+	Context           context.Context
 }
 
 func (m *Store) StartRaftGroup(
@@ -606,10 +612,18 @@ func (m *Store) StartRaftGroup(
 	// If RestoreConfig is set but InitWithDBArchive is not (local client path),
 	// copy the backup file from the source location to the snap directory.
 	if conf.InitWithDBArchive == "" && conf.RestoreConfig != nil {
-		if after, ok := strings.CutPrefix(conf.RestoreConfig.Location, "file://"); ok {
+		effectiveLocation, locationErr := common.EffectiveFilesystemLocation(*conf.RestoreConfig)
+		if locationErr != nil {
+			return fmt.Errorf("resolving local restore location: %w", locationErr)
+		}
+		if after, ok := strings.CutPrefix(effectiveLocation, "file://"); ok {
+			restoreCtx := conf.Context
+			if restoreCtx == nil {
+				restoreCtx = context.Background()
+			}
 			archiveName, copyErr := copyLocalBackupToSnapDir(
-				lg, snapStore, shardID, after,
-				conf.RestoreConfig.BackupID, conf.RestoreConfig.Format,
+				restoreCtx, lg, snapStore, shardID, after,
+				conf.RestoreConfig,
 			)
 			if copyErr != nil {
 				return fmt.Errorf("copying local backup for restore: %w", copyErr)
@@ -639,9 +653,9 @@ func (m *Store) StartRaftGroup(
 	var commitC <-chan *raft.Commit
 	var raftNode raft.RaftNode
 
-	// In swarm mode, bypass Raft consensus with a pass-through channel
-	if m.antflyConfig != nil && m.antflyConfig.SwarmMode {
-		lg.Info("Starting shard in swarm mode (bypassing Raft)")
+	// In standalone mode, bypass Raft consensus with a pass-through channel
+	if m.antflyConfig != nil && m.antflyConfig.IsStandalone() {
+		lg.Info("Starting shard in standalone mode (bypassing Raft)")
 		commitC, errorC = m.createPassThroughChannels(proposeC)
 	} else {
 		raftConf := raft.RaftNodeConfig{
@@ -671,13 +685,13 @@ func (m *Store) StartRaftGroup(
 	dbDir := common.StorageDBDir(dataDir, shardID, m.config.ID)
 	var err2 error
 
-	// In swarm mode without Raft, provide a stub function that returns the restore archive ID if set,
-	// or an empty snapshot ID. This allows backup/restore to work in swarm mode.
+	// In standalone mode without Raft, provide a stub function that returns the restore archive ID if set,
+	// or an empty snapshot ID. This allows backup/restore to work in standalone mode.
 	var getSnapshotID func(ctx context.Context) (string, error)
 	if raftNode != nil {
 		getSnapshotID = raftNode.GetSnapshotID
 	} else {
-		// In swarm mode, return the restore archive ID if provided, otherwise empty
+		// In standalone mode, return the restore archive ID if provided, otherwise empty
 		initArchive := conf.InitWithDBArchive
 		getSnapshotID = func(ctx context.Context) (string, error) {
 			return initArchive, nil
@@ -741,7 +755,7 @@ func (m *Store) StartRaftGroup(
 
 		// Wait for the Raft node to fully stop by draining errorC.
 		// The Raft node closes errorC when it stops (see raftNode.stop()).
-		// In swarm mode, errorC is closed by the pass-through goroutine.
+		// In standalone mode, errorC is closed by the pass-through goroutine.
 		if errorC != nil {
 			for range errorC {
 				// Drain any remaining errors
@@ -762,7 +776,7 @@ func (m *Store) StartRaftGroup(
 	if raftNode != nil {
 		raftNode.SetLeaderFactory(dbw.LeaderFactory)
 	} else {
-		// In swarm mode without Raft, call the leader factory directly
+		// In standalone mode without Raft, call the leader factory directly
 		// since we're always the leader. Use a cancellable context so we
 		// can properly stop the LeaderFactory when the shard is removed.
 		ctx, cancel := context.WithCancel(context.Background())
@@ -813,34 +827,32 @@ func (m *Store) StartRaftGroup(
 
 // copyLocalBackupToSnapDir copies a backup file from a local directory into the
 // shard's snap store and returns the initWithDBArchive name to use. This handles
-// the local-client restore path (swarm mode) where the HTTP multipart upload
+// the local-client restore path (standalone mode) where the HTTP multipart upload
 // path in api.go is not used.
 func copyLocalBackupToSnapDir(
+	ctx context.Context,
 	lg *zap.Logger,
 	snapStore snapstore.SnapStore,
 	shardID types.ID,
 	localDir string,
-	backupID string,
-	format common.BackupFormat,
+	restoreConfig *common.BackupConfig,
 ) (string, error) {
-	backupFileName := common.ShardBackupFileName(backupID, shardID)
-	format = common.NormalizeBackupFormat(format)
+	if restoreConfig == nil {
+		return "", errors.New("restore configuration is required")
+	}
+	format, err := common.ValidateBackupFormat(restoreConfig.Format)
+	if err != nil {
+		return "", err
+	}
+	backupFileName := common.ShardBackupFileName(restoreConfig.BackupID, shardID)
 	if format == common.BackupFormatPortable {
-		backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
+		backupFileName = common.ShardPortableBackupFileName(restoreConfig.BackupID, shardID)
+	}
+	artifact, err := restoreArtifactForFile(restoreConfig, backupFileName)
+	if err != nil {
+		return "", err
 	}
 	srcPath := filepath.Join(localDir, backupFileName)
-
-	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		alternateName := common.ShardBackupFileName(backupID, shardID)
-		if format == common.BackupFormatNative {
-			alternateName = common.ShardPortableBackupFileName(backupID, shardID)
-		}
-		alternatePath := filepath.Join(localDir, alternateName)
-		if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-			backupFileName = alternateName
-			srcPath = alternatePath
-		}
-	}
 
 	f, err := os.Open(filepath.Clean(srcPath))
 	if err != nil {
@@ -848,8 +860,34 @@ func copyLocalBackupToSnapDir(
 	}
 	defer func() { _ = f.Close() }()
 
-	if err := snapStore.Put(context.Background(), backupFileName, f); err != nil {
-		return "", fmt.Errorf("storing backup in snap dir: %w", err)
+	reader := io.Reader(f)
+	var (
+		pipeReader *io.PipeReader
+		verifyDone chan error
+	)
+	if artifact != nil {
+		pipeReader, pipeWriter := io.Pipe()
+		verifyDone = make(chan error, 1)
+		go func() {
+			verifyErr := common.VerifyBackupArtifact(
+				ctx,
+				io.TeeReader(f, pipeWriter),
+				*artifact,
+			)
+			_ = pipeWriter.CloseWithError(verifyErr)
+			verifyDone <- verifyErr
+		}()
+		reader = pipeReader
+	}
+	putErr := snapStore.Put(ctx, backupFileName, reader)
+	if pipeReader != nil {
+		_ = pipeReader.CloseWithError(putErr)
+		if verifyErr := <-verifyDone; verifyErr != nil && putErr == nil {
+			putErr = verifyErr
+		}
+	}
+	if putErr != nil {
+		return "", fmt.Errorf("storing backup in snap dir: %w", putErr)
 	}
 
 	lg.Info("Copied local backup to snap directory",

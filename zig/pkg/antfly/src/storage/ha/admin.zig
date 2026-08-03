@@ -174,6 +174,14 @@ pub fn evaluateStandbyWrite(
     return try write_gate.evaluateStandby(standby, request);
 }
 
+pub fn evaluatePromotedPrimaryWrite(
+    primary: *const primary_mod.Primary,
+    handoff: standby_mod.PromotionHandoff,
+    request: write_gate.Request,
+) !write_gate.Decision {
+    return try write_gate.evaluatePromotedPrimary(primary, handoff, request);
+}
+
 pub fn evaluatePrimaryOwnerJob(
     primary: *const primary_mod.Primary,
     request: owner_job_gate.Request,
@@ -186,6 +194,14 @@ pub fn evaluateStandbyOwnerJob(
     request: owner_job_gate.Request,
 ) !owner_job_gate.Decision {
     return try owner_job_gate.evaluateStandby(standby, request);
+}
+
+pub fn evaluatePromotedPrimaryOwnerJob(
+    primary: *const primary_mod.Primary,
+    handoff: standby_mod.PromotionHandoff,
+    request: owner_job_gate.Request,
+) !owner_job_gate.Decision {
+    return try owner_job_gate.evaluatePromotedPrimary(primary, handoff, request);
 }
 
 pub fn assessPromotion(
@@ -227,7 +243,7 @@ pub fn promoteWithFence(
     standby: *standby_mod.Standby,
     request: FencedPromotionRequest,
 ) !FencedPromotionResult {
-    try validateFenceRequestForStandby(standby.identity, request.fence);
+    try validateFenceRequestForStandby(standby.identitySnapshot(), request.fence);
     const receipt = try fence_store.acquirePromotionFence(request.fence);
     defer fencing.freeReceipt(fence_store.alloc, receipt);
     return try promoteWithReceipt(alloc, standby, receipt);
@@ -248,7 +264,7 @@ fn promoteWithReceipt(
     standby: *standby_mod.Standby,
     receipt: fencing.Receipt,
 ) !FencedPromotionResult {
-    try validateFenceReceiptForStandby(standby.identity, receipt);
+    try validateFenceReceiptForStandby(standby.identitySnapshot(), receipt);
     const assessment = status.assessPromotionWithFence(standby, receipt);
     if (!assessment.can_promote) return error.PromotionNotAllowed;
 
@@ -312,7 +328,13 @@ pub fn markFormerPrimaryForReseed(
     assessment: rejoin.Assessment,
 ) !rejoin.ReseedResult {
     if (assessment.action != .reseed) return error.RejoinReseedNotAllowed;
-    try primary.markSlotReseedRequired(assessment.former_node_id);
+    primary.markSlotReseedRequired(assessment.former_node_id) catch |err| switch (err) {
+        error.SlotNotFound => {
+            try primary.createSlot(assessment.former_node_id, primary.lastLsn());
+            try primary.markSlotReseedRequired(assessment.former_node_id);
+        },
+        else => return err,
+    };
     return .{
         .node_id = assessment.former_node_id,
         .slot_name = assessment.former_node_id,
@@ -629,7 +651,7 @@ test "storage.ha admin acquires fence and promotes standby" {
     try std.testing.expectEqual(@as(u64, 1), result.fence_generation);
     try std.testing.expect(result.fence_token.len > 0);
     try std.testing.expectEqual(@as(u64, 3), result.promotion.switch_lsn);
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
     try std.testing.expect(!result.forced);
 
     const promoted_write = try evaluateStandbyWrite(&standby, .{ .expected_identity = result.promotion.new_identity });
@@ -692,7 +714,7 @@ test "storage.ha admin rejects mismatched fence identity for promotion" {
     });
     defer fencing.freeReceipt(alloc, wrong_receipt);
     try std.testing.expectError(error.WrongTimeline, promoteWithCurrentFence(alloc, &store, &standby));
-    try std.testing.expectEqual(@as(u64, identity.timeline_id), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, identity.timeline_id), standby.identitySnapshot().timeline_id);
 }
 
 test "storage.ha admin assesses former primary rejoin workflow" {

@@ -19,6 +19,8 @@ pub const Routes = struct {
     pub const head = "/metadata/v1/head";
     pub const status = "/metadata/v1/status";
     pub const admin_snapshot = "/metadata/v1/admin/snapshot";
+    pub const internal_catalog_publication_check = "/internal/v1/catalog/publication-check";
+    pub const internal_catalog_table_publication_check = "/internal/v1/catalog/table-publication-check";
     pub const active_transitions = "/metadata/v1/transitions/active";
     pub const table_ranges_prefix = "/metadata/v1/tables/";
     pub const table_ranges_suffix = "/ranges";
@@ -39,6 +41,7 @@ pub const Routes = struct {
     pub const internal_extension_config_suffix = "/config";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_table_restore_suffix = "/restore";
+    pub const internal_table_definition_suffix = "/definition";
     pub const internal_table_schema_suffix = "/schema";
     pub const internal_table_indexes_infix = "/indexes/";
     pub const internal_table_enrichments_infix = "/enrichments/";
@@ -201,6 +204,10 @@ pub const Routes = struct {
         return matchInternalTablePath(path, internal_table_schema_suffix);
     }
 
+    pub fn matchInternalTableDefinition(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_table_definition_suffix);
+    }
+
     pub fn matchInternalTableRestore(path: []const u8) ?InternalTablePath {
         return matchInternalTablePath(path, internal_table_restore_suffix);
     }
@@ -316,6 +323,7 @@ test "metadata routes match dynamic paths" {
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTable("/internal/v1/tables/docs").?.table_name);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTableRestore("/internal/v1/tables/docs/restore").?.table_name);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTableSchema("/internal/v1/tables/docs/schema").?.table_name);
+    try std.testing.expectEqualStrings("docs", Routes.matchInternalTableDefinition("/internal/v1/tables/docs/definition").?.table_name);
     const table_index = Routes.matchInternalTableIndex("/internal/v1/tables/docs/indexes/embed_idx").?;
     try std.testing.expectEqualStrings("docs", table_index.table_name);
     try std.testing.expectEqualStrings("embed_idx", table_index.index_name);

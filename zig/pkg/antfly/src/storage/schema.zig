@@ -29,7 +29,7 @@ const DocStore = docstore.DocStore;
 const lsm_backend = @import("lsm_backend.zig");
 const lmdb = @import("lmdb.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 fn cleanupTestDir(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -2733,15 +2733,17 @@ pub const RelationalIndexRangePromotionResult = enum {
 };
 
 /// Save a schema to DocStore.
-pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
-    try saveSchemaWithMetadata(store, alloc, schema, &.{});
+pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !bool {
+    return try saveSchemaWithMetadata(store, alloc, schema, &.{});
 }
 
 /// Save a schema and schema-scoped metadata to DocStore in one durable
 /// transaction so every local schema surface advances together.
-pub fn saveSchemaWithMetadata(store: anytype, alloc: Allocator, schema: TableSchema, metadata_puts: []const SchemaMetadataPut) !void {
+pub fn saveSchemaWithMetadata(store: anytype, alloc: Allocator, schema: TableSchema, metadata_puts: []const SchemaMetadataPut) !bool {
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
+    if (try activeSchemaDataMatches(store, alloc, data)) return false;
+
     const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
     defer alloc.free(versioned_key);
     const previous_schema = try loadSchema(store, alloc);
@@ -2774,6 +2776,19 @@ pub fn saveSchemaWithMetadata(store: anytype, alloc: Allocator, schema: TableSch
         try txn.put(entry.key, entry.value);
     }
     try txn.commit();
+    return true;
+}
+
+fn activeSchemaDataMatches(store: anytype, alloc: Allocator, expected: []const u8) !bool {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(schema_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, raw, expected);
 }
 
 pub fn updateRelationalIndexGenerationRecord(
@@ -2799,7 +2814,7 @@ pub fn updateRelationalIndexGenerationRecord(
         if (index.generation_record) |old_record| freeRelationalIndexGenerationRecord(alloc, old_record);
         index.generation_record = record;
         index.lifecycle = progress.lifecycle;
-        try saveSchema(store, alloc, schema);
+        _ = try saveSchema(store, alloc, schema);
         return true;
     }
     return false;
@@ -2864,7 +2879,7 @@ pub fn promoteRelationalIndexRangesReady(
         index.generation_record = new_record;
         record_ranges_owned_by_schema = true;
         index.lifecycle = .ready;
-        try saveSchema(store, alloc, schema);
+        _ = try saveSchema(store, alloc, schema);
         return .promoted;
     }
     return if (saw_name) .wrong_access_method else .index_not_found;
@@ -2939,7 +2954,7 @@ pub fn promoteRelationalIndexComponentsReady(
             index.generation_record = record;
         }
 
-        try saveSchema(store, alloc, schema);
+        _ = try saveSchema(store, alloc, schema);
         return .promoted;
     }
     return if (saw_name) .wrong_access_method else .index_not_found;
@@ -5092,7 +5107,10 @@ test "schema save/load via DocStore" {
 
     // Save and reload
     const schema = TableSchema{ .version = 7, .default_type = "doc" };
-    try saveSchema(&store, alloc, schema);
+    try std.testing.expect(try saveSchema(&store, alloc, schema));
+    const saved_sequence = store.lastReplaySequence(0);
+    try std.testing.expect(!try saveSchema(&store, alloc, schema));
+    try std.testing.expectEqual(saved_sequence, store.lastReplaySequence(0));
 
     const loaded = (try loadSchema(&store, alloc)).?;
     defer freeSchema(alloc, loaded);
@@ -5153,7 +5171,7 @@ test "schema updates relational generation records by access method case" {
                 .owner_ranges = &ranges,
                 .generation_record = case.existing_record,
             };
-            try saveSchema(&store, alloc, .{
+            _ = try saveSchema(&store, alloc, .{
                 .version = 1,
                 .storage_mode = .relational,
                 .relational_indexes = &[_]RelationalIndex{index},
@@ -5275,7 +5293,7 @@ test "schema promotes relational access-method ranges ready by generation case" 
                 .owner_ranges = &ranges,
                 .generation_record = case.existing_record,
             };
-            try saveSchema(&store, alloc, .{
+            _ = try saveSchema(&store, alloc, .{
                 .version = 1,
                 .storage_mode = .relational,
                 .relational_indexes = &[_]RelationalIndex{index},
@@ -5436,7 +5454,7 @@ test "schema promotes algebraic component readiness by generation case" {
             .owner_ranges = &ranges,
             .generation_record = case.existing_record,
         };
-        try saveSchema(&store, alloc, .{
+        _ = try saveSchema(&store, alloc, .{
             .version = 1,
             .storage_mode = .relational,
             .relational_indexes = &[_]RelationalIndex{index},
@@ -5879,8 +5897,8 @@ test "schema preserves versioned history in DocStore" {
     defer store.close();
     defer cleanupTestDir(path);
 
-    try saveSchema(&store, alloc, .{ .version = 0, .default_type = "doc_v0" });
-    try saveSchema(&store, alloc, .{ .version = 1, .default_type = "doc_v1" });
+    _ = try saveSchema(&store, alloc, .{ .version = 0, .default_type = "doc_v0" });
+    _ = try saveSchema(&store, alloc, .{ .version = 1, .default_type = "doc_v1" });
 
     const active = (try loadSchema(&store, alloc)).?;
     defer freeSchema(alloc, active);
@@ -5910,8 +5928,8 @@ test "schema copy includes versioned history" {
     var dst = try DocStore.open(alloc, dst_path, .{});
     defer dst.close();
 
-    try saveSchema(&src, alloc, .{ .version = 0, .default_type = "doc_v0" });
-    try saveSchema(&src, alloc, .{ .version = 1, .default_type = "doc_v1" });
+    _ = try saveSchema(&src, alloc, .{ .version = 0, .default_type = "doc_v0" });
+    _ = try saveSchema(&src, alloc, .{ .version = 1, .default_type = "doc_v1" });
     try copySchemas(&src, &dst, alloc);
 
     const active = (try loadSchema(&dst, alloc)).?;
@@ -5939,7 +5957,7 @@ test "schema save upgrades legacy active-only schema into versioned history" {
     defer alloc.free(legacy_data);
     try store.put(schema_key, legacy_data);
 
-    try saveSchema(&store, alloc, .{ .version = 1, .default_type = "next_v1" });
+    _ = try saveSchema(&store, alloc, .{ .version = 1, .default_type = "next_v1" });
 
     const active = (try loadSchema(&store, alloc)).?;
     defer freeSchema(alloc, active);
@@ -5964,7 +5982,7 @@ test "schema save/load via memory backend store" {
     try std.testing.expect(none == null);
 
     const schema = TableSchema{ .version = 11, .default_type = "memdoc" };
-    try saveSchema(runtime, alloc, schema);
+    _ = try saveSchema(runtime, alloc, schema);
 
     const loaded = (try loadSchema(runtime, alloc)).?;
     defer freeSchema(alloc, loaded);
@@ -5984,7 +6002,7 @@ test "schema save/load via lsm backend store" {
     try std.testing.expect(none == null);
 
     const schema = TableSchema{ .version = 12, .default_type = "lsmdoc" };
-    try saveSchema(runtime, alloc, schema);
+    _ = try saveSchema(runtime, alloc, schema);
 
     const loaded = (try loadSchema(runtime, alloc)).?;
     defer freeSchema(alloc, loaded);

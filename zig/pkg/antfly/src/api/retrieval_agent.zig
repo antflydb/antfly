@@ -19,10 +19,11 @@ const generating_openapi = @import("antfly_generating_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const generating = @import("antfly_generating");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const query_api = @import("query.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const json_helpers = @import("../common/json_helpers.zig");
+const wildcard_mod = @import("../search/wildcard.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -231,6 +232,20 @@ pub const QueryRunner = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    pub const KeyPage = struct {
+        /// Owned keys in strictly ascending byte order, all greater than the
+        /// requested cursor.
+        keys: []const []const u8,
+        /// True only when no later matching key exists.
+        exhausted: bool,
+
+        pub fn deinit(self: *KeyPage, alloc: std.mem.Allocator) void {
+            for (self.keys) |key| alloc.free(key);
+            if (self.keys.len > 0) alloc.free(self.keys);
+            self.* = undefined;
+        }
+    };
+
     pub const VTable = struct {
         run_query: *const fn (
             ptr: *anyopaque,
@@ -238,11 +253,22 @@ pub const QueryRunner = struct {
             table_name: []const u8,
             query_json: []const u8,
         ) anyerror!query_api.QueryResponse,
-        scan_keys: ?*const fn (
+        scan_key_page: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
-        ) anyerror![]const []const u8 = null,
+            after_key: []const u8,
+            limit: u32,
+            filter_query_json: ?[]const u8,
+            exclusion_query_json: ?[]const u8,
+        ) anyerror!KeyPage = null,
+        probe_incoming_edges: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            keys: []const []const u8,
+        ) anyerror![]bool = null,
     };
 
     pub fn runQuery(
@@ -254,13 +280,37 @@ pub const QueryRunner = struct {
         return try self.vtable.run_query(self.ptr, alloc, table_name, query_json);
     }
 
-    pub fn scanKeys(
+    pub fn scanKeyPage(
         self: QueryRunner,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-    ) ![]const []const u8 {
-        const fn_ptr = self.vtable.scan_keys orelse return error.UnsupportedRetrievalAgentRequest;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        after_key: []const u8,
+        limit: u32,
+        filter_query_json: ?[]const u8,
+        exclusion_query_json: ?[]const u8,
+    ) !KeyPage {
+        const fn_ptr = self.vtable.scan_key_page orelse return error.UnsupportedRetrievalAgentRequest;
+        return try fn_ptr(
+            self.ptr,
+            alloc,
+            table_name,
+            after_key,
+            limit,
+            filter_query_json,
+            exclusion_query_json,
+        );
+    }
+
+    pub fn probeIncomingEdges(
+        self: QueryRunner,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]bool {
+        const fn_ptr = self.vtable.probe_incoming_edges orelse
+            return error.UnsupportedRetrievalAgentRequest;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, keys);
     }
 };
 
@@ -539,7 +589,6 @@ fn executeInternal(
     const max_internal_iterations = try effectiveMaxInternalIterations(request, tool_policy);
     if (max_internal_iterations < 0) return error.InvalidRetrievalAgentRequest;
     const agentic_mode = max_internal_iterations > 0;
-    if (request.accumulated_filters != null) return error.UnsupportedRetrievalAgentRequest;
 
     const retrieval_queries = request.queries;
     if (retrieval_queries.len == 0) return error.InvalidRetrievalAgentRequest;
@@ -550,6 +599,11 @@ fn executeInternal(
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
+    const mandatory_predicates = try buildMandatoryPredicates(
+        arena,
+        retrieval_queries,
+        request.accumulated_filters orelse &.{},
+    );
 
     var hit_list = std.ArrayListUnmanaged(QueryHit).empty;
     var seen_ids = std.StringHashMapUnmanaged(void).empty;
@@ -596,6 +650,7 @@ fn executeInternal(
                 runner,
                 raw_queries,
                 retrieval_queries,
+                mandatory_predicates,
                 classification_result,
                 value,
             );
@@ -789,7 +844,17 @@ fn executeInternal(
             });
         }
 
-        const query_json = try encodeQueryValueForRetrievalQuery(alloc, runner, raw_query, retrieval_query, previous_query_hits, classification_result, retrieval_query_index, .initial);
+        const query_json = try encodeQueryValueForRetrievalQuery(
+            alloc,
+            runner,
+            raw_query,
+            retrieval_query,
+            mandatory_predicates[retrieval_query_index],
+            previous_query_hits,
+            classification_result,
+            retrieval_query_index,
+            .initial,
+        );
         defer alloc.free(query_json);
 
         const query_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, query_json, request.query, retrieval_query.tree_search != null, true) catch |err| switch (format) {
@@ -820,6 +885,7 @@ fn executeInternal(
                 runner,
                 raw_query,
                 retrieval_query,
+                mandatory_predicates[retrieval_query_index],
                 previous_query_hits,
                 classification_result,
                 retrieval_query_index,
@@ -931,6 +997,7 @@ fn executeInternal(
                     runner,
                     raw_query,
                     expanded_query,
+                    mandatory_predicates[retrieval_query_index],
                     evaluation_hits,
                     classification_result,
                     retrieval_query_index,
@@ -1018,6 +1085,7 @@ fn executeInternal(
                     runner,
                     raw_query,
                     retrieval_query,
+                    mandatory_predicates[retrieval_query_index],
                     previous_query_hits,
                     classification_result,
                     retrieval_query_index,
@@ -1106,6 +1174,7 @@ fn executeInternal(
                     runner,
                     raw_queries,
                     retrieval_queries,
+                    mandatory_predicates,
                     classification_result,
                     candidate_scores,
                     attempted_query_indices,
@@ -4040,6 +4109,7 @@ fn maybeProbeAgenticSelection(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
+    mandatory_predicates: []const MandatoryPredicates,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     selection: AgenticSelection,
 ) !?AgenticSelection {
@@ -4069,6 +4139,7 @@ fn maybeProbeAgenticSelection(
             runner,
             raw_queries[candidate_index],
             retrieval_query,
+            mandatory_predicates[candidate_index],
             &.{},
             classification_result,
             candidate_index,
@@ -4176,6 +4247,7 @@ fn planNextAgenticFallback(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
+    mandatory_predicates: []const MandatoryPredicates,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
@@ -4186,6 +4258,7 @@ fn planNextAgenticFallback(
         runner,
         raw_queries,
         retrieval_queries,
+        mandatory_predicates,
         classification_result,
         candidate_scores,
         attempted_query_indices,
@@ -4214,6 +4287,7 @@ fn probeAgenticFallbackCandidates(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
+    mandatory_predicates: []const MandatoryPredicates,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
@@ -4238,6 +4312,7 @@ fn probeAgenticFallbackCandidates(
             runner,
             raw_queries[candidate_index],
             retrieval_query,
+            mandatory_predicates[candidate_index],
             &.{},
             classification_result,
             candidate_index,
@@ -5466,6 +5541,7 @@ fn encodeQueryValueForRetrievalQuery(
     runner: QueryRunner,
     value: std.json.Value,
     retrieval_query: RetrievalQueryRequest,
+    mandatory_predicates: MandatoryPredicates,
     previous_query_hits: []const QueryHit,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
@@ -5485,6 +5561,11 @@ fn encodeQueryValueForRetrievalQuery(
 
     var query_request = parsed.value;
     applyClassificationRefinement(&query_request, classification_result, retrieval_query_index, refinement_pass);
+    // The raw query predicates are already folded into this query's mandatory
+    // set. Install that canonical set instead of conjoining the source query a
+    // second time on every refinement pass.
+    query_request.filter_query = mandatory_predicates.filter_query;
+    query_request.exclusion_query = mandatory_predicates.exclusion_query;
     if (retrieval_query.tree_search) |tree_search| {
         if (query_request.graph_searches != null) return error.UnsupportedRetrievalAgentRequest;
         query_request.graph_searches = try buildTreeGraphSearches(
@@ -5499,6 +5580,194 @@ fn encodeQueryValueForRetrievalQuery(
     }
 
     return try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+}
+
+const MandatoryPredicates = struct {
+    filter_query: ?std.json.Value = null,
+    exclusion_query: ?std.json.Value = null,
+};
+
+fn buildMandatoryPredicates(
+    alloc: std.mem.Allocator,
+    queries: []const RetrievalQueryRequest,
+    accumulated_filters: []const generating_api_openapi.FilterSpec,
+) ![]MandatoryPredicates {
+    var global = MandatoryPredicates{};
+    for (accumulated_filters) |filter| {
+        const predicate = try predicateForAccumulatedFilter(alloc, filter);
+        global.filter_query = try combineMandatoryPredicate(
+            alloc,
+            global.filter_query,
+            predicate.filter_query,
+            "conjuncts",
+        );
+        global.exclusion_query = try combineMandatoryPredicate(
+            alloc,
+            global.exclusion_query,
+            predicate.exclusion_query,
+            "disjuncts",
+        );
+    }
+
+    const out = try alloc.alloc(MandatoryPredicates, queries.len);
+    for (queries, out) |query, *predicates| {
+        if (query.table == null) return error.InvalidRetrievalAgentRequest;
+        predicates.* = global;
+        predicates.filter_query = try combineMandatoryPredicate(
+            alloc,
+            predicates.filter_query,
+            query.filter_query,
+            "conjuncts",
+        );
+        predicates.exclusion_query = try combineMandatoryPredicate(
+            alloc,
+            predicates.exclusion_query,
+            query.exclusion_query,
+            "disjuncts",
+        );
+    }
+    return out;
+}
+
+fn predicateForAccumulatedFilter(
+    alloc: std.mem.Allocator,
+    filter: generating_api_openapi.FilterSpec,
+) !MandatoryPredicates {
+    if (filter.field.len == 0) return error.InvalidRetrievalAgentRequest;
+    const operation = @tagName(filter.operator);
+    if (std.mem.eql(u8, operation, "eq") or std.mem.eql(u8, operation, "ne")) {
+        const term = try singleFieldPredicate(alloc, "term", filter.field, filter.value);
+        return if (std.mem.eql(u8, operation, "ne"))
+            .{ .exclusion_query = term }
+        else
+            .{ .filter_query = term };
+    }
+    if (std.mem.eql(u8, operation, "in")) {
+        if (filter.value != .array or filter.value.array.items.len == 0) {
+            return error.InvalidRetrievalAgentRequest;
+        }
+        return .{ .filter_query = try singleFieldPredicate(alloc, "terms", filter.field, filter.value) };
+    }
+    if (std.mem.eql(u8, operation, "prefix") or std.mem.eql(u8, operation, "contains")) {
+        if (filter.value != .string) return error.InvalidRetrievalAgentRequest;
+        if (filter.value.string.len == 0) return error.InvalidRetrievalAgentRequest;
+        const root = if (std.mem.eql(u8, operation, "prefix")) "prefix" else "wildcard";
+        const value = if (std.mem.eql(u8, operation, "contains")) blk: {
+            const escaped = try wildcard_mod.escapeLiteralAlloc(alloc, filter.value.string);
+            defer alloc.free(escaped);
+            break :blk std.json.Value{
+                .string = try std.fmt.allocPrint(alloc, "*{s}*", .{escaped}),
+            };
+        } else filter.value;
+        return .{ .filter_query = try explicitFieldPredicate(
+            alloc,
+            root,
+            filter.field,
+            if (std.mem.eql(u8, operation, "contains")) "pattern" else "prefix",
+            value,
+        ) };
+    }
+    if (std.mem.eql(u8, operation, "gt") or
+        std.mem.eql(u8, operation, "gte") or
+        std.mem.eql(u8, operation, "lt") or
+        std.mem.eql(u8, operation, "lte") or
+        std.mem.eql(u8, operation, "range"))
+    {
+        return .{ .filter_query = try accumulatedRangePredicate(alloc, filter) };
+    }
+    return error.InvalidRetrievalAgentRequest;
+}
+
+fn singleFieldPredicate(
+    alloc: std.mem.Allocator,
+    root_name: []const u8,
+    field: []const u8,
+    value: std.json.Value,
+) !std.json.Value {
+    var field_object = std.json.ObjectMap.empty;
+    try field_object.put(alloc, field, value);
+    var root = std.json.ObjectMap.empty;
+    try root.put(alloc, root_name, .{ .object = field_object });
+    return .{ .object = root };
+}
+
+fn explicitFieldPredicate(
+    alloc: std.mem.Allocator,
+    root_name: []const u8,
+    field: []const u8,
+    value_name: []const u8,
+    value: std.json.Value,
+) !std.json.Value {
+    var body = std.json.ObjectMap.empty;
+    try body.put(alloc, "field", .{ .string = field });
+    try body.put(alloc, value_name, value);
+    var root = std.json.ObjectMap.empty;
+    try root.put(alloc, root_name, .{ .object = body });
+    return .{ .object = root };
+}
+
+fn accumulatedRangePredicate(
+    alloc: std.mem.Allocator,
+    filter: generating_api_openapi.FilterSpec,
+) !std.json.Value {
+    const operation = @tagName(filter.operator);
+    var body = std.json.ObjectMap.empty;
+    try body.put(alloc, "field", .{ .string = filter.field });
+    if (std.mem.eql(u8, operation, "range")) {
+        if (filter.value != .array or filter.value.array.items.len != 2) {
+            return error.InvalidRetrievalAgentRequest;
+        }
+        try body.put(alloc, "min", filter.value.array.items[0]);
+        try body.put(alloc, "max", filter.value.array.items[1]);
+        try body.put(alloc, "inclusive_min", .{ .bool = true });
+        try body.put(alloc, "inclusive_max", .{ .bool = true });
+    } else if (std.mem.eql(u8, operation, "gt") or std.mem.eql(u8, operation, "gte")) {
+        try body.put(alloc, "min", filter.value);
+        try body.put(alloc, "inclusive_min", .{ .bool = std.mem.eql(u8, operation, "gte") });
+    } else {
+        try body.put(alloc, "max", filter.value);
+        try body.put(alloc, "inclusive_max", .{ .bool = std.mem.eql(u8, operation, "lte") });
+    }
+    var root = std.json.ObjectMap.empty;
+    try root.put(alloc, "numeric_range", .{ .object = body });
+    return .{ .object = root };
+}
+
+fn applyMandatoryPredicates(
+    alloc: std.mem.Allocator,
+    query_request: *QueryRequest,
+    mandatory: MandatoryPredicates,
+) !void {
+    query_request.filter_query = try combineMandatoryPredicate(
+        alloc,
+        query_request.filter_query,
+        mandatory.filter_query,
+        "conjuncts",
+    );
+    query_request.exclusion_query = try combineMandatoryPredicate(
+        alloc,
+        query_request.exclusion_query,
+        mandatory.exclusion_query,
+        "disjuncts",
+    );
+}
+
+fn combineMandatoryPredicate(
+    alloc: std.mem.Allocator,
+    existing: ?std.json.Value,
+    mandatory: ?std.json.Value,
+    compound_key: []const u8,
+) !?std.json.Value {
+    const required = mandatory orelse return existing;
+    const current = existing orelse return required;
+
+    var clauses = std.json.Array.init(alloc);
+    try clauses.append(current);
+    try clauses.append(required);
+
+    var compound = std.json.ObjectMap.empty;
+    try compound.put(alloc, compound_key, .{ .array = clauses });
+    return .{ .object = compound };
 }
 
 fn applyClassificationRefinement(
@@ -5722,7 +5991,14 @@ fn buildTreeStartNodes(
         const trimmed = std.mem.trim(u8, start_nodes, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidRetrievalAgentRequest;
         if (std.mem.eql(u8, trimmed, "$roots")) {
-            return .{ .keys = try discoverTreeRootKeys(alloc, runner, table_name, tree_search.index) };
+            return .{ .keys = try discoverTreeRootKeys(
+                alloc,
+                runner,
+                table_name,
+                tree_search.index,
+                query_request.filter_query,
+                query_request.exclusion_query,
+            ) };
         }
         if (trimmed[0] == '$') {
             if (hasInlineTreeSeedSearch(query_request)) {
@@ -5783,83 +6059,77 @@ fn discoverTreeRootKeys(
     runner: QueryRunner,
     table_name: []const u8,
     index_name: []const u8,
+    filter_query: ?std.json.Value,
+    exclusion_query: ?std.json.Value,
 ) ![]const []const u8 {
-    const all_keys = try runner.scanKeys(alloc, table_name);
-    defer {
-        for (all_keys) |key| alloc.free(key);
-        alloc.free(all_keys);
-    }
+    const scan_page_size: u32 = 256;
+    const max_root_keys: usize = 4096;
+
+    const filter_query_json = if (filter_query) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{})
+    else
+        null;
+    defer if (filter_query_json) |value| alloc.free(value);
+    const exclusion_query_json = if (exclusion_query) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{})
+    else
+        null;
+    defer if (exclusion_query_json) |value| alloc.free(value);
+
     var roots = std.ArrayListUnmanaged([]const u8).empty;
-    defer roots.deinit(alloc);
-
-    for (all_keys) |key| {
-        if (!try treeNodeHasIncomingEdges(alloc, runner, table_name, index_name, key)) {
-            try roots.append(alloc, try alloc.dupe(u8, key));
-        }
+    errdefer {
+        for (roots.items) |key| alloc.free(key);
+        roots.deinit(alloc);
     }
+    var after_key: ?[]u8 = null;
+    defer if (after_key) |key| alloc.free(key);
 
-    // During fresh tree-index bring-up, incoming-edge probes can briefly lag the
-    // document scan even after the write path returns. If root detection is
-    // temporarily ambiguous, seed traversal from every visible document instead
-    // of collapsing "$roots" into an empty search.
-    if (roots.items.len == 0 and all_keys.len > 0) {
-        for (all_keys) |key| {
+    while (true) {
+        var page = try runner.scanKeyPage(
+            alloc,
+            table_name,
+            after_key orelse "",
+            scan_page_size,
+            filter_query_json,
+            exclusion_query_json,
+        );
+        defer page.deinit(alloc);
+        if (page.keys.len == 0) {
+            if (!page.exhausted) return error.InvalidRetrievalAgentRequest;
+            break;
+        }
+        var previous_key: ?[]const u8 = after_key;
+        for (page.keys) |key| {
+            if (previous_key) |previous| {
+                if (std.mem.order(u8, key, previous) != .gt) {
+                    return error.InvalidRetrievalAgentRequest;
+                }
+            }
+            previous_key = key;
+        }
+        // Root discovery is structural. Query predicates already constrain
+        // the candidate document scan; the reverse-index probe determines
+        // whether each admitted candidate has any physical parent.
+        const incoming = try runner.probeIncomingEdges(
+            alloc,
+            table_name,
+            index_name,
+            page.keys,
+        );
+        defer alloc.free(incoming);
+        for (page.keys, incoming) |key, has_incoming| {
+            if (has_incoming) continue;
+            if (roots.items.len >= max_root_keys) return error.TreeRootSetTooLarge;
             try roots.append(alloc, try alloc.dupe(u8, key));
         }
+
+        const next_after = try alloc.dupe(u8, page.keys[page.keys.len - 1]);
+        if (after_key) |cursor| alloc.free(cursor);
+        after_key = next_after;
+        if (page.exhausted) break;
     }
 
     return try roots.toOwnedSlice(alloc);
-}
-
-fn treeNodeHasIncomingEdges(
-    alloc: std.mem.Allocator,
-    runner: QueryRunner,
-    table_name: []const u8,
-    index_name: []const u8,
-    key: []const u8,
-) !bool {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, "incoming", .{
-        .type = .neighbors,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = @constCast((&[_][]const u8{key})[0..]) },
-        .params = .{
-            .direction = .in,
-            .max_results = 1,
-        },
-    });
-
-    const body = try std.json.Stringify.valueAlloc(alloc, QueryRequest{
-        .graph_searches = graph_searches,
-        .limit = 1,
-    }, .{});
-    defer alloc.free(body);
-
-    var response = try runner.runQuery(alloc, table_name, body);
-    defer response.deinit(alloc);
-
-    var parsed = std.json.parseFromSlice(QueryResponses, alloc, response.json, .{}) catch {
-        return error.InvalidRetrievalAgentRequest;
-    };
-    defer parsed.deinit();
-    return graphResponsesHaveHits(parsed.value);
-}
-
-fn graphResponsesHaveHits(responses: QueryResponses) bool {
-    const query_responses = responses.responses orelse return false;
-    for (query_responses) |response| {
-        const graph_results = response.graph_results orelse continue;
-        var it = graph_results.map.iterator();
-        while (it.next()) |entry| {
-            const value = entry.value_ptr.*;
-            if (value.total > 0) return true;
-            if (value.nodes) |nodes| if (nodes.len > 0) return true;
-            if (value.paths) |paths| if (paths.len > 0) return true;
-            if (value.matches) |matches| if (matches.len > 0) return true;
-        }
-    }
-    return false;
 }
 
 fn extractHits(responses: QueryResponses) []const QueryHit {
@@ -6376,40 +6646,56 @@ test "retrieval agent supports roots tree search" {
                 .ptr = undefined,
                 .vtable = &.{
                     .run_query = runQuery,
-                    .scan_keys = scanKeys,
+                    .scan_key_page = scanKeyPage,
+                    .probe_incoming_edges = probeIncomingEdges,
                 },
             };
         }
 
-        fn scanKeys(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8) ![]const []const u8 {
+        fn scanKeyPage(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            after_key: []const u8,
+            limit: u32,
+            filter_query_json: ?[]const u8,
+            exclusion_query_json: ?[]const u8,
+        ) !QueryRunner.KeyPage {
+            try std.testing.expectEqualStrings("", after_key);
+            try std.testing.expectEqual(@as(u32, 256), limit);
+            try std.testing.expect(filter_query_json != null);
+            try std.testing.expect(exclusion_query_json != null);
+            try std.testing.expect(std.mem.indexOf(u8, filter_query_json.?, "\"tenant\":\"visible\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, exclusion_query_json.?, "\"classification\":\"hidden\"") != null);
             const keys = try alloc.alloc([]const u8, 2);
-            keys[0] = try alloc.dupe(u8, "doc:root");
-            keys[1] = try alloc.dupe(u8, "doc:child");
-            return keys;
+            keys[0] = try alloc.dupe(u8, "doc:child");
+            keys[1] = try alloc.dupe(u8, "doc:root");
+            return .{ .keys = keys, .exhausted = true };
+        }
+
+        fn probeIncomingEdges(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            keys: []const []const u8,
+        ) ![]bool {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc_hierarchy", index_name);
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("doc:child", keys[0]);
+            try std.testing.expectEqualStrings("doc:root", keys[1]);
+            const incoming = try alloc.alloc(bool, 2);
+            incoming[0] = true;
+            incoming[1] = false;
+            return incoming;
         }
 
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
             var parsed_query = try parseJsonBody(QueryRequest, alloc, query_json);
             defer parsed_query.deinit();
-            if (parsed_query.value.graph_searches) |graph_searches| {
-                if (graph_searches.map.get("incoming") != null) {
-                    const start_nodes = graph_searches.map.get("incoming").?.start_nodes.?;
-                    if (start_nodes.keys) |keys| {
-                        if (keys.len == 1 and std.mem.eql(u8, keys[0], "doc:root")) {
-                            return .{
-                                .json = try alloc.dupe(u8,
-                                    \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming":{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}}}]}
-                                ),
-                            };
-                        }
-                    }
-                    return .{
-                        .json = try alloc.dupe(u8,
-                            \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming":{"type":"neighbors","nodes":[{"key":"doc:root","depth":1,"document":{"title":"root"}}],"paths":[],"total":1,"took":1}}}]}
-                        ),
-                    };
-                }
-            }
+            try std.testing.expect(parsed_query.value.filter_query != null);
+            try std.testing.expect(parsed_query.value.exclusion_query != null);
             const start_key = (try extractTreeFallbackRootKey(alloc, query_json)).?;
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
@@ -6421,7 +6707,7 @@ test "retrieval agent supports roots tree search" {
     };
 
     const body =
-        \\{"query":"find alpha","stream":false,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
+        \\{"query":"find alpha","stream":false,"queries":[{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"exclusion_query":{"term":{"classification":"hidden"}},"tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -6431,6 +6717,153 @@ test "retrieval agent supports roots tree search" {
     try std.testing.expectEqual(RetrievalStrategy.tree, parsed.value.strategy_used.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.hits.len);
     try std.testing.expectEqualStrings("doc:child", parsed.value.hits[0]._id);
+}
+
+test "retrieval agent conjoins mandatory predicates with generated predicates" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    var generated = try parseJsonBody(QueryRequest, alloc,
+        \\{"filter_query":{"term":{"status":"active"}},"exclusion_query":{"term":{"status":"archived"}}}
+    );
+    defer generated.deinit();
+    var declared = try parseJsonBody(RetrievalQueryRequest, alloc,
+        \\{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"exclusion_query":{"term":{"classification":"hidden"}}}
+    );
+    defer declared.deinit();
+
+    try applyMandatoryPredicates(arena_impl.allocator(), &generated.value, .{
+        .filter_query = declared.value.filter_query,
+        .exclusion_query = declared.value.exclusion_query,
+    });
+    const encoded = try std.json.Stringify.valueAlloc(alloc, generated.value, .{});
+    defer alloc.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"conjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tenant\":\"visible\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"disjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":\"archived\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"classification\":\"hidden\"") != null);
+}
+
+test "retrieval agent isolates query predicates while applying accumulated filters" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var first = try parseJsonBody(RetrievalQueryRequest, alloc,
+        \\{"table":"docs","full_text_search":{"query":"raft"}}
+    );
+    defer first.deinit();
+    var second = try parseJsonBody(RetrievalQueryRequest, alloc,
+        \\{"table":"docs","filter_query":{"term":{"tenant":"visible"}}}
+    );
+    defer second.deinit();
+    const queries = [_]RetrievalQueryRequest{ first.value, second.value };
+
+    var accumulated_value = try std.json.parseFromSlice(std.json.Value, alloc, "\"active\"", .{});
+    defer accumulated_value.deinit();
+    const accumulated = [_]generating_api_openapi.FilterSpec{.{
+        .field = "status",
+        .operator = .eq,
+        .value = accumulated_value.value,
+    }};
+    const mandatory = try buildMandatoryPredicates(arena, &queries, &accumulated);
+
+    var first_generated = try parseJsonBody(QueryRequest, alloc,
+        \\{"full_text_search":{"query":"raft"}}
+    );
+    defer first_generated.deinit();
+    try applyMandatoryPredicates(arena, &first_generated.value, mandatory[0]);
+    const first_encoded = try std.json.Stringify.valueAlloc(alloc, first_generated.value, .{});
+    defer alloc.free(first_encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, first_encoded, "\"tenant\":\"visible\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_encoded, "\"status\":\"active\"") != null);
+
+    var second_generated = try parseJsonBody(QueryRequest, alloc, "{}");
+    defer second_generated.deinit();
+    try applyMandatoryPredicates(arena, &second_generated.value, mandatory[1]);
+    const second_encoded = try std.json.Stringify.valueAlloc(alloc, second_generated.value, .{});
+    defer alloc.free(second_encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, second_encoded, "\"tenant\":\"visible\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_encoded, "\"status\":\"active\"") != null);
+}
+
+test "retrieval agent installs canonical mandatory predicates once" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const raw_json =
+        \\{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"exclusion_query":{"term":{"classification":"hidden"}},"limit":5}
+    ;
+    var raw = try std.json.parseFromSlice(std.json.Value, alloc, raw_json, .{});
+    defer raw.deinit();
+    var declared = try parseJsonBody(RetrievalQueryRequest, alloc, raw_json);
+    defer declared.deinit();
+    const queries = [_]RetrievalQueryRequest{declared.value};
+    const mandatory = try buildMandatoryPredicates(arena, &queries, &.{});
+
+    const encoded = try encodeQueryValueForRetrievalQuery(
+        alloc,
+        ValidationOnlyRunner.iface(),
+        raw.value,
+        declared.value,
+        mandatory[0],
+        &.{},
+        null,
+        0,
+        .initial,
+    );
+    defer alloc.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"tenant\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"classification\""));
+}
+
+test "retrieval contains filter treats wildcard operators as literals" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, "\"a*?\\\\b\"", .{});
+    defer value.deinit();
+
+    const predicate = try predicateForAccumulatedFilter(alloc, .{
+        .field = "title",
+        .operator = .contains,
+        .value = value.value,
+    });
+    const wildcard = predicate.filter_query.?.object.get("wildcard") orelse return error.TestUnexpectedResult;
+    const pattern = wildcard.object.get("pattern") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*a\\*\\?\\\\b*", pattern.string);
+    try std.testing.expect(wildcard_mod.match(pattern.string, "prefix a*?\\b suffix"));
+    try std.testing.expect(!wildcard_mod.match(pattern.string, "prefix axxb suffix"));
+
+    var empty = try std.json.parseFromSlice(std.json.Value, alloc, "\"\"", .{});
+    defer empty.deinit();
+    try std.testing.expectError(error.InvalidRetrievalAgentRequest, predicateForAccumulatedFilter(alloc, .{
+        .field = "title",
+        .operator = .contains,
+        .value = empty.value,
+    }));
+}
+
+test "retrieval session id remains a correlation identifier with mandatory predicates" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"query":"find active docs","stream":false,"session_id":"conversation-1","queries":[{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"limit":5}]}
+    ;
+    const encoded = try executeJson(alloc, ValidationOnlyRunner.iface(), null, body);
+    defer alloc.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(RetrievalAgentResult, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("conversation-1", parsed.value.session_id.?);
 }
 
 test "describe hit for generation includes tree lineage" {

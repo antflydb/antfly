@@ -24,13 +24,16 @@
 //! direct TLS support.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const array_list_writer_mod = @import("../util/array_list_writer.zig");
 const arrayListWriter = array_list_writer_mod.arrayListWriter;
 const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
+const posix = std.posix;
 const Allocator = mem.Allocator;
 const Io = std.Io;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
+const encoding = @import("../util/encoding.zig");
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -79,6 +82,10 @@ pub const ServerConfig = struct {
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
+    /// Permit rebinding an address that has recently been used. Disable for
+    /// exclusive production listeners where two live servers must never share
+    /// an address (notably macOS SO_REUSEADDR semantics).
+    reuse_address: bool = true,
     keep_alive: bool = true,
     max_requests_per_connection: u32 = 1000,
     /// Idle timeout for HTTP/2 connections (ms). The server initiates graceful
@@ -105,7 +112,24 @@ pub const ServerConfig = struct {
 fn routeErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        error.SyntaxError,
+        error.UnexpectedToken,
+        error.MissingField,
+        error.UnknownField,
+        error.InvalidRequest,
+        => 400,
         else => 500,
+    };
+}
+
+fn routeErrorBody(code: u16) []const u8 {
+    return switch (code) {
+        400 => "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
+        404 => "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
+        408 => "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
+        413 => "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        431 => "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
+        else => "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
     };
 }
 
@@ -117,6 +141,7 @@ pub const Context = struct {
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
     data: ?std.StringHashMap(DataEntry) = null,
+    decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
 
     // H1 streaming field (set by the server, null for HTTP/2).
@@ -156,6 +181,8 @@ pub const Context = struct {
 
     /// Releases context resources. Calls destructors for data entries that have them.
     pub fn deinit(self: *Self) void {
+        for (self.decoded_query_values.items) |value| self.allocator.free(value);
+        self.decoded_query_values.deinit(self.allocator);
         if (self.data) |*data| {
             var it = data.iterator();
             while (it.next()) |entry| {
@@ -196,6 +223,16 @@ pub const Context = struct {
     pub fn query(self: *const Self, name: []const u8) ?[]const u8 {
         const query_str = self.request.uri.query orelse return null;
         return common.queryValue(query_str, name);
+    }
+
+    /// Returns one application/x-www-form-urlencoded query value, decoded
+    /// exactly once into request-owned memory.
+    pub fn queryDecoded(self: *Self, name: []const u8) !?[]const u8 {
+        const raw = self.query(name) orelse return null;
+        const decoded = try encoding.PercentEncoding.decodeFormData(self.allocator, raw);
+        errdefer self.allocator.free(decoded);
+        try self.decoded_query_values.append(self.allocator, decoded);
+        return decoded;
     }
 
     /// Returns a request header by name.
@@ -665,10 +702,53 @@ pub const Server = struct {
     global_handler: ?Handler = null,
     listener: ?TcpListener = null,
     running: bool = false,
+    /// Cross-thread shutdown requests are published atomically. The listener
+    /// thread remains the sole owner of `listener`, `running`, and the
+    /// connection group; requestStop only wakes its accept loop.
+    /// 0 = running, 1 = graceful drain, 2 = immediate cancellation. Immediate
+    /// shutdown is terminal and wins races with graceful requests.
+    shutdown_mode: std.atomic.Value(u8) = .init(0),
+    graceful_timeout_ms: std.atomic.Value(u64) = .init(0),
+    listen_started: std.atomic.Value(bool) = .init(false),
+    /// Actual bound port, published for cross-thread wakeups when config.port
+    /// is zero and the kernel selects an ephemeral port.
+    wake_port: std.atomic.Value(u16) = .init(0),
+    active_connections: std.atomic.Value(usize) = .init(0),
+    active_requests: std.atomic.Value(usize) = .init(0),
+    connection_controls_mutex: std.atomic.Mutex = .unlocked,
+    connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
+    waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
 
     const Self = @This();
+
+    const ConnectionControl = struct {
+        socket: *Socket,
+        h2: ?*H2Connection = null,
+        interrupted: std.atomic.Value(bool) = .init(false),
+
+        /// Interrupts in-flight I/O without releasing the descriptor. The
+        /// connection fiber is the sole descriptor owner and closes it after
+        /// its handler has unwound.
+        fn interrupt(self: *@This(), graceful: bool) void {
+            if (graceful) {
+                if (self.h2) |h2| {
+                    h2.write_mutex.lockUncancelable(h2.io);
+                    h2.sendGoaway(self.socket, .no_error) catch {};
+                    h2.write_mutex.unlock(h2.io);
+                }
+            }
+            if (!self.interrupted.swap(true, .acq_rel)) {
+                self.socket.shutdown();
+            }
+        }
+    };
+
+    const ConnectionContext = struct {
+        socket: Socket,
+        control: ConnectionControl,
+    };
 
     /// Creates a server with default configuration.
     pub fn init(allocator: Allocator, io: Io) Self {
@@ -697,6 +777,7 @@ pub const Server = struct {
         self.router.deinit();
         self.middleware.deinit(self.allocator);
         self.pre_route_hooks.deinit(self.allocator);
+        self.connection_controls.deinit(self.allocator);
         if (self.listener) |*l| l.deinit();
     }
 
@@ -778,8 +859,14 @@ pub const Server = struct {
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
         self.listener = try TcpListener.initWithOptions(addr, self.io, .{
             .kernel_backlog = backlog,
-            .reuse_address = true,
+            .reuse_address = self.config.reuse_address,
         });
+        const bound = self.listener.?.getLocalAddress();
+        const port = switch (bound) {
+            .ip4 => |ip4| ip4.port,
+            .ip6 => |ip6| ip6.port,
+        };
+        self.wake_port.store(port, .release);
     }
 
     /// Returns the bound listener address, or null if not yet bound.
@@ -795,73 +882,154 @@ pub const Server = struct {
     pub fn listen(self: *Self) !void {
         if (self.listener == null) try self.bind();
         self.running = true;
+        self.listen_started.store(true, .release);
+        defer self.listen_started.store(false, .release);
 
         if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
-        std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
-
-        while (self.running) {
+        while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
+            self.waiting_for_connection_permit.store(true, .release);
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                // If stop won the announcement handshake it published exactly
+                // one wake permit. Consume that permit before leaving so a
+                // later listen cycle cannot exceed max_connections.
+                if (!self.waiting_for_connection_permit.swap(false, .acq_rel)) {
+                    self.conn_semaphore.waitUncancelable(self.io);
+                }
+                break;
+            }
             self.conn_semaphore.waitUncancelable(self.io);
+            const stop_published_wake = !self.waiting_for_connection_permit.swap(false, .acq_rel);
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                // Without a published wake, the wait consumed a real capacity
+                // permit; restore it. With a wake, the net permit count is
+                // already unchanged even if another permit was also available.
+                if (!stop_published_wake) self.conn_semaphore.post(self.io);
+                break;
+            }
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.io);
-                if (!self.running or self.listener == null) break;
+                if (!self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                var wake_socket = conn.socket;
+                wake_socket.close();
+                self.conn_semaphore.post(self.io);
+                break;
+            }
 
             // Spawn a lightweight fiber to handle this connection concurrently.
             // If the Io backend doesn't support concurrency, fall back to sync.
-            self.connections.concurrent(self.io, handleConnectionFiber, .{ self, conn.socket }) catch {
-                self.handleConnection(conn.socket) catch |err| {
+            const connection = self.allocator.create(ConnectionContext) catch {
+                var rejected_socket = conn.socket;
+                rejected_socket.close();
+                self.conn_semaphore.post(self.io);
+                continue;
+            };
+            connection.socket = conn.socket;
+            connection.control = .{ .socket = &connection.socket };
+            self.registerConnection(&connection.control) catch {
+                connection.socket.close();
+                self.allocator.destroy(connection);
+                self.conn_semaphore.post(self.io);
+                continue;
+            };
+            _ = self.active_connections.fetchAdd(1, .acq_rel);
+            self.connections.concurrent(self.io, handleConnectionFiber, .{ self, connection }) catch {
+                self.handleConnection(connection) catch |err| {
                     logConnectionError(err);
                 };
             };
         }
 
+        self.running = false;
+        if (self.shutdown_mode.load(.acquire) == 1) self.drainRequests(self.graceful_timeout_ms.load(.acquire));
+        self.closeConnections();
+        if (self.active_connections.load(.acquire) != 0) self.connections.cancel(self.io);
         // Wait for all in-flight connections to finish before returning.
         self.connections.await(self.io) catch {};
+        self.shutdown_mode.store(0, .release);
     }
 
-    /// Stops the server immediately, cancelling all in-flight connections.
+    fn drainRequests(self: *Self, timeout_ms: u64) void {
+        if (timeout_ms == 0 or self.active_requests.load(.acquire) == 0) return;
+        const started_ns = Io.Clock.awake.now(self.io).nanoseconds;
+        const timeout_ns: i128 = @as(i128, timeout_ms) * std.time.ns_per_ms;
+        while (self.active_requests.load(.acquire) != 0) {
+            if (self.shutdown_mode.load(.acquire) == 2) return;
+            const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
+            if (now_ns - started_ns >= timeout_ns) return;
+            const remaining_ms: u64 = @intCast(@max(@as(i128, 1), @divFloor(timeout_ns - (now_ns - started_ns), std.time.ns_per_ms)));
+            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(@min(remaining_ms, 10))), .awake) catch return;
+        }
+    }
+
+    /// Requests shutdown from another OS thread without touching listener or
+    /// connection-group state. A loopback connection wakes a blocked accept;
+    /// posting the semaphore also wakes a listener blocked at its connection
+    /// limit. All mutable server teardown remains on the listener thread.
+    pub fn requestStop(self: *Self) void {
+        var observed = self.shutdown_mode.load(.acquire);
+        while (observed != 2) {
+            observed = self.shutdown_mode.cmpxchgWeak(observed, 2, .acq_rel, .acquire) orelse break;
+        }
+        self.wakeListener();
+    }
+
+    fn wakeListener(self: *Self) void {
+        // Only publish a permit when the listener has announced that it may
+        // block in the admission gate. The listener consumes this permit before
+        // leaving, so repeated stop/listen cycles cannot inflate capacity.
+        if (self.waiting_for_connection_permit.swap(false, .acq_rel)) {
+            self.conn_semaphore.post(self.io);
+        }
+
+        const published_port = self.wake_port.load(.acquire);
+        const port = if (published_port != 0) published_port else self.config.port;
+        if (port == 0) return;
+        var addr = Address.parse(self.config.host, port) catch return;
+        switch (addr) {
+            .ip4 => |ip4| if (std.mem.allEqual(u8, &ip4.bytes, 0)) {
+                addr = .{ .ip4 = .loopback(ip4.port) };
+            },
+            .ip6 => |ip6| if (std.mem.allEqual(u8, &ip6.bytes, 0)) {
+                addr = .{ .ip6 = .loopback(ip6.port) };
+            },
+        }
+        const wake_io = std.Io.Threaded.global_single_threaded.io();
+        var wake_socket = Socket.connect(addr, wake_io) catch return;
+        wake_socket.close();
+    }
+
+    /// Requests immediate server shutdown. This method is safe to call from a
+    /// different OS thread; listener and connection teardown are performed by
+    /// the listener thread before listen() returns.
     pub fn stop(self: *Self) void {
-        self.running = false;
-        self.connections.cancel(self.io);
-        if (self.listener) |*l| {
-            l.deinit();
-            self.listener = null;
-        }
+        self.requestStop();
     }
 
-    /// Gracefully shuts down the server: stops accepting new connections and
-    /// waits up to `timeout_ms` for in-flight requests to complete before
-    /// forcefully cancelling them. Similar to Go's http.Server.Shutdown.
-    ///
-    /// Must be called from a fiber context (e.g. a route handler or a
-    /// dedicated shutdown fiber) because it calls `io.sleep`. For signal-safe
-    /// stopping without a fiber, use `stop()` instead.
+    /// Publishes a graceful shutdown request from any ordinary OS thread or
+    /// fiber. The listener thread stops accepting, drains active connections
+    /// for at most `timeout_ms`, then cancels the remainder before `listen()`
+    /// returns. Callers that need synchronous completion should join the thread
+    /// running `listen()`. Signal handlers must still notify ordinary code.
     pub fn shutdown(self: *Self, timeout_ms: u64) void {
-        self.running = false;
-        if (self.listener) |*l| {
-            l.deinit();
-            self.listener = null;
-        }
-        // Give in-flight connections time to finish.
-        if (timeout_ms > 0) {
-            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .awake) catch {};
-        }
-        // Force-cancel any remaining connections.
-        self.connections.cancel(self.io);
+        self.graceful_timeout_ms.store(timeout_ms, .release);
+        _ = self.shutdown_mode.cmpxchgStrong(0, 1, .acq_rel, .acquire);
+        self.wakeListener();
     }
 
     /// Fiber entry point for concurrent connection handling.
     /// Signature returns `Io.Cancelable!void` as required by Group.concurrent.
-    fn handleConnectionFiber(self: *Self, socket: Socket) Io.Cancelable!void {
-        self.handleConnection(socket) catch |err| {
+    fn handleConnectionFiber(self: *Self, connection: *ConnectionContext) Io.Cancelable!void {
+        self.handleConnection(connection) catch |err| {
             logConnectionError(err);
         };
     }
@@ -874,10 +1042,13 @@ pub const Server = struct {
     }
 
     /// Handles a single connection.
-    fn handleConnection(self: *Self, socket: Socket) !void {
+    fn handleConnection(self: *Self, connection: *ConnectionContext) !void {
+        defer _ = self.active_connections.fetchSub(1, .acq_rel);
         defer self.conn_semaphore.post(self.io);
-        var sock = socket;
-        defer sock.close();
+        defer self.allocator.destroy(connection);
+        defer connection.socket.close();
+        defer self.unregisterConnection(&connection.control);
+        var sock = connection.socket;
 
         // Set initial timeout once; only update when transitioning to keep-alive.
         if (self.config.request_timeout_ms > 0) {
@@ -892,7 +1063,7 @@ pub const Server = struct {
         if (first_n == 0) return;
 
         if (first_n >= 24 and mem.eql(u8, peek_buf[0..24], http.HTTP2_PREFACE)) {
-            return self.handleH2Connection(&sock, peek_buf[24..first_n]);
+            return self.handleH2Connection(&connection.control, &sock, peek_buf[24..first_n]);
         }
 
         // HTTP/1.1 path — feed the already-read bytes to the parser.
@@ -902,11 +1073,13 @@ pub const Server = struct {
         parser.max_headers = self.config.max_headers;
 
         var first_request = true;
+        var request_active = false;
+        defer if (request_active) self.finishRequest();
         var request_count: u32 = 0;
         var first_recv_done = true; // We already did the first recv.
         var buffer: [8192]u8 = undefined;
         var leftover: usize = 0;
-        while (self.running) {
+        while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             parser.reset();
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
@@ -981,6 +1154,9 @@ pub const Server = struct {
                 }
             }
 
+            self.startRequest();
+            request_active = true;
+
             var req = try Request.init(
                 self.allocator,
                 parser.method orelse .GET,
@@ -1021,7 +1197,11 @@ pub const Server = struct {
             // Pass any bytes beyond the parsed request (H2 preface pipelined
             // in the same TCP segment) as initial_data for the H2 reader.
             if (first_request and http.isH2cUpgradeRequest(&req.headers)) {
-                return self.handleH2cUpgrade(&sock, &req, buffer[0..leftover]);
+                // Transfer request accounting to the H2 upgrade handler. It
+                // completes stream 1 before entering the long-lived H2 loop.
+                self.finishRequest();
+                request_active = false;
+                return self.handleH2cUpgrade(&connection.control, &sock, &req, buffer[0..leftover]);
             }
 
             var ctx = Context.init(self.allocator, self.io, &req);
@@ -1088,9 +1268,12 @@ pub const Server = struct {
             // clean state for the next request.
             if (ctx.h1_stream_sent) {
                 ctx.h1_stream_sent = false;
+                self.finishRequest();
+                request_active = false;
                 // Check if the client wants keep-alive
                 const stream_keep_alive = self.config.keep_alive and
-                    req.headers.isKeepAlive(req.version);
+                    req.headers.isKeepAlive(req.version) and
+                    self.shutdown_mode.load(.acquire) == 0;
                 if (!stream_keep_alive) return;
 
                 request_count += 1;
@@ -1122,7 +1305,7 @@ pub const Server = struct {
             const reaches_request_limit = self.config.max_requests_per_connection > 0 and
                 request_count + 1 >= self.config.max_requests_per_connection;
             const keep_alive = self.config.keep_alive and request_wants_keep_alive and
-                !reaches_request_limit;
+                !reaches_request_limit and self.shutdown_mode.load(.acquire) == 0;
             if (!keep_alive) {
                 try response.headers.set(HeaderName.CONNECTION, "close");
             }
@@ -1131,6 +1314,9 @@ pub const Server = struct {
             try ensureDateHeader(self.io, &response);
 
             try sendBuffered(self.allocator, &sock, &response);
+
+            self.finishRequest();
+            request_active = false;
 
             if (!keep_alive) return;
 
@@ -1172,7 +1358,7 @@ pub const Server = struct {
     /// Sends 101 Switching Protocols, handles the original request as stream 1,
     /// then enters the normal H2 receive loop for subsequent requests.
     /// `initial_h2_data` contains any bytes pipelined beyond the upgrade request.
-    fn handleH2cUpgrade(self: *Self, sock: *Socket, original_req: *Request, initial_h2_data: []const u8) !void {
+    fn handleH2cUpgrade(self: *Self, control: *ConnectionControl, sock: *Socket, original_req: *Request, initial_h2_data: []const u8) !void {
         // 1. Send 101 Switching Protocols.
         try sock.sendAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
 
@@ -1184,10 +1370,12 @@ pub const Server = struct {
 
         // 3. Create H2 connection and apply peer settings.
         var h2 = H2Connection.initServer(self.allocator, self.io);
+        defer h2.deinit();
+        self.setH2Control(control, &h2);
+        defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
-        defer h2.deinit();
         try h2.applyPeerSettings(settings_payload);
 
         // 4. Send server SETTINGS.
@@ -1219,13 +1407,17 @@ pub const Server = struct {
         // 6. Handle the original HTTP/1.1 request as stream 1.
         _ = try h2.stream_manager.getOrCreateStream(1);
         original_req.version = .HTTP_2;
-        self.routeAndRespondH2(&h2, sock, 1, original_req, null) catch |err| {
-            // RFC 7540 §6.8: Send GOAWAY before closing so the client
-            // knows stream 1 was processed (or at least attempted).
-            h2.sendGoaway(sock, .no_error) catch {};
-            h2.stream_manager.removeStream(1);
-            return err;
-        };
+        {
+            self.startRequest();
+            defer self.finishRequest();
+            self.routeAndRespondH2(&h2, sock, 1, original_req, null) catch |err| {
+                // RFC 7540 §6.8: Send GOAWAY before closing so the client
+                // knows stream 1 was processed (or at least attempted).
+                h2.sendGoaway(sock, .no_error) catch {};
+                h2.stream_manager.removeStream(1);
+                return err;
+            };
+        }
         h2.stream_manager.removeStream(1);
         // Stream 1 was fully processed; record it so GOAWAY advertises the
         // correct last_stream_id and clients don't retry it (RFC 7540 §6.8).
@@ -1250,7 +1442,12 @@ pub const Server = struct {
         // Count stream 1 (the upgraded request) toward h2_max_requests.
         var h2c_request_count: u32 = 1;
         var last_activity: i64 = milliTimestamp(self.io);
-        while (!h2.goaway_received and self.running) {
+        while (!h2.goaway_received and self.shouldContinueH2()) {
+            if (self.shutdown_mode.load(.acquire) == 1 and !h2.goaway_sent) {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendGoaway(sock, .no_error) catch {};
+                h2.write_mutex.unlock(h2.io);
+            }
             // H2 idle timeout (mirrors handleH2Connection).
             if (self.config.h2_idle_timeout_ms > 0 and
                 h2.stream_manager.activeStreamCount() == 0)
@@ -1283,6 +1480,13 @@ pub const Server = struct {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendRstStream(sock, sid, .refused_stream) catch {};
+                h2.write_mutex.unlock(h2.io);
+                h2.stream_manager.removeStream(sid);
+                continue;
+            }
 
             // Use > (not >=) because deliverToMailbox already added this
             // stream to the map, so activeStreamCount() includes it.
@@ -1306,6 +1510,10 @@ pub const Server = struct {
             data_event.* = .unset;
             stream.data_event = data_event;
 
+            // Reserve drain ownership before publishing the handler fiber. A
+            // concurrent graceful shutdown must not observe an accepted stream
+            // as idle during the scheduler handoff.
+            self.startRequest();
             stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
                 self.handleH2Stream(&h2, sock, sid, data_event) catch |err| {
                     std.debug.print("H2 stream handler error: {}\n", .{err});
@@ -1321,12 +1529,14 @@ pub const Server = struct {
     /// mailboxes. When a stream is complete, a handler fiber is spawned to
     /// process the request concurrently (falls back to synchronous if the Io
     /// backend doesn't support concurrency).
-    fn handleH2Connection(self: *Self, sock: *Socket, initial_data: []const u8) !void {
+    fn handleH2Connection(self: *Self, control: *ConnectionControl, sock: *Socket, initial_data: []const u8) !void {
         var h2 = H2Connection.initServer(self.allocator, self.io);
+        defer h2.deinit();
+        self.setH2Control(control, &h2);
+        defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
-        defer h2.deinit();
 
         // Set socket recv timeout so the receive loop unblocks periodically,
         // allowing the idle timeout check to re-evaluate. Without this,
@@ -1380,7 +1590,12 @@ pub const Server = struct {
         // serialized with handler fibers' response writes.
         var h2_request_count: u32 = 0;
         var last_activity: i64 = milliTimestamp(self.io);
-        while (!h2.goaway_received and self.running) {
+        while (!h2.goaway_received and self.shouldContinueH2()) {
+            if (self.shutdown_mode.load(.acquire) == 1 and !h2.goaway_sent) {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendGoaway(sock, .no_error) catch {};
+                h2.write_mutex.unlock(h2.io);
+            }
             // H2 idle timeout: initiate graceful shutdown if no streams are
             // active and idle threshold is exceeded.
             if (self.config.h2_idle_timeout_ms > 0 and
@@ -1428,6 +1643,13 @@ pub const Server = struct {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendRstStream(sock, sid, .refused_stream) catch {};
+                h2.write_mutex.unlock(h2.io);
+                h2.stream_manager.removeStream(sid);
+                continue;
+            }
 
             // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
             // Check before incrementing h2_request_count so refused streams
@@ -1459,6 +1681,7 @@ pub const Server = struct {
 
             // Spawn a fiber to handle this stream's request. Falls back to
             // synchronous handling if the Io backend doesn't support fibers.
+            self.startRequest();
             stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
                 self.handleH2Stream(&h2, sock, sid, data_event) catch |err| {
                     std.debug.print("H2 stream handler error: {}\n", .{err});
@@ -1478,6 +1701,7 @@ pub const Server = struct {
     /// mailbox, routes the request, and sends the response. Dispatched as
     /// soon as HEADERS arrive — the body may still be streaming.
     fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
+        defer self.finishRequest();
         // Ensure cleanup: detach event from stream, remove stream, free event.
         // All stream map mutations happen under write_mutex so the receive
         // loop (which holds write_mutex in processOneFrameLocked) cannot
@@ -1624,6 +1848,59 @@ pub const Server = struct {
         try self.routeAndRespondH2(h2, sock, stream_id, &req, if (body_reader != null) &body_reader.? else null);
     }
 
+    fn startRequest(self: *Self) void {
+        _ = self.active_requests.fetchAdd(1, .acq_rel);
+    }
+
+    fn finishRequest(self: *Self) void {
+        _ = self.active_requests.fetchSub(1, .acq_rel);
+    }
+
+    fn shouldContinueH2(self: *Self) bool {
+        const mode = self.shutdown_mode.load(.acquire);
+        return mode != 2 and (self.running or (mode == 1 and self.active_requests.load(.acquire) != 0));
+    }
+
+    fn registerConnection(self: *Self, control: *ConnectionControl) !void {
+        self.lockConnectionControls();
+        defer self.connection_controls_mutex.unlock();
+        try self.connection_controls.append(self.allocator, control);
+    }
+
+    fn unregisterConnection(self: *Self, control: *ConnectionControl) void {
+        self.lockConnectionControls();
+        defer self.connection_controls_mutex.unlock();
+        for (self.connection_controls.items, 0..) |candidate, index| {
+            if (candidate == control) {
+                _ = self.connection_controls.swapRemove(index);
+                return;
+            }
+        }
+    }
+
+    fn closeConnections(self: *Self) void {
+        self.lockConnectionControls();
+        defer self.connection_controls_mutex.unlock();
+        const graceful = self.shutdown_mode.load(.acquire) == 1;
+        for (self.connection_controls.items) |control| control.interrupt(graceful);
+    }
+
+    fn setH2Control(self: *Self, control: *ConnectionControl, h2: *H2Connection) void {
+        self.lockConnectionControls();
+        defer self.connection_controls_mutex.unlock();
+        control.h2 = h2;
+    }
+
+    fn clearH2Control(self: *Self, control: *ConnectionControl) void {
+        self.lockConnectionControls();
+        defer self.connection_controls_mutex.unlock();
+        control.h2 = null;
+    }
+
+    fn lockConnectionControls(self: *Self) void {
+        while (!self.connection_controls_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
     /// Routes a request through middleware and sends the H2 response.
     /// Shared between normal H2 streams (from HPACK) and h2c upgrade (from HTTP/1.1).
     fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request, body_reader: ?*Context.H2StreamReader) !void {
@@ -1739,12 +2016,20 @@ pub const Server = struct {
         }
     }
 
-    /// Sends an HTTP/2 error response (just a HEADERS frame with :status).
+    /// Sends the same safe JSON error envelope used by HTTP/1.
     fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
+        const body = routeErrorBody(code);
+        var length_buf: [32]u8 = undefined;
+        const length = try std.fmt.bufPrint(&length_buf, "{d}", .{body.len});
+        const extra = [_]hpack.HeaderEntry{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "content-length", .value = length },
+        };
         var status_buf: [3]u8 = undefined;
-        const h2_headers = try H2Connection.buildResponseHeaders(code, &.{}, &status_buf, self.allocator);
+        const h2_headers = try H2Connection.buildResponseHeaders(code, &extra, &status_buf, self.allocator);
         defer self.allocator.free(h2_headers);
-        try h2.sendHeaders(writer, stream_id, h2_headers, true);
+        try h2.sendHeaders(writer, stream_id, h2_headers, false);
+        try h2.writeDataBlocking(writer, stream_id, body, true);
     }
 
     /// Like `sendH2Error` but acquires the write mutex first.
@@ -1759,6 +2044,8 @@ pub const Server = struct {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
+        resp.body = routeErrorBody(code);
+        try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
         try ensureContentLengthHeader(&resp);
         try ensureDateHeader(self.io, &resp);
 
@@ -2101,10 +2388,57 @@ test "ServerConfig defaults" {
 }
 
 test "routeErrorStatus maps oversized route errors to payload too large" {
+    try std.testing.expectEqual(@as(u16, 400), routeErrorStatus(error.SyntaxError));
+    try std.testing.expectEqual(@as(u16, 400), routeErrorStatus(error.MissingField));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.ValueTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.BodyTooLarge));
     try std.testing.expectEqual(@as(u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
+        routeErrorBody(400),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
+        routeErrorBody(404),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
+        routeErrorBody(408),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        routeErrorBody(413),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
+        routeErrorBody(431),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
+        routeErrorBody(500),
+    );
+}
+
+test "Context queryDecoded decodes percent escapes exactly once" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(
+        allocator,
+        .GET,
+        "/backup?location=s3%3A%2F%2Fbucket%2Fa%2520b&plus=a+b",
+    );
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const location = (try ctx.queryDecoded("location")).?;
+    try std.testing.expectEqualStrings("s3://bucket/a%20b", location);
+    const plus = (try ctx.queryDecoded("plus")).?;
+    try std.testing.expectEqualStrings("a b", plus);
+    const location_again = (try ctx.queryDecoded("location")).?;
+    try std.testing.expectEqualStrings(location, location_again);
+    try std.testing.expectEqual(@as(usize, 3), ctx.decoded_query_values.items.len);
 }
 
 test "Context max_file_size default and override" {
@@ -2508,42 +2842,148 @@ test "isH2ForbiddenHeader rejects connection-specific headers" {
     try std.testing.expect(!isH2ForbiddenHeader("accept", "*/*"));
 }
 
-test "shutdown with zero timeout closes listener and cancels connections" {
+test "shutdown publishes graceful listener-thread work" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
-    // Simulate running state.
     server.running = true;
-
-    // shutdown(0) should set running=false and not call io.sleep.
-    server.shutdown(0);
-    try std.testing.expect(!server.running);
+    server.shutdown(25);
+    try std.testing.expect(server.running);
     try std.testing.expect(server.listener == null);
+    try std.testing.expectEqual(@as(u8, 1), server.shutdown_mode.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 25), server.graceful_timeout_ms.load(.acquire));
 }
 
-test "shutdown with nonzero timeout sleeps then cancels" {
-    const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
-    defer server.deinit();
-
-    server.running = true;
-
-    // shutdown with a small timeout should sleep (uses .awake clock)
-    // then cancel connections. This verifies the clock enum is valid.
-    server.shutdown(1);
-    try std.testing.expect(!server.running);
-}
-
-test "stop cancels connections immediately" {
+test "stop publishes synchronized listener-thread shutdown" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
     server.running = true;
     server.stop();
-    try std.testing.expect(!server.running);
+    try std.testing.expect(server.running);
+    try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
+}
+
+test "requestStop only publishes synchronized listener-thread work" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(allocator, std.testing.io, .{ .host = "127.0.0.1", .port = 1 });
+    defer server.deinit();
+
+    server.running = true;
+    server.requestStop();
+    try std.testing.expect(server.running);
+    try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
+    try std.testing.expect(server.listener == null);
+}
+
+test "repeated stop requests do not inflate connection admission permits" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 1,
+        .max_connections = 3,
+    });
+    defer server.deinit();
+    server.requestStop();
+    server.requestStop();
+    try std.testing.expectEqual(@as(usize, 3), server.conn_semaphore.permits);
+}
+
+test "cross-thread stop wakes an ephemeral listener" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.bind();
+    try std.testing.expect(server.wake_port.load(.acquire) != 0);
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("ephemeral listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    server.stop();
+    listener_thread.join();
+    try std.testing.expect(!server.running);
+}
+
+test "cross-thread graceful shutdown is listener-owned" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("graceful listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    // An idle keep-alive connection is not an active request and must not
+    // consume the graceful request deadline.
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(address, client_io);
+    defer client.close();
+    while (server.active_connections.load(.acquire) == 0) std.Thread.yield() catch {};
+    const started = Io.Clock.awake.now(client_io).nanoseconds;
+    server.shutdown(5000);
+    listener_thread.join();
+    const elapsed = Io.Clock.awake.now(client_io).nanoseconds - started;
+    try std.testing.expect(!server.running);
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
+    try std.testing.expect(elapsed < std.time.ns_per_s);
+}
+
+test "connection interruption preserves the fiber-owned descriptor" {
+    if (builtin.os.tag == .windows) return;
+
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+
+    var client = try Socket.connect(listener.getLocalAddress(), io);
+    defer client.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+
+    var control = Server.ConnectionControl{ .socket = &accepted.socket };
+    control.interrupt(false);
+
+    const rc = posix.system.fcntl(accepted.socket.handle, posix.F.GETFD, @as(usize, 0));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
+}
+
+test "immediate stop preempts graceful request drain" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.bind();
+    server.active_requests.store(1, .release);
+    server.shutdown(10_000);
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("draining listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    const caller_io = std.Io.Threaded.global_single_threaded.io();
+    caller_io.sleep(Io.Duration.fromMilliseconds(20), .awake) catch {};
+    const started = Io.Clock.awake.now(caller_io).nanoseconds;
+    server.stop();
+    listener_thread.join();
+    const elapsed = Io.Clock.awake.now(caller_io).nanoseconds - started;
+    server.active_requests.store(0, .release);
+    try std.testing.expect(elapsed < std.time.ns_per_s);
 }
 
 test "containsTraversal rejects double-encoded dot-dot" {

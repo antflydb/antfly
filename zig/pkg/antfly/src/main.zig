@@ -27,7 +27,20 @@ pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    mainImpl(init) catch |err| {
+        const message = switch (err) {
+            error.FileNotFound => "required file was not found; check the configured path",
+            error.AddressInUse => "listen address is already in use",
+            error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
+            else => "startup failed; see the preceding diagnostic for details",
+        };
+        std.debug.print("antfly: {s}\n", .{message});
+        std.process.exit(1);
+    };
+}
+
+fn mainImpl(init: std.process.Init) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -52,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "graph-metric-maintenance")) return try cmd.graph_metric_maintenance.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "swarm")) return try cmd.swarm.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
@@ -73,6 +86,10 @@ pub fn main(init: std.process.Init) !void {
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
+            if (cliHelpRequested(&args)) {
+                cmd.cli.printCommandUsage(cli_cmd);
+                return;
+            }
             return runCliCommand(init.gpa, cli_cmd, &args) catch |err| switch (err) {
                 error.ApiError => std.process.exit(1),
                 else => return err,
@@ -83,6 +100,17 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
+    var probe = args.*;
+    var first = true;
+    while (probe.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (first and std.mem.eql(u8, arg, "help")) return true;
+        first = false;
+    }
+    return false;
 }
 
 fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {
@@ -179,7 +207,7 @@ fn printUsage(argv0: []const u8) void {
         \\  data
         \\  graph-metric-maintenance
         \\  metadata
-        \\  swarm
+        \\  standalone
         \\  inference
         \\  serverless
         \\  lite           Embedded Antfly Lite databases (*.aflite)
@@ -230,6 +258,19 @@ fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
 
 test "main cmd compiles" {
     _ = main;
+}
+
+test "client help is recognized before command execution" {
+    var argv = [_][*:0]const u8{ "--table", "docs", "--help" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(cliHelpRequested(&args));
+    try std.testing.expectEqualStrings("--table", args.next().?);
+    try std.testing.expect(cmd.cli.commandUsage("query") != null);
+    try std.testing.expect(cmd.cli.commandUsage("load") != null);
+
+    var value_argv = [_][*:0]const u8{ "--key", "help" };
+    var value_args = std.process.Args.Iterator.init(.{ .vector = value_argv[0..] });
+    try std.testing.expect(!cliHelpRequested(&value_args));
 }
 
 test "cloud shim argv starts with antfly-cloud and preserves args" {

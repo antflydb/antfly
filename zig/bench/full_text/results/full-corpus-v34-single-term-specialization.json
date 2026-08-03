@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "status": "accepted_query_only_optimization",
+  "comparison_boundary": "reused_settled_v34_full_corpus_index",
+  "source_index": {
+    "documents": 5032105,
+    "corpus_sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+    "wire_version": 34,
+    "segments": 10,
+    "bytes": 3406622680,
+    "prior_cross_engine_correctness": "5_of_5_strict_id_and_score_matches"
+  },
+  "change": {
+    "term_dictionary": "stack_reconstruct_normal_query_suffix_and_stop_after_lexicographic_overshoot",
+    "single_term_execution": "dedicated_block_max_top_k_without_multi_term_pivot_ordering_or_duplicate_bound_decode",
+    "persisted_format_changed": false
+  },
+  "validation": {
+    "focused_search_tests": 49,
+    "focused_search_failures": 0,
+    "focused_search_leaks": 0,
+    "warmup_queries": 1000,
+    "warmup_min_seconds": 1,
+    "latency_repetitions_per_run": 11,
+    "resource_profile_seconds_per_class": 5,
+    "independent_candidate_runs": 2
+  },
+  "matched_cpu_per_query_ns": {
+    "baseline": {
+      "term": 110665,
+      "union": 318285,
+      "intersection": 278065,
+      "phrase": 591386
+    },
+    "candidate_runs": {
+      "term": [93492, 93012],
+      "union": [316684, 314134],
+      "intersection": [276750, 274785],
+      "phrase": [588260, 580972]
+    },
+    "candidate_mean": {
+      "term": 93252,
+      "union": 315409,
+      "intersection": 275767.5,
+      "phrase": 584616
+    },
+    "change_percent": {
+      "term": -15.734876,
+      "union": -0.903593,
+      "intersection": -0.826246,
+      "phrase": -1.144768
+    }
+  },
+  "archived_tantivy_reference": {
+    "term_cpu_per_query_ns": 40028,
+    "candidate_mean_term_to_tantivy_ratio": 2.329669
+  },
+  "latency_median_ns": {
+    "baseline": {
+      "term": 120375,
+      "union": 344166,
+      "intersection": 318209,
+      "phrase": 644417
+    },
+    "candidate_run_1": {
+      "term": 108833,
+      "union": 335333,
+      "intersection": 300500,
+      "phrase": 625292
+    },
+    "candidate_run_2": {
+      "term": 104333,
+      "union": 333084,
+      "intersection": 293500,
+      "phrase": 644916
+    }
+  },
+  "rejected_candidate": {
+    "name": "bulk_word_refill_for_packed_u32_reservoir",
+    "reason": "Matched full-corpus sustained CPU was flat for term and union/intersection and phrase regressed 4.3 percent; the compiler's byte-fed reservoir remained the better measured implementation.",
+    "cpu_per_query_ns": {
+      "term": 111000,
+      "union": 316748,
+      "intersection": 280304,
+      "phrase": 616909
+    }
+  },
+  "decision": {
+    "accepted": true,
+    "reason": "The dedicated single-term path removes multi-term WAND control and one redundant impact-bound decode per scored posting, reducing matched full-corpus term CPU by 15.7 percent without a regression in any other query class.",
+    "remaining_priority": "Term execution remains 2.33x the archived Tantivy CPU reference; continue with postings decode/control-flow profiling. Phrase remains the other principal query CPU target."
+  }
+}

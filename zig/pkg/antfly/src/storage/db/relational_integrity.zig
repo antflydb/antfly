@@ -24,7 +24,7 @@ const mapper = @import("document_mapper.zig");
 const db_internal = @import("internal.zig");
 const relational_store_mod = @import("relational_store.zig");
 const types = @import("types.zig");
-const platform_clock = @import("../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 
 const Allocator = std.mem.Allocator;

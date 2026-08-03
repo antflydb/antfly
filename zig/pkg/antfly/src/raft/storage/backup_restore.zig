@@ -17,14 +17,105 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const backups_api = @import("../../api/backups.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
-const lsm_table_file = @import("../../storage/lsm/table_file.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
+
+pub const RestoreAuthority = union(enum) {
+    /// A private artifact already admitted and staged by Antfly.
+    staged_local,
+    /// An external source resolved through this cluster-local connection ID.
+    external: []const u8,
+};
 
 pub const RestoreSource = struct {
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
+    identity_location: ?[]const u8 = null,
     snapshot_path: []const u8,
+    authority: RestoreAuthority,
+    expected_artifact_size_bytes: u64,
+    expected_artifact_sha256: []const u8,
+    manifest: ?*const backups_api.TableBackupManifest = null,
+    io: ?std.Io = null,
+    open_options: backups_api.OpenOptions = .{},
 };
+
+const RestoreIoScope = struct {
+    alloc: std.mem.Allocator,
+    io_value: std.Io,
+    owned: ?*std.Io.Threaded = null,
+
+    fn init(alloc: std.mem.Allocator, restore: RestoreSource) !RestoreIoScope {
+        if (restore.open_options.io orelse restore.io) |shared_io| {
+            return .{ .alloc = alloc, .io_value = shared_io };
+        }
+        const owned = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(owned);
+        owned.* = std.Io.Threaded.init(alloc, .{});
+        return .{ .alloc = alloc, .io_value = owned.io(), .owned = owned };
+    }
+
+    fn deinit(self: *RestoreIoScope) void {
+        if (self.owned) |owned| {
+            owned.deinit();
+            self.alloc.destroy(owned);
+        }
+        self.* = undefined;
+    }
+
+    fn io(self: *const RestoreIoScope) std.Io {
+        return self.io_value;
+    }
+};
+
+fn restoreIdentityLocation(restore: RestoreSource) []const u8 {
+    return restore.identity_location orelse restore.location;
+}
+
+fn openRestoreLocation(
+    alloc: std.mem.Allocator,
+    restore: RestoreSource,
+    io: std.Io,
+) !backups_api.BackupLocation {
+    var options = restore.open_options;
+    options.connection = switch (restore.authority) {
+        .external => |connection| blk: {
+            if (connection.len == 0) return error.RestoreConnectionMissing;
+            break :blk connection;
+        },
+        .staged_local => blk: {
+            if (restore.identity_location == null or
+                !std.mem.startsWith(u8, restore.location, "file://"))
+            {
+                return error.InvalidStagedRestoreSource;
+            }
+            backups_api.validateCanonicalRestoreSourceIdentity(
+                alloc,
+                restore.identity_location.?,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidStagedRestoreSource,
+            };
+            break :blk null;
+        },
+    };
+    options.required_capability = "restore.read";
+    options.io = io;
+    return try backups_api.openBackupLocationWithOptions(alloc, restore.location, options);
+}
+
+fn validateExpectedArtifactBinding(
+    restore: RestoreSource,
+    shard: *const backups_api.ShardSnapshot,
+) !void {
+    if (restore.expected_artifact_sha256.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
+        return error.RestoreArtifactIdentityMissing;
+    if (restore.expected_artifact_size_bytes != shard.artifact_size_bytes or
+        !std.mem.eql(u8, restore.expected_artifact_sha256, shard.artifact_sha256))
+    {
+        return error.RestoreArtifactIdentityMismatch;
+    }
+}
 
 pub const RestoreOptions = struct {
     expected_table_name: ?[]const u8 = null,
@@ -66,31 +157,166 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
-    try applyRestoreSnapshotIfNeeded(alloc, path, group_id, restore, options);
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(path);
+    defer transition.deinit();
+    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
 }
 
-pub fn restoreSnapshotMatchesPath(
+pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
     alloc: std.mem.Allocator,
     path: []const u8,
+    group_id: u64,
     restore: RestoreSource,
     options: RestoreOptions,
-) !bool {
-    const snapshot_doc_count = try restoreSnapshotDocCount(alloc, restore);
+) !void {
+    var prepared = (try prepareRestoreSnapshotToPathWithExclusiveTransition(
+        transition,
+        alloc,
+        path,
+        group_id,
+        restore,
+        options,
+    )) orelse return;
+    defer prepared.deinit();
+    const outcome = try publishPreparedRestore(alloc, path, &prepared);
+    if (outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
+}
 
-    var db = db_mod.DB.open(alloc, path, .{
-        .identity_namespace = options.expected_identity_namespace,
-        .open_mode = .query_readonly,
-        .start_index_workers = false,
-        .start_optional_runtimes = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound, error.IdentityNamespaceMismatch => return false,
-        else => return err,
-    };
-    defer db.close();
+/// Builds and validates a replacement generation without mutating the live
+/// root. The caller must hold `transition` until the returned generation is
+/// either published or destroyed.
+pub fn prepareRestoreSnapshotToPathWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !?db_mod.generation_lifecycle.StagedGeneration {
+    try transition.validate(path);
+    try transition.reconcilePublished();
+    return try prepareRestoreSnapshotIfNeeded(transition, alloc, path, group_id, restore, options);
+}
 
-    const stats = try db.stats(alloc);
-    defer db_mod.types.freeDBStats(alloc, stats);
-    return stats.doc_count == snapshot_doc_count;
+/// Prepares a sibling generation while the current generation remains
+/// readable. The caller must drain serving leases and promote `preparation`
+/// before publishing the returned generation.
+pub fn prepareRestoreSnapshotToPathWithPreparation(
+    preparation: *db_mod.generation_lifecycle.PreparationTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !?db_mod.generation_lifecycle.StagedGeneration {
+    return try prepareRestoreSnapshotIfNeeded(preparation, alloc, path, group_id, restore, options);
+}
+
+pub fn publishPreparedRestore(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    prepared: *db_mod.generation_lifecycle.StagedGeneration,
+) !db_mod.generation_lifecycle.PublicationOutcome {
+    try prepared.validateLivePath(path);
+    const outcome = try prepared.publish();
+    cleanupSnapshotsForPublishedRestore(alloc, path);
+    return outcome;
+}
+
+pub fn reconcileCommittedRestoreWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    try reconcileCommittedRestoreWithExclusiveTransitionWithIo(
+        transition,
+        alloc,
+        io_scope.io(),
+        path,
+        group_id,
+        restore,
+    );
+}
+
+pub fn reconcileCommittedRestoreWithExclusiveTransitionWithIo(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    try transition.validate(path);
+    try transition.reconcilePublished();
+    try validateCommittedRestoreIdentityWithIo(alloc, io, path, group_id, restore);
+}
+
+pub fn validateCommittedRestoreIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    try validateCommittedRestoreIdentityWithIo(alloc, io_scope.io(), path, group_id, restore);
+}
+
+pub fn validateCommittedRestoreIdentityWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) orelse return error.RestoreIdentityMismatch;
+    defer state.deinit(alloc);
+    if (!state.primary_restored or
+        !state.runtime_repair_complete or
+        state.group_id != group_id or
+        !std.mem.eql(u8, state.backup_id, restore.backup_id) or
+        !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
+        !std.mem.eql(u8, state.artifact_sha256, restore.expected_artifact_sha256) or
+        !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
+    {
+        return error.RestoreIdentityMismatch;
+    }
+}
+
+pub fn validateImportedRestoreIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    try validateImportedRestoreIdentityWithIo(alloc, io_scope.io(), path, group_id, restore);
+}
+
+pub fn validateImportedRestoreIdentityWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) orelse return error.RestoreIdentityMismatch;
+    defer state.deinit(alloc);
+    if (!state.primary_restored or
+        state.group_id != group_id or
+        !std.mem.eql(u8, state.backup_id, restore.backup_id) or
+        !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
+        !std.mem.eql(u8, state.artifact_sha256, restore.expected_artifact_sha256) or
+        !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
+    {
+        return error.RestoreIdentityMismatch;
+    }
 }
 
 pub fn applyBackupRestoreFromRecord(
@@ -99,179 +325,182 @@ pub fn applyBackupRestoreFromRecord(
     group_id: u64,
     restore: @import("../catalog.zig").BackupRestoreBootstrapRecord,
 ) !void {
-    try applyRestoreSnapshotToReplicaRoot(alloc, replica_root_dir, group_id, .{
-        .backup_id = restore.backup_id,
-        .location = restore.location,
-        .snapshot_path = restore.snapshot_path,
-    }, null);
+    return try applyBackupRestoreFromRecordWithOptions(alloc, replica_root_dir, group_id, restore, .{});
 }
 
-pub fn forceApplyBackupRestoreFromRecord(
+pub fn applyBackupRestoreFromRecordWithOptions(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     group_id: u64,
     restore: @import("../catalog.zig").BackupRestoreBootstrapRecord,
+    open_options: backups_api.OpenOptions,
 ) !void {
-    const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-    try applyRestoreSnapshot(
-        alloc,
-        path,
-        group_id,
-        .{
-            .backup_id = restore.backup_id,
-            .location = restore.location,
-            .snapshot_path = restore.snapshot_path,
-        },
-        .{},
-    );
+    try restore.validate();
+    try applyRestoreSnapshotToReplicaRoot(alloc, replica_root_dir, group_id, .{
+        .backup_id = restore.backup_id,
+        .artifact_backup_id = restore.artifact_backup_id,
+        .location = restore.location,
+        .snapshot_path = restore.snapshot_path,
+        .authority = .{ .external = restore.connection },
+        .expected_artifact_size_bytes = restore.artifact_size_bytes,
+        .expected_artifact_sha256 = restore.artifact_sha256,
+        .open_options = open_options,
+    }, null);
 }
 
-fn applyRestoreSnapshotIfNeeded(
+fn prepareRestoreSnapshotIfNeeded(
+    transition: anytype,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
     options: RestoreOptions,
-) !void {
-    if (try db_mod.DB.readRestoreStateForPath(alloc, path)) |state_value| {
+) !?db_mod.generation_lifecycle.StagedGeneration {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    const io = io_scope.io();
+
+    if (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) |state_value| {
         var state = state_value;
         defer state.deinit(alloc);
         if (state.primary_restored and
             std.mem.eql(u8, state.backup_id, restore.backup_id) and
-            std.mem.eql(u8, state.location, restore.location) and
+            std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) and
+            std.mem.eql(u8, state.artifact_sha256, restore.expected_artifact_sha256) and
             std.mem.eql(u8, state.snapshot_path, restore.snapshot_path) and
             state.group_id == group_id)
         {
-            if (!state.runtime_repair_complete or
-                try restoreSnapshotMatchesPath(alloc, path, restore, options))
-            {
-                return;
-            }
+            // The state is persisted inside the staged generation before that
+            // generation is sealed and atomically published. Its content hash
+            // is therefore the idempotence proof; rescanning the external
+            // artifact would be weaker, O(artifact size), and racy.
+            return null;
         }
     }
 
-    try applyRestoreSnapshot(alloc, path, group_id, restore, options);
+    return try prepareRestoreSnapshot(transition, alloc, io, path, group_id, restore, options);
 }
 
-fn applyRestoreSnapshot(
+fn prepareRestoreSnapshot(
+    transition: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
     options: RestoreOptions,
-) !void {
-    var location = try backups_api.openBackupLocation(alloc, restore.location);
+) !db_mod.generation_lifecycle.StagedGeneration {
+    var location = try openRestoreLocation(alloc, restore, io);
     defer location.deinit(alloc);
-    var manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
-    defer manifest.deinit(alloc);
+    var owned_manifest: ?backups_api.TableBackupManifest = null;
+    defer if (owned_manifest) |*manifest| manifest.deinit(alloc);
+    const manifest = restore.manifest orelse blk: {
+        owned_manifest = try backups_api.readManifestFromLocationWithArtifactBackupId(
+            alloc,
+            &location,
+            restore.backup_id,
+            restore.artifact_backup_id,
+        );
+        break :blk &owned_manifest.?;
+    };
+    try backups_api.validateRestoreManifest(alloc, manifest, restore.backup_id);
     if (options.expected_table_name) |table_name| {
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) {
+            std.log.err("restore manifest validation failed phase=table_identity class=mismatch", .{});
+            return error.InvalidBackupRequest;
+        }
     }
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    const snapshot_path = if (restore.snapshot_path.len > 0)
-        restore.snapshot_path
-    else blk: {
-        const shard = backups_api.findShardSnapshot(&manifest, group_id) orelse return error.UnsupportedBackupFormat;
-        break :blk shard.snapshot_path;
-    };
+    const shard = resolveRestoreShard(manifest, group_id, restore.snapshot_path) orelse
+        return error.InvalidBackupRequest;
+    try validateExpectedArtifactBinding(restore, shard);
+    const snapshot_path = shard.snapshot_path;
 
-    if (std.mem.endsWith(u8, snapshot_path, ".afb")) {
-        try applyPortableRestore(alloc, path, group_id, restore, snapshot_path, &manifest, options);
-        return;
+    var staged_generation = try transition.beginStaging();
+    errdefer staged_generation.deinit();
+    const staged_path = staged_generation.path();
+
+    switch (manifest.format) {
+        .portable => {
+            try applyPortableRestore(
+                &staged_generation,
+                alloc,
+                staged_path,
+                group_id,
+                restore,
+                &location,
+                io,
+                shard,
+                manifest,
+                options,
+            );
+            return staged_generation;
+        },
+        .native => {},
     }
 
-    const snapshot_root = try stageRestoreSnapshot(alloc, path, &location, snapshot_path);
-    defer switch (location) {
-        .file => alloc.free(snapshot_root),
-        .remote => {
-            destroyPathIfExists(snapshot_root);
-            alloc.free(snapshot_root);
-        },
-    };
+    const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path);
+    defer {
+        destroyPathIfExistsWithIo(io, snapshot_root);
+        alloc.free(snapshot_root);
+    }
+    try backups_api.verifyShardArtifactIntegrity(
+        alloc,
+        io,
+        .native,
+        snapshot_root,
+        shard,
+    );
 
-    try resetLocalTablePath(path);
-    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{
+    std.log.info("native restore staged generation phase=materialization", .{});
+    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged_generation, alloc, io, snapshot_root, staged_path, .{
         .identity_namespace = options.expected_identity_namespace,
     }, .{
         .backup_id = restore.backup_id,
-        .location = restore.location,
+        .location = restoreIdentityLocation(restore),
+        .artifact_sha256 = shard.artifact_sha256,
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     });
-}
-
-fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u64 {
-    var location = try backups_api.openBackupLocation(alloc, restore.location);
-    defer location.deinit(alloc);
-
-    if (std.mem.endsWith(u8, restore.snapshot_path, ".afb")) {
-        const afb_path = try stageRestoreFile(alloc, "", &location, restore.snapshot_path);
-        defer switch (location) {
-            .file => alloc.free(afb_path),
-            .remote => {
-                if (std.fs.path.dirname(afb_path)) |staging_dir| destroyPathIfExists(staging_dir);
-                alloc.free(afb_path);
-            },
-        };
-        return try portableSnapshotDocCount(alloc, afb_path);
-    }
-
-    const snapshot_root = try stageRestoreSnapshot(alloc, "", &location, restore.snapshot_path);
-    defer switch (location) {
-        .file => alloc.free(snapshot_root),
-        .remote => {
-            destroyPathIfExists(snapshot_root);
-            alloc.free(snapshot_root);
-        },
-    };
-
-    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
-    defer alloc.free(snapshot_path);
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), snapshot_path, alloc, .limited(256 * 1024 * 1024));
-    defer alloc.free(raw);
-
-    var decoded = try lsm_table_file.decodeAlloc(alloc, raw);
-    defer decoded.deinit(alloc);
-    return @intCast(decoded.entries.len);
+    std.log.info("native restore staged generation phase=prepared", .{});
+    return staged_generation;
 }
 
 fn applyPortableRestore(
+    staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
-    snapshot_path: []const u8,
+    location: *backups_api.BackupLocation,
+    io: std.Io,
+    shard: *const backups_api.ShardSnapshot,
     manifest: *const backups_api.TableBackupManifest,
     options: RestoreOptions,
 ) !void {
     const embedding_source_fields = try portableEmbeddingSourceFieldsFromIndexesJson(alloc, manifest.indexes_json);
     defer freePortableEmbeddingSourceFields(alloc, embedding_source_fields);
-    var location = try backups_api.openBackupLocation(alloc, restore.location);
-    defer location.deinit(alloc);
-    const afb_path = try stageRestoreFile(alloc, path, &location, snapshot_path);
-    defer switch (location) {
-        .file => alloc.free(afb_path),
-        .remote => {
-            destroyPathIfExists(afb_path);
-            alloc.free(afb_path);
-        },
-    };
+    const afb_path = try stageRestoreFile(alloc, io, path, location, shard.snapshot_path);
+    defer {
+        if (std.fs.path.dirname(afb_path)) |staging_dir| destroyPathIfExistsWithIo(io, staging_dir);
+        alloc.free(afb_path);
+    }
+    try backups_api.verifyShardArtifactIntegrity(alloc, io, .portable, afb_path, shard);
 
-    const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
-    defer alloc.free(afb_data);
-
-    try resetLocalTablePath(path);
     var db = try db_mod.DB.open(alloc, path, .{
         .identity_namespace = options.expected_identity_namespace,
         .start_index_workers = false,
+        .staged_generation = staged_generation,
     });
     var db_closed = false;
     defer if (!db_closed) db.close();
-    try portable_backup.importPortableWithOptions(alloc, db.core.store, afb_data, .{
+    var afb_file = if (std.fs.path.isAbsolute(afb_path))
+        try std.Io.Dir.openFileAbsolute(io, afb_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, afb_path, .{});
+    defer afb_file.close(io);
+    const afb_stat = try afb_file.stat(io);
+    try portable_backup.importPortableFileWithOptions(alloc, db.core.store, io, afb_file, afb_stat.size, .{
         .identity_namespace = options.expected_identity_namespace,
         .prefer_existing_identity_namespace = true,
         .import_derived_indexes = true,
@@ -286,7 +515,26 @@ fn applyPortableRestore(
     db.close();
     db_closed = true;
     destroyPathIfExists(indexes_path);
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifactWithIo(
+        alloc,
+        io,
+        path,
+        restore.backup_id,
+        restoreIdentityLocation(restore),
+        shard.artifact_sha256,
+        shard.snapshot_path,
+        group_id,
+    );
+}
+
+fn resolveRestoreShard(
+    manifest: *const backups_api.TableBackupManifest,
+    group_id: u64,
+    requested_snapshot_path: []const u8,
+) ?*const backups_api.ShardSnapshot {
+    if (requested_snapshot_path.len > 0)
+        return backups_api.findShardSnapshotByPath(manifest, requested_snapshot_path);
+    return backups_api.findShardSnapshot(manifest, group_id);
 }
 
 fn portableEmbeddingSourceFieldsFromIndexesJson(
@@ -341,74 +589,41 @@ fn freePortableEmbeddingSourceFields(
     if (fields.len > 0) alloc.free(fields);
 }
 
-fn portableSnapshotDocCount(alloc: std.mem.Allocator, afb_path: []const u8) !u64 {
-    const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
-    defer alloc.free(afb_data);
-    var reader = @import("../../storage/backup_codec.zig").SliceReader.init(afb_data);
-    _ = try reader.readHeader();
-    var count: u64 = 0;
-    while (reader.pos < reader.data.len) {
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        if (block.block_type == .document_batch) {
-            const entries = try @import("../../storage/backup_codec.zig").decodeDocumentBatch(alloc, block.payload);
-            defer {
-                for (entries) |entry| {
-                    alloc.free(entry.key);
-                    alloc.free(entry.value);
-                }
-                alloc.free(entries);
-            }
-            count += @intCast(entries.len);
-        }
-    }
-    return count;
-}
-
 fn stageRestoreSnapshot(
     alloc: std.mem.Allocator,
+    io: std.Io,
     path: []const u8,
     location: *backups_api.BackupLocation,
     snapshot_path: []const u8,
 ) ![]u8 {
-    return switch (location.*) {
-        .file => |backup_root| try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path }),
-        .remote => blk: {
-            const staging_root = try std.fmt.allocPrint(alloc, "{s}.restore-staging", .{path});
-            errdefer alloc.free(staging_root);
-            destroyPathIfExists(staging_root);
-            try backups_api.copyDirectoryFromLocation(alloc, location, snapshot_path, staging_root);
-            break :blk staging_root;
-        },
-    };
+    const staging_root = try std.fmt.allocPrint(alloc, "{s}.restore-source", .{path});
+    errdefer alloc.free(staging_root);
+    destroyPathIfExistsWithIo(io, staging_root);
+    errdefer destroyPathIfExistsWithIo(io, staging_root);
+    try backups_api.copyDirectoryFromLocationUsingIo(alloc, io, location, snapshot_path, staging_root);
+    return staging_root;
 }
 
 fn stageRestoreFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     path: []const u8,
     location: *backups_api.BackupLocation,
     snapshot_path: []const u8,
 ) ![]u8 {
-    return switch (location.*) {
-        .file => |backup_root| try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path }),
-        .remote => blk: {
-            const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-staging/{s}", .{ path, std.fs.path.basename(snapshot_path) });
-            errdefer alloc.free(staging_path);
-            const staging_dir = std.fs.path.dirname(staging_path) orelse return error.InvalidBackupRequest;
-            destroyPathIfExists(staging_dir);
-            try ensureDirPath(staging_dir);
-            try backups_api.copyFileFromLocation(alloc, location, snapshot_path, staging_path);
-            break :blk staging_path;
-        },
-    };
+    const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-source/{s}", .{ path, std.fs.path.basename(snapshot_path) });
+    errdefer alloc.free(staging_path);
+    const staging_dir = std.fs.path.dirname(staging_path) orelse return error.InvalidBackupRequest;
+    destroyPathIfExistsWithIo(io, staging_dir);
+    errdefer destroyPathIfExistsWithIo(io, staging_dir);
+    try fs_paths.createDirPathPortable(io, staging_dir);
+    try backups_api.copyFileFromLocationUsingIo(alloc, io, location, snapshot_path, staging_path);
+    return staging_path;
 }
 
-fn resetLocalTablePath(path: []const u8) !void {
-    destroyPathIfExists(path);
-    try ensureDirPath(path);
-
-    const snapshot_dir = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.snapshots", .{path});
-    defer std.heap.page_allocator.free(snapshot_dir);
+fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+    const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
+    defer alloc.free(snapshot_dir);
     destroyPathIfExists(snapshot_dir);
 }
 
@@ -422,6 +637,10 @@ fn destroyPathIfExists(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+fn destroyPathIfExistsWithIo(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
 }
 
 fn writeFile(path: []const u8, data: []const u8) !void {

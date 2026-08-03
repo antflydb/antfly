@@ -297,6 +297,139 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("should return the durable table restore job", async () => {
+      const restoreJob = {
+        job_id: "9223372036854775807",
+        attempt_id: 0,
+        scope: "table" as const,
+        table_name: "products",
+        backup_id: "nightly",
+        phase: "queued" as const,
+        cancel_requested: false,
+        published_table_count: 0,
+        completed_table_count: 0,
+        total_table_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+      };
+      mockPost.mockResolvedValueOnce({ data: restoreJob, error: undefined });
+
+      const result = await client.tables.restore(
+        "products",
+        {
+          backup_id: "nightly",
+          location: "s3://backups/nightly",
+          connection: "archive",
+        },
+        { idempotencyKey: "products-nightly" }
+      );
+
+      expect(result).toEqual(restoreJob);
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/restore", {
+        params: { path: { tableName: "products" } },
+        headers: { "Idempotency-Key": "products-nightly" },
+        body: {
+          backup_id: "nightly",
+          location: "s3://backups/nightly",
+          connection: "archive",
+        },
+      });
+    });
+
+    it("should manage durable cluster restore jobs with opaque ids", async () => {
+      const restoreJob = {
+        job_id: "9223372036854775807",
+        attempt_id: 1,
+        scope: "cluster" as const,
+        backup_id: "nightly",
+        phase: "running" as const,
+        cancel_requested: false,
+        published_table_count: 12,
+        completed_table_count: 11,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+      };
+      mockPost.mockResolvedValueOnce({ data: restoreJob, error: undefined });
+      mockGet.mockResolvedValueOnce({ data: restoreJob, error: undefined });
+      mockDelete.mockResolvedValueOnce({
+        data: { ...restoreJob, cancel_requested: true },
+        error: undefined,
+      });
+
+      await expect(
+        client.restoreJobs.startCluster(
+          {
+            backup_id: "nightly",
+            location: "s3://backups/nightly",
+            connection: "archive",
+          },
+          { idempotencyKey: "cluster-nightly" }
+        )
+      ).resolves.toEqual(restoreJob);
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/restore", {
+        headers: { "Idempotency-Key": "cluster-nightly" },
+        body: {
+          backup_id: "nightly",
+          location: "s3://backups/nightly",
+          connection: "archive",
+        },
+      });
+
+      await expect(client.restoreJobs.get(restoreJob.job_id)).resolves.toEqual(restoreJob);
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/restore/jobs/{job_id}", {
+        params: { path: { job_id: restoreJob.job_id } },
+      });
+
+      await expect(client.restoreJobs.cancel(restoreJob.job_id)).resolves.toEqual({
+        ...restoreJob,
+        cancel_requested: true,
+      });
+      expect(mockDelete).toHaveBeenCalledWith("/db/v1/restore/jobs/{job_id}", {
+        params: { path: { job_id: restoreJob.job_id } },
+      });
+    });
+
+    it("should paginate durable restore jobs across empty filtered pages", async () => {
+      const restoreJob = {
+        job_id: "42",
+        attempt_id: 1,
+        scope: "table" as const,
+        table_name: "docs",
+        backup_id: "nightly",
+        phase: "running" as const,
+        cancel_requested: false,
+        published_table_count: 0,
+        completed_table_count: 0,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+      };
+      mockGet
+        .mockResolvedValueOnce({ data: { jobs: [], next_cursor: "100" }, error: undefined })
+        .mockResolvedValueOnce({ data: { jobs: [restoreJob] }, error: undefined });
+
+      await expect(
+        client.restoreJobs.listAll({ phase: "running", scope: "table" })
+      ).resolves.toEqual([restoreJob]);
+      expect(mockGet).toHaveBeenNthCalledWith(1, "/db/v1/restore/jobs", {
+        params: { query: { phase: "running", scope: "table", cursor: undefined } },
+      });
+      expect(mockGet).toHaveBeenNthCalledWith(2, "/db/v1/restore/jobs", {
+        params: { query: { phase: "running", scope: "table", cursor: "100" } },
+      });
+    });
+
+    it("should reject an invalid empty table restore response", async () => {
+      mockPost.mockResolvedValueOnce({ data: undefined, error: undefined });
+
+      await expect(
+        client.tables.restore("products", {
+          backup_id: "nightly",
+          location: "s3://backups/nightly",
+          connection: "archive",
+        })
+      ).rejects.toThrow("Restore failed: unexpected empty response");
+    });
+
     it("should perform bounded batch writes with fetch", async () => {
       const mockFetch = vi
         .spyOn(globalThis, "fetch")

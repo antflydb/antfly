@@ -52,7 +52,7 @@ const benchmark_algebraic_config_json =
 const Mode = enum {
     handler,
     local,
-    swarm,
+    standalone,
 };
 
 const ServerKind = enum {
@@ -235,7 +235,7 @@ const Config = struct {
     startup_timeout_ms: u64 = 30_000,
     index_ready_timeout_ms: u64 = 120_000,
     load_progress_interval: usize = 25_000,
-    swarm_binary: []const u8 = "./zig-out/bin/antfly",
+    standalone_binary: []const u8 = "./zig-out/bin/antfly",
     bind_host: []const u8 = "127.0.0.1",
 };
 
@@ -1086,10 +1086,10 @@ pub fn main(init: std.process.Init) !void {
     switch (cfg.mode) {
         .handler => try runHandlerBench(alloc, cfg, dataset, queries, query_bodies),
         .local => try runLocalBench(alloc, init.io, cfg, dataset, queries, query_bodies),
-        .swarm => {
+        .standalone => {
             const cwd = try std.process.currentPathAlloc(init.io, alloc);
             defer alloc.free(cwd);
-            try runSwarmBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+            try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
         },
     }
 }
@@ -1577,8 +1577,8 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
             cfg.mode = .handler;
         } else if (std.mem.eql(u8, raw, "local")) {
             cfg.mode = .local;
-        } else if (std.mem.eql(u8, raw, "swarm")) {
-            cfg.mode = .swarm;
+        } else if (std.mem.eql(u8, raw, "standalone")) {
+            cfg.mode = .standalone;
         } else {
             return error.InvalidArgument;
         }
@@ -1646,8 +1646,8 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
     } else if (std.mem.eql(u8, arg, "--sync-level")) {
         const raw = args.next() orelse return error.InvalidArgument;
         cfg.sync_level = db_mod.types.parsePublicSyncLevelText(raw) orelse return error.InvalidArgument;
-    } else if (std.mem.eql(u8, arg, "--swarm-binary")) {
-        cfg.swarm_binary = args.next() orelse return error.InvalidArgument;
+    } else if (std.mem.eql(u8, arg, "--standalone-binary")) {
+        cfg.standalone_binary = args.next() orelse return error.InvalidArgument;
     } else if (std.mem.eql(u8, arg, "--host")) {
         cfg.bind_host = args.next() orelse return error.InvalidArgument;
     } else {
@@ -2801,7 +2801,7 @@ fn makeQueryBodies(alloc: std.mem.Allocator, queries: []const f32, cfg: Config) 
     return out;
 }
 
-fn runSwarmBench(
+fn runStandaloneBench(
     alloc: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
@@ -2816,7 +2816,7 @@ fn runSwarmBench(
         if (completed) {
             cleanupTempDir(root_path);
         } else {
-            std.debug.print("public-query guardrail preserved failed swarm root={s}\n", .{root_path});
+            std.debug.print("public-query guardrail preserved failed standalone root={s}\n", .{root_path});
         }
     }
 
@@ -2830,7 +2830,7 @@ fn runSwarmBench(
     var store_raft_port = try reserveEphemeralPort(io);
     if (store_raft_port == bind_port or store_raft_port == health_port or store_raft_port == metadata_port or store_raft_port == metadata_admin_port) store_raft_port +%= 4;
 
-    var child = try spawnSwarm(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
+    var child = try spawnStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
     defer child.kill(io);
 
     const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, bind_port });
@@ -2842,12 +2842,12 @@ fn runSwarmBench(
     const index_status_uri = try std.fmt.allocPrint(alloc, "{s}/tables/{s}/indexes/{s}", .{ base_uri, table_name, index_name });
     defer alloc.free(index_status_uri);
 
-    std.debug.print("public-query guardrail stage=swarm-start\n", .{});
+    std.debug.print("public-query guardrail stage=standalone-start\n", .{});
     try waitForHttpOk(alloc, health_uri, cfg.startup_timeout_ms);
 
-    std.debug.print("public-query guardrail stage=swarm-load\n", .{});
+    std.debug.print("public-query guardrail stage=standalone-load\n", .{});
     const child_pid = child.id orelse return error.UnexpectedProcessExit;
-    const load = try seedSwarm(alloc, io, base_uri, health_uri, metrics_uri, index_status_uri, child_pid, dataset, cfg);
+    const load = try seedStandalone(alloc, io, base_uri, health_uri, metrics_uri, index_status_uri, child_pid, dataset, cfg);
     const load_memory = fetchMemoryBreakdown(alloc, base_uri, metrics_uri) catch |err| blk: {
         std.debug.print("public-query guardrail memory_breakdown_err phase=post_load err={s}\n", .{@errorName(err)});
         break :blk MemoryBreakdown{};
@@ -2871,7 +2871,7 @@ fn runSwarmBench(
     const avg_http_ns = http_stats.avgNs();
     const avg_profile_ns = http_stats.avgProfileNs();
     std.debug.print(
-        "public_query_guardrail mode=swarm server={s} query_shape={s} with_schema={} with_algebraic={} docs={d} dims={d} queries={d} repeats={d} k={d} threads={d} load_insert_ms={d:.2} index_wait_ms={d:.2} load_total_ms={d:.2} http={d:.3}us http_first_pass={d:.3}us http_later_pass={d:.3}us http_over_profile={d:.3}us profile_total={d:.3}us concurrent_qps={d:.2} concurrent_avg={d:.3}us concurrent_max={d:.3}us load_rss_peak_mb={d:.2} search_rss_peak_mb={d:.2}\n",
+        "public_query_guardrail mode=standalone server={s} query_shape={s} with_schema={} with_algebraic={} docs={d} dims={d} queries={d} repeats={d} k={d} threads={d} load_insert_ms={d:.2} index_wait_ms={d:.2} load_total_ms={d:.2} http={d:.3}us http_first_pass={d:.3}us http_later_pass={d:.3}us http_over_profile={d:.3}us profile_total={d:.3}us concurrent_qps={d:.2} concurrent_avg={d:.3}us concurrent_max={d:.3}us load_rss_peak_mb={d:.2} search_rss_peak_mb={d:.2}\n",
         .{
             @tagName(cfg.server_kind),
             cfg.query_shape.text(),
@@ -2899,7 +2899,7 @@ fn runSwarmBench(
         },
     );
     printPublicQueryGuardrailSummaryJson(
-        "swarm",
+        "standalone",
         @tagName(cfg.server_kind),
         cfg,
         0,
@@ -3028,7 +3028,7 @@ fn runSwarmBench(
     completed = true;
 }
 
-fn spawnSwarm(
+fn spawnStandalone(
     alloc: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
@@ -3070,8 +3070,8 @@ fn spawnSwarm(
         .zig => {
             return try std.process.spawn(io, .{
                 .argv = &.{
-                    cfg.swarm_binary,
-                    "swarm",
+                    cfg.standalone_binary,
+                    "standalone",
                     "--config",
                     config_path,
                     "--host",
@@ -3080,7 +3080,7 @@ fn spawnSwarm(
                     bind_port_arg,
                     "--health-port",
                     health_port_arg,
-                    "--tick-ms",
+                    "--control-tick-ms",
                     "5",
                     "--replica-root-dir",
                     replica_root,
@@ -3112,16 +3112,16 @@ fn spawnSwarm(
             try env_map.put("ANTFLY_STORAGE_LOCAL_BASE_DIR", root_path);
             try env_map.put("ANTFLY_HEALTH_PORT", health_port_arg);
             try env_map.put("ANTFLY_LOG_STYLE", "logfmt");
-            try env_map.put("ANTFLY_SWARM_TERMITE", "false");
+            try env_map.put("ANTFLY_STANDALONE_TERMITE", "false");
 
             return try std.process.spawn(io, .{
                 .argv = &.{
-                    cfg.swarm_binary,
+                    cfg.standalone_binary,
                     "--data-dir",
                     root_path,
                     "--log-style",
                     "logfmt",
-                    "swarm",
+                    "standalone",
                     "--metadata-api",
                     metadata_api_url,
                     "--metadata-raft",
@@ -3146,7 +3146,7 @@ fn spawnSwarm(
     }
 }
 
-fn seedSwarm(
+fn seedStandalone(
     alloc: std.mem.Allocator,
     io: std.Io,
     base_uri: []const u8,
@@ -3162,9 +3162,9 @@ fn seedSwarm(
     var client = api.ApiHttpClient.init(alloc, executor.executor());
 
     const create_table_body = if (cfg.with_schema or cfg.query_shape.requiresSchema())
-        try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\",\"schema\":{s}}}", .{benchmarkSchemaJson(cfg)})
+        try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query standalone guardrail\",\"schema\":{s}}}", .{benchmarkSchemaJson(cfg)})
     else
-        try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\"}}", .{});
+        try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query standalone guardrail\"}}", .{});
     defer alloc.free(create_table_body);
     const create_table_path = try std.fmt.allocPrint(alloc, "/tables/{s}", .{table_name});
     defer alloc.free(create_table_path);
@@ -3274,12 +3274,12 @@ fn seedSwarm(
             defer alloc.free(batch_path);
             const batch_started_ns = nowNs();
             const batch = postJsonExpect(alloc, executor.executor(), base_uri, batch_path, batch_body, &.{ 200, 201 }) catch |err| {
-                std.debug.print("public-query guardrail swarm batch failed start={d} end={d} err={s}\n", .{
+                std.debug.print("public-query guardrail standalone batch failed start={d} end={d} err={s}\n", .{
                     start,
                     end,
                     @errorName(err),
                 });
-                std.debug.print("public-query guardrail swarm load poll status health_samples={d} metrics_samples={d} status_samples={d} health_failures={d} metrics_failures={d} status_failures={d} health_max_ms={d:.2} metrics_max_ms={d:.2} status_max_ms={d:.2} rss_peak_mb={d:.2}\n", .{
+                std.debug.print("public-query guardrail standalone load poll status health_samples={d} metrics_samples={d} status_samples={d} health_failures={d} metrics_failures={d} status_failures={d} health_max_ms={d:.2} metrics_max_ms={d:.2} status_max_ms={d:.2} rss_peak_mb={d:.2}\n", .{
                     health_poller.stats.health_samples,
                     metrics_poller.stats.metrics_samples,
                     status_poller.stats.status_samples,
@@ -3291,7 +3291,7 @@ fn seedSwarm(
                     nsToMs(status_poller.stats.status_max_latency_ns),
                     bytesToMiB(rss_poller.peak_rss_bytes),
                 });
-                try printSwarmLoadFailureDiagnostics(alloc, &client, base_uri, health_uri);
+                try printStandaloneLoadFailureDiagnostics(alloc, &client, base_uri, health_uri);
                 return err;
             };
             const batch_ns = elapsedSince(batch_started_ns);
@@ -3301,7 +3301,7 @@ fn seedSwarm(
             window_max_batch_ns = @max(window_max_batch_ns, batch_ns);
             defer alloc.free(batch);
             if (cfg.load_progress_interval > 0 and (end == cfg.docs or end % cfg.load_progress_interval == 0)) {
-                try printSwarmLoadSample(
+                try printStandaloneLoadSample(
                     alloc,
                     &client,
                     base_uri,
@@ -3369,7 +3369,7 @@ fn postJsonExpect(
     return error.UnexpectedHttpStatus;
 }
 
-fn printSwarmLoadFailureDiagnostics(
+fn printStandaloneLoadFailureDiagnostics(
     alloc: std.mem.Allocator,
     client: *api.ApiHttpClient,
     base_uri: []const u8,
@@ -3381,17 +3381,17 @@ fn printSwarmLoadFailureDiagnostics(
         .method = .GET,
         .uri = health_uri,
     }) catch |err| {
-        std.debug.print("public-query guardrail swarm failure health_err={s}\n", .{@errorName(err)});
+        std.debug.print("public-query guardrail standalone failure health_err={s}\n", .{@errorName(err)});
         return;
     };
     defer health.deinit(alloc);
-    std.debug.print("public-query guardrail swarm failure health_status={d} body={s}\n", .{ health.status, health.body });
+    std.debug.print("public-query guardrail standalone failure health_status={d} body={s}\n", .{ health.status, health.body });
 
     const visibility = fetchDenseVisibilitySnapshot(alloc, client, base_uri) catch |err| {
-        std.debug.print("public-query guardrail swarm failure index_status_err={s}\n", .{@errorName(err)});
+        std.debug.print("public-query guardrail standalone failure index_status_err={s}\n", .{@errorName(err)});
         return;
     };
-    std.debug.print("public-query guardrail swarm failure index_status doc_count={d} total_indexed={d} node_count={d} root_node={d} replay_applied={d} replay_target={d} replay_required={any} backfill_active={any} rebuilding={any}\n", .{
+    std.debug.print("public-query guardrail standalone failure index_status doc_count={d} total_indexed={d} node_count={d} root_node={d} replay_applied={d} replay_target={d} replay_required={any} backfill_active={any} rebuilding={any}\n", .{
         visibility.doc_count,
         visibility.total_indexed,
         visibility.node_count,
@@ -3537,7 +3537,7 @@ fn fetchIndexVisibilitySnapshot(
     return .{};
 }
 
-fn printSwarmLoadSample(
+fn printStandaloneLoadSample(
     alloc: std.mem.Allocator,
     client: *api.ApiHttpClient,
     base_uri: []const u8,

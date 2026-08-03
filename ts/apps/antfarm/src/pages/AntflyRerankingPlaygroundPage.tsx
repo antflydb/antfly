@@ -20,7 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import { InferenceClient } from "@antfly/sdk";
+import type { RerankResponse } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
@@ -33,11 +33,12 @@ import {
   Zap,
 } from "lucide-react";
 import type React from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { useTable } from "@/hooks/use-table";
-import { fetchWithRetry } from "@/lib/utils";
 
 interface HitResult {
   id: string;
@@ -51,11 +52,6 @@ interface RankedHit extends HitResult {
   rerankScore: number;
   newRank: number;
   rankChange: number; // positive = moved up, negative = moved down
-}
-
-interface ModelsResponse {
-  rerankers: Record<string, { capabilities?: string[] }>;
-  [key: string]: Record<string, { capabilities?: string[] }>;
 }
 
 /** Extract a text representation from document source for reranking. */
@@ -126,7 +122,7 @@ function RankDelta({ change }: { change: number }) {
 }
 
 const AntflyRerankingPlaygroundPage: React.FC = () => {
-  const { client, inferenceApiUrl } = useApiConfig();
+  const { client, inferenceUrl } = useApiConfig();
   const { selectedTable, embeddingIndexes, selectedIndex, setSelectedIndex } = useTable();
 
   const [query, setQuery] = useState("");
@@ -147,34 +143,20 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
   const [isReranking, setIsReranking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("reranker");
 
-  const inferenceClient = useMemo(
-    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
-    [inferenceApiUrl]
-  );
-
-  // Fetch available reranker models
   useEffect(() => {
-    const fetchModels = async () => {
-      try {
-        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/models`);
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const rerankers = Object.keys(data.rerankers || {});
-          setAvailableModels(rerankers);
-          if (rerankers.length > 0) {
-            const builtin = rerankers.find((m) => m === "antfly-builtin-reranker");
-            setSelectedModel(builtin || rerankers[0]);
-          }
-        }
-      } catch {
-        console.error("Failed to fetch models");
-      } finally {
-        setModelsLoaded(true);
-      }
-    };
-    fetchModels();
-  }, [inferenceApiUrl]);
+    setAvailableModels(connectionModels);
+    setSelectedModel((current) =>
+      current && connectionModels.includes(current)
+        ? current
+        : connectionModels.find((model) => model === "antfly-builtin-reranker") ||
+          connectionModels[0] ||
+          ""
+    );
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   const handleSearch = async () => {
     if (!query.trim()) {
@@ -244,7 +226,13 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
 
     try {
       const prompts = searchResults.map((r) => r.text);
-      const response = await inferenceClient.rerank(selectedModel, query, prompts);
+      const raw = await fetch(inferenceUrl("rerank"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: selectedModel, query, prompts }),
+      });
+      if (!raw.ok) throw new Error(`Rerank failed: ${raw.status}`);
+      const response: RerankResponse = await raw.json();
       const scores = [...response.data].sort((a, b) => a.index - b.index).map((item) => item.score);
 
       if (scores.length !== searchResults.length) {
@@ -311,6 +299,8 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
+
+      <BackendInfoBar />
 
       {!selectedTable && (
         <DashboardToolbar className="items-center justify-center border-dashed text-center text-sm text-muted-foreground md:items-center">

@@ -47,6 +47,8 @@ pub fn addLibraryBenchSteps(ctx: anytype) void {
     }
     const linalg_bench_step = b.step("bench-linalg", "Run lib/linalg benchmarks");
     linalg_bench_step.dependOn(&run_linalg_bench.step);
+    const inference_linalg_bench_step = b.step("inference-bench-linalg", "Run the inference linalg benchmark");
+    inference_linalg_bench_step.dependOn(&run_linalg_bench.step);
 
     const audio_bench = b.addExecutable(.{
         .name = "lib-audio-bench",
@@ -64,6 +66,8 @@ pub fn addLibraryBenchSteps(ctx: anytype) void {
     }
     const audio_bench_step = b.step("bench-audio", "Run lib/audio decode and synthesis benchmarks");
     audio_bench_step.dependOn(&run_audio_bench.step);
+    const inference_audio_bench_step = b.step("inference-bench-audio", "Run the inference audio benchmark");
+    inference_audio_bench_step.dependOn(&run_audio_bench.step);
 
     const lib_image_bench_build_options = b.addOptions();
     lib_image_bench_build_options.addOption(bool, "enable_spng", lib_image_enable_spng);
@@ -158,6 +162,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     const platform_mod = ctx.platform_mod;
     const lmdb_engine_mod = ctx.lmdb_engine_mod;
     const json_mod = ctx.json_mod;
+    const inference_tokenizer_mod = ctx.inference_tokenizer_mod;
     const indexes_openapi_mod = ctx.indexes_openapi_mod;
     const metadata_openapi_mod = ctx.metadata_openapi_mod;
     const query_openapi_mod = ctx.query_openapi_mod;
@@ -172,6 +177,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     const scraping_mod = ctx.scraping_mod;
     const raft_engine_mod = ctx.raft_engine_mod;
     const run_lib_ha_compat_tests = ctx.run_lib_ha_compat_tests;
+    const include_ha_tests_in_aggregates = ctx.include_ha_tests_in_aggregates;
     const makeLmdbBuildOptions = ctx.makeLmdbBuildOptions;
     const makeRootBuildOptions = ctx.makeRootBuildOptions;
     const makeLmdbEngineModule = ctx.makeLmdbEngineModule;
@@ -813,6 +819,30 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     const json_bench_step = b.step("json-bench", "Benchmark std.json vs antfly-json parsing");
     json_bench_step.dependOn(&run_json_bench.step);
 
+    const tokenizer_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/tokenizer_benchmark.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    tokenizer_bench_mod.addImport("inference_tokenizer", inference_tokenizer_mod);
+    const tokenizer_bench = b.addExecutable(.{
+        .name = "tokenizer_benchmark",
+        .root_module = tokenizer_bench_mod,
+    });
+    const install_tokenizer_bench = b.addInstallArtifact(tokenizer_bench, .{});
+    const tokenizer_bench_build_step = b.step(
+        "bench-tokenizer-build",
+        "Build the native Zig HuggingFace tokenizer benchmark binary",
+    );
+    tokenizer_bench_build_step.dependOn(&install_tokenizer_bench.step);
+    const run_tokenizer_bench = b.addRunArtifact(tokenizer_bench);
+    if (b.args) |args| {
+        run_tokenizer_bench.addArgs(args);
+    }
+    const tokenizer_bench_step = b.step("bench-tokenizer", "Benchmark the native Zig HuggingFace tokenizer");
+    tokenizer_bench_step.dependOn(&run_tokenizer_bench.step);
+
     // Benchmark executable
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
@@ -880,7 +910,9 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
-    compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    if (include_ha_tests_in_aggregates) {
+        compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    }
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),
@@ -906,6 +938,19 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     });
     const install_search_benchmark_query = b.addInstallArtifact(search_benchmark_query, .{});
 
+    const search_benchmark_common_test_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    search_benchmark_common_test_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_common_tests = b.addTest(.{
+        .root_module = search_benchmark_common_test_mod,
+    });
+    const run_search_benchmark_common_tests = b.addRunArtifact(search_benchmark_common_tests);
+    const search_bench_test_step = b.step("search-bench-test", "Run search benchmark grammar and protocol tests");
+    search_bench_test_step.dependOn(&run_search_benchmark_common_tests.step);
+
     const search_benchmark_codec_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_codec_bench.zig"),
         .target = target,
@@ -924,6 +969,37 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     }
     const search_bench_codec_step = b.step("search-bench-codec-bench", "Benchmark StreamVByte codec used by search postings");
     search_bench_codec_step.dependOn(&run_search_benchmark_codec_bench.step);
+
+    const search_benchmark_bitpack_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_bitpack_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_benchmark_bitpack_bench_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_bitpack_bench = b.addExecutable(.{
+        .name = "search_benchmark_bitpack_bench",
+        .root_module = search_benchmark_bitpack_bench_mod,
+    });
+    const install_search_benchmark_bitpack_bench = b.addInstallArtifact(search_benchmark_bitpack_bench, .{});
+    const run_search_benchmark_bitpack_bench = b.addRunArtifact(search_benchmark_bitpack_bench);
+    if (b.args) |args| run_search_benchmark_bitpack_bench.addArgs(args);
+    const search_bench_bitpack_step = b.step("search-bench-bitpack-bench", "Benchmark portable Zig vector BP128 against horizontal bit packing");
+    search_bench_bitpack_step.dependOn(&run_search_benchmark_bitpack_bench.step);
+
+    const search_impact_layout_analyze_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_impact_layout_analyze.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_impact_layout_analyze_mod.addImport("antfly-zig", lib_mod);
+    const search_impact_layout_analyze = b.addExecutable(.{
+        .name = "search_impact_layout_analyze",
+        .root_module = search_impact_layout_analyze_mod,
+    });
+    const run_search_impact_layout_analyze = b.addRunArtifact(search_impact_layout_analyze);
+    if (b.args) |args| run_search_impact_layout_analyze.addArgs(args);
+    const search_impact_layout_analyze_step = b.step("search-impact-layout-analyze", "Project exact adaptive impact-column density for segment files");
+    search_impact_layout_analyze_step.dependOn(&run_search_impact_layout_analyze.step);
 
     const wand_skip_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),
@@ -946,6 +1022,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     search_bench_build_step.dependOn(&install_search_benchmark_index.step);
     search_bench_build_step.dependOn(&install_search_benchmark_query.step);
     search_bench_build_step.dependOn(&install_search_benchmark_codec_bench.step);
+    search_bench_build_step.dependOn(&install_search_benchmark_bitpack_bench.step);
 
     const storage_fixture_promote_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_fixture_promote.zig"),
@@ -1172,7 +1249,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     replay_bench_build_options.addOption(bool, "storage_sim_soak", false);
     replay_bench_build_options.addOption(bool, "with_tla", with_tla);
     replay_bench_build_options.addOption(bool, "link_libc", true);
-    replay_bench_build_options.addOption(bool, "swarm_runtime_focused_test", false);
+    replay_bench_build_options.addOption(bool, "standalone_runtime_focused_test", false);
     replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
 
     const replay_bench_mod = b.createModule(.{

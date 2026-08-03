@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/logger"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
@@ -85,6 +86,7 @@ type metadataKV struct {
 	// commitDoneC is closed when the ReadCommits goroutine exits,
 	// so Close() can wait for commit processing to finish before closing Pebble.
 	commitDoneC chan struct{}
+	ctx         context.Context
 	cancel      context.CancelFunc
 
 	// Pending batch for commit processing (implements raftkv.CommitProcessor).
@@ -97,6 +99,13 @@ type metadataKV struct {
 
 func (s *metadataKV) pebbleDir() string {
 	return s.dbDir + "/pebble"
+}
+
+func (s *metadataKV) ownedLifecycleContext() context.Context {
+	if s.ctx == nil || s.ctx.Err() != nil {
+		s.ctx, s.cancel = context.WithCancel(context.Background()) //nolint:gosec // owned and canceled by metadataKV.Close
+	}
+	return s.ctx
 }
 
 func newMetadataKV(
@@ -120,6 +129,7 @@ func newMetadataKV(
 		loadSnapshotID: loadSnapshotID,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx = ctx
 	s.cancel = cancel
 
 	// FIXME (ajr) If we gracefully shutdown we shouldn't need to load from the snapshot
@@ -202,7 +212,7 @@ func (s *metadataKV) LoadSnapshot(ctx context.Context) error {
 func (s *metadataKV) loadSnapshotAndOpenDB(ctx context.Context) error {
 	// Close existing pdb before loading snapshot and reopening.
 	// loadPersistentSnapshot closes pdb when a snapshot is found, but if no
-	// snapshot exists (e.g. swarm mode) we still need to close before reopening.
+	// snapshot exists (e.g. standalone mode) we still need to close before reopening.
 	if s.pdb != nil {
 		if err := s.pdb.Close(); err != nil {
 			s.logger.Warn("failed to close previous db before snapshot load", zap.Error(err))
@@ -243,7 +253,7 @@ func (s *metadataKV) loadPersistentSnapshot(ctx context.Context) error {
 	} else if err != nil {
 		return fmt.Errorf("failed to load snapshot info: %w", err)
 	}
-	// In swarm mode, snapID will be empty (no Raft snapshots)
+	// In standalone mode, snapID will be empty (no Raft snapshots)
 	if snapID == "" {
 		return nil
 	}
@@ -299,7 +309,10 @@ func (s *metadataKV) getPebbleOpts() (*pebble.Options, error) {
 
 // configureS3Storage configures Pebble to use S3 for remote sstable storage.
 func (s *metadataKV) configureS3Storage(pebbleOpts *pebble.Options) error {
-	s3Info := s.antflyConfig.Storage.S3
+	s3Info, err := s.antflyConfig.ResolveObjectStorageS3("catalog")
+	if err != nil {
+		return fmt.Errorf("resolving object storage catalog lane: %w", err)
+	}
 	s.logger.Info("Configuring S3 storage for metadata Pebble",
 		zap.String("endpoint", s3Info.Endpoint),
 		zap.String("bucket", s3Info.Bucket),
@@ -307,9 +320,11 @@ func (s *metadataKV) configureS3Storage(pebbleOpts *pebble.Options) error {
 		zap.Bool("useSSL", s3Info.UseSsl),
 	)
 
-	minioClient, err := s3Info.NewMinioClient()
+	bucketCtx, cancelBucket := context.WithTimeout(s.ownedLifecycleContext(), 30*time.Second)
+	defer cancelBucket()
+	minioClient, err := s3Info.EnsureBucket(bucketCtx)
 	if err != nil {
-		return fmt.Errorf("creating S3 client: %w", err)
+		return fmt.Errorf("preparing S3 bucket: %w", err)
 	}
 
 	baseS3Storage, err := s3storage.NewS3Storage(
@@ -357,10 +372,10 @@ func (s *metadataKV) SetLeaderFactory(f func(ctx context.Context) error) {
 	if s.raftNode != nil {
 		s.raftNode.SetLeaderFactory(wrappedFactory)
 	} else {
-		// In swarm mode without Raft, call the factory function directly
+		// In standalone mode without Raft, call the factory function directly
 		go func() {
 			if err := wrappedFactory(context.Background()); err != nil {
-				s.logger.Error("Leader factory error in swarm mode", zap.Error(err))
+				s.logger.Error("Leader factory error in standalone mode", zap.Error(err))
 			}
 		}()
 	}

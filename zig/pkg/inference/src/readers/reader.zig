@@ -25,6 +25,8 @@ const multistage_metadata = @import("multistage_metadata.zig");
 const multistage_reader_mod = @import("multistage_reader.zig");
 const pix2struct_mod = @import("pix2struct.zig");
 const vision_reader_mod = @import("vision_reader.zig");
+const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
 
 pub const Field = reader_types.Field;
@@ -64,6 +66,7 @@ const VisionLoadedReader = struct {
     }
 
     pub fn read(self: *VisionLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
+        try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
         var raw = try self.core.readRaw(image_data, .{
             .prompt = normalized_prompt,
@@ -72,6 +75,35 @@ const VisionLoadedReader = struct {
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+    }
+
+    pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        try validateVisionReadOptions(self.parser_kind, options);
+        const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
+        const raw_results = try self.core.readRawBatch(image_datas, .{
+            .prompt = normalized_prompt,
+            .max_tokens = options.max_tokens,
+        });
+        defer {
+            for (raw_results) |raw| {
+                var tmp = raw;
+                tmp.deinit();
+            }
+            self.allocator.free(raw_results);
+        }
+
+        const out = try self.allocator.alloc(Result, raw_results.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            self.allocator.free(out);
+        }
+
+        for (raw_results, 0..) |raw, i| {
+            out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+            filled += 1;
+        }
+        return out;
     }
 };
 
@@ -113,6 +145,10 @@ const VlmLoadedReader = struct {
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, options.prompt);
+    }
+
+    pub fn readBatch(self: *VlmLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return readBatchSerial(VlmLoadedReader, self, image_datas, options);
     }
 };
 
@@ -176,6 +212,10 @@ const GenAiLoadedReader = struct {
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, options.prompt);
     }
+
+    pub fn readBatch(self: *GenAiLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return readBatchSerial(GenAiLoadedReader, self, image_datas, options);
+    }
 };
 
 pub const LoadedReader = union(enum) {
@@ -191,7 +231,12 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
-            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(allocator, model_path, session_manager) };
+            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(
+                allocator,
+                model_path,
+                session_manager,
+                model_manager,
+            ) };
         }
 
         const parser_kind = try detectParserKind(allocator, model_path);
@@ -224,14 +269,70 @@ pub const LoadedReader = union(enum) {
     }
 
     pub fn read(self: *LoadedReader, image_data: []const u8, options: ReadOptions) !Result {
-        return switch (self.*) {
+        try validateReadOptions(options);
+        var result = try switch (self.*) {
             .vision => |*reader| reader.read(image_data, options),
             .genai => |*reader| reader.read(image_data, options),
             .vlm => |*reader| reader.read(image_data, options),
             .multistage => |*reader| reader.read(image_data, options),
         };
+        errdefer result.deinit();
+        try sanitizeResultUtf8(&result);
+        return result;
+    }
+
+    pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        try validateReadOptions(options);
+        const allocator = self.resultAllocator();
+        const results = try switch (self.*) {
+            .vision => |*reader| reader.readBatch(image_datas, options),
+            .genai => |*reader| reader.readBatch(image_datas, options),
+            .vlm => |*reader| reader.readBatch(image_datas, options),
+            .multistage => |*reader| readBatchSerial(@TypeOf(reader.*), reader, image_datas, options),
+        };
+        errdefer {
+            for (results) |*result| result.deinit();
+            allocator.free(results);
+        }
+        for (results) |*result| try sanitizeResultUtf8(result);
+        return results;
+    }
+
+    fn resultAllocator(self: *LoadedReader) std.mem.Allocator {
+        return switch (self.*) {
+            inline else => |*reader| reader.allocator,
+        };
     }
 };
+
+fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+    const allocator = reader.allocator;
+    const out = try allocator.alloc(Result, image_datas.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |*result| result.deinit();
+        allocator.free(out);
+    }
+
+    for (image_datas, 0..) |image_data, i| {
+        out[i] = try reader.read(image_data, options);
+        filled += 1;
+    }
+    return out;
+}
+
+fn validateReadOptions(options: ReadOptions) !void {
+    if (options.max_tokens) |max_tokens| {
+        if (max_tokens == 0) return error.InvalidMaxTokens;
+    }
+}
+
+fn validateVisionReadOptions(parser_kind: ParserKind, options: ReadOptions) !void {
+    if (parser_kind != .florence) return;
+    if (options.cache_dtype) |cache_dtype| {
+        if (!std.mem.eql(u8, cache_dtype, "f32")) return error.UnsupportedCacheDtype;
+    }
+}
 
 pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) bool {
     if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return true;
@@ -242,6 +343,28 @@ pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8)
     }
 
     return vision_reader_mod.isSupportedModelDir(allocator, model_path);
+}
+
+/// Same check, reusing a manifest the caller already loaded.
+///
+/// The directory-based form ends in a full `manifest.loadFromDir`, which parses GGUF
+/// tokenizer metadata. Running that once per model made `/ai/v1/models` take about a
+/// second per GGUF model even though the listing never needed those fields.
+pub fn isSupportedManifest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    man: manifest_mod.ModelManifest,
+) bool {
+    if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return true;
+
+    const parser_kind = detectParserKind(allocator, model_path) catch return false;
+    if (parser_kind == .moondream) {
+        return onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path);
+    }
+
+    if (enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man)) return true;
+
+    return vision_reader_mod.isSupportedManifest(man);
 }
 
 fn detectParserKind(allocator: std.mem.Allocator, model_path: []const u8) !ParserKind {
@@ -256,22 +379,75 @@ fn detectParserKind(allocator: std.mem.Allocator, model_path: []const u8) !Parse
 }
 
 fn parseOutput(allocator: std.mem.Allocator, parser_kind: ParserKind, text: []const u8, prompt: ?[]const u8) !Result {
+    // Generation cut off at max_tokens can end mid-multibyte character, leaving
+    // invalid UTF-8. std.json serializes such slices as arrays of byte integers
+    // instead of strings, breaking API clients — drop invalid sequences first.
+    const sanitized = try sanitizeUtf8Alloc(allocator, text);
+    defer if (sanitized) |s| allocator.free(s);
+    const clean_text = sanitized orelse text;
+
     return switch (parser_kind) {
         .default => .{
-            .text = try allocator.dupe(u8, std.mem.trim(u8, text, " \t\r\n")),
+            .text = try allocator.dupe(u8, std.mem.trim(u8, clean_text, " \t\r\n")),
             .allocator = allocator,
         },
         .florence => .{
-            .text = try parseFlorenceText(allocator, text),
+            .text = try parseFlorenceText(allocator, clean_text),
             .allocator = allocator,
         },
-        .donut => try parseDonutResult(allocator, text, prompt),
-        .moondream => try parseMoondreamResult(allocator, text),
+        .donut => try parseDonutResult(allocator, clean_text, prompt),
+        .moondream => try parseMoondreamResult(allocator, clean_text),
         .pix2struct => .{
-            .text = try allocator.dupe(u8, std.mem.trim(u8, text, " \t\r\n")),
+            .text = try allocator.dupe(u8, std.mem.trim(u8, clean_text, " \t\r\n")),
             .allocator = allocator,
         },
     };
+}
+
+/// Returns a copy of `text` with invalid UTF-8 byte sequences removed, or null
+/// when `text` is already valid (no allocation needed).
+fn sanitizeUtf8Alloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return null;
+    var out = try std.ArrayListUnmanaged(u8).initCapacity(allocator, text.len);
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1; // invalid lead byte
+            continue;
+        };
+        if (i + seq_len > text.len) break; // sequence truncated at end of text
+        if (std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
+            out.appendSliceAssumeCapacity(text[i .. i + seq_len]);
+            i += seq_len;
+        } else {
+            i += 1; // invalid continuation byte; resync on next byte
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn sanitizeOwnedUtf8(allocator: std.mem.Allocator, value: *[]const u8) !void {
+    if (try sanitizeUtf8Alloc(allocator, value.*)) |sanitized| {
+        allocator.free(value.*);
+        value.* = sanitized;
+    }
+}
+
+fn sanitizeResultUtf8(result: *Result) !void {
+    try sanitizeOwnedUtf8(result.allocator, &result.text);
+    for (result.fields) |*field| {
+        try sanitizeOwnedUtf8(result.allocator, &field.name);
+        try sanitizeOwnedUtf8(result.allocator, &field.value);
+    }
+    for (result.regions) |*region| {
+        try sanitizeOwnedUtf8(result.allocator, &region.text);
+        if (region.label) |label| {
+            var sanitized_label = label;
+            try sanitizeOwnedUtf8(result.allocator, &sanitized_label);
+            region.label = sanitized_label;
+        }
+    }
 }
 
 pub fn normalizePromptForFamily(parser_kind: ParserKind, prompt: ?[]const u8) ?[]const u8 {
@@ -627,6 +803,86 @@ test "florence parser inserts likely line breaks" {
     defer allocator.free(parsed);
 
     try std.testing.expectEqualStrings("heading\nThis is next.\nLineTwo", parsed);
+}
+
+test "sanitizeUtf8Alloc passes valid text through without allocating" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try sanitizeUtf8Alloc(allocator, "hello 世界"));
+}
+
+test "sanitizeUtf8Alloc drops sequence truncated at end of text" {
+    const allocator = std.testing.allocator;
+    // "世" is E4 B8 96; cut after two bytes to simulate a max_tokens cutoff.
+    const sanitized = (try sanitizeUtf8Alloc(allocator, "abc\xE4\xB8")).?;
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("abc", sanitized);
+}
+
+test "sanitizeUtf8Alloc drops interior invalid bytes and resyncs" {
+    const allocator = std.testing.allocator;
+    const sanitized = (try sanitizeUtf8Alloc(allocator, "a\xFFb\xE4\xB8\x96c")).?;
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("ab世c", sanitized);
+}
+
+test "parseOutput sanitizes truncated utf8 for florence" {
+    const allocator = std.testing.allocator;
+    var result = try parseOutput(allocator, .florence, "5月普\xE8\xA7", null);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("5月普", result.text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.text));
+}
+
+test "LoadedReader options reject zero tokens and Florence cache dtypes" {
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadOptions(.{ .max_tokens = 0 }));
+    try validateVisionReadOptions(.florence, .{});
+    try validateVisionReadOptions(.florence, .{ .cache_dtype = "f32" });
+    try std.testing.expectError(error.UnsupportedCacheDtype, validateVisionReadOptions(.florence, .{ .cache_dtype = "f16" }));
+    try std.testing.expectError(error.UnsupportedCacheDtype, validateVisionReadOptions(.florence, .{ .cache_dtype = "F32" }));
+    try validateVisionReadOptions(.default, .{ .cache_dtype = "f16" });
+}
+
+test "vision reader validates max tokens against the model limit" {
+    try std.testing.expectEqual(@as(usize, 512), try vision_reader_mod.resolveMaxLength(512, null, 1));
+    try std.testing.expectEqual(@as(usize, 3), try vision_reader_mod.resolveMaxLength(512, 2, 1));
+    try std.testing.expectEqual(@as(usize, 4), try vision_reader_mod.resolveMaxLength(512, 2, 2));
+    try std.testing.expectEqual(@as(usize, 512), try vision_reader_mod.resolveMaxLength(512, 511, 1));
+    try std.testing.expectEqual(@as(usize, 512), try vision_reader_mod.resolveMaxLength(512, 510, 2));
+    try std.testing.expectError(error.InvalidMaxTokens, vision_reader_mod.resolveMaxLength(512, 0, 1));
+    try std.testing.expectError(error.InvalidMaxTokens, vision_reader_mod.resolveMaxLength(512, 512, 1));
+    try std.testing.expectError(error.InvalidMaxTokens, vision_reader_mod.resolveMaxLength(512, 511, 2));
+    try std.testing.expectError(error.InvalidMaxTokens, vision_reader_mod.resolveMaxLength(512, std.math.maxInt(usize), 1));
+}
+
+test "sanitizeResultUtf8 covers text fields and regions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const fields = try allocator.alloc(Field, 1);
+    fields[0] = .{
+        .name = try allocator.dupe(u8, "na\xFFme"),
+        .value = try allocator.dupe(u8, "va\xFFlue"),
+    };
+    const regions = try allocator.alloc(Region, 1);
+    regions[0] = .{
+        .text = try allocator.dupe(u8, "re\xFFgion"),
+        .bbox = .{ 0, 0, 1, 1 },
+        .label = try allocator.dupe(u8, "la\xFFbel"),
+    };
+    var result = Result{
+        .text = try allocator.dupe(u8, "te\xFFxt"),
+        .fields = fields,
+        .regions = regions,
+        .allocator = allocator,
+    };
+
+    try sanitizeResultUtf8(&result);
+    try std.testing.expectEqualStrings("text", result.text);
+    try std.testing.expectEqualStrings("name", result.fields[0].name);
+    try std.testing.expectEqualStrings("value", result.fields[0].value);
+    try std.testing.expectEqualStrings("region", result.regions[0].text);
+    try std.testing.expectEqualStrings("label", result.regions[0].label.?);
 }
 
 test "moondream prompt uses default instruction" {

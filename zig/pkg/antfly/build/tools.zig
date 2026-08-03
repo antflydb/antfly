@@ -45,4 +45,22 @@ pub fn addToolSteps(ctx: anytype) void {
     }
     const hbc_trace_step = b.step("hbc-trace", "Trace one Zig HBC query against an exported vector dataset");
     hbc_trace_step.dependOn(&run_hbc_trace.step);
+
+    const hbc_leaf_debug_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/tools/hbc_leaf_debug.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    hbc_leaf_debug_mod.addImport("antfly-zig", lib_mod);
+    hbc_leaf_debug_mod.addImport("recall_common", recall_common_mod);
+    const hbc_leaf_debug = b.addExecutable(.{
+        .name = "hbc_leaf_debug",
+        .root_module = hbc_leaf_debug_mod,
+    });
+    const run_hbc_leaf_debug = b.addRunArtifact(hbc_leaf_debug);
+    if (b.args) |args| {
+        run_hbc_leaf_debug.addArgs(args);
+    }
+    const hbc_leaf_debug_step = b.step("hbc-leaf-debug", "Inspect cached versus fresh quantized HBC leaf scoring");
+    hbc_leaf_debug_step.dependOn(&run_hbc_leaf_debug.step);
 }

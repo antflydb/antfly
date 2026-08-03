@@ -110,6 +110,7 @@ pub const AlgebraicIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the sidecar is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the sidecar is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Backfill progress as a ratio from 0.0 to 1.0
@@ -168,7 +169,7 @@ pub const AlgebraicIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -245,6 +246,142 @@ pub const AntflyType = enum {
             .{ "geoshape", .geoshape },
             .{ "embedding", .embedding },
             .{ "blob", .blob },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A structured reason why the coverage projection cannot be treated as globally complete.
+pub const DerivedCoverageObservationIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    unknown_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+    counter_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .runtime_unavailable => "runtime_unavailable",
+            .missing_group => "missing_group",
+            .unknown_group => "unknown_group",
+            .remote_unknown_group => "remote_unknown_group",
+            .stale_group => "stale_group",
+            .summary_unavailable => "summary_unavailable",
+            .config_mismatch => "config_mismatch",
+            .counter_mismatch => "counter_mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "missing_group", .missing_group },
+            .{ "unknown_group", .unknown_group },
+            .{ "remote_unknown_group", .remote_unknown_group },
+            .{ "stale_group", .stale_group },
+            .{ "summary_unavailable", .summary_unavailable },
+            .{ "config_mismatch", .config_mismatch },
+            .{ "counter_mismatch", .counter_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How generation-scoped source outcomes determine derived-index completeness.
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DerivedCoverageStatus = struct {
+    policy: DerivedCoverageStatusPolicy,
+    /// Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality.
+    observation_complete: bool,
+    /// Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete.
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it.
+    config_fingerprint: []const u8,
+    /// Whether all observed shard-local coverage summaries were read atomically and completely.
+    summary_ready: bool,
+    /// Freshly observed shard groups reporting a different semantic configuration fingerprint.
+    config_mismatch_group_count: i64,
+    /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
+    source_total: i64,
+    /// Source documents with a durable produced outcome for this index generation.
+    produced: i64,
+    /// Source documents intentionally producing no indexable output.
+    skipped: i64,
+    /// Source documents whose generation failed non-retryably.
+    terminal_failed: i64,
+    /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
+    covered: i64,
+    /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+    pending: ?i64,
+    /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
+    complete: bool,
+    /// Whether coverage is complete without terminal failures.
+    healthy: bool,
+    /// Whether coverage is complete under best_effort but includes terminal failures.
+    degraded: bool,
+};
+
+pub const DerivedCoverageStatusPolicy = enum {
+    strict,
+    partial,
+    best_effort,
+    external,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+            .external => "external",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+            .{ "external", .external },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -372,6 +509,8 @@ pub const EdgeTypeConfig = struct {
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -401,6 +540,8 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -442,6 +583,7 @@ pub const EmbeddingsIndexStats = struct {
     total_terms: ?i64 = null,
     /// Whether the index enricher is currently backfilling
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
@@ -452,8 +594,10 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
     /// Operational readiness state such as ready, running, retrying, or failed.
     backfill_state: ?[]const u8 = null,
-    /// Number of documents visible to the index.
+    /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
+    /// Generation-scoped source-document coverage, separate from physical index cardinality.
+    coverage: ?DerivedCoverageStatus = null,
     /// Documents currently visible to queries.
     query_visible_doc_count: ?i64 = null,
     published_doc_count: ?i64 = null,
@@ -464,8 +608,6 @@ pub const EmbeddingsIndexStats = struct {
     dense_replay_target_sequence: ?i64 = null,
     /// Whether dense/vector artifacts still need publication before queries see the latest data.
     dense_publish_pending: ?bool = null,
-    /// Source document coverage accounting for embeddings indexes.
-    coverage: ?std.json.Value = null,
     replay_applied_sequence: ?i64 = null,
     replay_target_sequence: ?i64 = null,
     replay_catch_up_required: ?bool = null,
@@ -477,8 +619,7 @@ pub const EmbeddingsIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    /// Embedding enrichment worker runtime diagnostics.
-    enrichment_runtime: ?std.json.Value = null,
+    enrichment_runtime: ?EnrichmentRuntimeStatus = null,
     hbc_cache: ?std.json.Value = null,
     hbc_posting: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
@@ -489,7 +630,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -538,6 +679,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.
     producer_json: ?[]const u8 = null,
+    /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Managed generated artifact kind.
@@ -567,6 +710,58 @@ pub const EnrichmentKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Runtime state for the durable embeddings enrichment worker.
+pub const EnrichmentRuntimeStatus = struct {
+    enabled: bool,
+    target_sequence: i64,
+    applied_sequence: i64,
+    pending_sequence_count: i64,
+    projection_checkpoint_status: []const u8,
+    projection_checkpoint_applied_sequence: i64,
+    projection_checkpoint_generation: i64,
+    projection_checkpoint_config_fingerprint: []const u8,
+    /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
+    projection_checkpoint_identity_consistent: bool,
+    checkpoint_replay_tail_sequence_count: i64,
+    processed_requests: i64,
+    error_count: i64,
+    retryable_error_count: i64,
+    fatal_error_count: i64,
+    retrying: bool,
+    worker_failed: bool,
+    /// Whether the background enrichment worker is currently running.
+    worker_started: bool,
+    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    stalled: bool,
+    skip_by_hash_count: i64,
+    skipped_source_count: i64,
+    codec_decode_failures: i64,
+    embed_batches_started: i64,
+    embed_batches_completed: i64,
+    embed_items_started: i64,
+    embed_items_completed: i64,
+    active_embed_batch_items: i64,
+    active_embed_batch_bytes: i64,
+    active_embed_batch_max_bytes: i64,
+    active_embed_batch_started_ms: i64,
+    last_embed_batch_items: i64,
+    last_embed_batch_bytes: i64,
+    last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
+    last_embed_batch_ns: i64,
+    total_embed_ns: i64,
+};
+
+/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+pub const ExecutionPolicy = struct {
+    /// Maximum items to process in one batch for this operation.
+    batch_items: ?i64 = null,
+    /// Approximate maximum source bytes to process in one batch for this operation.
+    batch_bytes: ?i64 = null,
 };
 
 pub const FullTextIndexConfig = struct {
@@ -608,6 +803,7 @@ pub const FullTextIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Progress of ongoing rebuild as fraction [0.0, 1.0]
@@ -645,7 +841,7 @@ pub const FullTextIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -715,6 +911,7 @@ pub const GraphIndexStats = struct {
     edge_types: ?std.json.ArrayHashMap(i64) = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, materializing, or catching up.
     backfill_active: ?bool = null,
     /// Rebuild progress as a ratio from 0.0 to 1.0
@@ -752,7 +949,7 @@ pub const GraphIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -1447,6 +1644,8 @@ pub const GraphQueryType = enum {
 pub const GraphResultNode = struct {
     /// Document key
     key: []const u8,
+    /// Owning table for a cross-table node; omitted for nodes in the queried table
+    table: ?[]const u8 = null,
     /// Distance from start node
     depth: ?i64 = null,
     /// Weighted distance
@@ -1480,6 +1679,8 @@ pub const IndexConfig = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -1507,6 +1708,8 @@ pub const IndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -1534,6 +1737,10 @@ pub const IndexConfig = struct {
         }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
             try jw.write(value);
         }
         if (self.external) |value| {
@@ -1592,6 +1799,10 @@ pub const IndexConfig = struct {
             try jw.objectField("chunk_size");
             try jw.write(value);
         }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -1608,6 +1819,54 @@ pub const IndexConfig = struct {
     }
 };
 
+/// Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted.
+pub const IndexExecutionConfig = struct {
+    /// Chunk producer batching for shorthand-created chunk enrichments.
+    chunking: ?ExecutionPolicy = null,
+    /// Embedding producer batching for shorthand-created embedding enrichments.
+    embedding: ?ExecutionPolicy = null,
+};
+
+/// Stable repair state. Internal state-machine phases are intentionally not exposed here.
+pub const IndexRepairStatusState = enum {
+    rebuilding,
+    waiting,
+    paused,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rebuilding => "rebuilding",
+            .waiting => "waiting",
+            .paused => "paused",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rebuilding", .rebuilding },
+            .{ "waiting", .waiting },
+            .{ "paused", .paused },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
+pub const IndexRepairStatus = struct {
+    /// Stable repair state. Internal state-machine phases are intentionally not exposed here.
+    state: IndexRepairStatusState,
+    /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
+    action_required: bool,
+};
+
 /// Statistics for an index
 pub const IndexStats = union(enum) {
     full_text_index_stats: FullTextIndexStats,
@@ -1619,7 +1878,9 @@ pub const IndexStats = union(enum) {
     fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
         const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(encoded);
-        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.UnexpectedToken,
         };

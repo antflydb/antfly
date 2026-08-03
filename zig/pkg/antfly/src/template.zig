@@ -579,7 +579,8 @@ fn remoteMediaHelper(ctx: HelperContext) anyerror!Value {
     return .{ .safe_string = result };
 }
 
-/// remotePDF stub: emits error directive (needs HTTP client + PDF extraction)
+/// Deprecated remotePDF stub: use document_extraction for durable PDF ingestion
+/// or remoteMedia for template-time multimodal inference input.
 fn remotePDFHelper(ctx: HelperContext) anyerror!Value {
     const url = ctx.hash.get("url") orelse return .{ .safe_string = "" };
     const url_str = switch (url) {

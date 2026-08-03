@@ -4537,7 +4537,7 @@ test "db resolution runtime graph hydration fails closed for a not-yet-promoted 
         .writes = &.{.{
             .key = "doc:a",
             .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            \\{"tenant":"visible","relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
             ,
         }},
         .sync_level = .enrichments,
@@ -4551,6 +4551,26 @@ test "db resolution runtime graph hydration fails closed for a not-yet-promoted 
         .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_depth = 1 },
         .include_documents = true,
     };
+
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) !types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        db.search(alloc, .{
+            .graph_queries = &.{.{ .name = "m", .query = mention_query }},
+            .graph_table_read_authorizer = .{
+                .ctx = null,
+                .authorize_table = Authorizer.authorize,
+            },
+        }),
+    );
 
     // The mention edge points at person/ada_lovelace, but that entity document
     // has not been promoted into this store: the node is returned as a graph
@@ -4572,6 +4592,52 @@ test "db resolution runtime graph hydration fails closed for a not-yet-promoted 
         try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
         try std.testing.expect(nodes[0].table != null);
         try std.testing.expectEqualStrings("entities", nodes[0].table.?);
+    }
+
+    // Resolver targets are cross-table even when the graph's default node model
+    // is document. Reverse traversal admits that external start by edge role,
+    // while still enforcing the source-table predicate on the reached document.
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{
+                .name = "reverse_mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "prov_graph",
+                    .start_nodes = .{ .keys = &.{"person/ada_lovelace"} },
+                    .params = .{
+                        .edge_types = &.{"mentions"},
+                        .direction = .in,
+                        .max_depth = 1,
+                    },
+                },
+            }},
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+        try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].key);
+    }
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{
+                .name = "bidirectional_mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "prov_graph",
+                    .start_nodes = .{ .keys = &.{"person/ada_lovelace"} },
+                    .params = .{
+                        .edge_types = &.{"mentions"},
+                        .direction = .both,
+                        .max_depth = 1,
+                    },
+                },
+            }},
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+        try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].key);
     }
 
     // Once the entity document exists (promoter wrote it; here co-located for the

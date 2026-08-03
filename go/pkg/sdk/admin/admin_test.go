@@ -2569,6 +2569,12 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 	if err := ValidateHARejoinAssessResponse(base); err != nil {
 		t.Fatalf("ValidateHARejoinAssessResponse returned error: %v", err)
 	}
+	assessRewind := base
+	assessRewind.Assessment.Action = HARejoinActionRewind
+	assessRewind.Assessment.Reason = HARejoinReasonParentTimelineRetained
+	if err := ValidateHARejoinAssessResponse(assessRewind); err != nil {
+		t.Fatalf("ValidateHARejoinAssessResponse assess rewind returned error: %v", err)
+	}
 	wrongTarget := base
 	wrongTarget.Action.Target = "primary-b"
 	if err := ValidateHARejoinAssessResponse(wrongTarget); err == nil || !strings.Contains(err.Error(), "target") {

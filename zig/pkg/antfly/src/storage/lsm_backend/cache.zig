@@ -857,6 +857,7 @@ pub fn estimateTableIndexCost(path: []const u8, index: *const TableIndex) usize 
     var total = path.len +
         @sizeOf(TableIndex) +
         index.entry_offsets.len * @sizeOf(u32) +
+        index.block_entry_offsets.len * @sizeOf(u16) +
         index.filter.bytes.len;
     if (index.prefix_filter) |filter| total += filter.bytes.len;
     total += index.blocks.len * @sizeOf(TableIndex.BlockMeta);

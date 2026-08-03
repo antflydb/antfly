@@ -18,6 +18,7 @@ const platform = @import("antfly_platform");
 const docstore_mod = @import("../docstore.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
+const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
 const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
 const ha_write_gate_mod = @import("../ha/write_gate.zig");
@@ -136,10 +137,49 @@ pub const SessionSyncWait = struct {
     }
 };
 
+pub const SharedWriteGate = struct {
+    state: *const ha_public_gate_state_mod.State,
+    /// Sources track the live role. DB instances pin the generation they
+    /// opened with so promotion cannot pair stale runtime hooks with a new
+    /// primary.
+    generation: ?u64 = null,
+};
+
 pub const WriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
     fenced_primary: ha_write_gate_mod.FencedPrimary,
     standby: *ha_standby_mod.Standby,
+    shared: SharedWriteGate,
+
+    pub fn check(self: WriteGate) !void {
+        switch (self) {
+            .shared => |shared| return try shared.state.checkWrite(shared.generation),
+            else => {},
+        }
+
+        const decision = switch (self) {
+            .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+            .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
+            .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
+            .shared => unreachable,
+        };
+        switch (decision.action) {
+            .allow_write => {},
+            .reject_read_only_standby => return error.HAReadOnlyStandby,
+            .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+            .reject_fenced_primary => return error.HAFencedPrimary,
+        }
+    }
+
+    pub fn pinned(self: WriteGate) WriteGate {
+        return switch (self) {
+            .shared => |shared| .{ .shared = .{
+                .state = shared.state,
+                .generation = shared.generation orelse shared.state.currentGeneration(),
+            } },
+            else => self,
+        };
+    }
 };
 
 pub fn writeGateIsStandby(gate: ?WriteGate) bool {
@@ -148,6 +188,7 @@ pub fn writeGateIsStandby(gate: ?WriteGate) bool {
         .primary => false,
         .fenced_primary => false,
         .standby => true,
+        .shared => |shared| shared.state.isStandbyRole(),
     };
 }
 
@@ -176,4 +217,42 @@ fn syncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []con
         if (std.mem.eql(u8, name, slot_name)) return true;
     }
     return false;
+}
+
+test "db shared write gate pins the DB open generation" {
+    var state = ha_public_gate_state_mod.State{};
+    const live_gate: WriteGate = .{ .shared = .{ .state = &state } };
+    const pinned_gate = live_gate.pinned();
+
+    try live_gate.check();
+    try pinned_gate.check();
+
+    _ = state.generation.fetchAdd(1, .acq_rel);
+
+    try live_gate.check();
+    try std.testing.expectError(
+        error.HAPromotedStandbyRequiresPrimaryOpen,
+        pinned_gate.check(),
+    );
+}
+
+test "db shared write gate tracks standby and promotion roles" {
+    var state = ha_public_gate_state_mod.State{};
+    const gate: WriteGate = .{ .shared = .{ .state = &state } };
+
+    try std.testing.expect(!writeGateIsStandby(gate));
+    state.configureStandby(.{
+        .received_lsn = 0,
+        .applied_lsn = 0,
+        .safe_read_lsn = 0,
+    });
+    try std.testing.expect(writeGateIsStandby(gate));
+    try std.testing.expectError(error.HAReadOnlyStandby, gate.check());
+
+    state.beginPromotion();
+    try std.testing.expect(writeGateIsStandby(gate));
+    try std.testing.expectError(
+        error.HAPromotedStandbyRequiresPrimaryOpen,
+        gate.check(),
+    );
 }

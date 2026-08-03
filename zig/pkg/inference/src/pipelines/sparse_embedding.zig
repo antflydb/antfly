@@ -72,6 +72,17 @@ pub const SparseEmbeddingPipeline = struct {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = texts.len;
+        const tokens = std.math.mul(usize, batch, max_len) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try self.session.admit(.{
+            .batch = batch,
+            .sequence = max_len,
+            .input_bytes = std.math.mul(usize, tokens, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
         // Tokenize
         const all_ids = try alloc.alloc(i32, batch * max_len);
@@ -125,7 +136,7 @@ pub const SparseEmbeddingPipeline = struct {
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
         // Run inference
-        var outputs = try self.session.run(inputs, alloc);
+        var outputs = try run_permit.run(inputs, alloc);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

@@ -702,6 +702,8 @@ components:
           example: "microsoft/trocr-base-printed"
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: "#/components/schemas/ImageURL"
           description: |
@@ -722,6 +724,8 @@ components:
         max_tokens:
           type: integer
           description: Maximum tokens to generate
+          minimum: 1
+          maximum: 1024
           default: 256
           example: 256
 
@@ -1123,6 +1127,17 @@ components:
           description: |
             List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
+        prompt_cache_key:
+          type: string
+          maxLength: 256
+          description: |
+            inference-native prompt prefix cache namespace key. Requests with the same key can
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+            requests without a key are never cached.
+        prompt_cache:
+          type: boolean
+          description: |
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         tool_choice:
           $ref: "#/components/schemas/ToolChoice"
           description: Controls how the model uses tools
@@ -1160,6 +1175,98 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: "#/components/schemas/GenerateUsage"
+
+    GenerateBatchMode:
+      type: string
+      enum: ["sync"]
+      description: Batch execution mode. Only synchronous batches are implemented.
+
+    GenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: "#/components/schemas/GenerateBatchMode"
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/GenerateBatchRequestItem"
+
+    GenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: "#/components/schemas/GenerateRequest"
+
+    GenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+
+    GenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: "#/components/schemas/GenerateResponse"
+        error:
+          $ref: "#/components/schemas/GenerateBatchError"
+
+    GenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+
+    GenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum: ["generate.batch"]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenerateBatchResultItem"
+        summary:
+          $ref: "#/components/schemas/GenerateBatchSummary"
 
     GenerateChoice:
       type: object
@@ -1213,6 +1320,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
 
     GenerateChunk:
       type: object
@@ -1339,6 +1449,41 @@ components:
         quantization:
           $ref: "#/components/schemas/ModelQuantization"
 
+    PromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: |
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+            scalable production mode. `simple` keeps the linear-scan retained-prefix
+            cache and is only suitable for small caches or debugging.
+          enum: [simple, block_hash]
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          description: |
+            Node-wide target for live prompt-cache entries. The runtime divides it
+            across participating model caches and evicts using estimated metadata
+            and logical host/device KV bytes. Backend allocators may retain reusable
+            capacity, so this is not a hard cap on process or accelerator memory.
+          default: 512
+        min_tokens:
+          type: integer
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          description: |
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+            hit, so only entries left unused for this duration expire.
+          default: 300000
     Config:
       type: object
       required:
@@ -1383,9 +1528,9 @@ components:
           description: |
             How long to keep models loaded in memory after last use (Ollama-compatible).
             Models are automatically unloaded after this duration of inactivity.
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-            where all models are loaded at startup and never unloaded.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+            still be evicted under resource pressure or to enforce max_loaded_models.
           default: "5m"
           example: "5m"
         max_loaded_models:
@@ -1393,8 +1538,9 @@ components:
           description: |
             Maximum total models loaded across all registry types (embedders, rerankers,
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+            Defaults to 10.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -1405,6 +1551,9 @@ components:
             independently of max_loaded_models.
           default: 1
           example: 1
+        prompt_cache:
+          $ref: "#/components/schemas/PromptCacheConfig"
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:
@@ -1490,9 +1639,8 @@ components:
             enum: [eager, lazy, bounded]
           description: |
             Per-model loading strategy overrides. Maps model names to their loading strategy.
-            Models not in this map use the default strategy based on keep_alive:
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-            - If keep_alive="0": eager loading (load at startup, never unload)
+            Models not in this map load on demand. keep_alive controls their idle
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
             When a model has strategy "eager" in this map:
             - It is loaded at startup through the same startup warmup path
@@ -1506,7 +1654,7 @@ components:
           type: boolean
           description: |
             Whether the dashboard should show model download commands.
-            Defaults to true for standalone/swarm mode. Set to false in managed
+            Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
             deployments (e.g., Kubernetes operator) where models are managed externally.
           default: true
         log:
@@ -1749,6 +1897,50 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           description: Generation service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: |
+        Runs multiple non-streaming generation requests as one synchronous batch.
+        Compatible native requests for the same model are executed through the
+        native batched KV decoder; unsupported per-item options are returned as
+        per-item errors without failing sibling requests.
+
+        This endpoint implements the synchronous form only. Future async durable
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateBatchRequest"
+      responses:
+        "200":
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateBatchResponse"
+        "400":
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Generation service unavailable
           content:
             application/json:
               schema:

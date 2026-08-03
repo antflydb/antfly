@@ -100,6 +100,27 @@ pub const Group = struct {
         return try self.raw_node.proposeConfChangeV2(conf_change);
     }
 
+    pub fn applyCommittedConfChanges(self: *Group, entries: []const core.Entry) !bool {
+        var changed = false;
+        for (entries) |entry| {
+            switch (entry.entry_type) {
+                .conf_change => {
+                    const conf_change = try core.ConfChange.decode(entry.data);
+                    _ = try self.raw_node.applyConfChange(conf_change);
+                    changed = true;
+                },
+                .conf_change_v2 => {
+                    var conf_change = try core.ConfChangeV2.decode(entry.data, self.alloc);
+                    defer conf_change.deinit(self.alloc);
+                    _ = try self.raw_node.applyConfChangeV2(conf_change);
+                    changed = true;
+                },
+                .normal => {},
+            }
+        }
+        return changed;
+    }
+
     pub fn hasReady(self: *const Group) bool {
         return self.raw_node.hasReady();
     }
@@ -118,6 +139,10 @@ pub const Group = struct {
 
     pub fn compactAppliedLogTo(self: *Group, index: core.types.Index) !void {
         try self.raw_node.compactAppliedLogTo(index);
+    }
+
+    pub fn termAt(self: *Group, index: core.types.Index) !core.types.Term {
+        return try self.raw_node.termAt(index);
     }
 };
 

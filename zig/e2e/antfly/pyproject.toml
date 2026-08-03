@@ -13,8 +13,8 @@ testpaths = ["."]
 addopts = "-v"
 markers = [
     "objectstore_integration: requires real S3 or GCS objectstore credentials and buckets",
-    "swarm_integration: requires local antfly swarm plus a live inference generator model",
-    "ha_standby: starts local Zig antfly swarm primary/standby processes for HA replication",
+    "standalone_integration: requires local antfly standalone plus a live inference generator model",
+    "ha_standby: starts local Zig antfly standalone primary/standby processes for HA replication",
     "real_model: requires local or downloadable model weights",
     "postgres_integration: requires a local PostgreSQL instance",
     "slow: marks tests that are too long-running for required E2E base CI",

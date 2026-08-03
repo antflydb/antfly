@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const raft_engine = @import("raft_engine");
 pub const applied_sink = @import("applied_sink.zig");
 pub const read_state_observer = @import("read_state_observer.zig");
 pub const metadata = @import("metadata.zig");
@@ -40,6 +41,18 @@ pub const SnapshotBuilder = struct {
 
     pub const VTable = struct {
         build_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) anyerror![]u8,
+        prepare_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            applied_index: u64,
+        ) anyerror!?raft_engine.runtime.storage_iface.SnapshotSource = null,
+        install_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            commit_index: u64,
+            snapshot: []const u8,
+        ) anyerror!void = null,
         apply_batch: *const fn (ptr: *anyopaque, batch: ApplyBatch) anyerror!void,
     };
 
@@ -47,8 +60,29 @@ pub const SnapshotBuilder = struct {
         return try self.vtable.build_snapshot(self.ptr, alloc, group_id);
     }
 
+    pub fn prepareSnapshot(
+        self: SnapshotBuilder,
+        group_id: u64,
+        applied_index: u64,
+    ) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const prepare = self.vtable.prepare_snapshot orelse return null;
+        return try prepare(self.ptr, group_id, applied_index);
+    }
+
     pub fn applyBatch(self: SnapshotBuilder, batch: ApplyBatch) !void {
         return try self.vtable.apply_batch(self.ptr, batch);
+    }
+
+    pub fn installSnapshot(
+        self: SnapshotBuilder,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        snapshot: []const u8,
+    ) !bool {
+        const install = self.vtable.install_snapshot orelse return false;
+        try install(self.ptr, alloc, group_id, commit_index, snapshot);
+        return true;
     }
 };
 
@@ -175,8 +209,8 @@ test "routed state machine uses metadata and data apply paths" {
         .data_state_machine = data_sm.stateMachine(),
     };
 
-    try routed.stateMachine().applyReady(42, &.{.{ .term = 1, .index = 7 }}, &.{});
-    try routed.stateMachine().applyReady(99, &.{.{ .term = 1, .index = 11 }}, &.{});
+    try routed.stateMachine().applyReady(42, null, &.{.{ .term = 1, .index = 7 }}, &.{});
+    try routed.stateMachine().applyReady(99, null, &.{.{ .term = 1, .index = 11 }}, &.{});
 
     try std.testing.expectEqual(@as(u64, 7), sink_recorder.metadata_applied);
     try std.testing.expectEqual(@as(u64, 11), sink_recorder.data_applied);
@@ -221,7 +255,7 @@ test "routed state machine forwards read states into observer" {
     const ctx = try std.testing.allocator.dupe(u8, "readable");
     defer std.testing.allocator.free(ctx);
 
-    try routed.stateMachine().applyReady(42, &.{}, &.{.{
+    try routed.stateMachine().applyReady(42, null, &.{}, &.{.{
         .index = 9,
         .request_ctx = ctx,
     }});
@@ -272,6 +306,7 @@ test "metadata and data state machines forward applied batches into snapshot bui
         last_group_id: u64 = 0,
         last_commit_index: u64 = 0,
         last_payload_len: usize = 0,
+        apply_calls: usize = 0,
 
         fn builder(self: *@This()) SnapshotBuilder {
             return .{
@@ -292,6 +327,7 @@ test "metadata and data state machines forward applied batches into snapshot bui
             self.last_group_id = batch.group_id;
             self.last_commit_index = batch.commit_index;
             self.last_payload_len = batch.entries_bytes.len;
+            self.apply_calls += 1;
         }
     };
 
@@ -328,16 +364,64 @@ test "metadata and data state machines forward applied batches into snapshot bui
         .snapshot_builder = data_builder.builder(),
     };
 
-    try metadata_sm.stateMachine().applyReady(7, &.{.{ .term = 2, .index = 9, .data = @constCast("meta") }}, &.{});
-    try data_sm.stateMachine().applyReady(8, &.{.{ .term = 3, .index = 11, .data = @constCast("data") }}, &.{});
+    try metadata_sm.stateMachine().applyReady(7, null, &.{.{ .term = 2, .index = 9, .data = @constCast("meta") }}, &.{});
+    try data_sm.stateMachine().applyReady(8, null, &.{.{ .term = 3, .index = 11, .data = @constCast("data") }}, &.{});
+    try metadata_sm.stateMachine().applyReady(7, null, &.{}, &.{});
+    try data_sm.stateMachine().applyReady(8, null, &.{}, &.{});
 
     try std.testing.expectEqual(@as(u64, 7), metadata_builder.last_group_id);
     try std.testing.expectEqual(@as(u64, 9), metadata_builder.last_commit_index);
     try std.testing.expect(metadata_builder.last_payload_len > 0);
     try std.testing.expectEqual(@as(u64, 9), metadata_sink.last_index);
+    try std.testing.expectEqual(@as(usize, 1), metadata_builder.apply_calls);
 
     try std.testing.expectEqual(@as(u64, 8), data_builder.last_group_id);
     try std.testing.expectEqual(@as(u64, 11), data_builder.last_commit_index);
     try std.testing.expect(data_builder.last_payload_len > 0);
     try std.testing.expectEqual(@as(u64, 11), data_sink.last_index);
+    try std.testing.expectEqual(@as(usize, 1), data_builder.apply_calls);
+}
+
+test "metadata and data state machines publish applied index only after delegate effects" {
+    const FailingDelegate = struct {
+        fn stateMachine(self: *@This()) raft_engine.runtime.storage_iface.StateMachine {
+            return .{ .ptr = self, .vtable = &.{ .apply_ready = applyReady } };
+        }
+
+        fn applyReady(_: *anyopaque, _: u64, _: ?raft_engine.core.types.Snapshot, _: []const raft_engine.core.Entry, _: []const raft_engine.core.ReadState) !void {
+            return error.DelegateApplyFailed;
+        }
+    };
+    const SinkRecorder = struct {
+        calls: usize = 0,
+
+        fn sink(self: *@This()) AppliedIndexSink {
+            return .{ .ptr = self, .vtable = &.{ .set_applied_index = setAppliedIndex } };
+        }
+
+        fn setAppliedIndex(ptr: *anyopaque, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+
+    var delegate = FailingDelegate{};
+    var metadata_sink = SinkRecorder{};
+    var data_sink = SinkRecorder{};
+    var metadata_sm = MetadataStateMachine{
+        .alloc = std.testing.allocator,
+        .applied_sink = metadata_sink.sink(),
+        .delegate = delegate.stateMachine(),
+    };
+    var data_sm = DataStateMachine{
+        .alloc = std.testing.allocator,
+        .applied_sink = data_sink.sink(),
+        .delegate = delegate.stateMachine(),
+    };
+    const entries: []const raft_engine.core.Entry = &.{.{ .term = 1, .index = 3 }};
+
+    try std.testing.expectError(error.DelegateApplyFailed, metadata_sm.stateMachine().applyReady(7, null, entries, &.{}));
+    try std.testing.expectError(error.DelegateApplyFailed, data_sm.stateMachine().applyReady(8, null, entries, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), metadata_sink.calls);
+    try std.testing.expectEqual(@as(usize, 0), data_sink.calls);
 }

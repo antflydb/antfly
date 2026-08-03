@@ -17,7 +17,7 @@
 Usage:
     ANTFLY_SERVERLESS_URL=http://127.0.0.1:8080 uv run --project e2e/antfly pytest e2e/antfly
 
-    # Start a local swarm binary automatically:
+    # Start a local standalone binary automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest e2e/antfly
 
     # Run stateful tests against an existing server:
@@ -42,13 +42,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlparse
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+E2E_BACKUP_CONNECTION = "e2e-backups"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
@@ -70,12 +71,28 @@ def preserve_e2e_root() -> bool:
     return value != "" and value not in {"0", "false", "False"}
 
 
-def maybe_preserve_tempdir(tempdir: tempfile.TemporaryDirectory[str]) -> bool:
-    if not preserve_e2e_root():
+def preserve_failed_e2e_root() -> bool:
+    value = os.environ.get("ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE", "")
+    return value != "" and value not in {"0", "false", "False"}
+
+
+def maybe_preserve_tempdir(
+    tempdir: tempfile.TemporaryDirectory[str],
+    *,
+    failed: bool = False,
+) -> bool:
+    if not preserve_e2e_root() and not (failed and preserve_failed_e2e_root()):
         return False
     tempdir._finalizer.detach()
     print(f"preserving e2e tempdir: {tempdir.name}")
     return True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, f"rep_{report.when}", report)
 
 
 def default_antfly_api_root(binary: str) -> str:
@@ -128,7 +145,7 @@ def find_free_port() -> int:
 
 def wait_for_server(
     url: str,
-    timeout: float = 30.0,
+    timeout: float = float(os.environ.get("ANTFLY_E2E_SERVER_START_TIMEOUT_S", "30.0")),
     path: str = "/status",
     *,
     allow_unauthorized: bool = False,
@@ -174,14 +191,14 @@ def wait_for_listener(url: str, timeout: float = 5.0) -> bool:
     return False
 
 
-def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflyServer | SwarmAntflyServer:
+def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflyServer | StandaloneAntflyServer:
     if Path(binary).name != "antfly":
         return PublicAntflyServer(binary, "127.0.0.1", port)
 
     last_error: RuntimeError | None = None
     for _ in range(3):
         try:
-            return SwarmAntflyServer(binary, "127.0.0.1", port)
+            return StandaloneAntflyServer(binary, "127.0.0.1", port)
         except RuntimeError as exc:
             last_error = exc
             time.sleep(0.5)
@@ -195,9 +212,22 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
         return None
     if not isinstance(status, dict):
         return None
+    if status.get("error"):
+        return None
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
+        return None
+    if status.get("backfill_state") == "failed":
+        return None
+    if isinstance(status.get("repair"), dict):
+        return None
+    if status.get("repair_degraded") is True:
+        return None
+    if status.get("repair_summary_ready") is False:
+        return None
+    repair_issue_count = status.get("repair_issue_count")
+    if type(repair_issue_count) is int and repair_issue_count > 0:
         return None
     if status.get("dense_publish_pending", False):
         return None
@@ -205,12 +235,22 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
         return None
     if status.get("catch_up_active", False):
         return None
+    coverage = status.get("coverage")
+    if isinstance(coverage, dict):
+        if coverage.get("observation_complete") is not True:
+            return None
+        mismatch_count = coverage.get("config_mismatch_group_count")
+        if type(mismatch_count) is not int or mismatch_count != 0:
+            return None
     if require_query_fresh:
         expected_groups = status.get("expected_groups")
         fresh_groups = status.get("fresh_groups")
-        if isinstance(expected_groups, int) and expected_groups > 0:
-            if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
-                return None
+        if not isinstance(expected_groups, int) or expected_groups <= 0:
+            return None
+        if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+            return None
+        if status.get("runtime_present") is not True:
+            return None
         stale_groups = status.get("stale_groups")
         if isinstance(stale_groups, int) and stale_groups > 0:
             return None
@@ -273,9 +313,27 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
     return status
 
 
+def _wait_for_restore_job(get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0) -> dict[str, Any]:
+    job_id = accepted.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise AssertionError(f"restore admission did not return an opaque job id: {accepted}")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        job = get_job(f"/restore/jobs/{job_id}")
+        phase = job.get("phase")
+        if phase == "succeeded":
+            result = job.get("result")
+            return result if isinstance(result, dict) else job
+        if phase in {"failed", "cancelled"}:
+            raise AssertionError(f"restore job {job_id} ended in {phase}: {job.get('error')}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"restore job {job_id} did not complete within {timeout_s}s: {job}")
+        time.sleep(0.1)
+
+
 def raise_request_error_with_logs(
     err: requests.RequestException,
-    server_ref: AntflyServer | PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
+    server_ref: AntflyServer | PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
 ) -> None:
     logs = ""
     proc_statuses: list[str] = []
@@ -287,7 +345,7 @@ def raise_request_error_with_logs(
         raise err
     message = f"{err}\nserver logs:\n{logs}"
     if proc_statuses:
-        message += f"\nserver exit status:\n" + "\n".join(proc_statuses)
+        message += "\nserver exit status:\n" + "\n".join(proc_statuses)
     raise err.__class__(
         message,
         request=getattr(err, "request", None),
@@ -346,7 +404,18 @@ def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
 def _write_remote_content_e2e_config(root: Path) -> Path:
     config_path = root / "antfly-e2e.json"
     config_path.write_text(
-        json.dumps({"remote_content": {"security": {"block_private_ips": False}}}),
+        json.dumps(
+            {
+                "remote_content": {"security": {"block_private_ips": False}},
+                "connections": {
+                    E2E_BACKUP_CONNECTION: {
+                        "kind": "external_io",
+                        "capabilities": ["backup.write", "restore.read"],
+                        "external_io": {"protocol": "filesystem", "root": "/"},
+                    }
+                },
+            }
+        ),
         encoding="utf-8",
     )
     return config_path
@@ -370,7 +439,7 @@ class AntflyServer:
                 "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
             }
         )
-        command = _serverless_swarm_command(binary, host=host, port=port, root=root)
+        command = _serverless_combined_command(binary, host=host, port=port, root=root)
         self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, env=env, cwd=REPO_ROOT)
         if not wait_for_server(self.url):
             self.stop()
@@ -435,20 +504,20 @@ class PublicAntflyServer:
             self.stop()
             raise RuntimeError(f"Public API server failed to resume at {self.url}\n{out}")
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self.pause()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
-def _serverless_swarm_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
+def _serverless_combined_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
     basename = Path(binary).name
     if basename == "antfly":
         return [
             binary,
             "serverless",
-            "swarm",
+            "combined",
             "--host",
             host,
             "--port",
@@ -493,7 +562,7 @@ def _legacy_stateful_command(binary: str, *, host: str, port: int, root: Path) -
     ]
 
 
-def _swarm_stateful_command(
+def _standalone_stateful_command(
     binary: str,
     *,
     host: str,
@@ -504,7 +573,7 @@ def _swarm_stateful_command(
 ) -> list[str]:
     command = [
         binary,
-        "swarm",
+        "standalone",
         "--config",
         str(_write_remote_content_e2e_config(root)),
         "--host",
@@ -513,7 +582,7 @@ def _swarm_stateful_command(
         str(port),
         "--data-dir",
         str(root),
-        "--tick-ms",
+        "--control-tick-ms",
         "5",
         "--replica-root-dir",
         str(root / "replicas"),
@@ -551,7 +620,9 @@ def _metadata_command(
         str(admin_port),
         "--data-dir",
         str(root),
-        "--tick-ms",
+        "--raft-tick-ms",
+        "5",
+        "--control-tick-ms",
         "5",
         "--replica-root-dir",
         str(root / "metadata-replicas"),
@@ -594,7 +665,9 @@ def _data_command(
         "2",
         "--data-dir",
         str(root),
-        "--tick-ms",
+        "--raft-tick-ms",
+        "5",
+        "--control-tick-ms",
         "5",
         "--replica-root-dir",
         str(root / "data-replicas"),
@@ -731,15 +804,15 @@ class StatefulAntflyServer:
     def resume(self) -> None:
         self._start_processes(truncate_logs=False)
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self._stop_processes()
         self.data_log_file.close()
         self.metadata_log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
-class SwarmAntflyServer:
+class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int, *, pgwire_port: int | None = None, auth_enabled: bool = False):
         self.binary = binary
         self.host = host
@@ -749,7 +822,7 @@ class SwarmAntflyServer:
         self.url = f"http://{host}:{port}"
         self.pgwire_url = f"http://{host}:{pgwire_port}" if pgwire_port is not None else None
         self.api_url = antfly_public_api_url(self.url, binary=binary)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-swarm-e2e-")
+        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
         self.root = Path(self.tempdir.name)
         self.replica_root = self.root / "replicas"
         self.log_path = self.root / "server.log"
@@ -760,7 +833,7 @@ class SwarmAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
-        command = _swarm_stateful_command(
+        command = _standalone_stateful_command(
             self.binary,
             host=self.host,
             port=self.port,
@@ -772,11 +845,11 @@ class SwarmAntflyServer:
         if not wait_for_server(self.api_url, allow_unauthorized=self.auth_enabled):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Swarm API server failed to start at {self.api_url}\n{out}")
+            raise RuntimeError(f"Standalone API server failed to start at {self.api_url}\n{out}")
         if self.pgwire_url is not None and not wait_for_listener(self.pgwire_url):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Swarm pgwire listener failed to start at {self.pgwire_url}\n{out}")
+            raise RuntimeError(f"Standalone pgwire listener failed to start at {self.pgwire_url}\n{out}")
         self.metadata_admin_url = self._poll_metadata_admin_url()
 
     def _poll_metadata_admin_url(self) -> str:
@@ -784,7 +857,7 @@ class SwarmAntflyServer:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             logs = _read_log_tail(self.log_path)
-            matches = re.findall(r"(?:swarm )?metadata admin api listening on (http://[^\s]+)", logs)
+            matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
             if matches:
                 return matches[-1].rstrip("/")
             time.sleep(0.1)
@@ -816,10 +889,10 @@ class SwarmAntflyServer:
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self._stop_process()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
@@ -1106,6 +1179,10 @@ class RateLimitedOpenAiEmbeddingServer:
     def allow_all_requests(self) -> None:
         with self._lock:
             self._allowed_successes = 2**31 - 1
+
+    def deny_requests(self) -> None:
+        with self._lock:
+            self._allowed_successes = self._successful_requests
 
     def stats(self) -> dict[str, int]:
         with self._lock:
@@ -1670,9 +1747,9 @@ def real_clipclap_backup_api(request, clipclap_model_available):
 
 
 @pytest.fixture(scope="function")
-def stateful_api():
+def stateful_api(request: pytest.FixtureRequest):
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
-    server: PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None = None
+    server: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
         binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -1698,7 +1775,7 @@ def stateful_api():
             self,
             session: requests.Session,
             base_url: str,
-            server_ref: PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
+            server_ref: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
         ):
             self.s = session
             self.url = base_url.rstrip("/")
@@ -1749,6 +1826,28 @@ def stateful_api():
                 if not wait_for_server(self.url, timeout=20):
                     logs = server.debug_logs().strip()
                     raise AssertionError(f"stateful server failed to restart at {self.url}\n{logs}")
+                new_session = requests.Session()
+                new_session.headers["Content-Type"] = "application/json"
+                new_session.headers["Connection"] = "close"
+                self.s = new_session
+
+        def pause_server(self) -> None:
+            server = self._server
+            if server is None or not hasattr(server, "pause"):
+                raise AssertionError("pause is only available for locally managed stateful servers")
+            with self._request_lock:
+                self.s.close()
+                server.pause()
+
+        def resume_server(self) -> None:
+            server = self._server
+            if server is None or not hasattr(server, "resume"):
+                raise AssertionError("resume is only available for locally managed stateful servers")
+            with self._request_lock:
+                server.resume()
+                if not wait_for_server(self.url, timeout=20):
+                    logs = server.debug_logs().strip()
+                    raise AssertionError(f"stateful server failed to resume at {self.url}\n{logs}")
                 new_session = requests.Session()
                 new_session.headers["Content-Type"] = "application/json"
                 new_session.headers["Connection"] = "close"
@@ -1913,6 +2012,7 @@ def stateful_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
@@ -1928,10 +2028,12 @@ def stateful_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
-                return self._check(response)
+                accepted = self._check(response)
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -1939,6 +2041,7 @@ def stateful_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -1959,6 +2062,7 @@ def stateful_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -1966,12 +2070,13 @@ def stateful_api():
                 payload["restore_mode"] = restore_mode
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                    accepted = self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def list_backups(self, *, location: str) -> dict:
-            response = self.s.get(f"{self.url}/backups?location={location}", timeout=30)
+            response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
             return self._check(response)
 
         def batch_write_with_timeout(
@@ -2169,10 +2274,16 @@ def stateful_api():
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
 
+        def debug_logs(self) -> str:
+            if self._server is None:
+                return ""
+            return self._server.debug_logs().strip()
+
     yield PublicApi(session, base, server)
     session.close()
     if server is not None:
-        server.stop()
+        report = getattr(request.node, "rep_call", None)
+        server.stop(test_failed=bool(report and report.failed))
 
 
 @pytest.fixture(scope="function")
@@ -2183,7 +2294,7 @@ def backup_api():
 
     port = find_free_port()
     if Path(binary).name == "antfly":
-        server = SwarmAntflyServer(binary, "127.0.0.1", port)
+        server = StandaloneAntflyServer(binary, "127.0.0.1", port)
     else:
         server = PublicAntflyServer(binary, "127.0.0.1", port)
 
@@ -2202,7 +2313,7 @@ def backup_api():
             self,
             session: requests.Session,
             base_url: str,
-            server_ref: PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
+            server_ref: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
         ):
             self.s = session
             self.url = base_url.rstrip("/")
@@ -2427,6 +2538,7 @@ def backup_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
@@ -2442,10 +2554,12 @@ def backup_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
-                return self._check(response)
+                accepted = self._check(response)
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2453,6 +2567,7 @@ def backup_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -2473,6 +2588,7 @@ def backup_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -2480,12 +2596,13 @@ def backup_api():
                 payload["restore_mode"] = restore_mode
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                    accepted = self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def list_backups(self, *, location: str) -> dict:
-            response = self.s.get(f"{self.url}/backups?location={location}", timeout=30)
+            response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
             return self._check(response)
 
     yield PublicApi(session, base, server)

@@ -15,6 +15,7 @@
 const std = @import("std");
 const common = @import("http_common.zig");
 const std_http_listener = @import("std_http_listener.zig");
+const threaded_connect_io = @import("threaded_connect_io.zig");
 
 pub const StdHttpExecutorConfig = struct {
     read_buffer_size: usize = 8 * 1024,
@@ -36,56 +37,64 @@ pub const StdHttpExecutor = struct {
     alloc: std.mem.Allocator,
     cfg: StdHttpExecutorConfig,
     io_impl: *std.Io.Threaded,
+    io_vtable: *std.Io.VTable,
     io_owner: IoOwner,
     client: std.http.Client,
     lifecycle_mutex: std.Io.Mutex,
     idle_cond: std.Io.Condition,
     closing: bool,
     in_flight: usize,
+    client_mutex: std.Io.Mutex,
     reuse_mutex: std.Io.Mutex,
     requests_on_current_connection: u32,
 
     pub fn initInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) void {
         const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
         io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.thread_stack_size });
+        const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
             .cfg = cfg,
             .io_impl = io_impl,
+            .io_vtable = io_vtable,
             .io_owner = .owned,
             .client = undefined,
             .lifecycle_mutex = .init,
             .idle_cond = .init,
             .closing = false,
             .in_flight = 0,
+            .client_mutex = .init,
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
         self.client = .{
             .allocator = alloc,
-            .io = io_impl.io(),
+            .io = threaded_connect_io.io(io_impl, io_vtable),
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
     }
 
     pub fn initSharedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io_impl: *std.Io.Threaded) void {
+        const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
             .cfg = cfg,
             .io_impl = io_impl,
+            .io_vtable = io_vtable,
             .io_owner = .shared,
             .client = undefined,
             .lifecycle_mutex = .init,
             .idle_cond = .init,
             .closing = false,
             .in_flight = 0,
+            .client_mutex = .init,
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
         self.client = .{
             .allocator = alloc,
-            .io = io_impl.io(),
+            .io = threaded_connect_io.io(io_impl, io_vtable),
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
@@ -107,6 +116,7 @@ pub const StdHttpExecutor = struct {
         self.lifecycle_mutex.unlock(io);
 
         self.client.deinit();
+        self.alloc.destroy(self.io_vtable);
         if (self.io_owner == .owned) {
             self.io_impl.deinit();
             self.alloc.destroy(self.io_impl);
@@ -125,6 +135,9 @@ pub const StdHttpExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const self: *StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        try self.beginRequest();
+        defer self.endRequest();
+
         if (req.timeout_ms) |timeout_ms| {
             return try self.executeWithTimeout(alloc, req, timeout_ms);
         }
@@ -146,8 +159,8 @@ pub const StdHttpExecutor = struct {
                 return http_executor.executeDirect(request_alloc, request);
             }
 
-            fn timeoutTask(io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
-                return timeout.sleep(io);
+            fn timeoutTask(task_io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
+                return timeout.sleep(task_io);
             }
 
             fn drainLateResult(result: SelectResult, response_alloc: std.mem.Allocator) void {
@@ -190,8 +203,21 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        try self.beginRequest();
-        defer self.endRequest();
+        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
+        if (self.cfg.keep_alive) self.client_mutex.lockUncancelable(io);
+        defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
+
+        // std.http.Client owns mutable connection and resolver state. A pooled
+        // client must be serialized; non-persistent requests use request-local
+        // state so callers can execute concurrently without sacrificing reuse.
+        var local_client: std.http.Client = .{
+            .allocator = self.alloc,
+            .io = io,
+            .read_buffer_size = self.cfg.read_buffer_size,
+            .write_buffer_size = self.cfg.write_buffer_size,
+        };
+        defer if (!self.cfg.keep_alive) local_client.deinit();
+        const client = if (self.cfg.keep_alive) &self.client else &local_client;
 
         const uri = try std.Uri.parse(req.uri);
         const method = switch (req.method) {
@@ -216,6 +242,7 @@ pub const StdHttpExecutor = struct {
             });
         }
         for (req.headers) |header| {
+            if (!shouldForwardRequestHeader(req.headers, header.name)) continue;
             try extra_headers.append(alloc, .{
                 .name = header.name,
                 .value = header.value,
@@ -223,7 +250,7 @@ pub const StdHttpExecutor = struct {
         }
 
         const request_keep_alive = self.reserveRequestKeepAlive();
-        var request = try std.http.Client.request(&self.client, method, uri, .{
+        var request = try std.http.Client.request(client, method, uri, .{
             .extra_headers = extra_headers.items,
             .keep_alive = request_keep_alive,
         });
@@ -338,9 +365,63 @@ pub const StdHttpExecutor = struct {
     }
 };
 
+fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []const u8) bool {
+    // The new client request owns framing, routing, connection lifecycle, and
+    // the two canonical headers represented separately on HttpRequest.
+    const transport_owned = [_][]const u8{
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "expect",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    };
+    for (transport_owned) |blocked| {
+        if (std.ascii.eqlIgnoreCase(name, blocked)) return false;
+    }
+
+    // RFC 9110 permits Connection to nominate additional hop-by-hop fields.
+    // Strip those tokens as well rather than forwarding connection-specific
+    // state to a different socket.
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(name, std.mem.trim(u8, token, " \t"))) return false;
+        }
+    }
+    return true;
+}
+
 test "std http executor module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpExecutor;
+}
+
+test "std http executor forwards only end-to-end request headers" {
+    const headers = [_]common.RequestHeader{
+        .{ .name = "Host", .value = "source.invalid" },
+        .{ .name = "Content-Length", .value = "42" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Authorization", .value = "Bearer token" },
+        .{ .name = "Connection", .value = "keep-alive, X-Hop" },
+        .{ .name = "X-Hop", .value = "socket state" },
+        .{ .name = "X-Antfly-Trusted-Principal", .value = "principal-token" },
+        .{ .name = "X-Request-Id", .value = "request-1" },
+    };
+    for (headers[0..6]) |header| {
+        try std.testing.expect(!shouldForwardRequestHeader(&headers, header.name));
+    }
+    try std.testing.expect(shouldForwardRequestHeader(&headers, headers[6].name));
+    try std.testing.expect(shouldForwardRequestHeader(&headers, headers[7].name));
 }
 
 test "std http executor retires pooled connection before configured cap" {

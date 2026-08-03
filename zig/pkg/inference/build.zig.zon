@@ -36,6 +36,9 @@
         .onnx_graph = .{
             .path = "../../lib/onnx",
         },
+        .antfly_platform = .{
+            .path = "../../lib/platform",
+        },
     },
     .paths = .{
         "build.zig",

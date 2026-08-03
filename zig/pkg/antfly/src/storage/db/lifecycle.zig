@@ -29,6 +29,7 @@ const common_secrets = @import("../../common/secrets.zig");
 const db_config = @import("config.zig");
 const db_core = @import("core.zig");
 const db_internal = @import("internal.zig");
+const generation_lifecycle = @import("generation_lifecycle.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const derived_async_mod = @import("derived_async.zig");
@@ -45,14 +46,16 @@ const graph_query_mod = @import("../../graph/query.zig");
 const ha_types = @import("ha_types.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const internal_keys = @import("../internal_keys.zig");
+const index_repair_state = @import("derived/index_repair_state.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
+const root_identity = @import("root_identity.zig");
 const schema_mod = @import("../schema.zig");
 const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
     @import("scraping_stub.zig")
@@ -72,6 +75,52 @@ const ManagedSyncTargets = db_internal.ManagedSyncTargets;
 const run_until_idle_max_replay_rounds: usize = 16;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+
+fn loadDerivedCoverageOutcomeCounterFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+    outcome: []const u8,
+) !?u64 {
+    const counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
+    defer alloc.free(counter_key);
+    const raw = store.get(alloc, counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
+}
+
+fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Config) void {
+    if (cfg.dense_embedder) |dense_embedder| {
+        dense_embedder.deinit(alloc);
+        cfg.dense_embedder = null;
+    }
+    if (cfg.sparse_embedder) |sparse_embedder| {
+        sparse_embedder.deinit(alloc);
+        cfg.sparse_embedder = null;
+    }
+    if (cfg.asset_producer) |producer| {
+        producer.deinit(alloc);
+        cfg.asset_producer = null;
+    }
+}
+
+fn loadOrCreateDurableRootIdentity(
+    alloc: Allocator,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    path: []const u8,
+) !root_identity.State {
+    if (backend_runtime) |runtime| {
+        if (runtime.io()) |io| return try root_identity.loadOrCreate(alloc, io, path);
+    }
+    if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
+}
 
 pub const DerivedReplayDebtStatus = struct {
     index_name: []const u8,
@@ -139,6 +188,11 @@ pub const DocIdentityCoverage = struct {
 };
 
 pub const OpenOptions = struct {
+    pub const PhysicalRootMode = enum {
+        filesystem_managed,
+        external_backend,
+    };
+
     pub const OpenMode = enum {
         writer,
         writer_no_replay,
@@ -174,12 +228,15 @@ pub const OpenOptions = struct {
     lsm_cache: ?*lsm_backend_mod.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
+    staged_generation: ?*const generation_lifecycle.StagedGeneration = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    capacity_source: ?types.RepairCapacitySource = null,
     change_journal_backend: ?change_journal_mod.StorageBackend = null,
     change_journal_storage: ?lsm_backend_mod.Storage = null,
     index_backends: db_config.IndexBackendOptions = .{},
     index_base_path: ?[]const u8 = null,
     index_open_parallelism: ?usize = null,
+    schema_before_index_load: ?schema_mod.TableSchema = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
@@ -188,7 +245,10 @@ pub const OpenOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
     start_optional_runtimes: bool = true,
+    start_optional_runtime_workers: bool = true,
     external_derived_checkpoints: bool = true,
+    index_repair_checkpoint_storage: ?lsm_backend_mod.Storage = null,
+    physical_root_mode: PhysicalRootMode = .filesystem_managed,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
@@ -391,10 +451,129 @@ fn applyProjectionCheckpointStats(item: *types.DBIndexStats, checkpoint: apply_s
     }
 }
 
+fn applyDurableIndexRepairStats(
+    alloc: Allocator,
+    state: ?*const index_repair_state.State,
+    repair_state_corrupt: bool,
+    item: *types.DBIndexStats,
+) !void {
+    if (repair_state_corrupt) {
+        item.index_repair_trigger = "corrupt_local_repair_state";
+        item.index_repair_phase = "terminal";
+        item.index_repair_wait_reason = "terminal";
+        item.repair_degraded = true;
+        return;
+    }
+    const durable = state orelse return;
+    const i = durable.findIndex(item.name) orelse return;
+    const intent = durable.entries.items[i].intent;
+    item.index_repair_id = intent.repair_id;
+    item.index_repair_trigger = @tagName(intent.trigger);
+    item.index_repair_phase = @tagName(intent.phase);
+    item.index_repair_automation = @tagName(intent.automation);
+    item.index_repair_attempts = intent.attempt_count;
+    item.index_repair_started_at_ms = intent.started_at_ms;
+    item.index_repair_updated_at_ms = intent.updated_at_ms;
+    item.index_repair_build_floor_sequence = intent.build_floor_sequence;
+    item.index_repair_applied_sequence = intent.candidate_applied_sequence;
+    item.index_repair_target_sequence = intent.target_sequence;
+    item.index_repair_next_retry_at_ms = intent.next_retry_at_ms;
+    item.index_repair_last_error = if (intent.last_error) |value| try alloc.dupe(u8, value) else null;
+    item.index_repair_wait_reason = if (intent.automation == .paused)
+        "paused"
+    else if (intent.phase == .terminal)
+        "terminal"
+    else if (intent.next_retry_at_ms > db_internal.currentTimeNs() / std.time.ns_per_ms)
+        "backoff"
+    else if (intent.phase == .waiting_for_convergence)
+        "convergence"
+    else
+        "none";
+    switch (intent.trigger) {
+        .incomplete_bulk_publish,
+        .root_generation_rebuild,
+        .projection_generation_invalid,
+        .operator_generation_validation,
+        => item.repair_degraded = true,
+        .artifact_coverage_mismatch, .artifact_counter_missing => {
+            item.backfill_active = intent.phase != .terminal;
+            item.repair_degraded = true;
+        },
+        .operator_generation_rebuild => {
+            item.backfill_active = intent.phase != .terminal;
+            item.repair_degraded = intent.phase == .activating or
+                intent.phase == .validating or
+                intent.phase == .terminal;
+        },
+    }
+}
+
+fn applyCachedIdentityVisibilitySummary(identity_stats: *doc_identity.Stats, summary: ?doc_identity.VisibilitySummary) void {
+    const cached = summary orelse return;
+    identity_stats.live_ordinals = cached.live_ordinals;
+    identity_stats.tombstone_ordinals = cached.tombstone_ordinals;
+    identity_stats.max_created_generation = cached.max_created_generation;
+    identity_stats.min_deleted_generation = cached.min_deleted_generation;
+    identity_stats.max_deleted_generation = cached.max_deleted_generation;
+}
+
+test "db lifecycle operational stats prefer the maintained live identity summary" {
+    var stats = doc_identity.Stats{
+        .live_ordinals = 0,
+        .tombstone_ordinals = 1,
+        .max_created_generation = 2,
+        .min_deleted_generation = 2,
+        .max_deleted_generation = 2,
+    };
+    applyCachedIdentityVisibilitySummary(&stats, .{
+        .live_ordinals = 1,
+        .tombstone_ordinals = 0,
+        .max_created_generation = 3,
+    });
+    try std.testing.expectEqual(@as(u64, 1), stats.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.tombstone_ordinals);
+    try std.testing.expectEqual(@as(u64, 3), stats.max_created_generation);
+    try std.testing.expectEqual(@as(u64, 0), stats.min_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_deleted_generation);
+
+    const DB = @import("mod.zig").DB;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    var db = try DB.open(std.testing.allocator, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+    db.identity_visibility_summary_cache = .{
+        .live_ordinals = 1,
+        .max_created_generation = 3,
+    };
+    const operational = try db.stats(std.testing.allocator);
+    defer types.freeDBStats(std.testing.allocator, operational);
+    try std.testing.expectEqual(@as(u64, 1), operational.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), operational.doc_identity.live_ordinals);
+}
+
 fn applyTerminalLoadFailureStatus(item: *types.DBIndexStats) void {
     item.replay_catch_up_required = false;
     item.catch_up_active = false;
     item.backfill_active = false;
+    item.repair_degraded = true;
+}
+
+test "terminal index load failure clears activity and remains degraded" {
+    var item = types.DBIndexStats{
+        .name = "dense",
+        .kind = .dense_vector,
+        .backfill_active = true,
+        .catch_up_active = true,
+        .replay_catch_up_required = true,
+    };
+    applyTerminalLoadFailureStatus(&item);
+    try std.testing.expect(!item.replay_catch_up_required);
+    try std.testing.expect(!item.catch_up_active);
+    try std.testing.expect(!item.backfill_active);
+    try std.testing.expect(item.repair_degraded);
 }
 
 fn markDenseCoverageRegressionIfNeeded(
@@ -420,6 +599,8 @@ fn finalizeDocIdentityRebuildRequired(identity_stats: *types.DocIdentityStats) v
 
 pub fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
     alloc.free(item.name);
+    if (item.load_error) |value| alloc.free(value);
+    if (item.index_repair_last_error) |value| alloc.free(value);
     if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
     if (item.algebraic_last_error_reason) |value| alloc.free(value);
     if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -545,6 +726,7 @@ pub fn Impl(comptime DB: type) type {
         pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
             var async_stats = self.async_context.stats.snapshot();
             async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
+            async_stats.derived_workers = self.executor.snapshotStats();
             return async_stats;
         }
 
@@ -565,11 +747,39 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
-        pub fn open(alloc: std.mem.Allocator, path: []const u8, opts: anytype) !DB {
+        pub fn open(alloc: std.mem.Allocator, path: []const u8, requested_opts: anytype) !DB {
             return blk: {
+                var opts = requested_opts;
+                errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
+                if (opts.backend_runtime) |runtime| {
+                    if (runtime.db_open_configurator) |configurator| {
+                        try configurator.configure(path, &opts);
+                    }
+                }
+                var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
+                    try staged_generation.validatePath(path);
+                    break :staged_blk null;
+                } else if (opts.physical_root_mode == .external_backend)
+                    null
+                else
+                    try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, opts.backend_runtime);
+                errdefer if (generation_read_lease) |*lease| lease.deinit();
                 const open_started_ns = monotonicTimeNs();
+                const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
                 var profile = OpenProfile{};
                 const runtime_alloc = backgroundRuntimeAllocator(alloc);
+                var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
+                const bind_cache_resource_manager = opts.resource_manager != null;
+                if (opts.resource_manager == null) {
+                    const manager = try alloc.create(resource_manager_mod.ResourceManager);
+                    manager.* = resource_manager_mod.ResourceManager.init(.{});
+                    owned_resource_manager = manager;
+                    opts.resource_manager = manager;
+                }
+                errdefer if (owned_resource_manager) |manager| {
+                    manager.deinit(alloc);
+                    alloc.destroy(manager);
+                };
                 var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
                 errdefer if (owned_backend_runtime) |*handle| handle.deinit();
 
@@ -583,7 +793,14 @@ pub fn Impl(comptime DB: type) type {
                 if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
                     effective_executor.backend = .manual;
                 }
-                const backend_owner_id = backend_runtime.allocOwnerId();
+                const backend_owner_id = try backend_runtime.allocOwnerId();
+                var backend_owner_transferred = false;
+                errdefer if (!backend_owner_transferred)
+                    backend_runtime.durable_jobs.closeOwner(backend_owner_id);
+                const repair_cleanup_owner_id = try backend_runtime.allocOwnerId();
+                var repair_cleanup_owner_transferred = false;
+                errdefer if (!repair_cleanup_owner_transferred)
+                    backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
                 var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
                 var effective_primary_backend = opts.primary_backend;
                 var effective_index_backends = opts.index_backends;
@@ -609,7 +826,10 @@ pub fn Impl(comptime DB: type) type {
                     .lmdb, .mem => {},
                 }
                 installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
-                const relational_index_worker_owner_id = backend_runtime.allocOwnerId();
+                const relational_index_worker_owner_id = try backend_runtime.allocOwnerId();
+                var relational_owner_transferred = false;
+                errdefer if (!relational_owner_transferred)
+                    backend_runtime.durable_jobs.closeOwner(relational_index_worker_owner_id);
 
                 const core_opts: db_config.CoreOpenOptions = .{
                     .map_size = opts.map_size,
@@ -622,6 +842,7 @@ pub fn Impl(comptime DB: type) type {
                     .hbc_cache = opts.hbc_cache,
                     .lsm_root_generation = opts.lsm_root_generation,
                     .resource_manager = opts.resource_manager,
+                    .bind_cache_resource_manager = bind_cache_resource_manager,
                     .index_backends = effective_index_backends,
                 };
                 const resolved_config = db_config.ResolvedOpenConfig.init(
@@ -631,6 +852,7 @@ pub fn Impl(comptime DB: type) type {
                     opts.hbc_cache,
                     opts.lsm_root_generation,
                     opts.resource_manager,
+                    bind_cache_resource_manager,
                     effective_index_backends,
                 );
                 const open_primary_started_ns = monotonicTimeNs();
@@ -654,6 +876,8 @@ pub fn Impl(comptime DB: type) type {
                     false,
                     if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
                     opts.external_derived_checkpoints,
+                    opts.index_repair_checkpoint_storage,
+                    opts.lsm_root_generation,
                     openModeRequiresReadOnlyBackends(opts.open_mode),
                 );
                 profile.core_resources_ns = elapsedSince(core_resources_started_ns);
@@ -671,12 +895,13 @@ pub fn Impl(comptime DB: type) type {
                     .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                     .lmdb, .mem => {},
                 }
-                const ha_standby_role = ha_types.writeGateIsStandby(opts.ha_write_gate);
+                const ha_standby_role = ha_types.writeGateIsStandby(ha_write_gate);
                 const start_index_workers = openModeAllowsIndexWorkers(opts.open_mode) and opts.start_index_workers and !ha_standby_role;
 
                 var db = DB{
                     .alloc = alloc,
                     .runtime_alloc = runtime_alloc,
+                    .generation_read_lease = generation_read_lease,
                     .open_mode = opts.open_mode,
                     .primary_backend = stored_primary_backend,
                     .primary_lsm_storage = resolved_config.primary_lsm_storage,
@@ -686,9 +911,14 @@ pub fn Impl(comptime DB: type) type {
                     .backend_runtime = backend_runtime,
                     .backend_owner_id = backend_owner_id,
                     .relational_index_worker_owner_id = relational_index_worker_owner_id,
+                    .repair_cleanup_owner_id = repair_cleanup_owner_id,
+                    .algebraic_hll_owner_id = 0,
                     .owned_backend_runtime = owned_backend_runtime,
+                    .owned_resource_manager = owned_resource_manager,
+                    .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                     .executor = executor,
                     .start_index_workers = start_index_workers,
+                    .optional_runtime_workers_enabled = false,
                     .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
                     .graph_metric_idle_planned_options = opts.graph_metric_idle_planned_options,
                     .graph_metric_idle_auto_options = opts.graph_metric_idle_auto_options,
@@ -705,7 +935,7 @@ pub fn Impl(comptime DB: type) type {
                     .ha_async_effect_mirror = opts.ha_async_effect_mirror,
                     .ha_async_batch_mirror = opts.ha_async_batch_mirror,
                     .ha_async_metadata_mirror = opts.ha_async_metadata_mirror,
-                    .ha_write_gate = opts.ha_write_gate,
+                    .ha_write_gate = ha_write_gate,
                     .ttl_cleanup_context = null,
                     .ttl_runtime = null,
                     .transaction_recovery_identity_context = null,
@@ -715,26 +945,48 @@ pub fn Impl(comptime DB: type) type {
                     .graph_metric_runtime = null,
                     .shadow = null,
                 };
+                backend_owner_transferred = true;
+                repair_cleanup_owner_transferred = true;
+                relational_owner_transferred = true;
                 var executor_ready = false;
                 owned_backend_runtime = null;
+                owned_resource_manager = null;
+                generation_read_lease = null;
                 async_context_owned = false;
                 executor_owned = false;
                 errdefer Self.deinitWrapperState(&db, executor_ready);
 
+                db.core.index_manager.setIo(db.backend_runtime.io());
                 db.core.setIndexOpenParallelism(opts.index_open_parallelism);
                 const init_async_started_ns = monotonicTimeNs();
                 try Self.initAsyncInfrastructure(&db, effective_executor, opts.resource_manager);
                 profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
                 executor_ready = true;
 
-                const optional_runtimes_enabled = openModeAllowsOptionalRuntimes(opts.open_mode) and opts.start_optional_runtimes and !ha_standby_role;
-                if (optional_runtimes_enabled) {
-                    const init_optional_started_ns = monotonicTimeNs();
-                    try Self.initOptionalRuntimes(&db, opts);
-                    profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
+                if (!openModeRequiresReadOnlyBackends(opts.open_mode) and
+                    opts.physical_root_mode == .filesystem_managed)
+                {
+                    const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
+                    db.root_incarnation = identity.incarnation;
+                }
+                if (opts.schema_before_index_load) |table_schema| {
+                    try db.core.setSchema(table_schema);
                 }
 
-                Self.attachAlgebraicHllMaintenanceLane(&db);
+                const optional_runtimes_initialized = openModeAllowsOptionalRuntimes(opts.open_mode) and opts.start_optional_runtimes and !ha_standby_role;
+                const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
+                db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
+                if (optional_runtimes_initialized) {
+                    const init_optional_started_ns = monotonicTimeNs();
+                    try Self.initOptionalRuntimes(&db, &opts);
+                    profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
+                } else if (opts.enrichment) |*cfg| {
+                    deinitOwnedEnrichmentConfig(alloc, cfg);
+                    opts.enrichment = null;
+                }
+
+                try Self.attachAlgebraicHllMaintenanceLane(&db);
+                try DB.LifecycleCallbacks.load_managed_admission_snapshot_for_open(&db, alloc);
                 if (opts.open_mode == .status_only) {
                     try db.core.loadIndexCatalogOnly();
                 } else if (opts.open_mode == .query_readonly) {
@@ -746,11 +998,9 @@ pub fn Impl(comptime DB: type) type {
                     try db.core.loadIndexes();
                     profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
                 }
+                try DB.LifecycleCallbacks.initialize_index_repair_state_for_open(&db, alloc);
                 if (opts.open_mode != .status_only) {
                     Self.hydrateAlgebraicObservationStatusBestEffort(&db);
-                }
-                if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
-                    db.core.index_manager.cleanupInactiveRepairShadowRoots();
                 }
                 if (opts.open_mode != .status_only) {
                     try Self.rebaseManagedIndexAppliedSequencesIfNeeded(&db);
@@ -768,7 +1018,7 @@ pub fn Impl(comptime DB: type) type {
                     };
                     profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
                 }
-                if (optional_runtimes_enabled) {
+                if (optional_runtime_workers_enabled) {
                     try Self.resumeGeneratedReplayFromJournalIfNeeded(&db);
                 }
                 if (db.start_index_workers) {
@@ -779,10 +1029,13 @@ pub fn Impl(comptime DB: type) type {
                     }
                     profile.start_index_workers_ns = elapsedSince(start_workers_started_ns);
                 }
-                if (optional_runtimes_enabled) {
+                if (optional_runtime_workers_enabled) {
                     const start_optional_started_ns = monotonicTimeNs();
                     try Self.startOptionalRuntimes(&db);
                     profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
+                }
+                if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                    DB.LifecycleCallbacks.schedule_generated_artifact_cleanup(&db);
                 }
                 profile.total_ns = monotonicTimeNs() - open_started_ns;
                 if (openProfileEnabled()) {
@@ -793,7 +1046,20 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn close(self: *DB) void {
+            if (self.closed) return;
+            self.closed = true;
             Self.deinitWrapperState(self, true);
+        }
+
+        pub fn isClosed(self: *const DB) bool {
+            return self.closed;
+        }
+
+        pub fn durableRootIncarnation(self: *const DB) !u128 {
+            if (self.root_incarnation == 0) {
+                return error.DurableRootIncarnationUnavailable;
+            }
+            return self.root_incarnation;
         }
 
         pub fn maintenanceDriver(self: *DB) db_core.MaintenanceDriver {
@@ -815,6 +1081,8 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+            self.core.lockApply();
+            defer self.core.unlockApply();
             return try self.core.runTransactionRecoveryOnce(self.alloc, config);
         }
 
@@ -868,9 +1136,11 @@ pub fn Impl(comptime DB: type) type {
             self.async_context.stats.startup.wal_replay_current_segment.store(lsm_maintenance_stats.wal_replay_current_segment, .monotonic);
         }
 
-        pub fn attachAlgebraicHllMaintenanceLane(self: *DB) void {
+        pub fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
             const runtime = self.backend_runtime;
-            self.core.index_manager.attachHllMaintenance(runtime.durable_jobs, runtime.allocOwnerId());
+            const owner_id = try runtime.allocOwnerId();
+            self.algebraic_hll_owner_id = owner_id;
+            self.core.index_manager.attachHllMaintenance(runtime.durable_jobs, owner_id);
         }
 
         pub fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -909,8 +1179,10 @@ pub fn Impl(comptime DB: type) type {
                 .alloc = self.runtime_alloc,
                 .store = async_resources.store,
                 .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
+                .index_repair_checkpoint = async_resources.index_repair_checkpoint,
                 .index_manager = async_resources.index_manager,
                 .apply_mutex = async_resources.apply_mutex,
+                .repair_replay_mutex = async_resources.repair_replay_mutex,
                 .io = self.backend_runtime.io(),
                 .require_graph_resolution_contract = true,
                 .query_visibility_hook = null,
@@ -928,18 +1200,52 @@ pub fn Impl(comptime DB: type) type {
                 DB.LifecycleCallbacks.begin_derived_catch_up_session_async,
                 DB.LifecycleCallbacks.finish_derived_catch_up_session_async,
                 DB.LifecycleCallbacks.can_advance_derived_to_target_async,
+                DB.LifecycleCallbacks.notify_derived_applied_sequence_advanced,
                 resource_manager,
                 self.backend_runtime,
             );
         }
 
         pub fn setQueryVisibilityHook(self: *DB, hook: anytype) void {
+            if (hook != null) Self.bindTtlIdentityVisibilityOwner(self);
+            var pending_hook: @TypeOf(self.async_context.query_visibility_hook) = null;
+            db_internal.lockAtomicWithBackoff(&self.async_context.query_visibility_hook_mutex);
             self.async_context.query_visibility_hook = hook;
+            if (hook) |attached| {
+                if (self.async_context.index_repair_notification_pending) {
+                    self.async_context.index_repair_notification_pending = false;
+                    _ = self.async_context.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
+                    pending_hook = attached;
+                }
+            }
+            self.async_context.query_visibility_hook_mutex.unlock();
+            if (pending_hook) |attached| {
+                attached.notify(.index_repair_pending);
+                _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
+            }
+            if (hook == null) {
+                while (self.async_context.query_visibility_hook_in_flight.load(.acquire) != 0) {
+                    db_internal.spinOrYield();
+                }
+            }
             if (self.enrichment_runtime) |runtime| {
                 runtime.setStatusHook(if (hook == null) null else .{
                     .ptr = self.async_context,
                     .on_change = DB.LifecycleCallbacks.notify_async_context_visibility_hook,
                 });
+            }
+        }
+
+        fn bindTtlIdentityVisibilityOwner(self: *DB) void {
+            const ttl_ctx = self.ttl_cleanup_context orelse return;
+            ttl_ctx.identity_visibility_owner.store(self, .release);
+
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            if (doc_identity.visibilitySummaryFromStore(self.core.store) catch null) |summary| {
+                self.identity_visibility_summary_cache = summary;
+                self.clearLiveDocSetCache();
+                self.clearNonVisibleDocSetCache();
             }
         }
 
@@ -1013,14 +1319,17 @@ pub fn Impl(comptime DB: type) type {
                 .alloc = self.runtime_alloc,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+                .index_repair_checkpoint = resources.index_repair_checkpoint,
                 .shard_manager = resources.shard_manager,
                 .index_manager = resources.index_manager,
                 .apply_mutex = resources.apply_mutex,
+                .repair_replay_mutex = resources.repair_replay_mutex,
                 .change_journal = resources.change_journal,
                 .replay_source = resources.replay_source,
                 .executor = self.executor,
                 .async_context = self.async_context,
                 .log_mutex = resources.log_mutex,
+                .identity_namespace = resources.identity_namespace,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
                 .ha_async_batch_mirror = self.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -1037,6 +1346,7 @@ pub fn Impl(comptime DB: type) type {
                 self.core.batchExecutionResources().change_journal,
                 self.core.replaySource(),
                 self.core.batchExecutionResources().index_manager,
+                self.core.batchExecutionResources().apply_mutex,
                 append_ctx,
                 DB.LifecycleCallbacks.append_generated_batch_from_enrichment,
                 self.executor,
@@ -1056,21 +1366,11 @@ pub fn Impl(comptime DB: type) type {
             const owned = detached.take();
             self.enrichment_runtime = owned.runtime;
             self.enrichment_append_context = owned.append_ctx;
+            self.async_context.enrichment_runtime = owned.runtime;
         }
 
         fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
-            if (cfg.dense_embedder) |dense_embedder| {
-                dense_embedder.deinit(self.runtime_alloc);
-                cfg.dense_embedder = null;
-            }
-            if (cfg.sparse_embedder) |sparse_embedder| {
-                sparse_embedder.deinit(self.runtime_alloc);
-                cfg.sparse_embedder = null;
-            }
-            if (cfg.asset_producer) |producer| {
-                producer.deinit(self.runtime_alloc);
-                cfg.asset_producer = null;
-            }
+            deinitOwnedEnrichmentConfig(self.runtime_alloc, cfg);
         }
 
         pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
@@ -1080,7 +1380,7 @@ pub fn Impl(comptime DB: type) type {
             var cfg_owned = true;
             errdefer if (cfg_owned) Self.deinitEnrichmentConfig(self, &owned_cfg);
 
-            const query_visibility_hook = self.async_context.query_visibility_hook;
+            const query_visibility_hook_present = DB.hasQueryVisibilityHook(self.async_context);
             var detached = try Self.createDetachedEnrichmentRuntime(self, owned_cfg);
             cfg_owned = false;
             errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
@@ -1089,7 +1389,7 @@ pub fn Impl(comptime DB: type) type {
                     const target_sequence = self.core.nextEnrichmentSequence();
                     if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
                 }
-                if (query_visibility_hook != null) {
+                if (query_visibility_hook_present) {
                     runtime.runtime.?.setStatusHook(.{
                         .ptr = self.async_context,
                         .on_change = DB.LifecycleCallbacks.notify_async_context_visibility_hook,
@@ -1098,29 +1398,33 @@ pub fn Impl(comptime DB: type) type {
             }
 
             const should_start_replacement = detached != null and self.open_mode.allowsOptionalRuntimes();
+            const previous_desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
             var stopped_existing_runtime = false;
             if (should_start_replacement) {
-                if (self.enrichment_runtime) |runtime| {
+                db_internal.lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+                if (self.async_context.enrichment_runtime) |runtime| {
                     runtime.stop();
                     stopped_existing_runtime = true;
                 }
+                self.async_context.enrichment_lifecycle_mutex.unlock();
             }
             errdefer if (stopped_existing_runtime) {
-                if (self.enrichment_runtime) |runtime| {
-                    runtime.start() catch |err| {
-                        std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
-                    };
-                }
+                self.async_context.enrichment_desired_running.store(previous_desired or stopped_existing_runtime, .release);
+                DB.LifecycleCallbacks.restart_enrichment_after_structural_mutation(self, "failed enrichment reconfiguration", "") catch |err| {
+                    std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
+                };
             };
 
             if (should_start_replacement) {
                 try detached.?.runtime.?.start();
             }
 
+            db_internal.lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
             if (self.enrichment_runtime) |runtime| {
                 runtime.deinit();
                 self.runtime_alloc.destroy(runtime);
                 self.enrichment_runtime = null;
+                self.async_context.enrichment_runtime = null;
             }
             if (self.enrichment_append_context) |ctx| {
                 self.runtime_alloc.destroy(ctx);
@@ -1131,8 +1435,11 @@ pub fn Impl(comptime DB: type) type {
                 const owned = runtime.take();
                 self.enrichment_append_context = owned.append_ctx;
                 self.enrichment_runtime = owned.runtime;
+                self.async_context.enrichment_runtime = owned.runtime;
             }
-            Self.setQueryVisibilityHook(self, query_visibility_hook);
+            self.async_context.enrichment_desired_running.store(should_start_replacement, .release);
+            self.async_context.enrichment_lifecycle_mutex.unlock();
+            if (!query_visibility_hook_present) Self.setQueryVisibilityHook(self, null);
         }
 
         pub fn initResolutionRuntime(self: *DB) !void {
@@ -1146,14 +1453,17 @@ pub fn Impl(comptime DB: type) type {
                 .alloc = self.runtime_alloc,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+                .index_repair_checkpoint = resources.index_repair_checkpoint,
                 .shard_manager = resources.shard_manager,
                 .index_manager = resources.index_manager,
                 .apply_mutex = resources.apply_mutex,
+                .repair_replay_mutex = resources.repair_replay_mutex,
                 .change_journal = resources.change_journal,
                 .replay_source = resources.replay_source,
                 .executor = self.executor,
                 .async_context = self.async_context,
                 .log_mutex = resources.log_mutex,
+                .identity_namespace = resources.identity_namespace,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
                 .ha_async_batch_mirror = self.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -1247,15 +1557,20 @@ pub fn Impl(comptime DB: type) type {
                     .alloc = self.runtime_alloc,
                     .store = batch_resources.store,
                     .applied_sequence_checkpoint_path = batch_resources.applied_sequence_checkpoint_path,
+                    .index_repair_checkpoint = batch_resources.index_repair_checkpoint,
                     .shard_manager = batch_resources.shard_manager,
                     .change_journal = batch_resources.change_journal,
                     .replay_source = batch_resources.replay_source,
                     .index_manager = batch_resources.index_manager,
                     .apply_mutex = batch_resources.apply_mutex,
+                    .repair_replay_mutex = batch_resources.repair_replay_mutex,
                     .log_mutex = batch_resources.log_mutex,
                     .identity_namespace = batch_resources.identity_namespace,
+                    .artifact_cleanup_maybe = batch_resources.artifact_cleanup_maybe,
                     .executor = self.executor,
+                    .io = self.backend_runtime.io(),
                     .enrichment_runtime = self.enrichment_runtime,
+                    .async_context = self.async_context,
                     .relational_base_rows = self.relationalColumnsForStore() != null,
                     .resolution_runtime = self.resolution_runtime,
                     .promotion_runtime = self.promotion_runtime,
@@ -1266,6 +1581,7 @@ pub fn Impl(comptime DB: type) type {
                 },
                 .grace_period_ns = cfg.grace_period_ns,
             };
+            ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
             const runtime = try self.runtime_alloc.create(ttl_runtime_mod.TtlRuntime);
             errdefer self.runtime_alloc.destroy(runtime);
             runtime.* = try ttl_runtime_mod.TtlRuntime.init(
@@ -1377,6 +1693,7 @@ pub fn Impl(comptime DB: type) type {
                 if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
                 if (enrichment_cfg.resource_manager == null) enrichment_cfg.resource_manager = opts.resource_manager;
                 try Self.initOptionalEnrichmentRuntime(self, enrichment_cfg);
+                opts.enrichment = null;
             }
             if (opts.ttl_cleanup.enabled) {
                 try Self.initOptionalTtlRuntime(self, opts.ttl_cleanup);
@@ -1391,7 +1708,10 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn startOptionalRuntimes(self: *DB) !void {
             try Self.startResolverReplayRuntimesIfConfigured(self);
-            if (self.enrichment_runtime) |runtime| try runtime.start();
+            if (self.enrichment_runtime) |runtime| {
+                try runtime.start();
+                self.async_context.enrichment_desired_running.store(true, .release);
+            }
             if (self.ttl_runtime) |runtime| try runtime.start();
             if (self.transaction_runtime) |runtime| try runtime.start();
             if (self.text_merge_runtime) |runtime| try runtime.start();
@@ -1767,9 +2087,18 @@ pub fn Impl(comptime DB: type) type {
             self.stopQuarantineRetryWorker();
             self.stopArtifactRepairMetadataWorker();
             Self.setQueryVisibilityHook(self, null);
+            self.async_context.background_closing.store(true, .release);
+            self.async_context.enrichment_desired_running.store(false, .release);
+            self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
+            self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
+            self.backend_runtime.durable_jobs.closeOwner(self.relational_index_worker_owner_id);
+            if (self.algebraic_hll_owner_id != 0) {
+                self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+            }
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
             DB.LifecycleCallbacks.deinit_bulk_ingest_coalescer(self);
-            DB.LifecycleCallbacks.clear_bulk_ingest_seen_doc_keys_locked(self);
+            DB.LifecycleCallbacks.clear_bulk_ingest_identity_all_new_locked(self);
             self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
             self.clearActiveIndexRepairsLocked();
             self.active_index_repairs.deinit(self.alloc);
@@ -1819,12 +2148,18 @@ pub fn Impl(comptime DB: type) type {
                 runtime.deinit();
                 self.runtime_alloc.destroy(runtime);
             }
-            self.backend_runtime.durable_jobs.closeOwner(self.relational_index_worker_owner_id);
             self.core.deinit();
             if (self.owned_backend_runtime) |*runtime| runtime.deinit();
             self.async_context.deinit(self.runtime_alloc);
             self.runtime_alloc.destroy(self.async_context);
+            if (self.owned_resource_manager) |manager| {
+                manager.deinit(self.alloc);
+                self.alloc.destroy(manager);
+            }
+            if (self.generation_read_lease) |*lease| lease.deinit();
+            self.generation_read_lease = null;
             self.* = undefined;
+            self.closed = true;
         }
 
         pub fn refreshManagedIndexWorkersLocked(self: *DB) !void {
@@ -1883,7 +2218,7 @@ pub fn Impl(comptime DB: type) type {
             return .{
                 .derived_target_sequence = self.core.nextDerivedSequence(),
                 .has_async_indexes = self.executor.hasWorkers(),
-                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .enrichment = Self.enrichmentStatsWithSupervisorState(self, .{}),
                 .resolution = Self.resolutionStageStats(self),
                 .promotion = Self.promotionStageStats(self),
                 .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -1905,11 +2240,13 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn resolutionStageStats(self: *DB) types.ReplayStageStats {
+            if (!Self.hasConfiguredResolvers(self)) return .{};
             if (self.resolution_runtime) |runtime| return runtime.stats();
             return Self.persistedReplayStageStats(self, resolution_runtime_mod.scope_name, false) catch .{};
         }
 
         pub fn promotionStageStats(self: *DB) types.ReplayStageStats {
+            if (!Self.hasConfiguredResolvers(self)) return .{};
             if (self.promotion_runtime) |runtime| return runtime.stats();
             return Self.persistedReplayStageStats(self, promotion_runtime_mod.scope_name, false) catch .{};
         }
@@ -1975,14 +2312,31 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
-        pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+        const ReplayDrainOptions = struct {
+            truncate_replay: bool = true,
+        };
+
+        fn runDerivedUntilWithOptions(
+            self: *DB,
+            sequence: u64,
+            truncate_replay: bool,
+        ) !void {
             if (sequence == 0) return;
             if (!self.executor.hasWorkers()) {
-                try self.catchUpPendingDerivedReplay();
+                try DB.LifecycleCallbacks.replay_pending_derived_batches_with_options(
+                    self,
+                    null,
+                    null,
+                    truncate_replay,
+                );
                 return;
             }
             self.executor.notifySequence(sequence);
             try self.executor.waitForAll(sequence);
+        }
+
+        pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+            try Self.runDerivedUntilWithOptions(self, sequence, true);
         }
 
         pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -1995,6 +2349,10 @@ pub fn Impl(comptime DB: type) type {
         pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
             if (sequence == 0) return;
             if (self.enrichment_runtime) |runtime| {
+                if (!self.optional_runtime_workers_enabled) {
+                    try runtime.catchUpUntil(sequence);
+                    return;
+                }
                 runtime.notifySequence(sequence);
                 try runtime.waitForApplied(sequence);
             }
@@ -2020,7 +2378,12 @@ pub fn Impl(comptime DB: type) type {
             return true;
         }
 
-        pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+        fn runMaintenanceUntilWithOptions(
+            self: *DB,
+            sequence: u64,
+            sync_targets: ManagedSyncTargets,
+            truncate_replay: bool,
+        ) !void {
             var stable_target = sequence;
             while (true) {
                 try Self.runEnrichmentUntil(self, stable_target);
@@ -2029,7 +2392,11 @@ pub fn Impl(comptime DB: type) type {
                     stable_target = enriched_target;
                     continue;
                 }
-                try Self.runDerivedUntil(self, stable_target);
+                try Self.runDerivedUntilWithOptions(
+                    self,
+                    stable_target,
+                    truncate_replay,
+                );
 
                 const next_target = self.core.nextDerivedSequence();
                 if (next_target <= stable_target) {
@@ -2039,6 +2406,15 @@ pub fn Impl(comptime DB: type) type {
                 }
                 stable_target = next_target;
             }
+        }
+
+        pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+            try Self.runMaintenanceUntilWithOptions(
+                self,
+                sequence,
+                sync_targets,
+                true,
+            );
         }
 
         pub fn runMaintenanceUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -2175,6 +2551,10 @@ pub fn Impl(comptime DB: type) type {
             return target_sequence;
         }
 
+        pub fn prepareSnapshot(self: *DB) !void {
+            try Self.runMaintenanceUntil(self, Self.currentMaintenanceTargetSequence(self), .{});
+        }
+
         fn resolverReplayBlockedAfterRunnableDrain(self: *DB) bool {
             const resolution_stats = Self.resolutionStageStats(self);
             if (resolution_stats.catch_up_required and !resolution_stats.blocked) return false;
@@ -2182,29 +2562,44 @@ pub fn Impl(comptime DB: type) type {
             return promotion_stats.blocked;
         }
 
-        fn drainReplayStagesUntilStable(self: *DB) !void {
+        fn drainReplayStagesUntilStableWithOptions(
+            self: *DB,
+            truncate_replay: bool,
+        ) !void {
             var rounds: usize = 0;
             while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
                 const starting_sequence = self.core.nextDerivedSequence();
                 const starting_resolution_applied = if (self.resolution_runtime) |runtime| runtime.stats().applied_sequence else 0;
                 const starting_promotion_applied = if (self.promotion_runtime) |runtime| runtime.stats().applied_sequence else 0;
-                try Self.runMaintenanceUntil(self, Self.currentMaintenanceTargetSequence(self), .{});
+                try Self.runMaintenanceUntilWithOptions(
+                    self,
+                    Self.currentMaintenanceTargetSequence(self),
+                    .{},
+                    truncate_replay,
+                );
                 const drained_sequence = self.core.nextDerivedSequence();
 
                 const drain_resolver_replay = Self.resolverReplayNeedsDrain(self);
                 if (drain_resolver_replay) {
                     if (self.resolution_runtime) |runtime| {
-                        if (drained_sequence > 0) runtime.notifySequence(drained_sequence);
+                        if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
                         try runtime.catchUp();
                     }
 
                     if (self.promotion_runtime) |runtime| {
                         const latest = self.core.nextDerivedSequence();
-                        if (latest > 0) runtime.notifySequence(latest);
+                        if (latest > 0) runtime.notifySequence(latest - 1);
                         try runtime.catchUp();
                     }
 
-                    try Self.runMaintenanceUntil(self, Self.currentMaintenanceTargetSequence(self), .{});
+                    if (Self.resolverReplayBlockedAfterRunnableDrain(self)) return;
+
+                    try Self.runMaintenanceUntilWithOptions(
+                        self,
+                        Self.currentMaintenanceTargetSequence(self),
+                        .{},
+                        truncate_replay,
+                    );
                     if (Self.resolverReplayBlockedAfterRunnableDrain(self)) return;
                 }
 
@@ -2219,6 +2614,14 @@ pub fn Impl(comptime DB: type) type {
                 if (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced) return;
             }
             return error.RunUntilIdleDidNotConverge;
+        }
+
+        fn drainReplayStagesUntilStable(self: *DB) !void {
+            try Self.drainReplayStagesUntilStableWithOptions(self, true);
+        }
+
+        pub fn drainReplayStagesUntilStableWithoutTruncation(self: *DB) !void {
+            try Self.drainReplayStagesUntilStableWithOptions(self, false);
         }
 
         pub fn snapshotForeignKeyStats(self: *DB) types.ForeignKeyStats {
@@ -2252,7 +2655,7 @@ pub fn Impl(comptime DB: type) type {
             if (requested) |generation| {
                 if (generation != current_generation) {
                     self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
-                    return error.UnsupportedQueryRequest;
+                    return error.IdentityReadGenerationChanged;
                 }
                 return generation;
             }
@@ -2291,6 +2694,11 @@ pub fn Impl(comptime DB: type) type {
                 .state_rows = raw.state_rows,
                 .live_ordinals = raw.live_ordinals,
                 .tombstone_ordinals = raw.tombstone_ordinals,
+                .visibility_chunk_size = doc_identity.visibility_chunk_size,
+                .visibility_chunks = raw.visibility_chunks,
+                .visibility_deleted_ordinals = raw.visibility_deleted_ordinals,
+                .visibility_mask_bytes = raw.visibility_mask_bytes,
+                .visibility_repair_count = raw.visibility_repair_count,
                 .min_created_generation = raw.min_created_generation,
                 .max_created_generation = raw.max_created_generation,
                 .min_deleted_generation = raw.min_deleted_generation,
@@ -2312,6 +2720,10 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
             return self.doc_set_planning_stats.snapshot();
+        }
+
+        pub fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
+            return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
         }
 
         pub fn scanPrimaryDocCount(self: *DB, byte_range: types.ByteRange) !u64 {
@@ -2347,56 +2759,97 @@ pub fn Impl(comptime DB: type) type {
             return try Self.scanPrimaryDocCount(self, self.core.byteRange());
         }
 
-        fn countDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
-            if (try Self.loadDerivedCoverageSkippedCounter(self, index_name, generation)) |count| return count;
-            return try Self.scanDerivedCoverageSkipped(self, index_name, generation);
-        }
-
-        fn populateDerivedCoverageSkippedStats(self: *DB, cfg: types.IndexConfig, item: *types.DBIndexStats) !void {
-            switch (cfg.kind) {
-                .dense_vector, .sparse_vector => {
-                    item.coverage_skipped_count = try Self.countDerivedCoverageSkipped(
-                        self,
-                        cfg.name,
-                        internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json),
-                    );
-                },
-                else => {},
+        pub fn initializeDerivedCoverageIdentity(cfg: types.IndexConfig, item: *types.DBIndexStats) void {
+            if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return;
+            item.coverage_generation = internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
+            if (cfg.coverage_config_fingerprint) |fingerprint| {
+                item.coverage_config_hash = fingerprint;
+                item.coverage_identity_ready = true;
+            } else {
+                // Catalog admission should make this state unreachable. Keep status
+                // available and expose the missing identity as degraded coverage.
+                item.coverage_summary_ready = false;
+                item.repair_degraded = true;
             }
         }
 
-        fn loadDerivedCoverageSkippedCounter(self: *DB, index_name: []const u8, generation: u64) !?u64 {
-            const key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(self.core.alloc, index_name, generation);
-            defer self.core.alloc.free(key);
-            const raw = self.core.store.get(self.core.alloc, key) catch |err| switch (err) {
-                error.NotFound => return null,
-                else => return err,
-            };
-            defer self.core.alloc.free(raw);
-            return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+        fn hydrateDerivedCoverageIdentities(self: *DB, alloc: Allocator, items: []types.DBIndexStats) !void {
+            var needs_hydration = false;
+            for (items) |item| {
+                if ((item.kind == .dense_vector or item.kind == .sparse_vector) and !item.coverage_identity_ready) {
+                    needs_hydration = true;
+                    break;
+                }
+            }
+            if (!needs_hydration) return;
+
+            var identities = try self.core.index_manager.coverageIdentityMapAlloc(alloc);
+            defer identities.deinit(alloc);
+            for (items) |*item| {
+                if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
+                const identity = identities.get(item.name) orelse {
+                    markMissingDerivedCoverageIdentity(item);
+                    continue;
+                };
+                item.coverage_generation = identity.generation;
+                if (identity.config_fingerprint) |fingerprint| {
+                    item.coverage_config_hash = fingerprint;
+                    item.coverage_identity_ready = true;
+                } else {
+                    markMissingDerivedCoverageIdentity(item);
+                }
+            }
         }
 
-        fn scanDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
-            const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(self.core.alloc, index_name, generation, "skipped");
-            defer self.core.alloc.free(lower);
-            const upper = try internal_keys.nextPrefixAlloc(self.core.alloc, lower);
-            defer if (upper) |key| self.core.alloc.free(key);
+        fn hydrateDerivedCoverageIdentitiesBestEffort(self: *DB, alloc: Allocator, items: []types.DBIndexStats) void {
+            self.hydrateDerivedCoverageIdentities(alloc, items) catch markMissingDerivedCoverageIdentities(items);
+        }
 
-            var skipped: u64 = 0;
-            const CountState = struct {
-                skipped: *u64,
+        fn markMissingDerivedCoverageIdentities(items: []types.DBIndexStats) void {
+            for (items) |*item| {
+                if (item.kind == .dense_vector or item.kind == .sparse_vector) markMissingDerivedCoverageIdentity(item);
+            }
+        }
 
-                fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-                    _ = key;
-                    _ = value;
-                    const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                    state.skipped.* += 1;
-                    return .@"continue";
-                }
+        fn markMissingDerivedCoverageIdentity(item: *types.DBIndexStats) void {
+            item.coverage_identity_ready = false;
+            item.coverage_summary_ready = false;
+            item.repair_degraded = true;
+        }
+
+        fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
+            item.coverage_config_hash = config_hash;
+            const produced = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "produced");
+            const skipped = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "skipped");
+            const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "terminal_failed");
+
+            const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
+                @as(u2, @intFromBool(skipped != null)) +
+                @as(u2, @intFromBool(terminal_failed != null));
+            // Counter creation and marker mutation share one atomic batch. No
+            // counters means a new generation; a partial tuple means corruption or
+            // an interrupted legacy write and must not be reported as complete.
+            item.coverage_summary_ready = present_count == 0 or present_count == 3;
+            item.coverage_produced_count = produced orelse 0;
+            item.coverage_skipped_count = skipped orelse 0;
+            item.coverage_terminal_failed_count = terminal_failed orelse 0;
+            if (!item.coverage_summary_ready) item.repair_degraded = true;
+        }
+
+        fn populateConfiguredDerivedCoverageCounts(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
+            if (!item.coverage_identity_ready) {
+                item.coverage_summary_ready = false;
+                item.repair_degraded = true;
+                return;
+            }
+            try Self.populateDerivedCoverageCounts(self, index_name, item.coverage_generation, item.coverage_config_hash, item);
+        }
+
+        fn populateConfiguredDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, item: *types.DBIndexStats) void {
+            Self.populateConfiguredDerivedCoverageCounts(self, index_name, item) catch {
+                item.coverage_summary_ready = false;
+                item.repair_degraded = true;
             };
-            var state = CountState{ .skipped = &skipped };
-            try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
-            return skipped;
         }
 
         pub fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
@@ -2459,11 +2912,11 @@ pub fn Impl(comptime DB: type) type {
             Self.overlayRuntimeStatusIndexesAssumeApplyLockHeld(self, stats_alloc, runtime_stats);
         }
 
-        pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
+        pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) !void {
             Self.overlayRuntimeStatusRuntimeOnly(self, runtime_stats);
             self.core.lockApplyShared();
             defer self.core.unlockApplyShared();
-            Self.overlayRuntimeStatusIndexesLocked(self, stats_alloc, runtime_stats);
+            try Self.overlayRuntimeStatusIndexesLocked(self, stats_alloc, runtime_stats);
         }
 
         pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
@@ -2477,9 +2930,10 @@ pub fn Impl(comptime DB: type) type {
                 return .{
                     .async_indexing = Self.snapshotAsyncIndexingStats(self),
                     .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                    .visibility = Self.snapshotVisibilityStats(self),
                     .foreign_keys = Self.snapshotForeignKeyStats(self),
                     .relational_index_repair = .{},
-                    .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                    .enrichment = Self.enrichmentStatsWithSupervisorState(self, .{}),
                     .resolution = Self.resolutionStageStats(self),
                     .promotion = Self.promotionStageStats(self),
                     .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
@@ -2827,12 +3281,39 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        fn loadIndexRepairStateForStats(self: *const DB, alloc: Allocator) !?index_repair_state.State {
+            return self.loadIndexRepairState(alloc) catch |err| switch (err) {
+                error.FileNotFound, error.DurableIndexRepairStateUnavailable, error.InvalidIndexRepairState => null,
+                else => return err,
+            };
+        }
+
+        pub fn saveAllLiveIndexStatusSnapshots(self: *DB, alloc: Allocator) !void {
+            const configs = try self.core.listIndexes(alloc);
+            defer types.freeIndexConfigs(alloc, configs);
+            if (configs.len == 0) return;
+
+            var updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
+            defer updates.deinit(alloc);
+            for (configs) |cfg| {
+                try updates.append(alloc, .{
+                    .index_name = cfg.name,
+                    .sequence = try self.core.loadAppliedSequence(alloc, cfg.name),
+                });
+            }
+            try saveIndexStatusSnapshots(alloc, self.core.store, self.core.index_manager, updates.items);
+        }
+
         pub fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
             const configs = try self.core.listIndexes(alloc);
             defer types.freeIndexConfigs(alloc, configs);
+            var durable_index_repairs = try Self.loadIndexRepairStateForStats(self, alloc);
+            defer if (durable_index_repairs) |*state| state.deinit(alloc);
             const async_indexing = Self.snapshotAsyncIndexingStats(self);
-            const identity_stats = Self.dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
-            const primary_doc_count = Self.scanPrimaryDocCount(self, self.core.byteRange()) catch 0;
+            var raw_identity_stats = try doc_identity.fastStatsFromStore(self.core.store);
+            applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.identity_visibility_summary_cache);
+            const identity_stats = Self.dbDocIdentityStats(raw_identity_stats, self.core.identity_namespace);
+            var primary_doc_count_fallback: ?u64 = null;
             const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
             const repair_issue_count = repair_summary.count;
             var repair_index_fallback = DB.ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
@@ -2864,14 +3345,21 @@ pub fn Impl(comptime DB: type) type {
                     .catch_up_target_sequence = target_sequence,
                 };
                 errdefer freeDBIndexStatsItem(alloc, item);
+                Self.initializeDerivedCoverageIdentity(cfg, &item);
                 applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
+                try applyDurableIndexRepairStats(
+                    alloc,
+                    if (durable_index_repairs) |*state| state else null,
+                    self.async_context.index_repair_state_corrupt.load(.acquire),
+                    &item,
+                );
                 Self.applyRelationalGenerationDiagnosticsForIndexStats(self, &item);
                 if (target_sequence > 0) {
                     item.backfill_progress = @min(
                         1.0,
                         @as(f64, @floatFromInt(applied_sequence)) / @as(f64, @floatFromInt(target_sequence)),
                     );
-                    item.backfill_active = applied_sequence < target_sequence;
+                    item.backfill_active = item.backfill_active or applied_sequence < target_sequence;
                 }
                 if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
                     item.load_error = try alloc.dupe(u8, load_error);
@@ -2894,7 +3382,8 @@ pub fn Impl(comptime DB: type) type {
                 switch (cfg.kind) {
                     .full_text => {
                         if (self.core.textIndex(cfg.name)) |entry| {
-                            const text_snapshot = entry.snapshot();
+                            const text_snapshot = entry.acquireSnapshot();
+                            defer text_snapshot.release();
                             item.doc_count = text_snapshot.global_doc_count;
                             item.term_count = textIndexTermCount(entry);
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -2924,10 +3413,15 @@ pub fn Impl(comptime DB: type) type {
                             const sparse_snapshot = entry.index.stats();
                             const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
                                 identity_stats.live_ordinals
-                            else if (primary_doc_count > 0)
-                                primary_doc_count
-                            else
-                                visible_doc_count;
+                            else fallback: {
+                                if (primary_doc_count_fallback == null) {
+                                    primary_doc_count_fallback = Self.scanPrimaryDocCount(self, self.core.byteRange()) catch 0;
+                                }
+                                break :fallback if (primary_doc_count_fallback.? > 0)
+                                    primary_doc_count_fallback.?
+                                else
+                                    visible_doc_count;
+                            };
                             item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
                                 @min(sparse_snapshot.doc_count, sparse_doc_cap)
                             else
@@ -2951,7 +3445,9 @@ pub fn Impl(comptime DB: type) type {
                     },
                     .algebraic => try DB.LifecycleCallbacks.populate_algebraic_index_stats(self, alloc, cfg.name, &item, false),
                 }
-                try Self.populateDerivedCoverageSkippedStats(self, cfg, &item);
+                if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                    try Self.populateConfiguredDerivedCoverageCounts(self, cfg.name, &item);
+                }
                 if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
                 if (item.repair_degraded) repair_degraded = true;
                 index_stats[index_count] = item;
@@ -2959,6 +3455,7 @@ pub fn Impl(comptime DB: type) type {
             }
 
             return .{
+                .source_doc_count = identity_stats.live_ordinals,
                 .doc_count = visible_doc_count,
                 .index_count = @intCast(self.core.indexCount()),
                 .indexes = index_stats[0..index_count],
@@ -2968,9 +3465,10 @@ pub fn Impl(comptime DB: type) type {
                 .repair_issue_count_estimated = !repair_summary.ready,
                 .doc_identity = identity_stats,
                 .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                .visibility = Self.snapshotVisibilityStats(self),
                 .foreign_keys = Self.snapshotForeignKeyStats(self),
                 .relational_index_repair = Self.snapshotRelationalIndexRepairStatsLockedBestEffort(self),
-                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .enrichment = Self.enrichmentStatsWithSupervisorState(self, .{}),
                 .resolution = Self.resolutionStageStats(self),
                 .promotion = Self.promotionStageStats(self),
                 .resolver_replay = try Self.resolverReplayDiagnosticsLocked(self, alloc),
@@ -2995,7 +3493,9 @@ pub fn Impl(comptime DB: type) type {
             const byte_range = self.core.byteRange();
             const configs = try self.core.listIndexes(alloc);
             defer types.freeIndexConfigs(alloc, configs);
-            const replay_debt = try Self.listDerivedReplayDebt(self, alloc);
+            var durable_index_repairs = try Self.loadIndexRepairStateForStats(self, alloc);
+            defer if (durable_index_repairs) |*state| state.deinit(alloc);
+            const replay_debt = try Self.listDerivedReplayDebtAssumeApplyLockHeld(self, alloc);
             defer {
                 for (replay_debt) |*status| status.deinit(alloc);
                 alloc.free(replay_debt);
@@ -3029,6 +3529,7 @@ pub fn Impl(comptime DB: type) type {
                     .kind = cfg.kind,
                 };
                 errdefer freeDBIndexStatsItem(alloc, item);
+                Self.initializeDerivedCoverageIdentity(cfg, &item);
                 Self.applyRelationalGenerationDiagnosticsForIndexStats(self, &item);
                 if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
                     item.load_error = try alloc.dupe(u8, load_error);
@@ -3057,6 +3558,14 @@ pub fn Impl(comptime DB: type) type {
                     item.catch_up_active = false;
                     break;
                 }
+                applyProjectionCheckpointStats(&item, try self.core.loadProjectionCheckpoint(alloc, cfg.name), item.replay_target_sequence);
+                try applyDurableIndexRepairStats(
+                    alloc,
+                    if (durable_index_repairs) |*state| state else null,
+                    self.async_context.index_repair_state_corrupt.load(.acquire),
+                    &item,
+                );
+                if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
                 switch (cfg.kind) {
                     .full_text => {
                         if (self.core.textIndex(cfg.name)) |entry| {
@@ -3087,7 +3596,11 @@ pub fn Impl(comptime DB: type) type {
                             }
                             const rebuild_root_path = try DB.LifecycleCallbacks.dense_index_rebuild_state_path_alloc(self, alloc, entry.config.name);
                             defer alloc.free(rebuild_root_path);
-                            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                            const rebuild_state = self.core.index_manager.rebuildState(
+                                .dense_vector,
+                                rebuild_root_path,
+                                entry.config,
+                            );
                             if (item.doc_count < visible_doc_count) {
                                 if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                                     item.backfill_active = true;
@@ -3149,7 +3662,9 @@ pub fn Impl(comptime DB: type) type {
                     },
                     .algebraic => try DB.LifecycleCallbacks.populate_algebraic_index_stats(self, alloc, cfg.name, &item, true),
                 }
-                try Self.populateDerivedCoverageSkippedStats(self, cfg, &item);
+                if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                    try Self.populateConfiguredDerivedCoverageCounts(self, cfg.name, &item);
+                }
                 if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
                 if (item.repair_degraded) repair_degraded = true;
                 index_stats[index_count] = item;
@@ -3163,6 +3678,7 @@ pub fn Impl(comptime DB: type) type {
             // The full-text index count is the current efficient proxy when
             // present; tables without full-text still fall back to the docstore.
             return .{
+                .source_doc_count = identity_stats.live_ordinals,
                 .doc_count = visible_doc_count,
                 .index_count = @intCast(self.core.indexCount()),
                 .indexes = index_stats[0..index_count],
@@ -3172,9 +3688,10 @@ pub fn Impl(comptime DB: type) type {
                 .repair_issue_count_estimated = !repair_summary.ready,
                 .doc_identity = identity_stats,
                 .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                .visibility = Self.snapshotVisibilityStats(self),
                 .foreign_keys = Self.snapshotForeignKeyStats(self),
                 .relational_index_repair = Self.snapshotRelationalIndexRepairStatsLockedBestEffort(self),
-                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try Self.persistedEnrichmentStats(self),
+                .enrichment = Self.enrichmentStatsWithSupervisorState(self, .{}),
                 .resolution = Self.resolutionStageStats(self),
                 .promotion = Self.promotionStageStats(self),
                 .resolver_replay = try Self.resolverReplayDiagnosticsLocked(self, alloc),
@@ -3187,7 +3704,8 @@ pub fn Impl(comptime DB: type) type {
                     for (configs) |cfg| {
                         if (cfg.kind != .full_text) continue;
                         if (self.core.textIndex(cfg.name)) |entry| {
-                            const text_snapshot = entry.snapshot();
+                            const text_snapshot = entry.acquireSnapshot();
+                            defer text_snapshot.release();
                             total += text_snapshot.term_doc_freq_cache_hits;
                         }
                     }
@@ -3198,7 +3716,8 @@ pub fn Impl(comptime DB: type) type {
                     for (configs) |cfg| {
                         if (cfg.kind != .full_text) continue;
                         if (self.core.textIndex(cfg.name)) |entry| {
-                            const text_snapshot = entry.snapshot();
+                            const text_snapshot = entry.acquireSnapshot();
+                            defer text_snapshot.release();
                             total += text_snapshot.term_doc_freq_cache_misses;
                         }
                     }
@@ -3208,12 +3727,54 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        fn applyStatusOnlyRebuildStateStats(
+            self: *DB,
+            alloc: Allocator,
+            cfg: types.IndexConfig,
+            item: *types.DBIndexStats,
+        ) !void {
+            if (cfg.kind == .algebraic) return;
+            const rebuild_root_path = try DB.LifecycleCallbacks.dense_index_rebuild_state_path_alloc(self, alloc, cfg.name);
+            defer alloc.free(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(cfg.kind, rebuild_root_path, cfg);
+            var loaded = try rebuild_state.loadWithIo(
+                alloc,
+                self.core.index_manager.checkpointIo(),
+            );
+            defer loaded.deinit(alloc);
+            const key = switch (loaded) {
+                .absent => return,
+                .valid => |resume_key| resume_key,
+                .legacy => {
+                    item.backfill_active = true;
+                    item.backfill_progress = 0;
+                    return;
+                },
+                .corrupt => {
+                    item.load_error = try alloc.dupe(u8, @errorName(error.InvalidRebuildState));
+                    item.repair_degraded = true;
+                    item.backfill_active = false;
+                    item.backfill_progress = 0;
+                    return;
+                },
+            };
+            const byte_range = self.core.byteRange();
+            item.backfill_active = true;
+            item.backfill_progress = backfill_state_mod.estimateProgressForKey(
+                byte_range.start,
+                byte_range.end,
+                key,
+            );
+        }
+
         pub fn statusOnlyStats(self: *DB, alloc: Allocator) !types.DBStats {
             self.core.lockApplyShared();
             defer self.core.unlockApplyShared();
 
             const configs = try self.core.listIndexes(alloc);
             defer types.freeIndexConfigs(alloc, configs);
+            var durable_index_repairs = try Self.loadIndexRepairStateForStats(self, alloc);
+            defer if (durable_index_repairs) |*state| state.deinit(alloc);
             var visible_doc_count: u64 = 0;
             const identity_stats = Self.dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
             const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
@@ -3244,25 +3805,31 @@ pub fn Impl(comptime DB: type) type {
                     .catch_up_target_sequence = target_sequence,
                 };
                 errdefer freeDBIndexStatsItem(alloc, item);
+                Self.initializeDerivedCoverageIdentity(cfg, &item);
+                try Self.applyStatusOnlyRebuildStateStats(self, alloc, cfg, &item);
                 applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
+                try applyDurableIndexRepairStats(
+                    alloc,
+                    if (durable_index_repairs) |*state| state else null,
+                    self.async_context.index_repair_state_corrupt.load(.acquire),
+                    &item,
+                );
                 Self.applyRelationalGenerationDiagnosticsForIndexStats(self, &item);
                 if (target_sequence > 0) {
                     item.backfill_progress = @min(
                         1.0,
                         @as(f64, @floatFromInt(applied_sequence)) / @as(f64, @floatFromInt(target_sequence)),
                     );
-                    item.backfill_active = applied_sequence < target_sequence;
+                    item.backfill_active = item.backfill_active or applied_sequence < target_sequence;
                 }
                 if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                    if (item.load_error) |previous| alloc.free(previous);
                     item.load_error = try alloc.dupe(u8, load_error);
-                    item.repair_degraded = true;
-                    item.backfill_active = false;
-                    item.catch_up_active = false;
+                    applyTerminalLoadFailureStatus(&item);
                 } else if (try self.loadPersistedIndexLoadFailure(alloc, cfg.name)) |load_error| {
+                    if (item.load_error) |previous| alloc.free(previous);
                     item.load_error = load_error;
-                    item.repair_degraded = true;
-                    item.backfill_active = false;
-                    item.catch_up_active = false;
+                    applyTerminalLoadFailureStatus(&item);
                 }
                 const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
                 item.repair_issue_count = index_repair_summary.count;
@@ -3281,7 +3848,9 @@ pub fn Impl(comptime DB: type) type {
                         try populateGraphMetricStatusStats(alloc, &item, &entry.index);
                     }
                 }
-                try Self.populateDerivedCoverageSkippedStats(self, cfg, &item);
+                if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                    Self.populateConfiguredDerivedCoverageCountsBestEffort(self, cfg.name, &item);
+                }
                 if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
                 if (item.repair_degraded) repair_degraded = true;
                 index_stats[index_count] = item;
@@ -3289,6 +3858,7 @@ pub fn Impl(comptime DB: type) type {
             }
 
             return .{
+                .source_doc_count = identity_stats.live_ordinals,
                 .doc_count = visible_doc_count,
                 .index_count = @intCast(self.core.indexCount()),
                 .indexes = index_stats[0..index_count],
@@ -3298,6 +3868,7 @@ pub fn Impl(comptime DB: type) type {
                 .repair_issue_count_estimated = !repair_summary.ready,
                 .doc_identity = identity_stats,
                 .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                .visibility = Self.snapshotVisibilityStats(self),
                 .foreign_keys = Self.snapshotForeignKeyStats(self),
                 .relational_index_repair = Self.snapshotRelationalIndexRepairStatsLockedBestEffort(self),
                 .resolution = Self.resolutionStageStats(self),
@@ -3329,14 +3900,30 @@ pub fn Impl(comptime DB: type) type {
             );
         }
 
-        fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+        pub fn managedIndexReplayTargetSequence(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            kind: types.IndexKind,
+            applied_sequence: u64,
+        ) !u64 {
             return try Self.probeDerivedReplayTargetSequence(
                 self,
                 alloc,
                 .{
-                    .name = cfg.name,
-                    .kind = cfg.kind,
+                    .name = index_name,
+                    .kind = kind,
                 },
+                applied_sequence,
+            );
+        }
+
+        fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+            return try Self.managedIndexReplayTargetSequence(
+                self,
+                alloc,
+                cfg.name,
+                cfg.kind,
                 applied_sequence,
             );
         }
@@ -3345,6 +3932,10 @@ pub fn Impl(comptime DB: type) type {
             self.core.lockApplyShared();
             defer self.core.unlockApplyShared();
 
+            return try Self.listDerivedReplayDebtAssumeApplyLockHeld(self, alloc);
+        }
+
+        fn listDerivedReplayDebtAssumeApplyLockHeld(self: *DB, alloc: Allocator) ![]DerivedReplayDebtStatus {
             const managed_indexes = try self.core.managedIndexes(alloc);
             var transferred_names: usize = 0;
             errdefer {
@@ -3443,27 +4034,66 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        pub fn enrichmentStatsWithSupervisorState(self: *DB, fallback: types.EnrichmentStats) types.EnrichmentStats {
+            // Status is called while the DB apply lock is held. Structural
+            // mutations hold lifecycle while stopping and joining the enrichment
+            // worker, and that worker can be waiting for apply. Never close the
+            // lifecycle -> worker join -> apply -> lifecycle cycle here.
+            const lifecycle_locked = self.async_context.enrichment_lifecycle_mutex.tryLock();
+            defer if (lifecycle_locked) self.async_context.enrichment_lifecycle_mutex.unlock();
+            var enrichment_status = if (lifecycle_locked)
+                if (self.async_context.enrichment_runtime) |runtime|
+                    runtime.stats()
+                else
+                    Self.persistedEnrichmentStats(self) catch fallback
+            else
+                fallback;
+            const desired = self.async_context.enrichment_desired_running.load(.acquire);
+            const started = if (lifecycle_locked)
+                if (self.async_context.enrichment_runtime) |runtime| runtime.isStarted() else false
+            else
+                false;
+            if (desired and !started) {
+                // While lifecycle owns the runtime pointer, expose the persisted
+                // snapshot as a supervised transition rather than a fatal worker.
+                const supervised = !lifecycle_locked or self.async_context.enrichment_restart_state.load(.acquire) != 0;
+                enrichment_status.retrying = supervised;
+                enrichment_status.worker_failed = !supervised;
+                enrichment_status.projection_checkpoint_status = if (supervised) "retrying" else "failed";
+            }
+            return enrichment_status;
+        }
+
         fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
             runtime_stats.async_indexing = Self.snapshotAsyncIndexingStats(self);
+            runtime_stats.doc_set_planning = Self.snapshotDocSetPlanningStats(self);
+            runtime_stats.visibility = Self.snapshotVisibilityStats(self);
             runtime_stats.foreign_keys = Self.snapshotForeignKeyStats(self);
             runtime_stats.relational_index_repair = Self.snapshotRelationalIndexRepairStatsBestEffort(self);
-            runtime_stats.enrichment = if (self.enrichment_runtime) |runtime|
-                runtime.stats()
-            else
-                Self.persistedEnrichmentStats(self) catch runtime_stats.enrichment;
+            runtime_stats.enrichment = Self.enrichmentStatsWithSupervisorState(self, runtime_stats.enrichment);
             runtime_stats.resolution = Self.resolutionStageStats(self);
             runtime_stats.promotion = Self.promotionStageStats(self);
             runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
             runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
             runtime_stats.graph_metric_runtime = Self.graphMetricRuntimeStats(self);
 
-            const target_sequence = self.core.nextDerivedSequence();
+            // Runtime-only diagnostics may run under apply. Skip enrichment
+            // detail while its lifecycle owner is transitioning the runtime.
+            if (self.async_context.enrichment_lifecycle_mutex.tryLock()) {
+                defer self.async_context.enrichment_lifecycle_mutex.unlock();
+                if (self.async_context.enrichment_runtime) |runtime| {
+                    for (runtime_stats.indexes) |*item| {
+                        item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+                    }
+                }
+            }
+
             for (runtime_stats.indexes) |*item| {
                 const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
                 if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
                     item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+                    item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
                 };
-                item.replay_target_sequence = @max(item.replay_target_sequence, target_sequence);
                 item.catch_up_active = dense_catch_up;
                 if (item.kind == .dense_vector) {
                     const progress = runtime_stats.async_indexing.dense_catch_up;
@@ -3503,28 +4133,69 @@ pub fn Impl(comptime DB: type) type {
                         );
                     }
                 } else {
-                    item.backfill_active = false;
+                    item.backfill_active = durableGenerationBuildActive(item);
                     if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
                 }
+                normalizeReplayStatusFromDurableCheckpoint(item);
                 item.checkpoint_replay_tail_sequence_count = item.replay_target_sequence -| item.projection_checkpoint_applied_sequence;
                 Self.applyRelationalGenerationDiagnosticsForIndexStats(self, item);
                 if (item.load_error != null) applyTerminalLoadFailureStatus(item);
             }
         }
 
+        pub fn normalizeReplayStatusFromDurableCheckpoint(item: *types.DBIndexStats) void {
+            const durable_applied = item.projection_checkpoint_applied_sequence;
+            if (durable_applied <= item.replay_applied_sequence) return;
+
+            // Projection checkpoints are persisted only after the index publication
+            // boundary. A worker snapshot can briefly lag that durable write while
+            // it updates its in-memory sequence, but status must not expose the
+            // transient ordering as durable replay debt.
+            item.replay_applied_sequence = durable_applied;
+            item.replay_target_sequence = @max(item.replay_target_sequence, durable_applied);
+            item.catch_up_applied_sequence = @max(item.catch_up_applied_sequence, durable_applied);
+            item.catch_up_target_sequence = @max(item.catch_up_target_sequence, item.replay_target_sequence);
+            item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+            if (!item.catch_up_active and !item.replay_catch_up_required) {
+                item.backfill_active = durableGenerationBuildActive(item);
+                if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+            }
+        }
+
+        fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
+            const generation_build = std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_rebuild)) or
+                std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
+                std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
+                std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_counter_missing)) or
+                std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.projection_generation_invalid));
+            return generation_build and
+                !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal));
+        }
+
         fn overlayRuntimeStatusIndexesAssumeApplyLockHeld(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
             if (!self.core.tryLockApplyShared()) return;
             defer self.core.unlockApplyShared();
-            Self.overlayRuntimeStatusIndexesLocked(self, stats_alloc, runtime_stats);
+            Self.overlayRuntimeStatusIndexesLocked(self, stats_alloc, runtime_stats) catch {
+                markMissingDerivedCoverageIdentities(runtime_stats.indexes);
+                return;
+            };
         }
 
-        fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
+        fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) !void {
+            // Coverage outcomes and identity totals form one apply-fenced status
+            // invariant; refresh both before overlaying live index counters.
+            var identity_stats = try doc_identity.fastStatsFromStore(self.core.store);
+            applyCachedIdentityVisibilitySummary(&identity_stats, self.identity_visibility_summary_cache);
+            runtime_stats.source_doc_count = identity_stats.live_ordinals;
+            runtime_stats.doc_identity = Self.dbDocIdentityStats(identity_stats, self.core.identity_namespace);
+            try Self.hydrateDerivedCoverageIdentities(self, stats_alloc, runtime_stats.indexes);
             var visible_doc_count = runtime_stats.doc_count;
             for (runtime_stats.indexes) |*item| {
                 switch (item.kind) {
                     .full_text => {
                         if (self.core.textIndex(item.name)) |entry| {
-                            const text_snapshot = entry.snapshot();
+                            const text_snapshot = entry.acquireSnapshot();
+                            defer text_snapshot.release();
                             item.doc_count = text_snapshot.global_doc_count;
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
@@ -3538,6 +4209,7 @@ pub fn Impl(comptime DB: type) type {
                             item.root_node = hbc_stats.root_node;
                             item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         }
+                        try Self.populateConfiguredDerivedCoverageCounts(self, item.name, item);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     },
                     .sparse_vector => {
@@ -3549,6 +4221,7 @@ pub fn Impl(comptime DB: type) type {
                                 sparse_stats.doc_count;
                             item.term_count = sparse_stats.term_count;
                         }
+                        try Self.populateConfiguredDerivedCoverageCounts(self, item.name, item);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     },
                     .graph => {
@@ -4301,11 +4974,166 @@ test "db lifecycle open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each open allocates three owner ids from the shared runtime: one for the
-    // backend (backend_owner_id), one for relational index workers, and one for
-    // algebraic HLL cardinality maintenance. Two opens therefore consume ids
-    // 1..6, leaving 7 next.
-    try std.testing.expectEqual(@as(u64, 7), runtime.ptr().allocOwnerId());
+    // Each open allocates four owner ids from the shared runtime: backend,
+    // repair cleanup, relational index workers, and algebraic HLL maintenance.
+    // The runtime also reserves a shared retired-generation cleanup owner.
+    try std.testing.expectEqual(
+        second.algebraic_hll_owner_id + 1,
+        try runtime.ptr().allocOwnerId(),
+    );
+}
+
+test "db close retires runtime owners for memory primary backend" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+    });
+    const backend_owner_id = db.backend_owner_id;
+    const repair_cleanup_owner_id = db.repair_cleanup_owner_id;
+    const relational_index_worker_owner_id = db.relational_index_worker_owner_id;
+    const algebraic_hll_owner_id = db.algebraic_hll_owner_id;
+    db.close();
+
+    const Fns = struct {
+        fn run(_: *anyopaque) !void {}
+        fn deinit(_: *anyopaque) void {}
+    };
+    var ctx: u8 = 0;
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = backend_owner_id,
+        .class = .maintenance,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = repair_cleanup_owner_id,
+        .class = .cleanup,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = relational_index_worker_owner_id,
+        .class = .maintenance,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = algebraic_hll_owner_id,
+        .class = .maintenance,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+}
+
+test "db inherits the resource manager capacity source" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const CapacityContext = struct {
+        fn observe(_: *anyopaque) anyerror!resource_manager_mod.CapacityObservation {
+            return .{ .available_bytes = 1234, .capacity_bytes = 5678 };
+        }
+    };
+    var source_context: u8 = 0;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    try manager.installCapacitySource(.{
+        .ptr = &source_context,
+        .domain_id = 91,
+        .observe = CapacityContext.observe,
+    });
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager });
+    defer db.close();
+    const source = db.capacity_source orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u128, 91), source.domain_id);
+    const observed = try source.current();
+    try std.testing.expectEqual(@as(?u64, 1234), observed.available_bytes);
+    try std.testing.expectEqual(@as(?u64, 5678), observed.capacity_bytes);
+}
+
+test "db lifecycle standalone resource manager governs dense cache and storage" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const resources = db.owned_resource_manager orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(resources, db.core.index_manager.resource_manager.?);
+    try std.testing.expectEqual(resources, db.core.index_manager.dense_lsm_options.resource_manager.?);
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":8,\"external\":true}",
+    });
+    const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(resources, dense.index.resource_manager.?);
+}
+
+test "db lifecycle fallback resource manager does not bind caller owned lsm cache" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var cache = lsm_backend_mod.Cache.init(alloc, lsm_backend_mod.DefaultCacheSizeBytes);
+    defer cache.deinit();
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .lsm_cache = &cache,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try std.testing.expect(db.owned_resource_manager != null);
+        try std.testing.expect(cache.resource_manager == null);
+    }
+    try std.testing.expect(cache.resource_manager == null);
+}
+
+test "db repair capacity treats unsupported observation as accounting only" {
+    const DB = @import("mod.zig").DB;
+    const Unsupported = struct {
+        fn observe(_: *anyopaque) anyerror!resource_manager_mod.CapacityObservation {
+            return error.UnsupportedPlatform;
+        }
+    };
+    var context: u8 = 0;
+    const observed = try DB.ArtifactRepairCallbacks.repair_capacity_observation(.{
+        .capacity_source = .{
+            .ptr = &context,
+            .domain_id = 17,
+            .observe = Unsupported.observe,
+        },
+    });
+    try std.testing.expectEqual(@as(?u64, null), observed.available_bytes);
+    try std.testing.expectEqual(@as(?u64, null), observed.capacity_bytes);
 }
 
 test "db lifecycle open downgrades borrowed manual backend runtime to manual executor" {
@@ -4475,6 +5303,8 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
     defer db.backend_runtime = original_backend_runtime;
 
     const original_runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(original_runtime, db.async_context.enrichment_runtime.?);
+    try std.testing.expect(db.async_context.enrichment_desired_running.load(.acquire));
     var manual_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer manual_runtime.deinit();
 
@@ -4484,6 +5314,8 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
         .dense_embedder = replacement_embedder.interface(),
     }));
     try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
+    try std.testing.expectEqual(original_runtime, db.async_context.enrichment_runtime.?);
+    try std.testing.expect(db.async_context.enrichment_desired_running.load(.acquire));
 }
 
 test "db lifecycle open ttl cleanup enabled requires backend runtime io" {
@@ -4574,6 +5406,14 @@ test "db lifecycle open status_only reads index catalog without loading index st
         const indexes = try status_db.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, indexes);
         try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        var full_text_generation: u64 = 0;
+        for (indexes) |config| {
+            if (std.mem.eql(u8, config.name, "ft_v1")) {
+                full_text_generation = config.coverage_generation;
+                break;
+            }
+        }
+        try std.testing.expect(full_text_generation != 0);
 
         const stats = try status_db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
@@ -4589,6 +5429,66 @@ test "db lifecycle open status_only reads index catalog without loading index st
             try std.testing.expect(item.root_node > 0);
         }
         try std.testing.expect(saw_dense);
+
+        const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1", .{std.mem.span(path)});
+        defer alloc.free(rebuild_root);
+        const stale_generation = if (full_text_generation == 1) 2 else full_text_generation - 1;
+        const stale_state = backfill_state_mod.RebuildState.initOwned(rebuild_root, null, stale_generation);
+        defer stale_state.clear() catch {};
+        try stale_state.update("doc:stale");
+
+        const stale_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, stale_stats);
+        const stale_ft = blk: {
+            for (stale_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(!stale_ft.backfill_active);
+
+        const current_state = backfill_state_mod.RebuildState.initOwned(rebuild_root, null, full_text_generation);
+        defer current_state.clear() catch {};
+        try current_state.update("doc:a");
+        const rebuilding_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, rebuilding_stats);
+        const rebuilding_ft = blk: {
+            for (rebuilding_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(rebuilding_ft.backfill_active);
+
+        try current_state.clear();
+        const current_state_path = try current_state.pathAlloc(alloc);
+        defer alloc.free(current_state_path);
+        const legacy_state = backfill_state_mod.RebuildState.init(rebuild_root);
+        const legacy_state_path = try legacy_state.pathAlloc(alloc);
+        defer alloc.free(legacy_state_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = legacy_state_path,
+            .data = "doc:legacy",
+        });
+
+        const legacy_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, legacy_stats);
+        const legacy_ft = blk: {
+            for (legacy_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(legacy_ft.backfill_active);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, current_state_path, .{}));
+        const preserved_legacy = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            legacy_state_path,
+            alloc,
+            .limited(1024),
+        );
+        defer alloc.free(preserved_legacy);
+        try std.testing.expectEqualStrings("doc:legacy", preserved_legacy);
     }
 }
 
@@ -5395,6 +6295,7 @@ test "db lifecycle open quarantines dense index with unsupported artifact versio
     // Drop + recreate recovers and clears the recorded failure.
     try std.testing.expect(try db.deleteIndex("dv_quarantine"));
     try std.testing.expect(db.core.index_manager.loadFailure("dv_quarantine") == null);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(dense_cfg);
     try db.runUntilIdle();
     try std.testing.expect(db.core.denseIndex("dv_quarantine") != null);
@@ -5465,6 +6366,7 @@ test "db lifecycle quarantine drops dense index after persisted index directory 
     try std.testing.expect(try db.deleteIndex("dv_corrupt"));
     try std.testing.expect(db.core.index_manager.loadFailure("dv_corrupt") == null);
     try std.testing.expect(db.core.index_manager.get("dv_corrupt") == null);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
 
     var io_impl = db_internal.threadedIo();
     defer io_impl.deinit();
@@ -5893,7 +6795,7 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
         try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
         try std.testing.expectError(
             error.InvalidDerivedApplyState,
-            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.store, checkpoint_path, "dense_idx"),
+            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx"),
         );
     }
 
@@ -5918,7 +6820,7 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
     try std.testing.expectEqual(@as(u64, 11), stats.indexes[0].projection_checkpoint_generation);
 }
 
-test "db corrupt projection sidecar degrades non-dense checkpoint and can be replaced" {
+test "db corrupt projection sidecar degrades non-dense checkpoint and quarantines writes" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -5927,6 +6829,7 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and can be rep
     defer TestHelpers.cleanupTempDir(path);
 
     const text_cfg: types.IndexConfig = .{ .name = "ft_idx", .kind = .full_text, .config_json = "{}" };
+    var text_config_hash: u64 = 0;
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -5936,11 +6839,13 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and can be rep
         defer db.close();
 
         try db.addIndex(text_cfg);
+        const stored_text_cfg = db.core.index_manager.get("ft_idx") orelse return error.TestUnexpectedResult;
+        text_config_hash = types.indexConfigHash(stored_text_cfg.*);
         try db.core.saveProjectionCheckpoint("ft_idx", .{
             .applied_sequence = 9,
             .status = .clean,
             .generation = 4,
-            .config_hash = types.indexConfigHash(text_cfg),
+            .config_hash = text_config_hash,
         });
 
         const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
@@ -5959,8 +6864,7 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and can be rep
         const degraded_checkpoint = try status_only.core.loadProjectionCheckpoint(alloc, "ft_idx");
         try std.testing.expectEqual(apply_state.ProjectionStatus.repair_required, degraded_checkpoint.status);
         try std.testing.expectEqual(@as(u64, 0), degraded_checkpoint.applied_sequence);
-        const stored_text_cfg = status_only.core.index_manager.get("ft_idx") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(types.indexConfigHash(stored_text_cfg.*), degraded_checkpoint.config_hash);
+        try std.testing.expectEqual(text_config_hash, degraded_checkpoint.config_hash);
 
         const degraded_stats = try status_only.stats(alloc);
         defer types.freeDBStats(alloc, degraded_stats);
@@ -5977,17 +6881,20 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and can be rep
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 0), try reopened.core.loadAppliedSequence(alloc, "ft_idx"));
-    const repaired_by_open_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
-    const reopened_text_cfg = reopened.core.index_manager.get("ft_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, repaired_by_open_checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 0), repaired_by_open_checkpoint.applied_sequence);
-    try std.testing.expectEqual(types.indexConfigHash(reopened_text_cfg.*), repaired_by_open_checkpoint.config_hash);
+    const degraded_by_open_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.repair_required, degraded_by_open_checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 0), degraded_by_open_checkpoint.applied_sequence);
+    try std.testing.expectEqual(text_config_hash, degraded_by_open_checkpoint.config_hash);
+    try std.testing.expectEqualStrings(
+        "InvalidDerivedApplyState",
+        reopened.core.index_manager.loadFailure("ft_idx") orelse return error.TestUnexpectedResult,
+    );
 
-    try reopened.core.saveAppliedSequence("ft_idx", 7);
-    const repaired_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
-    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, repaired_checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 7), repaired_checkpoint.applied_sequence);
-    try std.testing.expectEqual(types.indexConfigHash(reopened_text_cfg.*), repaired_checkpoint.config_hash);
+    try std.testing.expectError(error.IndexNotFound, reopened.core.saveAppliedSequence("ft_idx", 7));
+    const still_degraded_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.repair_required, still_degraded_checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 0), still_degraded_checkpoint.applied_sequence);
+    try std.testing.expectEqual(text_config_hash, still_degraded_checkpoint.config_hash);
 }
 
 test "db lifecycle open dense replay progress target matches replay debt target" {
@@ -6518,7 +7425,7 @@ test "dense target advance is blocked while external bulk session is active" {
     };
     defer ctx.deinit(alloc);
 
-    beginExternalDenseBulkSessionTracked(&ctx);
+    try beginExternalDenseBulkSessionTracked(&ctx);
     defer finishExternalDenseBulkSessionTracked(&ctx);
 
     const can_advance = try DB.derivedAsyncCanAdvanceDerivedToTargetAsync(&ctx, .{
@@ -6549,6 +7456,9 @@ test "db catch-up defers artifact dense target advance without durable counter" 
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
     });
+    const counter_key = try DB.DerivedAsyncCallbacks.dense_artifact_target_counter_key_alloc(alloc, "dv_v1");
+    defer alloc.free(counter_key);
+    try db.core.store.putBatch(&.{}, &.{counter_key});
 
     const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(stored_key);
@@ -6693,25 +7603,39 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
     try db.core.store.putBatch(writes.items, &.{});
     try db.core.putArtifactPresenceMarker();
 
-    try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
-    var latest_raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
-    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
-    var batch = try db.core.store.beginWriteBatch();
-    errdefer batch.abort();
-    try batch.put(latest_key[0..], latest_raw[0..]);
-    try batch.commit();
+    const source_only_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = target_sequence,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(source_only_payload);
+    try db.core.store.appendReplayOpaque(alloc, target_sequence, source_only_payload);
+
+    {
+        const before = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (before) |*status| status.deinit(alloc);
+            alloc.free(before);
+        }
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqual(@as(u64, 0), before[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, before[0].target_sequence);
+        try std.testing.expect(before[0].catch_up_required);
+    }
 
     try db.catchUpPendingDerivedReplay();
 
-    const after = try db.listDerivedReplayDebt(alloc);
-    defer {
-        for (after) |*status| status.deinit(alloc);
-        alloc.free(after);
+    {
+        const after = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (after) |*status| status.deinit(alloc);
+            alloc.free(after);
+        }
+        try std.testing.expectEqual(@as(usize, 1), after.len);
+        try std.testing.expectEqual(target_sequence, after[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, after[0].target_sequence);
+        try std.testing.expect(!after[0].catch_up_required);
     }
-    try std.testing.expectEqual(@as(usize, 1), after.len);
-    try std.testing.expectEqual(target_sequence, after[0].applied_sequence);
-    try std.testing.expect(!after[0].catch_up_required);
 
     var result = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -7437,6 +8361,80 @@ test "db lifecycle basic batch/get works with in-memory lsm primary backend" {
     defer if (raw) |value| alloc.free(value);
     try std.testing.expect(raw != null);
     try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"beta\"") != null);
+}
+
+test "db enrichment restart supervisor recovers transient start failures" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(runtime.isStarted());
+    try std.testing.expect(DB.SchemaRuntimeCallbacks.quiesce_enrichment_for_structural_mutation(&db));
+    try std.testing.expect(!runtime.isStarted());
+
+    DB.ArtifactRepairCallbacks.set_test_enrichment_restart_failures_remaining(std.math.maxInt(u32));
+    defer DB.ArtifactRepairCallbacks.set_test_enrichment_restart_failures_remaining(0);
+    try std.testing.expectError(
+        error.TestTransientEnrichmentRestart,
+        DB.SchemaRuntimeCallbacks.restart_enrichment_after_structural_mutation(&db, "test", "semantic_idx"),
+    );
+    const degraded = DB.LifecycleCallbacks.enrichment_stats_with_supervisor_state(&db, .{});
+    try std.testing.expect(degraded.retrying);
+    try std.testing.expect(!degraded.worker_failed);
+    const pending = db.pendingWorkStats();
+    try std.testing.expect(pending.enrichment.retrying);
+    try std.testing.expect(!pending.enrichment.worker_failed);
+    const operational = try db.stats(alloc);
+    defer types.freeDBStats(alloc, operational);
+    try std.testing.expect(operational.enrichment.retrying);
+    try std.testing.expect(!operational.enrichment.worker_failed);
+    const diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, diagnostic);
+    try std.testing.expect(diagnostic.enrichment.retrying);
+    try std.testing.expect(!diagnostic.enrichment.worker_failed);
+    DB.ArtifactRepairCallbacks.set_test_enrichment_restart_failures_remaining(12);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
+    try std.testing.expectEqual(@as(u32, 0), DB.ArtifactRepairCallbacks.test_enrichment_restart_failures_remaining());
+    try std.testing.expect(db.async_context.enrichment_desired_running.load(.acquire));
+    try std.testing.expect(runtime.isStarted());
+}
+
+test "db enrichment status does not wait for lifecycle mutation" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    db_internal.lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
+    const fallback = types.EnrichmentStats{
+        .enabled = true,
+        .target_sequence = 41,
+        .applied_sequence = 37,
+    };
+    const status = DB.LifecycleCallbacks.enrichment_stats_with_supervisor_state(&db, fallback);
+    db.async_context.enrichment_lifecycle_mutex.unlock();
+
+    try std.testing.expect(status.enabled);
+    try std.testing.expectEqual(@as(u64, 41), status.target_sequence);
+    try std.testing.expectEqual(@as(u64, 37), status.applied_sequence);
+    try std.testing.expect(status.retrying);
+    try std.testing.expect(!status.worker_failed);
 }
 
 test "db lifecycle basic batch/get works with memory primary backend" {

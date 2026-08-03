@@ -87,8 +87,10 @@ fn openCredentialedBindingObjectStoreAlloc(
         ),
         .file => |path| blk: {
             if (external_io.protocol != .filesystem) return error.UnsupportedExternalLakeCredentialRef;
-            if (external_io.prefix) |allowed| try ensurePrefixAllowed(path, allowed);
-            const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
+            const root = external_io.root orelse return error.UnsupportedExternalLakeCredentialRef;
+            const resolved_path = try resolveFilesystemSourcePathAlloc(alloc, root, path);
+            defer alloc.free(resolved_path);
+            const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{resolved_path});
             defer alloc.free(file_uri);
             break :blk try object_store_support.OpenedObjectStore.initFileUriWithOptions(
                 alloc,
@@ -114,12 +116,13 @@ fn openCredentialedS3PrefixAlloc(
 
     const endpoint = if (external_io.endpoint) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
     defer if (endpoint) |value| alloc.free(value);
-    const access_key_id = if (external_io.access_key_id) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
-    defer if (access_key_id) |value| alloc.free(value);
-    const secret_access_key = if (external_io.secret_access_key) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
-    defer if (secret_access_key) |value| alloc.free(value);
-    const session_token = if (external_io.session_token) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
-    defer if (session_token) |value| alloc.free(value);
+    var resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, external_io, secret_store);
+    defer resolved_credentials.deinit(alloc);
+    const resolved = resolved_credentials.apply(external_io);
+    switch (resolved.credentials.source) {
+        .default, .static => {},
+        .profile, .web_identity => return error.UnsupportedExternalLakeCredentialRef,
+    }
 
     return try object_store_support.OpenedObjectStore.initS3UriWithOverridesAndOptions(
         alloc,
@@ -127,12 +130,17 @@ fn openCredentialedS3PrefixAlloc(
         prefix,
         .{
             .endpoint = endpoint,
+            .region = resolved.region,
             .use_ssl = external_io.use_ssl orelse true,
-            .access_key_id = access_key_id,
-            .secret_access_key = secret_access_key,
-            .session_token = session_token,
+            .access_key_id = resolved.credentials.access_key_id,
+            .secret_access_key = resolved.credentials.secret_access_key,
+            .session_token = resolved.credentials.session_token,
+            .addressing_style = switch (resolved.addressing_style) {
+                .path => .path,
+                .virtual_hosted => .virtual_hosted,
+            },
         },
-        .{ .ensure_bucket = !read_only },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
     );
 }
 
@@ -147,14 +155,21 @@ fn openCredentialedGcsPrefixAlloc(
     if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
     if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
-    const bearer_token = try gcsBearerTokenFromHeadersAlloc(alloc, secret_store, external_io.headers);
+    var resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, external_io, secret_store);
+    defer resolved_credentials.deinit(alloc);
+    const resolved = resolved_credentials.apply(external_io);
+    const bearer_token = switch (resolved.gcs_credentials.source) {
+        .default => try gcsBearerTokenFromHeadersAlloc(alloc, secret_store, external_io.headers),
+        .bearer_token => if (resolved.gcs_credentials.bearer_token) |token| try alloc.dupe(u8, token) else return error.UnsupportedExternalLakeCredentialRef,
+        .service_account => return error.UnsupportedExternalLakeCredentialRef,
+    };
     defer if (bearer_token) |value| alloc.free(value);
     return try object_store_support.OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(
         alloc,
         bucket,
         prefix,
         bearer_token,
-        .{ .ensure_bucket = !read_only },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
     );
 }
 
@@ -198,6 +213,68 @@ fn ensurePrefixAllowed(prefix: []const u8, allowed_prefix: []const u8) !void {
     return error.ExternalLakeCredentialScopeMismatch;
 }
 
+fn resolveFilesystemSourcePathAlloc(
+    alloc: Allocator,
+    configured_root: []const u8,
+    uri_path: []const u8,
+) ![]u8 {
+    if (!std.fs.path.isAbsolute(configured_root)) return error.UnsupportedExternalLakeCredentialRef;
+    const relative = std.mem.trimStart(u8, uri_path, "/");
+    if (relative.len > 0) try validateFilesystemSourceRelativePath(relative);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const canonical_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return error.UnsupportedExternalLakeCredentialRef,
+        else => return err,
+    };
+    defer alloc.free(canonical_root);
+
+    const candidate = if (relative.len == 0)
+        try alloc.dupe(u8, canonical_root)
+    else
+        try std.fs.path.join(alloc, &.{ canonical_root, relative });
+    errdefer alloc.free(candidate);
+
+    // Resolve the nearest existing ancestor so an existing symlink cannot
+    // redirect a root-relative source outside the administrator-owned root.
+    var ancestor: []const u8 = candidate;
+    while (true) {
+        const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, ancestor, alloc) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                ancestor = std.fs.path.dirname(ancestor) orelse return error.ExternalLakeCredentialScopeMismatch;
+                continue;
+            },
+            else => return err,
+        };
+        defer alloc.free(canonical);
+        if (!filesystemPathIsWithin(canonical_root, canonical)) return error.ExternalLakeCredentialScopeMismatch;
+        break;
+    }
+    return candidate;
+}
+
+fn validateFilesystemSourceRelativePath(path: []const u8) !void {
+    if (path.len > 4096 or std.fs.path.isAbsolute(path) or
+        std.mem.indexOfAny(u8, path, "\\\x00") != null)
+    {
+        return error.ExternalLakeCredentialScopeMismatch;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            return error.ExternalLakeCredentialScopeMismatch;
+        }
+    }
+}
+
+fn filesystemPathIsWithin(root: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (candidate.len <= root.len or !std.mem.startsWith(u8, candidate, root)) return false;
+    return root[root.len - 1] == std.fs.path.sep or candidate[root.len] == std.fs.path.sep;
+}
+
 fn hasConnectionCapability(connection: common_config.Config.ConnectionConfig, capability: []const u8) bool {
     for (connection.capabilities) |value| {
         if (std.mem.eql(u8, value, capability)) return true;
@@ -209,10 +286,15 @@ test "credentialed binding object store opens scoped filesystem source" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const allowed_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/allowed/events", .{tmp.sub_path});
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(cwd);
+    const allowed_root = try std.fs.path.resolve(alloc, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], "allowed" });
+    defer alloc.free(allowed_root);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, allowed_root, .default_dir);
+    const allowed_root_json = try std.json.Stringify.valueAlloc(alloc, allowed_root, .{});
+    defer alloc.free(allowed_root_json);
+    const allowed_path = try std.fs.path.resolve(alloc, &.{ allowed_root, "events" });
     defer alloc.free(allowed_path);
-    const denied_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/denied/events", .{tmp.sub_path});
-    defer alloc.free(denied_path);
 
     const cfg_json = try std.fmt.allocPrint(alloc,
         \\{{
@@ -222,22 +304,20 @@ test "credentialed binding object store opens scoped filesystem source" {
         \\      "capabilities": ["lake_read"],
         \\      "external_io": {{
         \\        "protocol": "filesystem",
-        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\        "root": {s}
         \\      }}
         \\    }}
         \\  }}
         \\}}
-    , .{tmp.sub_path});
+    , .{allowed_root_json});
     defer alloc.free(cfg_json);
     var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
     defer cfg.deinit();
 
-    const allowed_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{allowed_path});
-    defer alloc.free(allowed_uri);
     var opened = try openBindingObjectStoreAlloc(alloc, .{
         .table_id = "events",
         .format = .parquet,
-        .source_uri = allowed_uri,
+        .source_uri = "file:///events",
         .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
         .schema_fingerprint = "schema-v1",
     }, .{
@@ -246,14 +326,13 @@ test "credentialed binding object store opens scoped filesystem source" {
     });
     defer opened.deinit();
     try std.testing.expectEqualStrings("external-lake", opened.bucket);
+    try std.testing.expectEqualStrings(allowed_path, opened.fs_client.?.root_dir);
     try std.testing.expect(!(try opened.client.bucketExists("external-lake")));
 
-    const denied_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{denied_path});
-    defer alloc.free(denied_uri);
     try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
         .table_id = "events",
         .format = .parquet,
-        .source_uri = denied_uri,
+        .source_uri = "file:///../denied/events",
         .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
         .schema_fingerprint = "schema-v1",
     }, .{

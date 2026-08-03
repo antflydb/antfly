@@ -123,6 +123,16 @@ pub fn parseCheckHAWriteBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(types.WriteCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get a storage maintenance job
+pub const GetStorageMaintenanceJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Request cancellation of a storage maintenance job
+pub const CancelStorageMaintenanceJobPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Route metadata for all operations.
 pub const Route = struct {
     method: []const u8,
@@ -154,6 +164,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby" },
     .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
     .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite" },
+    .{ .method = "POST", .path = "/maintenance/check", .operation_id = "startStorageCheck" },
+    .{ .method = "POST", .path = "/maintenance/compact", .operation_id = "startStorageCompact" },
+    .{ .method = "GET", .path = "/maintenance/jobs/{job_id}", .operation_id = "getStorageMaintenanceJob" },
+    .{ .method = "DELETE", .path = "/maintenance/jobs/{job_id}", .operation_id = "cancelStorageMaintenanceJob" },
+    .{ .method = "POST", .path = "/maintenance/vacuum", .operation_id = "startStorageVacuum" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -190,6 +205,11 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
         if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
+        if (!@hasDecl(Impl, "startStorageCheck")) @compileError("ServerRouter: Impl missing required method 'startStorageCheck'");
+        if (!@hasDecl(Impl, "startStorageCompact")) @compileError("ServerRouter: Impl missing required method 'startStorageCompact'");
+        if (!@hasDecl(Impl, "getStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'getStorageMaintenanceJob'");
+        if (!@hasDecl(Impl, "cancelStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'cancelStorageMaintenanceJob'");
+        if (!@hasDecl(Impl, "startStorageVacuum")) @compileError("ServerRouter: Impl missing required method 'startStorageVacuum'");
     }
 
     return struct {
@@ -227,6 +247,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/ha/standby/bootstrap", bootstrapHAStandby);
             try server.get("/ha/standby/status", getHAStandbyStatus);
             try server.post("/ha/write/check", checkHAWrite);
+            try server.post("/maintenance/check", startStorageCheck);
+            try server.post("/maintenance/compact", startStorageCompact);
+            try server.get("/maintenance/jobs/:job_id", getStorageMaintenanceJob);
+            try server.delete("/maintenance/jobs/:job_id", cancelStorageMaintenanceJob);
+            try server.post("/maintenance/vacuum", startStorageVacuum);
         }
 
         /// Begin an HA base backup and reserve its replication slot
@@ -283,14 +308,14 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getHAPrimaryStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = GetHAPrimaryStatusParams{
-                .max_lag_lsn = ctx.query("max_lag_lsn"),
-                .max_retained_bytes = ctx.query("max_retained_bytes"),
-                .max_retained_age_ns = ctx.query("max_retained_age_ns"),
-                .sync_mode = ctx.query("sync_mode"),
-                .sync_selection = ctx.query("sync_selection"),
-                .sync_required = ctx.query("sync_required"),
-                .sync_standby = ctx.query("sync_standby"),
-                .sync_failure = ctx.query("sync_failure"),
+                .max_lag_lsn = try ctx.queryDecoded("max_lag_lsn"),
+                .max_retained_bytes = try ctx.queryDecoded("max_retained_bytes"),
+                .max_retained_age_ns = try ctx.queryDecoded("max_retained_age_ns"),
+                .sync_mode = try ctx.queryDecoded("sync_mode"),
+                .sync_selection = try ctx.queryDecoded("sync_selection"),
+                .sync_required = try ctx.queryDecoded("sync_required"),
+                .sync_standby = try ctx.queryDecoded("sync_standby"),
+                .sync_failure = try ctx.queryDecoded("sync_failure"),
             };
             return impl.getHAPrimaryStatus(ctx, query_params);
         }
@@ -394,7 +419,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = GetHAStandbyStatusParams{
-                .upstream_lsn = ctx.query("upstream_lsn"),
+                .upstream_lsn = try ctx.queryDecoded("upstream_lsn"),
             };
             return impl.getHAStandbyStatus(ctx, query_params);
         }
@@ -404,6 +429,43 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn checkHAWrite(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.checkHAWrite(ctx);
+        }
+
+        /// Start a coordinated storage integrity check
+        /// POST /maintenance/check
+        fn startStorageCheck(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.startStorageCheck(ctx);
+        }
+
+        /// Start coordinated storage compaction
+        /// POST /maintenance/compact
+        fn startStorageCompact(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.startStorageCompact(ctx);
+        }
+
+        /// Get a storage maintenance job
+        /// GET /maintenance/jobs/{job_id}
+        fn getStorageMaintenanceJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.getStorageMaintenanceJob(ctx, job_id);
+        }
+
+        /// Request cancellation of a storage maintenance job
+        /// DELETE /maintenance/jobs/{job_id}
+        fn cancelStorageMaintenanceJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.cancelStorageMaintenanceJob(ctx, job_id);
+        }
+
+        /// Start physical storage reclamation
+        /// POST /maintenance/vacuum
+        fn startStorageVacuum(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.startStorageVacuum(ctx);
         }
     };
 }
@@ -433,3 +495,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
 //   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startStorageCheck(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startStorageCompact(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn startStorageVacuum(self: *Impl, ctx: *httpx.Context) !httpx.Response

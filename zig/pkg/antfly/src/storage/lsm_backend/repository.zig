@@ -59,6 +59,7 @@ pub const Run = struct {
     entry_count: u32,
     bloom_filter: ?bloom.OwnedFilter,
     owns_metadata: bool = true,
+    owns_path: bool = false,
     owns_bloom_filter: bool = true,
     cached_state_index: ?usize = null,
     cached_index_index: ?usize = null,
@@ -68,8 +69,13 @@ pub const Run = struct {
     state: ?state_mod.State,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
-        if (self.owns_metadata) {
+        if (self.owns_path) {
             if (self.path) |path| allocator.free(path);
+        }
+        if (self.owns_metadata) {
+            if (!self.owns_path) {
+                if (self.path) |path| allocator.free(path);
+            }
             if (self.smallest_namespace_name) |name| allocator.free(name);
             allocator.free(self.smallest_key);
             if (self.largest_namespace_name) |name| allocator.free(name);
@@ -93,6 +99,7 @@ pub const Run = struct {
             .entry_count = 0,
             .bloom_filter = null,
             .owns_metadata = false,
+            .owns_path = false,
             .owns_bloom_filter = false,
             .cached_state_index = null,
             .cached_index_index = null,
@@ -269,12 +276,15 @@ pub fn loadManifestIfPresentWithStorage(
     next_run_id.* = decoded.next_run_id;
     try runs.ensureTotalCapacity(allocator, decoded.runs.len);
     for (decoded.runs) |*meta| {
+        const owned_path = try runPath(allocator, root_dir, meta.id);
+        var path_owned = true;
+        errdefer if (path_owned) allocator.free(owned_path);
         try runs.append(allocator, .{
             .id = meta.id,
             .level = meta.level,
             .size_bytes = meta.size_bytes,
             .compression_stats = meta.compression_stats,
-            .path = @constCast(meta.path),
+            .path = owned_path,
             .smallest_namespace_name = if (meta.smallest_namespace_name) |name| @constCast(name) else null,
             .smallest_key = @constCast(meta.smallest_key),
             .largest_namespace_name = if (meta.largest_namespace_name) |name| @constCast(name) else null,
@@ -282,12 +292,14 @@ pub fn loadManifestIfPresentWithStorage(
             .entry_count = meta.entry_count,
             .bloom_filter = null,
             .owns_metadata = false,
+            .owns_path = true,
             .state = null,
         });
+        path_owned = false;
     }
     try obsolete_paths.ensureTotalCapacity(allocator, decoded.obsolete_paths.len);
     for (decoded.obsolete_paths) |obsolete| {
-        const owned_path = try allocator.dupe(u8, obsolete.path);
+        const owned_path = try rebaseManifestPathAlloc(allocator, root_dir, obsolete.path);
         obsolete_paths.appendAssumeCapacity(.{
             .path = owned_path,
             .delete_after_ns = obsolete.delete_after_ns,
@@ -296,6 +308,13 @@ pub fn loadManifestIfPresentWithStorage(
     manifest_backing.* = decoded.raw;
     decoded.raw = &.{};
     return true;
+}
+
+fn rebaseManifestPathAlloc(allocator: Allocator, root_dir: []const u8, path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return try std.fs.path.join(allocator, &.{ root_dir, path });
+    const parent = std.fs.path.dirname(path) orelse return try allocator.dupe(u8, path);
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), "runs")) return try allocator.dupe(u8, path);
+    return try std.fs.path.join(allocator, &.{ root_dir, "runs", std.fs.path.basename(path) });
 }
 
 pub fn persistRunFile(allocator: Allocator, root_dir: []const u8, run: *Run) ![]u8 {
@@ -477,7 +496,6 @@ pub fn persistManifestWithStorageCount(
     });
     defer allocator.free(encoded);
     try replaceFileAtomicallyAbsolute(storage, manifest_path, encoded);
-    try storage.syncFileAbsolute(manifest_path);
     return @intCast(encoded.len);
 }
 
@@ -509,12 +527,18 @@ pub fn loadRunStateAllocWithStorage(storage: storage_io.Storage, allocator: Allo
             window.physicalLen(),
         );
         defer allocator.free(payload);
-        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
+        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(
+            allocator,
+            window.compression,
+            payload,
+            window.len,
+            window.checksum,
+        );
         defer allocator.free(bytes);
 
         const end = block.first_entry_index + block.entry_count;
         for (block.first_entry_index..end) |entry_index| {
-            const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
+            const relative_offset: usize = @intCast(index.entryStartInBlock(entry_index, block_index) - window.relative_offset);
             const entry = try lsm_table_file.parseEntryAt(bytes, relative_offset);
             try appendStateEntryClone(allocator, &state, entry);
         }
@@ -565,16 +589,51 @@ pub fn loadRunTableIndexAllocWithStorage(
     // obsoleted and reclaimed it after this reader loaded the manifest;
     // propagate the transient error so callers can retry against a fresh
     // manifest instead of misreporting a format mismatch.
-    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
-    defer allocator.free(footer_bytes);
+    const footer = try loadRunFooterWithStorage(storage, allocator, path);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+}
 
-    if (lsm_table_file.hasFooterMagic(footer_bytes)) {
-        const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
-        const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
-        defer allocator.free(metadata_bytes);
-        return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+pub fn loadRunSequentialTableIndexAllocWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    path: []const u8,
+) !lsm_table_file.SequentialTableIndex {
+    const footer = try loadRunFooterWithStorage(storage, allocator, path);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+}
+
+fn loadRunFooterWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    path: []const u8,
+) !lsm_table_file.Footer {
+    var trailer = try storage.readFileTrailerAlloc(
+        allocator,
+        path,
+        lsm_table_file.footer_len,
+    );
+    defer trailer.deinit(allocator);
+
+    const file_size = trailer.file_size;
+    if (file_size > max_run_file_read_bytes) return error.FileTooBig;
+    if (file_size < lsm_table_file.header_len + lsm_table_file.footer_len)
+        return error.InvalidTableFile;
+
+    const footer_offset_u64 = file_size - lsm_table_file.footer_len;
+    if (!lsm_table_file.hasFooterMagic(trailer.bytes)) return error.UnsupportedVersion;
+
+    const footer = try lsm_table_file.decodeFooterBytes(trailer.bytes);
+    const footer_offset: usize = @intCast(footer_offset_u64);
+    if (footer.metadata_offset > footer_offset or
+        footer.metadata_len != footer_offset - footer.metadata_offset)
+    {
+        return error.InvalidTableFile;
     }
-    return error.UnsupportedVersion;
+    return footer;
 }
 
 pub fn deleteFileAbsolute(path: []const u8) !void {
@@ -785,38 +844,25 @@ fn joinPath(allocator: Allocator, root_dir: []const u8, suffix: []const u8) ![]u
 }
 
 fn replaceFileAtomicallyAbsolute(storage: storage_io.Storage, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try tempSiblingPath(std.heap.page_allocator, path);
-    defer std.heap.page_allocator.free(tmp_path);
-    writeFileAbsoluteWithStorage(storage, tmp_path, contents) catch |err| {
+    var writer = storage.beginAtomicWrite(std.heap.page_allocator, path) catch |err| {
         if (!isInjectedStorageFault(err)) {
-            std.log.err("lsm replace write failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(err) });
+            std.log.err("lsm atomic replace begin failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         }
-        deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
         return err;
     };
-
-    storage.renameAbsolute(tmp_path, path) catch |err| {
-        if (err == error.FileNotFound) {
-            writeFileAbsoluteWithStorage(storage, tmp_path, contents) catch |rewrite_err| {
-                if (!isInjectedStorageFault(rewrite_err)) {
-                    std.log.err("lsm replace rewrite failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(rewrite_err) });
-                }
-                deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
-                return rewrite_err;
-            };
-            storage.renameAbsolute(tmp_path, path) catch |retry_err| {
-                if (!isInjectedStorageFault(retry_err)) {
-                    std.log.err("lsm replace rename retry failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(retry_err) });
-                }
-                deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
-                return retry_err;
-            };
-            return;
-        }
+    var writer_open = true;
+    defer if (writer_open) writer.abort();
+    writer.appendSlice(contents) catch |err| {
         if (!isInjectedStorageFault(err)) {
-            std.log.err("lsm replace rename failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(err) });
+            std.log.err("lsm atomic replace write failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         }
-        deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
+        return err;
+    };
+    writer_open = false;
+    writer.finish() catch |err| {
+        if (!isInjectedStorageFault(err)) {
+            std.log.err("lsm atomic replace publish failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
+        }
         return err;
     };
 }
@@ -1038,6 +1084,30 @@ test "repository run table index load surfaces missing run file" {
     try std.testing.expectError(
         error.FileNotFound,
         loadRunTableIndexAllocWithStorage(storage.storage(), allocator, missing_path),
+    );
+}
+
+test "repository rejects forged run metadata length before allocating" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+    };
+    const encoded = try lsm_table_file.encodeAlloc(allocator, &entries);
+    defer allocator.free(encoded);
+
+    const footer_offset = encoded.len - lsm_table_file.footer_len;
+    const footer = encoded[footer_offset..];
+    std.mem.writeInt(u64, footer[24..32], max_run_file_read_bytes, .little);
+    std.mem.writeInt(u32, footer[44..48], std.hash.Crc32.hash(footer[0..44]), .little);
+
+    const path = "/repository-forged-run-metadata/run.tbl";
+    try storage.storage().writeFileAbsolute(path, encoded);
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        loadRunTableIndexAllocWithStorage(storage.storage(), allocator, path),
     );
 }
 

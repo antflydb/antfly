@@ -32,8 +32,49 @@ GENERATED_FILE_PROVENANCE: dict[str, list[str]] = {}
 GENERATED_PROVENANCE_ALLOWLIST: dict[str, str] = {}
 DECISION_SCOPE: dict[str, str] = {}
 
+BUILD_SURFACE_CATEGORIES = {
+    "options",
+    "steps",
+    "root_sources",
+    "artifacts",
+    "module_imports",
+    "module_options",
+    "step_dependencies",
+    "system_libraries",
+    "frameworks",
+    "include_paths",
+    "system_include_paths",
+    "library_paths",
+    "framework_paths",
+    "native_sources",
+}
+
+
+def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def load_json_file(path: pathlib.Path) -> Any:
+    return json.loads(
+        path.read_text(),
+        object_pairs_hook=reject_duplicate_json_keys,
+    )
+SEMANTIC_BUILD_SURFACE_CATEGORIES = BUILD_SURFACE_CATEGORIES - {
+    "options",
+    "steps",
+    "root_sources",
+    "artifacts",
+}
+
 MANIFEST_SCHEMA: dict[str, str] = {
     "decision_scope": "map_string",
+    "required_split_migrations": "list_nonempty_string",
+    "split_migrations": "split_migrations",
     "moved_paths": "map_list",
     "expected_incoming_only_integration_diffs": "map_string",
     "expected_ours_only_resolutions": "map_string",
@@ -45,8 +86,11 @@ MANIFEST_SCHEMA: dict[str, str] = {
     "same_path_const_false_positives": "map_list",
     "same_path_const_aliases": "nested_map_list",
     "test_name_aliases": "map_list",
+    "declaration_name_aliases": "map_list",
     "changed_helper_aliases": "map_list",
     "generated_workflows": "list_string",
+    "zig_relative_import_roots": "list_string",
+    "zig_relative_import_exceptions": "relative_import_exceptions",
 }
 
 
@@ -86,8 +130,961 @@ def ensure_manifest_shape(data: object, path: pathlib.Path) -> dict[str, Any]:
         elif expected == "list_string":
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 errors.append(f"{key}: expected list[string]")
+        elif expected == "list_nonempty_string":
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) and item for item in value
+            ):
+                errors.append(f"{key}: expected list[non-empty string]")
+        elif expected == "relative_import_exceptions":
+            if not isinstance(value, list):
+                errors.append(f"{key}: expected list")
+            else:
+                for index, rule in enumerate(value):
+                    if (
+                        not isinstance(rule, dict)
+                        or set(rule) != {"path", "import", "reason"}
+                        or any(
+                            not isinstance(rule.get(field), str)
+                            or not rule[field]
+                            for field in ("path", "import", "reason")
+                        )
+                    ):
+                        errors.append(
+                            f"{key}[{index}]: expected exactly non-empty "
+                            "path, import, and reason strings"
+                        )
+        elif expected == "split_migrations":
+            if not isinstance(value, dict):
+                errors.append(f"{key}: expected object")
+                continue
+            for migration_name, migration in value.items():
+                prefix = f"{key}.{migration_name}"
+                if not isinstance(migration_name, str) or not migration_name:
+                    errors.append(f"{key}: migration names must be non-empty strings")
+                    continue
+                if not isinstance(migration, dict):
+                    errors.append(f"{prefix}: expected object")
+                    continue
+                unknown = set(migration) - {
+                    "source",
+                    "source_facade_removed",
+                    "destinations",
+                    "build_surface_helpers",
+                    "build_surface_dependency_helpers",
+                    "build_surface_delta_only_categories",
+                    "build_surface_aliases",
+                    "build_surface_retention_aliases",
+                    "build_companion_globs",
+                    "build_surface_conditional_steps",
+                    "build_surface_omissions",
+                    "container_field_migrations",
+                    "declaration_mixins",
+                    "declaration_companion_globs",
+                    "declaration_companion_policies",
+                    "declaration_placement_ranges",
+                    "declaration_placements",
+                    "declaration_owner_migrations",
+                    "intentional_declaration_deletions",
+                    "module_path_migrations",
+                    "relative_import_exceptions",
+                    "retained_deletions",
+                    "reviewed_compositions",
+                    "reviewed_resolutions",
+                    "symbol_call_migrations",
+                    "symbol_reference_migrations",
+                    "test_name_rewrites",
+                }
+                if unknown:
+                    errors.append(
+                        f"{prefix}: unknown keys {', '.join(sorted(unknown))}"
+                    )
+                container_field_migrations = migration.get(
+                    "container_field_migrations",
+                    {},
+                )
+                if not isinstance(container_field_migrations, dict):
+                    errors.append(
+                        f"{prefix}.container_field_migrations: expected object"
+                    )
+                else:
+                    for container_key, fields in container_field_migrations.items():
+                        fields_prefix = (
+                            f"{prefix}.container_field_migrations.{container_key}"
+                        )
+                        if (
+                            not isinstance(container_key, str)
+                            or not container_key.startswith("container:")
+                            or not isinstance(fields, dict)
+                            or not fields
+                        ):
+                            errors.append(
+                                f"{fields_prefix}: expected a container obligation "
+                                "mapped to a non-empty object"
+                            )
+                            continue
+                        for source_field, field_migration in fields.items():
+                            field_prefix = f"{fields_prefix}.{source_field}"
+                            if (
+                                not isinstance(source_field, str)
+                                or not source_field
+                                or not isinstance(field_migration, dict)
+                                or set(field_migration) != {"target", "reason"}
+                                or not isinstance(field_migration.get("target"), str)
+                                or not field_migration["target"]
+                                or not isinstance(field_migration.get("reason"), str)
+                                or not field_migration["reason"]
+                            ):
+                                errors.append(
+                                    f"{field_prefix}: expected exact non-empty "
+                                    "target and reason strings"
+                                )
+                module_path_migrations = migration.get(
+                    "module_path_migrations",
+                    {},
+                )
+                if (
+                    not isinstance(module_path_migrations, dict)
+                    or any(
+                        not isinstance(source, str)
+                        or not source
+                        or not isinstance(destinations, list)
+                        or not destinations
+                        or any(
+                            not isinstance(destination, str) or not destination
+                            for destination in destinations
+                        )
+                        for source, destinations in module_path_migrations.items()
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.module_path_migrations: expected non-empty "
+                        "source paths mapped to non-empty path lists"
+                    )
+                symbol_call_migrations = migration.get(
+                    "symbol_call_migrations",
+                    {},
+                )
+                if (
+                    not isinstance(symbol_call_migrations, dict)
+                    or any(
+                        not isinstance(source, str)
+                        or not source
+                        or not isinstance(targets, list)
+                        or not targets
+                        or any(
+                            not isinstance(target, str) or not target
+                            for target in targets
+                        )
+                        for source, targets in symbol_call_migrations.items()
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.symbol_call_migrations: expected non-empty "
+                        "source symbols mapped to non-empty symbol lists"
+                    )
+                symbol_reference_migrations = migration.get(
+                    "symbol_reference_migrations",
+                    {},
+                )
+                if (
+                    not isinstance(symbol_reference_migrations, dict)
+                    or any(
+                        not isinstance(source, str)
+                        or not source
+                        or not isinstance(targets, list)
+                        or not targets
+                        or any(
+                            not isinstance(target, str) or not target
+                            for target in targets
+                        )
+                        for source, targets in symbol_reference_migrations.items()
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.symbol_reference_migrations: expected "
+                        "non-empty source symbols mapped to non-empty symbol lists"
+                    )
+                if not isinstance(migration.get("source"), str) or not migration["source"]:
+                    errors.append(f"{prefix}.source: expected non-empty string")
+                if not isinstance(
+                    migration.get("source_facade_removed", False),
+                    bool,
+                ):
+                    errors.append(
+                        f"{prefix}.source_facade_removed: expected boolean"
+                    )
+                destinations = migration.get("destinations")
+                if (
+                    not isinstance(destinations, list)
+                    or not destinations
+                    or not all(
+                        isinstance(destination, str) and destination
+                        for destination in destinations
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.destinations: expected non-empty list[string]"
+                    )
+                surface_helpers = migration.get("build_surface_helpers", {})
+                if not isinstance(surface_helpers, dict):
+                    errors.append(f"{prefix}.build_surface_helpers: expected object")
+                else:
+                    for category, helpers in surface_helpers.items():
+                        helper_prefix = f"{prefix}.build_surface_helpers.{category}"
+                        if category not in BUILD_SURFACE_CATEGORIES:
+                            errors.append(f"{helper_prefix}: unknown surface category")
+                            continue
+                        if not isinstance(helpers, list):
+                            errors.append(f"{helper_prefix}: expected list")
+                            continue
+                        for index, helper in enumerate(helpers):
+                            item_prefix = f"{helper_prefix}[{index}]"
+                            if (
+                                not isinstance(helper, dict)
+                                or set(helper) != {"function", "argument"}
+                                or not isinstance(helper.get("function"), str)
+                                or not helper["function"]
+                                or not isinstance(helper.get("argument"), int)
+                                or isinstance(helper.get("argument"), bool)
+                                or helper["argument"] < 0
+                            ):
+                                errors.append(
+                                    f"{item_prefix}: expected exactly a non-empty "
+                                    "function string and non-negative argument integer"
+                                )
+                dependency_helpers = migration.get(
+                    "build_surface_dependency_helpers", []
+                )
+                if not isinstance(dependency_helpers, list):
+                    errors.append(
+                        f"{prefix}.build_surface_dependency_helpers: expected list"
+                    )
+                else:
+                    for index, helper in enumerate(dependency_helpers):
+                        item_prefix = (
+                            f"{prefix}.build_surface_dependency_helpers[{index}]"
+                        )
+                        keys = set(helper) if isinstance(helper, dict) else set()
+                        if (
+                            not isinstance(helper, dict)
+                            or not {"function", "step_argument"} <= keys
+                            or not keys
+                            <= {
+                                "function",
+                                "step_argument",
+                                "step_field",
+                                "target_argument",
+                            }
+                            or not isinstance(helper.get("function"), str)
+                            or not helper["function"]
+                            or not isinstance(helper.get("step_argument"), int)
+                            or isinstance(helper.get("step_argument"), bool)
+                            or helper["step_argument"] < 0
+                            or "step_field" in helper
+                            and (
+                                not isinstance(helper["step_field"], str)
+                                or not helper["step_field"]
+                            )
+                            or "target_argument" in helper
+                            and (
+                                not isinstance(helper["target_argument"], int)
+                                or isinstance(helper["target_argument"], bool)
+                                or helper["target_argument"] < 0
+                            )
+                        ):
+                            errors.append(
+                                f"{item_prefix}: expected function and "
+                                "non-negative step_argument, with optional "
+                                "step_field or target_argument"
+                            )
+                delta_only_categories = migration.get(
+                    "build_surface_delta_only_categories", []
+                )
+                if (
+                    not isinstance(delta_only_categories, list)
+                    or len(delta_only_categories) != len(set(delta_only_categories))
+                    or any(
+                        not isinstance(category, str)
+                        or category not in SEMANTIC_BUILD_SURFACE_CATEGORIES
+                        for category in delta_only_categories
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.build_surface_delta_only_categories: "
+                        "expected unique known semantic category strings"
+                    )
+                companion_globs = migration.get("build_companion_globs", [])
+                if (
+                    not isinstance(companion_globs, list)
+                    or any(
+                        not isinstance(pattern, str) or not pattern
+                        for pattern in companion_globs
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.build_companion_globs: expected list of "
+                        "non-empty strings"
+                    )
+                declaration_companion_globs = migration.get(
+                    "declaration_companion_globs",
+                    [],
+                )
+                if (
+                    not isinstance(declaration_companion_globs, list)
+                    or any(
+                        not isinstance(pattern, str) or not pattern
+                        for pattern in declaration_companion_globs
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.declaration_companion_globs: expected list "
+                        "of non-empty strings"
+                    )
+                companion_policies = migration.get(
+                    "declaration_companion_policies",
+                    {},
+                )
+                companion_policy_keys = {
+                    "container_field_migrations",
+                    "declaration_mixins",
+                    "declaration_placement_ranges",
+                    "declaration_placements",
+                    "declaration_owner_migrations",
+                    "destinations",
+                    "intentional_declaration_deletions",
+                    "retained_deletions",
+                    "reviewed_compositions",
+                    "reviewed_resolutions",
+                    "symbol_call_migrations",
+                    "symbol_reference_migrations",
+                    "test_name_rewrites",
+                }
+                if not isinstance(companion_policies, dict):
+                    errors.append(
+                        f"{prefix}.declaration_companion_policies: expected object"
+                    )
+                else:
+                    for companion_path, companion_policy in companion_policies.items():
+                        companion_prefix = (
+                            f"{prefix}.declaration_companion_policies."
+                            f"{companion_path}"
+                        )
+                        if not isinstance(companion_path, str) or not companion_path:
+                            errors.append(
+                                f"{prefix}.declaration_companion_policies: "
+                                "paths must be non-empty strings"
+                            )
+                            continue
+                        if not isinstance(companion_policy, dict):
+                            errors.append(f"{companion_prefix}: expected object")
+                            continue
+                        companion_unknown = set(companion_policy) - companion_policy_keys
+                        if companion_unknown:
+                            errors.append(
+                                f"{companion_prefix}: unknown keys "
+                                + ", ".join(sorted(companion_unknown))
+                            )
+                            continue
+                        companion_destinations = companion_policy.get(
+                            "destinations",
+                            [companion_path],
+                        )
+                        if (
+                            not isinstance(companion_destinations, list)
+                            or not companion_destinations
+                            or companion_path not in companion_destinations
+                            or any(
+                                not isinstance(destination, str) or not destination
+                                for destination in companion_destinations
+                            )
+                        ):
+                            errors.append(
+                                f"{companion_prefix}.destinations: expected a "
+                                "non-empty string list containing the companion path"
+                            )
+                            continue
+
+                        # Reuse the complete declaration-policy schema so path
+                        # scopes cannot bypass hash, ownership, or mixin checks.
+                        synthetic_migration = dict(companion_policy)
+                        synthetic_migration["source"] = companion_path
+                        synthetic_migration["destinations"] = companion_destinations
+                        try:
+                            ensure_manifest_shape(
+                                {
+                                    "split_migrations": {
+                                        "companion": synthetic_migration,
+                                    },
+                                },
+                                path,
+                            )
+                        except ValueError as exc:
+                            errors.append(f"{companion_prefix}: {exc}")
+                for alias_key in (
+                    "build_surface_aliases",
+                    "build_surface_retention_aliases",
+                ):
+                    surface_aliases = migration.get(alias_key, {})
+                    if not isinstance(surface_aliases, dict):
+                        errors.append(f"{prefix}.{alias_key}: expected object")
+                        continue
+                    for category, aliases in surface_aliases.items():
+                        alias_prefix = f"{prefix}.{alias_key}.{category}"
+                        if (
+                            category not in BUILD_SURFACE_CATEGORIES
+                            or not isinstance(aliases, dict)
+                        ):
+                            errors.append(
+                                f"{alias_prefix}: expected known category object"
+                            )
+                            continue
+                        for source_name, targets in aliases.items():
+                            valid_targets = (
+                                isinstance(targets, str) and bool(targets)
+                            ) or (
+                                isinstance(targets, list)
+                                and bool(targets)
+                                and all(
+                                    isinstance(target, str) and target
+                                    for target in targets
+                                )
+                            )
+                            if (
+                                not isinstance(source_name, str)
+                                or not source_name
+                                or not valid_targets
+                            ):
+                                errors.append(
+                                    f"{alias_prefix}: expected non-empty string "
+                                    "aliases to string or non-empty list[string]"
+                                )
+                surface_omissions = migration.get("build_surface_omissions", {})
+                if not isinstance(surface_omissions, dict):
+                    errors.append(f"{prefix}.build_surface_omissions: expected object")
+                else:
+                    for category, omissions in surface_omissions.items():
+                        omission_prefix = f"{prefix}.build_surface_omissions.{category}"
+                        if (
+                            category not in BUILD_SURFACE_CATEGORIES
+                            or not isinstance(omissions, dict)
+                            or not all(
+                                isinstance(name, str)
+                                and name
+                                and isinstance(reason, str)
+                                and reason
+                                for name, reason in omissions.items()
+                            )
+                        ):
+                            errors.append(
+                                f"{omission_prefix}: expected known category "
+                                "object of non-empty reasons"
+                            )
+                conditional_steps = migration.get(
+                    "build_surface_conditional_steps",
+                    {},
+                )
+                if (
+                    not isinstance(conditional_steps, dict)
+                    or not all(
+                        isinstance(name, str)
+                        and name
+                        and isinstance(reason, str)
+                        and reason
+                        for name, reason in conditional_steps.items()
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.build_surface_conditional_steps: expected "
+                        "non-empty step names mapped to non-empty reasons"
+                    )
+                placements = migration.get("declaration_placements", {})
+                if not isinstance(placements, dict) or not all(
+                    isinstance(obligation, str)
+                    and obligation
+                    and isinstance(destination, str)
+                    and destination
+                    for obligation, destination in placements.items()
+                ):
+                    errors.append(
+                        f"{prefix}.declaration_placements: "
+                        "expected object of non-empty string -> non-empty string"
+                    )
+                placement_ranges = migration.get(
+                    "declaration_placement_ranges",
+                    [],
+                )
+                if not isinstance(placement_ranges, list):
+                    errors.append(
+                        f"{prefix}.declaration_placement_ranges: expected list"
+                    )
+                else:
+                    for index, rule in enumerate(placement_ranges):
+                        rule_prefix = (
+                            f"{prefix}.declaration_placement_ranges[{index}]"
+                        )
+                        if (
+                            not isinstance(rule, dict)
+                            or set(rule) != {"start", "end", "path", "reason"}
+                            or any(
+                                not isinstance(rule.get(field), str)
+                                or not rule[field]
+                                for field in ("start", "end", "path", "reason")
+                            )
+                        ):
+                            errors.append(
+                                f"{rule_prefix}: expected exactly non-empty "
+                                "start, end, path, and reason strings"
+                            )
+                mixins = migration.get("declaration_mixins", [])
+                if not isinstance(mixins, list):
+                    errors.append(
+                        f"{prefix}.declaration_mixins: expected list"
+                    )
+                else:
+                    for index, rule in enumerate(mixins):
+                        rule_prefix = (
+                            f"{prefix}.declaration_mixins[{index}]"
+                        )
+                        if (
+                            not isinstance(rule, dict)
+                            or set(rule) != {"path", "factory", "owner"}
+                            or any(
+                                not isinstance(rule.get(field), str)
+                                or not rule[field]
+                                for field in ("path", "factory", "owner")
+                            )
+                        ):
+                            errors.append(
+                                f"{rule_prefix}: expected exactly non-empty "
+                                "path, factory, and owner strings"
+                            )
+                test_name_rewrites = migration.get("test_name_rewrites", [])
+                if not isinstance(test_name_rewrites, list):
+                    errors.append(
+                        f"{prefix}.test_name_rewrites: expected list"
+                    )
+                else:
+                    for index, rule in enumerate(test_name_rewrites):
+                        rule_prefix = (
+                            f"{prefix}.test_name_rewrites[{index}]"
+                        )
+                        if (
+                            not isinstance(rule, dict)
+                            or set(rule)
+                            != {
+                                "path",
+                                "source_prefix",
+                                "destination_prefix",
+                            }
+                            or not isinstance(rule.get("path"), str)
+                            or not rule["path"]
+                            or not isinstance(rule.get("source_prefix"), str)
+                            or not isinstance(
+                                rule.get("destination_prefix"),
+                                str,
+                            )
+                        ):
+                            errors.append(
+                                f"{rule_prefix}: expected exactly a non-empty "
+                                "path and string source_prefix and "
+                                "destination_prefix"
+                            )
+                relative_import_exceptions = migration.get(
+                    "relative_import_exceptions",
+                    [],
+                )
+                if not isinstance(relative_import_exceptions, list):
+                    errors.append(
+                        f"{prefix}.relative_import_exceptions: expected list"
+                    )
+                else:
+                    for index, rule in enumerate(relative_import_exceptions):
+                        rule_prefix = (
+                            f"{prefix}.relative_import_exceptions[{index}]"
+                        )
+                        if (
+                            not isinstance(rule, dict)
+                            or set(rule) != {"path", "import", "reason"}
+                            or any(
+                                not isinstance(rule.get(field), str)
+                                or not rule[field]
+                                for field in ("path", "import", "reason")
+                            )
+                        ):
+                            errors.append(
+                                f"{rule_prefix}: expected exactly non-empty "
+                                "path, import, and reason strings"
+                            )
+                owner_migrations = migration.get(
+                    "declaration_owner_migrations",
+                    {},
+                )
+                if not isinstance(owner_migrations, dict):
+                    errors.append(
+                        f"{prefix}.declaration_owner_migrations: expected object"
+                    )
+                    continue
+                for obligation, target in owner_migrations.items():
+                    target_prefix = (
+                        f"{prefix}.declaration_owner_migrations.{obligation}"
+                    )
+                    if not isinstance(obligation, str) or not obligation:
+                        errors.append(
+                            f"{prefix}.declaration_owner_migrations: "
+                            "obligation keys must be non-empty strings"
+                        )
+                        continue
+                    if not isinstance(target, dict):
+                        errors.append(f"{target_prefix}: expected object")
+                        continue
+                    target_unknown = set(target) - {
+                        "owner",
+                        "path",
+                        "name",
+                        "kind",
+                    }
+                    if target_unknown:
+                        errors.append(
+                            f"{target_prefix}: unknown keys "
+                            + ", ".join(sorted(target_unknown))
+                        )
+                    if "owner" not in target or (
+                        target["owner"] is not None
+                        and (
+                            not isinstance(target["owner"], str)
+                            or not target["owner"]
+                        )
+                    ):
+                        errors.append(
+                            f"{target_prefix}.owner: "
+                            "expected null or non-empty string"
+                        )
+                    if not isinstance(target.get("path"), str) or not target["path"]:
+                        errors.append(
+                            f"{target_prefix}.path: expected non-empty string"
+                        )
+                    if "name" in target and (
+                        not isinstance(target["name"], str) or not target["name"]
+                    ):
+                        errors.append(
+                            f"{target_prefix}.name: expected non-empty string"
+                        )
+                    if target.get("kind", "function") not in {
+                        "binding",
+                        "container",
+                        "function",
+                        "test",
+                    }:
+                        errors.append(
+                            f"{target_prefix}.kind: expected binding, "
+                            "container, function, or test"
+                        )
+                intentional_deletions = migration.get(
+                    "intentional_declaration_deletions",
+                    {},
+                )
+                if not isinstance(intentional_deletions, dict):
+                    errors.append(
+                        f"{prefix}.intentional_declaration_deletions: "
+                        "expected object"
+                    )
+                else:
+                    for obligation, deletion in intentional_deletions.items():
+                        deletion_prefix = (
+                            f"{prefix}.intentional_declaration_deletions."
+                            f"{obligation}"
+                        )
+                        if (
+                            not isinstance(obligation, str)
+                            or not obligation
+                            or not isinstance(deletion, dict)
+                            or set(deletion) != {"incoming_sha256", "reason"}
+                            or not isinstance(deletion.get("incoming_sha256"), str)
+                            or len(deletion["incoming_sha256"]) != 64
+                            or not isinstance(deletion.get("reason"), str)
+                            or not deletion["reason"]
+                        ):
+                            errors.append(
+                                f"{deletion_prefix}: expected exact non-empty "
+                                "incoming_sha256 and reason strings"
+                            )
+                retained_deletions = migration.get("retained_deletions", {})
+                retention_fields = {
+                    "base_sha256",
+                    "current_sha256",
+                    "path",
+                    "reason",
+                }
+                if not isinstance(retained_deletions, dict):
+                    errors.append(
+                        f"{prefix}.retained_deletions: expected object"
+                    )
+                else:
+                    for obligation, retention in retained_deletions.items():
+                        retention_prefix = (
+                            f"{prefix}.retained_deletions.{obligation}"
+                        )
+                        if (
+                            not isinstance(obligation, str)
+                            or not obligation
+                            or not isinstance(retention, dict)
+                            or set(retention) != retention_fields
+                            or any(
+                                not isinstance(retention.get(field), str)
+                                or not retention[field]
+                                for field in retention_fields
+                            )
+                            or any(
+                                len(retention[field]) != 64
+                                or any(
+                                    char not in "0123456789abcdef"
+                                    for char in retention[field]
+                                )
+                                for field in (
+                                    "base_sha256",
+                                    "current_sha256",
+                                )
+                            )
+                        ):
+                            errors.append(
+                                f"{retention_prefix}: expected exact "
+                                "base_sha256, current_sha256, path, and reason "
+                                "fields with lowercase SHA-256 hashes"
+                            )
+                reviewed_compositions = migration.get(
+                    "reviewed_compositions",
+                    {},
+                )
+                composition_fields = {
+                    "base_sha256",
+                    "incoming_sha256",
+                    "current_sha256",
+                    "path",
+                    "reason",
+                }
+                if not isinstance(reviewed_compositions, dict):
+                    errors.append(
+                        f"{prefix}.reviewed_compositions: expected object"
+                    )
+                else:
+                    for obligation, review in reviewed_compositions.items():
+                        review_prefix = (
+                            f"{prefix}.reviewed_compositions.{obligation}"
+                        )
+                        if (
+                            not isinstance(obligation, str)
+                            or not obligation
+                            or not isinstance(review, dict)
+                            or set(review) != composition_fields
+                            or any(
+                                not isinstance(review.get(field), str)
+                                or not review[field]
+                                for field in composition_fields
+                            )
+                            or any(
+                                len(review[field]) != 64
+                                or any(
+                                    char not in "0123456789abcdef"
+                                    for char in review[field]
+                                )
+                                for field in (
+                                    "base_sha256",
+                                    "incoming_sha256",
+                                    "current_sha256",
+                                )
+                            )
+                        ):
+                            errors.append(
+                                f"{review_prefix}: expected exact base_sha256, "
+                                "incoming_sha256, current_sha256, path, and "
+                                "reason fields with lowercase SHA-256 hashes"
+                            )
+                reviewed_resolutions = migration.get(
+                    "reviewed_resolutions",
+                    {},
+                )
+                resolution_fields = {
+                    "status",
+                    "base_sha256",
+                    "incoming_sha256",
+                    "current_sha256",
+                    "path",
+                    "reason",
+                }
+                reviewable_statuses = {
+                    "added_name_collision",
+                    "clean_candidate",
+                    "container_fields_diverged",
+                    "container_variants_diverged",
+                    "three_way_conflict",
+                }
+                if not isinstance(reviewed_resolutions, dict):
+                    errors.append(
+                        f"{prefix}.reviewed_resolutions: expected object"
+                    )
+                else:
+                    for obligation, review in reviewed_resolutions.items():
+                        review_prefix = (
+                            f"{prefix}.reviewed_resolutions.{obligation}"
+                        )
+                        hashes: list[object] = []
+                        if isinstance(review, dict):
+                            hashes = [
+                                review.get("incoming_sha256"),
+                                review.get("current_sha256"),
+                            ]
+                            if review.get("base_sha256") is not None:
+                                hashes.append(review.get("base_sha256"))
+                        if (
+                            not isinstance(obligation, str)
+                            or not obligation
+                            or not isinstance(review, dict)
+                            or set(review) != resolution_fields
+                            or review.get("status") not in reviewable_statuses
+                            or (
+                                review.get("base_sha256") is not None
+                                and not isinstance(
+                                    review.get("base_sha256"),
+                                    str,
+                                )
+                            )
+                            or any(
+                                not isinstance(review.get(field), str)
+                                or not review[field]
+                                for field in (
+                                    "incoming_sha256",
+                                    "current_sha256",
+                                    "path",
+                                    "reason",
+                                )
+                            )
+                            or any(
+                                not isinstance(value, str)
+                                or len(value) != 64
+                                or any(
+                                    char not in "0123456789abcdef"
+                                    for char in value
+                                )
+                                for value in hashes
+                            )
+                        ):
+                            errors.append(
+                                f"{review_prefix}: expected exact reviewable "
+                                "status, nullable base_sha256, incoming_sha256, "
+                                "current_sha256, path, and reason fields with "
+                                "lowercase SHA-256 hashes"
+                            )
         else:
             errors.append(f"{key}: internal schema error for {expected!r}")
+
+    required_migrations = data.get("required_split_migrations", [])
+    split_migrations = data.get("split_migrations", {})
+    moved_paths = data.get("moved_paths", {})
+    if isinstance(required_migrations, list):
+        valid_required = [
+            name
+            for name in required_migrations
+            if isinstance(name, str) and name
+        ]
+        duplicate_required = sorted(
+            {
+                name
+                for name in valid_required
+                if valid_required.count(name) > 1
+            }
+        )
+        if duplicate_required:
+            errors.append(
+                "required_split_migrations: duplicate entries "
+                + ", ".join(duplicate_required)
+            )
+        if isinstance(split_migrations, dict):
+            missing_required = sorted(
+                set(valid_required) - set(split_migrations)
+            )
+            if missing_required:
+                errors.append(
+                    "required_split_migrations: missing split_migrations "
+                    + ", ".join(missing_required)
+                )
+            if isinstance(moved_paths, dict):
+                for migration_name in valid_required:
+                    migration = split_migrations.get(migration_name)
+                    if not isinstance(migration, dict):
+                        continue
+                    source = migration.get("source")
+                    destinations = migration.get("destinations")
+                    if not isinstance(source, str) or not isinstance(
+                        destinations,
+                        list,
+                    ):
+                        continue
+                    mapped_paths = moved_paths.get(source)
+                    if not isinstance(mapped_paths, list) or not mapped_paths:
+                        errors.append(
+                            f"required split migration {migration_name}: "
+                            f"moved_paths has no entry for {source}"
+                        )
+                        continue
+                    source_facade_removed = migration.get(
+                        "source_facade_removed",
+                        False,
+                    )
+                    if source_facade_removed is True and source in mapped_paths:
+                        errors.append(
+                            f"required split migration {migration_name}: "
+                            f"moved_paths.{source} must omit its removed source facade"
+                        )
+                    elif source_facade_removed is not True and source not in mapped_paths:
+                        errors.append(
+                            f"required split migration {migration_name}: "
+                            f"moved_paths.{source} must include its source facade"
+                        )
+                    valid_destinations = [
+                        destination
+                        for destination in destinations
+                        if isinstance(destination, str) and destination
+                    ]
+
+                    def covered_by_destination(candidate: str) -> bool:
+                        return any(
+                            candidate == destination
+                            or candidate.startswith(destination.rstrip("/") + "/")
+                            for destination in valid_destinations
+                        )
+
+                    outside_destinations = sorted(
+                        mapped
+                        for mapped in mapped_paths
+                        if isinstance(mapped, str)
+                        and not covered_by_destination(mapped)
+                    )
+                    if outside_destinations:
+                        errors.append(
+                            f"required split migration {migration_name}: "
+                            "moved_paths contains paths outside destinations: "
+                            + ", ".join(outside_destinations)
+                        )
+                    uncovered_destinations = sorted(
+                        destination
+                        for destination in valid_destinations
+                        if not any(
+                            isinstance(mapped, str)
+                            and (
+                                mapped == destination
+                                or mapped.startswith(
+                                    destination.rstrip("/") + "/"
+                                )
+                            )
+                            for mapped in mapped_paths
+                        )
+                    )
+                    if uncovered_destinations:
+                        errors.append(
+                            f"required split migration {migration_name}: "
+                            "destinations missing from moved_paths coverage: "
+                            + ", ".join(uncovered_destinations)
+                        )
 
     decision_fields = (
         "expected_incoming_only_integration_diffs",
@@ -118,7 +1115,7 @@ def ensure_manifest_shape(data: object, path: pathlib.Path) -> dict[str, Any]:
 def load_policy(path: pathlib.Path) -> None:
     if not path.exists():
         return
-    data = ensure_manifest_shape(json.loads(path.read_text()), path)
+    data = ensure_manifest_shape(load_json_file(path), path)
     DECISION_SCOPE.update(data.get("decision_scope", {}))
     MOVED_PATHS.update({key: list(value) for key, value in data.get("moved_paths", {}).items()})
     EXPECTED_INCOMING_ONLY_INTEGRATION_DIFFS.update(data.get("expected_incoming_only_integration_diffs", {}))
@@ -253,7 +1250,7 @@ def resolved_previous_main_baseline(previous_main_merge: str, incoming_ref: str)
 
 
 def load_snapshot(path: pathlib.Path) -> dict[str, Any]:
-    data = json.loads(path.read_text())
+    data = load_json_file(path)
     required = {
         "schema_version": int,
         "mode": str,

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
     from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
     from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+    from ..models.index_repair_status import IndexRepairStatus
 
 
 T = TypeVar("T", bound="AlgebraicIndexStats")
@@ -35,6 +36,8 @@ class AlgebraicIndexStats:
             total_indexed (int | Unset): Number of documents reflected in the algebraic sidecar
             disk_usage (int | Unset): Size of the index in bytes
             rebuilding (bool | Unset): Whether the sidecar is currently rebuilding
+            repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
+                diagnostics are available from the admin API and metrics.
             backfill_active (bool | Unset): Whether the sidecar is actively rebuilding, replaying, or catching up.
             backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
             backfill_items_processed (int | Unset): Number of documents processed during current backfill
@@ -85,8 +88,8 @@ class AlgebraicIndexStats:
             projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
                 projection checkpoint.
             projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
-            projection_checkpoint_config_hash (int | Unset): Projection configuration identity associated with the durable
-                checkpoint.
+            projection_checkpoint_config_fingerprint (str | Unset): Projection configuration identity associated with the
+                durable checkpoint.
             checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
                 checkpoint that still need replay.
             repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
@@ -115,6 +118,7 @@ class AlgebraicIndexStats:
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    repair: IndexRepairStatus | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
     backfill_items_processed: int | Unset = UNSET
@@ -159,7 +163,7 @@ class AlgebraicIndexStats:
     projection_checkpoint_status: str | Unset = UNSET
     projection_checkpoint_applied_sequence: int | Unset = UNSET
     projection_checkpoint_generation: int | Unset = UNSET
-    projection_checkpoint_config_hash: int | Unset = UNSET
+    projection_checkpoint_config_fingerprint: str | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
     edge_count: int | Unset = UNSET
@@ -190,6 +194,10 @@ class AlgebraicIndexStats:
         disk_usage = self.disk_usage
 
         rebuilding = self.rebuilding
+
+        repair: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.repair, Unset):
+            repair = self.repair.to_dict()
 
         backfill_active = self.backfill_active
 
@@ -285,7 +293,7 @@ class AlgebraicIndexStats:
 
         projection_checkpoint_generation = self.projection_checkpoint_generation
 
-        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+        projection_checkpoint_config_fingerprint = self.projection_checkpoint_config_fingerprint
 
         checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
 
@@ -346,6 +354,8 @@ class AlgebraicIndexStats:
             field_dict["disk_usage"] = disk_usage
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if repair is not UNSET:
+            field_dict["repair"] = repair
         if backfill_active is not UNSET:
             field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
@@ -434,8 +444,8 @@ class AlgebraicIndexStats:
             field_dict["projection_checkpoint_applied_sequence"] = projection_checkpoint_applied_sequence
         if projection_checkpoint_generation is not UNSET:
             field_dict["projection_checkpoint_generation"] = projection_checkpoint_generation
-        if projection_checkpoint_config_hash is not UNSET:
-            field_dict["projection_checkpoint_config_hash"] = projection_checkpoint_config_hash
+        if projection_checkpoint_config_fingerprint is not UNSET:
+            field_dict["projection_checkpoint_config_fingerprint"] = projection_checkpoint_config_fingerprint
         if checkpoint_replay_tail_sequence_count is not UNSET:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
@@ -482,6 +492,7 @@ class AlgebraicIndexStats:
         from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
         from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
         from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+        from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = AlgebraicIndexStatsIndexType(d.pop("index_type"))
@@ -493,6 +504,13 @@ class AlgebraicIndexStats:
         disk_usage = d.pop("disk_usage", UNSET)
 
         rebuilding = d.pop("rebuilding", UNSET)
+
+        _repair = d.pop("repair", UNSET)
+        repair: IndexRepairStatus | Unset
+        if isinstance(_repair, Unset):
+            repair = UNSET
+        else:
+            repair = IndexRepairStatus.from_dict(_repair)
 
         backfill_active = d.pop("backfill_active", UNSET)
 
@@ -599,7 +617,7 @@ class AlgebraicIndexStats:
 
         projection_checkpoint_generation = d.pop("projection_checkpoint_generation", UNSET)
 
-        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash", UNSET)
+        projection_checkpoint_config_fingerprint = d.pop("projection_checkpoint_config_fingerprint", UNSET)
 
         checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count", UNSET)
 
@@ -663,6 +681,7 @@ class AlgebraicIndexStats:
             total_indexed=total_indexed,
             disk_usage=disk_usage,
             rebuilding=rebuilding,
+            repair=repair,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
             backfill_items_processed=backfill_items_processed,
@@ -707,7 +726,7 @@ class AlgebraicIndexStats:
             projection_checkpoint_status=projection_checkpoint_status,
             projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
             projection_checkpoint_generation=projection_checkpoint_generation,
-            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            projection_checkpoint_config_fingerprint=projection_checkpoint_config_fingerprint,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
             edge_count=edge_count,

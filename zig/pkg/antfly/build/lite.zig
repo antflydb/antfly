@@ -36,6 +36,7 @@ pub fn addCliSteps(ctx: anytype) void {
     const capi_steps = ctx.capi_steps;
     const run_antfly_main_tests = ctx.run_antfly_main_tests;
     const run_lite_cli_tests = ctx.run_lite_cli_tests;
+    const run_lite_cmd_tests = ctx.run_lite_cmd_tests;
     const run_lite_native_tests = ctx.run_lite_native_tests;
     const run_antfly_embedded_pkg_tests = ctx.run_antfly_embedded_pkg_tests;
 
@@ -100,6 +101,7 @@ pub fn addCliSteps(ctx: anytype) void {
     lite_full_step.dependOn(&capi_steps.install_capi_header.step);
     lite_full_step.dependOn(&run_antfly_main_tests.step);
     lite_full_step.dependOn(&run_lite_cli_tests.step);
+    lite_full_step.dependOn(&run_lite_cmd_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
     lite_full_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
     lite_full_step.dependOn(&capi_steps.run_lite_go_tests.step);
@@ -137,6 +139,7 @@ pub fn addCliSteps(ctx: anytype) void {
     const lite_test_step = b.step("lite-test", "Run Antfly Lite CLI, native, C ABI, Go binding, packaging, and WASM profile checks");
     lite_test_step.dependOn(&run_lite_core_main_tests.step);
     lite_test_step.dependOn(&run_lite_cli_tests.step);
+    lite_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_test_step.dependOn(&run_lite_native_tests.step);
     lite_test_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
     lite_test_step.dependOn(&capi_steps.run_lite_go_tests.step);
@@ -156,6 +159,7 @@ pub fn addCliSteps(ctx: anytype) void {
     lite_dev_step.dependOn(&run_antfly_main_tests.step);
     lite_dev_step.dependOn(&run_lite_core_main_tests.step);
     lite_dev_step.dependOn(&run_lite_cli_tests.step);
+    lite_dev_step.dependOn(&run_lite_cmd_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
     lite_dev_step.dependOn(&capi_steps.run_lite_capi_smoke.step);
     lite_dev_step.dependOn(&capi_steps.run_lite_go_tests.step);

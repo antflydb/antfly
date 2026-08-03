@@ -427,7 +427,9 @@ const ModelCard: React.FC<{
           <h3 className="font-semibold text-sm text-foreground leading-tight truncate">
             {model.name}
           </h3>
-          <p className="text-xs text-muted-foreground truncate mt-0.5 font-mono">{model.source}</p>
+          <p className="text-xs text-muted-foreground truncate mt-0.5 font-mono">
+            {model.connectionName} · {model.provider}
+          </p>
         </div>
       </div>
 
@@ -472,6 +474,7 @@ const ModelDetailSheet: React.FC<{
   allowDownloads: boolean;
 }> = ({ model, open, onOpenChange, types, quantizationOptions, allowDownloads }) => {
   const navigate = useNavigate();
+  const { setInferenceConnectionId } = useApiConfig();
   const [selectedVariant, setSelectedVariant] = useState<QuantizationType | undefined>(undefined);
   const [selectedPreset, setSelectedPreset] = useState<VariantPreset | null>("recommended");
   const [showAllVariants, setShowAllVariants] = useState(false);
@@ -799,19 +802,25 @@ const ModelDetailSheet: React.FC<{
           </div>
 
           {/* Open in Playground button */}
-          {model.inRegistry && MODEL_TYPE_PLAYGROUND[model.type] && (
+          {model.inRegistry && model.provider === "antfly" && MODEL_TYPE_PLAYGROUND[model.type] ? (
             <Button
               className="w-full"
               onClick={() => {
                 const route = MODEL_TYPE_PLAYGROUND[model.type];
-                navigate(`${route}?model=${encodeURIComponent(model.name)}`);
+                setInferenceConnectionId(model.connectionId);
+                navigate(`${route}?model=${encodeURIComponent(model.source)}`);
                 onOpenChange(false);
               }}
             >
               <Sparkles className="w-4 h-4 mr-2" />
               Open in Playground
             </Button>
-          )}
+          ) : model.inRegistry && MODEL_TYPE_PLAYGROUND[model.type] ? (
+            <p className="text-xs text-muted-foreground text-center">
+              This playground currently supports Antfly-compatible connections. Use this model in a
+              configured database workflow.
+            </p>
+          ) : null}
 
           {/* HuggingFace link */}
           {model.sourceUrl && (
@@ -902,10 +911,11 @@ const TypeContextBanner: React.FC<{
 // Main page component
 const ModelsPage: React.FC = () => {
   const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
-  const { apiUrl, inferenceApiUrl } = useApiConfig();
+  const { apiUrl } = useApiConfig();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
+  const [selectedConnection, setSelectedConnection] = useState("all");
   const [selectedModel, setSelectedModel] = useState<InferenceModel | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [allowDownloads, setAllowDownloads] = useState(false);
@@ -915,18 +925,11 @@ const ModelsPage: React.FC = () => {
     const checkDownloads = async () => {
       try {
         if (isProductEnabled("antfly")) {
-          // Full antfarm build: check swarm_mode from antfly status
+          // Full antfarm build: check the deployment topology from Antfly status.
           const response = await fetch(`${apiUrl}/status`);
           if (response.ok) {
             const data = await response.json();
-            setAllowDownloads(data.swarm_mode === true);
-          }
-        } else {
-          // Inference-only build: check allow_downloads from the model listing metadata.
-          const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
-          if (response.ok) {
-            const data = await response.json();
-            setAllowDownloads(data.allow_downloads === true);
+            setAllowDownloads(data.deployment_mode === "standalone");
           }
         }
       } catch {
@@ -934,11 +937,20 @@ const ModelsPage: React.FC = () => {
       }
     };
     checkDownloads();
-  }, [apiUrl, inferenceApiUrl]);
+  }, [apiUrl]);
+
+  const connections = useMemo(
+    () =>
+      Array.from(
+        new Map(models.map((model) => [model.connectionId, model.connectionName])).entries()
+      ),
+    [models]
+  );
 
   const filteredModels = useMemo(() => {
     return models.filter((model) => {
       if (selectedType !== "all" && model.type !== selectedType) return false;
+      if (selectedConnection !== "all" && model.connectionId !== selectedConnection) return false;
 
       if (searchQuery) {
         const query = searchQuery.toLowerCase();
@@ -951,7 +963,7 @@ const ModelsPage: React.FC = () => {
 
       return true;
     });
-  }, [models, searchQuery, selectedType]);
+  }, [models, searchQuery, selectedConnection, selectedType]);
 
   const modelsByType = useMemo(() => {
     const grouped: Record<ModelType, InferenceModel[]> = {
@@ -1039,7 +1051,7 @@ const ModelsPage: React.FC = () => {
     return (
       <DashboardPage className="min-h-full items-center justify-center">
         <ErrorState
-          message="Could not load models from Antfly inference. Check the runtime connection and try again."
+          message="Could not load models from configured inference connections. Check Connections and try again."
           onRetry={retry}
         />
       </DashboardPage>
@@ -1052,8 +1064,8 @@ const ModelsPage: React.FC = () => {
         <div>
           <DashboardPageTitle className="font-aeonik">Models & Runtime</DashboardPageTitle>
           <DashboardPageDescription>
-            Browse {models.length} models reported by Antfly inference. Models run locally through
-            the Zig runtime.
+            Browse {models.length} models available through local, shared, and external inference
+            connections.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -1097,6 +1109,42 @@ const ModelsPage: React.FC = () => {
               <X className="w-4 h-4" />
             </Button>
           )}
+        </div>
+
+        <div
+          role="group"
+          aria-label="Filter models by connection"
+          className="flex flex-wrap items-center gap-1.5"
+        >
+          <button
+            type="button"
+            onClick={() => setSelectedConnection("all")}
+            aria-pressed={selectedConnection === "all"}
+            className={cn(
+              "px-3 py-1.5 rounded-none text-sm transition-colors",
+              selectedConnection === "all"
+                ? "bg-foreground text-background"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted"
+            )}
+          >
+            All connections
+          </button>
+          {connections.map(([id, name]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setSelectedConnection(id)}
+              aria-pressed={selectedConnection === id}
+              className={cn(
+                "px-3 py-1.5 rounded-none text-sm transition-colors",
+                selectedConnection === id
+                  ? "bg-foreground text-background"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted"
+              )}
+            >
+              {name}
+            </button>
+          ))}
         </div>
 
         <div

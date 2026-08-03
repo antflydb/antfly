@@ -21,14 +21,17 @@
 // response.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
+const platform_sync = @import("antfly_platform").sync;
 const common_config = @import("../common/config.zig");
+const common_secrets = @import("../common/secrets.zig");
 const metadata_api = @import("../metadata/api.zig");
+const bedrock = @import("../inference/bedrock.zig");
 const list_models = @import("../inference/list_models.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const backups_api = @import("backups.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -140,18 +143,106 @@ pub const ConnectionsResponse = struct {
     connections: []const Connection = &.{},
 };
 
+pub const InvokeResult = struct {
+    status: u16,
+    body: []u8,
+};
+
+pub fn invokeInferenceConnection(
+    alloc: Allocator,
+    http: *httpx.Client,
+    node_config: *const common_config.Config,
+    secret_store: ?*common_secrets.FileStore,
+    connection_id: []const u8,
+    operation: []const u8,
+    body: []const u8,
+) !InvokeResult {
+    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
+    const connection = node_config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .inference) return error.ConnectionNotInference;
+    try requireInferenceCapability(connection.capabilities, required_capability);
+    const cfg = connection.inference orelse return error.InvalidConfig;
+    if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
+    const raw_url = cfg.url orelse return error.ConnectionURLMissing;
+    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    const base = std.mem.trimEnd(u8, raw_url, "/");
+    const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
+    defer if (prefix.ptr != base.ptr) alloc.free(prefix);
+    const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    defer alloc.free(url);
+
+    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, cfg.api_key);
+    defer if (resolved_key) |key| alloc.free(key);
+    const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
+    defer if (auth) |value| alloc.free(value);
+    const headers = if (auth) |value| &[_][2][]const u8{
+        .{ "Authorization", value },
+        .{ "Content-Type", "application/json" },
+    } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
+
+    var response = try http.request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
+    defer response.deinit();
+    return .{
+        .status = response.status.code,
+        .body = try alloc.dupe(u8, response.body orelse ""),
+    };
+}
+
+fn inferenceCapability(operation: []const u8) ?[]const u8 {
+    inline for (&.{
+        .{ "embed", "models.embed" },
+        .{ "generate", "models.generate" },
+        .{ "rerank", "models.rerank" },
+        .{ "chunk", "models.chunk" },
+        .{ "recognize", "models.recognize" },
+        .{ "extract", "models.extract" },
+        .{ "rewrite", "models.rewrite" },
+        .{ "read", "models.read" },
+        .{ "transcribe", "models.transcribe" },
+    }) |mapping| {
+        if (std.mem.eql(u8, operation, mapping[0])) return mapping[1];
+    }
+    return null;
+}
+
+fn resolveInferenceApiKey(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    raw: ?[]const u8,
+) !?[]u8 {
+    return if (raw) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
+}
+
+fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
+    if (!containsString(capabilities, required)) return error.ConnectionCapabilityMissing;
+}
+
+fn validInferenceURL(raw_url: []const u8) bool {
+    if (std.mem.indexOfAny(u8, raw_url, "?#") != null) return false;
+    const parsed = std.Uri.parse(raw_url) catch return false;
+    return parsed.host != null and
+        (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https"));
+}
+
 pub const Sources = struct {
     node_config: ?*const common_config.Config = null,
     snapshot: ?*const metadata_api.AdminSnapshot = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    /// Live secret source used to resolve external-I/O credential references
+    /// immediately before a probe.
+    secret_store: ?*common_secrets.FileStore = null,
+    /// Shared server runtime for bounded connection discovery fanout. Tests
+    /// and embedded callers without a runtime fall back to sequential work.
+    io: ?std.Io = null,
 };
 
 pub const BuildOptions = struct {
     include_models: bool = false,
     refresh: bool = false,
-    probe: bool = true,
+    cached_err_name: ?[]const u8 = null,
+    probe: bool = false,
     timeout_ms: u64 = 5_000,
     max_workers: usize = 8,
     ttl_ns: u64 = 30 * std.time.ns_per_s,
@@ -163,8 +254,10 @@ pub const BuildOptions = struct {
 /// provider APIs. Keyed by connection identity; entries are owned by the
 /// cache allocator.
 pub const Cache = struct {
+    const key_lock_count = 64;
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    key_locks: [key_lock_count]std.Io.Mutex = [_]std.Io.Mutex{.init} ** key_lock_count,
     entries: std.StringArrayHashMapUnmanaged(Entry) = .{},
 
     pub const Entry = struct {
@@ -189,17 +282,15 @@ pub const Cache = struct {
     }
 
     fn lock(self: *Cache) void {
-        while (!self.mutex.tryLock()) {
-            if (comptime builtin.os.tag == .freestanding) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            std.Thread.yield() catch {};
-        }
+        platform_sync.lockYielding(&self.mutex);
     }
 
     fn unlock(self: *Cache) void {
         self.mutex.unlock();
+    }
+
+    fn keyLock(self: *Cache, key: []const u8) *std.Io.Mutex {
+        return &self.key_locks[std.hash.Wyhash.hash(0, key) % key_lock_count];
     }
 
     pub fn deinit(self: *Cache) void {
@@ -226,13 +317,17 @@ pub const Cache = struct {
         defer self.unlock();
         var owned = try copyEntry(self.alloc, entry);
         errdefer owned.deinitOwned(self.alloc);
-        const gop = try self.entries.getOrPut(self.alloc, key);
-        if (gop.found_existing) {
-            gop.value_ptr.deinitOwned(self.alloc);
-        } else {
-            gop.key_ptr.* = try self.alloc.dupe(u8, key);
+        if (self.entries.getPtr(key)) |existing| {
+            existing.deinitOwned(self.alloc);
+            existing.* = owned;
+            return;
         }
-        gop.value_ptr.* = owned;
+        // Duplicate the key before mutating the map. `getOrPut` inserts the
+        // caller-owned key immediately, which would leave a dangling key and
+        // uninitialized value if the subsequent duplication failed.
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        try self.entries.putNoClobber(self.alloc, owned_key, owned);
     }
 
     fn copyEntry(alloc: Allocator, entry: Entry) !Entry {
@@ -298,17 +393,55 @@ const ModelsJob = struct {
     arena_state: std.heap.ArenaAllocator,
     result: ?list_models.ListResult = null,
     err: ?anyerror = null,
+    cache: ?*Cache = null,
+    cache_key: []const u8 = "",
+    request_started_ns: u64 = 0,
+    ttl_ns: u64 = 0,
+    refresh: bool = false,
+    cached_err_name: ?[]const u8 = null,
+    io: ?std.Io = null,
 
-    fn run(job: *ModelsJob) void {
+    fn run(job: *ModelsJob) std.Io.Cancelable!void {
         const alloc = job.arena_state.allocator();
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        const key_lock = if (job.io) |io|
+            if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
+        else
+            null;
+        if (key_lock) |guard| guard.lock.lockUncancelable(guard.io);
+        defer if (key_lock) |guard| guard.lock.unlock(guard.io);
+        if (job.cache) |cache| {
+            const now = platform_time.monotonicNs();
+            if (cache.lookupCopy(alloc, job.cache_key, now, job.ttl_ns) catch null) |entry| {
+                if (!job.refresh or entry.captured_at_ns >= job.request_started_ns) {
+                    if (entry.ok) {
+                        job.result = .{ .models = entry.models };
+                    } else {
+                        job.err = error.CachedProviderFailure;
+                        job.cached_err_name = entry.err_name;
+                    }
+                    return;
+                }
+            }
+        }
+        var fallback_io_impl: ?std.Io.Threaded = if (job.io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        defer if (fallback_io_impl) |*io_impl| io_impl.deinit();
+        const io = job.io orelse fallback_io_impl.?.io();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
         defer client.deinit();
         job.result = list_models.listModels(alloc, &client, job.ep, job.timeout_ms) catch |err| {
             job.err = err;
+            if (job.cache) |cache| cache.store(job.cache_key, .{
+                .captured_at_ns = platform_time.monotonicNs(),
+                .ok = false,
+                .err_name = @constCast(@errorName(err)),
+            }) catch {};
             return;
         };
+        if (job.cache) |cache| cache.store(job.cache_key, .{
+            .captured_at_ns = platform_time.monotonicNs(),
+            .ok = true,
+            .models = job.result.?.models,
+        }) catch {};
     }
 };
 
@@ -321,14 +454,65 @@ pub fn buildConnectionsResponse(
 ) !ConnectionsResponse {
     var kinds = std.EnumSet(ConnectionKind).initFull();
     if (opts.types_filter) |filter| kinds = parseKindFilter(filter);
+    const effective_opts = opts;
 
     var connections = std.ArrayListUnmanaged(Connection).empty;
 
+    if (kinds.contains(.inference) and sources.antfly_provider != null) {
+        try appendLocalInferenceConnection(arena, &connections, sources, cache, effective_opts);
+    }
+
     if (sources.node_config) |node_config| {
-        try appendConfiguredConnections(arena, &connections, sources, cache, opts, kinds, node_config);
+        try appendConfiguredConnections(arena, &connections, sources, cache, effective_opts, kinds, node_config);
+        if (effective_opts.probe and kinds.contains(.external_io)) {
+            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts, sources.io, sources.secret_store);
+        }
     }
 
     return .{ .connections = connections.items };
+}
+
+fn appendLocalInferenceConnection(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    sources: Sources,
+    cache: ?*Cache,
+    opts: BuildOptions,
+) !void {
+    const instance = try arena.create(Instance);
+    instance.* = .{
+        .provider = .antfly,
+        .key = "runtime:local-inference",
+    };
+    try instance.sources.append(arena, "runtime:local-inference");
+
+    var connection = Connection{
+        .id = common_config.local_inference_connection_id,
+        .name = common_config.local_inference_connection_id,
+        .display_name = "Local inference",
+        .kind = .inference,
+        .status = .configured,
+        .capabilities = &.{ "embedding", "generation", "reranking", "chunking" },
+        .sources = &.{"runtime:local-inference"},
+        .inference = .{ .provider = .antfly },
+    };
+
+    if (opts.include_models) {
+        const instances = try arena.alloc(*Instance, 1);
+        instances[0] = instance;
+        const outcomes = try resolveModels(arena, sources, cache, opts, instances);
+        if (outcomes[0]) |outcome| {
+            if (outcome.ok) {
+                connection.status = .connected;
+                connection.inference.?.models = try modelsMapAlloc(arena, outcome.models, instance);
+            } else {
+                connection.status = .@"error";
+                connection.@"error" = outcome.err_name;
+            }
+        }
+    }
+
+    try connections.append(arena, connection);
 }
 
 fn parseKindFilter(filter: []const u8) std.EnumSet(ConnectionKind) {
@@ -348,6 +532,15 @@ pub fn includeHasModels(include: ?[]const u8) bool {
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |value| {
         if (std.mem.eql(u8, std.mem.trim(u8, value, " \t"), "models")) return true;
+    }
+    return false;
+}
+
+pub fn includeHasStatus(include: ?[]const u8) bool {
+    const raw = include orelse return false;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |value| {
+        if (std.mem.eql(u8, std.mem.trim(u8, value, " \t"), "status")) return true;
     }
     return false;
 }
@@ -386,8 +579,6 @@ fn appendConfiguredConnections(
             .external_io => try appendConfiguredExternalIoConnection(
                 arena,
                 connections,
-                cache,
-                opts,
                 entry.key_ptr.*,
                 cfg,
             ),
@@ -496,13 +687,11 @@ fn appendConfiguredWebSearchConnection(
 fn appendConfiguredExternalIoConnection(
     arena: Allocator,
     connections: *std.ArrayListUnmanaged(Connection),
-    cache: ?*Cache,
-    opts: BuildOptions,
     id: []const u8,
     cfg: common_config.Config.ConnectionConfig,
 ) !void {
     const external_cfg = cfg.external_io orelse return error.InvalidConfig;
-    var connection = Connection{
+    const connection = Connection{
         .id = id,
         .name = id,
         .display_name = cfg.display_name,
@@ -518,13 +707,6 @@ fn appendConfiguredExternalIoConnection(
             .hosts = external_cfg.hosts,
         },
     };
-
-    if (opts.probe and external_cfg.protocol == .s3) {
-        if (try probeConfiguredExternalIoS3(arena, id, external_cfg, cache, opts)) |probe| {
-            connection.status = probe.status;
-            connection.@"error" = probe.err_name;
-        }
-    }
 
     try connections.append(arena, connection);
 }
@@ -704,7 +886,7 @@ fn modelsMapAlloc(arena: Allocator, models: []const list_models.ListedModel, ins
 }
 
 /// Resolve model listings per instance, serving from the cache when fresh and
-/// fanning out worker threads (capped) for live calls.
+/// using bounded shared-runtime fanout for live calls.
 fn resolveModels(
     arena: Allocator,
     sources: Sources,
@@ -758,12 +940,17 @@ fn resolveModels(
             }
         }
 
+        const api_key = resolveInferenceApiKey(arena, sources.secret_store, instance.api_key) catch |err| {
+            outcomes[i] = .{ .ok = false, .err_name = @errorName(err) };
+            continue;
+        };
+
         const job = try arena.create(ModelsJob);
         job.* = .{
             .ep = .{
                 .provider = instance.provider,
                 .url = instance.url,
-                .api_key = instance.api_key,
+                .api_key = api_key,
                 .region = instance.region,
                 .project_id = instance.project_id,
                 .location = instance.location,
@@ -771,24 +958,36 @@ fn resolveModels(
             },
             .timeout_ms = opts.timeout_ms,
             .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .cache = cache,
+            .cache_key = instance.key,
+            .request_started_ns = now_ns,
+            .ttl_ns = opts.ttl_ns,
+            .refresh = opts.refresh,
+            .io = sources.io,
         };
         try pending.append(arena, .{ .index = i, .job = job });
     }
 
-    // Run pending jobs in capped batches.
+    // Run pending jobs in capped batches on the server-owned std.Io runtime.
+    // This bounds process resources across requests instead of creating an OS
+    // thread per connection. Embedded/test callers without a runtime execute
+    // sequentially and retain identical semantics.
     const max_workers = @min(@max(opts.max_workers, 1), 64);
     var offset: usize = 0;
     while (offset < pending.items.len) {
         const end = @min(pending.items.len, offset + max_workers);
-        var threads: [64]?std.Thread = @splat(null);
-        for (pending.items[offset..end], 0..) |item, slot| {
-            threads[slot] = std.Thread.spawn(.{}, ModelsJob.run, .{item.job}) catch |err| blk: {
+        if (sources.io) |io| {
+            var group: std.Io.Group = .init;
+            for (pending.items[offset..end]) |item| {
+                group.concurrent(io, ModelsJob.run, .{item.job}) catch |err| {
+                    item.job.err = err;
+                };
+            }
+            group.await(io) catch {};
+        } else {
+            for (pending.items[offset..end]) |item| item.job.run() catch |err| {
                 item.job.err = err;
-                break :blk null;
             };
-        }
-        for (threads[0 .. end - offset]) |maybe_thread| {
-            if (maybe_thread) |thread| thread.join();
         }
         offset = end;
     }
@@ -809,7 +1008,7 @@ fn resolveModels(
             }
             outcome = .{ .ok = true, .models = models };
         } else {
-            outcome = .{ .ok = false, .err_name = @errorName(item.job.err orelse error.Unknown) };
+            outcome = .{ .ok = false, .err_name = item.job.cached_err_name orelse @errorName(item.job.err orelse error.Unknown) };
         }
         item.job.arena_state.deinit();
         outcomes[item.index] = outcome;
@@ -834,81 +1033,463 @@ const ProbeResult = struct {
     err_name: ?[]const u8 = null,
 };
 
-/// Probe an external-IO S3 connection by checking its first bucket.
-/// Returns null when the credentials are incomplete (no probe possible).
-fn probeConfiguredExternalIoS3(
-    arena: Allocator,
-    name: []const u8,
+const ObjectProbeJob = struct {
     cfg: common_config.Config.ExternalIoConnectionConfig,
-    cache: ?*Cache,
-    opts: BuildOptions,
-) !?ProbeResult {
-    const endpoint = cfg.endpoint orelse return null;
-    const access_key_id = cfg.access_key_id orelse return null;
-    const secret_access_key = cfg.secret_access_key orelse return null;
-    const buckets = cfg.buckets;
-    if (buckets.len == 0) return null;
+    timeout_ms: u64,
+    arena_state: std.heap.ArenaAllocator,
+    failed_bucket: ?usize = null,
+    err: ?anyerror = null,
+    cache: ?*Cache = null,
+    cache_key: []const u8 = "",
+    request_started_ns: u64 = 0,
+    ttl_ns: u64 = 0,
+    refresh: bool = false,
+    cached_err_name: ?[]const u8 = null,
+    io: ?std.Io = null,
 
-    const cache_key = try std.fmt.allocPrint(arena, "objectstore\x1f{s}\x1f{s}\x1f{s}", .{ name, endpoint, buckets[0] });
-    const now_ns = platform_time.monotonicNs();
-    if (!opts.refresh) {
-        if (cache) |c| {
-            if (try c.lookupCopy(arena, cache_key, now_ns, opts.ttl_ns)) |entry| {
-                return .{
-                    .status = if (entry.ok) .connected else .@"error",
-                    .err_name = if (entry.ok) null else entry.err_name,
-                };
+    fn run(job: *ObjectProbeJob) std.Io.Cancelable!void {
+        const key_lock = if (job.io) |io|
+            if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
+        else
+            null;
+        if (key_lock) |guard| guard.lock.lockUncancelable(guard.io);
+        defer if (key_lock) |guard| guard.lock.unlock(guard.io);
+        if (job.cache) |cache| {
+            const now = platform_time.monotonicNs();
+            if (cache.lookupCopy(job.arena_state.allocator(), job.cache_key, now, job.ttl_ns) catch null) |entry| {
+                if (!job.refresh or entry.captured_at_ns >= job.request_started_ns) {
+                    if (!entry.ok) {
+                        job.err = error.CachedProbeFailure;
+                        job.cached_err_name = entry.err_name;
+                    }
+                    return;
+                }
             }
         }
-    }
-
-    const outcome: ProbeResult = blk: {
-        probeS3Bucket(arena, cfg, endpoint, access_key_id, secret_access_key, buckets[0]) catch |err| {
-            break :blk .{ .status = .@"error", .err_name = @errorName(err) };
+        probeObjectBuckets(job.arena_state.allocator(), job.cfg, job.timeout_ms, &job.failed_bucket, job.io) catch |err| {
+            job.err = err;
+            if (job.cache) |cache| cache.store(job.cache_key, .{
+                .captured_at_ns = platform_time.monotonicNs(),
+                .ok = false,
+                .err_name = @constCast(@errorName(err)),
+            }) catch {};
+            return;
         };
-        break :blk .{ .status = .connected };
+        if (job.cache) |cache| cache.store(job.cache_key, .{
+            .captured_at_ns = platform_time.monotonicNs(),
+            .ok = true,
+        }) catch {};
+    }
+};
+
+/// Probes configured object-store connections concurrently through a bounded worker
+/// pool. One worker resolves credentials once and reuses one HTTP client for
+/// every bucket belonging to that connection.
+fn resolveExternalIoProbes(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    node_config: *const common_config.Config,
+    cache: ?*Cache,
+    opts: BuildOptions,
+    io: ?std.Io,
+    secret_store: ?*common_secrets.FileStore,
+) !void {
+    const Pending = struct {
+        connection_index: usize,
+        cache_key: []const u8,
+        job: *ObjectProbeJob,
     };
+    var pending = std.ArrayListUnmanaged(Pending).empty;
+    defer for (pending.items) |item| item.job.arena_state.deinit();
+    const now_ns = platform_time.monotonicNs();
 
-    if (cache) |c| {
-        c.store(cache_key, .{
-            .captured_at_ns = now_ns,
-            .ok = outcome.status == .connected,
-            .err_name = @constCast(outcome.err_name orelse ""),
-        }) catch |err| {
-            std.log.warn("connections: probe cache store failed err={}", .{err});
+    for (connections.items, 0..) |*connection, connection_index| {
+        if (connection.kind != .external_io) continue;
+        const protocol = connection.external_io.?.protocol;
+        if (protocol == .filesystem) {
+            const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
+            const cfg = configured.external_io orelse return error.InvalidConfig;
+            probeFilesystemRoot(cfg.root orelse "", io) catch |err| {
+                connection.status = .@"error";
+                connection.@"error" = @errorName(err);
+                continue;
+            };
+            connection.status = .connected;
+            continue;
+        }
+        if (protocol != .s3 and protocol != .gcs) {
+            connection.status = .unsupported;
+            continue;
+        }
+        const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
+        const raw_cfg = configured.external_io orelse return error.InvalidConfig;
+        var resolved_credentials = common_config.Config.resolveExternalIoCredentials(arena, raw_cfg, secret_store) catch |err| {
+            connection.status = .@"error";
+            connection.@"error" = @errorName(err);
+            continue;
         };
+        const cfg = resolved_credentials.apply(raw_cfg);
+        if (cfg.buckets.len == 0) {
+            connection.status = .@"error";
+            connection.@"error" = "MissingBucketAllowlist";
+            continue;
+        }
+
+        const cache_key = try objectProbeCacheKeyAlloc(arena, connection.id, cfg);
+        if (!opts.refresh) {
+            if (cache) |c| {
+                if (try c.lookupCopy(arena, cache_key, now_ns, opts.ttl_ns)) |entry| {
+                    connection.status = if (entry.ok) .connected else .@"error";
+                    connection.@"error" = if (entry.ok) null else entry.err_name;
+                    continue;
+                }
+            }
+        }
+
+        const job = try arena.create(ObjectProbeJob);
+        job.* = .{
+            .cfg = cfg,
+            .timeout_ms = @max(opts.timeout_ms, 1),
+            .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .cache = cache,
+            .cache_key = cache_key,
+            .request_started_ns = now_ns,
+            .ttl_ns = opts.ttl_ns,
+            .refresh = opts.refresh,
+            .io = io,
+        };
+        try pending.append(arena, .{ .connection_index = connection_index, .cache_key = cache_key, .job = job });
     }
-    return outcome;
+
+    const max_workers = @min(@max(opts.max_workers, 1), 64);
+    var offset: usize = 0;
+    while (offset < pending.items.len) {
+        const end = @min(pending.items.len, offset + max_workers);
+        if (io) |runtime_io| {
+            var group: std.Io.Group = .init;
+            for (pending.items[offset..end]) |item| {
+                group.concurrent(runtime_io, ObjectProbeJob.run, .{item.job}) catch |err| {
+                    item.job.err = err;
+                };
+            }
+            group.await(runtime_io) catch {};
+        } else {
+            for (pending.items[offset..end]) |item| item.job.run() catch |err| {
+                item.job.err = err;
+            };
+        }
+        offset = end;
+    }
+
+    for (pending.items) |item| {
+        const connection = &connections.items[item.connection_index];
+        const outcome: ProbeResult = if (item.job.err) |err| .{
+            .status = .@"error",
+            .err_name = if (item.job.failed_bucket) |bucket_index|
+                try std.fmt.allocPrint(arena, "bucket {s}: {s}", .{ item.job.cfg.buckets[bucket_index], @errorName(err) })
+            else
+                item.job.cached_err_name orelse @errorName(err),
+        } else .{ .status = .connected };
+        connection.status = outcome.status;
+        connection.@"error" = outcome.err_name;
+
+        if (cache) |c| {
+            c.store(item.cache_key, .{
+                // TTL starts when the probe completes, not before potentially
+                // slow credential resolution and network I/O.
+                .captured_at_ns = platform_time.monotonicNs(),
+                .ok = outcome.status == .connected,
+                .err_name = @constCast(outcome.err_name orelse ""),
+            }) catch |err| {
+                std.log.warn("connections: probe cache store failed err={}", .{err});
+            };
+        }
+    }
 }
 
-fn probeS3Bucket(
+fn objectProbeCacheKeyAlloc(arena: Allocator, name: []const u8, cfg: common_config.Config.ExternalIoConnectionConfig) ![]u8 {
+    // Credential material participates in identity so rotation invalidates a
+    // stale probe, but only its cryptographic digest is retained as a cache
+    // key. A full digest also makes cross-connection aliasing negligible.
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hashProbeField(&hash, name);
+    hashProbeField(&hash, @tagName(cfg.protocol));
+    hashProbeOptionalField(&hash, cfg.endpoint);
+    hashProbeOptionalField(&hash, cfg.region);
+    hashProbeField(&hash, @tagName(cfg.addressing_style));
+    hashProbeField(&hash, if (cfg.use_ssl orelse true) "tls" else "plain");
+    for (cfg.buckets) |bucket| hashProbeField(&hash, bucket);
+    hashProbeField(&hash, @tagName(cfg.credentials.source));
+    hashProbeOptionalField(&hash, cfg.credentials.access_key_id);
+    hashProbeOptionalField(&hash, cfg.credentials.secret_access_key);
+    hashProbeOptionalField(&hash, cfg.credentials.session_token);
+    hashProbeOptionalField(&hash, cfg.credentials.profile);
+    hashProbeOptionalField(&hash, cfg.credentials.shared_credentials_file);
+    hashProbeOptionalField(&hash, cfg.credentials.role_arn);
+    hashProbeOptionalField(&hash, cfg.credentials.token_file);
+    hashProbeOptionalField(&hash, cfg.credentials.session_name);
+    hashProbeOptionalField(&hash, cfg.credentials.sts_endpoint);
+    hashProbeOptionalField(&hash, cfg.project_id);
+    hashProbeOptionalField(&hash, cfg.upload_endpoint);
+    hashProbeField(&hash, @tagName(cfg.gcs_credentials.source));
+    hashProbeOptionalField(&hash, cfg.gcs_credentials.bearer_token);
+    hashProbeOptionalField(&hash, cfg.gcs_credentials.service_account_json);
+    hashProbeOptionalField(&hash, cfg.gcs_credentials.credentials_path);
+    hashProbeOptionalField(&hash, cfg.gcs_credentials.scope);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    return try std.fmt.allocPrint(arena, "objectstore\x1f{s}", .{digest_hex});
+}
+
+fn hashProbeField(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    const len: u64 = @intCast(value.len);
+    hash.update(std.mem.asBytes(&len));
+    hash.update(value);
+}
+
+fn hashProbeOptionalField(hash: *std.crypto.hash.sha2.Sha256, value: ?[]const u8) void {
+    if (value) |present| {
+        hash.update(&.{1});
+        hashProbeField(hash, present);
+    } else {
+        hash.update(&.{0});
+    }
+}
+
+fn probeS3Buckets(
     arena: Allocator,
     cfg: common_config.Config.ExternalIoConnectionConfig,
-    endpoint: []const u8,
-    access_key_id: []const u8,
-    secret_access_key: []const u8,
-    bucket: []const u8,
+    timeout_ms: u64,
+    failed_bucket: *?usize,
+    shared_io: ?std.Io,
 ) !void {
-    var s3_client = try objectstore.s3.Client.init(arena, .{
-        .credentials = .{
-            .endpoint = try arena.dupe(u8, endpoint),
-            .use_ssl = cfg.use_ssl orelse std.mem.startsWith(u8, endpoint, "https://"),
-            .access_key_id = try arena.dupe(u8, access_key_id),
-            .secret_access_key = try arena.dupe(u8, secret_access_key),
-            .session_token = if (cfg.session_token) |value| try arena.dupe(u8, value) else null,
-            .region = try arena.dupe(u8, "us-east-1"),
+    var dynamic_credentials: ?bedrock.Credentials = null;
+    defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
+
+    if (cfg.credentials.source != .static) {
+        var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(arena, .{}) else null;
+        defer if (io_impl) |*owned| owned.deinit();
+        var http = httpx.Client.initWithConfig(arena, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
+            .connect_ms = timeout_ms,
+            .read_ms = timeout_ms,
+            .write_ms = timeout_ms,
+            .request_ms = timeout_ms,
+        } });
+        defer http.deinit();
+        var credential_cache: bedrock.CredentialCache = .{};
+        defer credential_cache.deinit(arena);
+        const source: bedrock.CredentialSource = switch (cfg.credentials.source) {
+            .default => .default,
+            .static => unreachable,
+            .profile => .{ .profile = .{
+                .name = cfg.credentials.profile orelse return error.InvalidConnectionCredentials,
+                .shared_credentials_file = cfg.credentials.shared_credentials_file,
+            } },
+            .web_identity => .{ .web_identity = .{
+                .role_arn = cfg.credentials.role_arn orelse return error.InvalidConnectionCredentials,
+                .token_file = cfg.credentials.token_file orelse return error.InvalidConnectionCredentials,
+                .session_name = cfg.credentials.session_name orelse "antfly-connection-probe",
+                .sts_endpoint = cfg.credentials.sts_endpoint,
+            } },
+        };
+        dynamic_credentials = try credential_cache.getForSource(arena, &http, cfg.region orelse "us-east-1", source);
+    }
+
+    const access_key_id = if (dynamic_credentials) |credentials| credentials.access_key_id else cfg.credentials.access_key_id orelse return error.InvalidConnectionCredentials;
+    const secret_access_key = if (dynamic_credentials) |credentials| credentials.secret_access_key else cfg.credentials.secret_access_key orelse return error.InvalidConnectionCredentials;
+    const session_token = if (dynamic_credentials) |credentials| credentials.session_token else cfg.credentials.session_token;
+    var s3_config = try objectstore.s3.fromEnvAlloc(
+        arena,
+        cfg.endpoint,
+        cfg.use_ssl orelse true,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        cfg.region,
+        switch (cfg.addressing_style) {
+            .path => .path,
+            .virtual_hosted => .virtual_hosted,
         },
-        .addressing_style = .path,
-    });
+    );
+    s3_config.request_timeout_ms = timeout_ms;
+    s3_config.io = shared_io;
+    var s3_client = try objectstore.s3.Client.init(arena, s3_config);
     var client = s3_client.client();
     defer client.deinit();
-    const exists = try client.bucketExists(bucket);
-    if (!exists) return error.BucketNotFound;
+    for (cfg.buckets, 0..) |bucket, bucket_index| {
+        const exists = client.bucketExists(bucket) catch |err| {
+            failed_bucket.* = bucket_index;
+            return err;
+        };
+        if (!exists) {
+            failed_bucket.* = bucket_index;
+            return error.BucketNotFound;
+        }
+    }
+}
+
+fn probeObjectBuckets(
+    arena: Allocator,
+    cfg: common_config.Config.ExternalIoConnectionConfig,
+    timeout_ms: u64,
+    failed_bucket: *?usize,
+    io: ?std.Io,
+) !void {
+    return switch (cfg.protocol) {
+        .s3 => probeS3Buckets(arena, cfg, timeout_ms, failed_bucket, io),
+        .gcs => probeGcsBuckets(arena, cfg, timeout_ms, failed_bucket, io),
+        else => error.InvalidConfig,
+    };
+}
+
+fn probeGcsBuckets(
+    arena: Allocator,
+    cfg: common_config.Config.ExternalIoConnectionConfig,
+    timeout_ms: u64,
+    failed_bucket: *?usize,
+    io: ?std.Io,
+) !void {
+    var gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg, io);
+    gcs_cfg.request_timeout_ms = timeout_ms;
+    var gcs = try objectstore.Gcs.JsonApiClient.init(arena, gcs_cfg);
+    var client = gcs.client();
+    defer client.deinit();
+    for (cfg.buckets, 0..) |bucket, bucket_index| {
+        const exists = client.bucketExists(bucket) catch |err| {
+            failed_bucket.* = bucket_index;
+            return err;
+        };
+        if (!exists) {
+            failed_bucket.* = bucket_index;
+            return error.BucketNotFound;
+        }
+    }
+}
+
+fn probeFilesystemRoot(root: []const u8, shared_io: ?std.Io) !void {
+    if (!std.fs.path.isAbsolute(root)) return error.InvalidFilesystemRoot;
+    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = shared_io orelse io_impl.?.io();
+    var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
+    defer dir.close(io);
 }
 
 // --- Tests ---
 
 const table_manager = @import("../metadata/table_manager.zig");
+
+test "object probe cache identity covers every bucket and credential source" {
+    const alloc = std.testing.allocator;
+    var first = common_config.Config.ExternalIoConnectionConfig{
+        .protocol = .s3,
+        .buckets = @constCast(&[_][]u8{ @constCast("bucket-one"), @constCast("bucket-two") }),
+        .credentials = .{ .source = .profile, .profile = @constCast("reader-a") },
+    };
+    const first_key = try objectProbeCacheKeyAlloc(alloc, "archive", first);
+    defer alloc.free(first_key);
+    first.buckets = @constCast(&[_][]u8{ @constCast("bucket-one"), @constCast("bucket-three") });
+    const bucket_key = try objectProbeCacheKeyAlloc(alloc, "archive", first);
+    defer alloc.free(bucket_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, bucket_key));
+    first.credentials.profile = @constCast("reader-b");
+    const credential_key = try objectProbeCacheKeyAlloc(alloc, "archive", first);
+    defer alloc.free(credential_key);
+    try std.testing.expect(!std.mem.eql(u8, bucket_key, credential_key));
+}
+
+test "connection cache remains valid across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache = Cache.init(alloc);
+            defer cache.deinit();
+            try cache.store("provider", .{
+                .captured_at_ns = 1,
+                .ok = false,
+                .err_name = @constCast("first failure"),
+            });
+            try cache.store("provider", .{
+                .captured_at_ns = 2,
+                .ok = true,
+            });
+            const entry = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
+            var owned = entry;
+            defer owned.deinitOwned(alloc);
+            try std.testing.expect(owned.ok);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "build response exposes embedded inference as a local connection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = undefined,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+    };
+    const response = try buildConnectionsResponse(
+        arena_state.allocator(),
+        .{ .antfly_provider = provider },
+        null,
+        .{ .types_filter = "inference" },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
+    try std.testing.expectEqualStrings("local-inference", response.connections[0].id);
+    try std.testing.expectEqual(ConnectionKind.inference, response.connections[0].kind);
+    try std.testing.expectEqual(list_models.ProviderTag.antfly, response.connections[0].inference.?.provider);
+}
+
+test "inference connection operations are allowlisted" {
+    try std.testing.expectEqualStrings("models.generate", inferenceCapability("generate").?);
+    try std.testing.expectEqualStrings("models.embed", inferenceCapability("embed").?);
+    try std.testing.expect(inferenceCapability("../models") == null);
+
+    const embed_only = &.{"models.embed"};
+    try requireInferenceCapability(embed_only, inferenceCapability("embed").?);
+    try std.testing.expectError(error.ConnectionCapabilityMissing, requireInferenceCapability(embed_only, inferenceCapability("generate").?));
+
+    const alloc = std.testing.allocator;
+    var cfg = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "embed-only": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": { "provider": "antfly", "url": "https://platform.antfly.io" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, "embed-only", "generate", "{}"));
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
+    defer alloc.free(store_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+
+    var secret_store = try common_secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    var stored = try secret_store.put(alloc, "openai.api_key", "resolved-key");
+    defer stored.deinit(alloc);
+
+    const resolved = (try resolveInferenceApiKey(alloc, &secret_store, "${secret:openai.api_key}")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("resolved-key", resolved);
+}
+
+test "inference connection URLs require an HTTP origin" {
+    try std.testing.expect(validInferenceURL("https://platform.antfly.io/ai/v1"));
+    try std.testing.expect(validInferenceURL("http://antfly-inference.default.svc:8080"));
+    try std.testing.expect(!validInferenceURL("file:///etc/passwd"));
+    try std.testing.expect(!validInferenceURL("https://platform.antfly.io/ai/v1?redirect=bad"));
+}
 
 test "build response reports mock connected and types filter" {
     const alloc = std.testing.allocator;
@@ -1008,13 +1589,14 @@ test "build response reports configured external io connections" {
         arena,
         .{ .node_config = &cfg },
         null,
-        .{ .types_filter = "external_io", .probe = false },
+        .{ .types_filter = "external_io" },
     );
     try std.testing.expectEqual(@as(usize, 2), response.connections.len);
     for (response.connections) |connection| {
         try std.testing.expectEqual(ConnectionKind.external_io, connection.kind);
         try std.testing.expect(connection.id.len > 0);
         try std.testing.expect(connection.external_io != null);
+        try std.testing.expectEqual(ConnectionStatus.configured, connection.status);
     }
 
     const backups = response.connections[0];
@@ -1066,7 +1648,7 @@ test "build response reports configured web search connections" {
         \\        "region": "us",
         \\        "include_content": true,
         \\        "include_highlights": true,
-        \\        "api_key": "test-exa-api-key",
+        \\        "api_key": "test-only-key",
         \\        "include_domains": ["docs.example.com"]
         \\      }
         \\    }
@@ -1192,4 +1774,8 @@ test "include param parsing" {
     try std.testing.expect(!includeHasModels(null));
     try std.testing.expect(!includeHasModels(""));
     try std.testing.expect(!includeHasModels("modeling"));
+    try std.testing.expect(includeHasStatus("status"));
+    try std.testing.expect(includeHasStatus("models, status"));
+    try std.testing.expect(!includeHasStatus(null));
+    try std.testing.expect(!includeHasStatus("statuses"));
 }

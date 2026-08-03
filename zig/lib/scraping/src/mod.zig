@@ -119,6 +119,52 @@ pub const RemoteContentConfig = struct {
     default_s3: ?[]u8 = null,
     s3: std.StringArrayHashMapUnmanaged(S3CredentialConfig) = .{},
     http: std.StringArrayHashMapUnmanaged(HTTPCredentialConfig) = .{},
+    /// Optional process-owned publisher for hot-reloadable configuration. The
+    /// publisher is borrowed and must outlive every use of this facade.
+    runtime: ?RemoteContentRuntime = null,
+
+    pub const Snapshot = struct {
+        config: *const RemoteContentConfig,
+        context: ?*anyopaque = null,
+        release_fn: ?*const fn (*anyopaque) void = null,
+
+        pub fn deinit(self: *Snapshot) void {
+            if (self.context) |context| self.release_fn.?(context);
+            self.* = undefined;
+        }
+    };
+
+    pub const RuntimeHealth = struct {
+        generation: u64,
+        hash: [32]u8,
+        last_reload_failed: bool,
+        stale_snapshot: bool,
+        reload_successes: u64,
+        reload_failures: u64,
+    };
+
+    pub const RemoteContentRuntime = struct {
+        context: *anyopaque,
+        acquire_fn: *const fn (*anyopaque) ?Snapshot,
+        health_fn: *const fn (*anyopaque) RuntimeHealth,
+
+        pub fn acquire(self: RemoteContentRuntime) ?Snapshot {
+            return self.acquire_fn(self.context);
+        }
+
+        pub fn health(self: RemoteContentRuntime) RuntimeHealth {
+            return self.health_fn(self.context);
+        }
+    };
+
+    pub fn acquire(self: *const RemoteContentConfig) Snapshot {
+        if (self.runtime) |runtime| return runtime.acquire() orelse .{ .config = self };
+        return .{ .config = self };
+    }
+
+    pub fn runtimeHealth(self: *const RemoteContentConfig) ?RuntimeHealth {
+        return if (self.runtime) |runtime| runtime.health() else null;
+    }
 
     pub fn getS3(self: *const RemoteContentConfig, name: []const u8) ?*const S3CredentialConfig {
         return self.s3.getPtr(name);
@@ -357,6 +403,8 @@ fn downloadHttpOutcomeAlloc(
         trimMimeParameters(value)
     else
         "application/octet-stream";
+    const owned_mime = try alloc.dupe(u8, mime);
+    errdefer alloc.free(owned_mime);
 
     const max_size: usize = if (security) |cfg|
         @intCast(cfg.max_download_size_bytes orelse (100 * 1024 * 1024))
@@ -368,7 +416,7 @@ fn downloadHttpOutcomeAlloc(
     errdefer alloc.free(body);
 
     return .{ .ok = .{
-        .content_type = try alloc.dupe(u8, mime),
+        .content_type = owned_mime,
         .data = body,
     } };
 }

@@ -29,7 +29,8 @@ const platform_sync = @import("antfly_platform").sync;
 const Io = std.Io;
 const http_common = @import("http/http_common.zig");
 const std_http_listener = @import("http/std_http_listener.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
+const prometheus = @import("prometheus.zig");
 
 const StdHttpListener = std_http_listener.StdHttpListener;
 const StdHttpListenerConfig = std_http_listener.StdHttpListenerConfig;
@@ -298,82 +299,12 @@ fn sleepRefreshInterval(io: Io, stop: *std.atomic.Value(bool)) void {
     }
 }
 
-/// Writes a Prometheus text-format metric (HELP, TYPE, value) for a single
-/// scalar counter/gauge. Matches the format used by Antfly inference.
-pub fn appendPromMetric(
-    writer: *std.Io.Writer,
-    name: []const u8,
-    metric_type: []const u8,
-    help: []const u8,
-    value: u64,
-) !void {
-    try appendPromMetricHeader(writer, name, metric_type, help);
-    try appendPromSample(writer, name, value);
-}
-
-pub const PromLabel = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub fn appendPromMetricLabeled(
-    writer: *std.Io.Writer,
-    name: []const u8,
-    metric_type: []const u8,
-    help: []const u8,
-    labels: []const PromLabel,
-    value: u64,
-) !void {
-    try appendPromMetricHeader(writer, name, metric_type, help);
-    try appendPromSampleLabeled(writer, name, labels, value);
-}
-
-pub fn appendPromMetricHeader(
-    writer: *std.Io.Writer,
-    name: []const u8,
-    metric_type: []const u8,
-    help: []const u8,
-) !void {
-    try writer.print("# HELP {s} {s}\n# TYPE {s} {s}\n", .{ name, help, name, metric_type });
-}
-
-pub fn appendPromSample(writer: *std.Io.Writer, name: []const u8, value: u64) !void {
-    try writer.print("{s} {d}\n", .{ name, value });
-}
-
-pub fn appendPromSampleLabeled(
-    writer: *std.Io.Writer,
-    name: []const u8,
-    labels: []const PromLabel,
-    value: u64,
-) !void {
-    try writer.print("{s}", .{name});
-    try appendPromLabels(writer, labels);
-    try writer.print(" {d}\n", .{value});
-}
-
-fn appendPromLabels(writer: *std.Io.Writer, labels: []const PromLabel) !void {
-    if (labels.len == 0) return;
-    try writer.print("{{", .{});
-    for (labels, 0..) |label, i| {
-        if (i > 0) try writer.print(",", .{});
-        try writer.print("{s}=\"", .{label.name});
-        try appendPromLabelValue(writer, label.value);
-        try writer.print("\"", .{});
-    }
-    try writer.print("}}", .{});
-}
-
-fn appendPromLabelValue(writer: *std.Io.Writer, value: []const u8) !void {
-    for (value) |c| {
-        switch (c) {
-            '\\' => try writer.print("\\\\", .{}),
-            '"' => try writer.print("\\\"", .{}),
-            '\n' => try writer.print("\\n", .{}),
-            else => try writer.print("{c}", .{c}),
-        }
-    }
-}
+pub const PromLabel = prometheus.PromLabel;
+pub const appendPromMetric = prometheus.appendPromMetric;
+pub const appendPromMetricLabeled = prometheus.appendPromMetricLabeled;
+pub const appendPromMetricHeader = prometheus.appendPromMetricHeader;
+pub const appendPromSample = prometheus.appendPromSample;
+pub const appendPromSampleLabeled = prometheus.appendPromSampleLabeled;
 
 fn pathOnly(uri: []const u8) []const u8 {
     const query_index = std.mem.indexOfScalar(u8, uri, '?') orelse return uri;

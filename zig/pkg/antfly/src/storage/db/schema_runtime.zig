@@ -19,6 +19,7 @@ const algebraic_ir = @import("algebraic/ir.zig");
 const db_config = @import("config.zig");
 const db_internal = @import("internal.zig");
 const derived_types = @import("derived/derived_types.zig");
+const doc_identity = @import("doc_identity.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -90,6 +91,273 @@ pub const SchemaRewriteJobDrainOptions = struct {
 
 pub fn Impl(comptime DB: type) type {
     return struct {
+        const InstalledIndex = struct {
+            applied: u64,
+            needs_enrichment_replay: bool,
+            managed_admission_pending: bool = false,
+            post_commit_error: ?anyerror = null,
+        };
+
+        const IndexAdmissionMode = enum {
+            ordinary,
+            managed_full_text,
+        };
+
+        var test_fail_managed_index_delete_after_catalog_commit = false;
+
+        var test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
+
+        pub var test_fail_index_activation_after_catalog_commit = false;
+
+        pub fn setTestFailManagedIndexDeleteAfterCatalogCommit(value: bool) void {
+            if (!builtin.is_test) return;
+            test_fail_managed_index_delete_after_catalog_commit = value;
+        }
+
+        pub fn setTestFailManagedIndexRepairCleanupAfterCatalogCommit(value: bool) void {
+            if (!builtin.is_test) return;
+            test_fail_managed_index_repair_cleanup_after_catalog_commit = value;
+        }
+
+        pub fn managedAdmissionVisibilitySummary(self: *DB) !doc_identity.VisibilitySummary {
+            // Admission is a rare structural mutation and must be based on the
+            // primary store that commits the catalog marker. The runtime cache is
+            // published only after HA mirrors complete, so a mirror failure can
+            // legitimately leave it behind the durable primary state.
+            if (try doc_identity.visibilitySummaryFromStore(self.core.store)) |summary| return summary;
+            const empty = (try doc_identity.loadAllNewTrustedStateForNamespace(
+                self.core.store,
+                self.core.identity_namespace,
+            )) orelse return error.InvalidDocIdentity;
+            return empty.visibility_summary;
+        }
+
+        pub fn installIndexWhileEnrichmentQuiesced(
+            self: *DB,
+            cfg: types.IndexConfig,
+            admission_mode: IndexAdmissionMode,
+        ) !InstalledIndex {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try DB.SchemaRuntimeCallbacks.remove_orphaned_index_repair_intent_for_fresh_admission(self, self.alloc, cfg.name);
+            if (admission_mode == .managed_full_text and cfg.kind != .full_text) return error.InvalidArgument;
+            const summary = try Self.managedAdmissionVisibilitySummary(self);
+            const managed_admission_pending = admission_mode == .managed_full_text and summary.live_ordinals != 0;
+            const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, cfg.name);
+            defer self.alloc.free(admission_key);
+            const admission_value = DB.SchemaRuntimeCallbacks.encode_managed_index_admission_value(
+                types.indexAdmissionConfigHash(cfg),
+                summary.live_ordinals,
+                @max(summary.max_created_generation, summary.max_deleted_generation),
+                self.core.nextDerivedSequence(),
+                managed_admission_pending,
+            );
+            const admission_write: index_manager_mod.IndexManager.AtomicCatalogMutation = .{ .put = .{
+                .key = admission_key,
+                .value = &admission_value,
+            } };
+            var catalog_committed = false;
+            // Allocate the service gate before committing admission. Once the
+            // catalog and marker become durable, allocation failure must not
+            // create an ungated window in the current process.
+            try self.core.index_manager.markRepairUnavailable(cfg.name);
+            errdefer if (!catalog_committed) {
+                self.core.index_manager.clearRepairUnavailable(cfg.name);
+            };
+
+            // Managed empty-source admission still bypasses ordinary synchronous
+            // backfill. Its O(1) identity proof establishes an already-complete
+            // generation at the current replay head without scanning tombstones.
+            var applied = switch (admission_mode) {
+                .ordinary => try self.core.addIndex(cfg, admission_write),
+                .managed_full_text => try self.core.addManagedIndex(cfg, admission_write),
+            };
+            catalog_committed = true;
+            // Publish outbox work only after the catalog/marker transaction is
+            // durable. Any later failure leaves a generation that the scheduler
+            // can drain without relying on the failed request to reach its tail.
+            if (managed_admission_pending) DB.SchemaRuntimeCallbacks.request_managed_admission_materialization(self);
+
+            var post_commit_error: ?anyerror = if (builtin.is_test and test_fail_index_activation_after_catalog_commit)
+                error.TestPostCommitIndexActivation
+            else
+                null;
+            if (admission_mode == .managed_full_text and !managed_admission_pending) {
+                applied = self.core.nextDerivedSequence();
+            }
+            if (post_commit_error == null) {
+                self.core.saveAppliedSequence(cfg.name, applied) catch |err| {
+                    post_commit_error = err;
+                };
+            }
+            if (post_commit_error == null) {
+                DB.SchemaRuntimeCallbacks.initialize_dense_artifact_target_counter_if_needed(self, cfg) catch |err| {
+                    post_commit_error = err;
+                };
+            }
+            if (post_commit_error == null) {
+                DB.SchemaRuntimeCallbacks.save_index_status_snapshot(self, cfg.name, applied) catch |err| {
+                    post_commit_error = err;
+                };
+            }
+            if (cfg.kind == .algebraic) {
+                DB.SchemaRuntimeCallbacks.hydrate_algebraic_observation_status_for_index_best_effort(self, cfg.name);
+            }
+            var needs_enrichment_replay = false;
+            if (post_commit_error == null) {
+                needs_enrichment_replay = self.core.indexRequiresEnrichmentReplay(cfg.name) catch |err| blk: {
+                    post_commit_error = err;
+                    break :blk false;
+                };
+            }
+            return .{
+                .applied = applied,
+                .needs_enrichment_replay = needs_enrichment_replay,
+                .managed_admission_pending = managed_admission_pending,
+                .post_commit_error = post_commit_error,
+            };
+        }
+
+        pub fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
+            self.async_context.enrichment_desired_running.store(true, .release);
+            db_internal.lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+            const runtime = self.async_context.enrichment_runtime orelse {
+                self.async_context.enrichment_lifecycle_mutex.unlock();
+                return;
+            };
+            const start_result = if (!runtime.isStarted()) DB.SchemaRuntimeCallbacks.start_enrichment_runtime_for_lifecycle(runtime) else {};
+            self.async_context.enrichment_lifecycle_mutex.unlock();
+            start_result catch |err| {
+                // The durable restart supervisor owns recovery from this point;
+                // preserve the diagnostic without classifying a retryable outage
+                // as an unrecoverable process failure.
+                std.log.warn("failed to restart enrichment runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+                DB.SchemaRuntimeCallbacks.schedule_enrichment_restart_context(
+                    self.async_context,
+                    self.backend_runtime.durable_jobs,
+                    self.repair_cleanup_owner_id,
+                );
+                DB.notifyQueryVisibilityHook(self.async_context, .status);
+                return err;
+            };
+        }
+
+        fn finalizeCompletedIndexAdmission(self: *DB, index_name: []const u8) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            const key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, index_name);
+            defer self.alloc.free(key);
+            self.core.store.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
+            self.core.index_manager.clearRepairUnavailable(index_name);
+            DB.notifyQueryVisibilityHook(self.async_context, .index_repair_cleared);
+        }
+
+        fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) ?u128 {
+            // Admission remains fail-closed until the durable repair marker is
+            // materialized, so this is degraded-but-recoverable state.
+            std.log.warn("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });
+            DB.SchemaRuntimeCallbacks.request_managed_admission_materialization(self);
+            DB.SchemaRuntimeCallbacks.drain_managed_index_admissions(self, self.alloc) catch |materialize_err| {
+                // The primary-store marker remains authoritative and startup will
+                // retry projection into the repair scheduler.
+                std.log.err("committed index activation marker remains pending index={s} err={s}", .{ cfg.name, @errorName(materialize_err) });
+                return null;
+            };
+            return DB.SchemaRuntimeCallbacks.index_repair_id_for_index(self, self.alloc, cfg.name) catch |lookup_err| {
+                std.log.err("committed index activation repair lookup failed index={s} err={s}", .{ cfg.name, @errorName(lookup_err) });
+                return null;
+            };
+        }
+
+        fn completeInstalledIndexAdmission(
+            self: *DB,
+            cfg: types.IndexConfig,
+            installed: InstalledIndex,
+            restart_enrichment: bool,
+        ) !?u128 {
+            const repair_id = if (installed.managed_admission_pending) repair_blk: {
+                // Drain the complete outbox, not only this index. A prior admission
+                // may have committed before a transient checkpoint failure.
+                try DB.SchemaRuntimeCallbacks.drain_managed_index_admissions(self, self.alloc);
+                break :repair_blk try DB.SchemaRuntimeCallbacks.index_repair_id_for_index(self, self.alloc, cfg.name);
+            } else null;
+
+            var worker_applied = installed.applied;
+            if (installed.needs_enrichment_replay) {
+                // A newly admitted index owns a fresh coverage generation. Establish
+                // its worker baseline only after current artifact reconstruction.
+                const rebuilt = switch (cfg.kind) {
+                    .dense_vector => try DB.SchemaRuntimeCallbacks.rebuild_dense_index_for_target_coverage_context(self.async_context, cfg.name, 2048),
+                    .sparse_vector => try DB.SchemaRuntimeCallbacks.rebuild_sparse_index_from_stored_embedding_artifacts_context(self.async_context, cfg.name, 2048),
+                    else => 0,
+                };
+                const generation_baseline = self.core.nextDerivedSequence();
+                if (rebuilt > 0 or generation_baseline > worker_applied) {
+                    worker_applied = generation_baseline;
+                    try self.core.saveAppliedSequence(cfg.name, worker_applied);
+                    try DB.SchemaRuntimeCallbacks.save_index_status_snapshot(self, cfg.name, worker_applied);
+                }
+                if (self.enrichment_runtime != null) {
+                    const refs = try DB.SchemaRuntimeCallbacks.replay_generated_enrichments_from_stored_docs(self, self.alloc);
+                    if (refs == 0) {
+                        const target_sequence = self.core.nextDerivedSequence();
+                        try self.core.saveAppliedSequence(cfg.name, target_sequence);
+                        try Self.markEnrichmentAppliedIfNoPendingThrough(self, target_sequence);
+                    }
+                }
+            }
+
+            if (self.start_index_workers) {
+                try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
+            }
+            if (restart_enrichment) try Self.restartEnrichmentAfterStructuralMutation(self, "index creation", cfg.name);
+            if (self.start_index_workers) {
+                const current_target = self.core.nextDerivedSequence();
+                if (current_target > worker_applied) self.executor.notifyIndexes(current_target, &.{cfg.name});
+            }
+            if (!installed.managed_admission_pending) try Self.finalizeCompletedIndexAdmission(self, cfg.name);
+            return repair_id;
+        }
+
+        fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            // Generated artifact namespaces can be shared across differently named
+            // indexes. Cleanup is durable and owner-driven; never turn index
+            // admission into an unbounded corpus scan. Metadata reconciliation can
+            // retry after the conflicting generation's tombstone is retired.
+            try DB.SchemaRuntimeCallbacks.reject_conflicting_retired_index_cleanup_for_admission(self, cfg);
+            const restart_enrichment = DB.SchemaRuntimeCallbacks.quiesce_enrichment_for_structural_mutation(self);
+            var enrichment_restarted = false;
+            errdefer if (restart_enrichment and !enrichment_restarted) {
+                Self.restartEnrichmentAfterStructuralMutation(self, "failed index creation", cfg.name) catch |restart_err| {
+                    std.log.err("failed to restore enrichment runtime after index creation error index={s} err={s}", .{ cfg.name, @errorName(restart_err) });
+                };
+            };
+            const installed = try Self.installIndexWhileEnrichmentQuiesced(self, cfg, admission_mode);
+            if (installed.post_commit_error) |activation_err| {
+                if (restart_enrichment) Self.restartEnrichmentAfterStructuralMutation(self, "pending index activation", cfg.name) catch {};
+                enrichment_restarted = true;
+                return Self.recoverCommittedIndexAdmission(self, cfg, activation_err);
+            }
+
+            const repair_id = Self.completeInstalledIndexAdmission(self, cfg, installed, restart_enrichment) catch |activation_err| {
+                if (restart_enrichment) Self.restartEnrichmentAfterStructuralMutation(self, "pending index activation", cfg.name) catch {};
+                enrichment_restarted = true;
+                return Self.recoverCommittedIndexAdmission(self, cfg, activation_err);
+            };
+            enrichment_restarted = true;
+            return repair_id;
+        }
+
+        pub fn admitManagedFullTextIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+            if (cfg.kind != .full_text) return error.InvalidArgument;
+            return try Self.addIndexWithAdmission(self, cfg, .managed_full_text);
+        }
+
         const Self = @This();
 
         fn currentTimeNs() u64 {
@@ -606,7 +874,7 @@ pub fn Impl(comptime DB: type) type {
                 try DB.SchemaRuntimeCallbacks.append_generated_enrichments(self, &pending_batch, .{
                     .writes = replay_batch.writes,
                     .sync_level = .write,
-                }, replay_batch.extracted);
+                }, replay_batch.extracted, true);
                 if (pending_batch.generated_enrichment_refs.len != 0) {
                     generated_ref_count += pending_batch.generated_enrichment_refs.len;
                     const sequence = try DB.SchemaRuntimeCallbacks.append_derived_batch_record(self, pending_batch);
@@ -632,52 +900,41 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             artifact_name: ?[]const u8,
         ) !usize {
-            const name = artifact_name orelse return try Self.replayGeneratedEnrichmentsFromStoredDocs(self, alloc);
             if (self.enrichment_runtime == null) return 0;
 
-            const lower = try self.core.documentRangeLowerAlloc("");
-            defer self.core.alloc.free(lower);
-            const docs = try self.core.scanStoreRange(alloc, lower, "");
-            defer docstore_mod.DocStore.freeResults(alloc, docs);
-
             const chunk_size: usize = 128;
-            const relational_base_rows = self.relationalColumnsForStore() != null;
-            const force_artifacts = [_][]const u8{name};
-            var index: usize = 0;
+            const initial_lower = try self.core.documentRangeLowerAlloc("");
+            defer self.core.alloc.free(initial_lower);
+            var lower = try alloc.dupe(u8, initial_lower);
+            defer alloc.free(lower);
+            var lower_exclusive = false;
+
+            const force_artifact = [_][]const u8{artifact_name orelse ""};
+            const force_artifacts: []const []const u8 = if (artifact_name != null)
+                force_artifact[0..]
+            else
+                &.{};
             var reprocessed: usize = 0;
-            while (index < docs.len) {
-                var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-                defer {
-                    for (writes.items) |write| {
-                        alloc.free(@constCast(write.key));
-                        alloc.free(@constCast(write.value));
-                    }
-                    writes.deinit(alloc);
-                }
-                while (index < docs.len and writes.items.len < chunk_size) : (index += 1) {
-                    const doc = docs[index];
-                    if (!db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, doc.key)) continue;
-                    const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
-                    errdefer alloc.free(raw_key);
-                    const doc_json = if (relational_base_rows)
-                        try mapper.materializeRelationalRowValueAlloc(alloc, doc.value)
-                    else
-                        try mapper.materializeDocumentValueAlloc(alloc, doc.value);
-                    errdefer alloc.free(doc_json);
-                    try writes.append(alloc, .{
-                        .key = raw_key,
-                        .value = doc_json,
-                    });
-                }
-                if (writes.items.len == 0) continue;
+            while (true) {
+                var replay_batch = try Self.collectStoredGeneratedReplayBatch(self, alloc, lower, lower_exclusive, chunk_size);
+                defer replay_batch.deinit(alloc);
+                if (replay_batch.writes.len == 0) break;
+
                 try DB.WritePathCallbacks.batch_internal(self, .{
-                    .writes = writes.items,
+                    .writes = replay_batch.writes,
                     .sync_level = .write,
                 }, null, .{
-                    .force_generated_artifact_names = &force_artifacts,
+                    .force_generated_artifact_names = force_artifacts,
+                    .force_all_generated_artifacts = artifact_name == null,
                     .admission_prechecked = true,
                 });
-                reprocessed += writes.items.len;
+                reprocessed += replay_batch.writes.len;
+
+                const next_lower = replay_batch.next_lower orelse break;
+                replay_batch.next_lower = null;
+                alloc.free(lower);
+                lower = next_lower;
+                lower_exclusive = true;
             }
             return reprocessed;
         }
@@ -693,31 +950,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
-            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-            self.core.lockApply();
-            var apply_locked = true;
-            errdefer if (apply_locked) self.core.unlockApply();
-            const applied = try self.core.addIndex(cfg);
-            try DB.SchemaRuntimeCallbacks.save_index_status_snapshot(self, cfg.name, applied);
-            if (cfg.kind == .algebraic) {
-                DB.SchemaRuntimeCallbacks.hydrate_algebraic_observation_status_for_index_best_effort(self, cfg.name);
-            }
-            const needs_enrichment_replay = try self.core.indexRequiresEnrichmentReplay(cfg.name);
-            self.core.unlockApply();
-            apply_locked = false;
-            if (self.start_index_workers) {
-                try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, applied);
-            }
-            if (needs_enrichment_replay) {
-                if (self.enrichment_runtime != null) {
-                    const refs = try DB.SchemaRuntimeCallbacks.replay_generated_enrichments_from_stored_docs(self, self.alloc);
-                    if (refs == 0) {
-                        const target_sequence = self.core.nextDerivedSequence();
-                        try self.core.saveAppliedSequence(cfg.name, target_sequence);
-                        try Self.markEnrichmentAppliedIfNoPendingThrough(self, target_sequence);
-                    }
-                }
-            }
+            _ = try Self.addIndexWithAdmission(self, cfg, .ordinary);
         }
 
         pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
@@ -752,13 +985,51 @@ pub fn Impl(comptime DB: type) type {
             return try self.core.listEnrichments(alloc);
         }
 
-        pub fn deleteIndex(self: *DB, name: []const u8) !bool {
-            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
             self.executor.removeWorker(name);
             self.core.lockApply();
             defer self.core.unlockApply();
-            const removed = try self.core.deleteIndex(name);
-            if (removed) try deleteDerivedCoverageForIndex(self.core.alloc, self.core.store, name);
+            const repair_id = try DB.SchemaRuntimeCallbacks.prepare_index_repair_for_deletion(self, self.alloc, name);
+            defer if (repair_id != null) DB.SchemaRuntimeCallbacks.end_index_repair_lease(self, name);
+            const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, name);
+            defer self.alloc.free(admission_key);
+            const removed = try self.core.deleteManagedIndex(name, admission_key);
+            if (removed) {
+                if (builtin.is_test and test_fail_managed_index_delete_after_catalog_commit)
+                    return error.TestManagedIndexDeleteCrash;
+                self.core.index_manager.clearManagedAdmissionSnapshotForIndex(name);
+                if (repair_id) |id| {
+                    const repair_cleanup = if (builtin.is_test and test_fail_managed_index_repair_cleanup_after_catalog_commit)
+                        error.TestPostCommitRepairCleanup
+                    else
+                        DB.SchemaRuntimeCallbacks.remove_index_repair_intent_and_pin(self, self.alloc, id);
+                    repair_cleanup catch |err| {
+                        std.log.warn("index removal committed with stale repair intent name={s} err={s}", .{ name, @errorName(err) });
+                    };
+                }
+                DB.SchemaRuntimeCallbacks.delete_dense_artifact_counter_metadata_context(self.alloc, self.core.store, name) catch |err| {
+                    std.log.warn("index removal committed with stale dense coverage counters name={s} err={s}", .{ name, @errorName(err) });
+                };
+                deleteDerivedCoverageForIndex(self.core.alloc, self.core.store, name) catch |err| {
+                    std.log.warn("index removal committed with stale derived coverage counters name={s} err={s}", .{ name, @errorName(err) });
+                };
+            }
+            return removed;
+        }
+
+        pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+            if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            const restart_enrichment = DB.SchemaRuntimeCallbacks.quiesce_enrichment_for_structural_mutation(self);
+            const removed = Self.deleteIndexWhileEnrichmentQuiesced(self, name) catch |delete_err| {
+                if (restart_enrichment) Self.restartEnrichmentAfterStructuralMutation(self, "failed index deletion", name) catch |restart_err| {
+                    std.log.err("failed to restore enrichment runtime after index deletion error index={s} err={s}", .{ name, @errorName(restart_err) });
+                };
+                return delete_err;
+            };
+            if (removed) DB.SchemaRuntimeCallbacks.schedule_generated_artifact_cleanup(self);
+            if (restart_enrichment) Self.restartEnrichmentAfterStructuralMutation(self, "index deletion", name) catch |restart_err| {
+                std.log.err("failed to restart enrichment runtime after committed index deletion index={s} err={s}", .{ name, @errorName(restart_err) });
+            };
             return removed;
         }
 
@@ -3645,17 +3916,17 @@ test "db schema runtime delete index clears derived coverage rows" {
         .config_json = "{\"field\":\"embedding\",\"dims\":2}",
     });
 
-    const delete_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_delete", 7, "doc:a", "skipped");
+    const delete_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_delete", 7, "doc:a");
     defer alloc.free(delete_key);
-    const delete_counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, "dv_delete", 7);
+    const delete_counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, "dv_delete", 7, "skipped");
     defer alloc.free(delete_counter_key);
-    const keep_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_keep", 7, "doc:a", "skipped");
+    const keep_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_keep", 7, "doc:a");
     defer alloc.free(keep_key);
 
     var counter_value: [8]u8 = undefined;
     try db.core.store.putBatch(&.{
         .{ .key = delete_key, .value = "skipped" },
-        .{ .key = delete_counter_key, .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, 1) },
+        .{ .key = delete_counter_key, .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_value, 1) },
         .{ .key = keep_key, .value = "skipped" },
     }, &.{});
 
@@ -3666,4 +3937,109 @@ test "db schema runtime delete index clears derived coverage rows" {
     const kept = try db.core.store.get(alloc, keep_key);
     defer alloc.free(kept);
     try std.testing.expectEqualStrings("skipped", kept);
+}
+
+test "db schema runtime managed index deletion commits catalog absence with marker removal" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const SchemaRuntime = Impl(DB);
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    const index_name = "full_text_index_v1";
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        try std.testing.expect((try db.admitManagedFullTextIndex(.{
+            .name = index_name,
+            .kind = .full_text,
+            .config_json = "{}",
+        })) != null);
+
+        SchemaRuntime.setTestFailManagedIndexDeleteAfterCatalogCommit(true);
+        defer SchemaRuntime.setTestFailManagedIndexDeleteAfterCatalogCommit(false);
+        try std.testing.expectError(error.TestManagedIndexDeleteCrash, db.deleteIndex(index_name));
+        SchemaRuntime.setTestFailManagedIndexDeleteAfterCatalogCommit(false);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expect(reopened.core.index_manager.get(index_name) == null);
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+    defer alloc.free(admission_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, admission_key));
+    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+}
+
+test "db schema runtime managed index deletion remains successful after post-commit cleanup failure" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const SchemaRuntime = Impl(DB);
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    const index_name = "full_text_index_v1";
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const old_repair_id = (try db.admitManagedFullTextIndex(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+
+    index_manager_mod.test_inject_index_removal_cleanup_error = error.TestPostCommitCleanup;
+    defer index_manager_mod.test_inject_index_removal_cleanup_error = null;
+    index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(std.math.maxInt(u32), .release);
+    defer index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
+    SchemaRuntime.setTestFailManagedIndexRepairCleanupAfterCatalogCommit(true);
+    defer SchemaRuntime.setTestFailManagedIndexRepairCleanupAfterCatalogCommit(false);
+    try std.testing.expect(try db.deleteIndex(index_name));
+    index_manager_mod.test_inject_index_removal_cleanup_error = null;
+    SchemaRuntime.setTestFailManagedIndexRepairCleanupAfterCatalogCommit(false);
+
+    try std.testing.expect(db.core.index_manager.get(index_name) == null);
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+    defer alloc.free(admission_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, admission_key));
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    try std.testing.expectError(error.IndexArtifactCleanupPending, db.admitManagedFullTextIndex(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    }));
+    index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
+    const new_repair_id = (try db.admitManagedFullTextIndex(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(new_repair_id != old_repair_id);
+    try std.testing.expect(db.core.index_manager.get(index_name) != null);
 }

@@ -89,7 +89,11 @@ pub const ContainerStorage = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
+        .sync_contents_absolute = syncContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
+        .root_identity_alloc = rootIdentityAlloc,
+        .rename_is_atomic = true,
     };
 
     pub fn open(allocator: Allocator, path: []const u8) !ContainerStorage {
@@ -154,11 +158,11 @@ pub const ContainerStorage = struct {
         defer io_impl.deinit();
         const io = io_impl.io();
 
-        const lock_file = try openLockFile(io, path, true);
-        defer if (lock_file) |file| {
-            file.unlock(io);
-            file.close(io);
-        };
+        var lock_file = try openLockFile(io, path, true);
+        defer {
+            lock_file.unlock(io);
+            lock_file.close(io);
+        }
 
         const raw = try readFile(io, allocator, path, std.math.maxInt(usize));
         defer allocator.free(raw);
@@ -632,14 +636,17 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     return stored.len;
 }
 
-fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
 
     const stored = self.files.get(path) orelse return error.FileNotFound;
     if (stored.len < len) return error.EndOfStream;
-    return try allocator.dupe(u8, stored[stored.len - len ..]);
+    return .{
+        .bytes = try allocator.dupe(u8, stored[stored.len - len ..]),
+        .file_size = stored.len,
+    };
 }
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -698,12 +705,41 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     try self.deleteTreeDurable(path);
 }
 
+fn syncContentsAbsolute(ptr: *anyopaque, _: []const u8) !void {
+    const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    const file = self.lock_file orelse return error.FileNotFound;
+    if (!self.read_only) try file.sync(self.io_impl.io());
+}
+
+fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+    // Logical files and their namespace are one checksummed container record,
+    // so the physical container sync provides both durability barriers.
+    return try syncContentsAbsolute(ptr, path);
+}
+
 fn nowNs(ptr: *anyopaque) u64 {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
     const now = std.Io.Timestamp.now(self.io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
+}
+
+fn rootIdentityAlloc(
+    ptr: *anyopaque,
+    allocator: Allocator,
+    root_dir: []const u8,
+) ![]u8 {
+    const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    const canonical = try storage_io.nativeRealPathAlloc(allocator, self.path);
+    defer allocator.free(canonical);
+    return try std.fmt.allocPrint(
+        allocator,
+        "aflite-bridge:{s}\x00{s}",
+        .{ canonical, root_dir },
+    );
 }
 
 const ContainerAtomicWriteSink = struct {
@@ -717,6 +753,7 @@ const ContainerAtomicWriteSink = struct {
         .append_slice = appendSlice,
         .write_at = writeAt,
         .crc32_prefix = crc32Prefix,
+        .crc32_range = crc32Range,
         .finish = finish,
         .abort = abort,
     };
@@ -763,6 +800,12 @@ const ContainerAtomicWriteSink = struct {
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
     }
 
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -797,14 +840,12 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
     try fs_paths.createDirPathPortable(io, parent);
 }
 
-fn openLockFile(io: std.Io, path: []const u8, read_only: bool) !?std.Io.File {
-    return openLockedFile(io, path, read_only) catch |err| switch (err) {
-        error.FileLocksUnsupported => {
-            try prepareUnlockedFile(io, path, read_only);
-            return null;
-        },
-        else => return err,
-    };
+fn openLockFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
+    // The bridge is internal, but it shares Lite's file-safety contract:
+    // never open a writable container or maintenance/check handle without an
+    // OS-enforced lease. There is no safe process-local substitute for a
+    // filesystem that does not implement advisory locks.
+    return try openLockedFile(io, path, read_only);
 }
 
 fn openLockedFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
@@ -827,20 +868,6 @@ fn openLockedFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
     });
     errdefer file.close(io);
     return file;
-}
-
-fn prepareUnlockedFile(io: std.Io, path: []const u8, read_only: bool) !void {
-    if (read_only) {
-        var file = try openFilePortable(io, path, .{ .mode = .read_only });
-        defer file.close(io);
-        return;
-    }
-
-    var file = try fs_paths.createFilePortable(io, path, .{
-        .read = true,
-        .truncate = false,
-    });
-    defer file.close(io);
 }
 
 fn openFilePortable(io: std.Io, path: []const u8, flags: std.Io.Dir.OpenFileOptions) !std.Io.File {
@@ -935,9 +962,10 @@ test "aflite container storage persists logical files across reopen" {
         const got = try storage.readFileAlloc(alloc, "/lsm/a.table", 64);
         defer alloc.free(got);
         try std.testing.expectEqualStrings("hello world!", got);
-        const trailer = try storage.readFileTrailerAlloc(alloc, "/lsm/a.table", 6);
-        defer alloc.free(trailer);
-        try std.testing.expectEqualStrings("world!", trailer);
+        var trailer = try storage.readFileTrailerAlloc(alloc, "/lsm/a.table", 6);
+        defer trailer.deinit(alloc);
+        try std.testing.expectEqualStrings("world!", trailer.bytes);
+        try std.testing.expectEqual(@as(u64, 12), trailer.file_size);
     }
 }
 

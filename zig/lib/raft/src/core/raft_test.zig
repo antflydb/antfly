@@ -65,6 +65,9 @@ const CaptureLogger = struct {
 
 const CaptureTraceLogger = struct {
     events: std.ArrayListUnmanaged(logger_mod.TraceEventType) = .empty,
+    conf_change_event_count: usize = 0,
+    last_conf_change_type: ?types.ConfChangeType = null,
+    last_conf_change_node_id: ?types.NodeId = null,
 
     fn traceLogger(self: *CaptureTraceLogger) logger_mod.TraceLogger {
         return .{
@@ -82,6 +85,11 @@ const CaptureTraceLogger = struct {
     fn traceEventImpl(ptr: *anyopaque, event: *const logger_mod.TraceEvent) void {
         const self: *CaptureTraceLogger = @ptrCast(@alignCast(ptr));
         self.events.append(std.testing.allocator, event.event_type) catch return;
+        if (event.event_type != .change_conf and event.event_type != .apply_conf_change) return;
+        self.conf_change_event_count += 1;
+        if (event.conf_changes.len == 0) return;
+        self.last_conf_change_type = event.conf_changes[0].change_type;
+        self.last_conf_change_node_id = event.conf_changes[0].node_id;
     }
 };
 
@@ -302,6 +310,19 @@ test "custom trace logger observes init ready and role transitions" {
     try std.testing.expectEqual(logger_mod.TraceEventType.ready, trace_logger.events.items[1]);
     try std.testing.expectEqual(logger_mod.TraceEventType.become_candidate, trace_logger.events.items[2]);
     try std.testing.expectEqual(logger_mod.TraceEventType.become_leader, trace_logger.events.items[3]);
+
+    var changes = [_]types.ConfChangeSingle{.{
+        .change_type = .add_learner_node,
+        .node_id = 2,
+    }};
+    try raw.proposeConfChangeV2(.{ .changes = changes[0..] });
+    _ = try raw.applyConfChangeV2(.{ .changes = changes[0..] });
+
+    try std.testing.expect(std.mem.indexOfScalar(logger_mod.TraceEventType, trace_logger.events.items, .change_conf) != null);
+    try std.testing.expect(std.mem.indexOfScalar(logger_mod.TraceEventType, trace_logger.events.items, .apply_conf_change) != null);
+    try std.testing.expectEqual(@as(usize, 2), trace_logger.conf_change_event_count);
+    try std.testing.expectEqual(types.ConfChangeType.add_learner_node, trace_logger.last_conf_change_type.?);
+    try std.testing.expectEqual(@as(types.NodeId, 2), trace_logger.last_conf_change_node_id.?);
 }
 
 test "custom logger records ignored stale snapshot" {
@@ -468,6 +489,73 @@ test "leader provides snapshot to active follower behind compaction" {
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
     try std.testing.expectEqual(message_mod.MessageType.snapshot, fixture.raft.messages.items[0].msg_type);
     try std.testing.expectEqual(@as(types.Index, 11), fixture.raft.messages.items[0].snapshot.?.metadata.index);
+}
+
+test "leader incrementally catches up follower within retained snapshot suffix" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{ 1, 2 };
+    try storage.seedConfState(.{ .voters = voters[0..] });
+    var entries: [11]types.Entry = undefined;
+    for (&entries, 1..) |*entry, index| {
+        entry.* = .{ .index = @intCast(index), .term = @intCast(index) };
+    }
+    try storage.append(&entries);
+    try storage.compactToSnapshot(.{
+        .metadata = .{
+            .index = 11,
+            .term = 11,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = @constCast("latest-state"),
+    }, 7);
+    storage.setHardState(.{ .current_term = 11, .commit_index = 11 });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{ 1, 2 },
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .request_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+    });
+    clearMessages(&raft);
+
+    raft.progress[1] = .{
+        .match_index = 7,
+        .next_index = 8,
+        .state = .probe,
+        .recent_active = true,
+    };
+    try raft.step(.{
+        .msg_type = .append_entries_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+        .log_index = 7,
+        .reject = true,
+        .reject_hint = 8,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), raft.messages.items.len);
+    const append = raft.messages.items[0];
+    try std.testing.expectEqual(message_mod.MessageType.append_entries, append.msg_type);
+    try std.testing.expectEqual(@as(types.Index, 7), append.log_index);
+    try std.testing.expectEqual(@as(types.Term, 7), append.log_term);
+    try std.testing.expect(append.entries.len > 0);
+    try std.testing.expectEqual(@as(types.Index, 8), append.entries[0].index);
 }
 
 test "leader ignores providing snapshot to inactive follower" {
@@ -806,6 +894,65 @@ test "disable_conf_change_validation allows leave-joint proposal past pending un
     strict.advance(rd);
 
     try std.testing.expectError(error.PendingConfChange, strict.proposeConfChangeV2(.{}));
+}
+
+test "applying voter changes keeps all peer-indexed leader state aligned" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.seedConfState(.{ .voters = @constCast((&[_]types.NodeId{2})[0..]) });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 2,
+        .group_id = 1,
+        .peers = &.{2},
+        .election_tick = 3,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 3 });
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 1 });
+    try std.testing.expectEqualSlices(types.NodeId, &.{ 1, 2, 3 }, raft.status().conf_state.voters);
+
+    _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
+    try std.testing.expectEqualSlices(types.NodeId, &.{ 2, 3 }, raft.status().conf_state.voters);
+    try raft.propose("still-aligned");
+}
+
+test "removed leader rejects proposals without mutating its log" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.seedConfState(.{ .voters = @constCast((&[_]types.NodeId{1})[0..]) });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 3,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+        .step_down_on_removal = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 2 });
+    _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
+
+    const last_index = raft.status().last_index;
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+    try std.testing.expectError(error.NotLeader, raft.propose("must-not-append"));
+    var changes = [_]types.ConfChangeSingle{.{ .change_type = .add_node, .node_id = 3 }};
+    try std.testing.expectError(error.NotLeader, raft.proposeConfChangeV2(.{
+        .changes = changes[0..],
+    }));
+    try std.testing.expectEqual(last_index, raft.status().last_index);
 }
 
 test "memory storage compaction preserves snapshot term and trimmed bounds" {

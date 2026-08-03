@@ -77,6 +77,50 @@ pub const MetadataHttpClient = struct {
         return try self.getJson(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot);
     }
 
+    pub fn validateCatalogPublication(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        contract: metadata_api.CatalogPublicationContract,
+    ) !bool {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, contract, .{});
+        defer self.alloc.free(body);
+        self.requestWithBody(
+            base_uri,
+            .POST,
+            routes.Routes.internal_catalog_publication_check,
+            body,
+            null,
+            null,
+            error.CatalogChanged,
+        ) catch |err| switch (err) {
+            error.CatalogChanged => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    pub fn validateCatalogTablePublication(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        contract: metadata_api.CatalogTablePublicationContract,
+    ) !bool {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, contract, .{});
+        defer self.alloc.free(body);
+        self.requestWithBody(
+            base_uri,
+            .POST,
+            routes.Routes.internal_catalog_table_publication_check,
+            body,
+            null,
+            null,
+            error.CatalogChanged,
+        ) catch |err| switch (err) {
+            error.CatalogChanged => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn listTableRanges(self: *MetadataHttpClient, base_uri: []const u8, table_id: u64) !std.json.Parsed([]metadata_table_manager.RangeRecord) {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{
             routes.Routes.table_ranges_prefix,
@@ -139,7 +183,7 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_node_shutdown_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, null, null);
+        try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
     pub fn finalizeNodeShutdown(
@@ -152,7 +196,7 @@ pub const MetadataHttpClient = struct {
             node_id,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, null, null);
+        try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
     pub fn reportNodeStatus(
@@ -269,7 +313,7 @@ pub const MetadataHttpClient = struct {
             table_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null);
+        try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null, error.TableTransitionActive);
     }
 
     pub fn updateSchema(
@@ -284,7 +328,22 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_table_schema_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, null);
+        try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, error.TableTransitionActive);
+    }
+
+    pub fn replaceTableDefinition(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_definition_suffix,
+        });
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .PUT, path, body, error.InvalidTableDefinitionReplacement, error.TableNotFound, error.TableGenerationChanged);
     }
 
     pub fn restoreTable(
@@ -316,7 +375,7 @@ pub const MetadataHttpClient = struct {
             index_name,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, index_json, error.InvalidCreateIndexRequest, error.TableNotFound, null);
+        try self.requestWithBody(base_uri, .PUT, path, index_json, error.InvalidCreateIndexRequest, error.TableNotFound, error.TableTransitionActive);
     }
 
     pub fn dropIndex(
@@ -332,7 +391,7 @@ pub const MetadataHttpClient = struct {
             index_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.IndexNotFound, null);
+        try self.requestNoBody(base_uri, .DELETE, path, error.IndexNotFound, null, error.TableTransitionActive);
     }
 
     pub fn putArtifactEnrichment(
@@ -353,7 +412,7 @@ pub const MetadataHttpClient = struct {
             escaped_enrichment_name,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, null);
+        try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, error.TableTransitionActive);
     }
 
     pub fn deleteArtifactEnrichment(
@@ -373,7 +432,7 @@ pub const MetadataHttpClient = struct {
             escaped_enrichment_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment);
+        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment, error.TableTransitionActive);
     }
 
     pub fn requestTableSplit(
@@ -535,6 +594,7 @@ pub const MetadataHttpClient = struct {
         path: []const u8,
         not_found_err: ?anyerror,
         bad_request_err: ?anyerror,
+        conflict_err: ?anyerror,
     ) !void {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
@@ -545,7 +605,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
-        try mapStatus(resp.status, bad_request_err, not_found_err, null);
+        try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
     }
 
     fn executeWithRetry(self: *MetadataHttpClient, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -899,7 +959,7 @@ test "metadata http client round-trips server endpoints" {
             .{ .record = .{ .group_id = 10, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = placement_peer_ids[0..] },
         };
         const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{
-            .{ .transition_id = 9001, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
+            .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
         };
         const merge_transitions = [_]metadata_transition_state.MergeTransitionRecord{
             .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },

@@ -60,6 +60,7 @@ pub const AtomicWriteSink = struct {
         append_slice: *const fn (*anyopaque, []const u8) anyerror!void,
         write_at: *const fn (*anyopaque, usize, []const u8) anyerror!void,
         crc32_prefix: *const fn (*anyopaque, usize) anyerror!u32,
+        crc32_range: *const fn (*anyopaque, usize, usize) anyerror!u32,
         finish: *const fn (*anyopaque) anyerror!void,
         abort: *const fn (*anyopaque) void,
     };
@@ -83,6 +84,10 @@ pub const AtomicWriteSink = struct {
 
     pub fn crc32Prefix(self: *AtomicWriteSink, len_prefix: usize) !u32 {
         return try self.vtable.crc32_prefix(self.ptr, len_prefix);
+    }
+
+    pub fn crc32Range(self: *AtomicWriteSink, offset: usize, range_len: usize) !u32 {
+        return try self.vtable.crc32_range(self.ptr, offset, range_len);
     }
 
     /// Atomically publish the written bytes at the requested destination.
@@ -314,7 +319,20 @@ pub fn acquireNativePathLock(
     };
 }
 
+pub const FileTrailer = struct {
+    /// Bytes and size must describe the same pinned storage generation.
+    bytes: []u8,
+    file_size: u64,
+
+    pub fn deinit(self: *FileTrailer, allocator: Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
 pub const Storage = struct {
+    pub const Trailer = FileTrailer;
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -327,16 +345,24 @@ pub const Storage = struct {
         read_file_range_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!void = null,
         read_file_range_at_most_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!usize = null,
         file_size: *const fn (*anyopaque, []const u8) anyerror!u64,
-        read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8 = null,
+        /// Reads an exact suffix and reports the size already observed while
+        /// locating it, avoiding a separate metadata operation.
+        read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror!FileTrailer = null,
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
-        sync_file_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+        /// Persists file contents without implying namespace durability.
+        sync_contents_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+        /// Persists the parent namespace entry for the supplied path.
+        sync_parent_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         rename_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         now_ns: *const fn (*anyopaque) u64,
         root_identity_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+        /// The host guarantees that rename_absolute is an atomic replacement
+        /// when source and destination are siblings on the same storage.
+        rename_is_atomic: bool = false,
         supports_native_path_locks: bool = false,
     };
 
@@ -394,14 +420,21 @@ pub const Storage = struct {
         return self.vtable.file_size(self.ptr, path);
     }
 
-    pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+    pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
         if (self.vtable.read_file_trailer_alloc) |read_file_trailer_alloc| {
-            return read_file_trailer_alloc(self.ptr, allocator, path, len);
+            var trailer = try read_file_trailer_alloc(self.ptr, allocator, path, len);
+            errdefer trailer.deinit(allocator);
+            if (trailer.bytes.len != len or trailer.file_size < len)
+                return error.EndOfStream;
+            return trailer;
         }
 
         const size = try self.fileSize(path);
         if (size < len) return error.EndOfStream;
-        return try self.readFileRangeAlloc(allocator, path, size - len, len);
+        return .{
+            .bytes = try self.readFileRangeAlloc(allocator, path, size - len, len),
+            .file_size = size,
+        };
     }
 
     pub fn writeFileAbsolute(self: Storage, path: []const u8, contents: []const u8) !void {
@@ -416,6 +449,7 @@ pub const Storage = struct {
         const existing = self.readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
             error.FileNotFound => {
                 try self.writeFileAbsolute(path, contents);
+                if (sync) try self.syncFileContentsAbsolute(path);
                 return;
             },
             else => return err,
@@ -427,19 +461,35 @@ pub const Storage = struct {
         @memcpy(joined[0..existing.len], existing);
         @memcpy(joined[existing.len..], contents);
         try self.writeFileAbsolute(path, joined);
+        if (sync) try self.syncFileContentsAbsolute(path);
     }
 
     pub fn beginAtomicWrite(self: Storage, allocator: Allocator, path: []const u8) !AtomicWriteSink {
         if (self.vtable.begin_atomic_write) |begin_atomic_write| {
             return try begin_atomic_write(self.ptr, allocator, path);
         }
+        if (self.vtable.sync_contents_absolute == null or
+            self.vtable.sync_parent_absolute == null or
+            !self.vtable.rename_is_atomic)
+        {
+            return error.DurableAtomicWriteUnsupported;
+        }
         return try BufferedAtomicWriteSink.create(allocator, self, path);
     }
 
-    pub fn syncFileAbsolute(self: Storage, path: []const u8) !void {
-        if (self.vtable.sync_file_absolute) |sync_file_absolute| {
-            return try sync_file_absolute(self.ptr, path);
+    pub fn syncFileContentsAbsolute(self: Storage, path: []const u8) !void {
+        if (self.vtable.sync_contents_absolute) |sync_contents_absolute| {
+            return try sync_contents_absolute(self.ptr, path);
         }
+        return error.DurableFileSyncUnsupported;
+    }
+
+    /// Persists creation or removal of `path` without resyncing its contents.
+    pub fn syncParentAbsolute(self: Storage, path: []const u8) !void {
+        if (self.vtable.sync_parent_absolute) |sync_parent_absolute| {
+            return try sync_parent_absolute(self.ptr, path);
+        }
+        return error.DurableDirectorySyncUnsupported;
     }
 
     pub fn renameAbsolute(self: Storage, old_path: []const u8, new_path: []const u8) !void {
@@ -480,7 +530,10 @@ pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
 
 /// Thin wrapper for host-provided storage callbacks.
 /// Intended for embedders that want durable LSM semantics without native fs access,
-/// such as wasm or foreign host runtimes.
+/// such as wasm or foreign host runtimes. Durable writers require either a
+/// host-provided atomic writer or an explicitly atomic rename plus separate
+/// file-content and parent-namespace sync callbacks. A host with one combined
+/// durability barrier may install it in both callback slots.
 pub const HostStorage = struct {
     ptr: *anyopaque,
     vtable: *const Storage.VTable,
@@ -558,6 +611,12 @@ const BufferedAtomicWriteSink = struct {
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
     }
 
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -566,10 +625,15 @@ const BufferedAtomicWriteSink = struct {
             self.storage.deleteFileAbsolute(self.tmp_path) catch {};
             return err;
         };
+        self.storage.syncFileContentsAbsolute(self.tmp_path) catch |err| {
+            self.storage.deleteFileAbsolute(self.tmp_path) catch {};
+            return err;
+        };
         self.storage.renameAbsolute(self.tmp_path, self.final_path) catch |err| {
             self.storage.deleteFileAbsolute(self.tmp_path) catch {};
             return err;
         };
+        try self.storage.syncParentAbsolute(self.final_path);
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -584,6 +648,7 @@ const buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .append_slice = BufferedAtomicWriteSink.appendSlice,
     .write_at = BufferedAtomicWriteSink.writeAt,
     .crc32_prefix = BufferedAtomicWriteSink.crc32Prefix,
+    .crc32_range = BufferedAtomicWriteSink.crc32Range,
     .finish = BufferedAtomicWriteSink.finish,
     .abort = BufferedAtomicWriteSink.abort,
 };
@@ -608,7 +673,7 @@ const FdCache = if (!supports_posix_fd_cache)
             return error.UnsupportedNativeStorageRuntime;
         }
 
-        pub fn readTrailerAlloc(_: *FdCache, _: Allocator, _: []const u8, _: usize) ![]u8 {
+        pub fn readTrailerAlloc(_: *FdCache, _: Allocator, _: []const u8, _: usize) !FileTrailer {
             return error.UnsupportedNativeStorageRuntime;
         }
 
@@ -715,7 +780,7 @@ else
             return try fileSizeFromFd(entry.fd);
         }
 
-        fn readTrailerAlloc(self: *FdCache, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readTrailerAlloc(self: *FdCache, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
             const entry = try self.retain(path);
             defer self.release(entry);
 
@@ -725,7 +790,7 @@ else
             const out = try allocator.alloc(u8, len);
             errdefer allocator.free(out);
             try readAllAtOffset(entry.fd, out, size - len);
-            return out;
+            return .{ .bytes = out, .file_size = size };
         }
 
         fn invalidatePath(self: *FdCache, path: []const u8) void {
@@ -1150,12 +1215,14 @@ else blk: {
                 .write_file_absolute = writeFileAbsolute,
                 .append_file_absolute = appendFileAbsolute,
                 .begin_atomic_write = beginAtomicWrite,
-                .sync_file_absolute = syncFileAbsolute,
+                .sync_contents_absolute = syncFileContentsAbsolute,
+                .sync_parent_absolute = syncParentAbsolute,
                 .rename_absolute = renameAbsolute,
                 .delete_file_absolute = deleteFileAbsolute,
                 .delete_tree = deleteTree,
                 .now_ns = nowNs,
                 .root_identity_alloc = nativeRootIdentityAlloc,
+                .rename_is_atomic = true,
                 .supports_native_path_locks = true,
             };
 
@@ -1275,7 +1342,7 @@ else blk: {
                 };
             }
 
-            fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+            fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
@@ -1311,11 +1378,19 @@ else blk: {
                 return try NativeAtomicWriteSink.create(allocator, path, self.state);
             }
 
-            fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 switch (self.runtime) {
-                    .threaded => |*threaded| try syncFilePathWithIo(threaded.io(), path),
-                    .evented => |*evented| try syncFilePathWithIo(evented.io(), path),
+                    .threaded => |*threaded| try syncFileContentsPathWithIo(threaded.io(), path),
+                    .evented => |*evented| try syncFileContentsPathWithIo(evented.io(), path),
+                }
+            }
+
+            fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                switch (self.runtime) {
+                    .threaded => |*threaded| try syncParentPathWithIo(threaded.io(), path),
+                    .evented => |*evented| try syncParentPathWithIo(evented.io(), path),
                 }
             }
 
@@ -1377,12 +1452,14 @@ else blk: {
             .write_file_absolute = writeFileAbsolute,
             .append_file_absolute = appendFileAbsolute,
             .begin_atomic_write = beginAtomicWrite,
-            .sync_file_absolute = syncFileAbsolute,
+            .sync_contents_absolute = syncFileContentsAbsolute,
+            .sync_parent_absolute = syncParentAbsolute,
             .rename_absolute = renameAbsolute,
             .delete_file_absolute = deleteFileAbsolute,
             .delete_tree = deleteTree,
             .now_ns = nowNs,
             .root_identity_alloc = nativeRootIdentityAlloc,
+            .rename_is_atomic = true,
             .supports_native_path_locks = true,
         };
 
@@ -1469,7 +1546,7 @@ else blk: {
             return try fileSizeWithIo(retained.threaded.io(), path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const retained = try state.retain();
             defer retained.release();
@@ -1500,11 +1577,18 @@ else blk: {
             return try NativeAtomicWriteSink.create(allocator, path, state);
         }
 
-        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const retained = try state.retain();
             defer retained.release();
-            try syncFilePathWithIo(retained.threaded.io(), path);
+            try syncFileContentsPathWithIo(retained.threaded.io(), path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            try syncParentPathWithIo(retained.threaded.io(), path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -1593,8 +1677,13 @@ fn appendFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8,
     };
 }
 
-fn syncFilePathWithIo(io: anytype, path: []const u8) !void {
-    try fs_paths.syncFileAndParentPortable(io, path);
+fn syncFileContentsPathWithIo(io: anytype, path: []const u8) !void {
+    try fs_paths.syncFilePortable(io, path);
+}
+
+fn syncParentPathWithIo(io: anytype, path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 fn openFilePathForWriteWithIo(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
@@ -1649,7 +1738,7 @@ fn fileSizeWithIo(io: anytype, path: []const u8) !u64 {
     return (try file.stat(io)).size;
 }
 
-fn readFileTrailerWithIo(io: anytype, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn readFileTrailerWithIo(io: anytype, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
     const file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -1664,7 +1753,7 @@ fn readFileTrailerWithIo(io: anytype, allocator: Allocator, path: []const u8, le
     const out = try allocator.alloc(u8, len);
     errdefer allocator.free(out);
     try reader.interface.readSliceAll(out);
-    return out;
+    return .{ .bytes = out, .file_size = size };
 }
 
 fn renamePathWithIo(io: anytype, old_path: []const u8, new_path: []const u8) !void {
@@ -2024,31 +2113,38 @@ const NativeBufferedAtomicWriteSink = struct {
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
     }
 
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-
+        const io = self.state.threaded.io();
         self.state.invalidatePath(self.tmp_path);
-        writeFileAbsoluteWithIo(io_impl.io(), self.tmp_path, self.out.items) catch |err| {
-            deleteFilePathWithIo(io_impl.io(), self.tmp_path) catch {};
+        writeFileAbsoluteWithIo(io, self.tmp_path, self.out.items) catch |err| {
+            deleteFilePathWithIo(io, self.tmp_path) catch {};
+            return err;
+        };
+        syncFileContentsPathWithIo(io, self.tmp_path) catch |err| {
+            deleteFilePathWithIo(io, self.tmp_path) catch {};
             return err;
         };
         self.state.invalidateRename(self.tmp_path, self.final_path);
-        renamePathWithIo(io_impl.io(), self.tmp_path, self.final_path) catch |err| {
-            deleteFilePathWithIo(io_impl.io(), self.tmp_path) catch {};
+        renamePathWithIo(io, self.tmp_path, self.final_path) catch |err| {
+            deleteFilePathWithIo(io, self.tmp_path) catch {};
             return err;
         };
+        try syncParentPathWithIo(io, self.final_path);
     }
 
     fn abort(ptr: *anyopaque) void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
         self.state.invalidatePath(self.tmp_path);
-        deleteFilePathWithIo(io_impl.io(), self.tmp_path) catch {};
+        deleteFilePathWithIo(self.state.threaded.io(), self.tmp_path) catch {};
         self.deinit();
     }
 };
@@ -2058,6 +2154,7 @@ const native_buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .append_slice = NativeBufferedAtomicWriteSink.appendSlice,
     .write_at = NativeBufferedAtomicWriteSink.writeAt,
     .crc32_prefix = NativeBufferedAtomicWriteSink.crc32Prefix,
+    .crc32_range = NativeBufferedAtomicWriteSink.crc32Range,
     .finish = NativeBufferedAtomicWriteSink.finish,
     .abort = NativeBufferedAtomicWriteSink.abort,
 };
@@ -2072,7 +2169,10 @@ const NativeAtomicWriteSink = struct {
 
     fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState) !AtomicWriteSink {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
-            return try NativeBufferedAtomicWriteSink.create(allocator, path, state);
+            // std.Io rename does not expose a write-through durability contract
+            // on these targets. Fail before creating the temporary file rather
+            // than acknowledge an atomic write whose namespace may be lost.
+            return error.DurableAtomicRenameUnsupported;
         }
 
         const retained_state = try state.retain();
@@ -2103,6 +2203,7 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn deinit(self: *NativeAtomicWriteSink) void {
+        if (self.fd >= 0) closeFd(self.fd);
         self.state.release();
         self.allocator.free(self.final_path);
         self.allocator.free(self.tmp_path);
@@ -2127,15 +2228,19 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
+        return crc32Range(ptr, 0, len_prefix);
+    }
+
+    fn crc32Range(ptr: *anyopaque, range_offset: usize, range_len: usize) !u32 {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (len_prefix > self.bytes_written) return error.InvalidAtomicWriteOffset;
+        if (range_offset > self.bytes_written or range_len > self.bytes_written - range_offset) return error.InvalidAtomicWriteOffset;
 
         var crc = std.hash.Crc32.init();
         var offset: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
-        while (offset < len_prefix) {
-            const n = @min(buf.len, len_prefix - offset);
-            try readAllAtOffset(self.fd, buf[0..n], @intCast(offset));
+        while (offset < range_len) {
+            const n = @min(buf.len, range_len - offset);
+            try readAllAtOffset(self.fd, buf[0..n], @intCast(range_offset + offset));
             crc.update(buf[0..n]);
             offset += n;
         }
@@ -2146,7 +2251,13 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
-        try fs_paths.syncFdPortable(self.fd);
+        fs_paths.syncFileFdPortable(self.fd) catch |err| {
+            closeFd(self.fd);
+            self.fd = -1;
+            self.state.invalidatePath(self.tmp_path);
+            deleteFilePathPosix(self.tmp_path) catch {};
+            return err;
+        };
         closeFd(self.fd);
         self.fd = -1;
 
@@ -2155,11 +2266,15 @@ const NativeAtomicWriteSink = struct {
             deleteFilePathPosix(self.tmp_path) catch {};
             return err;
         };
+        try syncParentDirectoryPosix(self.final_path);
     }
 
     fn abort(ptr: *anyopaque) void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (self.fd >= 0) closeFd(self.fd);
+        if (self.fd >= 0) {
+            closeFd(self.fd);
+            self.fd = -1;
+        }
         self.state.invalidatePath(self.tmp_path);
         deleteFilePathPosix(self.tmp_path) catch {};
         self.deinit();
@@ -2171,9 +2286,21 @@ const native_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .append_slice = NativeAtomicWriteSink.appendSlice,
     .write_at = NativeAtomicWriteSink.writeAt,
     .crc32_prefix = NativeAtomicWriteSink.crc32Prefix,
+    .crc32_range = NativeAtomicWriteSink.crc32Range,
     .finish = NativeAtomicWriteSink.finish,
     .abort = NativeAtomicWriteSink.abort,
 };
+
+fn syncParentDirectoryPosix(path: []const u8) !void {
+    const parent_path = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+    const parent_fd = try std.posix.openat(std.posix.AT.FDCWD, parent_path, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer closeFd(parent_fd);
+    try fs_paths.syncDirectoryFdPortable(parent_fd);
+}
 
 pub const MemoryStorage = struct {
     allocator: Allocator,
@@ -2219,11 +2346,13 @@ const memory_vtable: Storage.VTable = .{
     .read_file_trailer_alloc = memoryReadFileTrailerAlloc,
     .write_file_absolute = memoryWriteFileAbsolute,
     .append_file_absolute = memoryAppendFileAbsolute,
-    .sync_file_absolute = memorySyncFileAbsolute,
+    .sync_contents_absolute = memorySyncFileContentsAbsolute,
+    .sync_parent_absolute = memorySyncParentAbsolute,
     .rename_absolute = memoryRenameAbsolute,
     .delete_file_absolute = memoryDeleteFileAbsolute,
     .delete_tree = memoryDeleteTree,
     .now_ns = memoryNowNs,
+    .rename_is_atomic = true,
 };
 
 fn memoryCreateDirPath(_: *anyopaque, _: []const u8) !void {}
@@ -2258,14 +2387,17 @@ fn memoryFileSize(ptr: *anyopaque, path: []const u8) !u64 {
     return stored.len;
 }
 
-fn memoryReadFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn memoryReadFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
     const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
 
     const stored = self.files.get(path) orelse return error.FileNotFound;
     if (stored.len < len) return error.EndOfStream;
-    return try allocator.dupe(u8, stored[stored.len - len ..]);
+    return .{
+        .bytes = try allocator.dupe(u8, stored[stored.len - len ..]),
+        .file_size = stored.len,
+    };
 }
 
 fn memoryWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -2312,7 +2444,9 @@ fn memoryAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
     try self.files.putNoClobber(self.allocator, owned_path, owned_contents);
 }
 
-fn memorySyncFileAbsolute(_: *anyopaque, _: []const u8) !void {}
+fn memorySyncFileContentsAbsolute(_: *anyopaque, _: []const u8) !void {}
+
+fn memorySyncParentAbsolute(_: *anyopaque, _: []const u8) !void {}
 
 fn memoryRenameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
@@ -2400,6 +2534,8 @@ test "host storage delegates through callbacks" {
     const HostContext = struct {
         backing: *MemoryStorage,
         trailer_reads: usize = 0,
+        content_syncs: usize = 0,
+        parent_syncs: usize = 0,
 
         fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2421,7 +2557,7 @@ test "host storage delegates through callbacks" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -2430,6 +2566,18 @@ test "host storage delegates through callbacks" {
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.content_syncs += 1;
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.parent_syncs += 1;
+            return self.backing.storage().syncParentAbsolute(path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -2477,9 +2625,10 @@ test "host storage delegates through callbacks" {
     const ell = try host.readFileRangeAlloc(std.testing.allocator, "/host/a.txt", 1, 3);
     defer std.testing.allocator.free(ell);
     try std.testing.expectEqualStrings("ell", ell);
-    const llo = try host.readFileTrailerAlloc(std.testing.allocator, "/host/a.txt", 3);
-    defer std.testing.allocator.free(llo);
-    try std.testing.expectEqualStrings("llo", llo);
+    var llo = try host.readFileTrailerAlloc(std.testing.allocator, "/host/a.txt", 3);
+    defer llo.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("llo", llo.bytes);
+    try std.testing.expectEqual(@as(u64, 5), llo.file_size);
     try std.testing.expectEqual(@as(usize, 1), host_ctx.trailer_reads);
 
     try host.renameAbsolute("/host/a.txt", "/host/b.txt");
@@ -2498,6 +2647,49 @@ test "host storage delegates through callbacks" {
     const t0 = host.nowNs();
     const t1 = host.nowNs();
     try std.testing.expect(t1 > t0);
+    try std.testing.expectError(
+        error.DurableAtomicWriteUnsupported,
+        host.beginAtomicWrite(std.testing.allocator, "/host/not-durable"),
+    );
+    try std.testing.expectError(
+        error.DurableFileSyncUnsupported,
+        host.syncFileContentsAbsolute("/host/not-durable"),
+    );
+    try std.testing.expectError(
+        error.DurableDirectorySyncUnsupported,
+        host.syncParentAbsolute("/host/not-durable"),
+    );
+
+    var durable_host_vtable = host_vtable;
+    durable_host_vtable.sync_contents_absolute = HostContext.syncFileContentsAbsolute;
+    const durable_host = HostStorage.init(&host_ctx, &durable_host_vtable).storage();
+    try std.testing.expectError(
+        error.DurableAtomicWriteUnsupported,
+        durable_host.beginAtomicWrite(std.testing.allocator, "/host/not-atomic"),
+    );
+    try std.testing.expectError(
+        error.DurableDirectorySyncUnsupported,
+        durable_host.syncParentAbsolute("/host/not-parent-durable"),
+    );
+    try durable_host.appendFileAbsolute(std.testing.allocator, "/host/durable.log", "a", true);
+    try durable_host.appendFileAbsolute(std.testing.allocator, "/host/durable.log", "b", true);
+    try std.testing.expectEqual(@as(usize, 2), host_ctx.content_syncs);
+    const durable_contents = try durable_host.readFileAlloc(std.testing.allocator, "/host/durable.log", 32);
+    defer std.testing.allocator.free(durable_contents);
+    try std.testing.expectEqualStrings("ab", durable_contents);
+
+    var atomic_host_vtable = durable_host_vtable;
+    atomic_host_vtable.sync_parent_absolute = HostContext.syncParentAbsolute;
+    atomic_host_vtable.rename_is_atomic = true;
+    const atomic_host = HostStorage.init(&host_ctx, &atomic_host_vtable).storage();
+    var atomic_writer = try atomic_host.beginAtomicWrite(std.testing.allocator, "/host/atomic.bin");
+    try atomic_writer.appendSlice("durable");
+    try atomic_writer.finish();
+    try std.testing.expectEqual(@as(usize, 3), host_ctx.content_syncs);
+    try std.testing.expectEqual(@as(usize, 1), host_ctx.parent_syncs);
+    const atomic_contents = try atomic_host.readFileAlloc(std.testing.allocator, "/host/atomic.bin", 32);
+    defer std.testing.allocator.free(atomic_contents);
+    try std.testing.expectEqualStrings("durable", atomic_contents);
 }
 
 test "storage range read future fallback waits and cancels" {
@@ -2540,6 +2732,37 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native atomic write sink cleans temporary file when content sync fails" {
+    if (!supports_native_storage) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-sync-failure-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+
+    var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
+    const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+    const tmp_path = try std.testing.allocator.dupe(u8, impl.tmp_path);
+    defer std.testing.allocator.free(tmp_path);
+    try writer.appendSlice("uncommitted");
+
+    closeFd(impl.fd);
+    impl.fd = -1;
+    try std.testing.expectError(error.InvalidFileDescriptor, writer.finish());
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        native.storage().fileSize(tmp_path),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        native.storage().fileSize(path),
+    );
 }
 
 test "buffered atomic write sink supports overlapping writes and appends" {

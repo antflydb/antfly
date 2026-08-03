@@ -4175,6 +4175,8 @@ pub export fn antfly_db_search_json(
             if (full_result) |*value| value.deinit();
         }
         if (!agg_source_is_full) {
+            if (result.total_hits > aggregations_mod.max_aggregation_source_hits)
+                return capi.mapError(error.QueryCandidateBudgetExceeded);
             var agg_req = req;
             agg_req.offset = 0;
             agg_req.limit = if (result.total_hits == 0) 1 else result.total_hits;
@@ -7024,7 +7026,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
+    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    defer alloc.free(expected_format_version);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"active_checkpoint\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);

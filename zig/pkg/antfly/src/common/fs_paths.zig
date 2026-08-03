@@ -67,32 +67,24 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
 }
 
 pub fn syncDirPortable(io: anytype, path: []const u8) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableDirectorySyncUnsupported;
 
     var dir = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
     else
         try std.Io.Dir.cwd().openDir(io, if (path.len == 0) "." else path, .{ .iterate = true });
     defer dir.close(io);
-
-    while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        .INVAL => return,
-        .BADF => return error.InvalidFileDescriptor,
-        .IO => return error.InputOutput,
-        .NOSPC => return error.NoSpaceLeft,
-        .DQUOT => return error.DiskQuota,
-        else => |err| return std.posix.unexpectedErrno(err),
-    };
+    try syncDirectoryFdPortable(dir.handle);
 }
 
-pub fn syncFdPortable(fd: std.posix.fd_t) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableFileSyncUnsupported;
     while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
         .SUCCESS => return,
         .INTR => continue,
-        .INVAL => return,
+        .INVAL => return error.DurableFileSyncUnsupported,
         .BADF => return error.InvalidFileDescriptor,
         .IO => return error.InputOutput,
         .NOSPC => return error.NoSpaceLeft,
@@ -101,15 +93,57 @@ pub fn syncFdPortable(fd: std.posix.fd_t) !void {
     };
 }
 
-pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
+pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableDirectorySyncUnsupported;
+    while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .INVAL => return error.DurableDirectorySyncUnsupported,
+        .BADF => return error.InvalidFileDescriptor,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+pub fn syncFilePortable(io: anytype, path: []const u8) !void {
     const file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     try file.sync(io);
+}
+
+pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
+    try syncFilePortable(io, path);
     const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
     try syncDirPortable(io, parent);
+}
+
+pub fn pathsReferToSameExistingFile(allocator: std.mem.Allocator, io: anytype, a: []const u8, b: []const u8) !bool {
+    const a_real = realPathAlloc(allocator, io, a) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(a_real);
+
+    const b_real = realPathAlloc(allocator, io, b) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(b_real);
+
+    return std.mem.eql(u8, a_real, b_real);
+}
+
+fn realPathAlloc(allocator: std.mem.Allocator, io: anytype, path: []const u8) ![:0]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
 }
 
 test "syncDirPortable opens a real directory fd" {
@@ -141,6 +175,24 @@ test "createDirPathPortable creates absolute nested directories" {
 
     var dir = try std.Io.Dir.openDirAbsolute(io_impl.io(), path, .{});
     defer dir.close(io_impl.io());
+}
+
+test "pathsReferToSameExistingFile resolves aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+
+    const relative = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(relative);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), relative, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const aliased = try std.fmt.allocPrint(std.testing.allocator, "./{s}", .{relative});
+    defer std.testing.allocator.free(aliased);
+
+    try std.testing.expect(try pathsReferToSameExistingFile(std.testing.allocator, io_impl.io(), absolute, aliased));
+    try std.testing.expect(!try pathsReferToSameExistingFile(std.testing.allocator, io_impl.io(), absolute, "missing"));
 }
 
 fn createDirAbsolutePortable(path: []const u8) !void {

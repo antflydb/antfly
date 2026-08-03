@@ -27,6 +27,7 @@ pub const CatalogOptions = struct {
     base_url: ?[]const u8 = null,
     publisher_domain: []const u8 = "antfly.local",
     display_name: []const u8 = "Antfly",
+    a2a_enabled: bool = false,
     is_admin: bool = false,
     permissions: ?[]const usermgr.Permission = null,
     profile: ?[]const u8 = null,
@@ -2701,6 +2702,7 @@ fn isAgentLike(entry: Entry) bool {
 }
 
 fn catalogOptionsAllowStaticEntry(options: CatalogOptions, entry: Entry) bool {
+    if (!options.a2a_enabled and std.mem.eql(u8, entry.media_type, "application/a2a-agent-card+json")) return false;
     if (entry.admin_only and !options.is_admin) return false;
     if (!catalogOptionsAllowRequiredPermission(options, entry.required_permission)) return false;
     return catalogOptionsAllowMedia(options, entry.media_type, entry.tags);
@@ -3071,6 +3073,18 @@ test "ARD catalog entries contain required value or reference fields" {
         try std.testing.expect(has_url != has_data);
         if (object.get("metadata")) |metadata| try expectMetadataValuesAreScalars(metadata);
     }
+}
+
+test "ARD catalog omits A2A discovery when disabled" {
+    const hidden = try catalogJsonAlloc(std.testing.allocator, .{ .a2a_enabled = false });
+    defer std.testing.allocator.free(hidden);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "application/a2a-agent-card+json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "/.well-known/agent-card.json") == null);
+
+    const enabled = try catalogJsonAlloc(std.testing.allocator, .{ .a2a_enabled = true });
+    defer std.testing.allocator.free(enabled);
+    try std.testing.expect(std.mem.indexOf(u8, enabled, "application/a2a-agent-card+json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enabled, "/.well-known/agent-card.json") != null);
 }
 
 test "ARD catalog resolves artifact urls against configured base url" {

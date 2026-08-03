@@ -33,23 +33,23 @@ func TestE2E_AntflyJoin(t *testing.T) {
 
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	// ---- Create tables ----
 	t.Log("Creating customers and orders tables...")
-	err := swarm.Client.CreateTable(ctx, "customers", antfly.CreateTableRequest{NumShards: 1})
+	err := standalone.Client.CreateTable(ctx, "customers", antfly.CreateTableRequest{NumShards: 1})
 	require.NoError(t, err, "creating customers table")
 
-	err = swarm.Client.CreateTable(ctx, "orders", antfly.CreateTableRequest{NumShards: 1})
+	err = standalone.Client.CreateTable(ctx, "orders", antfly.CreateTableRequest{NumShards: 1})
 	require.NoError(t, err, "creating orders table")
 
-	waitForShardsReady(t, ctx, swarm.Client, "customers", 30*time.Second)
-	waitForShardsReady(t, ctx, swarm.Client, "orders", 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, "customers", 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, "orders", 30*time.Second)
 
 	// ---- Insert customer data ----
 	t.Log("Inserting customer data...")
-	_, err = swarm.Client.Batch(ctx, "customers", antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, "customers", antfly.BatchRequest{
 		Inserts: map[string]any{
 			"cust-1": map[string]any{"customer_id": "cust-1", "name": "Alice", "email": "alice@example.com", "tier": "gold"},
 			"cust-2": map[string]any{"customer_id": "cust-2", "name": "Bob", "email": "bob@example.com", "tier": "silver"},
@@ -63,7 +63,7 @@ func TestE2E_AntflyJoin(t *testing.T) {
 
 	// ---- Insert order data ----
 	t.Log("Inserting order data...")
-	_, err = swarm.Client.Batch(ctx, "orders", antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, "orders", antfly.BatchRequest{
 		Inserts: map[string]any{
 			"order-001": map[string]any{"customer_id": "cust-1", "product": "Widget A", "amount": 29.99},
 			"order-002": map[string]any{"customer_id": "cust-3", "product": "Widget B", "amount": 49.99},
@@ -76,18 +76,18 @@ func TestE2E_AntflyJoin(t *testing.T) {
 	// ---- Wait for keys ----
 	for _, key := range []string{"cust-1", "cust-2", "cust-3", "cust-4", "cust-5"} {
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, "customers", key, 15*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, "customers", key, 15*time.Second),
 			"customer key %s not available", key)
 	}
 	for _, key := range []string{"order-001", "order-002", "order-003"} {
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, "orders", key, 15*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, "orders", key, 15*time.Second),
 			"order key %s not available", key)
 	}
 
 	// ---- INNER JOIN ----
 	t.Log("Executing INNER JOIN: orders JOIN customers ON customer_id = customer_id...")
-	resp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: "orders",
 		Limit: 10,
 		Join: antfly.JoinClause{
@@ -129,7 +129,7 @@ func TestE2E_AntflyJoin(t *testing.T) {
 	// ---- LEFT JOIN with unmatched row ----
 	// Insert an order referencing a non-existent customer
 	t.Log("Inserting order with non-existent customer for LEFT JOIN test...")
-	_, err = swarm.Client.Batch(ctx, "orders", antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, "orders", antfly.BatchRequest{
 		Inserts: map[string]any{
 			"order-004": map[string]any{"customer_id": "cust-999", "product": "Widget D", "amount": 9.99},
 		},
@@ -137,11 +137,11 @@ func TestE2E_AntflyJoin(t *testing.T) {
 	})
 	require.NoError(t, err, "inserting unmatched order")
 	require.NoError(t,
-		waitForKeyAvailable(t, ctx, swarm.Client, "orders", "order-004", 15*time.Second),
+		waitForKeyAvailable(t, ctx, standalone.Client, "orders", "order-004", 15*time.Second),
 		"order-004 not available")
 
 	t.Log("Executing LEFT JOIN: orders LEFT JOIN customers ON customer_id...")
-	resp, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: "orders",
 		Limit: 20,
 		Join: antfly.JoinClause{
@@ -197,13 +197,13 @@ func TestE2E_ForeignTable_BasicQuery(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	// Start Antfly (no Antfly inference needed)
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	// Query the foreign table — no Antfly table creation needed.
 	// The foreign_sources map tells Antfly to route the query to PG.
 	t.Log("Querying foreign PostgreSQL table through Antfly...")
-	resp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: "pg_customers",
 		Limit: 10,
 		ForeignSources: map[string]antfly.ForeignSource{
@@ -238,13 +238,13 @@ func TestE2E_ForeignTable_FilteredQuery(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	// Filter for gold tier customers
 	t.Log("Querying foreign table with filter_query for tier=gold...")
 	filterQ := query.NewTerm("gold", "tier")
-	resp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:       "pg_customers",
 		Limit:       10,
 		FilterQuery: &filterQ,
@@ -280,12 +280,12 @@ func TestE2E_ForeignTable_UnsupportedOps(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	// Unsupported aggregation types on foreign tables should fail with 400
 	t.Log("Verifying unsupported aggregation types are rejected on foreign tables...")
-	resp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: "pg_customers",
 		Limit: 10,
 		Aggregations: map[string]antfly.AggregationRequest{
@@ -313,21 +313,21 @@ func TestE2E_ForeignTable_JoinWithAntfly(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	// Create an Antfly table with order data that references customer IDs
 	t.Log("Creating Antfly orders table...")
-	err := swarm.Client.CreateTable(ctx, "orders", antfly.CreateTableRequest{
+	err := standalone.Client.CreateTable(ctx, "orders", antfly.CreateTableRequest{
 		NumShards: 1,
 	})
 	require.NoError(t, err, "creating orders table")
-	waitForShardsReady(t, ctx, swarm.Client, "orders", 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, "orders", 30*time.Second)
 
 	// Insert order documents into Antfly.
 	// customer_id is a string to match the PG column type for join compatibility.
 	t.Log("Inserting order data into Antfly...")
-	_, err = swarm.Client.Batch(ctx, "orders", antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, "orders", antfly.BatchRequest{
 		Inserts: map[string]any{
 			"order-001": map[string]any{
 				"customer_id": "cust-1",
@@ -352,13 +352,13 @@ func TestE2E_ForeignTable_JoinWithAntfly(t *testing.T) {
 	// Wait for all keys to be available
 	for _, key := range []string{"order-001", "order-002", "order-003"} {
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, "orders", key, 15*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, "orders", key, 15*time.Second),
 			"key %s not available", key)
 	}
 
 	// Join orders (Antfly) with customers (PostgreSQL)
 	t.Log("Executing join: orders LEFT JOIN pg_customers ON customer_id = customer_id...")
-	resp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: "orders",
 		Limit: 10,
 		Join: antfly.JoinClause{
@@ -438,12 +438,12 @@ func TestE2E_ForeignTable_CDCJoin(t *testing.T) {
 	conn.Close(ctx)
 
 	// ---- Start Antfly ----
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	// Create Antfly table with CDC replication from PG orders
 	t.Log("Creating Antfly table with CDC replication source for orders...")
-	err = swarm.Client.CreateTable(ctx, antflyOrdersTable, antfly.CreateTableRequest{
+	err = standalone.Client.CreateTable(ctx, antflyOrdersTable, antfly.CreateTableRequest{
 		NumShards: 1,
 		ReplicationSources: []antfly.ReplicationSource{
 			{
@@ -455,7 +455,7 @@ func TestE2E_ForeignTable_CDCJoin(t *testing.T) {
 		},
 	})
 	require.NoError(t, err, "creating Antfly CDC orders table")
-	waitForShardsReady(t, ctx, swarm.Client, antflyOrdersTable, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, antflyOrdersTable, 30*time.Second)
 
 	// ---- INSERT orders into PG ----
 	t.Log("Inserting orders into PostgreSQL...")
@@ -472,19 +472,19 @@ func TestE2E_ForeignTable_CDCJoin(t *testing.T) {
 	t.Log("Waiting for CDC replication of orders...")
 	for _, key := range []string{"order-001", "order-002", "order-003"} {
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, antflyOrdersTable, key, 30*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, antflyOrdersTable, key, 30*time.Second),
 			"order %s not replicated", key)
 	}
 
 	// Verify order content replicated correctly
-	doc, err := swarm.Client.LookupKey(ctx, antflyOrdersTable, "order-001")
+	doc, err := standalone.Client.LookupKey(ctx, antflyOrdersTable, "order-001")
 	require.NoError(t, err)
 	require.Equal(t, "cust-1", doc["customer_id"], "expected customer_id=cust-1")
 	require.Equal(t, "Widget A", doc["product"])
 
 	// ---- JOIN: CDC orders (Antfly) LEFT JOIN customers (PG foreign) ----
 	t.Log("Executing LEFT JOIN: cdc_orders LEFT JOIN pg_customers ON customer_id...")
-	resp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: antflyOrdersTable,
 		Limit: 10,
 		Join: antfly.JoinClause{
@@ -533,12 +533,12 @@ func TestE2E_ForeignTable_CDCJoin(t *testing.T) {
 
 	// Wait for CDC to propagate the update
 	require.NoError(t,
-		waitForFieldValue(t, ctx, swarm.Client, antflyOrdersTable, "order-003", "customer_id", "cust-2", 30*time.Second),
+		waitForFieldValue(t, ctx, standalone.Client, antflyOrdersTable, "order-003", "customer_id", "cust-2", 30*time.Second),
 		"CDC update not propagated for order-003")
 
 	// Re-run the join and verify the updated mapping
 	t.Log("Re-executing join after CDC update...")
-	resp, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	resp, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: antflyOrdersTable,
 		Limit: 10,
 		Join: antfly.JoinClause{

@@ -16,7 +16,7 @@ const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
 const backups_api = @import("../backups.zig");
 const metadata_mod = @import("../../metadata/mod.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
@@ -61,6 +61,25 @@ pub const DroppedTableDeleteWork = struct {
         std.heap.page_allocator.destroy(self);
     }
 };
+
+pub fn forwardedTableBackupRequestAlloc(
+    alloc: std.mem.Allocator,
+    backup_id: []const u8,
+    location_uri: []const u8,
+    connection: []const u8,
+    format: backups_api.BackupFormat,
+) ![]u8 {
+    const format_name = switch (format) {
+        .native => "native",
+        .portable => "portable",
+    };
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .backup_id = backup_id,
+        .location = location_uri,
+        .connection = connection,
+        .format = format_name,
+    }, .{})});
+}
 
 pub fn scheduleDroppedGroupDelete(
     runtime: *db_mod.background_runtime.BackendRuntime,
@@ -219,17 +238,14 @@ pub fn exportPortableBackupShard(
     backup_root: []const u8,
     backup_id: []const u8,
     group_id: u64,
+    shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
     const rel_path = try portableBackupShardRelPath(alloc, backup_id);
     errdefer alloc.free(rel_path);
 
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(alloc);
-    try portable_backup.exportPortableDb(alloc, db, &out);
-
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
     defer alloc.free(dest_path);
-    try writeBackupFile(dest_path, out.items);
+    try exportPortableBackupFile(alloc, db, dest_path, shared_io);
 
     const byte_range = db.getRange();
     const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
@@ -239,6 +255,14 @@ pub fn exportPortableBackupShard(
         .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
         .snapshot_path = rel_path,
     };
+    errdefer shards[0].deinit(alloc);
+    try backups_api.populateShardArtifactIntegrity(
+        alloc,
+        shared_io,
+        .portable,
+        dest_path,
+        &shards[0],
+    );
     return shards;
 }
 
@@ -250,9 +274,10 @@ pub fn backupOpenDbShard(
     group_id: u64,
     snapshot_token: []const u8,
     format: backups_api.BackupFormat,
+    shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
     if (format == .portable) {
-        return try exportPortableBackupShard(alloc, db, backup_root, backup_id, group_id);
+        return try exportPortableBackupShard(alloc, db, backup_root, backup_id, group_id, shared_io);
     }
 
     _ = try db.snapshot(snapshot_token);
@@ -261,7 +286,7 @@ pub fn backupOpenDbShard(
     defer alloc.free(snapshot_root);
     const dest_root = try backups_api.shardSnapshotPath(alloc, backup_root, backup_id, group_id);
     defer alloc.free(dest_root);
-    try backups_api.copyDirectoryRecursive(alloc, snapshot_root, dest_root);
+    try backups_api.copyDirectoryRecursiveUsingIo(alloc, shared_io, snapshot_root, dest_root);
 
     const rel_path = try backups_api.shardSnapshotRelPath(alloc, backup_id, group_id);
     errdefer alloc.free(rel_path);
@@ -273,6 +298,14 @@ pub fn backupOpenDbShard(
         .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
         .snapshot_path = rel_path,
     };
+    errdefer shards[0].deinit(alloc);
+    try backups_api.populateShardArtifactIntegrity(
+        alloc,
+        shared_io,
+        .native,
+        dest_root,
+        &shards[0],
+    );
     return shards;
 }
 
@@ -283,7 +316,7 @@ pub fn backupLocalTable(
 ) ![]backups_api.ShardSnapshot {
     const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
     defer alloc.free(snapshot_token);
-    return try backupOpenDbShard(alloc, db, plan.backup_root, plan.backup_id, 0, snapshot_token, plan.format);
+    return try backupOpenDbShard(alloc, db, plan.backup_root, plan.backup_id, 0, snapshot_token, plan.format, plan.io);
 }
 
 pub fn restoreLocalTable(
@@ -296,9 +329,7 @@ pub fn restoreLocalTable(
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
     defer alloc.free(snapshot_root);
     if (std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb")) {
-        const body = try readBackupFileAlloc(alloc, snapshot_root);
-        defer alloc.free(body);
-        try portable_backup.importPortableDb(alloc, db, body);
+        try importPortableBackupFile(alloc, db, snapshot_root, plan.io);
         return;
     }
 
@@ -340,6 +371,7 @@ fn hasMatchingDeferredRestoreRepairState(
     if (!state.primary_restored or state.runtime_repair_complete) return false;
     if (state.group_id != group_id) return false;
     if (!std.mem.eql(u8, state.backup_id, plan.manifest.backup_id)) return false;
+    if (!std.mem.eql(u8, state.artifact_sha256, plan.manifest.shards[0].artifact_sha256)) return false;
     if (!std.mem.eql(u8, state.snapshot_path, snapshot_path)) return false;
     if (std.mem.eql(u8, state.location, plan.backup_root)) return true;
 
@@ -382,12 +414,16 @@ pub fn restoreProvisionedTableGroupDeferredRuntimeRepair(
     }
 
     if (before_restore_work) |run| run();
-    try prepareLocalTablePathForRestore(alloc, path);
-    db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(&staged, alloc, snapshot_root, staged.path(), .{
         .identity_namespace = identity_namespace,
     }, .{
         .backup_id = plan.manifest.backup_id,
         .location = plan.backup_root,
+        .artifact_sha256 = plan.manifest.shards[0].artifact_sha256,
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     }) catch |err| {
@@ -410,24 +446,48 @@ pub fn restoreProvisionedTableGroupDeferredRuntimeRepair(
         }
         return err;
     };
+    _ = try staged.publish();
 }
 
-pub fn writeBackupFile(path: []const u8, body: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        var io_parent = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_parent.deinit();
-        try fs_paths.createDirPathPortable(io_parent.io(), parent);
-    }
-
+pub fn exportPortableBackupFile(
+    alloc: std.mem.Allocator,
+    db: anytype,
+    path: []const u8,
+    shared_io: ?std.Io,
+) !void {
+    if (shared_io) |io| return try exportPortableBackupFileWithIo(alloc, db, path, io);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
-    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [8192]u8 = undefined;
+    return try exportPortableBackupFileWithIo(alloc, db, path, io_impl.io());
+}
+
+fn exportPortableBackupFileWithIo(
+    alloc: std.mem.Allocator,
+    db: anytype,
+    path: []const u8,
+    io: std.Io,
+) !void {
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(body);
+    try portable_backup.exportPortableDbToWriter(alloc, db, &writer.interface);
     try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
 }
 
 pub fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -439,6 +499,33 @@ pub fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
         alloc,
         .limited(backups_api.max_portable_backup_file_bytes),
     );
+}
+
+pub fn importPortableBackupFile(
+    alloc: std.mem.Allocator,
+    db: anytype,
+    path: []const u8,
+    shared_io: ?std.Io,
+) !void {
+    if (shared_io) |io| return try importPortableBackupFileWithIo(alloc, db, path, io);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try importPortableBackupFileWithIo(alloc, db, path, io_impl.io());
+}
+
+fn importPortableBackupFileWithIo(
+    alloc: std.mem.Allocator,
+    db: anytype,
+    path: []const u8,
+    io: std.Io,
+) !void {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    try portable_backup.importPortableDbFile(alloc, db, io, file, stat.size);
 }
 
 pub fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
@@ -462,6 +549,11 @@ pub fn cloneShardSnapshots(
             .start_key = try alloc.dupe(u8, shard.start_key),
             .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
+            .artifact_size_bytes = shard.artifact_size_bytes,
+            .artifact_sha256 = if (shard.artifact_sha256.len > 0)
+                try alloc.dupe(u8, shard.artifact_sha256)
+            else
+                "",
         };
         initialized += 1;
     }

@@ -31,6 +31,7 @@ const TruncateFnType = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
 const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
 const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
 const CanAdvanceToTargetFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
+const AppliedSequenceAdvancedFnType = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
 const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
     pub const RuntimeError = error{AsyncWorkerFailed};
@@ -40,6 +41,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
     pub const BeginCatchUpFn = BeginCatchUpFnType;
     pub const FinishCatchUpFn = FinishCatchUpFnType;
     pub const CanAdvanceToTargetFn = CanAdvanceToTargetFnType;
+    pub const AppliedSequenceAdvancedFn = AppliedSequenceAdvancedFnType;
 
     pub const DerivedRuntime = struct {
         pub fn init(
@@ -52,6 +54,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             begin_catch_up_fn: ?BeginCatchUpFnType,
             finish_catch_up_fn: ?FinishCatchUpFnType,
             can_advance_to_target_fn: ?CanAdvanceToTargetFnType,
+            applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFnType,
             resource_manager: ?*resource_manager_mod.ResourceManager,
         ) @This() {
             _ = alloc;
@@ -63,6 +66,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             _ = begin_catch_up_fn;
             _ = finish_catch_up_fn;
             _ = can_advance_to_target_fn;
+            _ = applied_sequence_advanced_fn;
             _ = resource_manager;
             return .{};
         }
@@ -96,6 +100,10 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             return null;
         }
 
+        pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
+            return .{};
+        }
+
         pub fn notifySequence(self: *@This(), sequence: u64) void {
             _ = self;
             _ = sequence;
@@ -124,8 +132,8 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             _ = bytes;
         }
 
-        pub fn shouldThrottleBacklog(_: *@This()) bool {
-            return false;
+        pub fn backlogThrottleTargetSequence(_: *@This()) ?u64 {
+            return null;
         }
 
         pub fn releaseBacklogThrough(self: *@This(), sequence: u64) void {
@@ -156,6 +164,7 @@ pub const TruncateFn = async_runtime_mod.TruncateFn;
 pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
 pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
+pub const AppliedSequenceAdvancedFn = async_runtime_mod.AppliedSequenceAdvancedFn;
 pub const RuntimeError = async_runtime_mod.RuntimeError;
 
 pub const Backend = runtime_backend.Backend;
@@ -175,12 +184,13 @@ pub const Executor = struct {
         add_worker: *const fn (ptr: *anyopaque, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) anyerror!void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
+        snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
         notify_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
         force_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         track_backlog_bytes: *const fn (ptr: *anyopaque, sequence: u64, bytes: u64) anyerror!void,
-        should_throttle_backlog: *const fn (ptr: *anyopaque) bool,
+        backlog_throttle_target_sequence: *const fn (ptr: *anyopaque) ?u64,
         release_backlog_through: *const fn (ptr: *anyopaque, sequence: u64) void,
         wait_for_all: *const fn (ptr: *anyopaque, sequence: u64) anyerror!void,
         wait_for_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) anyerror!void,
@@ -211,6 +221,10 @@ pub const Executor = struct {
         return self.vtable.applied_sequence(self.ptr, name);
     }
 
+    pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
+        return self.vtable.snapshot_stats(self.ptr);
+    }
+
     pub fn notifySequence(self: *Executor, sequence: u64) void {
         self.vtable.notify_sequence(self.ptr, sequence);
     }
@@ -231,8 +245,8 @@ pub const Executor = struct {
         return try self.vtable.track_backlog_bytes(self.ptr, sequence, bytes);
     }
 
-    pub fn shouldThrottleBacklog(self: *Executor) bool {
-        return self.vtable.should_throttle_backlog(self.ptr);
+    pub fn backlogThrottleTargetSequence(self: *Executor) ?u64 {
+        return self.vtable.backlog_throttle_target_sequence(self.ptr);
     }
 
     pub fn releaseBacklogThrough(self: *Executor, sequence: u64) void {
@@ -259,13 +273,14 @@ pub fn init(
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
 ) !Executor {
     try runtime_backend.ensureExecutorBackendAvailable(config.backend);
     return switch (config.backend) {
-        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager),
-        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager, backend_runtime),
+        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager),
+        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime),
     };
 }
 
@@ -286,6 +301,7 @@ const ManualRuntime = struct {
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     backlog: backlog_tracker_mod.Tracker,
     workers: std.ArrayListUnmanaged(ManualWorker) = .empty,
 
@@ -333,6 +349,18 @@ const ManualRuntime = struct {
         return null;
     }
 
+    fn snapshotStats(self: *ManualRuntime) types.DerivedWorkerStats {
+        var stats = types.DerivedWorkerStats{
+            .workers = @intCast(self.workers.items.len),
+        };
+        for (self.workers.items) |worker| {
+            const lag = worker.target_sequence -| worker.applied_sequence;
+            if (lag > 0) stats.workers_with_replay_debt += 1;
+            stats.max_replay_lag_sequences = @max(stats.max_replay_lag_sequences, lag);
+        }
+        return stats;
+    }
+
     fn notifySequence(self: *ManualRuntime, sequence: u64) void {
         for (self.workers.items) |*worker| {
             worker.target_sequence = @max(worker.target_sequence, sequence);
@@ -361,8 +389,8 @@ const ManualRuntime = struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
-    fn shouldThrottleBacklog(self: *ManualRuntime) bool {
-        return self.backlog.shouldThrottleWrites();
+    fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
+        return self.backlog.throttleTargetSequence();
     }
 
     fn releaseBacklogThrough(self: *ManualRuntime, sequence: u64) void {
@@ -411,6 +439,7 @@ const ManualRuntime = struct {
                     platform.time.yieldBriefly();
                 }
                 worker.applied_sequence = caught_up_sequence;
+                if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
             }
         }
 
@@ -441,6 +470,7 @@ const ManualRuntime = struct {
                     platform.time.yieldBriefly();
                 }
                 worker.applied_sequence = caught_up_sequence;
+                if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
             }
         }
 
@@ -478,6 +508,7 @@ fn initManual(
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
 ) !Executor {
     const runtime = try alloc.create(ManualRuntime);
@@ -492,6 +523,7 @@ fn initManual(
         .begin_catch_up_fn = begin_catch_up_fn,
         .finish_catch_up_fn = finish_catch_up_fn,
         .can_advance_to_target_fn = can_advance_to_target_fn,
+        .applied_sequence_advanced_fn = applied_sequence_advanced_fn,
         .backlog = backlog_tracker_mod.Tracker.init(resource_manager),
     };
     return .{
@@ -507,12 +539,13 @@ const manual_vtable = Executor.VTable{
     .add_worker = manualAddWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
+    .snapshot_stats = manualSnapshotStats,
     .notify_sequence = manualNotifySequence,
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
     .force_sequence = manualForceSequence,
     .track_backlog_bytes = manualTrackBacklogBytes,
-    .should_throttle_backlog = manualShouldThrottleBacklog,
+    .backlog_throttle_target_sequence = manualBacklogThrottleTargetSequence,
     .release_backlog_through = manualReleaseBacklogThrough,
     .wait_for_all = manualWaitForAll,
     .wait_for_indexes = manualWaitForIndexes,
@@ -549,6 +582,11 @@ fn manualAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     return runtime.appliedSequence(name);
 }
 
+fn manualSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.snapshotStats();
+}
+
 fn manualNotifySequence(ptr: *anyopaque, sequence: u64) void {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     runtime.notifySequence(sequence);
@@ -574,9 +612,9 @@ fn manualTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
-fn manualShouldThrottleBacklog(ptr: *anyopaque) bool {
+fn manualBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
-    return runtime.shouldThrottleBacklog();
+    return runtime.backlogThrottleTargetSequence();
 }
 
 fn manualReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {
@@ -604,6 +642,7 @@ fn initIoThreaded(
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
 ) !Executor {
@@ -613,9 +652,9 @@ fn initIoThreaded(
     errdefer alloc.destroy(runtime);
     if (backend_runtime) |bg| {
         const io_impl = bg.io_impl orelse return error.MissingBackendRuntimeIo;
-        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager);
+        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     } else {
-        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager);
+        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     }
     return .{
         .ptr = runtime,
@@ -630,12 +669,13 @@ const io_threaded_vtable = Executor.VTable{
     .add_worker = ioThreadedAddWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
+    .snapshot_stats = ioThreadedSnapshotStats,
     .notify_sequence = ioThreadedNotifySequence,
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
     .force_sequence = ioThreadedForceSequence,
     .track_backlog_bytes = ioThreadedTrackBacklogBytes,
-    .should_throttle_backlog = ioThreadedShouldThrottleBacklog,
+    .backlog_throttle_target_sequence = ioThreadedBacklogThrottleTargetSequence,
     .release_backlog_through = ioThreadedReleaseBacklogThrough,
     .wait_for_all = ioThreadedWaitForAll,
     .wait_for_indexes = ioThreadedWaitForIndexes,
@@ -672,6 +712,11 @@ fn ioThreadedAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     return runtime.appliedSequence(name);
 }
 
+fn ioThreadedSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.snapshotStats();
+}
+
 fn ioThreadedNotifySequence(ptr: *anyopaque, sequence: u64) void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     runtime.notifySequence(sequence);
@@ -697,9 +742,9 @@ fn ioThreadedTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
-fn ioThreadedShouldThrottleBacklog(ptr: *anyopaque) bool {
+fn ioThreadedBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return runtime.shouldThrottleBacklog();
+    return runtime.backlogThrottleTargetSequence();
 }
 
 fn ioThreadedReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {

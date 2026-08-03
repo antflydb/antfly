@@ -12,6 +12,103 @@ const antfly_middleware_openapi = @import("antfly_middleware_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
+pub const AwsCredentialConfigSource = enum {
+    default,
+    static,
+    profile,
+    web_identity,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .default => "default",
+            .static => "static",
+            .profile => "profile",
+            .web_identity => "web_identity",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "default", .default },
+            .{ "static", .static },
+            .{ "profile", .profile },
+            .{ "web_identity", .web_identity },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Per-connection AWS credential identity. Each named connection owns an independent refresh cache, allowing lanes to use different accounts, profiles, or workload identities.
+pub const AwsCredentialConfig = struct {
+    source: AwsCredentialConfigSource,
+    /// Static access key or secret reference.
+    access_key_id: ?[]const u8 = null,
+    /// Static secret key or secret reference.
+    secret_access_key: ?[]const u8 = null,
+    /// Optional static session token or secret reference.
+    session_token: ?[]const u8 = null,
+    /// Shared credentials profile name.
+    profile: ?[]const u8 = null,
+    /// Optional credentials file path for this connection.
+    shared_credentials_file: ?[]const u8 = null,
+    /// IAM role assumed with web identity.
+    role_arn: ?[]const u8 = null,
+    /// Web identity token file mounted for this connection.
+    token_file: ?[]const u8 = null,
+    /// STS role session name.
+    session_name: ?[]const u8 = null,
+    /// Optional STS endpoint override.
+    sts_endpoint: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.access_key_id) |value| {
+            try jw.objectField("access_key_id");
+            try jw.write(value);
+        }
+        if (self.secret_access_key) |value| {
+            try jw.objectField("secret_access_key");
+            try jw.write(value);
+        }
+        if (self.session_token) |value| {
+            try jw.objectField("session_token");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        if (self.shared_credentials_file) |value| {
+            try jw.objectField("shared_credentials_file");
+            try jw.write(value);
+        }
+        if (self.role_arn) |value| {
+            try jw.objectField("role_arn");
+            try jw.write(value);
+        }
+        if (self.token_file) |value| {
+            try jw.objectField("token_file");
+            try jw.write(value);
+        }
+        if (self.session_name) |value| {
+            try jw.objectField("session_name");
+            try jw.write(value);
+        }
+        if (self.sts_endpoint) |value| {
+            try jw.objectField("sts_endpoint");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const CdcConnectionConfig = struct {
     /// CDC provider type. Initially postgres.
     provider: []const u8,
@@ -29,6 +126,71 @@ pub const CdcConnectionConfig = struct {
     publication_name: ?[]const u8 = null,
 };
 
+pub const CdcConnectionVariantKind = enum {
+    cdc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .cdc => "cdc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cdc", .cdc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const CdcConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: CdcConnectionVariantKind,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    cdc: CdcConnectionConfig,
+};
+
+/// Runtime deployment topology. Standalone runs metadata, data, APIs, and inference in one process.
+pub const ConfigDeploymentMode = enum {
+    embedded,
+    distributed,
+    standalone,
+    serverless,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedded => "embedded",
+            .distributed => "distributed",
+            .standalone => "standalone",
+            .serverless => "serverless",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedded", .embedded },
+            .{ "distributed", .distributed },
+            .{ "standalone", .standalone },
+            .{ "serverless", .serverless },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const Config = struct {
     /// Internal version of antfly
     version: ?[]const u8 = null,
@@ -38,13 +200,14 @@ pub const Config = struct {
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
     storage: ?StorageConfig = null,
+    transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
     inference: ?antfly_inference_config_openapi.Config = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
     /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
     connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
-    /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```yaml speech_to_text: antfly-whisper: provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base openai-whisper: provider: openai model: whisper-1 ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
+    /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```json { "speech_to_text": { "antfly-whisper": { "provider": "antfly", "api_url": "http://localhost:8080", "model": "openai/whisper-base" }, "openai-whisper": { "provider": "openai", "model": "whisper-1" } } } ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
     speech_to_text: ?std.json.ArrayHashMap(antfly_audio_openapi.STTConfig) = null,
     cors: ?antfly_middleware_openapi.CORSConfig = null,
     /// How many replicas of each shard should be maintained.
@@ -69,32 +232,72 @@ pub const Config = struct {
     max_shards_per_table: ?i64 = null,
     /// Default number of shards to create for a new table.
     default_shards_per_table: ?i64 = null,
-    /// Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
-    swarm_mode: ?bool = null,
-    /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add openai.api_key ``` Then reference in config: `api_key: ${secret:openai.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml embedders: openai-small: provider: openai model: text-embedding-3-small antfly-local: provider: antfly model: bge-base-en-v1.5 api_url: "http://localhost:8082" ```
+    /// Runtime deployment topology. Standalone runs metadata, data, APIs, and inference in one process.
+    deployment_mode: ?ConfigDeploymentMode = null,
+    /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided through a protected secret-store file or environment variables: 1. **Secret store** (recommended for production): mount a platform-managed secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`. Reference its values in JSON config as `"api_key": "${secret:openai.api_key}"`. 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```json { "embedders": { "openai-small": { "provider": "openai", "model": "text-embedding-3-small" }, "antfly-local": { "provider": "antfly", "model": "bge-base-en-v1.5", "api_url": "http://localhost:8082" } } } ```
     embedders: ?std.json.ArrayHashMap(antfly_embeddings_openapi.EmbedderConfig) = null,
-    /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add gemini.api_key ``` Then reference in config: `api_key: ${secret:gemini.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml generators: gemini-flash: provider: gemini model: gemini-2.5-flash ollama-local: provider: ollama model: llama3 openai-gpt4: provider: openai model: gpt-4.1 ```
+    /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided through a protected secret-store file or environment variables: 1. **Secret store** (recommended for production): mount a platform-managed secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`. Reference its values in JSON config as `"api_key": "${secret:gemini.api_key}"`. 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```json { "generators": { "gemini-flash": { "provider": "gemini", "model": "gemini-2.5-flash" }, "ollama-local": { "provider": "ollama", "model": "llama3" }, "openai-gpt4": { "provider": "openai", "model": "gpt-4.1" } } } ```
     generators: ?std.json.ArrayHashMap(antfly_generating_openapi.GeneratorConfig) = null,
-    /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```yaml chains: default: - generator: gemini-flash # Reference by name retry: max_attempts: 3 condition: on_rate_limit - generator: ollama-local # Reference by name with-inline: - generator: gemini-flash - generator_config: # Inline config provider: anthropic model: claude-sonnet-4-5-20250929 ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
+    /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```json { "chains": { "default": [ { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" }, { "generator": "ollama-local" } ], "with-inline": [ { "generator": "gemini-flash" }, { "generator_config": { "provider": "anthropic", "model": "claude-sonnet-4-5-20250929" } } ] } } ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
     chains: ?std.json.ArrayHashMap([]const NamedChainLink) = null,
-    /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```yaml rerankers: cohere-english: provider: cohere model: rerank-english-v3.0 antfly-local: provider: antfly model: mxbai-rerank-base-v1 url: "http://localhost:8080" ```
+    /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```json { "rerankers": { "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" }, "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" } } } ```
     rerankers: ?std.json.ArrayHashMap(antfly_reranking_openapi.RerankerConfig) = null,
-    /// Named chunker configurations for text chunking. Define named chunkers that can be referenced by indexes and API calls. The first chunker defined becomes the default when no chunker name is specified. **Example:** ```yaml chunkers: fixed-500: provider: antfly model: fixed target_tokens: 500 overlap_tokens: 50 semantic: provider: antfly model: semantic-chunker api_url: "http://localhost:8080" ```
+    /// Named chunker configurations for text chunking. Define named chunkers that can be referenced by indexes and API calls. The first chunker defined becomes the default when no chunker name is specified. **Example:** ```json { "chunkers": { "fixed-500": { "provider": "antfly", "model": "fixed", "target_tokens": 500, "overlap_tokens": 50 }, "semantic": { "provider": "antfly", "model": "semantic-chunker", "api_url": "http://localhost:8080" } } } ```
     chunkers: ?std.json.ArrayHashMap(antfly_chunking_openapi.ChunkerConfig) = null,
 };
 
-pub const ConnectionConfig = struct {
-    /// Optional display name for UIs.
-    display_name: ?[]const u8 = null,
-    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
-    provider: ?[]const u8 = null,
-    kind: ConnectionKind,
-    /// Namespaced actions and workflow uses this connection supports.
-    capabilities: []const []const u8,
-    inference: ?InferenceConnectionConfig = null,
-    web_search: ?WebSearchConnectionConfig = null,
-    external_io: ?ExternalIoConnectionConfig = null,
-    cdc: ?CdcConnectionConfig = null,
+pub const ConnectionConfig = union(enum) {
+    inference_connection_variant: InferenceConnectionVariant,
+    web_search_connection_variant: WebSearchConnectionVariant,
+    external_io_connection_variant: ExternalIoConnectionVariant,
+    cdc_connection_variant: CdcConnectionVariant,
+
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("kind") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "inference")) {
+            return .{ .inference_connection_variant = try parseUnionVariantFromValue(InferenceConnectionVariant, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "web_search")) {
+            return .{ .web_search_connection_variant = try parseUnionVariantFromValue(WebSearchConnectionVariant, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "external_io")) {
+            return .{ .external_io_connection_variant = try parseUnionVariantFromValue(ExternalIoConnectionVariant, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "cdc")) {
+            return .{ .cdc_connection_variant = try parseUnionVariantFromValue(CdcConnectionVariant, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .inference_connection_variant => |v| try jw.write(v),
+            .web_search_connection_variant => |v| try jw.write(v),
+            .external_io_connection_variant => |v| try jw.write(v),
+            .cdc_connection_variant => |v| try jw.write(v),
+        }
+    }
 };
 
 /// Broad physical category for a configured connection.
@@ -129,26 +332,91 @@ pub const ConnectionKind = enum {
     }
 };
 
-pub const ExternalIoConnectionConfig = struct {
-    protocol: ExternalIoProtocol,
-    /// Custom endpoint URL when configured.
-    endpoint: ?[]const u8 = null,
-    /// Buckets this connection is configured for.
-    buckets: ?[]const []const u8 = null,
-    /// Key prefix when configured.
-    prefix: ?[]const u8 = null,
-    /// Hosts or base URLs this connection applies to.
-    hosts: ?[]const []const u8 = null,
-    /// HTTP headers or secret references. Never returned by inventory APIs.
-    headers: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Object-store access key or secret reference. Never returned by inventory APIs.
-    access_key_id: ?[]const u8 = null,
-    /// Object-store secret key or secret reference. Never returned by inventory APIs.
-    secret_access_key: ?[]const u8 = null,
-    /// Object-store session token or secret reference. Never returned by inventory APIs.
-    session_token: ?[]const u8 = null,
-    /// Whether S3-compatible endpoints should use TLS.
-    use_ssl: ?bool = null,
+pub const ExternalIoConnectionConfig = union(enum) {
+    s3_external_io_config: S3ExternalIoConfig,
+    gcs_external_io_config: GcsExternalIoConfig,
+    filesystem_external_io_config: FilesystemExternalIoConfig,
+    http_external_io_config: HttpExternalIoConfig,
+
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        var owned_options = options;
+        owned_options.allocate = .alloc_always;
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, owned_options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("protocol") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "s3")) {
+            return .{ .s3_external_io_config = try parseUnionVariantFromValue(S3ExternalIoConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "gcs")) {
+            return .{ .gcs_external_io_config = try parseUnionVariantFromValue(GcsExternalIoConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "filesystem")) {
+            return .{ .filesystem_external_io_config = try parseUnionVariantFromValue(FilesystemExternalIoConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "http")) {
+            return .{ .http_external_io_config = try parseUnionVariantFromValue(HttpExternalIoConfig, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .s3_external_io_config => |v| try jw.write(v),
+            .gcs_external_io_config => |v| try jw.write(v),
+            .filesystem_external_io_config => |v| try jw.write(v),
+            .http_external_io_config => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const ExternalIoConnectionVariantKind = enum {
+    external_io,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .external_io => "external_io",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "external_io", .external_io },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ExternalIoConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: ExternalIoConnectionVariantKind,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    external_io: ExternalIoConnectionConfig,
 };
 
 /// External IO transport protocol.
@@ -183,6 +451,184 @@ pub const ExternalIoProtocol = enum {
     }
 };
 
+pub const FilesystemExternalIoConfigProtocol = enum {
+    filesystem,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .filesystem => "filesystem",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "filesystem", .filesystem },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const FilesystemExternalIoConfig = struct {
+    protocol: FilesystemExternalIoConfigProtocol,
+    /// Absolute administrator-controlled root. URI paths are resolved beneath this root.
+    root: []const u8,
+};
+
+pub const GcsCredentialConfigSource = enum {
+    default,
+    bearer_token,
+    service_account,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .default => "default",
+            .bearer_token => "bearer_token",
+            .service_account => "service_account",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "default", .default },
+            .{ "bearer_token", .bearer_token },
+            .{ "service_account", .service_account },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GcsCredentialConfig = struct {
+    source: GcsCredentialConfigSource,
+    /// Token or secret reference.
+    bearer_token: ?[]const u8 = null,
+    /// Service-account JSON or secret reference.
+    service_account_json: ?[]const u8 = null,
+    credentials_path: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.bearer_token) |value| {
+            try jw.objectField("bearer_token");
+            try jw.write(value);
+        }
+        if (self.service_account_json) |value| {
+            try jw.objectField("service_account_json");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.scope) |value| {
+            try jw.objectField("scope");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GcsExternalIoConfigProtocol = enum {
+    gcs,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gcs => "gcs",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gcs", .gcs },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GcsExternalIoConfigBucketProvisioning = enum {
+    require_existing,
+    create_if_missing,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .require_existing => "require_existing",
+            .create_if_missing => "create_if_missing",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "require_existing", .require_existing },
+            .{ "create_if_missing", .create_if_missing },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GcsExternalIoConfig = struct {
+    protocol: GcsExternalIoConfigProtocol,
+    /// GCS JSON API endpoint override.
+    endpoint: ?[]const u8 = null,
+    /// GCS JSON upload endpoint override.
+    upload_endpoint: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    bucket_provisioning: ?GcsExternalIoConfigBucketProvisioning = null,
+    buckets: []const []const u8,
+    prefix: ?[]const u8 = null,
+    credentials: ?GcsCredentialConfig = null,
+};
+
+pub const HttpExternalIoConfigProtocol = enum {
+    http,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .http => "http",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "http", .http },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HttpExternalIoConfig = struct {
+    protocol: HttpExternalIoConfigProtocol,
+    hosts: ?[]const []const u8 = null,
+    /// HTTP headers or secret references. Never returned by inventory APIs.
+    headers: ?std.json.ArrayHashMap([]const u8) = null,
+};
+
 pub const InferenceConnectionConfig = struct {
     /// Inference provider type, such as openai, anthropic, antfly, ollama, or mock.
     provider: []const u8,
@@ -202,6 +648,46 @@ pub const InferenceConnectionConfig = struct {
     names: ?[]const []const u8 = null,
     /// Model types this connection is configured to serve.
     configured_model_types: ?[]const []const u8 = null,
+};
+
+pub const InferenceConnectionVariantKind = enum {
+    inference,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inference => "inference",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inference", .inference },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: InferenceConnectionVariantKind,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    inference: InferenceConnectionConfig,
+};
+
+pub const LiteStorageConfig = struct {
+    /// Path to the single writable Antfly Lite database file.
+    path: []const u8,
+    /// Synchronize committed Lite state before acknowledging it.
+    fsync: ?bool = null,
 };
 
 pub const LocalStorageConfig = struct {
@@ -226,21 +712,35 @@ pub const NamedChainLink = struct {
     condition: ?antfly_generating_openapi.ChainCondition = null,
 };
 
-pub const S3Info = struct {
-    /// S3 bucket name where SST files will be stored
+pub const ObjectStorageConfig = struct {
+    /// ID of a connections entry with kind external_io, protocol s3, and the storage.primary capability. Storage credentials are resolved from that connection independently of remote-content credentials.
+    connection: []const u8,
     bucket: []const u8,
-    /// Optional path prefix within the bucket (e.g., 'antfly/production/')
+    prefix: ?[]const u8 = null,
+    lanes: ?ObjectStorageLanes = null,
+};
+
+/// Optional placement overrides for independently managed serverless durability lanes. Unspecified fields inherit from the object-level connection, bucket, and prefix.
+pub const ObjectStorageLanes = struct {
+    artifacts: ?ObjectStorageLocation = null,
+    manifests: ?ObjectStorageLocation = null,
+    wal: ?ObjectStorageLocation = null,
+    progress: ?ObjectStorageLocation = null,
+    catalog: ?ObjectStorageLocation = null,
+};
+
+pub const ObjectStorageLocation = struct {
+    /// Optional external_io connection override for this lane.
+    connection: ?[]const u8 = null,
+    bucket: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
 };
 
-/// Storage backend type
-pub const StorageBackend = enum {
-    local,
+pub const S3ExternalIoConfigProtocol = enum {
     s3,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .local => "local",
             .s3 => "s3",
         };
         try jw.write(s);
@@ -252,18 +752,129 @@ pub const StorageBackend = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "local", .local },
             .{ "s3", .s3 },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
+pub const S3ExternalIoConfigAddressingStyle = enum {
+    path,
+    virtual_hosted,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .path => "path",
+            .virtual_hosted => "virtual_hosted",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "path", .path },
+            .{ "virtual_hosted", .virtual_hosted },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const S3ExternalIoConfigBucketProvisioning = enum {
+    require_existing,
+    create_if_missing,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .require_existing => "require_existing",
+            .create_if_missing => "create_if_missing",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "require_existing", .require_existing },
+            .{ "create_if_missing", .create_if_missing },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const S3ExternalIoConfig = struct {
+    protocol: S3ExternalIoConfigProtocol,
+    /// S3-compatible endpoint override.
+    endpoint: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    addressing_style: ?S3ExternalIoConfigAddressingStyle = null,
+    bucket_provisioning: ?S3ExternalIoConfigBucketProvisioning = null,
+    buckets: []const []const u8,
+    prefix: ?[]const u8 = null,
+    credentials: ?AwsCredentialConfig = null,
+    use_ssl: ?bool = null,
+};
+
+/// Tagged storage-engine configuration. Engine is required and exactly the matching engine member must be present.
 pub const StorageConfig = struct {
+    engine: StorageEngine,
+    lite: ?LiteStorageConfig = null,
+    object: ?ObjectStorageConfig = null,
     local: ?LocalStorageConfig = null,
-    data: ?StorageBackend = null,
-    metadata: ?StorageBackend = null,
-    s3: ?S3Info = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("engine");
+        try jw.write(self.engine);
+        if (self.lite) |value| {
+            try jw.objectField("lite");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.local) |value| {
+            try jw.objectField("local");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Durable storage representation, independent of deployment topology.
+pub const StorageEngine = enum {
+    lite,
+    local,
+    object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lite => "lite",
+            .local => "local",
+            .object => "object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lite", .lite },
+            .{ "local", .local },
+            .{ "object", .object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const TLSInfo = struct {
@@ -271,6 +882,15 @@ pub const TLSInfo = struct {
     cert: ?[]const u8 = null,
     /// Path to TLS key file
     key: ?[]const u8 = null,
+};
+
+/// Resource and retention limits for multi-request transaction sessions.
+pub const TransactionSessionConfig = struct {
+    ttl_seconds: ?i64 = null,
+    cleanup_interval_seconds: ?i64 = null,
+    max_count: ?i64 = null,
+    max_record_bytes: ?i64 = null,
+    max_savepoints: ?i64 = null,
 };
 
 pub const WebSearchConnectionConfig = struct {
@@ -308,4 +928,37 @@ pub const WebSearchConnectionConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains when provider supports it.
     exclude_domains: ?[]const []const u8 = null,
+};
+
+pub const WebSearchConnectionVariantKind = enum {
+    web_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .web_search => "web_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "web_search", .web_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const WebSearchConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: WebSearchConnectionVariantKind,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    web_search: WebSearchConnectionConfig,
 };

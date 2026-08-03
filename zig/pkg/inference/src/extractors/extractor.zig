@@ -110,7 +110,9 @@ const RecognizerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -128,7 +130,9 @@ const RecognizerExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -164,17 +168,14 @@ const ReaderExtractor = struct {
         );
         defer reader.deinit();
 
-        var results = std.ArrayListUnmanaged(readers_mod.Result).empty;
+        const results = try reader.readBatch(image_datas, read_options);
         defer {
-            for (results.items) |*result| result.deinit();
-            results.deinit(ctx.allocator);
+            for (results) |*result| result.deinit();
+            ctx.allocator.free(results);
         }
+        if (results.len != image_datas.len) return error.InvalidReadResultCount;
 
-        for (image_datas) |image_data| {
-            try results.append(ctx.allocator, try reader.read(image_data, read_options));
-        }
-
-        return extraction_mod.extractBatchFromReaderResults(ctx.allocator, results.items, schemas, config);
+        return extraction_mod.extractBatchFromReaderResults(ctx.allocator, results, schemas, config);
     }
 };
 

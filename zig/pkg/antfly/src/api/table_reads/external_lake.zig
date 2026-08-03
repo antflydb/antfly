@@ -1114,6 +1114,10 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .join_rows_group_local = joinRowsGroupLocal,
                 .join_unmatched_group_local = joinUnmatchedGroupLocal,
                 .join_finalize_group_local = joinFinalizeGroupLocal,
+                .join_partition_group_local_with_timeout = joinPartitionGroupLocalWithTimeout,
+                .join_rows_group_local_with_timeout = joinRowsGroupLocalWithTimeout,
+                .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocalWithTimeout,
+                .join_finalize_group_local_with_timeout = joinFinalizeGroupLocalWithTimeout,
                 .join_job_state_group_local = joinJobStateGroupLocal,
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
@@ -1385,6 +1389,26 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn joinFinalizeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.base.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn joinPartitionGroupLocalWithTimeout(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinPartitionGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms);
+    }
+
+    fn joinRowsGroupLocalWithTimeout(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinRowsGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms);
+    }
+
+    fn joinUnmatchedGroupLocalWithTimeout(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinUnmatchedGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms);
+    }
+
+    fn joinFinalizeGroupLocalWithTimeout(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.joinFinalizeGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms);
     }
 
     fn joinJobStateGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
@@ -3541,6 +3565,8 @@ test "external lake routing source resolves object store for external row plans"
         document_algebraic_aggregate_count: u32 = 0,
         local_runtime_statuses_catalog_count: u32 = 0,
         observed_dynamic_capability_sets_count: u32 = 0,
+        join_partition_count: u32 = 0,
+        last_join_timeout_ms: ?u32 = null,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -3554,6 +3580,7 @@ test "external lake routing source resolves object store for external row plans"
                     .rows_query_plan_system_time_as_of_sequence = rowsQueryPlanSystemTimeAsOfSequence,
                     .local_runtime_statuses_catalog = localRuntimeStatusesCatalog,
                     .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
+                    .join_partition_group_local_with_timeout = joinPartitionGroupLocalWithTimeout,
                 },
             };
         }
@@ -3614,6 +3641,13 @@ test "external lake routing source resolves object store for external row plans"
                 .raw_value = try db_mod.algebraic.algebra.encodeAvgAlloc(aggregate_alloc, .{ .sum = 11, .count = 1 }),
             };
             return .{ .rows = rows, .total_groups = 1 };
+        }
+
+        fn joinPartitionGroupLocalWithTimeout(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.join_partition_count += 1;
+            self.last_join_timeout_ms = timeout_ms;
+            return error.BaseJoinPartitionReached;
         }
     };
 
@@ -3705,6 +3739,14 @@ test "external lake routing source resolves object store for external row plans"
     try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
     try std.testing.expect(aggregate.rows[0].group_json == null);
     try std.testing.expectEqualStrings("11", aggregate.rows[0].value_json);
+
+    try std.testing.expectError(error.BaseJoinPartitionReached, source.joinPartitionGroupLocalWithTimeout(alloc, 7001, "events", "{}", 73));
+    try std.testing.expectEqual(@as(u32, 1), base.join_partition_count);
+    try std.testing.expectEqual(@as(?u32, 73), base.last_join_timeout_ms);
+
+    try std.testing.expectError(error.BaseJoinPartitionReached, source.joinPartitionGroupLocal(alloc, 7001, "events", "{}"));
+    try std.testing.expectEqual(@as(u32, 2), base.join_partition_count);
+    try std.testing.expectEqual(@as(?u32, null), base.last_join_timeout_ms);
 }
 
 fn icebergRoutingMetadataJson() []const u8 {
@@ -4090,10 +4132,15 @@ test "configured external lake resolver opens credentialed filesystem connection
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const allowed_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/allowed/events", .{tmp.sub_path});
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(cwd);
+    const allowed_root = try std.fs.path.resolve(alloc, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], "allowed" });
+    defer alloc.free(allowed_root);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, allowed_root, .default_dir);
+    const allowed_root_json = try std.json.Stringify.valueAlloc(alloc, allowed_root, .{});
+    defer alloc.free(allowed_root_json);
+    const allowed_path = try std.fs.path.resolve(alloc, &.{ allowed_root, "events" });
     defer alloc.free(allowed_path);
-    const denied_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/denied/events", .{tmp.sub_path});
-    defer alloc.free(denied_path);
 
     const cfg_json = try std.fmt.allocPrint(alloc,
         \\{{
@@ -4103,12 +4150,12 @@ test "configured external lake resolver opens credentialed filesystem connection
         \\      "capabilities": ["lake_read"],
         \\      "external_io": {{
         \\        "protocol": "filesystem",
-        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\        "root": {s}
         \\      }}
         \\    }}
         \\  }}
         \\}}
-    , .{tmp.sub_path});
+    , .{allowed_root_json});
     defer alloc.free(cfg_json);
     var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
     defer cfg.deinit();
@@ -4117,24 +4164,21 @@ test "configured external lake resolver opens credentialed filesystem connection
     resolver.configure(&cfg, null);
     const source = resolver.resolver();
 
-    const allowed_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{allowed_path});
-    defer alloc.free(allowed_uri);
     var opened = try source.openParquetPrefixAlloc(alloc, .{
         .table_id = "events",
         .format = .parquet,
-        .source_uri = allowed_uri,
+        .source_uri = "file:///events",
         .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
         .schema_fingerprint = "schema-v1",
     }, .{});
     defer opened.deinit();
     try std.testing.expectEqualStrings("external-lake", opened.bucket);
+    try std.testing.expectEqualStrings(allowed_path, opened.fs_client.?.root_dir);
 
-    const denied_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{denied_path});
-    defer alloc.free(denied_uri);
     try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, source.openParquetPrefixAlloc(alloc, .{
         .table_id = "events",
         .format = .parquet,
-        .source_uri = denied_uri,
+        .source_uri = "file:///../denied/events",
         .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
         .schema_fingerprint = "schema-v1",
     }, .{}));
@@ -4147,12 +4191,12 @@ test "configured external lake resolver opens credentialed filesystem connection
         \\      "capabilities": ["lake_write"],
         \\      "external_io": {{
         \\        "protocol": "filesystem",
-        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\        "root": {s}
         \\      }}
         \\    }}
         \\  }}
         \\}}
-    , .{tmp.sub_path});
+    , .{allowed_root_json});
     defer alloc.free(no_lake_read_cfg_json);
     var no_lake_read_cfg = try common_config.Config.parseFromSlice(alloc, no_lake_read_cfg_json);
     defer no_lake_read_cfg.deinit();
@@ -4160,7 +4204,7 @@ test "configured external lake resolver opens credentialed filesystem connection
     try std.testing.expectError(error.UnsupportedExternalLakeCredentialRef, source.openParquetPrefixAlloc(alloc, .{
         .table_id = "events",
         .format = .parquet,
-        .source_uri = allowed_uri,
+        .source_uri = "file:///events",
         .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
         .schema_fingerprint = "schema-v1",
     }, .{}));

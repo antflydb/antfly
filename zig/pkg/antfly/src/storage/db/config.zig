@@ -84,10 +84,14 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .l0_hard_limit_bytes = 2 * 1024 * 1024 * 1024,
     .level_target_bytes_base = doc_lsm_level_target_bytes_base,
     .level_target_bytes_multiplier = doc_lsm_level_target_bytes_multiplier,
+    .max_compaction_input_bytes = 2 * gib,
+    .run_partition_prefix_bytes = 1,
     .wal_soft_limit_segments = primary_wal_soft_limit_segments,
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = primary_wal_hard_limit_bytes,
+    .foreground_soft_wal_checkpoint = true,
+    .max_deferred_immutable_bytes = 256 * mib,
     .table_prefix_extractor = .first_separator,
 };
 
@@ -106,6 +110,7 @@ pub const text_main_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
+    .max_deferred_immutable_bytes = 128 * mib,
     .table_prefix_extractor = .first_separator,
 };
 
@@ -124,6 +129,7 @@ pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
+    .max_deferred_immutable_bytes = 128 * mib,
     .table_prefix_extractor = .first_separator,
 };
 
@@ -144,6 +150,7 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
+    .max_deferred_immutable_bytes = 512 * mib,
     .table_prefix_extractor = .none,
     // HBC mutation streams rewrite nodes/ranges/quantized payloads. Direct
     // sorted ingest is reserved for a true final-unique bulk builder.
@@ -168,6 +175,7 @@ pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
     .wal_hard_limit_segments = index_wal_hard_limit_segments,
     .wal_soft_limit_bytes = index_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = index_wal_hard_limit_bytes,
+    .max_deferred_immutable_bytes = 128 * mib,
     .table_prefix_extractor = .first_separator,
 };
 
@@ -186,6 +194,10 @@ pub const IndexBackendOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    // Binding a caller-owned shared cache requires a manager whose lifetime
+    // covers that cache. Per-DB fallback managers govern local work but must
+    // not be installed into external caches.
+    bind_cache_resource_manager: bool = true,
     text_main_lsm_options: lsm_backend_mod.Options = text_main_lsm_options_default,
     text_wal_lsm_options: lsm_backend_mod.Options = text_wal_lsm_options_default,
     dense_lsm_options: lsm_backend_mod.Options = dense_hbc_lsm_options_default,
@@ -204,6 +216,7 @@ pub const CoreOpenOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    bind_cache_resource_manager: bool = true,
     index_backends: IndexBackendOptions = .{},
 };
 
@@ -219,6 +232,7 @@ pub const ResolvedOpenConfig = struct {
         hbc_cache: ?*hbc_mod.Cache,
         lsm_root_generation: u64,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        bind_cache_resource_manager: bool,
         overrides: IndexBackendOptions,
     ) ResolvedOpenConfig {
         const primary_backend_kind = primaryBackendKind(primary_backend);
@@ -226,7 +240,7 @@ pub const ResolvedOpenConfig = struct {
         return .{
             .primary_backend_kind = primary_backend_kind,
             .primary_lsm_storage = primary_lsm_storage,
-            .index_backends = indexBackendOptionsForPrimary(primary_backend_kind, primary_lsm_storage, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, overrides),
+            .index_backends = indexBackendOptionsForPrimary(primary_backend_kind, primary_lsm_storage, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, bind_cache_resource_manager, overrides),
         };
     }
 };
@@ -258,6 +272,7 @@ pub fn mergedLsmOptions(
     storage_override: ?lsm_backend_mod.Storage,
     cache_override: ?*lsm_backend_mod.Cache,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    bind_cache_resource_manager: bool,
     no_sync: bool,
     backend_opts: lsm_backend_mod.Options,
 ) lsm_backend_mod.Options {
@@ -268,7 +283,9 @@ pub fn mergedLsmOptions(
     merged.cache = cache_override orelse backend_opts.cache;
     if (resource_manager) |manager| {
         merged.resource_manager = manager;
-        if (merged.cache) |cache| cache.attachResourceManager(manager);
+        if (bind_cache_resource_manager) {
+            if (merged.cache) |cache| cache.attachResourceManager(manager);
+        }
     }
     if (backend_opts.backend.durability == .full and no_sync) {
         merged.backend.durability = .none;
@@ -281,6 +298,7 @@ pub fn mergedIndexLsmOptions(
     cache_override: ?*lsm_backend_mod.Cache,
     root_generation_override: u64,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    bind_cache_resource_manager: bool,
     store_opts: lsm_backend_mod.Options,
 ) lsm_backend_mod.Options {
     var merged = store_opts;
@@ -291,7 +309,9 @@ pub fn mergedIndexLsmOptions(
     }
     if (resource_manager) |manager| {
         merged.resource_manager = manager;
-        if (merged.cache) |cache| cache.attachResourceManager(manager);
+        if (bind_cache_resource_manager) {
+            if (merged.cache) |cache| cache.attachResourceManager(manager);
+        }
     }
     return merged;
 }
@@ -303,7 +323,7 @@ pub fn splitLsmOptions(
 ) ?lsm_backend_mod.Options {
     return switch (primary_backend) {
         .lsm => |opts| blk: {
-            var split_opts = mergedLsmOptions(storage_override, cache_override, null, true, opts);
+            var split_opts = mergedLsmOptions(storage_override, cache_override, null, false, true, opts);
             split_opts.backend.durability = .none;
             split_opts.background_executor = null;
             break :blk split_opts;
@@ -352,6 +372,7 @@ pub fn indexBackendOptionsForPrimary(
     hbc_cache: ?*hbc_mod.Cache,
     lsm_root_generation: u64,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    bind_cache_resource_manager: bool,
     overrides: IndexBackendOptions,
 ) IndexBackendOptions {
     const text_storage_override = overrides.text_lsm_storage != null;
@@ -371,11 +392,13 @@ pub fn indexBackendOptionsForPrimary(
         .hbc_cache = overrides.hbc_cache orelse hbc_cache,
         .lsm_root_generation = if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
         .resource_manager = overrides.resource_manager orelse resource_manager,
+        .bind_cache_resource_manager = overrides.bind_cache_resource_manager and bind_cache_resource_manager,
         .text_main_lsm_options = mergedIndexLsmOptions(
             overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
             overrides.lsm_cache orelse lsm_cache,
             if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
             overrides.resource_manager orelse resource_manager,
+            overrides.bind_cache_resource_manager and bind_cache_resource_manager,
             overrides.text_main_lsm_options,
         ),
         .text_wal_lsm_options = mergedIndexLsmOptions(
@@ -383,6 +406,7 @@ pub fn indexBackendOptionsForPrimary(
             overrides.lsm_cache orelse lsm_cache,
             if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
             overrides.resource_manager orelse resource_manager,
+            overrides.bind_cache_resource_manager and bind_cache_resource_manager,
             overrides.text_wal_lsm_options,
         ),
         .dense_lsm_options = mergedIndexLsmOptions(
@@ -390,6 +414,7 @@ pub fn indexBackendOptionsForPrimary(
             overrides.lsm_cache orelse lsm_cache,
             if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
             overrides.resource_manager orelse resource_manager,
+            overrides.bind_cache_resource_manager and bind_cache_resource_manager,
             overrides.dense_lsm_options,
         ),
         .sparse_lsm_options = mergedIndexLsmOptions(
@@ -397,6 +422,7 @@ pub fn indexBackendOptionsForPrimary(
             overrides.lsm_cache orelse lsm_cache,
             if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
             overrides.resource_manager orelse resource_manager,
+            overrides.bind_cache_resource_manager and bind_cache_resource_manager,
             overrides.sparse_lsm_options,
         ),
         .graph_reverse_lsm_options = mergedIndexLsmOptions(
@@ -404,6 +430,7 @@ pub fn indexBackendOptionsForPrimary(
             overrides.lsm_cache orelse lsm_cache,
             if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
             overrides.resource_manager orelse resource_manager,
+            overrides.bind_cache_resource_manager and bind_cache_resource_manager,
             overrides.graph_reverse_lsm_options,
         ),
     };
@@ -423,9 +450,11 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.text_main_lsm_options.wal_hard_limit_segments);
     try std.testing.expectEqual(index_wal_soft_limit_bytes, opts.text_main_lsm_options.wal_soft_limit_bytes);
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.text_main_lsm_options.wal_hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 128 * mib), opts.text_main_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.text_main_lsm_options.table_prefix_extractor), .first_separator), opts.text_main_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.text_wal_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.text_wal_lsm_options.wal_hard_limit_segments);
+    try std.testing.expectEqual(@as(u64, 128 * mib), opts.text_wal_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.text_wal_lsm_options.table_prefix_extractor), .first_separator), opts.text_wal_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(@as(usize, 8), opts.dense_lsm_options.flush_threshold);
     try std.testing.expectEqual(@as(u64, 128 * 1024 * 1024), opts.dense_lsm_options.flush_threshold_bytes);
@@ -443,6 +472,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.dense_lsm_options.wal_hard_limit_segments);
     try std.testing.expectEqual(index_wal_soft_limit_bytes, opts.dense_lsm_options.wal_soft_limit_bytes);
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.dense_lsm_options.wal_hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 512 * mib), opts.dense_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.dense_lsm_options.table_prefix_extractor), .none), opts.dense_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(false, opts.dense_lsm_options.direct_bulk_ingest);
     try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), opts.dense_lsm_options.obsolete_retention_ns);
@@ -453,6 +483,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 10), opts.sparse_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.sparse_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.sparse_lsm_options.wal_hard_limit_segments);
+    try std.testing.expectEqual(@as(u64, 128 * mib), opts.sparse_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.sparse_lsm_options.table_prefix_extractor), .first_separator), opts.sparse_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.graph_reverse_lsm_options.flush_threshold_bytes);
     try std.testing.expectEqual(opts.graph_reverse_lsm_options.flush_threshold_bytes, opts.graph_reverse_lsm_options.read_snapshot_rotate_mutable_bytes);
@@ -460,6 +491,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 10), opts.graph_reverse_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.graph_reverse_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.graph_reverse_lsm_options.wal_hard_limit_segments);
+    try std.testing.expectEqual(@as(u64, 128 * mib), opts.graph_reverse_lsm_options.max_deferred_immutable_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.graph_reverse_lsm_options.table_prefix_extractor), .first_separator), opts.graph_reverse_lsm_options.table_prefix_extractor);
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
@@ -468,11 +500,15 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 32), primary_opts.l0_soft_limit_runs);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), primary_opts.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), primary_opts.level_target_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 2 * gib), primary_opts.max_compaction_input_bytes);
     try std.testing.expectEqual(primary_wal_soft_limit_segments, primary_opts.wal_soft_limit_segments);
     try std.testing.expectEqual(primary_wal_hard_limit_segments, primary_opts.wal_hard_limit_segments);
     try std.testing.expectEqual(primary_wal_soft_limit_bytes, primary_opts.wal_soft_limit_bytes);
     try std.testing.expectEqual(primary_wal_hard_limit_bytes, primary_opts.wal_hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 256 * mib), primary_opts.max_deferred_immutable_bytes);
+    try std.testing.expect(primary_opts.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(@TypeOf(primary_opts.table_prefix_extractor), .first_separator), primary_opts.table_prefix_extractor);
+    try std.testing.expectEqual(@as(usize, 1), primary_opts.run_partition_prefix_bytes);
 }
 
 test "index backend resolver honors explicit lsm storage over memory primary" {
@@ -484,6 +520,7 @@ test "index backend resolver honors explicit lsm storage over memory primary" {
         null,
         0,
         null,
+        true,
         .{
             .text_main_backend = .lsm,
             .dense_storage_backend = .lsm,
@@ -502,7 +539,7 @@ test "index backend resolver honors explicit lsm storage over memory primary" {
 }
 
 test "index lsm profiles inherit shared cache root generation and overrides" {
-    const resolved = indexBackendOptionsForPrimary(.lsm, null, null, null, 9, null, .{
+    const resolved = indexBackendOptionsForPrimary(.lsm, null, null, null, 9, null, true, .{
         .dense_lsm_options = .{
             .flush_threshold = 128,
             .wal_soft_limit_segments = 12,

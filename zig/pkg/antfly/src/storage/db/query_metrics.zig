@@ -648,7 +648,7 @@ test "sort rejection metrics use stable unsupported exact-sort labels" {
     try collector.writePrometheus(&writer);
     const output = writer.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, output, "sort_plan=\"unsupported_exact_sort\",sort_exactness=\"unsupported\",sort_source=\"unsupported\",sort_candidate_source=\"\",sort_selection_reason=\"unsupported_exact_sort\",sort_rejection_reason=\"candidate_budget_exceeded\",budget_rejection_reason=\"match_all_candidate_collect_limit\",sort_cursor_mode=\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sort_plan=\"unsupported_exact_sort\",sort_exactness=\"unsupported\",sort_source=\"unsupported\",sort_candidate_source=\"none\",sort_selection_reason=\"unsupported_exact_sort\",sort_rejection_reason=\"candidate_budget_exceeded\",budget_rejection_reason=\"match_all_candidate_collect_limit\",sort_cursor_mode=\"none\"") != null);
 }
 
 test "sort profile metrics use concise planner labels" {

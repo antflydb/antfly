@@ -30,19 +30,16 @@ pub const testing = struct {
         return query_contract.testing.bodyHasPublicDocFilterBindings(alloc, body);
     }
 
+    pub fn expectSortProfileDiagnosticsSerialization() !void {
+        return query_contract.testing.expectSortProfileDiagnosticsSerialization();
+    }
+
     pub fn expectPublicExactSortRejectionMapping() !void {
         try expectPublicExactSortRejectionMappingForTest();
     }
 
     pub fn expectFilterOnlyQueryStringFilterPreserved() !void {
-        var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-            \\{"filter_query":{"query":"status:active"},"limit":5}
-        );
-        defer owned.deinit(std.testing.allocator);
-
-        try std.testing.expect(owned.req.full_text != null);
-        try std.testing.expect(owned.req.full_text.? == .match_all);
-        try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"active\"") != null);
+        return query_contract.testing.expectFilterOnlyQueryStringFilterPreserved();
     }
 };
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
@@ -84,7 +81,13 @@ pub const applyNativeDocIdConstraintEnvelope = query_contract.applyNativeDocIdCo
 pub const encodeNativeDocIdConstraintEnvelopeAlloc = query_contract.encodeNativeDocIdConstraintEnvelopeAlloc;
 pub const parseNativeDocIdConstraintEnvelopeAlloc = query_contract.parseNativeDocIdConstraintEnvelopeAlloc;
 pub const parseQueryRequest = query_contract.parseQueryRequest;
+pub const parseQueryRequestWithDeadline = query_contract.parseQueryRequestWithDeadline;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
+pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
+pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind;
+pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
+pub const publicFilterQueryErrorStatus = query_contract.publicFilterQueryErrorStatus;
+pub const encodePublicFilterQueryErrorBodyAlloc = query_contract.encodePublicFilterQueryErrorBodyAlloc;
 pub const queryExecutionDeadlineNsFromBody = query_contract.queryExecutionDeadlineNsFromBody;
 pub const preflightGraphSearchesAlloc = query_contract.preflightGraphSearchesAlloc;
 pub const queryRequestHasScoreBearingTextSourceAlloc = query_contract.queryRequestHasScoreBearingTextSourceAlloc;
@@ -92,11 +95,13 @@ pub const queryRequestHasScoreBearingSourceAlloc = query_contract.queryRequestHa
 pub const preflightQueryRequestAlloc = query_contract.preflightQueryRequestAlloc;
 pub const parseTotalHitsRelation = query_contract.parseTotalHitsRelation;
 pub const totalHitsRelationString = query_contract.totalHitsRelationString;
+pub const queryHitsTotalFromSearchResult = query_contract.queryHitsTotalFromSearchResult;
 pub const encodeQueryResponses = query_contract.encodeQueryResponses;
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
 pub const freeAggregationRequests = query_contract.freeAggregationRequests;
 pub const encodeSupportedPatternFilterQueryAlloc = query_contract.encodeSupportedPatternFilterQueryAlloc;
 pub const normalizePublicFilterQueryAlloc = query_contract.normalizePublicFilterQueryAlloc;
+pub const normalizePublicStoredFilterQueryAlloc = query_contract.normalizePublicStoredFilterQueryAlloc;
 
 pub const PublicExactSortRejection = struct {
     reason: []const u8,

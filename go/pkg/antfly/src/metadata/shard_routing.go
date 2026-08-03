@@ -61,7 +61,7 @@ func (ms *MetadataStore) leaderClientForShard(
 		return ms.leaderClientForShard(ctx, receiverShardID)
 	}
 	var nodeID types.ID
-	if !ms.config.SwarmMode {
+	if !ms.config.IsStandalone() {
 		// If this is a split-off shard that doesn't have data yet,
 		// try to find the parent shard and route to that instead.
 		// During a split, the parent shard still has all the data until
@@ -100,7 +100,7 @@ func (ms *MetadataStore) leaderClientForShard(
 			)
 		}
 	} else {
-		// In swarm mode, prefer nodes that have actually reported the shard (ReportedBy)
+		// In standalone mode, prefer nodes that have actually reported the shard (ReportedBy)
 		// over nodes that are just in the Raft voter config (Peers). This prevents
 		// routing to nodes that haven't finished loading the shard yet.
 		// We iterate through all candidates and return the first healthy one.
@@ -358,7 +358,7 @@ func (ms *MetadataStore) leaderClientForShardWithEffectiveID(
 		// Since this is a read path, fall back to any node that has reported
 		// having the shard — reads can be served by any replica with the data.
 		// Note: these reads may be slightly stale if the follower is behind.
-		// This fallback only applies in non-SwarmMode; in SwarmMode,
+		// This fallback only applies outside the standalone deployment mode;
 		// leaderClientForShard uses peer-any routing and never returns
 		// ErrNoLeaderElected.
 		// The status snapshot used here was fetched at the top of this function
@@ -839,14 +839,13 @@ func (ms *MetadataStore) forwardBatchToShard(
 func (ms *MetadataStore) forwardBackupToShard(
 	ctx context.Context,
 	shardID types.ID,
-	loc, id string,
-	format common.BackupFormat,
-) error {
+	backup common.BackupConfig,
+) (*common.BackupArtifactIntegrity, error) {
 	targetURL, err := ms.leaderClientForShard(ctx, shardID)
 	if err != nil {
-		return fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
+		return nil, fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
 	}
-	return targetURL.Backup(ctx, shardID, loc, id, format)
+	return targetURL.Backup(ctx, shardID, backup)
 }
 
 // forwardLookupToShard sends a batch lookup request to the leader node of a specific shard.

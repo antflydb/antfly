@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
+const backups_api = @import("../api/backups.zig");
+const common_config = @import("../common/config.zig");
 const catalog = @import("catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
 const host_mod = @import("host.zig");
@@ -25,11 +27,14 @@ const reconciler = @import("reconciler.zig");
 const state_machine = @import("state_machine/mod.zig");
 const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
+const background_runtime = @import("../storage/background_runtime.zig");
+const resource_manager = @import("../storage/resource_manager.zig");
 
 pub const ManagedHostConfig = struct {
     host: host_mod.HostConfig,
     wal_replica_state: storage.WalReplicaStateConfig = .{},
     wal_flush_on_deinit: bool = true,
+    restore_open_options: backups_api.OpenOptions = .{},
 };
 
 pub const ManagedHostDeps = struct {
@@ -45,6 +50,7 @@ pub const ManagedHttpHostConfig = struct {
     wal_replica_state: storage.WalReplicaStateConfig = .{},
     wal_flush_on_deinit: bool = true,
     replica_apply_store_no_sync: bool = false,
+    restore_open_options: backups_api.OpenOptions = .{},
 };
 
 pub const ManagedHttpHostDeps = struct {
@@ -88,6 +94,8 @@ pub const ManagedHost = struct {
             cfg.wal_replica_state,
             cfg.wal_flush_on_deinit,
             false,
+            null,
+            cfg.restore_open_options,
             deps.host,
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
@@ -183,6 +191,10 @@ pub const ManagedHost = struct {
         return try self.reconciler_loop.reconcileOnce();
     }
 
+    pub fn prepareReconcile(self: *ManagedHost) !reconciler.PreparedReconcile {
+        return try self.reconciler_loop.prepare();
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
@@ -196,8 +208,8 @@ pub const ManagedHost = struct {
         return try self.reconcileOnce();
     }
 
-    pub fn runRound(self: *ManagedHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.host.runRound(max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *ManagedHost, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        const round = try self.host.runRound(max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -206,9 +218,9 @@ pub const ManagedHost = struct {
         self: *ManagedHost,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const round = try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -229,10 +241,10 @@ pub const ManagedHost = struct {
         self: *ManagedHost,
         updates: []const metadata_view.MetadataUpdate,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRound(max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRound(max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -244,10 +256,10 @@ pub const ManagedHost = struct {
         updates: []const metadata_view.MetadataUpdate,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -305,6 +317,8 @@ pub const ManagedHttpHost = struct {
             cfg.wal_replica_state,
             cfg.wal_flush_on_deinit,
             cfg.replica_apply_store_no_sync,
+            deps.http.backend_runtime,
+            cfg.restore_open_options,
             deps.http.host,
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
@@ -413,8 +427,30 @@ pub const ManagedHttpHost = struct {
         return try self.reconciler_loop.reconcileOnce();
     }
 
+    pub fn prepareReconcile(self: *ManagedHttpHost) !reconciler.PreparedReconcile {
+        return try self.reconciler_loop.prepare();
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
+    }
+
+    pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHost, manager: *resource_manager.ResourceManager) !void {
+        const store = self.owned_data_store orelse return;
+        try store.attachResourceManager(manager);
+    }
+
+    pub fn retainDataApplyGroups(self: *ManagedHttpHost, group_ids: []const u64) !void {
+        const store = self.owned_data_store orelse return;
+        try store.retainActiveGroups(group_ids);
+    }
+
+    pub fn beginDataApplyGroupTransition(
+        self: *ManagedHttpHost,
+        group_ids: []const u64,
+    ) !?data_storage.RaftApplyStore.ActiveGroupTransition {
+        const store = self.owned_data_store orelse return null;
+        return try store.beginActiveGroupTransition(group_ids);
     }
 
     pub fn applyBatch(self: *ManagedHttpHost, updates: []const metadata_view.MetadataUpdate) !void {
@@ -426,8 +462,8 @@ pub const ManagedHttpHost = struct {
         return try self.reconcileOnce();
     }
 
-    pub fn runRound(self: *ManagedHttpHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.http_host.runRound(max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *ManagedHttpHost, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        const round = try self.http_host.runRound(max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -436,9 +472,9 @@ pub const ManagedHttpHost = struct {
         self: *ManagedHttpHost,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.http_host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const round = try self.http_host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -459,10 +495,10 @@ pub const ManagedHttpHost = struct {
         self: *ManagedHttpHost,
         updates: []const metadata_view.MetadataUpdate,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRound(max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRound(max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -474,10 +510,10 @@ pub const ManagedHttpHost = struct {
         updates: []const metadata_view.MetadataUpdate,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -553,10 +589,16 @@ const PreparedHostDeps = struct {
 
 const ReplicaBackupRestoreBootstrapper = struct {
     replica_root_dir: []u8,
+    open_options: backups_api.OpenOptions,
 
-    fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !ReplicaBackupRestoreBootstrapper {
+    fn init(
+        alloc: std.mem.Allocator,
+        replica_root_dir: []const u8,
+        open_options: backups_api.OpenOptions,
+    ) !ReplicaBackupRestoreBootstrapper {
         return .{
             .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
+            .open_options = open_options,
         };
     }
 
@@ -577,11 +619,12 @@ const ReplicaBackupRestoreBootstrapper = struct {
     fn prepareBackupRestore(ptr: *anyopaque, record: catalog.ReplicaRecord) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const restore = record.backup_restore_bootstrap orelse return;
-        try metadata_table_provisioner.applyBackupRestoreBootstrap(
+        try metadata_table_provisioner.applyBackupRestoreBootstrapWithOptions(
             std.heap.page_allocator,
             self.replica_root_dir,
             record.group_id,
             restore,
+            self.open_options,
         );
     }
 };
@@ -592,6 +635,8 @@ fn prepareHostDeps(
     wal_replica_state_cfg: storage.WalReplicaStateConfig,
     wal_flush_on_deinit: bool,
     replica_apply_store_no_sync: bool,
+    backend_runtime: ?*background_runtime.BackendRuntime,
+    restore_open_options: backups_api.OpenOptions,
     base: host_mod.HostDeps,
     metadata_snapshot_builder: ?state_machine.SnapshotBuilder,
     data_snapshot_builder: ?state_machine.SnapshotBuilder,
@@ -617,7 +662,11 @@ fn prepareHostDeps(
         if (prepared.host.backup_restore_bootstrapper == null) {
             const bootstrapper = try alloc.create(ReplicaBackupRestoreBootstrapper);
             errdefer alloc.destroy(bootstrapper);
-            bootstrapper.* = try ReplicaBackupRestoreBootstrapper.init(alloc, replica_root_dir);
+            bootstrapper.* = try ReplicaBackupRestoreBootstrapper.init(
+                alloc,
+                replica_root_dir,
+                restore_open_options,
+            );
             prepared.owned_backup_restore_bootstrapper = bootstrapper;
             prepared.host.backup_restore_bootstrapper = bootstrapper.iface();
         }
@@ -637,6 +686,7 @@ fn prepareHostDeps(
             owned_store.* = try data_storage.RaftApplyStore.init(alloc, .{
                 .root_dir = replica_root_dir,
                 .no_sync = replica_apply_store_no_sync,
+                .backend_runtime = backend_runtime,
             });
             prepared.owned_data_store = owned_store;
             effective_data_builder = owned_store.snapshotBuilder();
@@ -924,6 +974,20 @@ test "managed host restores replicas from file-backed catalog and persisted stat
     }
 }
 
+fn testRestoreNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+    return common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
 test "managed host restores backup bootstrap replicas from file-backed catalog on restart" {
     const Factory = struct {
         alloc: std.mem.Allocator,
@@ -969,8 +1033,6 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     };
 
     const db_mod = @import("../storage/db/mod.zig");
-    const backups_api = @import("../api/backups.zig");
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1016,10 +1078,20 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -1032,6 +1104,8 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/903",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -1051,6 +1125,10 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
                 .replica_root_dir = replica_root,
                 .replica_catalog_path = replica_catalog_path,
             },
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },
         });
@@ -1063,8 +1141,12 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "snap1",
+                .artifact_backup_id = "snap1",
                 .location = restore_location,
                 .snapshot_path = "snap1/groups/903",
+                .connection = "test-backups",
+                .artifact_size_bytes = artifact_integrity.size_bytes,
+                .artifact_sha256 = artifact_integrity.sha256,
             },
         });
     }
@@ -1077,6 +1159,10 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
                 .local_node_id = 1,
                 .replica_root_dir = replica_root,
                 .replica_catalog_path = replica_catalog_path,
+            },
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
             },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },
@@ -1632,7 +1718,7 @@ test "managed host defaults metadata and data apply stores when durable state is
     try std.testing.expect(metadata_batch.commit_index > 0);
     try std.testing.expect(metadata_batch.entries_bytes.len > 0);
     try std.testing.expect(data_batch.commit_index > 0);
-    try std.testing.expect(data_batch.entries_bytes.len > 0);
+    try std.testing.expect(data_batch.entry_count > 0);
 }
 
 test "managed host default metadata and data apply stores survive restart" {
@@ -1748,7 +1834,7 @@ test "managed host default metadata and data apply stores survive restart" {
         try std.testing.expect(metadata_batch.commit_index > 0);
         try std.testing.expect(metadata_batch.entries_bytes.len > 0);
         try std.testing.expect(data_batch.commit_index > 0);
-        try std.testing.expect(data_batch.entries_bytes.len > 0);
+        try std.testing.expect(data_batch.entry_count > 0);
     }
 }
 
@@ -1909,8 +1995,12 @@ test "managed http host exposes backup bootstrap status from underlying host" {
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-1205",
+            .artifact_backup_id = "snap-1205",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-1205/groups/1205",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
 

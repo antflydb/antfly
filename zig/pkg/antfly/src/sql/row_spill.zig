@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const db_types = @import("../storage/db/types.zig");
 
 var json_row_spill_nonce: std.atomic.Value(u64) = .init(0);

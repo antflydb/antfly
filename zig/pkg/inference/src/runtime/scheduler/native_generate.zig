@@ -13,6 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
+
+fn spinLock(mutex: *std.atomic.Mutex) void {
+    platform.sync.lockYielding(mutex);
+}
 
 pub const RequestId = u64;
 
@@ -119,6 +124,11 @@ const PendingPrefill = struct {
     exclusive_step: bool = false,
 };
 
+pub const PendingWorkOptions = struct {
+    kv_blocks_estimate: usize = 0,
+    exclusive_step: bool = false,
+};
+
 pub const StepItem = struct {
     work_ptr: *anyopaque,
     phase: Phase,
@@ -137,6 +147,7 @@ pub const Snapshot = struct {
 
 pub const NativeGenerateCoordinator = struct {
     allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
     policy: Policy = .{},
     stats: Stats = .{},
     entries: std.ArrayListUnmanaged(Entry) = .empty,
@@ -159,12 +170,17 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn deinit(self: *NativeGenerateCoordinator) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         self.entries.deinit(self.allocator);
         self.pending_prefill.deinit(self.allocator);
         self.pending_decode.deinit(self.allocator);
     }
 
     pub fn acquire(self: *NativeGenerateCoordinator, admission: Admission) !Lease {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const request_id = self.next_request_id;
         self.next_request_id += 1;
         const reserved_units = @max(admission.requested_units, 1);
@@ -182,12 +198,15 @@ pub const NativeGenerateCoordinator = struct {
             .reserved_units = reserved_units,
             .prompt_bytes = admission.prompt_bytes,
             .max_tokens = admission.max_tokens,
-            .prefill_chunk_size = self.recommendPrefillChunkFor(request_id),
+            .prefill_chunk_size = self.recommendPrefillChunkForUnlocked(request_id),
             .active_requests_snapshot = self.entries.items.len,
         };
     }
 
     pub fn release(self: *NativeGenerateCoordinator, lease: Lease) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         const entry = self.entries.items[idx];
         self.removePendingPrefillByRequest(lease.request_id);
@@ -212,7 +231,11 @@ pub const NativeGenerateCoordinator = struct {
         query_sequence_len: usize,
         kv_sequence_len: usize,
         kv_position_offset: usize,
+        options: PendingWorkOptions,
     ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.findPendingPrefill(work_ptr) != null) return;
         try self.pending_prefill.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -221,10 +244,14 @@ pub const NativeGenerateCoordinator = struct {
             .query_sequence_len = query_sequence_len,
             .kv_sequence_len = kv_sequence_len,
             .kv_position_offset = kv_position_offset,
+            .kv_blocks_estimate = options.kv_blocks_estimate,
+            .exclusive_step = options.exclusive_step,
         });
     }
 
     pub fn cancelPrefillWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         self.removePendingPrefill(work_ptr);
     }
 
@@ -235,7 +262,11 @@ pub const NativeGenerateCoordinator = struct {
         total_sequence_len: usize,
         kv_sequence_len: usize,
         kv_position_offset: usize,
+        options: PendingWorkOptions,
     ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.findPendingDecode(work_ptr) != null) return;
         try self.pending_decode.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -243,10 +274,14 @@ pub const NativeGenerateCoordinator = struct {
             .total_sequence_len = total_sequence_len,
             .kv_sequence_len = kv_sequence_len,
             .kv_position_offset = kv_position_offset,
+            .kv_blocks_estimate = options.kv_blocks_estimate,
+            .exclusive_step = options.exclusive_step,
         });
     }
 
     pub fn cancelDecodeWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         self.removePendingDecode(work_ptr);
     }
 
@@ -264,6 +299,9 @@ pub const NativeGenerateCoordinator = struct {
         phase: Phase,
         blocks: usize,
     ) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 if (self.findPendingDecode(work_ptr)) |idx| {
@@ -284,10 +322,13 @@ pub const NativeGenerateCoordinator = struct {
     /// tests and observability — production admission consults the field
     /// internally during `claimStep`.
     pub fn pendingKvBlocksEstimate(
-        self: *const NativeGenerateCoordinator,
+        self: *NativeGenerateCoordinator,
         work_ptr: *anyopaque,
         phase: Phase,
     ) ?usize {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 const idx = self.findPendingDecode(work_ptr) orelse return null;
@@ -310,6 +351,9 @@ pub const NativeGenerateCoordinator = struct {
         phase: Phase,
         exclusive: bool,
     ) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 if (self.findPendingDecode(work_ptr)) |idx| {
@@ -326,10 +370,13 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn pendingRequiresExclusiveStep(
-        self: *const NativeGenerateCoordinator,
+        self: *NativeGenerateCoordinator,
         work_ptr: *anyopaque,
         phase: Phase,
     ) ?bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 const idx = self.findPendingDecode(work_ptr) orelse return null;
@@ -360,6 +407,9 @@ pub const NativeGenerateCoordinator = struct {
         budget: StepBudget,
         out: *std.ArrayListUnmanaged(StepItem),
     ) !bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.in_turn) |owner| {
             if (owner != lease.request_id) return false;
         } else {
@@ -488,6 +538,9 @@ pub const NativeGenerateCoordinator = struct {
         lease: *Lease,
         items: []const StepItem,
     ) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         var prefill_count: u64 = 0;
         var decode_count: u64 = 0;
         var query_tokens: u64 = 0;
@@ -514,17 +567,29 @@ pub const NativeGenerateCoordinator = struct {
             self.stats.step_singleton_batches_total += 1;
         }
         const phase: Phase = if (decode_count > 0) .decode else .prefill;
-        self.finishTurn(lease, phase);
+        self.finishTurnUnlocked(lease, phase);
     }
 
     pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) void {
         while (!self.tryAcquireTurn(lease, phase)) {
-            self.stats.turn_yields_total += 1;
+            self.noteTurnYield();
             io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch return;
         }
     }
 
+    fn noteTurnYield(self: *NativeGenerateCoordinator) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.stats.turn_yields_total += 1;
+    }
+
     pub fn tryAcquireTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.tryAcquireTurnUnlocked(lease, phase);
+    }
+
+    fn tryAcquireTurnUnlocked(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {
         if (self.in_turn) |owner| {
             return owner == lease.request_id and self.in_turn_phase == phase;
         }
@@ -534,11 +599,17 @@ pub const NativeGenerateCoordinator = struct {
 
         self.in_turn = lease.request_id;
         self.in_turn_phase = phase;
-        lease.prefill_chunk_size = self.recommendPrefillChunkFor(lease.request_id);
+        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
         return true;
     }
 
     pub fn finishTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.finishTurnUnlocked(lease, phase);
+    }
+
+    fn finishTurnUnlocked(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
         if (self.in_turn != lease.request_id) return;
         self.in_turn = null;
         self.in_turn_phase = null;
@@ -556,31 +627,46 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn notePrefillProgress(self: *NativeGenerateCoordinator, lease: *Lease, processed_tokens: usize, total_prompt_tokens: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .prefill;
         entry.prompt_tokens_processed = processed_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
-        lease.prefill_chunk_size = self.recommendPrefillChunkFor(lease.request_id);
+        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
     }
 
     pub fn beginDecode(self: *NativeGenerateCoordinator, lease: *Lease, total_prompt_tokens: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
         entry.prompt_tokens_processed = total_prompt_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
-        lease.prefill_chunk_size = self.recommendPrefillChunkFor(lease.request_id);
+        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
     }
 
     pub fn noteDecodeProgress(self: *NativeGenerateCoordinator, lease: *Lease, generated_tokens: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
         entry.generated_tokens = generated_tokens;
     }
 
-    pub fn snapshot(self: *const NativeGenerateCoordinator) Snapshot {
+    pub fn snapshot(self: *NativeGenerateCoordinator) Snapshot {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.snapshotUnlocked();
+    }
+
+    fn snapshotUnlocked(self: *const NativeGenerateCoordinator) Snapshot {
         var waiting_requests: usize = 0;
         var prefill_requests: usize = 0;
         var decode_requests: usize = 0;
@@ -599,14 +685,22 @@ pub const NativeGenerateCoordinator = struct {
         };
     }
 
-    pub fn schedulerStats(self: *const NativeGenerateCoordinator) Stats {
+    pub fn schedulerStats(self: *NativeGenerateCoordinator) Stats {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         return self.stats;
     }
 
-    fn recommendPrefillChunkFor(self: *const NativeGenerateCoordinator, request_id: RequestId) usize {
+    pub fn recommendPrefillChunkFor(self: *NativeGenerateCoordinator, request_id: RequestId) usize {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.recommendPrefillChunkForUnlocked(request_id);
+    }
+
+    fn recommendPrefillChunkForUnlocked(self: *const NativeGenerateCoordinator, request_id: RequestId) usize {
         const idx = self.indexOf(request_id) orelse return self.base_prefill_chunk_size;
         const entry = self.entries.items[idx];
-        const state = self.snapshot();
+        const state = self.snapshotUnlocked();
 
         const prompt_bytes = @max(entry.prompt_bytes, 1);
         const prompt_token_estimate = @max(prompt_bytes / 4, 1);
@@ -892,7 +986,7 @@ test "native generate coordinator round-robins turns and prioritizes decode" {
     coordinator.finishTurn(&second, .prefill);
 
     coordinator.beginDecode(&first, 512);
-    try coordinator.enqueueDecodeWork(first, @ptrFromInt(1), 512, 512, 0);
+    try coordinator.enqueueDecodeWork(first, @ptrFromInt(1), 512, 512, 0, .{});
     try std.testing.expect(coordinator.tryAcquireTurn(&first, .decode));
     try std.testing.expect(!coordinator.tryAcquireTurn(&second, .prefill));
 }
@@ -921,9 +1015,9 @@ test "claimStep packs decode leader with extra decode and prefill work" {
 
     coordinator.beginDecode(&decode_lease, 8);
     coordinator.notePrefillProgress(&prefill_lease, 0, 8);
-    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&decode_a), 9, 9, 0);
-    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&decode_b), 9, 9, 0);
-    try coordinator.enqueuePrefillWork(prefill_lease, @ptrCast(&prefill_w), 10, 4, 6, 0);
+    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&decode_a), 9, 9, 0, .{});
+    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&decode_b), 9, 9, 0, .{});
+    try coordinator.enqueuePrefillWork(prefill_lease, @ptrCast(&prefill_w), 10, 4, 6, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -966,8 +1060,8 @@ test "claimStep keeps exclusive leader as singleton" {
     var peer_work: u8 = 2;
 
     coordinator.beginDecode(&lease, 8);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&exclusive_work), 9, 9, 0);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&peer_work), 9, 9, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&exclusive_work), 9, 9, 0, .{});
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&peer_work), 9, 9, 0, .{});
     coordinator.notePendingExclusiveStep(@ptrCast(&exclusive_work), .decode, true);
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
@@ -1003,9 +1097,9 @@ test "claimStep skips exclusive peer work" {
     var normal_peer: u8 = 3;
 
     coordinator.beginDecode(&lease, 8);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&leader_work), 9, 9, 0);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&exclusive_peer), 9, 9, 0);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_peer), 9, 9, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&leader_work), 9, 9, 0, .{});
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&exclusive_peer), 9, 9, 0, .{});
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_peer), 9, 9, 0, .{});
     coordinator.notePendingExclusiveStep(@ptrCast(&exclusive_peer), .decode, true);
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
@@ -1039,7 +1133,7 @@ test "claimStep emits leader-only step when no other work is queued" {
 
     var work: u8 = 1;
     coordinator.beginDecode(&decode_lease, 4);
-    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&work), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&work), 5, 5, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -1070,7 +1164,7 @@ test "claimStep with prefill leader and no pending decodes still admits the lead
 
     var work: u8 = 1;
     coordinator.notePrefillProgress(&prefill_lease, 0, 16);
-    try coordinator.enqueuePrefillWork(prefill_lease, @ptrCast(&work), 16, 8, 8, 0);
+    try coordinator.enqueuePrefillWork(prefill_lease, @ptrCast(&work), 16, 8, 8, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -1107,9 +1201,9 @@ test "claimStep respects max_items budget" {
     coordinator.beginDecode(&lease_a, 4);
     coordinator.beginDecode(&lease_b, 4);
     coordinator.beginDecode(&lease_c, 4);
-    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&w_a), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&w_b), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_c, @ptrCast(&w_c), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&w_a), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&w_b), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_c, @ptrCast(&w_c), 5, 5, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -1145,9 +1239,9 @@ test "claimStep respects max_query_tokens budget for prefill chunks" {
     coordinator.beginDecode(&leader_lease, 4);
     coordinator.notePrefillProgress(&big_lease, 0, 256);
     coordinator.notePrefillProgress(&small_lease, 0, 16);
-    try coordinator.enqueueDecodeWork(leader_lease, @ptrCast(&leader_w), 5, 5, 0);
-    try coordinator.enqueuePrefillWork(big_lease, @ptrCast(&big_w), 256, 256, 0, 0);
-    try coordinator.enqueuePrefillWork(small_lease, @ptrCast(&small_w), 16, 16, 0, 0);
+    try coordinator.enqueueDecodeWork(leader_lease, @ptrCast(&leader_w), 5, 5, 0, .{});
+    try coordinator.enqueuePrefillWork(big_lease, @ptrCast(&big_w), 256, 256, 0, 0, .{});
+    try coordinator.enqueuePrefillWork(small_lease, @ptrCast(&small_w), 16, 16, 0, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -1193,9 +1287,9 @@ test "claimStep skips items whose KV-block estimate exceeds budget" {
     coordinator.beginDecode(&lease_a, 4);
     coordinator.beginDecode(&lease_b, 4);
     coordinator.beginDecode(&lease_c, 4);
-    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&w_a), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&w_b), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_c, @ptrCast(&w_c), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&w_a), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&w_b), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_c, @ptrCast(&w_c), 5, 5, 0, .{});
 
     coordinator.notePendingKvBlocks(@ptrCast(&w_a), .decode, 1);
     coordinator.notePendingKvBlocks(@ptrCast(&w_b), .decode, 4);
@@ -1227,6 +1321,51 @@ test "claimStep skips items whose KV-block estimate exceeds budget" {
     try std.testing.expectEqual(@as(u64, 1), coordinator.stats.step_kv_block_skips_total);
 }
 
+test "enqueue work stores batching metadata atomically" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var leader = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(leader);
+    var exclusive = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(exclusive);
+    var over_budget = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(over_budget);
+    var admitted = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(admitted);
+
+    var leader_w: u8 = 1;
+    var exclusive_w: u8 = 2;
+    var over_budget_w: u8 = 3;
+    var admitted_w: u8 = 4;
+
+    coordinator.beginDecode(&leader, 4);
+    coordinator.beginDecode(&exclusive, 4);
+    coordinator.beginDecode(&over_budget, 4);
+    coordinator.beginDecode(&admitted, 4);
+    try coordinator.enqueueDecodeWork(leader, @ptrCast(&leader_w), 5, 5, 0, .{ .kv_blocks_estimate = 1 });
+    try coordinator.enqueueDecodeWork(exclusive, @ptrCast(&exclusive_w), 5, 5, 0, .{ .exclusive_step = true });
+    try coordinator.enqueueDecodeWork(over_budget, @ptrCast(&over_budget_w), 5, 5, 0, .{ .kv_blocks_estimate = 4 });
+    try coordinator.enqueueDecodeWork(admitted, @ptrCast(&admitted_w), 5, 5, 0, .{ .kv_blocks_estimate = 2 });
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &leader,
+        @ptrCast(&leader_w),
+        .decode,
+        .{ .max_items = 4, .max_query_tokens = 8, .max_kv_blocks = 4 },
+        &step,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&leader_w)), step.items[0].work_ptr);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&admitted_w)), step.items[1].work_ptr);
+    try std.testing.expectEqual(@as(u64, 1), coordinator.stats.step_kv_block_skips_total);
+}
+
 test "claimStep refuses to take a turn that belongs to another request" {
     const allocator = std.testing.allocator;
     var coordinator = NativeGenerateCoordinator.init(allocator);
@@ -1241,8 +1380,8 @@ test "claimStep refuses to take a turn that belongs to another request" {
     var w2: u8 = 2;
     coordinator.beginDecode(&first, 4);
     coordinator.beginDecode(&second, 4);
-    try coordinator.enqueueDecodeWork(first, @ptrCast(&w1), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(second, @ptrCast(&w2), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&w1), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&w2), 5, 5, 0, .{});
 
     // First request wins the round-robin; second must back off.
     coordinator.in_turn = first.request_id;
@@ -1276,8 +1415,8 @@ test "completeStep updates step stats and removes pending work" {
     var pre_w: u8 = 2;
     coordinator.beginDecode(&decode_lease, 4);
     coordinator.notePrefillProgress(&prefill_lease, 0, 8);
-    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&dec_w), 5, 5, 0);
-    try coordinator.enqueuePrefillWork(prefill_lease, @ptrCast(&pre_w), 8, 4, 4, 0);
+    try coordinator.enqueueDecodeWork(decode_lease, @ptrCast(&dec_w), 5, 5, 0, .{});
+    try coordinator.enqueuePrefillWork(prefill_lease, @ptrCast(&pre_w), 8, 4, 4, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -1313,7 +1452,7 @@ test "completeStep records singleton steps" {
 
     var work: u8 = 1;
     coordinator.beginDecode(&lease, 4);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work), 5, 5, 0, .{});
 
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
@@ -1369,11 +1508,11 @@ test "scheduler drains a multi-lease workload without leaking pending work" {
             if ((li + wi) % 2 == 0) {
                 slot.phase = .decode;
                 coordinator.beginDecode(&leases[li], 8);
-                try coordinator.enqueueDecodeWork(leases[li], @ptrCast(slot), 9, 9, 0);
+                try coordinator.enqueueDecodeWork(leases[li], @ptrCast(slot), 9, 9, 0, .{});
             } else {
                 slot.phase = .prefill;
                 coordinator.notePrefillProgress(&leases[li], 0, 8);
-                try coordinator.enqueuePrefillWork(leases[li], @ptrCast(slot), 12, 4, 8, 0);
+                try coordinator.enqueuePrefillWork(leases[li], @ptrCast(slot), 12, 4, 8, 0, .{});
             }
         }
     }
@@ -1475,9 +1614,9 @@ test "scheduler honors KV-block budget under contention" {
     coordinator.beginDecode(&lease_a, 4);
     coordinator.beginDecode(&lease_b, 4);
     coordinator.beginDecode(&lease_c, 4);
-    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&w_a), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&w_b), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_c, @ptrCast(&w_c), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&w_a), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&w_b), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_c, @ptrCast(&w_c), 5, 5, 0, .{});
 
     coordinator.notePendingKvBlocks(@ptrCast(&w_a), .decode, 3);
     coordinator.notePendingKvBlocks(@ptrCast(&w_b), .decode, 3);
@@ -1535,7 +1674,7 @@ test "scheduler step batches drain decode-only workload with high density" {
         for (0..n_leases) |li| {
             const slot = &works_storage[round * n_leases + li];
             slot.* = .{ .lease_idx = @intCast(li), .item_idx = @intCast(round), .phase = .decode };
-            try coordinator.enqueueDecodeWork(leases[li], @ptrCast(slot), 5 + round, 5 + round, 0);
+            try coordinator.enqueueDecodeWork(leases[li], @ptrCast(slot), 5 + round, 5 + round, 0, .{});
         }
 
         // Drain this round's pending decodes. Each lease attempts a claim;

@@ -25,7 +25,9 @@ const delegated_steps = [_]DelegatedStep{
     .{ .public_name = "bench-paged-attention", .package_step = "bench-paged-attention" },
     .{ .public_name = "bench-training", .package_step = "bench-training" },
     .{ .public_name = "bench-gliner2-native", .package_step = "bench-gliner2-native" },
+    .{ .public_name = "gliner2-production-readiness", .package_step = "gliner2-production-readiness" },
     .{ .public_name = "finetune-test", .package_step = "finetune-test" },
+    .{ .public_name = "lib-onnx-test", .package_step = "lib-onnx-test" },
     .{ .public_name = "test", .package_step = "test" },
     .{ .public_name = "wasm", .package_step = "wasm" },
 };
@@ -38,6 +40,7 @@ const DelegatedPackageStep = struct {
 pub const DelegatedBuildSteps = struct {
     inference_test: *std.Build.Step,
     inference_finetune_test: *std.Build.Step,
+    inference_onnx_test: *std.Build.Step,
 };
 
 pub fn addDelegatedBuildSteps(ctx: anytype) DelegatedBuildSteps {
@@ -52,6 +55,7 @@ pub fn addDelegatedBuildSteps(ctx: anytype) DelegatedBuildSteps {
 
     var test_step: ?*std.Build.Step = null;
     var finetune_test_step: ?*std.Build.Step = null;
+    var onnx_test_step: ?*std.Build.Step = null;
     for (delegated_steps) |step| {
         const delegated = addDelegatedPackageStep(b, step);
         const run = delegated.run;
@@ -61,11 +65,14 @@ pub fn addDelegatedBuildSteps(ctx: anytype) DelegatedBuildSteps {
             test_step = delegated.step;
         } else if (std.mem.eql(u8, step.public_name, "finetune-test")) {
             finetune_test_step = delegated.step;
+        } else if (std.mem.eql(u8, step.public_name, "lib-onnx-test")) {
+            onnx_test_step = delegated.step;
         }
     }
     return .{
         .inference_test = test_step.?,
         .inference_finetune_test = finetune_test_step.?,
+        .inference_onnx_test = onnx_test_step.?,
     };
 }
 

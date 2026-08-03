@@ -24,6 +24,7 @@ const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
 const ha_write_gate_mod = @import("../ha/write_gate.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
+const doc_identity = @import("doc_identity.zig");
 const internal_keys = @import("../internal_keys.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const ha_types = @import("ha_types.zig");
@@ -66,8 +67,8 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 200,
-        .shard_id = 3,
-        .table_id = 9,
+        .shard_id = 30,
+        .table_id = 90,
         .timeline_id = 1,
         .epoch = 1,
     }, .{});
@@ -79,6 +80,8 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     defer alloc.free(artifact_key);
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
+            .enrichment = .{ .enable_without_producers = true },
             .ha_async_effect_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -86,6 +89,10 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
             },
         });
         defer db.close();
+
+        const enrichment_ctx = db.enrichment_append_context orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 3), enrichment_ctx.identity_namespace.shard_id);
+        try std.testing.expectEqual(@as(u64, 9), enrichment_ctx.identity_namespace.table_id);
 
         const changed_artifact_keys = [_][]const u8{artifact_key};
         const sequence = try db.derivedAsyncAppendDerivedBatchRecord(.{
@@ -136,8 +143,8 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
         .cluster_id = 250,
-        .shard_id = 4,
-        .table_id = 10,
+        .shard_id = 40,
+        .table_id = 100,
         .timeline_id = 1,
         .epoch = 1,
     }, .{});
@@ -156,6 +163,7 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     var failures = std.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
             .ha_async_batch_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -194,6 +202,7 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_write_gate = .{ .standby = &standby },
         .ha_async_batch_mirror = .{
             .primary = &primary,
@@ -382,6 +391,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     defer standby.close();
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_write_gate = .{ .standby = &standby },
         .start_index_workers = false,
     });
@@ -400,6 +410,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     var waits = std.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
             .primary = &primary,
             .last_lsn = &last_lsn,
@@ -496,6 +507,7 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
     var waits = std.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
             .primary = &primary,
             .last_lsn = &last_lsn,
@@ -995,7 +1007,10 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
         .timeline_id = 1,
         .epoch = 1,
     };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    var primary_identity = identity;
+    primary_identity.shard_id = 50;
+    primary_identity.table_id = 110;
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, primary_identity, .{});
     defer primary.close();
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
     defer standby.close();
@@ -1004,6 +1019,7 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     var failures = std.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
             .ha_async_metadata_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -1041,6 +1057,7 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
         .ha_write_gate = .{ .standby = &standby },
         .start_index_workers = false,
     });
@@ -1095,7 +1112,10 @@ test "storage.ha db mirrors and applies local schema json metadata mutation reco
         .timeline_id = 1,
         .epoch = 1,
     };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    var primary_identity = identity;
+    primary_identity.shard_id = 50;
+    primary_identity.table_id = 110;
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, primary_identity, .{});
     defer primary.close();
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
     defer standby.close();
@@ -1108,6 +1128,7 @@ test "storage.ha db mirrors and applies local schema json metadata mutation reco
     var failures = std.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
             .ha_async_metadata_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -1127,6 +1148,8 @@ test "storage.ha db mirrors and applies local schema json metadata mutation reco
     var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
     defer entry.deinit(alloc);
     try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 5), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
 
     var decoded = try ha_effects_mod.decodeMetadataMutation(alloc, entry.record);
     defer decoded.deinit();
@@ -1135,6 +1158,7 @@ test "storage.ha db mirrors and applies local schema json metadata mutation reco
     try std.testing.expect(decoded.value.lite_sql_table_record_json == null);
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
         .ha_write_gate = .{ .standby = &standby },
         .start_index_workers = false,
     });
@@ -1187,7 +1211,10 @@ test "storage.ha db mirrors and applies lite sql table metadata mutation records
         .timeline_id = 1,
         .epoch = 1,
     };
-    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    var primary_identity = identity;
+    primary_identity.shard_id = 50;
+    primary_identity.table_id = 110;
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, primary_identity, .{});
     defer primary.close();
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
     defer standby.close();
@@ -1203,6 +1230,7 @@ test "storage.ha db mirrors and applies lite sql table metadata mutation records
     var failures = std.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
             .ha_async_metadata_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -1231,8 +1259,11 @@ test "storage.ha db mirrors and applies lite sql table metadata mutation records
     var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
     defer entry.deinit(alloc);
     try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 5), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
         .ha_write_gate = .{ .standby = &standby },
         .start_index_workers = false,
     });
@@ -1854,7 +1885,17 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn mirrorDBReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
             const resources = self.core.batchExecutionResources();
-            mirrorReplayPayloadBestEffort(resources.log_mutex, self.ha_async_effect_mirror, payload);
+            mirrorReplayPayloadBestEffort(resources.log_mutex, resources.identity_namespace, self.ha_async_effect_mirror, payload);
+        }
+
+        pub fn mirrorDBBatchMutationBestEffort(self: *DB, request: types.BatchRequest) void {
+            const resources = self.core.batchExecutionResources();
+            mirrorBatchMutationBestEffort(self.alloc, resources.log_mutex, resources.identity_namespace, self.ha_async_batch_mirror, request);
+        }
+
+        pub fn mirrorDBSchemaMetadataBestEffort(self: *DB, table_schema: schema_mod.TableSchema) void {
+            const resources = self.core.batchExecutionResources();
+            mirrorSchemaMetadataBestEffort(self.alloc, resources.log_mutex, resources.identity_namespace, self.ha_async_metadata_mirror, table_schema);
         }
 
         pub fn preflightDBBatchSyncCommit(self: *DB) !void {
@@ -1870,17 +1911,17 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn mirrorDBBatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
             const resources = self.core.batchExecutionResources();
-            try mirrorBatchMutationCommit(self.alloc, resources.log_mutex, self.ha_async_batch_mirror, request);
+            try mirrorBatchMutationCommit(self.alloc, resources.log_mutex, resources.identity_namespace, self.ha_async_batch_mirror, request);
         }
 
         pub fn mirrorDBReplayPayloadCommit(self: *DB, payload: []const u8) !void {
             const resources = self.core.batchExecutionResources();
-            try mirrorReplayPayloadCommit(resources.log_mutex, self.ha_async_effect_mirror, payload);
+            try mirrorReplayPayloadCommit(resources.log_mutex, resources.identity_namespace, self.ha_async_effect_mirror, payload);
         }
 
         pub fn mirrorDBSchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
             const resources = self.core.batchExecutionResources();
-            try mirrorSchemaMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema);
+            try mirrorSchemaMetadataCommit(self.alloc, resources.log_mutex, resources.identity_namespace, self.ha_async_metadata_mirror, table_schema);
         }
 
         pub fn mirrorDBSchemaJsonMetadataCommit(
@@ -1889,7 +1930,7 @@ pub fn Impl(comptime DB: type) type {
             schema_json: []const u8,
         ) !void {
             const resources = self.core.batchExecutionResources();
-            try mirrorSchemaJsonMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema, schema_json);
+            try mirrorSchemaJsonMetadataCommit(self.alloc, resources.log_mutex, resources.identity_namespace, self.ha_async_metadata_mirror, table_schema, schema_json);
         }
 
         pub fn mirrorDBLiteSqlTableMetadataCommit(
@@ -1902,6 +1943,7 @@ pub fn Impl(comptime DB: type) type {
             try mirrorLiteSqlTableMetadataCommit(
                 self.alloc,
                 resources.log_mutex,
+                resources.identity_namespace,
                 self.ha_async_metadata_mirror,
                 table_schema,
                 schema_json,
@@ -1998,17 +2040,7 @@ pub fn Impl(comptime DB: type) type {
 
 pub fn enforceWriteGateOptional(gate: ?WriteGate) !void {
     const configured = gate orelse return;
-    const decision = switch (configured) {
-        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-        .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
-        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-    };
-    switch (decision.action) {
-        .allow_write => return,
-        .reject_read_only_standby => return error.HAReadOnlyStandby,
-        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-        .reject_fenced_primary => return error.HAFencedPrimary,
-    }
+    try configured.check();
 }
 
 pub fn preflightMirrorSyncCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEffectMirror) !void {
@@ -2028,11 +2060,14 @@ pub fn preflightMirrorSyncCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEff
     }
 }
 
-pub fn mirrorReplayPayloadBestEffort(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEffectMirror, payload: []const u8) void {
+pub fn mirrorReplayPayloadBestEffort(log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncEffectMirror, payload: []const u8) void {
     const configured = mirror orelse return;
     _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(configured.primary, payload, .{}) catch |err| {
+    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(configured.primary, payload, .{
+        .shard_id = identity_namespace.shard_id,
+        .table_id = identity_namespace.table_id,
+    }) catch |err| {
         if (configured.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB derived effect into HA stream: {s}", .{@errorName(err)});
         return;
@@ -2040,12 +2075,15 @@ pub fn mirrorReplayPayloadBestEffort(log_mutex: *std.atomic.Mutex, mirror: ?Asyn
     if (configured.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-pub fn mirrorReplayPayloadCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEffectMirror, payload: []const u8) !void {
+pub fn mirrorReplayPayloadCommit(log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncEffectMirror, payload: []const u8) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
         _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
-        const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(configured.primary, payload, .{}) catch |err| {
+        const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(configured.primary, payload, .{
+            .shard_id = identity_namespace.shard_id,
+            .table_id = identity_namespace.table_id,
+        }) catch |err| {
             noteMirrorFailure(configured, "derived effect", err);
             if (mirrorSyncEnabled(configured)) return err;
             return;
@@ -2056,11 +2094,14 @@ pub fn mirrorReplayPayloadCommit(log_mutex: *std.atomic.Mutex, mirror: ?AsyncEff
     try evaluateMirrorCommitGate(configured, lsn);
 }
 
-pub fn mirrorBatchMutationBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncBatchMirror, request: types.BatchRequest) void {
+pub fn mirrorBatchMutationBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncBatchMirror, request: types.BatchRequest) void {
     const configured = mirror orelse return;
     _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendBatchMutationRequest(alloc, configured.primary, request, .{}) catch |err| {
+    const lsn = ha_effects_mod.appendBatchMutationRequest(alloc, configured.primary, request, .{
+        .shard_id = identity_namespace.shard_id,
+        .table_id = identity_namespace.table_id,
+    }) catch |err| {
         if (configured.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB batch mutation into HA stream: {s}", .{@errorName(err)});
         return;
@@ -2068,12 +2109,15 @@ pub fn mirrorBatchMutationBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mu
     if (configured.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-pub fn mirrorBatchMutationCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncBatchMirror, request: types.BatchRequest) !void {
+pub fn mirrorBatchMutationCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncBatchMirror, request: types.BatchRequest) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
         _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
-        const lsn = ha_effects_mod.appendBatchMutationRequest(alloc, configured.primary, request, .{}) catch |err| {
+        const lsn = ha_effects_mod.appendBatchMutationRequest(alloc, configured.primary, request, .{
+            .shard_id = identity_namespace.shard_id,
+            .table_id = identity_namespace.table_id,
+        }) catch |err| {
             noteMirrorFailure(configured, "batch mutation", err);
             if (mirrorSyncEnabled(configured)) return err;
             return;
@@ -2084,11 +2128,14 @@ pub fn mirrorBatchMutationCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex,
     try evaluateMirrorCommitGate(configured, lsn);
 }
 
-pub fn mirrorSchemaMetadataBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) void {
+pub fn mirrorSchemaMetadataBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) void {
     const configured = mirror orelse return;
     _ = platform.sync.lockAtomic(log_mutex);
     defer log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{}) catch |err| {
+    const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{
+        .shard_id = identity_namespace.shard_id,
+        .table_id = identity_namespace.table_id,
+    }) catch |err| {
         if (configured.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB schema metadata into HA stream: {s}", .{@errorName(err)});
         return;
@@ -2096,12 +2143,15 @@ pub fn mirrorSchemaMetadataBestEffort(alloc: Allocator, log_mutex: *std.atomic.M
     if (configured.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-pub fn mirrorSchemaMetadataCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) !void {
+pub fn mirrorSchemaMetadataCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) !void {
     const configured = mirror orelse return;
     const lsn = blk: {
         _ = platform.sync.lockAtomic(log_mutex);
         defer log_mutex.*.unlock();
-        const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{}) catch |err| {
+        const lsn = ha_effects_mod.appendSchemaMetadataMutation(alloc, configured.primary, table_schema, .{
+            .shard_id = identity_namespace.shard_id,
+            .table_id = identity_namespace.table_id,
+        }) catch |err| {
             noteMirrorFailure(configured, "metadata mutation", err);
             if (mirrorSyncEnabled(configured)) return err;
             return;
@@ -2115,6 +2165,7 @@ pub fn mirrorSchemaMetadataCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex
 pub fn mirrorSchemaJsonMetadataCommit(
     alloc: Allocator,
     log_mutex: *std.atomic.Mutex,
+    identity_namespace: doc_identity.Namespace,
     mirror: ?AsyncMetadataMirror,
     table_schema: schema_mod.TableSchema,
     schema_json: []const u8,
@@ -2128,7 +2179,10 @@ pub fn mirrorSchemaJsonMetadataCommit(
             configured.primary,
             table_schema,
             .{ .local_schema_json = schema_json },
-            .{},
+            .{
+                .shard_id = identity_namespace.shard_id,
+                .table_id = identity_namespace.table_id,
+            },
         ) catch |err| {
             noteMirrorFailure(configured, "schema json metadata mutation", err);
             if (mirrorSyncEnabled(configured)) return err;
@@ -2143,6 +2197,7 @@ pub fn mirrorSchemaJsonMetadataCommit(
 pub fn mirrorLiteSqlTableMetadataCommit(
     alloc: Allocator,
     log_mutex: *std.atomic.Mutex,
+    identity_namespace: doc_identity.Namespace,
     mirror: ?AsyncMetadataMirror,
     table_schema: schema_mod.TableSchema,
     schema_json: []const u8,
@@ -2160,7 +2215,10 @@ pub fn mirrorLiteSqlTableMetadataCommit(
                 .local_schema_json = schema_json,
                 .lite_sql_table_record_json = table_record_json,
             },
-            .{},
+            .{
+                .shard_id = identity_namespace.shard_id,
+                .table_id = identity_namespace.table_id,
+            },
         ) catch |err| {
             noteMirrorFailure(configured, "lite sql metadata mutation", err);
             if (mirrorSyncEnabled(configured)) return err;

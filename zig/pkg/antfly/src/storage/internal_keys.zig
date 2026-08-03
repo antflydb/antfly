@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const coverage_identity = @import("coverage_identity.zig");
 const Allocator = std.mem.Allocator;
 
 pub const user_namespace: u8 = 0x01;
@@ -45,7 +46,8 @@ pub const asset_state_kind: u8 = 0x33;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
 pub const derived_coverage_kind: u8 = 0x36;
-pub const derived_coverage_skipped_count_kind: u8 = 0xff;
+pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
+pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
@@ -63,6 +65,9 @@ pub const artifact_repair_kind_index_progress_kind: u8 = 0x27;
 pub const artifact_repair_summary_ready_kind: u8 = 0x28;
 pub const artifact_repair_summary_progress_kind: u8 = 0x29;
 pub const artifact_repair_summary_rebuild_kind: u8 = 0x2a;
+pub const managed_index_admission_kind: u8 = 0x2b;
+pub const index_artifact_cleanup_kind: u8 = 0x2c;
+pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const relational_cte_spill_kind: u8 = 0x40;
 pub const relational_aggregate_spill_kind: u8 = 0x41;
@@ -70,9 +75,12 @@ pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
 pub const identity_canonical_to_ordinal_kind: u8 = 0x04;
+pub const identity_visibility_chunk_kind: u8 = 0x05;
+pub const identity_visibility_deleted_chunk_kind: u8 = 0x06;
 pub const identity_namespace_key = [_]u8{ identity_namespace, 0xff, 0x00 };
 pub const identity_next_ordinal_key = [_]u8{ identity_namespace, 0xff, 0x01 };
 pub const identity_visibility_summary_key = [_]u8{ identity_namespace, 0xff, 0x02 };
+pub const identity_visibility_manifest_key = [_]u8{ identity_namespace, 0xff, 0x03 };
 
 pub fn isInternalMetadataKey(key: []const u8) bool {
     if (key.len == 0) return false;
@@ -103,6 +111,34 @@ pub fn isRelationalPhysicalTableDataKey(key: []const u8) bool {
         isRelationalOrderedTupleIndexByDocKey(key) or
         isRelationalOrderedTupleUniqueConflictKey(key) or
         isRelationalForeignKeyConflictKey(key);
+}
+
+pub fn identityVisibilityChunkKey(chunk_id: u32) [6]u8 {
+    var key: [6]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_visibility_chunk_kind;
+    std.mem.writeInt(u32, key[2..6], chunk_id, .big);
+    return key;
+}
+
+pub fn parseIdentityVisibilityChunkKey(key: []const u8) ?u32 {
+    if (key.len != 6) return null;
+    if (key[0] != identity_namespace or key[1] != identity_visibility_chunk_kind) return null;
+    return std.mem.readInt(u32, key[2..6], .big);
+}
+
+pub fn identityVisibilityDeletedChunkKey(chunk_id: u32) [6]u8 {
+    var key: [6]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_visibility_deleted_chunk_kind;
+    std.mem.writeInt(u32, key[2..6], chunk_id, .big);
+    return key;
+}
+
+pub fn parseIdentityVisibilityDeletedChunkKey(key: []const u8) ?u32 {
+    if (key.len != 6) return null;
+    if (key[0] != identity_namespace or key[1] != identity_visibility_deleted_chunk_kind) return null;
+    return std.mem.readInt(u32, key[2..6], .big);
 }
 
 pub fn encodedBodyLen(bytes: []const u8) usize {
@@ -770,12 +806,131 @@ pub fn artifactNamedPrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_
 }
 
 pub fn derivedCoverageGeneration(config_json: []const u8) u64 {
-    return std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json);
+    return coverage_identity.fromHashBits(std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json));
+}
+
+/// Returns a versioned fingerprint of the fields that define generated output.
+/// Object order, credentials, rate limits, and top-level execution tuning are
+/// intentionally ignored.
+pub fn derivedCoverageConfigFingerprint(alloc: Allocator, config_json: []const u8) !u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed.deinit();
+
+    var hasher = std.hash.Wyhash.init(0x6472_636f_7665_7232);
+    hasher.update("antfly-derived-coverage-config-v2\x00");
+    try hashCanonicalJsonValue(alloc, &hasher, parsed.value, .root);
+    return hasher.final();
+}
+
+const CoverageFingerprintContext = enum {
+    root,
+    embedder,
+    other,
+};
+
+fn hashCanonicalJsonValue(
+    alloc: Allocator,
+    hasher: *std.hash.Wyhash,
+    value: std.json.Value,
+    context: CoverageFingerprintContext,
+) !void {
+    switch (value) {
+        .null => hasher.update("n"),
+        .bool => |flag| hasher.update(if (flag) "b1" else "b0"),
+        .integer => |number| {
+            hasher.update("i");
+            var buf: [32]u8 = undefined;
+            hashLengthPrefixed(hasher, std.fmt.bufPrint(&buf, "{d}", .{number}) catch unreachable);
+        },
+        .float => |number| {
+            hasher.update("f");
+            var buf: [64]u8 = undefined;
+            hashLengthPrefixed(hasher, std.fmt.bufPrint(&buf, "{d}", .{number}) catch unreachable);
+        },
+        .number_string => |number| {
+            hasher.update("r");
+            hashLengthPrefixed(hasher, number);
+        },
+        .string => |string| {
+            hasher.update("s");
+            hashLengthPrefixed(hasher, string);
+        },
+        .array => |array| {
+            hasher.update("a");
+            hashUsize(hasher, array.items.len);
+            for (array.items) |item| try hashCanonicalJsonValue(alloc, hasher, item, .other);
+        },
+        .object => |object| {
+            var keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            var key_count: usize = 0;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                if (!derivedCoverageConfigKeyIsSemantic(context, entry.key_ptr.*)) continue;
+                keys[key_count] = entry.key_ptr.*;
+                key_count += 1;
+            }
+            std.mem.sort([]const u8, keys[0..key_count], {}, struct {
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+
+            hasher.update("o");
+            hashUsize(hasher, key_count);
+            for (keys[0..key_count]) |key| {
+                hashLengthPrefixed(hasher, key);
+                const child_context: CoverageFingerprintContext = if (context == .root and std.mem.eql(u8, key, "embedder")) .embedder else .other;
+                try hashCanonicalJsonValue(alloc, hasher, object.get(key).?, child_context);
+            }
+        },
+    }
+}
+
+fn derivedCoverageConfigKeyIsSemantic(context: CoverageFingerprintContext, key: []const u8) bool {
+    if (context == .root and std.mem.eql(u8, key, "execution")) return false;
+    if (context != .embedder) return true;
+    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst");
+}
+
+fn hashLengthPrefixed(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    hashUsize(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn hashUsize(hasher: *std.hash.Wyhash, value: usize) void {
+    var buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &buf, @intCast(value), .little);
+    hasher.update(&buf);
 }
 
 pub fn derivedCoverageGenerationForConfig(coverage_generation: u64, config_json: []const u8) u64 {
     if (coverage_generation != 0) return coverage_generation;
     return derivedCoverageGeneration(config_json);
+}
+
+test "derived coverage config fingerprint is semantic and execution independent" {
+    const alloc = std.testing.allocator;
+    const first = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"field\":\"body\",\"dims\":384,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"},\"embedder\":{\"model\":\"clipclap\",\"api_key\":\"first\",\"requests_per_minute\":10},\"execution\":{\"embedding\":{\"batch_items\":16}}}",
+    );
+    const reordered = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"body\",\"kind\":\"dense_embedding\"},\"execution\":{\"embedding\":{\"batch_items\":1024}},\"embedder\":{\"requests_per_minute\":1000,\"api_key\":\"rotated\",\"model\":\"clipclap\"},\"dims\":384,\"field\":\"body\"}",
+    );
+    const changed = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"content\",\"kind\":\"dense_embedding\"},\"dims\":384,\"field\":\"body\"}",
+    );
+    const semantic_burst = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"body\",\"kind\":\"dense_embedding\",\"burst\":2},\"embedder\":{\"model\":\"clipclap\"},\"dims\":384,\"field\":\"body\"}",
+    );
+
+    try std.testing.expectEqual(first, reordered);
+    try std.testing.expect(first != changed);
+    try std.testing.expect(first != semantic_burst);
 }
 
 pub fn derivedCoverageOutcomePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -797,7 +952,7 @@ pub fn derivedCoverageOutcomeGenerationPrefixAlloc(alloc: Allocator, index_name:
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn derivedCoverageOutcomeKindPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64, outcome: []const u8) ![]u8 {
+pub fn derivedCoverageOutcomeMarkerPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
@@ -805,11 +960,11 @@ pub fn derivedCoverageOutcomeKindPrefixAlloc(alloc: Allocator, index_name: []con
     var generation_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &generation_buf, generation, .little);
     try list.appendSlice(alloc, &generation_buf);
-    try appendEncodedComponent(&list, alloc, outcome);
+    try list.append(alloc, derived_coverage_outcome_marker_kind);
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, doc_key: []const u8, outcome: []const u8) ![]u8 {
+pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
@@ -817,12 +972,29 @@ pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, 
     var generation_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &generation_buf, generation, .little);
     try list.appendSlice(alloc, &generation_buf);
-    try appendEncodedComponent(&list, alloc, outcome);
+    try list.append(alloc, derived_coverage_outcome_marker_kind);
     try appendEncodedComponent(&list, alloc, doc_key);
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn derivedCoverageSkippedCountKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
+pub fn derivedCoverageOutcomeDocKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    generation: u64,
+    key: []const u8,
+) ![]u8 {
+    const prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, index_name, generation);
+    defer alloc.free(prefix);
+    if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidDerivedCoverageOutcomeKey;
+    const component_start = prefix.len;
+    const component_end = findComponentTerminator(key, component_start) orelse
+        return error.InvalidDerivedCoverageOutcomeKey;
+    if (component_end + 2 != key.len) return error.InvalidDerivedCoverageOutcomeKey;
+    return decodeBodyAlloc(alloc, key[component_start..component_end]) catch
+        return error.InvalidDerivedCoverageOutcomeKey;
+}
+
+pub fn derivedCoverageOutcomeCountKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, outcome: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
@@ -830,17 +1002,18 @@ pub fn derivedCoverageSkippedCountKeyAlloc(alloc: Allocator, index_name: []const
     var generation_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &generation_buf, generation, .little);
     try list.appendSlice(alloc, &generation_buf);
-    try list.append(alloc, derived_coverage_skipped_count_kind);
+    try list.append(alloc, derived_coverage_outcome_count_kind);
+    try appendEncodedComponent(&list, alloc, outcome);
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn encodeDerivedCoverageSkippedCount(out: *[8]u8, count: u64) []const u8 {
+pub fn encodeDerivedCoverageOutcomeCount(out: *[8]u8, count: u64) []const u8 {
     std.mem.writeInt(u64, out, count, .little);
     return out[0..];
 }
 
-pub fn decodeDerivedCoverageSkippedCount(raw: []const u8) !u64 {
-    if (raw.len != 8) return error.InvalidDerivedCoverageSkippedCount;
+pub fn decodeDerivedCoverageOutcomeCount(raw: []const u8) !u64 {
+    if (raw.len != 8) return error.InvalidDerivedCoverageOutcomeCount;
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
@@ -891,6 +1064,70 @@ pub fn artifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn managedIndexAdmissionKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, managed_index_admission_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn managedIndexAdmissionRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, managed_index_admission_kind });
+}
+
+pub fn managedIndexAdmissionNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const prefix = [_]u8{ replay_namespace, 0xff, managed_index_admission_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_start = prefix.len;
+    const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
+    if (name_end + 2 != key.len) return error.InvalidInternalUserKey;
+    return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
+pub fn indexArtifactCleanupKeyAlloc(alloc: Allocator, index_name: []const u8, coverage_generation: u64) ![]u8 {
+    if (coverage_generation == 0) return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    const generation_be = std.mem.nativeToBig(u64, coverage_generation);
+    try list.appendSlice(alloc, std.mem.asBytes(&generation_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn indexArtifactCleanupRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+}
+
+pub fn indexArtifactCleanupIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn indexArtifactCleanupNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const prefix = [_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_start = prefix.len;
+    const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
+    if (name_end + 2 + @sizeOf(u64) != key.len) return error.InvalidInternalUserKey;
+    return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
+pub fn indexArtifactCleanupCoverageGeneration(key: []const u8) !u64 {
+    const prefix = [_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_end = findComponentTerminator(key, prefix.len) orelse return error.InvalidInternalUserKey;
+    const generation_start = name_end + 2;
+    if (generation_start + @sizeOf(u64) != key.len) return error.InvalidInternalUserKey;
+    const generation = std.mem.bigToNative(u64, std.mem.bytesToValue(u64, key[generation_start..][0..@sizeOf(u64)]));
+    if (generation == 0) return error.InvalidInternalUserKey;
+    return generation;
 }
 
 pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -2746,20 +2983,24 @@ test "derived coverage outcome keys are generation scoped" {
 
     const index_prefix = try derivedCoverageOutcomePrefixAlloc(alloc, "semantic_idx");
     defer alloc.free(index_prefix);
-    const old_prefix = try derivedCoverageOutcomeKindPrefixAlloc(alloc, "semantic_idx", old_generation, "skipped");
+    const old_prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, "semantic_idx", old_generation);
     defer alloc.free(old_prefix);
-    const new_prefix = try derivedCoverageOutcomeKindPrefixAlloc(alloc, "semantic_idx", new_generation, "skipped");
+    const new_prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, "semantic_idx", new_generation);
     defer alloc.free(new_prefix);
-    const old_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", old_generation, "doc:1", "skipped");
+    const old_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", old_generation, "doc:1");
     defer alloc.free(old_key);
-    const new_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", new_generation, "doc:1", "skipped");
+    const new_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", new_generation, "doc:1");
     defer alloc.free(new_key);
-    const skipped_count_key = try derivedCoverageSkippedCountKeyAlloc(alloc, "semantic_idx", new_generation);
+    const skipped_count_key = try derivedCoverageOutcomeCountKeyAlloc(alloc, "semantic_idx", new_generation, "skipped");
     defer alloc.free(skipped_count_key);
+    const produced_count_key = try derivedCoverageOutcomeCountKeyAlloc(alloc, "semantic_idx", new_generation, "produced");
+    defer alloc.free(produced_count_key);
 
     try std.testing.expect(std.mem.startsWith(u8, old_key, index_prefix));
     try std.testing.expect(std.mem.startsWith(u8, new_key, index_prefix));
     try std.testing.expect(std.mem.startsWith(u8, skipped_count_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, produced_count_key, index_prefix));
+    try std.testing.expect(!std.mem.eql(u8, skipped_count_key, produced_count_key));
     try std.testing.expect(std.mem.startsWith(u8, old_key, old_prefix));
     try std.testing.expect(std.mem.startsWith(u8, new_key, new_prefix));
     try std.testing.expect(!std.mem.startsWith(u8, skipped_count_key, new_prefix));
@@ -2767,8 +3008,42 @@ test "derived coverage outcome keys are generation scoped" {
     try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
 
     var encoded_count: [8]u8 = undefined;
-    const encoded = encodeDerivedCoverageSkippedCount(&encoded_count, 42);
-    try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageSkippedCount(encoded));
+    const encoded = encodeDerivedCoverageOutcomeCount(&encoded_count, 42);
+    try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageOutcomeCount(encoded));
+}
+
+test "managed index admission keys round trip encoded names" {
+    const alloc = std.testing.allocator;
+    const name = "full\x00text";
+    const key = try managedIndexAdmissionKeyAlloc(alloc, name);
+    defer alloc.free(key);
+    const decoded = try managedIndexAdmissionNameAlloc(alloc, key);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(error.InvalidInternalUserKey, managedIndexAdmissionNameAlloc(alloc, malformed));
+}
+
+test "index artifact cleanup keys round trip encoded names" {
+    const alloc = std.testing.allocator;
+    const name = "dense\x00index";
+    const generation: u64 = 0x1234_5678_9abc_def0;
+    const root = try indexArtifactCleanupRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const key = try indexArtifactCleanupKeyAlloc(alloc, name, generation);
+    defer alloc.free(key);
+    try std.testing.expect(std.mem.startsWith(u8, key, root));
+    const decoded = try indexArtifactCleanupNameAlloc(alloc, key);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+    try std.testing.expectEqual(generation, try indexArtifactCleanupCoverageGeneration(key));
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(error.InvalidInternalUserKey, indexArtifactCleanupNameAlloc(alloc, malformed));
+    try std.testing.expectError(error.InvalidInternalUserKey, indexArtifactCleanupCoverageGeneration(malformed));
 }
 
 test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {

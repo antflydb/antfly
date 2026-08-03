@@ -116,6 +116,7 @@ from antfly.client_generated.models.rows_window_spec import RowsWindowSpec  # no
 from antfly.client_generated.models.sort_profile import SortProfile  # noqa: E402
 from antfly.client_generated.models.sql_statement_response import SqlStatementResponse  # noqa: E402
 from antfly.client_generated.models.sql_statement_response_kind import SqlStatementResponseKind  # noqa: E402
+from antfly.client_generated.models.transform_op_type import TransformOpType  # noqa: E402
 from antfly.client_generated.types import UNSET, Unset  # noqa: E402
 
 type RowsExpression = RowsExpressionField | RowsExpressionOperator | RowsExpressionValue
@@ -163,6 +164,16 @@ def coalesce_value(value: object) -> RowsCoalesceValueOperand:
 
 class TestAntflyClient:
     """Test cases for AntflyClient."""
+
+    def test_transform_operator_names_are_stable(self) -> None:
+        assert {member.name: member.value for member in TransformOpType} == {
+            "SET": "$set",
+            "SET_ON_INSERT": "$setOnInsert",
+            "UNSET": "$unset",
+            "INC": "$inc",
+            "ADD_TO_SET": "$addToSet",
+            "MAX": "$max",
+        }
 
     def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
         """SortProfile keeps stable fields typed and drops internal counters."""

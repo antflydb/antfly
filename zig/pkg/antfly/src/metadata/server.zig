@@ -13,18 +13,22 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const metadata_mod = @import("mod.zig");
+const metadata_authority = @import("authority.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
 const table_manager = @import("table_manager.zig");
 const table_workflow = @import("table_workflow.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
+const catalog_source = @import("catalog/source.zig");
 const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const public_api_http_routes = @import("../api/http_routes.zig");
 const public_api_runtime = @import("../api/public_runtime.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const restore_jobs = @import("../api/restore_jobs.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
@@ -49,12 +53,19 @@ pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
     control_loop: metadata_mod.MetadataControlLoop,
+    transition_ops_registration: ?raft_shard_ops.OwnedShardOperationAdapter.Registration = null,
     owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null,
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     public_api_surface: public_api_runtime.PublicApiSurface,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
+    restore_supervisor_owner_id: u64 = 0,
+    restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
+
+    pub fn catalogSource(self: *MetadataServer) catalog_source.CatalogSource {
+        return self.svc.catalogSource();
+    }
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -70,6 +81,8 @@ pub const MetadataServer = struct {
         errdefer if (owned_hosted_shard_ops) |ops| alloc.destroy(ops);
         var owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null;
         errdefer if (owned_hosted_shard_db) |adapter| alloc.destroy(adapter);
+        var transition_ops_registration: ?raft_shard_ops.OwnedShardOperationAdapter.Registration = null;
+        errdefer if (transition_ops_registration) |*registration| registration.deinit();
 
         if (deps.http.raft.transition_ops == null) {
             const local_ops = metadataLocalShardOperationAdapter(svc);
@@ -80,9 +93,13 @@ pub const MetadataServer = struct {
                 metadataStoreGroupRouter(svc),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
+                .{
+                    .ptr = svc,
+                    .readiness = metadataGroupTransitionReadiness,
+                },
                 local_ops,
             );
-            try svc.raft.replaceTransitionOps(hosted_ops.adapter());
+            transition_ops_registration = try svc.raft.replaceTransitionOps(hosted_ops.adapter());
             owned_hosted_shard_ops = hosted_ops;
         }
         {
@@ -112,6 +129,12 @@ pub const MetadataServer = struct {
         };
 
         if (cfg.admin_listener) |listener_cfg| {
+            // The request allocator must share identity with the process
+            // allocator used by DB internals (c_allocator when libc is
+            // linked): request-scoped results adopt buffers allocated by
+            // DB-owned components (index metadata, table record clones), so a
+            // distinct allocator identity here turns those adoptions into
+            // cross-allocator frees that corrupt the heap.
             const admin_http_server = try alloc.create(metadata_http_server.MetadataHttpServer);
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
@@ -126,6 +149,11 @@ pub const MetadataServer = struct {
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
+            api_server_cfg.backend_runtime = try svc.ensureBackendRuntime();
+            api_server_cfg.restore_execution_guard = .{
+                .ptr = svc,
+                .is_current = metadataRestoreLeadershipIsCurrent,
+            };
             public_api_surface = try public_api_runtime.PublicApiSurface.initForMetadataService(
                 alloc,
                 .{
@@ -137,19 +165,22 @@ pub const MetadataServer = struct {
                     .backend_runtime = try svc.ensureBackendRuntime(),
                 },
             );
+            const public_http_server = public_api_surface.requireApiServer();
+            try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
 
             const mux = try alloc.create(MetadataAdminMux);
             mux.* = .{
                 .admin = admin_http_server,
-                .public_api = public_api_surface.requireApiServer(),
+                .public_api = public_http_server,
+                .svc = svc,
             };
             owned_admin_mux = mux;
 
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(alloc, listener_cfg, mux.executor(), io_impl)
+                raft_transport.StdHttpListener.initShared(public_http_server.alloc, listener_cfg, mux.executor(), io_impl)
             else
-                raft_transport.StdHttpListener.init(alloc, listener_cfg, mux.executor());
+                raft_transport.StdHttpListener.init(public_http_server.alloc, listener_cfg, mux.executor());
             owned_admin_listener = listener;
         }
 
@@ -157,6 +188,7 @@ pub const MetadataServer = struct {
             .alloc = alloc,
             .svc = svc,
             .control_loop = metadata_mod.MetadataControlLoop.initWithConfig(alloc, cfg.reconciler_config),
+            .transition_ops_registration = transition_ops_registration,
             .owned_hosted_shard_ops = owned_hosted_shard_ops,
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
@@ -166,7 +198,18 @@ pub const MetadataServer = struct {
         };
     }
 
+    fn metadataGroupTransitionReadiness(
+        ptr: *anyopaque,
+        group_id: u64,
+    ) !transition_state.StablePlacementReadiness {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.groupTransitionReadiness(group_id);
+    }
+
     pub fn deinit(self: *MetadataServer) void {
+        self.stopRestoreSupervisor();
+        if (self.transition_ops_registration) |*registration| registration.deinit();
+        self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
             listener.deinit();
             self.alloc.destroy(listener);
@@ -198,12 +241,71 @@ pub const MetadataServer = struct {
                 std.log.err("metadata server start failed step=admin_listener_start err={}", .{err});
                 return err;
             };
+            errdefer listener.stop();
+        }
+        if (self.owned_admin_mux != null) {
+            const runtime = try self.svc.ensureBackendRuntime();
+            if (runtime.threaded_jobs != null and runtime.io() != null) {
+                self.restore_supervisor_stop.store(false, .release);
+                self.restore_supervisor_owner_id = try runtime.allocOwnerId();
+                errdefer self.restore_supervisor_owner_id = 0;
+                try runtime.durable_jobs.submit(.{
+                    .owner_id = self.restore_supervisor_owner_id,
+                    .class = .maintenance,
+                    .ptr = self,
+                    .run = restoreSupervisorRun,
+                    .deinit = restoreSupervisorDeinit,
+                });
+            }
         }
     }
 
     pub fn stop(self: *MetadataServer) void {
         if (self.owned_admin_listener) |listener| listener.stop();
+        self.stopRestoreSupervisor();
         self.svc.stop();
+    }
+
+    fn restoreSupervisorRun(ptr: *anyopaque) !void {
+        const self: *MetadataServer = @ptrCast(@alignCast(ptr));
+        const io = (try self.svc.ensureBackendRuntime()).io() orelse return error.AsyncRestoreUnavailable;
+        var last_unexpected_error: ?anyerror = null;
+        while (!self.restore_supervisor_stop.load(.acquire)) {
+            if (self.owned_admin_mux) |mux| {
+                if (mux.ensureRestoreLeadershipIfLocalLeader()) |local_leader| {
+                    if (local_leader) {
+                        if (mux.public_api.pollRestoreJobsOnce()) |_| {
+                            last_unexpected_error = null;
+                        } else |err| {
+                            if (last_unexpected_error == null or last_unexpected_error.? != err)
+                                std.log.err("metadata restore dispatch retry failed err={s}", .{@errorName(err)});
+                            last_unexpected_error = err;
+                        }
+                    } else {
+                        last_unexpected_error = null;
+                    }
+                } else |err| {
+                    if (metadata_authority.isRetryableError(err)) {
+                        last_unexpected_error = null;
+                    } else {
+                        if (last_unexpected_error == null or last_unexpected_error.? != err)
+                            std.log.err("metadata restore supervisor failed err={s}", .{@errorName(err)});
+                        last_unexpected_error = err;
+                    }
+                }
+            }
+            io.sleep(std.Io.Duration.fromMilliseconds(250), .awake) catch return;
+        }
+    }
+
+    fn restoreSupervisorDeinit(_: *anyopaque) void {}
+
+    fn stopRestoreSupervisor(self: *MetadataServer) void {
+        self.restore_supervisor_stop.store(true, .release);
+        if (self.restore_supervisor_owner_id != 0) {
+            if (self.svc.backend_runtime) |runtime| runtime.durable_jobs.closeOwner(self.restore_supervisor_owner_id);
+        }
+        self.restore_supervisor_owner_id = 0;
     }
 
     pub fn baseUri(self: *MetadataServer, alloc: std.mem.Allocator) ![]u8 {
@@ -221,6 +323,14 @@ pub const MetadataServer = struct {
 
     pub fn runRound(self: *MetadataServer) !void {
         try self.svc.runRound();
+    }
+
+    pub fn runRaftRoundOnly(self: *MetadataServer) !void {
+        try self.svc.runRaftRoundOnly();
+    }
+
+    pub fn runControlRoundOnly(self: *MetadataServer) !void {
+        try self.svc.runControlRoundOnly();
     }
 
     pub fn runCdcRound(self: *MetadataServer) !void {
@@ -259,6 +369,14 @@ pub const MetadataServer = struct {
         return try self.svc.adminSnapshot();
     }
 
+    pub fn validatePublication(self: *MetadataServer, contract: @import("api.zig").CatalogPublicationContract) !bool {
+        return try self.svc.validatePublication(contract);
+    }
+
+    pub fn validateTablePublication(self: *MetadataServer, contract: @import("api.zig").CatalogTablePublicationContract) !bool {
+        return try self.svc.validateTablePublication(contract);
+    }
+
     pub fn freeAdminSnapshot(self: *MetadataServer, snapshot: *@import("api.zig").AdminSnapshot) void {
         self.svc.freeAdminSnapshot(snapshot);
     }
@@ -283,6 +401,9 @@ pub const MetadataServer = struct {
 const MetadataAdminMux = struct {
     admin: *metadata_http_server.MetadataHttpServer,
     public_api: *public_api_runtime.ApiHttpServer,
+    svc: *service.MetadataHttpService,
+    restore_leadership_mutex: std.atomic.Mutex = .unlocked,
+    restore_leadership_term: u64 = 0,
 
     fn executor(self: *MetadataAdminMux) http_common.RequestExecutor {
         return .{
@@ -293,8 +414,45 @@ const MetadataAdminMux = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
-        if (isPublicApiRequest(req.uri)) return try self.public_api.handle(req);
+        if (isPublicApiRequest(req.uri)) {
+            if (isRestoreApiRequest(req.uri)) {
+                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| {
+                    if (metadata_authority.isRetryableError(err)) {
+                        return try public_api_runtime.metadataNotLeaderResponse(alloc);
+                    }
+                    return err;
+                };
+                // Mutations and collection reads stay leader-serialized. A
+                // follower can refresh one replicated job by key, but it has
+                // no linearizable snapshot for collection pagination.
+                if (!local_leader and (req.method != .GET or isRestoreJobCollectionRequest(req.uri)))
+                    return try public_api_runtime.metadataNotLeaderResponse(alloc);
+            }
+            var response = self.public_api.handle(req) catch |err| {
+                if (metadata_authority.isRetryableError(err))
+                    return try public_api_runtime.metadataNotLeaderResponse(alloc);
+                return err;
+            };
+            if (response.owner_allocator == null) response.owner_allocator = self.public_api.alloc;
+            return response;
+        }
         return try self.admin.executor().execute(alloc, req);
+    }
+
+    fn ensureRestoreLeadershipIfLocalLeader(self: *MetadataAdminMux) !bool {
+        const term = self.svc.localMetadataLeadershipTerm() orelse {
+            platform_sync.lockYielding(&self.restore_leadership_mutex);
+            self.restore_leadership_term = 0;
+            self.restore_leadership_mutex.unlock();
+            return false;
+        };
+        platform_sync.lockYielding(&self.restore_leadership_mutex);
+        defer self.restore_leadership_mutex.unlock();
+        if (self.restore_leadership_term == term) return true;
+        try self.svc.ensureLinearizableRead();
+        try self.public_api.prepareRestoreLeadership(term);
+        self.restore_leadership_term = term;
+        return true;
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {
@@ -302,7 +460,111 @@ const MetadataAdminMux = struct {
             std.mem.startsWith(u8, uri, public_api_http_routes.Routes.db_v1_prefix ++ "/") or
             std.mem.startsWith(u8, uri, public_api_http_routes.Routes.db_v1_prefix ++ "?");
     }
+
+    fn isRestoreApiRequest(uri: []const u8) bool {
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
+        if (std.mem.eql(u8, path, "/db/v1/restore") or
+            std.mem.eql(u8, path, "/db/v1/restore/jobs") or
+            std.mem.startsWith(u8, path, "/db/v1/restore/jobs/")) return true;
+        return std.mem.startsWith(u8, path, "/db/v1/tables/") and std.mem.endsWith(u8, path, "/restore");
+    }
+
+    fn isRestoreJobCollectionRequest(uri: []const u8) bool {
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
+        return std.mem.eql(u8, path, "/db/v1/restore/jobs");
+    }
 };
+
+fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
+    return .{ .ptr = svc, .vtable = &.{
+        .load = metadataRestoreJobLoad,
+        .get = metadataRestoreJobGet,
+        .put = metadataRestoreJobPut,
+        .delete = metadataRestoreJobDelete,
+        .delete_many = metadataRestoreJobDeleteMany,
+    } };
+}
+
+fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const local_leader = svc.localMetadataLeadershipTerm() != null;
+    if (local_leader) try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse {
+        if (!local_leader) return error.NotLeader;
+        return error.MissingMetadataStore;
+    };
+    const value = try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    // A follower cannot distinguish "not committed here yet" from "does not
+    // exist". Fail retryably until the record is visible instead of leaking a
+    // load-balancer-dependent 404 for a durable job accepted by the leader.
+    if (value == null and !local_leader) return error.NotLeader;
+    return value;
+}
+
+fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const rows = try store.listRestoreJobRows(alloc, svc.metadata_group_id);
+    defer store.freeRestoreJobRows(alloc, rows);
+    const out = try alloc.alloc(restore_jobs.ReplicatedPersistence.OwnedRow, rows.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(out);
+    }
+    for (rows, 0..) |row, i| {
+        out[i] = .{ .key = try alloc.dupe(u8, row.key), .value = try alloc.dupe(u8, row.value) };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .upsert_restore_job = .{ .key = key, .value = value } });
+    // `propose` only admits the command to the local Raft node. A successful
+    // job mutation must not become visible to the HTTP caller until a read
+    // barrier proves that this proposal is committed and applied locally.
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const committed = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse
+        return error.RestoreJobCommitNotApplied;
+    defer svc.alloc.free(committed);
+    if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .remove_restore_job = .{ .key = key } });
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
+        svc.alloc.free(committed);
+        return error.RestoreJobCommitNotApplied;
+    }
+}
+
+fn metadataRestoreJobDeleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+    if (keys.len == 0) return;
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .remove_restore_jobs = .{ .keys = keys } });
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    for (keys) |key| {
+        if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
+            svc.alloc.free(committed);
+            return error.RestoreJobCommitNotApplied;
+        }
+    }
+}
+
+fn metadataRestoreLeadershipIsCurrent(ptr: *anyopaque, leadership_term: u64) bool {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.localMetadataLeadershipTerm() == leadership_term;
+}
 
 fn metadataStoreGroupRouter(svc: *service.MetadataHttpService) api_table_router.HostedGroupRouter {
     return .{
@@ -348,7 +610,7 @@ fn metadataStoreRouterNodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) r
     defer snapshot.deinit(svc, svc.alloc);
     const store = storeForNode(snapshot.stores, node_id) orelse return .absent;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return .absent;
-    if (!nodeHasGroupPlacement(snapshot.placements, group_id, node_id)) return .absent;
+    if (!nodeHasReadableGroupPlacement(snapshot.placements, group_id, node_id)) return .absent;
     return .active;
 }
 
@@ -421,7 +683,7 @@ fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Alloca
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
-    if (!nodeHasGroupPlacement(snapshot.placements, group_id, node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(snapshot.placements, group_id, node_id)) return null;
     const store = storeForNode(snapshot.stores, node_id) orelse return null;
     if (store.api_url.len == 0) return null;
     return try alloc.dupe(u8, store.api_url);
@@ -499,7 +761,7 @@ fn dataBearingStoreCandidate(
     group_id: u64,
 ) ?DataBearingStoreCandidate {
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return null;
-    if (!nodeHasGroupPlacement(placements, group_id, store.node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(placements, group_id, store.node_id)) return null;
 
     var candidate = DataBearingStoreCandidate{
         .node_id = store.node_id,
@@ -536,6 +798,14 @@ fn dataBearingStoreCandidateLessThan(a: DataBearingStoreCandidate, b: DataBearin
 fn nodeHasGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
     for (placements) |intent| {
         if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
+    }
+    return false;
+}
+
+fn nodeHasReadableGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
+    for (placements) |intent| {
+        if (intent.record.group_id != group_id or intent.record.local_node_id != node_id) continue;
+        return raft_reconciler.placementReadableWithPeers(placements, intent);
     }
     return false;
 }
@@ -602,73 +872,73 @@ fn schemaIndexReady(
     return try shard_db.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
 }
 
-fn observeSplit(ptr: *anyopaque, record: transition_state.SplitTransitionRecord) !transition_state.SplitObservation {
+fn observeSplit(ptr: *anyopaque, _: u64, record: transition_state.SplitTransitionRecord) !transition_state.SplitObservation {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     return try runtime.shardOperationAdapter().observeSplit(record);
 }
 
-fn observeMerge(ptr: *anyopaque, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
+fn observeMerge(ptr: *anyopaque, _: u64, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     return try runtime.shardOperationAdapter().observeMerge(record);
 }
 
-fn prepareSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "prepare_split_source")) !void {
+fn prepareSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "prepare_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .prepare_split_source = op });
 }
 
-fn startSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "start_split_source")) !void {
+fn startSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "start_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .start_split_source = op });
 }
 
-fn bootstrapSplitDestination(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "bootstrap_split_destination")) !void {
+fn bootstrapSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "bootstrap_split_destination")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
 }
 
-fn catchUpSplitDestination(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "catch_up_split_destination")) !void {
+fn catchUpSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "catch_up_split_destination")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
 }
 
-fn finalizeSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "finalize_split_source")) !void {
+fn finalizeSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "finalize_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .finalize_split_source = op });
 }
 
-fn rollbackSplit(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "rollback_split")) !void {
+fn rollbackSplit(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "rollback_split")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .rollback_split = op });
 }
 
-fn acceptMergeReceiver(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "accept_merge_receiver")) !void {
+fn acceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "accept_merge_receiver")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
 }
 
-fn catchUpMergeReceiver(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver")) !void {
+fn catchUpMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
 }
 
-fn finalizeMerge(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "finalize_merge")) !void {
+fn finalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "finalize_merge")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
 }
 
-fn rollbackMerge(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "rollback_merge")) !void {
+fn rollbackMerge(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "rollback_merge")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
@@ -678,6 +948,28 @@ test "metadata server module compiles" {
     _ = MetadataServerConfig;
     _ = MetadataServerDeps;
     _ = MetadataServer;
+}
+
+test "metadata data-bearing routes honor relocation serving states" {
+    var placements = [_]raft_reconciler.PlacementIntent{
+        .{
+            .store_id = 10,
+            .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+            .serving_state = .draining,
+        },
+        .{
+            .store_id = 20,
+            .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 },
+            .serving_state = .bootstrapping,
+        },
+    };
+
+    try std.testing.expect(nodeHasReadableGroupPlacement(&placements, 77, 1));
+    try std.testing.expect(!nodeHasReadableGroupPlacement(&placements, 77, 2));
+
+    placements[1].serving_state = .serving;
+    try std.testing.expect(!nodeHasReadableGroupPlacement(&placements, 77, 1));
+    try std.testing.expect(nodeHasReadableGroupPlacement(&placements, 77, 2));
 }
 
 test "metadata server wires hosted shard adapters by default" {
@@ -938,6 +1230,7 @@ test "metadata admin mux maps admin not leader through metadata executor" {
     var mux = MetadataAdminMux{
         .admin = &admin,
         .public_api = undefined,
+        .svc = undefined,
     };
 
     var response = try mux.executor().execute(std.testing.allocator, .{
@@ -1064,4 +1357,25 @@ test "metadata admin mux routes public db v1 requests through public api server"
     });
     defer sql_response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), sql_response.status);
+
+    try std.testing.expectError(
+        error.NotLeader,
+        metadataRestoreJobGet(server.svc, std.testing.allocator, "\x00\x00__api_restore_jobs__:0000000000000001"),
+    );
+
+    var list_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/restore/jobs",
+    });
+    defer list_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), list_response.status);
+
+    // Point reads may proceed to authorization on a follower because the
+    // replicated persistence adapter refreshes the requested key directly.
+    var item_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/restore/jobs/1",
+    });
+    defer item_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), item_response.status);
 }

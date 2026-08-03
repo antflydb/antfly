@@ -211,6 +211,10 @@ pub const ClientGenerator = struct {
             shared.hasOctetStreamRequestBody(self.resolver, rb_or)
         else
             false;
+        const is_body_required = if (op.request_body) |rb_or|
+            shared.isRequestBodyRequired(self.resolver, rb_or)
+        else
+            false;
 
         // Method signature
         {
@@ -224,9 +228,14 @@ pub const ClientGenerator = struct {
 
             // Request body parameter
             if (is_binary_request) {
-                try sig.appendSlice(self.arena, ", body: []const u8");
+                try sig.print(self.arena, ", body: {s}[]const u8", .{if (is_body_required) "" else "?"});
             } else if (body_type) |bt| {
-                try sig.print(self.arena, ", body: {s}", .{bt});
+                try sig.print(self.arena, ", body: {s}{s}", .{ if (is_body_required) "" else "?", bt });
+            }
+
+            for (params.header) |p| {
+                const pname = try naming.zigFieldName(self.arena, p.name);
+                try sig.print(self.arena, ", {s}: {s}[]const u8", .{ pname, if (p.required) "" else "?" });
             }
 
             // Query params struct
@@ -255,17 +264,59 @@ pub const ClientGenerator = struct {
 
         // Build request body
         if (!is_binary_request and body_type != null) {
-            try self.w.line("const json_body = try httpx.json.Json.stringify(self.allocator, body);", .{});
-            try self.w.line("defer self.allocator.free(json_body);", .{});
+            if (is_body_required) {
+                try self.w.line("const json_body = try httpx.json.Json.stringify(self.allocator, body);", .{});
+                try self.w.line("defer self.allocator.free(json_body);", .{});
+            } else {
+                try self.w.line("const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;", .{});
+                try self.w.line("defer if (json_body) |value| self.allocator.free(value);", .{});
+            }
+        }
+
+        if (params.header.len > 0) {
+            try self.w.line("var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;", .{});
+            try self.w.line("defer request_headers.deinit(self.allocator);", .{});
+            try self.w.line("if (self.auth_header) |header| try request_headers.append(self.allocator, header);", .{});
+            for (params.header) |p| {
+                const pname = try naming.zigFieldName(self.arena, p.name);
+                if (p.required) {
+                    try self.w.line("try request_headers.append(self.allocator, .{{ \"{s}\", {s} }});", .{ p.name, pname });
+                } else {
+                    try self.w.line("if ({s}) |value| try request_headers.append(self.allocator, .{{ \"{s}\", value }});", .{ pname, p.name });
+                }
+            }
         }
 
         // Make request
+        const headers_expr = if (params.header.len > 0) "request_headers.items" else "self.authHeaders()";
         if (is_binary_request) {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = self.authHeaders() }});", .{http_method});
+            if (is_body_required) {
+                try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = {s} }});", .{ http_method, headers_expr });
+            } else {
+                try self.w.line("var resp = if (body) |value|", .{});
+                self.w.indent();
+                try self.w.line("try self.http.{s}(url, .{{ .body = value, .headers = {s} }})", .{ http_method, headers_expr });
+                self.w.dedent();
+                try self.w.line("else", .{});
+                self.w.indent();
+                try self.w.line("try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+                self.w.dedent();
+            }
         } else if (body_type != null) {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = self.authHeaders() }});", .{http_method});
+            if (is_body_required) {
+                try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = {s} }});", .{ http_method, headers_expr });
+            } else {
+                try self.w.line("var resp = if (json_body) |value|", .{});
+                self.w.indent();
+                try self.w.line("try self.http.{s}(url, .{{ .json = value, .headers = {s} }})", .{ http_method, headers_expr });
+                self.w.dedent();
+                try self.w.line("else", .{});
+                self.w.indent();
+                try self.w.line("try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+                self.w.dedent();
+            }
         } else {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = self.authHeaders() }});", .{http_method});
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
         }
 
         // Return response
@@ -410,6 +461,69 @@ test "client generator smoke" {
     var w = SourceWriter.init(arena);
     var type_gen = TypeGenerator.init(arena, &w, &resolver);
     _ = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+}
+
+test "client generator preserves optional request body semantics" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var optional_content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+    try optional_content.put(arena, "application/json", .{
+        .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } },
+    });
+    var required_content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+    try required_content.put(arena, "application/json", .{
+        .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } },
+    });
+    var optional_binary_content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+    try optional_binary_content.put(arena, "application/octet-stream", .{});
+
+    var doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+    };
+    try doc.paths.put(arena, "/optional", .{
+        .post = .{
+            .operation_id = "optionalBody",
+            .request_body = .{ .request_body = .{
+                .required = false,
+                .content = optional_content,
+            } },
+        },
+    });
+    try doc.paths.put(arena, "/required", .{
+        .post = .{
+            .operation_id = "requiredBody",
+            .request_body = .{ .request_body = .{
+                .required = true,
+                .content = required_content,
+            } },
+        },
+    });
+    try doc.paths.put(arena, "/optional-binary", .{
+        .post = .{
+            .operation_id = "optionalBinaryBody",
+            .request_body = .{ .request_body = .{
+                .required = false,
+                .content = optional_binary_content,
+            } },
+        },
+    });
+
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var generator = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+    try generator.generate(&doc);
+
+    const generated = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn optionalBody(self: *@This(), body: ?[]const u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const json_body = if (body) |value|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn requiredBody(self: *@This(), body: []const u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn optionalBinaryBody(self: *@This(), body: ?[]const u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".body = value") != null);
 }
 
 test "client generator percent-encodes path parameters" {

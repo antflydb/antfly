@@ -12,11 +12,210 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const builtin = @import("builtin");
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const managed_host = @import("managed_host.zig");
 const metadata_view = @import("metadata_view.zig");
 const service = @import("service.zig");
 const reconciler = @import("reconciler.zig");
+
+pub const ProgressSource = struct {
+    ptr: *anyopaque,
+    run_once: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn runOnce(self: ProgressSource) !void {
+        return try self.run_once(self.ptr);
+    }
+};
+
+pub const RuntimeCadence = struct {
+    pub const default_raft_tick_ms: u64 = 100;
+    pub const default_control_tick_ms: u64 = 100;
+    pub const min_raft_tick_ms: u64 = 1;
+    pub const max_raft_tick_ms: u64 = 1_000;
+    pub const min_control_tick_ms: u64 = 1;
+    pub const max_control_tick_ms: u64 = 60_000;
+
+    raft_tick_ns: u64,
+    control_tick_ns: u64,
+
+    pub fn fromMillis(raft_tick_ms: u64, control_tick_ms: u64) !RuntimeCadence {
+        if (raft_tick_ms < min_raft_tick_ms or raft_tick_ms > max_raft_tick_ms)
+            return error.InvalidRaftTickInterval;
+        if (control_tick_ms < min_control_tick_ms or control_tick_ms > max_control_tick_ms)
+            return error.InvalidControlTickInterval;
+        return .{
+            .raft_tick_ns = std.math.mul(u64, raft_tick_ms, std.time.ns_per_ms) catch
+                return error.InvalidRaftTickInterval,
+            .control_tick_ns = std.math.mul(u64, control_tick_ms, std.time.ns_per_ms) catch
+                return error.InvalidControlTickInterval,
+        };
+    }
+};
+
+/// Owns the dedicated scheduling lane for one Raft runtime. The source retains
+/// semantic ownership of the Raft service and its synchronization; this driver
+/// owns only cadence, failure propagation, cancellation, and thread lifetime.
+/// A driver is one-shot: construct a new driver for a new runtime generation.
+pub const ManagedProgressDriver = struct {
+    const State = enum {
+        initialized,
+        running,
+        stopped,
+    };
+
+    io: std.Io,
+    source: ProgressSource,
+    interval_ns: u64,
+    thread: ?std.Thread = null,
+    state: State = .initialized,
+    stop_event: std.Io.Event = .unset,
+    failure_event: std.Io.Event = .unset,
+    failed: std.atomic.Value(bool) = .init(false),
+    /// Even generations are idle; odd generations identify one active round.
+    /// The generation brackets `round_started_ns`, giving observers a stable
+    /// snapshot instead of racing separate in-progress/completion atomics.
+    round_generation: std.atomic.Value(u64) = .init(0),
+    round_started_ns: std.atomic.Value(u64) = .init(0),
+    stall_timeout_ns: u64,
+    failure: ?anyerror = null,
+
+    pub fn init(io: std.Io, source: ProgressSource, interval_ns: u64) ManagedProgressDriver {
+        return initWithStallTimeout(
+            io,
+            source,
+            interval_ns,
+            @max(5 * std.time.ns_per_s, std.math.mul(u64, interval_ns, 10) catch std.math.maxInt(u64)),
+        );
+    }
+
+    fn initWithStallTimeout(
+        io: std.Io,
+        source: ProgressSource,
+        interval_ns: u64,
+        stall_timeout_ns: u64,
+    ) ManagedProgressDriver {
+        return .{
+            .io = io,
+            .source = source,
+            .interval_ns = interval_ns,
+            .stall_timeout_ns = stall_timeout_ns,
+        };
+    }
+
+    pub fn start(self: *ManagedProgressDriver) !void {
+        if (self.state != .initialized) return error.AlreadyStarted;
+        if (self.interval_ns == 0) return error.InvalidInterval;
+        if (comptime builtin.single_threaded) return error.UnsupportedPlatform;
+
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.state = .running;
+    }
+
+    pub fn check(self: *const ManagedProgressDriver) !void {
+        if (self.failed.load(.acquire))
+            return self.failure orelse error.RaftProgressDriverFailed;
+        if (self.isStalled(platform_time.monotonicNs()))
+            return error.RaftProgressDriverStalled;
+    }
+
+    pub fn isHealthy(self: *const ManagedProgressDriver) bool {
+        self.check() catch return false;
+        return true;
+    }
+
+    /// Sleeps for control-plane cadence while remaining immediately responsive
+    /// to a fatal progress-lane failure.
+    pub fn waitForFailureOrTimeout(self: *ManagedProgressDriver, timeout_ns: u64) !void {
+        try self.check();
+        const wait_ns = self.nextHealthCheckDelay(timeout_ns, platform_time.monotonicNs());
+        self.failure_event.waitTimeout(self.io, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromNanoseconds(wait_ns),
+                .clock = .awake,
+            },
+        }) catch |err| switch (err) {
+            error.Timeout => {
+                try self.check();
+                return;
+            },
+            error.Canceled => return error.Canceled,
+        };
+        try self.check();
+    }
+
+    pub fn stop(self: *ManagedProgressDriver) void {
+        if (self.state != .running) return;
+        self.stop_event.set(self.io);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.state = .stopped;
+    }
+
+    pub fn deinit(self: *ManagedProgressDriver) void {
+        self.stop();
+        self.* = undefined;
+    }
+
+    fn run(self: *ManagedProgressDriver) void {
+        while (!self.stop_event.isSet()) {
+            const started_ns = platform_time.monotonicNs();
+            self.round_started_ns.store(started_ns, .release);
+            _ = self.round_generation.fetchAdd(1, .acq_rel);
+            self.source.runOnce() catch |err| {
+                self.publishFailure(err);
+                return;
+            };
+            const completed_ns = platform_time.monotonicNs();
+            _ = self.round_generation.fetchAdd(1, .release);
+            const elapsed_ns = completed_ns -| started_ns;
+            if (elapsed_ns < self.interval_ns) {
+                self.stop_event.waitTimeout(self.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    error.Canceled => {
+                        if (self.stop_event.isSet()) return;
+                        self.publishFailure(err);
+                        return;
+                    },
+                };
+            }
+        }
+    }
+
+    fn publishFailure(self: *ManagedProgressDriver, err: anyerror) void {
+        self.failure = err;
+        self.failed.store(true, .release);
+        self.failure_event.set(self.io);
+    }
+
+    fn isStalled(self: *const ManagedProgressDriver, now_ns: u64) bool {
+        const generation = self.round_generation.load(.acquire);
+        if ((generation & 1) == 0) return false;
+        const started_ns = self.round_started_ns.load(.acquire);
+        if (self.round_generation.load(.acquire) != generation) return false;
+        return now_ns -| started_ns >= self.stall_timeout_ns;
+    }
+
+    fn nextHealthCheckDelay(
+        self: *const ManagedProgressDriver,
+        requested_ns: u64,
+        now_ns: u64,
+    ) u64 {
+        const generation = self.round_generation.load(.acquire);
+        if ((generation & 1) == 0) return requested_ns;
+        const started_ns = self.round_started_ns.load(.acquire);
+        if (self.round_generation.load(.acquire) != generation) return requested_ns;
+        const elapsed_ns = now_ns -| started_ns;
+        const remaining_ns = self.stall_timeout_ns -| elapsed_ns;
+        return @min(requested_ns, @max(@as(u64, 1), remaining_ns));
+    }
+};
 
 pub const MetadataUpdateSource = struct {
     ptr: *anyopaque,
@@ -248,6 +447,153 @@ pub const ManagedHttpHostRuntime = struct {
         return result;
     }
 };
+
+test "managed raft progress driver advances independently and joins on stop" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Counter = struct {
+        count: std.atomic.Value(u64) = .init(0),
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var counter = Counter{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), .{
+        .ptr = &counter,
+        .run_once = Counter.runOnce,
+    }, std.time.ns_per_ms);
+    defer driver.deinit();
+    try driver.start();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (counter.count.load(.acquire) < 3) {
+        try driver.check();
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
+
+    driver.stop();
+    const stopped_count = counter.count.load(.acquire);
+    try io_impl.io().sleep(.fromMilliseconds(5), .awake);
+    try std.testing.expectEqual(stopped_count, counter.count.load(.acquire));
+    try std.testing.expectError(error.AlreadyStarted, driver.start());
+}
+
+test "managed raft progress driver publishes source failure" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const FailingSource = struct {
+        count: std.atomic.Value(u64) = .init(0),
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.count.fetchAdd(1, .acq_rel) >= 2) return error.InjectedFailure;
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var source = FailingSource{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), .{
+        .ptr = &source,
+        .run_once = FailingSource.runOnce,
+    }, std.time.ns_per_ms);
+    defer driver.deinit();
+    try driver.start();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (!driver.failed.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.InjectedFailure, driver.check());
+    try std.testing.expect(!driver.isHealthy());
+    try std.testing.expectError(error.InjectedFailure, driver.waitForFailureOrTimeout(std.time.ns_per_s));
+}
+
+test "managed raft progress driver reports a wedged round unhealthy" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const Noop = struct {
+        fn runOnce(_: *anyopaque) !void {}
+    };
+    var driver = ManagedProgressDriver.initWithStallTimeout(io_impl.io(), .{
+        .ptr = undefined,
+        .run_once = Noop.runOnce,
+    }, std.time.ns_per_ms, std.time.ns_per_ms);
+    defer driver.deinit();
+
+    driver.round_started_ns.store(platform_time.monotonicNs() -| (2 * std.time.ns_per_ms), .release);
+    driver.round_generation.store(1, .release);
+    try std.testing.expectError(error.RaftProgressDriverStalled, driver.check());
+    try std.testing.expect(!driver.isHealthy());
+}
+
+test "managed raft progress driver ignores a completed observed generation" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const Noop = struct {
+        fn runOnce(_: *anyopaque) !void {}
+    };
+    var driver = ManagedProgressDriver.initWithStallTimeout(io_impl.io(), .{
+        .ptr = undefined,
+        .run_once = Noop.runOnce,
+    }, std.time.ns_per_ms, std.time.ns_per_ms);
+    defer driver.deinit();
+
+    driver.round_started_ns.store(platform_time.monotonicNs() -| (2 * std.time.ns_per_ms), .release);
+    driver.round_generation.store(2, .release);
+    try driver.check();
+    try std.testing.expect(driver.isHealthy());
+}
+
+test "managed raft progress driver stop interrupts a long cadence wait" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Counter = struct {
+        count: std.atomic.Value(u64) = .init(0),
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var counter = Counter{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), .{
+        .ptr = &counter,
+        .run_once = Counter.runOnce,
+    }, std.time.ns_per_hour);
+    defer driver.deinit();
+    try driver.start();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (counter.count.load(.acquire) == 0) {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
+
+    const stop_started_ns = platform_time.monotonicNs();
+    driver.stop();
+    try std.testing.expect(platform_time.monotonicNs() -| stop_started_ns < 100 * std.time.ns_per_ms);
+}
+
+test "raft runtime cadence validates independent intervals" {
+    const cadence = try RuntimeCadence.fromMillis(25, 250);
+    try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), cadence.raft_tick_ns);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), cadence.control_tick_ns);
+    try std.testing.expectError(error.InvalidRaftTickInterval, RuntimeCadence.fromMillis(0, 100));
+    try std.testing.expectError(error.InvalidRaftTickInterval, RuntimeCadence.fromMillis(1_001, 100));
+    try std.testing.expectError(error.InvalidControlTickInterval, RuntimeCadence.fromMillis(100, 0));
+    try std.testing.expectError(error.InvalidControlTickInterval, RuntimeCadence.fromMillis(100, 60_001));
+}
 
 test "managed host runtime deterministically drains metadata updates" {
     const raft_engine = @import("raft_engine");

@@ -1550,16 +1550,32 @@ func (t *TableApi) resolveWebSearchProvider(toolsConfig ai.ChatToolsConfig) (web
 }
 
 func webSearchConfigFromConnection(name string, connection common.ConnectionConfig) (websearch.WebSearchConfig, error) {
-	if connection.Kind != common.ConnectionKindWebSearch {
-		return websearch.WebSearchConfig{}, fmt.Errorf("connection %q has kind %q, expected web_search", name, connection.Kind)
+	kind, err := connection.Discriminator()
+	if err != nil {
+		return websearch.WebSearchConfig{}, fmt.Errorf("reading connection %q kind: %w", name, err)
+	}
+	if kind != "web_search" {
+		return websearch.WebSearchConfig{}, fmt.Errorf(
+			"connection %q has kind %q, expected web_search",
+			name,
+			kind,
+		)
+	}
+	variant, err := connection.AsWebSearchConnectionVariant()
+	if err != nil {
+		return websearch.WebSearchConfig{}, fmt.Errorf(
+			"decoding web_search connection %q: %w",
+			name,
+			err,
+		)
 	}
 
-	provider := strings.TrimSpace(connection.Provider)
+	provider := strings.TrimSpace(variant.Provider)
 	if provider == "" {
 		return websearch.WebSearchConfig{}, fmt.Errorf("web_search connection %q is missing provider", name)
 	}
 
-	webSearch := connection.WebSearch
+	webSearch := variant.WebSearch
 	config := websearch.WebSearchConfig{
 		Provider:          websearch.WebSearchProvider(provider),
 		ApiKey:            webSearch.ApiKey,

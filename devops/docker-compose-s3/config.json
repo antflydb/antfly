@@ -1,0 +1,27 @@
+{
+  "deployment_mode": "serverless",
+  "connections": {
+    "minio-storage": {
+      "kind": "external_io",
+      "capabilities": ["storage.primary"],
+      "external_io": {
+        "protocol": "s3",
+        "endpoint": "minio:9000",
+        "region": "us-east-1",
+        "use_ssl": false,
+        "addressing_style": "path",
+        "bucket_provisioning": "require_existing",
+        "buckets": ["antfly-data"]
+      }
+    }
+  },
+  "storage": {
+    "engine": "object",
+    "object": {
+      "connection": "minio-storage",
+      "bucket": "antfly-data",
+      "prefix": "local-dev"
+    }
+  },
+  "log": { "level": "debug", "style": "terminal" }
+}
