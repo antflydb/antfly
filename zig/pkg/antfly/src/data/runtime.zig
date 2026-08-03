@@ -4814,6 +4814,7 @@ pub const DataServer = struct {
                             // Split runtime can briefly observe placement before the
                             // local replica root is fully provisioned on disk.
                             error.LsmRootWriterAlreadyOpen,
+                            error.PersistentDescriptorAdmissionExhausted,
                             error.FileNotFound,
                             error.UnknownGroup,
                             error.LmdbUnexpected,
@@ -4838,6 +4839,7 @@ pub const DataServer = struct {
                             // Treat those as transient and retry on the next provision tick.
                             error.LsmRootWriterAlreadyOpen,
                             error.WriterLocked,
+                            error.PersistentDescriptorAdmissionExhausted,
                             error.FileNotFound,
                             error.UnknownGroup,
                             error.LmdbUnexpected,
@@ -4979,6 +4981,7 @@ pub const DataServer = struct {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
             error.LsmRootWriterAlreadyOpen,
+            error.PersistentDescriptorAdmissionExhausted,
             error.ReadOnly,
             error.FileNotFound,
             error.LmdbUnexpected,
@@ -13549,6 +13552,7 @@ fn groupHasActiveTransition(
 fn isTransientStatusDbConflict(err: anyerror) bool {
     return err == error.LsmRootWriterAlreadyOpen or
         err == error.WriterLocked or
+        err == error.PersistentDescriptorAdmissionExhausted or
         err == error.TableReadChurn;
 }
 

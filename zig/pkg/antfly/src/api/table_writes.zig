@@ -134,7 +134,13 @@ fn isTransientReplayVisibilityError(err: anyerror) bool {
 }
 
 fn isTransientWriterOpenConflict(err: anyerror) bool {
-    return err == error.LsmRootWriterAlreadyOpen or err == error.WriterLocked;
+    return err == error.LsmRootWriterAlreadyOpen or
+        err == error.WriterLocked or
+        err == error.PersistentDescriptorAdmissionExhausted;
+}
+
+test "persistent descriptor exhaustion is a retryable writer-open conflict" {
+    try std.testing.expect(isTransientWriterOpenConflict(error.PersistentDescriptorAdmissionExhausted));
 }
 
 const TestExecutionHook = struct {
@@ -6727,6 +6733,16 @@ pub const ProvisionedTableWriteSource = struct {
                     lockAtomic(&self.local_db_mutex);
                     continue;
                 },
+                error.PersistentDescriptorAdmissionExhausted => {
+                    self.local_db_mutex.unlock();
+                    if (platform_time.monotonicNs() >= deadline_ns) {
+                        lockAtomic(&self.local_db_mutex);
+                        return err;
+                    }
+                    sleepNs(replicated_apply_writer_open_retry_ns);
+                    lockAtomic(&self.local_db_mutex);
+                    continue;
+                },
                 else => return err,
             };
             return cached;
@@ -10189,8 +10205,8 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 indexes_json,
                 staged_generation,
-            ) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err)) {
                     if (platform_time.monotonicNs() -| open_start_ns >= open_retry_timeout_ns) return err;
                     if (!logged_open_wait) {
                         logged_open_wait = true;
@@ -10203,8 +10219,8 @@ pub const ProvisionedTableWriteSource = struct {
                         error.Canceled => Io.recancel(self.table_activity_threaded.io()),
                     };
                     continue;
-                },
-                else => return err,
+                }
+                return err;
             };
             defer db.close();
 
@@ -10313,9 +10329,9 @@ pub const ProvisionedTableWriteSource = struct {
                 self.table_name,
                 indexes_json,
                 null,
-            ) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
-                else => return err,
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err)) return true;
+                return err;
             };
             defer db.close();
 
@@ -10837,9 +10853,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .indexes_json = metadata.indexes_json,
                 .schema_json = metadata.schema_json,
                 .identity_namespace = identity_namespace,
-            }) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return .busy,
-                else => return err,
+            }) catch |err| {
+                if (isTransientWriterOpenConflict(err)) return .busy;
+                return err;
             };
             var cached_active = true;
             defer if (cached_active) cached.deinit(alloc);
@@ -11011,9 +11027,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_batch_mirror = self.ha_async_mirror,
                     .ha_async_metadata_mirror = self.ha_async_mirror,
                 },
-            ) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return .busy,
-                else => return err,
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err)) return .busy;
+                return err;
             }
         else
             db_mod.DB.open(alloc, path, .{
@@ -11026,9 +11042,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .ha_async_effect_mirror = self.ha_async_mirror,
                 .ha_async_batch_mirror = self.ha_async_mirror,
                 .ha_async_metadata_mirror = self.ha_async_mirror,
-            }) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return .busy,
-                else => return err,
+            }) catch |err| {
+                if (isTransientWriterOpenConflict(err)) return .busy;
+                return err;
             };
         defer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -14675,7 +14691,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
         while (true) {
             self.reconcileCachedIndexCreate(alloc, table_name, index_name) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked, error.PersistentDescriptorAdmissionExhausted => {
                     self.invalidateManagedCache(table_name);
                     if (platform_time.monotonicNs() >= deadline_ns) return err;
                     sleepNs(replicated_apply_writer_open_retry_ns);
@@ -14726,7 +14742,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         while (true) {
             self.invalidateManagedCache(table_name);
             dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked, error.PersistentDescriptorAdmissionExhausted => {
                     if (platform_time.monotonicNs() >= deadline_ns) return err;
                     sleepNs(replicated_apply_writer_open_retry_ns);
                     continue;

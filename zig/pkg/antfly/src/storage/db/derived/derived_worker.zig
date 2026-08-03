@@ -152,6 +152,7 @@ fn logCatchUpError(
 ) void {
     if (err == error.WriterLocked) return;
     if (err == error.ResourceBudgetExceeded) return;
+    if (err == error.PersistentDescriptorAdmissionExhausted) return;
     if (err == error.ReplayDocumentNotVisible) return;
     if (err == error.ArtifactRepairRequired) return;
     if (err == error.CatchUpDeadlineExceeded) return;

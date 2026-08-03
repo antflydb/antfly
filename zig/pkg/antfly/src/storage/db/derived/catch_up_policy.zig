@@ -74,7 +74,7 @@ pub const RecoverableRetryCounters = struct {
         _ = self.total.fetchAdd(1, .monotonic);
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
-            error.ResourceBudgetExceeded => _ = self.resource_budget.fetchAdd(1, .monotonic),
+            error.ResourceBudgetExceeded, error.PersistentDescriptorAdmissionExhausted => _ = self.resource_budget.fetchAdd(1, .monotonic),
             error.ReplayDocumentNotVisible => _ = self.replay_document_not_visible.fetchAdd(1, .monotonic),
             error.ArtifactRepairRequired => _ = self.artifact_repair_required.fetchAdd(1, .monotonic),
             error.NotFound => _ = self.not_found.fetchAdd(1, .monotonic),
@@ -279,14 +279,15 @@ test "recoverable retry counters preserve failure reasons" {
     var counters = RecoverableRetryCounters{};
     counters.record(error.WriterLocked);
     counters.record(error.ResourceBudgetExceeded);
+    counters.record(error.PersistentDescriptorAdmissionExhausted);
     counters.record(error.ReplayDocumentNotVisible);
     counters.record(error.ArtifactRepairRequired);
     counters.record(error.NotFound);
 
     const stats = counters.snapshot();
-    try std.testing.expectEqual(@as(u64, 5), stats.total);
+    try std.testing.expectEqual(@as(u64, 6), stats.total);
     try std.testing.expectEqual(@as(u64, 1), stats.writer_locked);
-    try std.testing.expectEqual(@as(u64, 1), stats.resource_budget);
+    try std.testing.expectEqual(@as(u64, 2), stats.resource_budget);
     try std.testing.expectEqual(@as(u64, 1), stats.replay_document_not_visible);
     try std.testing.expectEqual(@as(u64, 1), stats.artifact_repair_required);
     try std.testing.expectEqual(@as(u64, 1), stats.not_found);

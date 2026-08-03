@@ -7581,6 +7581,14 @@ pub const IndexManager = struct {
         return self.textMergeStatsWithPrune(false);
     }
 
+    /// Allocation-free live query fan-out for producer admission. The caller
+    /// holds the apply lock shared, so the catalog entry and snapshot remain
+    /// stable for the duration of this observation.
+    pub fn textActiveSegmentCountSnapshot(self: *IndexManager, index_name: []const u8) u64 {
+        const entry = self.textIndexEntry(index_name) orelse return 0;
+        return @intCast(entry.persistent.snapshot().segments.len);
+    }
+
     fn textMergeStatsWithPrune(self: *IndexManager, prune_expired: bool) types.TextMergeStats {
         const now_ns = platform_time.monotonicNs();
         if (prune_expired) self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);

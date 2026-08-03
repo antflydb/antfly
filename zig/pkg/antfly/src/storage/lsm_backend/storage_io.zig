@@ -785,6 +785,7 @@ else
         shards: []Shard,
         capacity: usize,
         persistent_reserve: usize,
+        persistent_open_headroom: usize,
         admitted_descriptors: std.atomic.Value(usize) = .init(0),
         persistent_descriptors: std.atomic.Value(usize) = .init(0),
         cache_entry_count: std.atomic.Value(usize) = .init(0),
@@ -811,6 +812,9 @@ else
                 // read/write pressure. Small test and emergency limits retain
                 // their full capacity.
                 .persistent_reserve = if (capacity < 4) 0 else @min(@as(usize, 64), @max(@as(usize, 2), capacity / 8)),
+                // Creating one lifetime lock can transiently require both the
+                // newly-created descriptor and the final reopened descriptor.
+                .persistent_open_headroom = if (capacity < 4) 0 else 2,
             };
         }
 
@@ -1073,10 +1077,21 @@ else
         }
 
         fn makeCapacityAvailable(self: *FdCache, count: usize) bool {
-            // Keep the reserve empty even after lock files consume permits.
-            // Otherwise transient work can reclaim it and a subsequent lock
-            // open again loses the peak descriptors needed by create/openat.
-            const transient_capacity = self.capacity - self.persistent_reserve;
+            // The reserve is startup headroom, not a permanent tax. Once
+            // lifetime locks consume it, transient leases may use the freed
+            // portion while retaining the two-descriptor peak needed by the
+            // next create/openat. Without this dynamic accounting, enough
+            // open backends can make transient admission wait forever even
+            // though the aggregate pool still has unused descriptors.
+            const persistent = self.persistent_descriptors.load(.acquire);
+            const unused_reserve = self.persistent_reserve -| persistent;
+            const remaining_capacity = self.capacity -| persistent;
+            const open_headroom = if (remaining_capacity >= self.persistent_open_headroom)
+                self.persistent_open_headroom
+            else
+                0;
+            const held_headroom = @max(unused_reserve, open_headroom);
+            const transient_capacity = self.capacity - held_headroom;
             if (count > transient_capacity) return false;
             const available_at = transient_capacity - count;
             while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
@@ -3348,6 +3363,34 @@ test "persistent path lock exhaustion fails without waiting" {
     const stats = pool.snapshotStats();
     try std.testing.expectEqual(@as(usize, 0), stats.fd_admission_waiters);
     try std.testing.expectEqual(@as(u64, 1), stats.fd_persistent_admission_failures);
+}
+
+test "persistent locks consume reserved headroom without stranding transient capacity" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 42);
+    defer pool.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    // Model nineteen open backends (root + WAL locks each). The original
+    // fixed-reserve calculation capped transient admission at 37 and would
+    // wait forever here despite four unused aggregate slots.
+    try pool.fd_cache.reservePersistentDescriptors(io, 38);
+    defer pool.fd_cache.releasePersistentDescriptors(io, 38);
+    try std.testing.expect(pool.fd_cache.makeCapacityAvailable(2));
+    try pool.fd_cache.reserveDescriptors(io, 2);
+    defer pool.fd_cache.releaseDescriptors(io, 2);
+
+    // The dynamic transient ceiling still preserves the exact two-descriptor
+    // peak required to open the next lifetime path lock.
+    try pool.fd_cache.reservePersistentDescriptors(io, 2);
+    defer pool.fd_cache.releasePersistentDescriptors(io, 2);
+    const stats = pool.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 42), stats.fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(usize, 40), stats.fd_persistent_descriptors);
+    try std.testing.expectEqual(@as(usize, 5), stats.fd_persistent_reserve);
 }
 
 test "shared native fd cache blocks before opening more than 64 files across stores" {

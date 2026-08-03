@@ -110,7 +110,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         pub fn release(_: *@This()) void {}
     };
 
-    pub fn acquireProducerPermit(_: *@This(), _: u64, _: u64) !ProducerPermit {
+    pub fn acquireProducerPermit(_: *@This(), _: []const u8, _: u64, _: u64) !ProducerPermit {
         return .{};
     }
 
@@ -411,7 +411,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     /// segment visible. Concurrent producers are included in the bound, so
     /// the configured high watermark is an admission limit rather than a
     /// best-effort cleanup trigger.
-    pub fn acquireProducerPermit(self: *TextMergeRuntime, segment_count: u64, byte_count: u64) !ProducerPermit {
+    pub fn acquireProducerPermit(
+        self: *TextMergeRuntime,
+        index_name: []const u8,
+        segment_count: u64,
+        byte_count: u64,
+    ) !ProducerPermit {
         if ((segment_count == 0 and byte_count == 0) or !self.config.enabled or
             (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0))
         {
@@ -466,6 +471,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
             lockApplyShared(self.apply_mutex);
             const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
+            const active_segments = self.index_manager.textActiveSegmentCountSnapshot(index_name);
             self.apply_mutex.unlockShared();
 
             self.mutex.lockUncancelable(io);
@@ -481,7 +487,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             }
             const reserved_segments = std.math.add(u64, self.producer_segment_reservations, segment_count) catch std.math.maxInt(u64);
             const reserved_bytes = std.math.add(u64, self.producer_byte_reservations, byte_count) catch std.math.maxInt(u64);
-            const admitted_segments = std.math.add(u64, stats_snapshot.pending_segments, reserved_segments) catch std.math.maxInt(u64);
+            // Query fan-out is determined by every live segment of the target
+            // index, not merely indexes already marked for compaction. Global
+            // in-flight reservations remain conservative across indexes and
+            // avoid allocation or name ownership on this hot path.
+            const admitted_segments = std.math.add(u64, active_segments, reserved_segments) catch std.math.maxInt(u64);
             const admitted_bytes = std.math.add(u64, stats_snapshot.pending_bytes, reserved_bytes) catch std.math.maxInt(u64);
             const request_oversized =
                 (self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments) or

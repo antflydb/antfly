@@ -15180,7 +15180,7 @@ pub const DB = struct {
         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
         if (self.text_merge_runtime) |runtime| {
             const estimate = self.core.index_manager.estimateTextKernelPublication(docs);
-            merge_permit = try runtime.acquireProducerPermit(estimate.segment_count, estimate.byte_count);
+            merge_permit = try runtime.acquireProducerPermit(index_name, estimate.segment_count, estimate.byte_count);
         }
         defer if (merge_permit) |*permit| permit.release();
         lockApply(self);
@@ -32811,7 +32811,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
         if (ctx.text_merge_runtime) |runtime| {
             const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, collected.writes.items);
-            merge_permit = try runtime.acquireProducerPermit(estimate.segment_count, estimate.byte_count);
+            merge_permit = try runtime.acquireProducerPermit(index_ref.name, estimate.segment_count, estimate.byte_count);
         }
         defer if (merge_permit) |*permit| permit.release();
 
@@ -70546,7 +70546,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     try bounded_runtime.start();
     const bounded_outcome = bounded_runtime.applyBackpressure();
     try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.timed_out, bounded_outcome);
-    try std.testing.expectError(error.TextMergeBackpressureTimeout, bounded_runtime.acquireProducerPermit(1, 1));
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, bounded_runtime.acquireProducerPermit("ft_v1", 1, 1));
     try std.testing.expectEqual(@as(u64, 2), bounded_runtime.stats().backpressure_timeouts);
     bounded_runtime.deinit();
 
@@ -70564,7 +70564,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         },
     );
     try byte_only_runtime.start();
-    try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit(0, 1));
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1));
     byte_only_runtime.deinit();
 
     resources.index_manager.cancelTextMergeTask(&held_task);
@@ -70597,6 +70597,31 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     try std.testing.expectEqual(@as(u64, 1), after.backpressure_events);
     try std.testing.expect(after.merge_input_segments_total >= 10);
 
+    // Admission includes the target index's steady live segments even when it
+    // is no longer marked compaction-pending. This is the actual query fan-out
+    // bound; pending-only accounting allowed the live baseline plus another
+    // full watermark of concurrent publications.
+    var fanout_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = after.active_segments + 1,
+            .resume_pending_segments = after.active_segments,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer fanout_runtime.deinit();
+    var fanout_permit = try fanout_runtime.acquireProducerPermit("ft_v1", 1, 0);
+    try std.testing.expectError(
+        error.TextMergeBackpressureTimeout,
+        fanout_runtime.acquireProducerPermit("ft_v1", 1, 0),
+    );
+    fanout_permit.release();
+
     var admission_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
         alloc,
         resources.index_manager,
@@ -70613,20 +70638,20 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     defer admission_runtime.deinit();
     try admission_runtime.start();
 
-    var first_permit = try admission_runtime.acquireProducerPermit(1, 80);
-    try std.testing.expectError(error.TextMergeBackpressureTimeout, admission_runtime.acquireProducerPermit(1, 30));
+    var first_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 80);
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, admission_runtime.acquireProducerPermit("ft_v1", 1, 30));
     first_permit.release();
 
     // Admission sleeps on a release epoch rather than rescanning the complete
     // segment catalog at a fixed polling interval.
-    var held_permit = try admission_runtime.acquireProducerPermit(1, 80);
+    var held_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 80);
     const Waiter = struct {
         runtime: *text_merge_runtime_mod.TextMergeRuntime,
         acquired: std.atomic.Value(bool) = .init(false),
         failed: std.atomic.Value(bool) = .init(false),
 
         fn run(self: *@This()) void {
-            var permit = self.runtime.acquireProducerPermit(1, 30) catch {
+            var permit = self.runtime.acquireProducerPermit("ft_v1", 1, 30) catch {
                 self.failed.store(true, .release);
                 return;
             };
@@ -70670,7 +70695,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         },
     );
     defer fair_runtime.deinit();
-    var blocking_permit = try fair_runtime.acquireProducerPermit(80, 0);
+    var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
     var blocking_active = true;
     defer if (blocking_active) blocking_permit.release();
 
@@ -70681,7 +70706,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         release_gate: ?*const std.atomic.Value(bool),
 
         fn run(self: *@This()) void {
-            var permit = self.runtime.acquireProducerPermit(self.segment_count, 0) catch return;
+            var permit = self.runtime.acquireProducerPermit("admission-test", self.segment_count, 0) catch return;
             self.acquired.store(true, .release);
             if (self.release_gate) |gate| {
                 while (!gate.load(.acquire)) std.Thread.yield() catch {};
@@ -70749,7 +70774,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
 
     // Runtime cancellation is not a capacity timeout and must leave the FIFO
     // queue usable by subsequent producers.
-    var cancel_blocker = try fair_runtime.acquireProducerPermit(80, 0);
+    var cancel_blocker = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
     var cancel_blocker_active = true;
     defer if (cancel_blocker_active) cancel_blocker.release();
     const CancelWaiter = struct {
@@ -70757,7 +70782,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         outcome: *std.atomic.Value(u8),
 
         fn run(self: *@This()) void {
-            var permit = self.runtime.acquireProducerPermit(30, 0) catch |err| {
+            var permit = self.runtime.acquireProducerPermit("admission-test", 30, 0) catch |err| {
                 self.outcome.store(if (err == error.Canceled) 1 else 2, .release);
                 return;
             };
@@ -70783,18 +70808,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     try std.testing.expectEqual(timeouts_before, fair_runtime.stats().backpressure_timeouts);
     cancel_blocker.release();
     cancel_blocker_active = false;
-    var post_cancel_permit = try fair_runtime.acquireProducerPermit(1, 0);
+    var post_cancel_permit = try fair_runtime.acquireProducerPermit("admission-test", 1, 0);
     post_cancel_permit.release();
 
     // One indivisible publication larger than either watermark is admitted
     // exclusively once existing debt and reservations are empty.
-    var oversized_permit = try admission_runtime.acquireProducerPermit(9, 200);
+    var oversized_permit = try admission_runtime.acquireProducerPermit("ft_v1", 9, 200);
     oversized_permit.release();
 
     // Pausing the background worker for a structural mutation must not poison
     // foreground admission while capacity is available.
     try std.testing.expect(admission_runtime.pause());
-    var paused_permit = try admission_runtime.acquireProducerPermit(1, 10);
+    var paused_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 10);
     paused_permit.release();
     try admission_runtime.resumeAfterPause();
 
