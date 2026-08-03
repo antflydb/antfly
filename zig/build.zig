@@ -147,6 +147,12 @@ const inference_delegated_steps = [_][]const u8{
     "wasm",
 };
 
+const release_scale_test_filters = [_][]const u8{
+    "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "db one real delete keeps filtered full text on complement path across restart",
+    "db production ingest preserves high-frequency keyword recall across clean restarts",
+};
+
 const DelegatedPackageStep = struct {
     run: *std.Build.Step.Run,
     step: *std.Build.Step,
@@ -172,6 +178,12 @@ fn addRuntimeTestFilters(
         run.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run, b.args orelse &.{});
+}
+
+fn addRuntimeSkipTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) void {
+    for (filters) |filter| {
+        run.addArgs(&.{ "--skip-test-filter", filter });
+    }
 }
 
 fn compileFiltersWithAnchors(
@@ -3649,6 +3661,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_db_tests = addFilteredTestRunArtifact(b, lib_db_tests);
+    addRuntimeSkipTestFilters(run_lib_db_tests, &release_scale_test_filters);
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
     lib_db_test_step.dependOn(&run_lib_db_tests.step);
 
@@ -5526,6 +5539,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_storage_tests = addFilteredTestRunArtifact(b, lib_storage_tests);
+    addRuntimeSkipTestFilters(run_lib_storage_tests, &release_scale_test_filters);
     const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
@@ -6033,6 +6047,7 @@ pub fn build(b: *std.Build) void {
     for (unit_progress_skip_filters) |filter| {
         run_unit_progress_root_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
+    addRuntimeSkipTestFilters(run_unit_progress_root_tests, &release_scale_test_filters);
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRunStep(b, run_unit_progress_root_tests, "lib-root-test", unit_progress_tail);
@@ -6390,14 +6405,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
     if (b.args) |args| run_db_unit_tests.addArgs(args);
-    const release_scale_test_filters = [_][]const u8{
-        "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
-        "db one real delete keeps filtered full text on complement path across restart",
-        "db production ingest preserves high-frequency keyword recall across clean restarts",
-    };
-    for (release_scale_test_filters) |filter| {
-        run_db_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
-    }
+    addRuntimeSkipTestFilters(run_db_unit_tests, &release_scale_test_filters);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
@@ -6611,6 +6619,7 @@ pub fn build(b: *std.Build) void {
     for (root_test_skip_filters) |filter| {
         run_unit_root_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
+    addRuntimeSkipTestFilters(run_unit_root_tests, &release_scale_test_filters);
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
