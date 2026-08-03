@@ -294,17 +294,28 @@ jobs:
         working-directory: zig
         run: zig build inference-cli-test -Dedition=inference -Dmetal=false -Dcuda=false -Donnx=false -Dsystem-blas=false
 
-      - name: Run CUDA benchmark contract tests
+      - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
         run: |
           python3 -m unittest \
+            scripts.test_benchmark_gemma4_long_e2e_server \
             scripts.test_benchmark_gemma4_cuda_batching \
             scripts.test_benchmark_gemma4_cuda_matrix \
+            scripts.test_benchmark_metal_gemma4_ab \
+            scripts.test_benchmark_metal_gemma4_long_output \
+            scripts.test_content_security_contract \
             scripts.test_gemma4_cuda_l4_release_gate \
             scripts.test_gemma4_cuda_production_gate \
             scripts.test_gemma4_qat_cuda_tuning \
             scripts.test_gemma4_qat_llamacpp_pair_benchmark \
-            scripts.test_validate_gemma4_cuda_candidate
+            scripts.test_paired_benchmark \
+            scripts.test_regen_cuda_artifacts \
+            scripts.test_summarize_cuda_flash_prefill_v2 \
+            scripts.test_validate_gemma4_cuda_candidate \
+            scripts.test_validate_gemma4_cuda_quality_candidate
+
+      - name: Test reproducible release archive packaging
+        run: python3 scripts/packaging/test_reproducible_tar.py
 
       # ARC exposes the node CPU count instead of the pod quota. Keep the
       # process affinity aligned with the pod CPU budget, and independently

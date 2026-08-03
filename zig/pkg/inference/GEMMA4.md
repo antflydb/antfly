@@ -89,11 +89,11 @@ default. `TERMITE_METAL_DISABLE_SINGLETON_SCHEDULED_PREFILL_FRAME=1` restores
 the scheduled mixed-context path for diagnosis. Final logits and MTP hidden
 capture never use the planned intermediate-chunk frame.
 
-`TERMITE_METAL_ENABLE_SPLIT_SWA_KV_RING=1` stores Gemma 4 sliding-attention
-layers in a fixed Metal ring while global-attention layers retain full KV
-history. The ring is disabled for prompt-cache requests, cache compaction, and
-non-paged attention; `TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING=1` is the master
-rollback while the long-context rollout gate remains experimental.
+The typed KV policy stores Gemma 4 sliding-attention layers in a fixed Metal
+ring while global-attention layers retain full KV history. The ring is disabled
+for prompt-cache requests, cache compaction, and non-paged attention;
+`TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING=1` is the master rollback while the
+long-context rollout gate remains experimental.
 
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not

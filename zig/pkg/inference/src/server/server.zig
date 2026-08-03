@@ -6313,34 +6313,6 @@ pub const Node = struct {
         }
     };
 
-    const BatchModelLockOwner = struct {
-        mutex: *std.atomic.Mutex,
-        io: std.Io,
-        held: bool = true,
-
-        fn initAcquired(mutex: *std.atomic.Mutex, io: std.Io) @This() {
-            return .{ .mutex = mutex, .io = io };
-        }
-
-        fn releaseForWorkers(self: *@This()) void {
-            std.debug.assert(self.held);
-            self.mutex.unlock();
-            self.held = false;
-        }
-
-        fn reacquireForTeardown(self: *@This()) void {
-            std.debug.assert(!self.held);
-            platform.sync.lockYieldingIo(self.mutex, self.io);
-            self.held = true;
-        }
-
-        fn deinit(self: *@This()) void {
-            std.debug.assert(self.held);
-            self.mutex.unlock();
-            self.held = false;
-        }
-    };
-
     const BatchExecutionMode = enum {
         /// NativeCompute is cheap request state over a shared, internally
         /// synchronized weight store. Give each item its own instance so task
@@ -6358,6 +6330,36 @@ pub const Node = struct {
             .metal, .cuda => .shared_serial,
         };
     }
+
+    const BatchModelLock = struct {
+        mutex: *std.atomic.Mutex,
+        owns_outer_lock: bool,
+
+        fn init(
+            execution_mode: BatchExecutionMode,
+            mutex: *std.atomic.Mutex,
+            io: std.Io,
+        ) @This() {
+            const owns_outer_lock = execution_mode == .shared_serial;
+            if (owns_outer_lock) platform.sync.lockYieldingIo(mutex, io);
+            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock };
+        }
+
+        fn pipelineExecutionLock(self: *const @This()) ?*std.atomic.Mutex {
+            // The request owns the model mutex for the complete lifetime of a
+            // shared Metal/CUDA backend, so the pipeline must not lock it
+            // again. Besides avoiding self-deadlock, this keeps request-scoped
+            // backend state (including CUDA's RunBudget pointer) from being
+            // rebound by another request between generation steps.
+            return if (self.owns_outer_lock) null else self.mutex;
+        }
+
+        fn deinit(self: *@This()) void {
+            if (!self.owns_outer_lock) return;
+            self.mutex.unlock();
+            self.owns_outer_lock = false;
+        }
+    };
 
     const BatchAdmission = struct {
         lease: runtime.tier.memory.AdmissionLease,
@@ -6570,6 +6572,7 @@ pub const Node = struct {
                         continue;
                     },
                 };
+                const execution_mode = batchExecutionMode(backend_kind);
                 const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
                     backend_kind,
                     gpt_config,
@@ -6684,7 +6687,6 @@ pub const Node = struct {
                         leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
                     }
                 }
-                const execution_mode = batchExecutionMode(backend_kind);
                 var shared_run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
                 const task_run_budgets = try ctx.allocator.alloc(
                     runtime.tier.memory.RunBudget,
@@ -6844,6 +6846,20 @@ pub const Node = struct {
                     runnable_count += 1;
                 }
                 if (runnable_count == 0) continue;
+
+                // Match the single-request lock order: scheduler and resource
+                // admission must complete before the model mutex is acquired.
+                // Metal/CUDA backends reference stateful session-owned runtime
+                // or provider state, so from backend binding onward retain the
+                // mutex until every backend/KV defer has run. Native mode
+                // creates an independent backend per item and instead uses the
+                // scheduler's per-step execution lock below.
+                var batch_model_lock = BatchModelLock.init(
+                    execution_mode,
+                    model.nativeGenerationMutex(),
+                    ctx.io,
+                );
+                defer batch_model_lock.deinit();
 
                 var shared_cb: ?ops.ComputeBackend = null;
                 if (execution_mode == .shared_serial) {
@@ -7017,7 +7033,7 @@ pub const Node = struct {
                             .decode_state = &decode_states[pos],
                             .scheduler = model.native_generate_coordinator,
                             .scheduler_lease = if (model.native_generate_coordinator != null) &leases[pos] else null,
-                            .execution_lock = model.nativeGenerationMutex(),
+                            .execution_lock = batch_model_lock.pipelineExecutionLock(),
                         },
                         .messages = owned_messages[idx].messages,
                         .config = configs[pos],
@@ -11349,26 +11365,24 @@ test "generate batch queue units sum pending generation work" {
     try std.testing.expectEqual(expected, node.estimateGenerateBatchQueueUnits(parsed.value.requests, owned_messages, pending[0..]));
 }
 
-test "generate batch hands the model lock to workers and reacquires for teardown" {
+test "generate batch shared backends own the outer model lock" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var mutex: std.atomic.Mutex = .unlocked;
-    platform.sync.lockYielding(&mutex);
 
-    var owner = Node.BatchModelLockOwner.initAcquired(&mutex, io_impl.io());
-    defer if (owner.held) owner.deinit();
-
-    owner.releaseForWorkers();
-    try std.testing.expect(!owner.held);
+    var isolated = Node.BatchModelLock.init(.isolated_parallel, &mutex, io_impl.io());
+    defer isolated.deinit();
+    try std.testing.expectEqual(
+        &mutex,
+        isolated.pipelineExecutionLock().?,
+    );
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
 
-    owner.reacquireForTeardown();
-    try std.testing.expect(owner.held);
+    var shared = Node.BatchModelLock.init(.shared_serial, &mutex, io_impl.io());
+    try std.testing.expect(shared.pipelineExecutionLock() == null);
     try std.testing.expect(!mutex.tryLock());
-
-    owner.deinit();
-    try std.testing.expect(!owner.held);
+    shared.deinit();
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
 }

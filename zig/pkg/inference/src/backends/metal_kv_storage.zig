@@ -189,7 +189,7 @@ pub const MetalKvStorage = struct {
     ) !usize {
         if (!allow_swa_ring or sliding_window == 0 or max_inflight_tokens == 0 or page_size_tokens == 0) return 0;
         // Production requests opt in through the typed KV policy. Keep only a
-        // hard rollback flag here; the legacy ENABLE flag remains harmless.
+        // hard rollback flag here.
         if (envFlagEnabled("TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING")) return 0;
         if (envFlagEnabled("TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION")) return 0;
         return storage_runtime.swaRingPageCount(page_size_tokens, sliding_window, max_inflight_tokens, allow_swa_ring);

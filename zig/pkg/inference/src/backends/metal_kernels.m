@@ -2578,17 +2578,6 @@ static bool termite_metal_q4_0_linear_rms_add_sumsq_disabled(void) {
     return !termite_metal_env_flag_enabled(enabled);
 }
 
-static bool termite_metal_q4_0_f16_ffn_enabled(void) {
-    const char *enabled = getenv("TERMITE_METAL_Q4_0_F16_FFN_EXPERIMENT");
-    if (enabled == NULL) enabled = getenv("TERMITE_METAL_ENABLE_Q4_0_F16_FFN");
-    if (!termite_metal_env_flag_enabled(enabled)) return false;
-    // ponytail: measured slower for QAT; require the bench's explicit unsafe override outside production.
-    const char *unsafe = getenv("ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN");
-    if (!termite_metal_env_flag_enabled(unsafe)) return false;
-    const char *disabled = getenv("TERMITE_METAL_DISABLE_Q4_0_F16_FFN");
-    return !termite_metal_env_flag_enabled(disabled);
-}
-
 static bool termite_metal_debug_direct_block_finite(size_t layer_index) {
     const char *enabled = getenv("TERMITE_METAL_DEBUG_DIRECT_BLOCK_FINITE");
     if (enabled == NULL || enabled[0] == '\0' || strcmp(enabled, "0") == 0) return false;
@@ -16019,18 +16008,12 @@ static int termite_metal_encode_quant_linear_rms_add_planned_1x(
     if (in_dim == 0 || hidden_size == 0 || in_dim > UINT32_MAX || hidden_size > UINT32_MAX) return failure_code;
     id<MTLBuffer> sumsq_buffer = nil;
     const size_t sumsq_partials = (hidden_size + 7u) / 8u;
-    const BOOL scaled_ple_sumsq_enabled =
-        output_scale_present != 0 &&
-        source == TERMITE_METAL_COMPUTE_SOURCE_PLE &&
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PLE_LINEAR_RMS_ADD_SUMSQ")) &&
-        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_PLE_LINEAR_RMS_ADD_SUMSQ"));
     const BOOL can_use_sumsq =
         quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
         output_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 &&
-        ((output_scale_present == 0 && !termite_metal_q4_0_linear_rms_add_sumsq_disabled()) ||
-            scaled_ple_sumsq_enabled) &&
-        ((output_scale_present == 0 && runtime->rms_norm_add_sumsq_pipeline != nil) ||
-            (output_scale_present != 0 && runtime->rms_norm_add_scale_sumsq_pipeline != nil)) &&
+        output_scale_present == 0 &&
+        !termite_metal_q4_0_linear_rms_add_sumsq_disabled() &&
+        runtime->rms_norm_add_sumsq_pipeline != nil &&
         ((input_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 && runtime->q4_0_reduce_sumsq_pipeline != nil) ||
             (input_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F16 && runtime->q4_0_reduce_f16_input_sumsq_pipeline != nil));
     if (can_use_sumsq) {
@@ -38451,12 +38434,6 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
     const bool down_q8_0 = down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0;
     const bool down_q4_0 = down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_0;
     const bool down_q6_k = down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q6_K;
-    const bool enable_q4_0_f16_ffn =
-        block_q4_0 &&
-        (down_q4_0 || down_q6_k) &&
-        rows == 1 &&
-        termite_metal_q4_0_f16_ffn_enabled() &&
-        (!down_q6_k || !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_Q6K_F16_FFN")));
     const bool enable_q4_k_q6_k_f16_ffn =
         block_q4_k &&
         down_q6_k &&
@@ -38599,56 +38576,6 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                     -16) : -16;
                 pre_gate_pair_done = (scale_status == 0 && pair_status == 0);
             }
-            if (!pre_gate_pair_done &&
-                enable_q4_0_f16_ffn &&
-                rows == 1 &&
-                post_gate_rms_norm_slot == SIZE_MAX &&
-                runtime->rms_inv_scale_pipeline != nil &&
-                runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline != nil &&
-                (down_q6_k ? runtime->q6_k_reduce_f16_input_pipeline != nil : runtime->q4_0_reduce_f16_input_pipeline != nil))
-            {
-                const int scale_status = termite_metal_encode_rms_inv_scale_1x(
-                    runtime,
-                    command_buffer,
-                    input_buffer,
-                    input_offset,
-                    pre_norm_input_buffer,
-                    0,
-                    hidden_size,
-                    eps,
-                    -16);
-                termite_metal_quant_matmul_descriptor descriptor = {
-                    .slot = gate_linear_slot,
-                    .format = TERMITE_METAL_QUANT_FORMAT_Q4_0,
-                    .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-                    .input_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-                    .output_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F16,
-                    .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_RMS_SCALE_1X,
-                    .fallback_pipeline = runtime->q4_0_pair_activation_rms_scale_reduce_f16_output_pipeline,
-                    .input_buffer = input_buffer,
-                    .input_offset = input_offset,
-                    .weight_buffer = gate_view.weight_buffer,
-                    .weight_offset = gate_view.weight_offset,
-                    .second_weight_buffer = up_view.weight_buffer,
-                    .second_weight_offset = up_view.weight_offset,
-                    .output_buffer = gated_buffer,
-                    .inv_scale_buffer = pre_norm_input_buffer,
-                    .inv_scale_offset = 0,
-                    .norm_slot = pre_gate_rms_norm_slot,
-                    .rows = rows,
-                    .in_dim = hidden_size,
-                    .out_dim = intermediate_size,
-                    .values_per_block = gate_view.values_per_block,
-                    .bytes_per_block = gate_view.bytes_per_block,
-                    .activation_kind = activation_kind,
-                    .failure_code = -16,
-                };
-                const int pair_status = scale_status == 0
-                    ? termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor)
-                    : -16;
-                pre_gate_pair_done = (scale_status == 0 && pair_status == 0);
-                pre_gate_pair_f16_output = pre_gate_pair_done ? YES : NO;
-            }
             if (!pre_gate_pair_done && rows == 1) {
                 if (termite_metal_encode_rms_norm_reduce(
                         runtime,
@@ -38771,39 +38698,6 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 descriptor.planned_dispatch = TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN;
                 gate_up_status = termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
             }
-        } else if (!pre_gate_pair_done &&
-            !split_gate_up_linear &&
-            enable_q4_0_f16_ffn &&
-            post_gate_rms_norm_slot == SIZE_MAX &&
-            runtime->q4_0_pair_activation_reduce_f16_output_pipeline != nil &&
-            (down_q6_k ? runtime->q6_k_reduce_f16_input_pipeline != nil : runtime->q4_0_reduce_f16_input_pipeline != nil))
-        {
-            termite_metal_quant_matmul_descriptor descriptor = {
-                .slot = gate_linear_slot,
-                .format = TERMITE_METAL_QUANT_FORMAT_Q4_0,
-                .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-                .input_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
-                .output_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F16,
-                .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_MUL,
-                .fallback_pipeline = runtime->q4_0_pair_activation_reduce_f16_output_pipeline,
-                .input_buffer = gate_input_buffer,
-                .input_offset = gate_input_offset,
-                .weight_buffer = gate_view.weight_buffer,
-                .weight_offset = gate_view.weight_offset,
-                .second_weight_buffer = up_view.weight_buffer,
-                .second_weight_offset = up_view.weight_offset,
-                .output_buffer = gated_buffer,
-                .rows = rows,
-                .in_dim = hidden_size,
-                .out_dim = intermediate_size,
-                .values_per_block = gate_view.values_per_block,
-                .bytes_per_block = gate_view.bytes_per_block,
-                .activation_kind = activation_kind,
-                .failure_code = -16,
-            };
-            gate_up_status = termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
-            gate_up_activation_done = gate_up_status == 0;
-            gated_buffer_f16 = gate_up_activation_done ? YES : NO;
         } else if (!pre_gate_pair_done && !split_gate_up_linear && block_q4_0 &&
             // rows 2-8 may use the explicit-opt-in shared-read MTP kernels;
             // rows>=9 may use the separately qualified pair-MM portfolio.
@@ -44564,68 +44458,29 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
             const size_t previous_region = termite_metal_enter_compute_region(runtime, TERMITE_METAL_COMPUTE_REGION_FFN);
             id<MTLCommandBuffer> previous_frame = runtime->active_frame_cb;
             runtime->active_frame_cb = command_buffer;
-            const bool rowwise_quant_ffn =
-                termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ROWWISE_ACTIVE_GATED_FFN")) &&
-                q_len > 1 &&
-                ((ffn_gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
-                    ffn_down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q8_0) ||
-                    (ffn_gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
-                        (ffn_down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_0 ||
-                            ffn_down_quant_format == TERMITE_METAL_QUANT_FORMAT_Q6_K)));
-            if (rowwise_quant_ffn) {
-                const size_t hidden_row_bytes = hidden_size * sizeof(float);
-                for (size_t row = 0; row < q_len; ++row) {
-                    const size_t row_offset = row * hidden_row_bytes;
-                    rc = termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_device_impl(
-                        runtime,
-                        ffn_gate_up_quant_format,
-                        ffn_down_quant_format,
-                        (__bridge void *)ffn_gate_input_buffer,
-                        ffn_gate_input_offset + row_offset,
-                        (__bridge void *)attn_added_buffer,
-                        row_offset,
-                        1,
-                        hidden_size,
-                        intermediate_size,
-                        activation_kind,
-                        gate_ffn_linear_slot,
-                        up_ffn_linear_slot,
-                        ffn_pre_gate_rms_norm_slot,
-                        ffn_post_gate_rms_norm_slot,
-                        ffn_post_down_rms_norm_slot,
-                        eps,
-                        down_ffn_linear_slot,
-                        (__bridge void *)block_output_buffer,
-                        block_output_offset + row_offset,
-                        planned_contract
-                    );
-                    if (rc != 0) break;
-                }
-            } else {
-                rc = termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_device_impl(
-                    runtime,
-                    ffn_gate_up_quant_format,
-                    ffn_down_quant_format,
-                    (__bridge void *)ffn_gate_input_buffer,
-                    ffn_gate_input_offset,
-                    (__bridge void *)attn_added_buffer,
-                    0,
-                    q_len,
-                    hidden_size,
-                    intermediate_size,
-                    activation_kind,
-                    gate_ffn_linear_slot,
-                    up_ffn_linear_slot,
-                    ffn_pre_gate_rms_norm_slot,
-                    ffn_post_gate_rms_norm_slot,
-                    ffn_post_down_rms_norm_slot,
-                    eps,
-                    down_ffn_linear_slot,
-                    (__bridge void *)block_output_buffer,
-                    block_output_offset,
-                    planned_contract
-                );
-            }
+            rc = termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_device_impl(
+                runtime,
+                ffn_gate_up_quant_format,
+                ffn_down_quant_format,
+                (__bridge void *)ffn_gate_input_buffer,
+                ffn_gate_input_offset,
+                (__bridge void *)attn_added_buffer,
+                0,
+                q_len,
+                hidden_size,
+                intermediate_size,
+                activation_kind,
+                gate_ffn_linear_slot,
+                up_ffn_linear_slot,
+                ffn_pre_gate_rms_norm_slot,
+                ffn_post_gate_rms_norm_slot,
+                ffn_post_down_rms_norm_slot,
+                eps,
+                down_ffn_linear_slot,
+                (__bridge void *)block_output_buffer,
+                block_output_offset,
+                planned_contract
+            );
             runtime->active_frame_cb = previous_frame;
             termite_metal_restore_compute_region(runtime, previous_region);
             if (rc != 0 && timing != NULL) {
@@ -44640,7 +44495,6 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                 const bool ffn_split_q4_0_gate_up_linear =
                     ffn_gate_up_quant_format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
                     !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_SPLIT_GATE_UP_REDUCE")) &&
-                    !termite_metal_q4_0_f16_ffn_enabled() &&
                     !ffn_q4_0_pair_activation_enabled;
                 const bool ffn_split_gate_up_linear =
                     ffn_split_q4_0_gate_up_linear ||

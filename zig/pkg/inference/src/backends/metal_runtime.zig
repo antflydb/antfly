@@ -1011,15 +1011,6 @@ fn q4_0LinearRmsAddSumsqDisabled() bool {
     return !enabled;
 }
 
-fn q4_0F16FfnEnabled() bool {
-    const enabled = getenvFlagValue("TERMITE_METAL_Q4_0_F16_FFN_EXPERIMENT") orelse
-        getenvFlagValue("TERMITE_METAL_ENABLE_Q4_0_F16_FFN") orelse
-        false;
-    return enabled and
-        getenvFlagEnabled("ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN") and
-        !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_F16_FFN");
-}
-
 fn q4_0Ple1xReduceEnabled() bool {
     return !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_PLE_1X_REDUCE");
 }
@@ -29004,9 +28995,7 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output);
-    } else if (q4_0SplitGateUpReduceEnabled()) {
+    if (q4_0SplitGateUpReduceEnabled()) {
         try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
         try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 3);
     } else {
@@ -29017,8 +29006,6 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }
     if (q4_0LinearRmsAddF16ProjectEnabled()) {
         try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input_f16_output > before_direct.q4_0_linear_reduce_f16_input_f16_output);
-    } else if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input > before_direct.q4_0_linear_reduce_f16_input);
     } else {
         try std.testing.expect(after_direct.q4_0_linear_reduce > before_direct.q4_0_linear_reduce);
     }
@@ -29039,7 +29026,6 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
 test "metal native q4_0 gate up q6_k down device path matches decomposed" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
-    if (getenvBool("TERMITE_METAL_DISABLE_Q4_0_Q6K_F16_FFN")) return error.SkipZigTest;
 
     const metal_native_provider = @import("metal_native_provider.zig");
     var provider = try metal_native_provider.MetalNativeProvider.create();
@@ -29968,17 +29954,10 @@ test "metal native q4_0 attention ffn block works inside active frame" {
     } else if (!q4_0LinearRmsAddSumsqDisabled()) {
         try std.testing.expect(after_block.q4_0_linear_reduce_sumsq > before_block.q4_0_linear_reduce_sumsq);
         try std.testing.expect(after_block.rms_norm_add_sumsq > before_block.rms_norm_add_sumsq);
-    } else if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_block.q4_0_linear_reduce_f16_input > before_block.q4_0_linear_reduce_f16_input);
     } else {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     }
-    if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(
-            after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output or
-                after_block.q4_0_pair_activation_rms_scale_reduce_f16_output > before_block.q4_0_pair_activation_rms_scale_reduce_f16_output,
-        );
-    } else if (q4_0SplitGateUpReduceEnabled()) {
+    if (q4_0SplitGateUpReduceEnabled()) {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     } else {
         try std.testing.expect(

@@ -75,6 +75,10 @@ pub const RunAdmission = struct {
     static_workspace_bytes: usize,
     backend_workspace_reserved: bool = false,
     model_profile: ModelProfile = .{},
+    /// Serving sessions must retain the default live-memory pressure check.
+    /// Deterministic unit tests may disable it when exercising admission
+    /// accounting independently of the host's current memory pressure.
+    check_live_memory: bool = true,
 
     fn acquire(
         self: RunAdmission,
@@ -86,7 +90,7 @@ pub const RunAdmission = struct {
             self.backend_class,
             self.limits,
             try self.estimateRequest(request, output_info),
-            true,
+            self.check_live_memory,
         );
     }
 
@@ -99,7 +103,7 @@ pub const RunAdmission = struct {
             self.backend_class,
             self.limits,
             try self.estimateRequest(request, output_info),
-            true,
+            self.check_live_memory,
         );
     }
 
@@ -112,7 +116,7 @@ pub const RunAdmission = struct {
             self.backend_class,
             self.limits,
             try self.estimateResidentAmounts(inputs, output_info),
-            true,
+            self.check_live_memory,
         );
     }
 
@@ -534,6 +538,7 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
         .backend_class = .cpu,
         .limits = .{},
         .static_workspace_bytes = 4096,
+        .check_live_memory = false,
     };
     const cpu_amounts = try cpu.estimateAmounts(&.{input}, &outputs);
     try std.testing.expectEqual(@as(usize, 4672), cpu_amounts.host_scratch_bytes);
