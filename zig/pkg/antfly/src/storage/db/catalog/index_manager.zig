@@ -18150,16 +18150,17 @@ const IndexManagerSimRuntime = struct {
         runtime.dest_manager_open = true;
         errdefer if (runtime.dest_manager_open) runtime.dest_manager.deinit();
 
-        // Replay verification intentionally opens the same paths more than
-        // once. Load the durable catalog first so an existing generation keeps
-        // its coverage identity and projection provenance; only seed a truly
-        // fresh path.
+        // This initializer is also used to reopen crash-surviving modeled
+        // stores. Preserve the catalog's generated coverage identity instead
+        // of recreating the same public index name from a bare config. A new
+        // identity over existing postings is deliberately rejected by text
+        // projection provenance validation.
         try runtime.source_manager.load(&runtime.source_store);
-        if (runtime.source_manager.get(index_manager_sim_index_name) == null) {
+        if (!runtime.source_manager.has(index_manager_sim_index_name)) {
             try runtime.source_manager.addAllNoBackfill(&runtime.source_store, &.{indexManagerSimTextConfig()});
         }
         try runtime.dest_manager.load(&runtime.dest_store);
-        if (runtime.dest_manager.get(index_manager_sim_index_name) == null) {
+        if (!runtime.dest_manager.has(index_manager_sim_index_name)) {
             try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
         }
         runtime.updateRanges();
