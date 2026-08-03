@@ -803,6 +803,7 @@ components:
       description: Inference capacity is temporarily unavailable
       headers:
         Retry-After:
+          required: true
           description: Minimum number of seconds clients should wait before retrying
           schema:
             type: integer
@@ -810,7 +811,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/TransientCapacityError'
   schemas:
     Error:
       type: object
@@ -835,6 +836,36 @@ components:
         retry_after_ms:
           type: integer
           minimum: 0
+          description: Minimum retry delay in milliseconds
+    TransientCapacityError:
+      type: object
+      description: Actionable retry contract for temporary inference-capacity failures.
+      required:
+        - error
+        - message
+        - reason
+        - retryable
+        - retry_after_ms
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code
+        message:
+          type: string
+          description: Human-readable error description
+        reason:
+          type: string
+          description: Machine-readable capacity source
+          enum:
+            - inference_capacity
+            - request_queue
+        retryable:
+          type: boolean
+          enum: [true]
+          description: Always true for a transient-capacity response
+        retry_after_ms:
+          type: integer
+          minimum: 1
           description: Minimum retry delay in milliseconds
     PredictRequest:
       type: object
@@ -2738,6 +2769,7 @@ components:
       required:
         - code
         - message
+        - retryable
       properties:
         code:
           type: string
@@ -2746,6 +2778,11 @@ components:
         retryable:
           type: boolean
           default: false
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Minimum retry delay in milliseconds for a retryable capacity failure.
     GenerateBatchResultItem:
       type: object
       required:

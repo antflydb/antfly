@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	chunking "github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
@@ -100,6 +101,41 @@ type InferenceClient struct {
 	baseURL string
 }
 
+// InferenceCapacityError is returned when an inference request was rejected
+// before execution because model or request-queue capacity is temporarily
+// unavailable. Callers can use errors.As and retry after RetryAfter.
+type InferenceCapacityError struct {
+	Code       string
+	Message    string
+	Reason     string
+	RetryAfter time.Duration
+}
+
+func (e *InferenceCapacityError) Error() string {
+	return fmt.Sprintf("inference capacity unavailable (%s): %s; retry after %s", e.Code, e.Message, e.RetryAfter)
+}
+
+// Temporary reports that the request can be retried after RetryAfter.
+func (e *InferenceCapacityError) Temporary() bool { return true }
+
+func inferenceCapacityError(body *oapi.TransientCapacity) error {
+	reason := string(body.Reason)
+	retryAfterMs := int64(body.RetryAfterMs)
+	const maxDurationMillis = int64((1<<63 - 1) / int64(time.Millisecond))
+	if body.Message == "" ||
+		(reason != "inference_capacity" && reason != "request_queue") ||
+		retryAfterMs <= 0 || retryAfterMs > maxDurationMillis {
+		// Preserve compatibility with older servers that returned an untyped 503.
+		return fmt.Errorf("service unavailable: %s", body.Error)
+	}
+	return &InferenceCapacityError{
+		Code:       body.Error,
+		Message:    body.Message,
+		Reason:     reason,
+		RetryAfter: time.Duration(retryAfterMs) * time.Millisecond,
+	}
+}
+
 // NewInferenceClient creates a new inference client.
 // The baseURL should be the server address (e.g., "http://localhost:8080").
 // Legacy base URLs ending in /ai/v1 are accepted and normalized.
@@ -160,6 +196,9 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
+	}
 
 	// Check content type to determine response format
 	contentType := resp.HTTPResponse.Header.Get("Content-Type")
@@ -212,6 +251,9 @@ func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, inp
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
+	}
 
 	contentType := resp.HTTPResponse.Header.Get("Content-Type")
 	if strings.Contains(contentType, "application/json") {
@@ -262,6 +304,9 @@ func (c *InferenceClient) EmbedJSON(ctx context.Context, model string, input []s
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
+	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
@@ -310,6 +355,9 @@ func (c *InferenceClient) Chunk(ctx context.Context, text string, config ChunkCo
 	}
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
+	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -368,6 +416,9 @@ func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType 
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
+	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
@@ -398,7 +449,7 @@ func (c *InferenceClient) Rerank(ctx context.Context, model string, query string
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
 	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -442,7 +493,7 @@ func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionReques
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
 	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -600,7 +651,7 @@ func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs 
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
 	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -635,7 +686,7 @@ func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
 	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -728,7 +779,7 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
 	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -772,6 +823,9 @@ func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input [
 	}
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
+	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 
 	contentType := resp.HTTPResponse.Header.Get("Content-Type")
@@ -820,6 +874,9 @@ func (c *InferenceClient) SparseEmbedJSON(ctx context.Context, model string, inp
 	}
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
+	}
+	if resp.JSON503 != nil {
+		return nil, inferenceCapacityError(resp.JSON503)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))

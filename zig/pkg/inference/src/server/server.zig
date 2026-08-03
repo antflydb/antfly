@@ -2196,6 +2196,7 @@ pub const Node = struct {
             &parsed,
             model,
             &audio_asset_guard,
+            &asset_lease,
         );
         asset_lease.release();
         errdefer freeDirectDenseVectors(allocator, vectors);
@@ -2840,6 +2841,7 @@ pub const Node = struct {
                     &inputs,
                     model,
                     &audio_asset_guard,
+                    &asset_lease,
                 ) catch |err| return embedDenseInputFailureResponse(ctx, err);
                 asset_lease.release();
                 logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
@@ -2869,6 +2871,7 @@ pub const Node = struct {
                     &inputs,
                     model,
                     &audio_asset_guard,
+                    &asset_lease,
                 );
                 asset_lease.release();
                 logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
@@ -4478,12 +4481,26 @@ pub const Node = struct {
                 .code = "MODEL_RESOURCE_BUSY",
                 .message = "insufficient inference capacity is currently available",
                 .retryable = true,
+                .retry_after_ms = transient_capacity_retry_after_ms,
             },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
                 .message = @errorName(err),
                 .retryable = true,
             },
+        };
+    }
+
+    fn batchAdmissionError(err: anyerror) api.GenerateBatchError {
+        const retryable = err == error.ResourceTemporarilyUnavailable;
+        return .{
+            .code = if (retryable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+            .message = if (retryable)
+                "insufficient inference capacity is currently available"
+            else
+                "request exceeds the configured inference resource budget",
+            .retryable = retryable,
+            .retry_after_ms = if (retryable) transient_capacity_retry_after_ms else null,
         };
     }
 
@@ -4842,11 +4859,7 @@ pub const Node = struct {
                         &task_run_budgets[pos],
                         resource_estimate,
                     ) catch |err| {
-                        results[idx].@"error" = .{
-                            .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
-                            .message = @errorName(err),
-                            .retryable = err == error.ResourceTemporarilyUnavailable,
-                        };
+                        results[idx].@"error" = batchAdmissionError(err);
                         pending[idx] = false;
                         continue;
                     };
@@ -4865,11 +4878,7 @@ pub const Node = struct {
                             &shared_run_budget,
                             resource_estimates[pos].?,
                         ) catch |err| {
-                            results[idx].@"error" = .{
-                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
-                                .message = @errorName(err),
-                                .retryable = err == error.ResourceTemporarilyUnavailable,
-                            };
+                            results[idx].@"error" = batchAdmissionError(err);
                             pending[idx] = false;
                             continue;
                         };
@@ -5002,11 +5011,7 @@ pub const Node = struct {
                             &shared_run_budget,
                             resource_estimate,
                         ) catch |err| {
-                            results[idx].@"error" = .{
-                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
-                                .message = @errorName(err),
-                                .retryable = err == error.ResourceTemporarilyUnavailable,
-                            };
+                            results[idx].@"error" = batchAdmissionError(err);
                             pending[idx] = false;
                             continue;
                         };
@@ -8434,6 +8439,29 @@ test "generate batch queue units sum pending generation work" {
     try std.testing.expectEqual(expected, node.estimateGenerateBatchQueueUnits(parsed.value.requests, owned_messages, pending[0..]));
 }
 
+test "generate batch capacity errors include actionable retry metadata" {
+    const busy_load = Node.batchModelLoadError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_load.code);
+    try std.testing.expectEqual(true, busy_load.retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        busy_load.retry_after_ms,
+    );
+
+    const busy_admission = Node.batchAdmissionError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_admission.code);
+    try std.testing.expectEqual(true, busy_admission.retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        busy_admission.retry_after_ms,
+    );
+
+    const permanent = Node.batchAdmissionError(error.ResourceLimitExceeded);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", permanent.code);
+    try std.testing.expectEqual(false, permanent.retryable);
+    try std.testing.expectEqual(@as(?i64, null), permanent.retry_after_ms);
+}
+
 test "read batch downloaded byte accounting enforces aggregate cap" {
     const item = scraping.DownloadedContent{
         .content_type = @constCast("image/png"),
@@ -9703,6 +9731,7 @@ fn embedDenseInputs(
     inputs: *const ParsedDenseEmbedInputs,
     model: *model_manager_mod.LoadedModel,
     audio_asset_guard: *AudioEmbeddingAssetGuard,
+    asset_lease: *model_manager_mod.EmbeddingAssetLease,
 ) ![][]f32 {
     const embeddings = try allocator.alloc([]f32, inputs.total_count);
     errdefer allocator.free(embeddings);
@@ -9739,7 +9768,12 @@ fn embedDenseInputs(
                 filled[item.index] = true;
             }
         }
-        try admitPrimaryDenseEmbeddingAssetsAfterAudio(model, pipeline, inputs);
+        if (inputs.texts.items.len > 0 or inputs.images.items.len > 0) {
+            asset_lease.downgradeExclusiveToShared();
+            try admitPrimaryDenseEmbeddingAssetsAfterAudio(model, pipeline, inputs);
+        } else {
+            asset_lease.release();
+        }
     }
 
     if (inputs.texts.items.len > 0) {
@@ -9781,6 +9815,7 @@ fn embedDenseInputsPartial(
     inputs: *const ParsedDenseEmbedInputs,
     model: *model_manager_mod.LoadedModel,
     audio_asset_guard: *AudioEmbeddingAssetGuard,
+    asset_lease: *model_manager_mod.EmbeddingAssetLease,
 ) !DenseEmbedPartialResult {
     var result = try initDenseEmbedPartialResult(allocator, inputs.total_count);
     errdefer result.deinit(allocator);
@@ -9811,7 +9846,12 @@ fn embedDenseInputsPartial(
                 try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
             }
         }
-        primary_admission = admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(model, pipeline, inputs);
+        if (inputs.texts.items.len > 0 or inputs.images.items.len > 0) {
+            asset_lease.downgradeExclusiveToShared();
+            primary_admission = admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(model, pipeline, inputs);
+        } else {
+            asset_lease.release();
+        }
         if (primary_admission.text_error) |err| {
             try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.texts.items, err, "model_admission");
         }

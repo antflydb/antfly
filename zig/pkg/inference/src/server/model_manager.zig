@@ -1261,6 +1261,20 @@ const EmbeddingAssetGate = struct {
         self.resource_mutex.unlock();
         self.reader_gate.unlock();
     }
+
+    /// Convert an exclusive owner into the first shared reader without opening
+    /// a gap in which another writer could mutate optional-session slots.
+    fn downgradeExclusiveToShared(self: *EmbeddingAssetGate) void {
+        spinLock(&self.reader_mutex);
+        std.debug.assert(self.reader_count == 0);
+        self.reader_count = 1;
+        self.reader_mutex.unlock();
+
+        // Keep resource_mutex held on behalf of the new reader cohort. New
+        // readers may now join, while queued writers remain excluded until the
+        // final reader releases the resource.
+        self.reader_gate.unlock();
+    }
 };
 
 pub const EmbeddingAssetLease = struct {
@@ -1275,6 +1289,13 @@ pub const EmbeddingAssetLease = struct {
             .exclusive => self.gate.unlockExclusive(),
         }
         self.held = false;
+    }
+
+    pub fn downgradeExclusiveToShared(self: *EmbeddingAssetLease) void {
+        std.debug.assert(self.held);
+        std.debug.assert(self.access == .exclusive);
+        self.gate.downgradeExclusiveToShared();
+        self.access = .shared;
     }
 };
 
@@ -2402,6 +2423,23 @@ test "embedding asset gate admits concurrent readers and excludes writers" {
     gate.lockShared();
     var lease = EmbeddingAssetLease{ .gate = &gate, .access = .shared };
     lease.release();
+    lease.release();
+    try std.testing.expect(gate.tryLockExclusive());
+    gate.unlockExclusive();
+}
+
+test "embedding asset lease downgrades exclusive access without an ownership gap" {
+    var gate = EmbeddingAssetGate{};
+    gate.lockExclusive();
+    var lease = EmbeddingAssetLease{ .gate = &gate, .access = .exclusive };
+
+    lease.downgradeExclusiveToShared();
+    try std.testing.expect(lease.held);
+    try std.testing.expect(lease.access == .shared);
+    try std.testing.expect(gate.tryLockShared());
+    gate.unlockShared();
+    try std.testing.expect(!gate.tryLockExclusive());
+
     lease.release();
     try std.testing.expect(gate.tryLockExclusive());
     gate.unlockExclusive();

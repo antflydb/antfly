@@ -160,10 +160,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer freeEmbeddings(allocator, audio_embeddings);
 
     if (opts.audio_paths.items.len > 0 and has_primary_inputs) {
+        asset_lease.downgradeExclusiveToShared();
         model.lockEmbeddingAssets();
         defer model.unlockEmbeddingAssets();
         try model.ensurePrimaryEmbeddingAssetsLocked(opts.texts.items.len > 0, opts.image_paths.items.len > 0);
         model.bindEmbeddingPipelineAssetsLocked(&pipeline);
+    } else if (opts.audio_paths.items.len > 0) {
+        asset_lease.release();
     }
     const ensured_primary_assets_at = std.Io.Timestamp.now(io, .awake);
 

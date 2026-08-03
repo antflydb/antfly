@@ -8,6 +8,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.inference_embed_request import InferenceEmbedRequest
 from ...models.inference_embed_response import InferenceEmbedResponse
 from ...models.inference_error import InferenceError
+from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
 from ...types import Response
 
 
@@ -32,7 +33,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> InferenceEmbedResponse | InferenceError | None:
+) -> InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError | None:
     if response.status_code == 200:
         response_200 = InferenceEmbedResponse.from_dict(response.json())
 
@@ -54,7 +55,7 @@ def _parse_response(
         return response_500
 
     if response.status_code == 503:
-        response_503 = InferenceError.from_dict(response.json())
+        response_503 = InferenceTransientCapacityError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +67,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[InferenceEmbedResponse | InferenceError]:
+) -> Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,7 +80,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
-) -> Response[InferenceEmbedResponse | InferenceError]:
+) -> Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]:
     """Create embeddings (alias of `/embeddings`)
 
      Alias of `/ai/v1/embeddings`.
@@ -97,7 +98,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceEmbedResponse | InferenceError]
+        Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -115,7 +116,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
-) -> InferenceEmbedResponse | InferenceError | None:
+) -> InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError | None:
     """Create embeddings (alias of `/embeddings`)
 
      Alias of `/ai/v1/embeddings`.
@@ -133,7 +134,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceEmbedResponse | InferenceError
+        InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError
     """
 
     return sync_detailed(
@@ -146,7 +147,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
-) -> Response[InferenceEmbedResponse | InferenceError]:
+) -> Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]:
     """Create embeddings (alias of `/embeddings`)
 
      Alias of `/ai/v1/embeddings`.
@@ -164,7 +165,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceEmbedResponse | InferenceError]
+        Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -180,7 +181,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
-) -> InferenceEmbedResponse | InferenceError | None:
+) -> InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError | None:
     """Create embeddings (alias of `/embeddings`)
 
      Alias of `/ai/v1/embeddings`.
@@ -198,7 +199,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceEmbedResponse | InferenceError
+        InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError
     """
 
     return (

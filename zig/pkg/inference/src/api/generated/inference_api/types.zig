@@ -528,7 +528,9 @@ pub const FunctionDefinition = struct {
 pub const GenerateBatchError = struct {
     code: []const u8,
     message: []const u8,
-    retryable: ?bool = null,
+    retryable: bool,
+    /// Minimum retry delay in milliseconds for a retryable capacity failure.
+    retry_after_ms: ?i64 = null,
 };
 
 /// Batch execution mode. Only synchronous batches are implemented.
@@ -1351,6 +1353,20 @@ pub const TranscribeResponse = struct {
     /// Name of model used for transcription
     model: []const u8,
     usage: GenerateUsage,
+};
+
+/// Actionable retry contract for temporary inference-capacity failures.
+pub const TransientCapacityError = struct {
+    /// Stable machine-readable error code
+    @"error": []const u8,
+    /// Human-readable error description
+    message: []const u8,
+    /// Machine-readable capacity source
+    reason: []const u8,
+    /// Always true for a transient-capacity response
+    retryable: bool,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: i64,
 };
 
 pub const VADOptions = antfly_chunking_api_openapi.VADOptions;

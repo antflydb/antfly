@@ -11057,6 +11057,25 @@ export interface components {
             /** @description Minimum retry delay in milliseconds */
             retry_after_ms?: number;
         };
+        /** @description Actionable retry contract for temporary inference-capacity failures. */
+        InferenceTransientCapacityError: {
+            /** @description Stable machine-readable error code */
+            error: string;
+            /** @description Human-readable error description */
+            message: string;
+            /**
+             * @description Machine-readable capacity source
+             * @enum {string}
+             */
+            reason: "inference_capacity" | "request_queue";
+            /**
+             * @description Always true for a transient-capacity response
+             * @enum {boolean}
+             */
+            retryable: true;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms: number;
+        };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
             model: string;
@@ -11818,7 +11837,9 @@ export interface components {
             code: string;
             message: string;
             /** @default false */
-            retryable?: boolean;
+            retryable: boolean;
+            /** @description Minimum retry delay in milliseconds for a retryable capacity failure. */
+            retry_after_ms?: number | null;
         };
         InferenceGenerateBatchResultItem: {
             custom_id: string;
@@ -12764,11 +12785,11 @@ export interface components {
         TransientCapacity: {
             headers: {
                 /** @description Minimum number of seconds clients should wait before retrying */
-                "Retry-After"?: number;
+                "Retry-After": number;
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["InferenceError"];
+                "application/json": components["schemas"]["InferenceTransientCapacityError"];
             };
         };
     };
