@@ -6390,33 +6390,66 @@ pub fn build(b: *std.Build) void {
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
     if (b.args) |args| run_db_unit_tests.addArgs(args);
+    const release_scale_test_filters = [_][]const u8{
+        "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+        "db one real delete keeps filtered full text on complement path across restart",
+        "db production ingest preserves high-frequency keyword recall across clean restarts",
+    };
+    for (release_scale_test_filters) |filter| {
+        run_db_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
-    // Release-blocker regressions must run in the PR/base unit gate. Keep this
-    // as a focused artifact so CI does not need to run the entire DB suite.
+    // Keep the small, deterministic release-blocker primitives in the PR/base
+    // unit gate. The corpus-scale fixtures below protect thresholds that only
+    // appear at thousands of documents and run in the zig-full gate instead.
+    const release_blocker_regression_filters = [_][]const u8{
+        "non-visible doc set complements visibility per generation",
+        "built-in exact dense scorer filters metadata before vector reads",
+        "sorted unique vector id subtraction handles sparse and dense exclusions",
+    };
     const release_blocker_regression_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{
-            "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
-            "db one real delete keeps filtered full text on complement path across restart",
-            "db production ingest preserves high-frequency keyword recall across clean restarts",
-            "non-visible doc set complements visibility per generation",
-            "built-in exact dense scorer filters metadata before vector reads",
-            "sorted unique vector id subtraction handles sparse and dense exclusions",
-        },
+        // A root DB test keeps query/search_exec and dense_exact reachable to
+        // Zig's compile-time test discovery. Runtime filters below execute
+        // only the three fast primitives, never this corpus-scale anchor.
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates"},
+            &release_blocker_regression_filters,
+        ),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_release_blocker_regression_tests = addFilteredTestRunArtifact(b, release_blocker_regression_tests);
+    const run_release_blocker_regression_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        release_blocker_regression_tests,
+        &release_blocker_regression_filters,
+    );
     const release_blocker_regression_step = b.step(
         "release-blocker-regression-test",
         "Run selective ANN and post-delete full-text release-blocker regressions",
     );
     release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
     unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
+
+    const release_scale_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &release_scale_test_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_release_scale_tests = addFilteredTestRunArtifact(b, release_scale_tests);
+    const release_scale_test_step = b.step(
+        "release-scale-test",
+        "Run corpus-scale ANN and full-text release regressions",
+    );
+    release_scale_test_step.dependOn(&run_release_scale_tests.step);
 
     const db_restore_identity_tests = b.addTest(.{
         .root_module = db_test_mod,
