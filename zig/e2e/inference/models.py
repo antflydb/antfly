@@ -78,6 +78,14 @@ class ModelSpec:
         return f"hf:{self.repo}:{self.variant}"
 
 
+@dataclass(frozen=True)
+class LocalModel:
+    """A model directory and the artifacts validated during discovery."""
+
+    path: Path
+    artifacts: tuple[str, ...]
+
+
 # Models added while verifying the capability surface the website implies. Each is here
 # because a claim needed evidence, not because CI needs breadth for its own sake.
 EMBEDDER_MODELS = [
@@ -437,44 +445,54 @@ def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
     return tuple(artifact_paths) if has_supported_payload else ()
 
 
-def _looks_like_model_dir(path: Path) -> bool:
+def _probe_model_dir(path: Path) -> LocalModel | None:
     if not path.is_dir():
-        return False
+        return None
 
     if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (
         path / MANAGED_DOWNLOAD_PLAN
     ).exists():
-        return False
+        return None
 
     managed_artifacts = _validated_managed_artifacts(path)
     if managed_artifacts is not None:
-        return bool(managed_artifacts) and not (
-            (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
-            or (path / MANAGED_DOWNLOAD_PLAN).exists()
-        )
+        if not managed_artifacts:
+            return None
+        if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (
+            path / MANAGED_DOWNLOAD_PLAN
+        ).exists():
+            return None
+        return LocalModel(path=path, artifacts=managed_artifacts)
 
     # Legacy or externally provisioned model directories do not have Antfly's
     # completion receipt. Preserve compatibility while still rejecting an
     # interrupted file that is visibly in progress.
-    has_supported_payload = False
+    artifacts: list[str] = []
     for candidate in path.rglob("*"):
         if not candidate.is_file():
             continue
         if candidate.name.endswith(".part"):
-            return False
+            return None
         if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
-            has_supported_payload = True
-    return has_supported_payload and not (
-        (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
-        or (path / MANAGED_DOWNLOAD_PLAN).exists()
-    )
+            artifacts.append(candidate.relative_to(path).as_posix())
+    if not artifacts:
+        return None
+    if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (
+        path / MANAGED_DOWNLOAD_PLAN
+    ).exists():
+        return None
+    return LocalModel(path=path, artifacts=tuple(artifacts))
+
+
+def _looks_like_model_dir(path: Path) -> bool:
+    return _probe_model_dir(path) is not None
 
 
 def _is_projector_gguf(artifact_path: str) -> bool:
     name = PurePosixPath(artifact_path).name
-    if not name.lower().endswith(".gguf"):
+    if not name.endswith(".gguf"):
         return False
-    stem = name[: -len(".gguf")].lower()
+    stem = name[: -len(".gguf")]
     return (
         stem == "mmproj"
         or stem.startswith(("mmproj-", "mmproj_"))
@@ -503,33 +521,23 @@ def _projector_matches(artifact_path: str, selector: str) -> bool:
     return False
 
 
-def _model_satisfies_spec(path: Path, spec: ModelSpec) -> bool:
-    if not all((path / extra).exists() for extra in spec.extra_files):
+def _model_satisfies_spec(model: LocalModel, spec: ModelSpec) -> bool:
+    if not all((model.path / extra).exists() for extra in spec.extra_files):
         return False
     if spec.projector is None:
         return True
-
-    managed_artifacts = _validated_managed_artifacts(path)
-    if managed_artifacts is not None:
-        candidates = managed_artifacts
-    else:
-        candidates = (
-            candidate.relative_to(path).as_posix()
-            for candidate in path.rglob("*.gguf")
-            if candidate.is_file()
-        )
     return any(
-        _projector_matches(candidate, spec.projector) for candidate in candidates
+        _projector_matches(candidate, spec.projector) for candidate in model.artifacts
     )
 
 
 def model_available(spec: ModelSpec) -> bool:
     """Check if a model is already downloaded."""
 
-    path = find_local_model_path(spec.request_name, spec.task)
-    if path is None:
+    model = _find_local_model(spec.request_name, spec.task)
+    if model is None:
         return False
-    return _model_satisfies_spec(path, spec)
+    return _model_satisfies_spec(model, spec)
 
 
 def _dynamic_spec(name: str, task: str) -> ModelSpec:
@@ -540,7 +548,7 @@ def _dynamic_spec(name: str, task: str) -> ModelSpec:
     )
 
 
-def find_local_model_path(name: str, task_hint: str | None = None) -> Path | None:
+def _find_local_model(name: str, task_hint: str | None = None) -> LocalModel | None:
     if not name:
         return None
 
@@ -552,9 +560,14 @@ def find_local_model_path(name: str, task_hint: str | None = None) -> Path | Non
         if candidate in seen:
             continue
         seen.add(candidate)
-        if _looks_like_model_dir(candidate):
-            return candidate
+        if model := _probe_model_dir(candidate):
+            return model
     return None
+
+
+def find_local_model_path(name: str, task_hint: str | None = None) -> Path | None:
+    model = _find_local_model(name, task_hint)
+    return model.path if model is not None else None
 
 
 def local_model_exists(name: str, task_hint: str | None = None) -> bool:
@@ -575,9 +588,9 @@ def spec_for_name(name: str, task_hint: str | None = None) -> ModelSpec | None:
 def ensure_model(spec: ModelSpec) -> Path:
     """Download a model with `antfly inference pull` if not already present."""
 
-    existing = find_local_model_path(spec.request_name, spec.task)
+    existing = _find_local_model(spec.request_name, spec.task)
     if existing is not None and _model_satisfies_spec(existing, spec):
-        return existing
+        return existing.path
 
     command = [
         *inference_command(),
@@ -594,7 +607,7 @@ def ensure_model(spec: ModelSpec) -> Path:
     print(f"Downloading {spec.pull_ref}")
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
-    resolved = find_local_model_path(spec.request_name, spec.task)
+    resolved = _find_local_model(spec.request_name, spec.task)
     if resolved is None:
         raise RuntimeError(
             f"antfly inference pull finished but could not locate {spec.request_name} in {models_dir()}"
@@ -608,7 +621,7 @@ def ensure_model(spec: ModelSpec) -> Path:
         raise RuntimeError(
             f"antfly inference pull finished but {spec.request_name} is missing {requirement}"
         )
-    return resolved
+    return resolved.path
 
 
 def ensure_model_by_name(name: str, task_hint: str | None = None) -> Path | None:

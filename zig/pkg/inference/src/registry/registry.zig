@@ -145,6 +145,7 @@ pub const ModelRegistry = struct {
 
         var iter = dir.iterate();
         while (try iter.next(io)) |entry| {
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
             if (entry.kind != .directory and entry.kind != .sym_link) continue;
             if (isLegacyTaskDir(entry.name)) continue;
 
@@ -164,6 +165,7 @@ pub const ModelRegistry = struct {
 
             var owner_iter = owner_dir.iterate();
             while (try owner_iter.next(io)) |model_entry| {
+                if (model_entry.name.len == 0 or model_entry.name[0] == '.') continue;
                 if (model_entry.kind != .directory and model_entry.kind != .sym_link) continue;
                 const model_path = try std.fs.path.join(self.allocator, &.{ entry_path, model_entry.name });
                 defer self.allocator.free(model_path);
@@ -207,6 +209,7 @@ pub const ModelRegistry = struct {
 
             var iter = dir.iterate();
             while (try iter.next(io)) |entry| {
+                if (entry.name.len == 0 or entry.name[0] == '.') continue;
                 if (entry.kind == .directory or entry.kind == .sym_link) {
                     const entry_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
                     defer self.allocator.free(entry_path);
@@ -221,6 +224,7 @@ pub const ModelRegistry = struct {
 
                         var owner_iter = owner_dir.iterate();
                         while (try owner_iter.next(io)) |model_entry| {
+                            if (model_entry.name.len == 0 or model_entry.name[0] == '.') continue;
                             if (model_entry.kind == .directory or model_entry.kind == .sym_link) {
                                 const model_path = try std.fs.path.join(self.allocator, &.{ path, entry.name, model_entry.name });
                                 defer self.allocator.free(model_path);
@@ -255,9 +259,12 @@ pub const ModelRegistry = struct {
         // Destination: models_dir/owner/name
         const dest = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ resolved_models_dir, ref.owner, ref.name });
         defer self.allocator.free(dest);
-        try std.Io.Dir.cwd().createDirPath(io, dest);
+        const dest_parent = std.fs.path.dirname(dest) orelse resolved_models_dir;
+        try std.Io.Dir.cwd().createDirPath(io, dest_parent);
 
-        const lock_path = try std.fs.path.join(self.allocator, &.{ dest, download.managed_download_lock_filename });
+        // The lock lives beside the model directory so publishing the staged
+        // directory cannot move the lock inode out from under another pull.
+        const lock_path = try download.managedModelLockPathAlloc(self.allocator, dest);
         defer self.allocator.free(lock_path);
         var download_lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{
             .truncate = false,
@@ -265,15 +272,17 @@ pub const ModelRegistry = struct {
         });
         defer download_lock.close(io);
 
-        try download.beginManagedDownload(self.allocator, io, dest);
+        var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
+        defer transaction.deinit(io);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, dest, hub_config, projector_selection, .{
+        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, transaction.staging, hub_config, projector_selection, .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
         });
-        try self.writePulledModelManifest(io, dest, tasks_csv, capabilities_csv);
-        try download.completeManagedDownload(self.allocator, io, dest);
+        try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        try download.completeManagedDownload(self.allocator, io, transaction.staging);
+        try transaction.commit(io);
     }
 
     fn appendDiscoveredModel(
@@ -985,6 +994,11 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
         ,
     });
     try tmp.dir.createDirPath(io, "readers/monkt/empty-placeholder");
+    try tmp.dir.createDirPath(io, "readers/monkt/.paddleocr-onnx.antfly-download-backup");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "readers/monkt/.paddleocr-onnx.antfly-download-backup/antfly_metadata.json",
+        .data = "{\"model_type\":\"paddleocr\",\"pipeline_type\":\"multistage_ocr\",\"stages\":{}}",
+    });
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(models_dir);

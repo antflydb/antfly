@@ -286,6 +286,49 @@ def test_gemma_matching_managed_projector_skips_pull(monkeypatch, tmp_path):
     assert models.ensure_model(spec) == model_dir
 
 
+def test_managed_model_probe_validates_receipt_once(monkeypatch, tmp_path):
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+
+    model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
+    model_dir.mkdir(parents=True)
+    decoder = model_dir / "gemma-4-e2b-it-Q4_0.gguf"
+    projector = model_dir / "mmproj-gemma-4-e2b-it-Q8_0.gguf"
+    decoder.write_bytes(b"decoder")
+    projector.write_bytes(b"projector")
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": decoder.name, "size": decoder.stat().st_size},
+                    {"path": projector.name, "size": projector.stat().st_size},
+                ],
+            }
+        )
+    )
+
+    validations = 0
+    validate = models._validated_managed_artifacts
+
+    def count_validations(path):
+        nonlocal validations
+        validations += 1
+        return validate(path)
+
+    monkeypatch.setattr(models, "_validated_managed_artifacts", count_validations)
+
+    assert models.model_available(spec)
+    assert validations == 1
+
+
+def test_projector_filename_matching_mirrors_runtime_case_contract():
+    assert models._is_projector_gguf("nested/mmproj-model-Q8_0.gguf")
+    assert not models._is_projector_gguf("nested/MMPROJ-model-Q8_0.gguf")
+    assert not models._is_projector_gguf("nested/mmproj-model-Q8_0.GGUF")
+
+
 def test_gemma_wrong_projector_quant_does_not_satisfy_spec(monkeypatch, tmp_path):
     spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
     assert spec is not None
