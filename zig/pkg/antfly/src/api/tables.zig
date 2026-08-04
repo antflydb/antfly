@@ -1021,15 +1021,17 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
-    var updated = try metadata_table_manager.cloneTable(alloc, table.*);
-    errdefer metadata_table_manager.freeTable(alloc, updated);
-
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
     const next_version = if (schema_changed)
         std.math.add(u32, current_version, 1) catch return error.SchemaVersionExhausted
     else
         current_version;
+
+    // Validate and compare before cloning the catalog record so rejected
+    // updates do not duplicate potentially large schema/index metadata.
+    var updated = try metadata_table_manager.cloneTable(alloc, table.*);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
 
     const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
     var normalized_schema_json_owned = true;
@@ -2463,6 +2465,8 @@ fn appendRuntimeSchemaObject(
     const ttl_text = try std.fmt.allocPrint(alloc, "{d}", .{schema.ttl_duration_ns});
     defer alloc.free(ttl_text);
     try out.appendSlice(alloc, ttl_text);
+    try out.appendSlice(alloc, ",\"enforce_types\":");
+    try out.appendSlice(alloc, if (schema.enforce_types) "true" else "false");
     try out.appendSlice(alloc, ",\"index_sort\":[");
     for (schema.index_sort, 0..) |field, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -2574,6 +2578,11 @@ fn appendRuntimeSchemaObject(
         try out.appendSlice(alloc, "],\"open_dynamic_paths\":[");
         for (doc.open_dynamic_paths, 0..) |path, open_idx| {
             if (open_idx > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, path);
+        }
+        try out.appendSlice(alloc, "],\"infer_type_dynamic_paths\":[");
+        for (doc.infer_type_dynamic_paths, 0..) |path, infer_idx| {
+            if (infer_idx > 0) try out.append(alloc, ',');
             try appendJsonString(alloc, out, path);
         }
         try out.appendSlice(alloc, "]}");
@@ -2752,76 +2761,177 @@ fn schemasSemanticallyEqual(alloc: std.mem.Allocator, current_schema_json: []con
     };
     defer alloc.free(current_runtime_json);
 
+    if (!try sourceSchemasSemanticallyEqual(alloc, current_normalized, next_normalized)) return false;
+
     var current = try json_helpers.parseJsonValueAlloc(alloc, current_runtime_json);
     defer current.deinit();
     var next = try json_helpers.parseJsonValueAlloc(alloc, next_runtime_json);
     defer next.deinit();
-    return try runtimeSchemaJsonValuesEqual(alloc, current.value, next.value, null);
+
+    const current_canonical = try canonicalSchemaJsonAlloc(alloc, current.value, null, .runtime);
+    defer alloc.free(current_canonical);
+    const next_canonical = try canonicalSchemaJsonAlloc(alloc, next.value, null, .runtime);
+    defer alloc.free(next_canonical);
+    return std.mem.eql(u8, current_canonical, next_canonical);
 }
 
-fn runtimeSchemaArrayIsUnordered(field_name: ?[]const u8) bool {
-    const name = field_name orelse return false;
-    return std.mem.eql(u8, name, "field_capabilities") or
-        std.mem.eql(u8, name, "full_text_documents") or
-        std.mem.eql(u8, name, "fields") or
-        std.mem.eql(u8, name, "dynamic_rules") or
-        std.mem.eql(u8, name, "variants") or
-        std.mem.eql(u8, name, "open_dynamic_paths") or
-        std.mem.eql(u8, name, "infer_type_dynamic_paths");
-}
+const CanonicalSchemaKind = enum {
+    source,
+    runtime,
+};
 
-fn runtimeSchemaJsonValuesEqual(
+fn sourceSchemasSemanticallyEqual(
     alloc: std.mem.Allocator,
-    lhs: std.json.Value,
-    rhs: std.json.Value,
-    field_name: ?[]const u8,
+    current_schema_json: []const u8,
+    next_schema_json: []const u8,
 ) !bool {
-    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
-    return switch (lhs) {
-        .object => |lhs_object| blk: {
-            if (lhs_object.count() != rhs.object.count()) break :blk false;
-            var it = lhs_object.iterator();
-            while (it.next()) |entry| {
-                const rhs_value = rhs.object.get(entry.key_ptr.*) orelse break :blk false;
-                if (!try runtimeSchemaJsonValuesEqual(
-                    alloc,
-                    entry.value_ptr.*,
-                    rhs_value,
-                    entry.key_ptr.*,
-                )) break :blk false;
-            }
-            break :blk true;
-        },
-        .array => |lhs_array| blk: {
-            const rhs_array = rhs.array;
-            if (lhs_array.items.len != rhs_array.items.len) break :blk false;
-            if (!runtimeSchemaArrayIsUnordered(field_name)) {
-                for (lhs_array.items, rhs_array.items) |lhs_item, rhs_item| {
-                    if (!try runtimeSchemaJsonValuesEqual(alloc, lhs_item, rhs_item, null)) break :blk false;
-                }
-                break :blk true;
-            }
+    var current = try json_helpers.parseJsonValueAlloc(alloc, current_schema_json);
+    defer current.deinit();
+    var next = try json_helpers.parseJsonValueAlloc(alloc, next_schema_json);
+    defer next.deinit();
+    normalizeSourceSchemaTopLevelDefaults(&current.value);
+    normalizeSourceSchemaTopLevelDefaults(&next.value);
 
-            // Schema mutation is an administrative path. Use exact multiset
-            // matching here so JSON object order cannot create a generation,
-            // without weakening first-match ordering for dynamic_templates or
-            // positional ordering for index_sort.
-            const matched = try alloc.alloc(bool, rhs_array.items.len);
-            defer alloc.free(matched);
-            @memset(matched, false);
-            for (lhs_array.items) |lhs_item| {
-                for (rhs_array.items, 0..) |rhs_item, index| {
-                    if (matched[index]) continue;
-                    if (try runtimeSchemaJsonValuesEqual(alloc, lhs_item, rhs_item, null)) {
-                        matched[index] = true;
-                        break;
-                    }
-                } else break :blk false;
-            }
-            break :blk true;
-        },
-        else => json_helpers.jsonValuesEqual(lhs, rhs),
+    const current_canonical = try canonicalSchemaJsonAlloc(alloc, current.value, null, .source);
+    defer alloc.free(current_canonical);
+    const next_canonical = try canonicalSchemaJsonAlloc(alloc, next.value, null, .source);
+    defer alloc.free(next_canonical);
+    return std.mem.eql(u8, current_canonical, next_canonical);
+}
+
+fn normalizeSourceSchemaTopLevelDefaults(value: *std.json.Value) void {
+    if (value.* != .object) return;
+    const object = &value.object;
+    const removable = [_][]const u8{
+        "default_type",
+        "ttl_duration_ns",
+        "ttl_field",
+        "enforce_types",
+        "document_schemas",
+        "dynamic_templates",
+        "index_sort",
     };
+    for (removable) |name| {
+        const field = object.get(name) orelse continue;
+        const is_default = if (field == .null)
+            true
+        else if (std.mem.eql(u8, name, "default_type"))
+            field == .string and field.string.len == 0
+        else if (std.mem.eql(u8, name, "ttl_duration_ns"))
+            field == .integer and field.integer == 0
+        else if (std.mem.eql(u8, name, "ttl_field"))
+            field == .string and std.mem.eql(u8, field.string, "_timestamp")
+        else if (std.mem.eql(u8, name, "enforce_types"))
+            field == .bool and !field.bool
+        else if (std.mem.eql(u8, name, "document_schemas"))
+            field == .object and field.object.count() == 0
+        else
+            field == .array and field.array.items.len == 0;
+        if (is_default) _ = object.orderedRemove(name);
+    }
+}
+
+fn schemaArrayIsUnordered(kind: CanonicalSchemaKind, field_name: ?[]const u8) bool {
+    const name = field_name orelse return false;
+    return switch (kind) {
+        .source => std.mem.eql(u8, name, "required") or
+            std.mem.eql(u8, name, "enum") or
+            std.mem.eql(u8, name, "type") or
+            std.mem.eql(u8, name, "x-antfly-types") or
+            std.mem.eql(u8, name, "x-antfly-include-in-all") or
+            std.mem.eql(u8, name, "allOf") or
+            std.mem.eql(u8, name, "anyOf") or
+            std.mem.eql(u8, name, "oneOf"),
+        // Keep dynamic_rules ordered: the document mapper uses first-match
+        // precedence, so swapping two overlapping rules changes indexing.
+        .runtime => std.mem.eql(u8, name, "field_capabilities") or
+            std.mem.eql(u8, name, "full_text_documents") or
+            std.mem.eql(u8, name, "fields") or
+            std.mem.eql(u8, name, "variants") or
+            std.mem.eql(u8, name, "open_dynamic_paths") or
+            std.mem.eql(u8, name, "infer_type_dynamic_paths"),
+    };
+}
+
+fn canonicalSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    field_name: ?[]const u8,
+    kind: CanonicalSchemaKind,
+) std.mem.Allocator.Error![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendCanonicalSchemaJson(alloc, &out, value, field_name, kind);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendCanonicalSchemaJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    field_name: ?[]const u8,
+    kind: CanonicalSchemaKind,
+) std.mem.Allocator.Error!void {
+    switch (value) {
+        .object => |object| {
+            const keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            var key_index: usize = 0;
+            var it = object.iterator();
+            while (it.next()) |entry| : (key_index += 1) keys[key_index] = entry.key_ptr.*;
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+
+            try out.append(alloc, '{');
+            for (keys, 0..) |key, index| {
+                if (index > 0) try out.append(alloc, ',');
+                try appendJsonString(alloc, out, key);
+                try out.append(alloc, ':');
+                try appendCanonicalSchemaJson(alloc, out, object.get(key).?, key, kind);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            if (schemaArrayIsUnordered(kind, field_name)) {
+                // Canonicalize and sort once instead of performing quadratic
+                // pairwise matching for schemas with many derived fields.
+                const items = try alloc.alloc([]u8, array.items.len);
+                var initialized: usize = 0;
+                defer {
+                    for (items[0..initialized]) |item| alloc.free(item);
+                    alloc.free(items);
+                }
+                for (array.items) |item| {
+                    items[initialized] = try canonicalSchemaJsonAlloc(alloc, item, null, kind);
+                    initialized += 1;
+                }
+                std.mem.sort([]u8, items, {}, struct {
+                    fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                        return std.mem.order(u8, lhs, rhs) == .lt;
+                    }
+                }.lessThan);
+                for (items, 0..) |item, index| {
+                    if (index > 0) try out.append(alloc, ',');
+                    try out.appendSlice(alloc, item);
+                }
+            } else {
+                for (array.items, 0..) |item, index| {
+                    if (index > 0) try out.append(alloc, ',');
+                    try appendCanonicalSchemaJson(alloc, out, item, null, kind);
+                }
+            }
+            try out.append(alloc, ']');
+        },
+        else => {
+            const encoded = try stringifyJsonValue(alloc, value);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
 }
 
 pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
@@ -4274,7 +4384,7 @@ test "metadata.schema update avoids a generation for semantically identical JSON
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
         .name = "docs",
-        .schema_json = "{\"version\":2,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"title\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}}}}}}",
+        .schema_json = "{\"version\":2,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"required\":[\"title\",\"body\"],\"properties\":{\"title\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}}}}}}",
         .read_schema_json = "{\"version\":1}",
         .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
         .replication_sources_json = "[]",
@@ -4284,7 +4394,7 @@ test "metadata.schema update avoids a generation for semantically identical JSON
     const updated = try applySchemaUpdateRecord(
         std.testing.allocator,
         &table,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"properties\":{\"body\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"additionalProperties\":true,\"type\":\"object\"}}},\"version\":999,\"default_type\":\"doc\",\"enforce_types\":false}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"properties\":{\"body\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"body\",\"title\"],\"additionalProperties\":true,\"type\":\"object\"}}},\"version\":999,\"default_type\":\"doc\",\"enforce_types\":false}",
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
 
@@ -4314,6 +4424,86 @@ test "metadata.schema update avoids a generation for explicit runtime defaults" 
     try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
     try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
     try std.testing.expectEqualStrings(table.indexes_json, updated.indexes_json);
+}
+
+test "metadata.schema update versions dynamic rule precedence changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","patternProperties":{
+        \\  "^tag_.*":{"type":"string","x-antfly-types":["text"]},
+        \\  ".*":{"type":"string","x-antfly-types":["keyword"]}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","patternProperties":{
+        \\  ".*":{"type":"string","x-antfly-types":["keyword"]},
+        \\  "^tag_.*":{"type":"string","x-antfly-types":["text"]}
+        \\}}}}}
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
+}
+
+test "metadata.schema update versions inferred dynamic path changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "meta":{"type":"object"}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "meta":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}
+        \\}}}}}
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
+}
+
+test "metadata.schema update versions validation-only changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "title":{"type":"string","minLength":1}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "title":{"type":"string","minLength":2}
+        \\}}}}}
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
 }
 
 test "metadata.schema update rejects generation overflow" {
