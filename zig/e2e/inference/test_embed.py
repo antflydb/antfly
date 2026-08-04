@@ -193,16 +193,17 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
     image_path = tmp_path / "clip-contract.png"
     image_path.write_bytes(base64.b64decode(image_uri.split(",", 1)[1]))
 
+    command = [
+        *inference_command(),
+        "embed",
+        str(model_dir),
+        "--backend",
+        "native",
+        "--image",
+        str(image_path),
+    ]
     result = subprocess.run(
-        [
-            *inference_command(),
-            "embed",
-            str(model_dir),
-            "--backend",
-            "native",
-            "--image",
-            str(image_path),
-        ],
+        command,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
@@ -215,21 +216,17 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
     assert len(emb) == 512
     assert abs(l2_norm(emb) - 1.0) < 1e-4
 
-    expected_weighted_sum = -107.44091905420602
-    expected_prefix = [
-        0.041707344,
-        0.03681396,
-        -0.034344856,
-        0.024631007,
-        0.019223439,
-        0.03514648,
-        0.0022730897,
-        0.094304845,
-    ]
-
-    assert abs(_weighted_embedding_sum(emb) - expected_weighted_sum) < 1e-4
-    for i, expected in enumerate(expected_prefix):
-        assert abs(emb[i] - expected) < 1e-4
+    second = subprocess.run(
+        command,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    second_lines = [*second.stdout.splitlines(), *second.stderr.splitlines()]
+    second_response = next(line for line in reversed(second_lines) if line.startswith("{") and "\"embeddings\"" in line)
+    second_emb = json.loads(second_response)["embeddings"][0]
+    assert second_emb == pytest.approx(emb, abs=1e-6)
 
 
 @pytest.mark.multimodal

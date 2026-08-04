@@ -280,7 +280,7 @@ def api(base_url):
                 kwargs.pop("resolver")
             body: dict = {
                 "model": model or "fastino/gliner2-base-v1",
-                "inputs": [{"content": value} for value in text],
+                "texts": text,
                 "schema": schema,
                 **kwargs,
             }
