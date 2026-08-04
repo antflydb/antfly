@@ -462,7 +462,7 @@ fn workerMain(worker: *Worker) void {
             if (from_sequence > persisted_sequence) {
                 const persisted = persistIdleAppliedSequence(runtime, worker, from_sequence) catch |err| {
                     if (err == error.WorkerStopping) return;
-                    if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                    if (catch_up_policy.isRecoverableAdmissionError(err)) {
                         sleepAfterRecoverableCatchUpError(worker, err);
                         continue;
                     }
@@ -598,7 +598,7 @@ fn workerMain(worker: *Worker) void {
         var persisted = false;
         if (caught_up_sequence > from_sequence) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
-                if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                if (catch_up_policy.isRecoverableAdmissionError(err)) {
                     sleepAfterRecoverableCatchUpError(worker, err);
                     continue;
                 }
@@ -736,17 +736,17 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
+    if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked, error.ResourceBudgetExceeded => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => true,
         else => false,
     };
 }
 
 fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
+    if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
-        error.WriterLocked,
-        error.ResourceBudgetExceeded,
         error.ReplayDocumentNotVisible,
         error.ArtifactRepairRequired,
         => true,

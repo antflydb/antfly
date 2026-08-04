@@ -6081,7 +6081,11 @@ pub const ApiHttpServer = struct {
 
                 var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
                     error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
-                    error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    error.HAReadWaitForApply,
+                    error.HAReadWaitForMetadata,
+                    error.ReadUnavailable,
+                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    error.PersistentDescriptorAdmissionExhausted => return try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
                     else => {
                         std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
                         return try textResponse(self.alloc, 500, "lookup failed");
@@ -8657,7 +8661,13 @@ pub const ApiHttpServer = struct {
             => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.EnrichmentRetryInProgress, error.ResourceBudgetExceeded => return error.Backpressured,
+            error.EnrichmentRetryInProgress,
+            error.ResourceBudgetExceeded,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.TextMergeBackpressureTimeout,
+            error.TextMergeBackpressureUnavailable,
+            error.TextMergeRuntimeShutdown,
+            => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
@@ -8690,7 +8700,11 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -8820,7 +8834,11 @@ pub const ApiHttpServer = struct {
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.IndexRebuilding => return error.IndexRebuilding,
                 error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-                error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+                error.HAReadWaitForApply,
+                error.HAReadWaitForMetadata,
+                error.ReadUnavailable,
+                error.PersistentDescriptorAdmissionExhausted,
+                => return error.ReadUnavailable,
                 error.Timeout => return error.Timeout,
                 error.Cancelled => return error.Cancelled,
                 else => {
@@ -8854,7 +8872,11 @@ pub const ApiHttpServer = struct {
             error.IndexRebuilding => return error.IndexRebuilding,
             error.TableNotFound, error.NotFound => return error.NotFound,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             else => {
@@ -8916,7 +8938,11 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             else => {
@@ -9790,6 +9816,7 @@ pub const ApiHttpServer = struct {
                 _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                     error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                    error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
                     else => {
                         std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
                         return error.InternalFailure;
@@ -9954,7 +9981,10 @@ pub const ApiHttpServer = struct {
         return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -9974,7 +10004,10 @@ pub const ApiHttpServer = struct {
         return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -10944,7 +10977,11 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => try textResponse(self.alloc, 503, "doc identity unavailable"),
             error.IndexRebuilding => try indexRebuildingResponse(self.alloc),
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try textResponse(self.alloc, 503, "read requires primary"),
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try textResponse(self.alloc, 503, "standby read unavailable"),
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            => try textResponse(self.alloc, 503, "standby read unavailable"),
+            error.PersistentDescriptorAdmissionExhausted => try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");

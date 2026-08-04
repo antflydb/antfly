@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("change_journal.zig");
+const catch_up_policy = @import("catch_up_policy.zig");
 const replay_source_mod = @import("replay_source.zig");
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
@@ -150,8 +151,7 @@ fn logCatchUpError(
     applied_entries: usize,
     err: anyerror,
 ) void {
-    if (err == error.WriterLocked) return;
-    if (err == error.ResourceBudgetExceeded) return;
+    if (catch_up_policy.isRecoverableAdmissionError(err)) return;
     if (err == error.ReplayDocumentNotVisible) return;
     if (err == error.ArtifactRepairRequired) return;
     if (err == error.CatchUpDeadlineExceeded) return;

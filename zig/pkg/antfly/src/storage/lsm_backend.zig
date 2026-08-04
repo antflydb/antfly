@@ -355,6 +355,7 @@ pub const Options = struct {
     compaction_scratch_retained_cap_bytes: usize = 4 * 1024 * 1024,
     io_runtime: storage_io.RuntimeKind = .threaded,
     read_runtime: ?storage_io.ReadRuntime = null,
+    native_storage_pool: ?*storage_io.NativeStoragePool = null,
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
     local_block_cache_enabled: bool = true,
@@ -1585,11 +1586,12 @@ pub const Backend = struct {
         if (self.storage.?.supportsNativePathLocks()) {
             const lock_path = try rootLockPathAlloc(self.allocator, root_dir);
             defer self.allocator.free(lock_path);
-            native_lock = storage_io.acquireNativePathLock(
+            native_lock = storage_io.acquireNativePathLockWithPool(
                 self.allocator,
                 lock_path,
                 .exclusive,
                 .{ .nonblocking = true },
+                self.options.native_storage_pool,
             ) catch |err| switch (err) {
                 error.WouldBlock => return error.LsmRootWriterAlreadyOpen,
                 else => return err,
@@ -1618,9 +1620,12 @@ pub const Backend = struct {
 
         const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
         defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = storage_io.openNativePathLockFile(self.allocator, lock_path, .{
-            .create_if_missing = true,
-        }) catch |err| switch (err) {
+        self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
+            self.allocator,
+            lock_path,
+            .{ .create_if_missing = true },
+            self.options.native_storage_pool,
+        ) catch |err| switch (err) {
             error.FileNotFound => if (self.options.backend.read_only) return else return err,
             else => return err,
         };

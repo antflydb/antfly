@@ -3652,7 +3652,7 @@ pub fn build(b: *std.Build) void {
         .filters = selectTestFilters(b, &.{
             "storage.db.db.test.",
             "unsupported transforms fail atomically instead of reporting success",
-            "unsupported transform on a missing document is rejected before no-op resolution",
+            "supported transform on a missing document remains a no-op without upsert",
             "io threaded applied callback observes published watermark outside runtime lock",
         }),
         .test_runner = .{
@@ -5024,6 +5024,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
+            "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
@@ -5127,6 +5128,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
+            "public create index exposes retryable storage descriptor exhaustion",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler preserves retryable failure status",
             "public table query handler maps HA read gate errors",
@@ -5288,6 +5290,8 @@ pub fn build(b: *std.Build) void {
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
+            "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
+            "prepared writer open reclaims descriptor capacity from startup cache",
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",

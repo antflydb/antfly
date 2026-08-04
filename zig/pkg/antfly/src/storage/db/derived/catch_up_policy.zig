@@ -74,7 +74,12 @@ pub const RecoverableRetryCounters = struct {
         _ = self.total.fetchAdd(1, .monotonic);
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
-            error.ResourceBudgetExceeded => _ = self.resource_budget.fetchAdd(1, .monotonic),
+            error.ResourceBudgetExceeded,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.TextMergeBackpressureTimeout,
+            error.TextMergeBackpressureUnavailable,
+            error.TextMergeRuntimeShutdown,
+            => _ = self.resource_budget.fetchAdd(1, .monotonic),
             error.ReplayDocumentNotVisible => _ = self.replay_document_not_visible.fetchAdd(1, .monotonic),
             error.ArtifactRepairRequired => _ = self.artifact_repair_required.fetchAdd(1, .monotonic),
             error.NotFound => _ = self.not_found.fetchAdd(1, .monotonic),
@@ -93,6 +98,22 @@ pub const RecoverableRetryCounters = struct {
         };
     }
 };
+
+/// Resource admission failures are retryable control flow for derived replay.
+/// In particular, text publication can time out or observe a temporarily
+/// stopped/quarantined merge runtime without invalidating the replay record.
+pub fn isRecoverableAdmissionError(err: anyerror) bool {
+    return switch (err) {
+        error.WriterLocked,
+        error.ResourceBudgetExceeded,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.TextMergeBackpressureTimeout,
+        error.TextMergeBackpressureUnavailable,
+        error.TextMergeRuntimeShutdown,
+        => true,
+        else => false,
+    };
+}
 
 pub fn recordRecoverableRetry(
     counters: *RecoverableRetryCounters,
@@ -279,17 +300,28 @@ test "recoverable retry counters preserve failure reasons" {
     var counters = RecoverableRetryCounters{};
     counters.record(error.WriterLocked);
     counters.record(error.ResourceBudgetExceeded);
+    counters.record(error.PersistentDescriptorAdmissionExhausted);
+    counters.record(error.TextMergeBackpressureTimeout);
+    counters.record(error.TextMergeBackpressureUnavailable);
+    counters.record(error.TextMergeRuntimeShutdown);
     counters.record(error.ReplayDocumentNotVisible);
     counters.record(error.ArtifactRepairRequired);
     counters.record(error.NotFound);
 
     const stats = counters.snapshot();
-    try std.testing.expectEqual(@as(u64, 5), stats.total);
+    try std.testing.expectEqual(@as(u64, 9), stats.total);
     try std.testing.expectEqual(@as(u64, 1), stats.writer_locked);
-    try std.testing.expectEqual(@as(u64, 1), stats.resource_budget);
+    try std.testing.expectEqual(@as(u64, 5), stats.resource_budget);
     try std.testing.expectEqual(@as(u64, 1), stats.replay_document_not_visible);
     try std.testing.expectEqual(@as(u64, 1), stats.artifact_repair_required);
     try std.testing.expectEqual(@as(u64, 1), stats.not_found);
+}
+
+test "text merge admission failures remain recoverable for derived replay" {
+    try std.testing.expect(isRecoverableAdmissionError(error.TextMergeBackpressureTimeout));
+    try std.testing.expect(isRecoverableAdmissionError(error.TextMergeBackpressureUnavailable));
+    try std.testing.expect(isRecoverableAdmissionError(error.TextMergeRuntimeShutdown));
+    try std.testing.expect(!isRecoverableAdmissionError(error.TextPublicationExceedsSegmentLimit));
 }
 
 test "full text replay policy bounds work by item count as well as bytes" {
