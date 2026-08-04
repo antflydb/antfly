@@ -1009,9 +1009,9 @@ fn writeSyntheticMetadata(
     io: std.Io,
     dest_dir: []const u8,
     plan: SyntheticMetadataPlan,
-) !void {
+) !?ManagedArtifactReceipt {
     switch (plan) {
-        .none => {},
+        .none => return null,
         .paddleocr => |payload| {
             const metadata =
                 try std.fmt.allocPrint(allocator,
@@ -1035,7 +1035,11 @@ fn writeSyntheticMetadata(
 
             const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
             defer allocator.free(metadata_path);
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+            try writeFileAtomically(allocator, io, metadata_path, metadata);
+            return .{
+                .path = "antfly_metadata.json",
+                .size = metadata.len,
+            };
         },
     }
 }
@@ -1299,6 +1303,66 @@ fn writeFileAtomically(
     }
     try std.Io.Dir.rename(cwd, temp_path, cwd, path, io);
     try syncManagedDirectory(io, std.fs.path.dirname(path) orelse ".");
+}
+
+/// Atomically replace a private staging artifact and update its validated plan.
+/// Callers must hold the model pull lock; published directories must never use
+/// this API because the artifact and plan renames are intentionally separate.
+pub fn writeManagedArtifactAndUpdatePlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    relative_path: []const u8,
+    data: []const u8,
+) !void {
+    if (!managed_receipt.artifactPathIsSafe(relative_path)) return error.InvalidModelArtifactPath;
+
+    var validated = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer validated.deinit();
+
+    var artifacts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
+    defer artifacts.deinit(allocator);
+    try artifacts.ensureTotalCapacity(allocator, validated.artifacts.len + 1);
+    var replaced = false;
+    for (validated.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.path, relative_path)) {
+            try artifacts.append(allocator, .{
+                .path = relative_path,
+                .size = data.len,
+            });
+            replaced = true;
+        } else {
+            try artifacts.append(allocator, .{
+                .path = artifact.path,
+                .size = artifact.size,
+                .sha256 = artifact.sha256,
+            });
+        }
+    }
+    if (!replaced) {
+        if (validated.artifacts.len >= managed_receipt.max_artifact_count) {
+            return error.InvalidManagedDownload;
+        }
+        try artifacts.append(allocator, .{
+            .path = relative_path,
+            .size = data.len,
+        });
+    }
+
+    const receipt_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        ManagedDownloadReceipt{ .artifacts = artifacts.items },
+        .{},
+    );
+    defer allocator.free(receipt_json);
+    if (receipt_json.len > managed_receipt.max_receipt_bytes) return error.InvalidManagedDownload;
+    const artifact_path = try managedPath(allocator, dest_dir, relative_path);
+    defer allocator.free(artifact_path);
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+
+    try writeFileAtomically(allocator, io, artifact_path, data);
+    try writeFileAtomically(allocator, io, plan_path, receipt_json);
 }
 
 fn syncManagedDirectory(io: std.Io, path: []const u8) !void {
@@ -1612,16 +1676,11 @@ pub fn downloadModel(
             remaining_model_bytes,
             artifact_size,
         );
-        // Registry.pull may rewrite model_manifest.json after this function
-        // returns, so it is deliberately excluded from the immutable artifact
-        // receipt finalized by the registry.
-        if (!std.mem.eql(u8, filename, "model_manifest.json")) {
-            try receipts.append(allocator, .{
-                .path = filename,
-                .size = artifact_size,
-                .sha256 = file_meta.sha256,
-            });
-        }
+        try receipts.append(allocator, .{
+            .path = filename,
+            .size = artifact_size,
+            .sha256 = file_meta.sha256,
+        });
 
         if (progress.callback) |cb| {
             cb(.{
@@ -1634,7 +1693,16 @@ pub fn downloadModel(
         }
     }
 
-    try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata);
+    if (try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata)) |metadata_receipt| {
+        var replaced = false;
+        for (receipts.items) |*receipt| {
+            if (!std.mem.eql(u8, receipt.path, metadata_receipt.path)) continue;
+            receipt.* = metadata_receipt;
+            replaced = true;
+            break;
+        }
+        if (!replaced) try receipts.append(allocator, metadata_receipt);
+    }
 
     const receipt_json = try std.json.Stringify.valueAlloc(
         allocator,
@@ -1642,6 +1710,12 @@ pub fn downloadModel(
         .{},
     );
     defer allocator.free(receipt_json);
+    if (receipts.items.len == 0 or
+        receipts.items.len > managed_receipt.max_artifact_count or
+        receipt_json.len > managed_receipt.max_receipt_bytes)
+    {
+        return error.InvalidManagedDownload;
+    }
     const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
     defer allocator.free(plan_path);
     try writeFileAtomically(allocator, io, plan_path, receipt_json);
@@ -1803,6 +1877,9 @@ pub fn listModelFiles(
         if (sibling == .object) {
             if (sibling.object.get("rfilename")) |rf| {
                 if (rf == .string) {
+                    if (!managed_receipt.artifactPathIsSafe(rf.string)) {
+                        return error.InvalidModelArtifactPath;
+                    }
                     var file = HubFile{
                         .name = try allocator.dupe(u8, rf.string),
                     };
@@ -2053,6 +2130,7 @@ fn downloadFile(
     total_bytes: ?u64,
     expected_sha256: ?[]const u8,
 ) !void {
+    if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
         if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
@@ -2903,6 +2981,26 @@ test "aggregate model budget uses checked arithmetic" {
     );
 }
 
+test "downloadFile rejects artifact paths outside the model root before network access" {
+    try std.testing.expectError(
+        error.InvalidModelArtifactPath,
+        downloadFile(
+            std.testing.allocator,
+            std.testing.io,
+            "owner",
+            "model",
+            "../escape.gguf",
+            "unused",
+            .{ .base_url = "http://127.0.0.1:1" },
+            .{},
+            0,
+            1,
+            null,
+            null,
+        ),
+    );
+}
+
 test "managed download publication keeps incomplete state fail closed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2962,6 +3060,45 @@ test "managed download publication keeps incomplete state fail closed" {
         ManagedDownloadState.incomplete,
         managedDownloadState(allocator, io, dest_dir),
     );
+}
+
+test "managed staging artifact replacement updates the publication receipt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "managed-update");
+    defer allocator.free(dest_dir);
+    try beginManagedDownload(allocator, io, dest_dir);
+    const decoder_path = try managedPath(allocator, dest_dir, "model.gguf");
+    defer allocator.free(decoder_path);
+    try writeFileAtomically(allocator, io, decoder_path, "decoder");
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(
+        allocator,
+        io,
+        plan_path,
+        "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    );
+
+    const manifest_json = "{\"type\":\"generator\"}";
+    try writeManagedArtifactAndUpdatePlan(
+        allocator,
+        io,
+        dest_dir,
+        "model_manifest.json",
+        manifest_json,
+    );
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer plan.deinit();
+    const manifest_artifact = plan.find("model_manifest.json") orelse
+        return error.TestExpectedManifestArtifact;
+    try std.testing.expectEqual(@as(u64, manifest_json.len), manifest_artifact.size);
+
+    try completeManagedDownload(allocator, io, dest_dir);
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
 }
 
 test "managed model transaction reuses artifacts and publishes completed repair" {

@@ -42,13 +42,25 @@ pub const ValidatedReceipt = struct {
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(DownloadReceipt),
     artifacts: []ValidatedArtifact,
+    path_index: std.StringHashMapUnmanaged(usize),
+
+    pub fn find(self: *const ValidatedReceipt, path: []const u8) ?*const ValidatedArtifact {
+        const index = self.path_index.get(path) orelse return null;
+        return &self.artifacts[index];
+    }
 
     pub fn deinit(self: *ValidatedReceipt) void {
         for (self.artifacts) |artifact| self.allocator.free(artifact.canonical_path);
         self.allocator.free(self.artifacts);
+        self.path_index.deinit(self.allocator);
         self.parsed.deinit();
         self.* = undefined;
     }
+};
+
+const ReceiptSource = enum {
+    completion,
+    plan,
 };
 
 fn managedPath(allocator: std.mem.Allocator, dest_dir: []const u8, filename: []const u8) ![]u8 {
@@ -87,6 +99,7 @@ pub fn publicationBlocked(
 pub fn artifactPathIsSafe(path: []const u8) bool {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
     if (std.mem.indexOfScalar(u8, path, '\\') != null or
+        std.mem.indexOfScalar(u8, path, ':') != null or
         std.mem.indexOfScalar(u8, path, 0) != null)
     {
         return false;
@@ -154,30 +167,42 @@ pub fn resolveContainedArtifactPath(
 /// or `error.IncompleteManagedDownload`; operational filesystem errors remain
 /// visible to callers. Artifact paths are canonicalized and proven to remain
 /// under the canonical model root before they are returned.
-pub fn loadValidated(
+fn loadValidatedSource(
     allocator: std.mem.Allocator,
     io: std.Io,
     dest_dir: []const u8,
+    source: ReceiptSource,
 ) !?ValidatedReceipt {
     const cwd = std.Io.Dir.cwd();
     const in_progress_path = try managedPath(allocator, dest_dir, in_progress_filename);
     defer allocator.free(in_progress_path);
     const plan_path = try managedPath(allocator, dest_dir, plan_filename);
     defer allocator.free(plan_path);
-    if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
-        return error.IncompleteManagedDownload;
+    switch (source) {
+        .completion => if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
+            return error.IncompleteManagedDownload;
+        },
+        .plan => if (!try pathPresent(cwd, io, in_progress_path)) {
+            return error.IncompleteManagedDownload;
+        },
     }
 
     const complete_path = try managedPath(allocator, dest_dir, complete_filename);
     defer allocator.free(complete_path);
+    const receipt_path = switch (source) {
+        .completion => complete_path,
+        .plan => plan_path,
+    };
     const receipt_json = cwd.readFileAlloc(
         io,
-        complete_path,
+        receipt_path,
         allocator,
         .limited(max_receipt_bytes),
     ) catch |err| switch (err) {
         error.FileNotFound => {
-            if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
+            if (source == .plan or
+                try publicationBlockedPaths(cwd, io, in_progress_path, plan_path))
+            {
                 return error.IncompleteManagedDownload;
             }
             return null;
@@ -216,11 +241,17 @@ pub fn loadValidated(
 
     const artifacts = try allocator.alloc(ValidatedArtifact, parsed.value.artifacts.len);
     errdefer allocator.free(artifacts);
+    var path_index: std.StringHashMapUnmanaged(usize) = .{};
+    errdefer path_index.deinit(allocator);
+    try path_index.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
     var initialized: usize = 0;
     errdefer for (artifacts[0..initialized]) |artifact| allocator.free(artifact.canonical_path);
 
     var has_supported_payload = false;
     for (parsed.value.artifacts, 0..) |artifact, index| {
+        const entry = path_index.getOrPutAssumeCapacity(artifact.path);
+        if (entry.found_existing) return error.InvalidManagedDownload;
+        entry.value_ptr.* = index;
         const canonical_path = resolveContainedArtifactFromCanonicalRoot(
             allocator,
             io,
@@ -250,15 +281,43 @@ pub fn loadValidated(
         }
     }
     if (!has_supported_payload) return error.InvalidManagedDownload;
-    if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
-        return error.IncompleteManagedDownload;
+    switch (source) {
+        .completion => if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
+            return error.IncompleteManagedDownload;
+        },
+        .plan => if (!try pathPresent(cwd, io, in_progress_path) or
+            !try pathPresent(cwd, io, plan_path))
+        {
+            return error.IncompleteManagedDownload;
+        },
     }
 
     return .{
         .allocator = allocator,
         .parsed = parsed,
         .artifacts = artifacts,
+        .path_index = path_index,
     };
+}
+
+pub fn loadValidated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion);
+}
+
+/// Load the validated artifact plan of a private staging transaction. This is
+/// intentionally separate from published discovery: callers must already own
+/// the pull lock and know that `dest_dir` is not externally visible.
+pub fn loadValidatedPlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+) !ValidatedReceipt {
+    return (try loadValidatedSource(allocator, io, dest_dir, .plan)) orelse
+        error.IncompleteManagedDownload;
 }
 
 test "artifact receipt paths reject ambiguous and platform-specific forms" {
@@ -266,6 +325,7 @@ test "artifact receipt paths reject ambiguous and platform-specific forms" {
     try std.testing.expect(!artifactPathIsSafe("../model.gguf"));
     try std.testing.expect(!artifactPathIsSafe("nested//model.gguf"));
     try std.testing.expect(!artifactPathIsSafe("nested\\model.gguf"));
+    try std.testing.expect(!artifactPathIsSafe("C:model.gguf"));
     try std.testing.expect(!artifactPathIsSafe("nested/\x00model.gguf"));
 }
 
@@ -308,6 +368,49 @@ test "validated managed receipt accepts contained symlink artifacts" {
     defer receipt.deinit();
     try std.testing.expectEqual(@as(usize, 1), receipt.artifacts.len);
     try std.testing.expect(std.mem.endsWith(u8, receipt.artifacts[0].canonical_path, "artifacts/model.gguf"));
+}
+
+test "validated staging plan is private from published receipt loading" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-in-progress",
+        .data = "{\"version\":1,\"state\":\"in_progress\"}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-plan.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(model_dir);
+
+    try std.testing.expectError(error.IncompleteManagedDownload, loadValidated(allocator, io, model_dir));
+    var plan = try loadValidatedPlan(allocator, io, model_dir);
+    defer plan.deinit();
+    try std.testing.expect(plan.find("model.gguf") != null);
+}
+
+test "validated receipts reject duplicate artifact paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(model_dir);
+
+    try std.testing.expectError(error.InvalidManagedDownload, loadValidated(allocator, io, model_dir));
 }
 
 test "validated managed receipt cleans up every allocation failure" {
