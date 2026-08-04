@@ -1024,10 +1024,9 @@ test "GLiNER2 backend grad parity: span-start objective backward matches native 
     try runBackendGradParity(std.testing.allocator, "span-start", .span_start);
 }
 
-// The gate proper. The structure term of `gliner2-total-loss` is where the
-// ~17.5% native-vs-Metal backward divergence lives. This is EXPECTED TO FAIL
-// until that kernel bug is fixed — that failure is the whole point of the file.
-// Do not widen the tolerance to make it green.
+// The gate proper. The structure term of `gliner2-total-loss` previously
+// exposed a large native-vs-Metal backward divergence; keep the strict
+// tolerance so this remains a regression gate for the fixed kernel path.
 test "GLiNER2 backend grad parity: gliner2-total-loss objective backward matches native and Metal" {
     if (platform.env.getenv("TERMITE_CUDA_PARITY_TEST_FILTER") != null) return error.SkipZigTest;
     try runBackendGradParity(std.testing.allocator, "gliner2-total-loss", .gliner2_total_loss);

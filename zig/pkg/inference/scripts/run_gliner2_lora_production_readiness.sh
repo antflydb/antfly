@@ -357,12 +357,14 @@ PY
 
 native_min_f1=""
 native_min_exact_match=""
-for minimum in "${heldout_minima[@]}"; do
-  case "${minimum}" in
-    entities.micro_f1=*) native_min_f1="${minimum#*=}" ;;
-    entities.exact_match=*) native_min_exact_match="${minimum#*=}" ;;
-  esac
-done
+if ((${#heldout_minima[@]})); then
+  for minimum in "${heldout_minima[@]}"; do
+    case "${minimum}" in
+      entities.micro_f1=*) native_min_f1="${minimum#*=}" ;;
+      entities.exact_match=*) native_min_exact_match="${minimum#*=}" ;;
+    esac
+  done
+fi
 if [[ -z "${native_min_f1}" || -z "${native_min_exact_match}" ]]; then
   echo "native quality requires entities.micro_f1 and entities.exact_match minima" >&2
   exit 2
@@ -414,9 +416,11 @@ if (( default_rc == 0 )); then
     "--threshold" "${heldout_threshold}"
     "--batch-size" "${heldout_batch_size}"
   )
-  for minimum in "${heldout_minima[@]}"; do
-    quality_cmd+=("--min-metric" "${minimum}")
-  done
+  if ((${#heldout_minima[@]})); then
+    for minimum in "${heldout_minima[@]}"; do
+      quality_cmd+=("--min-metric" "${minimum}")
+    done
+  fi
   if [[ -n "${heldout_max_length}" ]]; then
     quality_cmd+=("--max-length" "${heldout_max_length}")
   fi
@@ -435,12 +439,14 @@ if (( quality_rc == 0 )); then
     --min-exact-match "${native_min_exact_match}" \
     --output "${native_release_report}"
   )
-  for minimum in "${heldout_minima[@]}"; do
-    case "${minimum}" in
-      entities.micro_f1=* | entities.exact_match=*) ;;
-      *) native_quality_cmd+=(--min-task-metric "${minimum}") ;;
-    esac
-  done
+  if ((${#heldout_minima[@]})); then
+    for minimum in "${heldout_minima[@]}"; do
+      case "${minimum}" in
+        entities.micro_f1=* | entities.exact_match=*) ;;
+        *) native_quality_cmd+=(--min-task-metric "${minimum}") ;;
+      esac
+    done
+  fi
   "${native_quality_cmd[@]}"
   native_release_rc=$?
 fi

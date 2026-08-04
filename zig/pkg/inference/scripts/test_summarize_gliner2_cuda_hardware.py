@@ -34,6 +34,60 @@ class CudaHardwareQualificationTest(unittest.TestCase):
                 )
             self.assertEqual(executable.resolve(), standalone_test_executable(package_dir, log_dir))
 
+    def test_resolves_standalone_target_from_configured_absolute_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = root / "package"
+            log_dir = root / "lane-logs"
+            cache_dir = root / "ci-zig-local-cache"
+            executable = cache_dir / "o" / ("b" * 32) / "test"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("test executable\n", encoding="utf-8")
+            log_dir.mkdir()
+            run_line = (
+                f"{executable} --cache-dir={cache_dir} "
+                "--seed=0x1 --listen=-\n"
+            )
+            for test_filter in FULL_PARITY_FILTERS:
+                (log_dir / f"full-parity-{test_filter}.log").write_text(
+                    run_line,
+                    encoding="utf-8",
+                )
+            self.assertEqual(
+                executable.resolve(),
+                standalone_test_executable(
+                    package_dir,
+                    log_dir,
+                    {"ZIG_LOCAL_CACHE_DIR": str(cache_dir)},
+                ),
+            )
+
+    def test_does_not_parse_failed_command_prefix_as_a_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = root / "package"
+            log_dir = root / "lane-logs"
+            cache_dir = root / "ci-zig-local-cache"
+            executable = cache_dir / "o" / ("c" * 32) / "test"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("test executable\n", encoding="utf-8")
+            log_dir.mkdir()
+            failed_line = (
+                f"failed command: {executable} --cache-dir={cache_dir} "
+                "--seed=0x1 --listen=-\n"
+            )
+            for test_filter in FULL_PARITY_FILTERS:
+                (log_dir / f"full-parity-{test_filter}.log").write_text(
+                    failed_line,
+                    encoding="utf-8",
+                )
+            with self.assertRaisesRegex(ValueError, "found 0"):
+                standalone_test_executable(
+                    package_dir,
+                    log_dir,
+                    {"ZIG_LOCAL_CACHE_DIR": str(cache_dir)},
+                )
+
     def test_requires_current_fp32_l4_a100_h100_lanes(self) -> None:
         package_dir = Path(__file__).resolve().parent.parent
         fingerprint = source_fingerprint(package_dir)

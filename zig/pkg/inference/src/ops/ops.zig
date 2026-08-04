@@ -1645,7 +1645,10 @@ pub const ComputeBackend = struct {
         /// Optional accelerator-native packed form. This avoids materializing
         /// five slices and downloading the additive attention bias merely to
         /// reconstruct a padding mask. qkv is [Q;K;V], qr_kr is [Qr;Kr], and
-        /// attn_bias is the existing [batch*heads, seq, seq] device tensor.
+        /// attn_bias is a hard validity mask in the existing
+        /// [batch*heads, seq, seq] device tensor: values >= -1e8 are valid and
+        /// values < -1e8 are masked. Finite additive score biases are not
+        /// supported by this packed operation.
         disentangledRelativeAttentionPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
         /// VJP of disentangledRelativeAttention. Given the same inputs plus the
@@ -1655,7 +1658,8 @@ pub const ComputeBackend = struct {
         ///    dQ_r (2*seq-1) ; dK_r (2*seq-1)]  → [3*batch*seq + 2*(2*seq-1), H].
         disentangledRelativeAttentionBackward: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
-        /// Packed/device-bias counterpart of disentangledRelativeAttentionBackward.
+        /// Packed/mask counterpart of disentangledRelativeAttentionBackward;
+        /// attn_bias has the same mask-only threshold contract as the forward op.
         disentangledRelativeAttentionBackwardPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this

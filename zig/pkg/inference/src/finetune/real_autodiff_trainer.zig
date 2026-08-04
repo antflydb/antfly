@@ -1243,8 +1243,12 @@ pub const RealAutodiffTrainer = struct {
         }
 
         // 2. Optional activation-budget reservation via the coordinator.
+        var lora_blocks_pinned = false;
+        defer if (lora_blocks_pinned) self.unpinAllLoraBlocks() catch {};
         if (self.coord != null) {
             try self.reserveActivationBudget(input);
+            // Set this before pinning so a partial pin failure is also cleaned up.
+            lora_blocks_pinned = true;
             try self.pinAllLoraBlocks();
         }
 
@@ -1584,6 +1588,7 @@ pub const RealAutodiffTrainer = struct {
         var step_result_live = true;
         defer if (step_result_live) step_result.deinit();
         const loss_value = step_result.loss;
+        if (!std.math.isFinite(loss_value)) return error.NonFiniteTrainingLoss;
 
         var grad_norm: f32 = 0.0;
         var stepped = false;
@@ -1644,6 +1649,7 @@ pub const RealAutodiffTrainer = struct {
                         try self.deviceGlobalGradNorm()
                     else
                         self.globalGradNorm();
+                    if (!std.math.isFinite(grad_norm)) return error.NonFiniteGradientNorm;
                     if (!use_device_optimizer and self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm) {
                         const clip = self.config.max_grad_norm / (grad_norm + 1e-6);
                         for (self.lora_params.items) |*slot| {
@@ -1690,8 +1696,9 @@ pub const RealAutodiffTrainer = struct {
         profile.optimizer_update_ns = elapsedNs(optimizer_update_start_ns, monotonicNowNs());
 
         // 7. Release pinned LoRA blocks.
-        if (self.coord != null) {
+        if (lora_blocks_pinned) {
             try self.unpinAllLoraBlocks();
+            lora_blocks_pinned = false;
         }
 
         if (mode == .train) self.step_count += 1;

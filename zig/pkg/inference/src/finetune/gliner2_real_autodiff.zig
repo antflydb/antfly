@@ -586,12 +586,13 @@ pub const GlinerAutodiffCtx = struct {
             // it explicit (rather than passing `null`) leaves the hook in place
             // should this layout ever gain a real per-sample active-field block
             // like the total-loss layout's `gliner2TotalLossActiveFieldsOffset`.
-            const compact_active_mask_2d = try bld.gather(
-                mask,
-                first_span_rows_i64,
-                Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }),
+            const compact_active_mask_buf = try bld.graph.allocator.alloc(f32, @intCast(compact_schema_rows));
+            defer bld.graph.allocator.free(compact_active_mask_buf);
+            @memset(compact_active_mask_buf, 1.0);
+            const compact_active_mask = try bld.tensorConst(
+                compact_active_mask_buf,
+                Shape.init(.f32, &.{@intCast(compact_schema_rows)}),
             );
-            const compact_active_mask = try bld.reshape(compact_active_mask_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
             const count_state_idx_i64 = if (has_schema_count_idx) count_idx: {
                 const count_idx_2d = try bld.sliceLastDim(targets, @intCast(count_idx_offset), @intCast(count_idx_offset + E));
                 const compact_count_idx_2d = try bld.gather(
@@ -1837,9 +1838,13 @@ pub fn tokenLogitsForBatch(
     const logits_node = ctx.token_logits orelse return error.MissingGlinerTokenLogitsNode;
 
     var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    var borrowed_rt = std.AutoHashMapUnmanaged(NodeId, void).empty;
     defer {
         var it = rt.iterator();
-        while (it.next()) |entry| trainer.compute_backend.free(entry.value_ptr.*);
+        while (it.next()) |entry| {
+            if (!borrowed_rt.contains(entry.key_ptr.*)) trainer.compute_backend.free(entry.value_ptr.*);
+        }
+        borrowed_rt.deinit(allocator);
         rt.deinit(allocator);
     }
 
@@ -1863,14 +1868,7 @@ pub fn tokenLogitsForBatch(
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, targets));
 
-    for (trainer.lora_params.items) |slot| {
-        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        try rt.put(allocator, slot.node_id, ct);
-    }
-    for (trainer.regular_params.items) |slot| {
-        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        try rt.put(allocator, slot.node_id, ct);
-    }
+    try bindEvalTrainables(allocator, trainer, &rt, &borrowed_rt);
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
@@ -2039,22 +2037,7 @@ pub fn gliner2EvalLogitsForBatch(
     try rt.put(allocator, gs.input_ids_node, try bindEvalInputIds(trainer.compute_backend, allocator, input_placeholder, input_ids));
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, targets));
-    for (trainer.lora_params.items) |slot| {
-        if (slot.device) |device| {
-            try borrowed_rt.put(allocator, slot.node_id, {});
-            try rt.put(allocator, slot.node_id, device.weight);
-        } else {
-            try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
-        }
-    }
-    for (trainer.regular_params.items) |slot| {
-        if (slot.device) |device| {
-            try borrowed_rt.put(allocator, slot.node_id, {});
-            try rt.put(allocator, slot.node_id, device.weight);
-        } else {
-            try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
-        }
-    }
+    try bindEvalTrainables(allocator, trainer, &rt, &borrowed_rt);
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
@@ -2123,9 +2106,13 @@ pub fn spanStartLogitsForBatch(
     const logits_node = ctx.span_logits orelse return error.MissingGlinerSpanLogitsNode;
 
     var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    var borrowed_rt = std.AutoHashMapUnmanaged(NodeId, void).empty;
     defer {
         var it = rt.iterator();
-        while (it.next()) |entry| trainer.compute_backend.free(entry.value_ptr.*);
+        while (it.next()) |entry| {
+            if (!borrowed_rt.contains(entry.key_ptr.*)) trainer.compute_backend.free(entry.value_ptr.*);
+        }
+        borrowed_rt.deinit(allocator);
         rt.deinit(allocator);
     }
 
@@ -2149,14 +2136,7 @@ pub fn spanStartLogitsForBatch(
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, span_targets));
 
-    for (trainer.lora_params.items) |slot| {
-        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        try rt.put(allocator, slot.node_id, ct);
-    }
-    for (trainer.regular_params.items) |slot| {
-        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        try rt.put(allocator, slot.node_id, ct);
-    }
+    try bindEvalTrainables(allocator, trainer, &rt, &borrowed_rt);
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
@@ -2360,9 +2340,13 @@ fn evalScalarNodeViaTrainStepForBatch(
     var gs = &trainer.graph_state.?;
 
     var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    var borrowed_rt = std.AutoHashMapUnmanaged(NodeId, void).empty;
     defer {
         var it = rt.iterator();
-        while (it.next()) |entry| trainer.compute_backend.free(entry.value_ptr.*);
+        while (it.next()) |entry| {
+            if (!borrowed_rt.contains(entry.key_ptr.*)) trainer.compute_backend.free(entry.value_ptr.*);
+        }
+        borrowed_rt.deinit(allocator);
         rt.deinit(allocator);
     }
 
@@ -2385,12 +2369,7 @@ fn evalScalarNodeViaTrainStepForBatch(
     try rt.put(allocator, gs.input_ids_node, try bindEvalInputIds(trainer.compute_backend, allocator, input_placeholder, input_ids));
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, targets));
-    for (trainer.lora_params.items) |slot| {
-        try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
-    }
-    for (trainer.regular_params.items) |slot| {
-        try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
-    }
+    try bindEvalTrainables(allocator, trainer, &rt, &borrowed_rt);
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
@@ -2593,9 +2572,13 @@ fn evalSpanStartNodeForBatch(
     var gs = &trainer.graph_state.?;
 
     var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    var borrowed_rt = std.AutoHashMapUnmanaged(NodeId, void).empty;
     defer {
         var it = rt.iterator();
-        while (it.next()) |entry| trainer.compute_backend.free(entry.value_ptr.*);
+        while (it.next()) |entry| {
+            if (!borrowed_rt.contains(entry.key_ptr.*)) trainer.compute_backend.free(entry.value_ptr.*);
+        }
+        borrowed_rt.deinit(allocator);
         rt.deinit(allocator);
     }
 
@@ -2619,14 +2602,7 @@ fn evalSpanStartNodeForBatch(
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, span_targets));
 
-    for (trainer.lora_params.items) |slot| {
-        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        try rt.put(allocator, slot.node_id, ct);
-    }
-    for (trainer.regular_params.items) |slot| {
-        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
-        try rt.put(allocator, slot.node_id, ct);
-    }
+    try bindEvalTrainables(allocator, trainer, &rt, &borrowed_rt);
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
@@ -2676,6 +2652,30 @@ fn vectorMean(values: []const f32) f64 {
     var sum: f64 = 0.0;
     for (values) |value| sum += @floatCast(value);
     return sum / @as(f64, @floatFromInt(values.len));
+}
+
+fn bindEvalTrainables(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+    borrowed_rt: *std.AutoHashMapUnmanaged(NodeId, void),
+) !void {
+    for (trainer.lora_params.items) |slot| {
+        if (slot.device) |device| {
+            try borrowed_rt.put(allocator, slot.node_id, {});
+            try rt.put(allocator, slot.node_id, device.weight);
+        } else {
+            try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
+        }
+    }
+    for (trainer.regular_params.items) |slot| {
+        if (slot.device) |device| {
+            try borrowed_rt.put(allocator, slot.node_id, {});
+            try rt.put(allocator, slot.node_id, device.weight);
+        } else {
+            try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
+        }
+    }
 }
 
 fn bindEvalLoraDropoutMasks(

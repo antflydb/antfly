@@ -52,7 +52,7 @@ EXPECTED_LOG_NAMES = (
     "racecheck.log",
 )
 TEST_EXECUTABLE_PATTERN = re.compile(
-    r"(?m)^(?P<path>(?:\./)?\.zig-cache/o/[0-9a-f]+/test) "
+    r"(?m)^(?P<path>(?:\./|/)?\S*?/o/[0-9a-f]+/test) "
     r"--cache-dir=.*--listen=-\s*$"
 )
 
@@ -169,9 +169,21 @@ def run_filtered_suite(
     }
 
 
-def standalone_test_executable(package_dir: Path, log_dir: Path) -> Path:
+def zig_local_cache_object_dir(package_dir: Path, env: dict[str, str]) -> Path:
+    configured = env.get("ZIG_LOCAL_CACHE_DIR")
+    cache_dir = Path(configured).expanduser() if configured else package_dir / ".zig-cache"
+    if not cache_dir.is_absolute():
+        cache_dir = package_dir / cache_dir
+    return (cache_dir / "o").resolve()
+
+
+def standalone_test_executable(
+    package_dir: Path,
+    log_dir: Path,
+    env: dict[str, str] | None = None,
+) -> Path:
     candidates: set[Path] = set()
-    cache_root = (package_dir / ".zig-cache" / "o").resolve()
+    cache_root = zig_local_cache_object_dir(package_dir, env or os.environ)
     for test_filter in FULL_PARITY_FILTERS:
         log_path = log_dir / f"full-parity-{test_filter}.log"
         try:
@@ -179,7 +191,10 @@ def standalone_test_executable(package_dir: Path, log_dir: Path) -> Path:
         except OSError as exc:
             raise ValueError(f"cannot read parity log needed for sanitizer target: {exc}") from exc
         for match in TEST_EXECUTABLE_PATTERN.finditer(output):
-            candidate = (package_dir / match.group("path")).resolve()
+            candidate_path = Path(match.group("path"))
+            candidate = (
+                candidate_path if candidate_path.is_absolute() else package_dir / candidate_path
+            ).resolve()
             try:
                 candidate.relative_to(cache_root)
             except ValueError as exc:
@@ -291,7 +306,7 @@ def main() -> int:
         timeout_seconds=args.timeout_seconds,
     )
     try:
-        sanitizer_test_executable = standalone_test_executable(package_dir, log_dir)
+        sanitizer_test_executable = standalone_test_executable(package_dir, log_dir, required_env)
     except ValueError as exc:
         parser.error(str(exc))
 

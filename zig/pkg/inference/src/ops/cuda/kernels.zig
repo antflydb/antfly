@@ -1305,6 +1305,10 @@ pub const KernelModule = struct {
     /// gradient accumulation, clipping, or the resident AdamW optimizer.
     pub fn hasGliner2TrainingPrimitives(self: *const KernelModule) bool {
         return self.hasGliner2Primitives() and
+            self.binary_scalar_f32 != null and
+            self.elementwise_broadcast_f32 != null and
+            self.f32_to_i32 != null and
+            self.round_f32 != null and
             self.primitive_where_f32 != null and
             self.primitive_batched_dot_f32 != null and
             self.deberta_attention_backward_scores_f32 != null and
@@ -1764,6 +1768,7 @@ pub const KernelModule = struct {
         try checkBytes(scalar, 1);
         if (count == 0) return;
         if (op.isUnary()) return error.InvalidCudaState;
+        if (!op.supportsScalarOrBroadcast()) return error.InvalidCudaState;
 
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
@@ -3646,6 +3651,7 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.elementwise_broadcast_f32 orelse return error.CudaKernelUnavailable;
         if (op.isUnary()) return error.InvalidCudaState;
+        if (!op.supportsScalarOrBroadcast()) return error.InvalidCudaState;
         try checkBytes(dst, output_count);
         try checkBytes(a, a_count);
         try checkBytes(b, b_count);
@@ -11363,6 +11369,13 @@ pub const ElementwiseOp = enum(u32) {
         return switch (self) {
             .add, .multiply, .subtract, .divide, .less_than, .gelu_exact_backward, .gelu_backward => false,
             .silu, .gelu, .gelu_exact, .relu, .quick_gelu, .sigmoid, .tanh, .negate, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .erf, .abs => true,
+        };
+    }
+
+    fn supportsScalarOrBroadcast(self: ElementwiseOp) bool {
+        return switch (self) {
+            .add, .multiply, .subtract, .divide, .less_than => true,
+            else => false,
         };
     }
 };

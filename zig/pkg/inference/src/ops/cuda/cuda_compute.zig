@@ -50,6 +50,7 @@ pub const CudaTensor = struct {
     /// Keeping the source alive lets cuMemcpyHtoDAsync remain asynchronous;
     /// compiled training steps synchronize before the next overwrite.
     training_upload_host: buffer_mod.HostBuffer = .{},
+    training_upload_generation: ?u64 = null,
     dtype: tensor_mod.DType,
     shape: []i64,
     elem_count: usize,
@@ -836,6 +837,7 @@ pub const CudaCompute = struct {
     pinned_upload_arena: PinnedUploadArena = .{},
     pinned_scalar_download_buffer: PinnedScalarDownloadBuffer = .{},
     pinned_bulk_download_buffer: buffer_mod.HostBuffer = .{},
+    training_upload_generation: u64 = 0,
     async_i32_scalar_download: AsyncI32ScalarDownload = .{},
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
@@ -4086,6 +4088,7 @@ fn drainDeferredDeviceFreesAfterSync(self: *CudaCompute) void {
 
 fn synchronizeAndDrainDeferredDeviceFrees(self: *CudaCompute) !void {
     try self.ctx.synchronize();
+    self.training_upload_generation +%= 1;
     drainDeferredDeviceFreesAfterSync(self);
     // Both page-locked upload staging areas are stream ordered. A completed
     // stream makes every previously submitted source slice reusable.
@@ -5624,7 +5627,7 @@ fn debugCudaDeviceWarmup(ctx: *anyopaque, bytes: usize, iterations: usize) !bool
         const value: f32 = @as(f32, @floatFromInt(iteration % 251)) * 0.001;
         try self.kernels.launchFillF32(&self.ctx, buffer, elem_count, value);
     }
-    try self.ctx.synchronize();
+    try synchronizeAndDrainDeferredDeviceFrees(self);
     return true;
 }
 
@@ -5724,6 +5727,9 @@ fn trainingOverwriteF32Op(ctx: *anyopaque, tensor_ct: CT, data: []const f32, sha
         elem_count = try checkedMul(elem_count, @intCast(dim));
     }
     if (elem_count != tensor.elem_count) return error.InvalidShape;
+    if (tensor.training_upload_generation == self.training_upload_generation) {
+        return error.TrainingUploadStillPending;
+    }
     const data_bytes = std.mem.sliceAsBytes(data);
     if (tensor.training_upload_host.len != data_bytes.len) {
         tensor.training_upload_host.free(&self.ctx);
@@ -5731,6 +5737,7 @@ fn trainingOverwriteF32Op(ctx: *anyopaque, tensor_ct: CT, data: []const f32, sha
     }
     @memcpy(tensor.training_upload_host.bytes(), data_bytes);
     try copyFromHostTracked(self, tensor.buffer, tensor.training_upload_host.constBytes());
+    tensor.training_upload_generation = self.training_upload_generation;
     self.stats.training_input_uploads += 1;
     self.stats.training_input_upload_bytes += data_bytes.len;
 }
@@ -5868,7 +5875,7 @@ fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceW
     const shape = try dupeShape(self.allocator, logits.shape);
     errdefer self.allocator.free(shape);
     var accum = try allocDeviceBuffer(self, 2 * @sizeOf(f32));
-    defer accum.free(&self.ctx);
+    defer releaseDeviceBuffer(self, &accum);
     try self.kernels.launchFillF32(&self.ctx, accum, 2, 0.0);
     if (request.mean_reduction) {
         try self.kernels.launchMaskedBceAccumulateF32(

@@ -424,8 +424,10 @@ pub const TrainingLoop = struct {
 
         // Optimizer step.
         const optimizer_start = nowNs();
-        self.optimizer_state.step_count += 1;
+        // Schedules consume the zero-based index of the update about to run;
+        // Adam-family bias correction below continues to use a one-based count.
         const current_lr = self.config.lr_schedule.lr(self.optimizer_state.step_count);
+        self.optimizer_state.step_count += 1;
         const needs_v = optimizerNeedsVariance(self.config.optimizer);
         if (flat_state.total_param_elements > 0) {
             const v = if (needs_v) flat_state.v else flat_state.v[0..0];

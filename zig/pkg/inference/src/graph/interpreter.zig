@@ -628,8 +628,19 @@ pub fn execute(
     const donated_values = try allocator.alloc(bool, count);
     defer allocator.free(donated_values);
     @memset(donated_values, false);
-    var freed_values = std.ArrayListUnmanaged(CT).empty;
-    defer freed_values.deinit(allocator);
+    // Track exact CT aliases by the node identity that first introduced the
+    // currently-live handle. A raw pointer is not a stable tombstone: backend
+    // allocators may recycle its address for a later handle in this execution.
+    const ct_alias_roots = try allocator.alloc(NodeId, count);
+    defer allocator.free(ct_alias_roots);
+    const freed_alias_roots = try allocator.alloc(bool, count);
+    defer allocator.free(freed_alias_roots);
+    @memset(freed_alias_roots, false);
+    const caller_owned_alias_roots = try allocator.alloc(bool, count);
+    defer allocator.free(caller_owned_alias_roots);
+    @memset(caller_owned_alias_roots, false);
+    var live_ct_roots = std.AutoHashMapUnmanaged(CT, NodeId).empty;
+    defer live_ct_roots.deinit(allocator);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
             if (ri.node_id >= count) continue;
@@ -688,6 +699,8 @@ pub fn execute(
                 });
             }
             values[i] = rt_val;
+            try registerCtAliasRoot(allocator, &live_ct_roots, ct_alias_roots, node_id, rt_val);
+            if (!donated_values[i]) caller_owned_alias_roots[ct_alias_roots[i]] = true;
             logNodeRuntimeShape(graph, cb, node_id, rt_val);
             try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, rt_val);
             continue;
@@ -781,6 +794,7 @@ pub fn execute(
             rt_values,
             donated_values,
         );
+        try registerCtAliasRoot(allocator, &live_ct_roots, ct_alias_roots, node_id, values[i].?);
 
         // Free inputs whose last consumer is this node
         const n = graph.node(node_id);
@@ -793,14 +807,18 @@ pub fn execute(
                 const input_idx: usize = @intCast(input_id);
                 if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
+                    if (caller_owned_alias_roots[ct_alias_roots[input_idx]]) {
+                        values[input_id] = null;
+                        continue;
+                    }
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
                             values[input_id] = null;
                             continue;
                         }
                     }
+                    retireCtAliasRoot(&live_ct_roots, ct_alias_roots, freed_alias_roots, input_idx, ct);
                     cb.free(ct);
-                    try freed_values.append(allocator, ct);
                     values[input_id] = null;
                 }
             }
@@ -845,9 +863,12 @@ pub fn execute(
     //    Skip by returned CT handle, not only by output node id: view,
     //    passthrough, and fused ops may legally share an exact handle across
     //    graph nodes, and ExecutionResult owns that handle until deinit.
+    //    Alias roots prevent both double-freeing an older node that shares the
+    //    handle and skipping a newer handle whose allocator address was reused.
     for (0..count) |i| {
         if (values[i] == null) continue;
-        if (containsCt(freed_values.items, values[i].?)) continue;
+        if (freed_alias_roots[ct_alias_roots[i]]) continue;
+        if (caller_owned_alias_roots[ct_alias_roots[i]]) continue;
         if (containsCt(outputs, values[i].?)) continue;
         // Skip output nodes — caller frees via ExecutionResult.deinit
         var is_output = false;
@@ -863,6 +884,7 @@ pub fn execute(
         if (rt_values[i] != null and !donated_values[i]) continue;
         // Free any remaining handles (parameters, donated inputs, or
         // intermediates that weren't caught by liveness-based freeing)
+        retireCtAliasRoot(&live_ct_roots, ct_alias_roots, freed_alias_roots, i, values[i].?);
         cb.free(values[i].?);
     }
 
@@ -873,6 +895,29 @@ pub fn execute(
         graphExecDiag("done outputs={} rss={}", .{ outputs.len, currentResidentBytes() });
     }
     return .{ .outputs = outputs, .allocator = allocator };
+}
+
+fn registerCtAliasRoot(
+    allocator: std.mem.Allocator,
+    live_ct_roots: *std.AutoHashMapUnmanaged(CT, NodeId),
+    ct_alias_roots: []NodeId,
+    node_id: NodeId,
+    ct: CT,
+) !void {
+    const entry = try live_ct_roots.getOrPut(allocator, ct);
+    if (!entry.found_existing) entry.value_ptr.* = node_id;
+    ct_alias_roots[@intCast(node_id)] = entry.value_ptr.*;
+}
+
+fn retireCtAliasRoot(
+    live_ct_roots: *std.AutoHashMapUnmanaged(CT, NodeId),
+    ct_alias_roots: []const NodeId,
+    freed_alias_roots: []bool,
+    node_idx: usize,
+    ct: CT,
+) void {
+    freed_alias_roots[@intCast(ct_alias_roots[node_idx])] = true;
+    _ = live_ct_roots.remove(ct);
 }
 
 pub fn captureNodeValues(
