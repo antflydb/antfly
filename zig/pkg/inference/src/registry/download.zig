@@ -21,6 +21,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
+const managed_receipt = @import("managed_receipt.zig");
 
 pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
@@ -43,23 +44,15 @@ pub const HubConfig = struct {
     max_model_bytes: u64 = default_max_model_bytes,
 };
 
-pub const managed_download_in_progress_filename = ".antfly-download-in-progress";
-pub const managed_download_plan_filename = ".antfly-download-plan.json";
-pub const managed_download_complete_filename = ".antfly-download-complete.json";
+pub const managed_download_in_progress_filename = managed_receipt.in_progress_filename;
+pub const managed_download_plan_filename = managed_receipt.plan_filename;
+pub const managed_download_complete_filename = managed_receipt.complete_filename;
 pub const managed_download_lock_filename = ".antfly-download.lock";
 const managed_download_staging_suffix = ".antfly-download-staging";
 const managed_download_backup_suffix = ".antfly-download-backup";
 
-const ManagedArtifactReceipt = struct {
-    path: []const u8,
-    size: u64,
-    sha256: ?[]const u8 = null,
-};
-
-const ManagedDownloadReceipt = struct {
-    version: u32 = 1,
-    artifacts: []const ManagedArtifactReceipt,
-};
+const ManagedArtifactReceipt = managed_receipt.ArtifactReceipt;
+const ManagedDownloadReceipt = managed_receipt.DownloadReceipt;
 
 pub const ManagedDownloadState = enum {
     unmanaged,
@@ -1153,30 +1146,17 @@ fn seedManagedArtifactsWithHardLinks(
     source_dir: []const u8,
     staging_dir: []const u8,
 ) !void {
-    if (managedDownloadState(allocator, io, source_dir) != .complete) return;
-
-    const complete_path = try managedPath(allocator, source_dir, managed_download_complete_filename);
-    defer allocator.free(complete_path);
-    const receipt_json = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        complete_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    );
-    defer allocator.free(receipt_json);
-    var parsed = try std.json.parseFromSlice(
-        ManagedDownloadReceipt,
-        allocator,
-        receipt_json,
-        .{ .ignore_unknown_fields = true },
-    );
-    defer parsed.deinit();
+    var receipt = managed_receipt.loadValidated(allocator, io, source_dir) catch |err| switch (err) {
+        error.InvalidManagedDownload,
+        error.IncompleteManagedDownload,
+        error.ModelArtifactOutsideRoot,
+        => return,
+        else => return err,
+    } orelse return;
+    defer receipt.deinit();
 
     const cwd = std.Io.Dir.cwd();
-    for (parsed.value.artifacts) |artifact| {
-        if (!managedArtifactPathIsSafe(artifact.path)) continue;
-        const source_path = try std.fs.path.join(allocator, &.{ source_dir, artifact.path });
-        defer allocator.free(source_path);
+    for (receipt.artifacts) |artifact| {
         const staging_path = try std.fs.path.join(allocator, &.{ staging_dir, artifact.path });
         defer allocator.free(staging_path);
         if (std.fs.path.dirname(staging_path)) |parent| try cwd.createDirPath(io, parent);
@@ -1184,7 +1164,7 @@ fn seedManagedArtifactsWithHardLinks(
         // Hard links let a repair reuse verified multi-gigabyte weights without
         // copying them. Downloads install replacements with atomic rename, so
         // changing the staged file can never mutate the published inode.
-        std.Io.Dir.hardLink(cwd, source_path, cwd, staging_path, io, .{ .follow_symlinks = true }) catch continue;
+        std.Io.Dir.hardLink(cwd, artifact.canonical_path, cwd, staging_path, io, .{ .follow_symlinks = false }) catch continue;
     }
 }
 
@@ -1397,24 +1377,6 @@ pub fn completeManagedDownload(
     try syncManagedDirectory(io, dest_dir);
 }
 
-fn managedArtifactPathIsSafe(path: []const u8) bool {
-    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
-    // Hub repository paths are POSIX-style on every platform. Rejecting
-    // backslashes avoids treating an attacker-controlled receipt differently
-    // on Windows.
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
-    var parts = std.mem.splitScalar(u8, path, '/');
-    while (parts.next()) |part| {
-        if (part.len == 0 or
-            std.mem.eql(u8, part, ".") or
-            std.mem.eql(u8, part, ".."))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 /// Return the publication state of a model directory managed by `pull`.
 ///
 /// A completion receipt is accepted only when every recorded artifact still
@@ -1427,103 +1389,12 @@ pub fn managedDownloadState(
     io: std.Io,
     dest_dir: []const u8,
 ) ManagedDownloadState {
-    const in_progress_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_in_progress_filename,
-    ) catch return .incomplete;
-    defer allocator.free(in_progress_path);
-    const plan_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_plan_filename,
-    ) catch return .incomplete;
-    defer allocator.free(plan_path);
-    const complete_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_complete_filename,
-    ) catch return .incomplete;
-    defer allocator.free(complete_path);
-
-    const cwd = std.Io.Dir.cwd();
-    if (cwd.access(io, in_progress_path, .{})) |_| return .incomplete else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .incomplete,
+    var receipt = managed_receipt.loadValidated(allocator, io, dest_dir) catch return .incomplete;
+    if (receipt) |*validated| {
+        validated.deinit();
+        return .complete;
     }
-    if (cwd.access(io, plan_path, .{})) |_| return .incomplete else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .incomplete,
-    }
-
-    const receipt_json = cwd.readFileAlloc(
-        io,
-        complete_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch |err| switch (err) {
-        error.FileNotFound => {
-            // Close the race with beginManagedDownload, which publishes the
-            // marker before deleting an old completion receipt.
-            if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
-                return .incomplete;
-            }
-            return .unmanaged;
-        },
-        else => return .incomplete,
-    };
-    defer allocator.free(receipt_json);
-    var parsed = std.json.parseFromSlice(
-        ManagedDownloadReceipt,
-        allocator,
-        receipt_json,
-        .{ .ignore_unknown_fields = true },
-    ) catch return .incomplete;
-    defer parsed.deinit();
-    if (parsed.value.version != 1 or parsed.value.artifacts.len == 0) {
-        return .incomplete;
-    }
-
-    var has_supported_payload = false;
-    for (parsed.value.artifacts) |artifact| {
-        if (!managedArtifactPathIsSafe(artifact.path)) return .incomplete;
-        const artifact_path = std.fs.path.join(
-            allocator,
-            &.{ dest_dir, artifact.path },
-        ) catch return .incomplete;
-        defer allocator.free(artifact_path);
-        const actual_size = requiredFileSize(cwd, io, artifact_path) catch
-            return .incomplete;
-        if (actual_size != artifact.size) return .incomplete;
-        if (std.mem.endsWith(u8, artifact.path, ".gguf") or
-            std.mem.endsWith(u8, artifact.path, ".onnx") or
-            std.mem.endsWith(u8, artifact.path, ".safetensors"))
-        {
-            has_supported_payload = true;
-        }
-    }
-    if (!has_supported_payload) return .incomplete;
-    if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
-        return .incomplete;
-    }
-    return .complete;
-}
-
-fn managedPublicationFilesBlocked(
-    cwd: std.Io.Dir,
-    io: std.Io,
-    in_progress_path: []const u8,
-    plan_path: []const u8,
-) bool {
-    if (cwd.access(io, in_progress_path, .{})) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
-    if (cwd.access(io, plan_path, .{})) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
-    return false;
+    return .unmanaged;
 }
 
 pub fn managedDownloadPublicationBlocked(
@@ -1531,24 +1402,7 @@ pub fn managedDownloadPublicationBlocked(
     io: std.Io,
     dest_dir: []const u8,
 ) bool {
-    const in_progress_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_in_progress_filename,
-    ) catch return true;
-    defer allocator.free(in_progress_path);
-    const plan_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_plan_filename,
-    ) catch return true;
-    defer allocator.free(plan_path);
-    return managedPublicationFilesBlocked(
-        std.Io.Dir.cwd(),
-        io,
-        in_progress_path,
-        plan_path,
-    );
+    return managed_receipt.publicationBlocked(allocator, io, dest_dir);
 }
 
 /// Download a model from HuggingFace Hub.
@@ -3160,6 +3014,37 @@ test "managed model transaction reuses artifacts and publishes completed repair"
     const published_projector_path = try std.fs.path.join(allocator, &.{ dest_dir, "nested/mmproj-model-Q8_0.gguf" });
     defer allocator.free(published_projector_path);
     try cwd.access(io, published_projector_path, .{});
+}
+
+test "managed model transaction never reuses receipt symlinks outside model root" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "symlink-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const outside_path = try testTmpPath(allocator, tmp, "outside.gguf");
+    defer allocator.free(outside_path);
+    try cwd.writeFile(io, .{ .sub_path = outside_path, .data = "outside" });
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.symLink(io, "../outside.gguf", decoder_path, .{});
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+
+    try std.testing.expectEqual(ManagedDownloadState.incomplete, managedDownloadState(allocator, io, dest_dir));
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    try std.testing.expectError(error.FileNotFound, cwd.openFile(io, staged_decoder_path, .{}));
 }
 
 test "managed model transaction failure preserves last known good cache" {
