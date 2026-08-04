@@ -3182,9 +3182,21 @@ fn memoryNowNs(ptr: *anyopaque) u64 {
 }
 
 fn pathContains(prefix: []const u8, path: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
-    if (path.len == prefix.len) return true;
-    return path[prefix.len] == '/';
+    // Preserve the storage namespace's empty spelling for the absolute root.
+    if (prefix.len == 0) return path.len == 0 or path[0] == '/';
+
+    // Storage paths use '/' on every backend. Treat redundant trailing
+    // separators as spelling aliases without allocating a normalized copy.
+    // Keep one separator for the root so "/" contains every absolute path.
+    var prefix_len = prefix.len;
+    while (prefix_len > 1 and prefix[prefix_len - 1] == '/') prefix_len -= 1;
+    const normalized = prefix[0..prefix_len];
+    if (normalized.len == 1 and normalized[0] == '/') {
+        return path.len > 0 and path[0] == '/';
+    }
+    if (!std.mem.startsWith(u8, path, normalized)) return false;
+    if (path.len == normalized.len) return true;
+    return path[normalized.len] == '/';
 }
 
 fn tempSiblingPath(allocator: Allocator, path: []const u8) ![]u8 {
@@ -3481,6 +3493,47 @@ test "native fd cache retries an open that straddles a mutation fence" {
     reader_joined = true;
     try std.testing.expect(reader.err == null);
     try std.testing.expectEqualStrings("new", reader.bytes[0..]);
+}
+
+test "native fd cache invalidates a deleted tree spelled with trailing separators" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+
+    const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
+    var root_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/antfly-storage-tree-invalidation-{d}", .{nonce});
+    defer native.storage().deleteTree(root) catch {};
+    try native.storage().createDirPath(root);
+
+    var path_buf: [288]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/cached.bin", .{root});
+    try native.storage().writeFileAbsolute(path, "old");
+    const cached = try native.storage().readFileRangeAlloc(std.testing.allocator, path, 0, 3);
+    defer std.testing.allocator.free(cached);
+    try std.testing.expectEqualStrings("old", cached);
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+
+    var alias_buf: [288]u8 = undefined;
+    const trailing_alias = try std.fmt.bufPrint(&alias_buf, "{s}///", .{root});
+    try native.storage().deleteTree(trailing_alias);
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_cache_entries);
+    try std.testing.expectError(
+        error.FileNotFound,
+        native.storage().readFileRangeAlloc(std.testing.allocator, path, 0, 3),
+    );
+}
+
+test "path containment handles root and trailing separators" {
+    try std.testing.expect(pathContains("/", "/tree/file"));
+    try std.testing.expect(pathContains("/tree///", "/tree/file"));
+    try std.testing.expect(pathContains("/tree///", "/tree"));
+    try std.testing.expect(!pathContains("/tree///", "/treehouse/file"));
+    try std.testing.expect(pathContains("", "/tree/file"));
+    try std.testing.expect(!pathContains("", "relative/file"));
 }
 
 test "native atomic write finish retains admission through parent sync" {

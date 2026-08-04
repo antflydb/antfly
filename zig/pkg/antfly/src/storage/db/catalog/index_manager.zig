@@ -10643,40 +10643,45 @@ pub const IndexManager = struct {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
 
-                if (source.deleted) |expected| {
-                    var expected_iter = expected.iterator();
-                    while (expected_iter.next()) |doc_id| {
-                        const current = seg.shared.deleted orelse return .{
-                            .source_current = false,
-                            .bitmaps = output_deleted,
-                        };
-                        if (!current.contains(doc_id)) return .{
-                            .source_current = false,
-                            .bitmaps = output_deleted,
-                        };
-                    }
-                }
+                const current_deleted = if (seg.shared.deleted) |*current|
+                    current
+                else {
+                    if (source.deleted != null) return .{
+                        .source_current = false,
+                        .bitmaps = output_deleted,
+                    };
+                    continue;
+                };
 
-                if (seg.shared.deleted) |current| {
-                    var current_iter = current.iterator();
-                    while (current_iter.next()) |doc_id| {
-                        if (source.deleted) |expected| {
-                            if (expected.contains(doc_id)) continue;
-                        }
-                        if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
+                // Segment tombstones are monotonic. Compare unchanged Roaring
+                // containers without allocation and materialize only containers
+                // with additions, so publication stays proportional to deletes
+                // which arrived during this merge rather than deletion history.
+                var added_storage: ?roaring.RoaringBitmap = null;
+                defer if (added_storage) |*added| added.deinit();
+                const added = if (source.deleted) |*expected| blk: {
+                    added_storage = (try current_deleted.differenceIfSupersetAlloc(expected, self.alloc)) orelse return .{
+                        .source_current = false,
+                        .bitmaps = output_deleted,
+                    };
+                    break :blk &added_storage.?;
+                } else current_deleted;
 
-                        const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
-                            result.outputForOrdinal(ordinal)
-                        else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
-                            result.outputForId(stored.id)
-                        else
-                            null;
-                        const output = location orelse return error.MissingMergeDocumentIdentity;
-                        if (output.segment >= output_deleted.len) return error.InvalidSegment;
-                        const output_idx: usize = @intCast(output.segment);
-                        if (output_deleted[output_idx] == null) output_deleted[output_idx] = roaring.RoaringBitmap.init(self.alloc);
-                        try output_deleted[output_idx].?.add(output.doc);
-                    }
+                var added_iter = added.iterator();
+                while (added_iter.next()) |doc_id| {
+                    if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
+
+                    const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
+                        result.outputForOrdinal(ordinal)
+                    else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
+                        result.outputForId(stored.id)
+                    else
+                        null;
+                    const output = location orelse return error.MissingMergeDocumentIdentity;
+                    if (output.segment >= output_deleted.len) return error.InvalidSegment;
+                    const output_idx: usize = @intCast(output.segment);
+                    if (output_deleted[output_idx] == null) output_deleted[output_idx] = roaring.RoaringBitmap.init(self.alloc);
+                    try output_deleted[output_idx].?.add(output.doc);
                 }
             }
         }
@@ -23506,20 +23511,39 @@ test "text merge task carries concurrent deletes into publication" {
         },
     });
 
-    var key_buf: [64]u8 = undefined;
     const opts: IndexBatchOptions = .{
         .compact_text = false,
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
     for (0..12) |i| {
-        const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
-        defer alloc.free(key);
-        const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge stale {d}\"}}", .{i});
-        defer alloc.free(value);
+        const first_key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i * 2});
+        defer alloc.free(first_key);
+        const second_key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i * 2 + 1});
+        defer alloc.free(second_key);
+        const first_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge stale {d}\"}}", .{i * 2});
+        defer alloc.free(first_value);
+        const second_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge stale {d}\"}}", .{i * 2 + 1});
+        defer alloc.free(second_value);
+        const store_writes = [_]docstore_mod.KVPair{
+            .{ .key = first_key, .value = first_value },
+            .{ .key = second_key, .value = second_value },
+        };
+        const index_writes = [_]types.BatchWrite{
+            .{ .key = first_key, .value = first_value },
+            .{ .key = second_key, .value = second_value },
+        };
 
-        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
-        try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+        try store.putBatch(&store_writes, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &index_writes, opts);
+    }
+
+    const text_entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    const predelete_snapshot = text_entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(usize, 12), predelete_snapshot.segments.len);
+    for (predelete_snapshot.segments) |*segment| {
+        const deleted_before_merge = (try segment.reader.storedDoc(0)) orelse return error.TestUnexpectedResult;
+        try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{deleted_before_merge.id}, opts);
     }
 
     const pending_stats = manager.textMergeStats();
@@ -23527,7 +23551,6 @@ test "text merge task carries concurrent deletes into publication" {
     try std.testing.expect(pending_stats.pending_segments >= 12);
     try std.testing.expect(pending_stats.pending_bytes > 0);
 
-    const text_entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(text_entry.apply_mutex.tryLock());
     const busy_task = try manager.beginTextMergeTask();
     text_entry.apply_mutex.unlock();
@@ -23541,7 +23564,7 @@ test "text merge task carries concurrent deletes into publication" {
     try std.testing.expect(in_flight_stats.in_flight_segments >= 2);
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
-    const stale_doc = (try stale_segment.reader.storedDoc(0)) orelse return error.TestUnexpectedResult;
+    const stale_doc = (try stale_segment.reader.storedDoc(1)) orelse return error.TestUnexpectedResult;
     var frozen_live_docs: u32 = 0;
     for (task.source, task.merge_indices) |source, seg_idx| {
         const deleted_count: u32 = if (source.deleted) |deleted| @intCast(deleted.cardinality()) else 0;
