@@ -2241,9 +2241,19 @@ pub const IndexManager = struct {
 
     /// Releases a pre-crash generation without executing backend finalizers.
     /// This is for storage simulators and fault injection after the modeled
-    /// device has already rolled back volatile state.
+    /// device has already rolled back volatile state. Call
+    /// prepareForCrashRollback() before performing that rollback.
     pub fn abandonAfterCrash(self: *IndexManager) void {
         self.deinitWithBackendDisposition(true);
+    }
+
+    /// Quiesce delayed full-text file reclamation before a modeled storage
+    /// rollback. This fence must precede device.crash(); abandonAfterCrash()
+    /// may then safely release the stale in-memory generation.
+    pub fn prepareForCrashRollback(self: *IndexManager) void {
+        for (self.text_indexes.items) |*entry| {
+            entry.persistent.prepareForCrashRollback();
+        }
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
@@ -18232,6 +18242,11 @@ const IndexManagerSimRuntime = struct {
         try self.reopenWithBackendDisposition(true);
     }
 
+    fn prepareForModeledCrash(self: *IndexManagerSimRuntime) void {
+        if (self.source_manager_open) self.source_manager.prepareForCrashRollback();
+        if (self.dest_manager_open) self.dest_manager.prepareForCrashRollback();
+    }
+
     fn reopenWithBackendDisposition(self: *IndexManagerSimRuntime, abandon_after_crash: bool) !void {
         if (self.source_manager_open) {
             if (abandon_after_crash) self.source_manager.abandonAfterCrash() else self.source_manager.deinit();
@@ -19138,6 +19153,7 @@ fn replayModeledIndexManagerCrashFixture(
         try runtime.applyReplayAction(action, step);
     }
     try runtime.applyReplayAction(crash_action, prelude_actions.len);
+    runtime.prepareForModeledCrash();
     try modeled_device.device().crash();
     try runtime.reopenAfterModeledCrash();
 
@@ -19279,6 +19295,7 @@ test "index manager split handoff preserves interleaved write and query summarie
         try expectIndexManagerSummaryEqual("deterministic-split-step", try expectedIndexManagerSummary(actions[0 .. step + 1]), actual);
     }
 
+    runtime.prepareForModeledCrash();
     try modeled_device.device().crash();
     try runtime.reopenAfterModeledCrash();
     try expectIndexManagerSummaryEqual("deterministic-split-reopen", try expectedIndexManagerSummary(&actions), try runtime.summary(alloc));

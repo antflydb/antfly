@@ -376,9 +376,28 @@ const SegmentFileStore = struct {
     }
 
     fn delete(self: *SegmentFileStore, seg_id: u64) void {
-        const path = self.pathAlloc(seg_id) catch return;
+        self.deleteChecked(seg_id) catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("text segment cleanup failed segment={d}: {s}", .{ seg_id, @errorName(err) });
+            }
+        };
+    }
+
+    fn deleteChecked(self: *SegmentFileStore, seg_id: u64) !void {
+        const path = try self.pathAlloc(seg_id);
         defer self.allocator.free(path);
-        self.storage.deleteFileAbsolute(path) catch {};
+        self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    fn syncDeletes(self: *SegmentFileStore) !void {
+        // All segment files share one parent. Passing any child path asks the
+        // storage implementation to persist that directory's namespace state.
+        const sentinel_path = try self.pathAlloc(0);
+        defer self.allocator.free(sentinel_path);
+        try self.storage.syncParentAbsolute(sentinel_path);
     }
 };
 
@@ -425,6 +444,8 @@ const RetiredSegmentFileDeleter = struct {
     refs: std.atomic.Value(usize) = .init(1),
     delete_mu: std.atomic.Mutex = .unlocked,
     delete_enabled: bool = true,
+    completed_ids: std.ArrayListUnmanaged(u64) = .empty,
+    retry_ids: std.ArrayListUnmanaged(u64) = .empty,
 
     fn init(allocator: Allocator, store: *const SegmentFileStore) !*RetiredSegmentFileDeleter {
         const deleter = try allocator.create(RetiredSegmentFileDeleter);
@@ -450,6 +471,8 @@ const RetiredSegmentFileDeleter = struct {
     fn release(self: *RetiredSegmentFileDeleter) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
+        self.completed_ids.deinit(allocator);
+        self.retry_ids.deinit(allocator);
         if (self.native_storage_lease) |*lease| lease.deinit();
         allocator.free(self.root_dir);
         allocator.destroy(self);
@@ -470,6 +493,63 @@ const RetiredSegmentFileDeleter = struct {
         self.delete_enabled = false;
     }
 
+    fn isDisarmed(self: *RetiredSegmentFileDeleter) bool {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        return !self.delete_enabled;
+    }
+
+    fn snapshotCompletedIds(self: *RetiredSegmentFileDeleter, allocator: Allocator) ![]u64 {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        return try allocator.dupe(u64, self.completed_ids.items);
+    }
+
+    fn acknowledgeCompletedId(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        for (self.completed_ids.items, 0..) |candidate, i| {
+            if (candidate != seg_id) continue;
+            _ = self.completed_ids.swapRemove(i);
+            return;
+        }
+    }
+
+    fn retryFailedDeletes(self: *RetiredSegmentFileDeleter) void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return;
+
+        var i: usize = 0;
+        while (i < self.retry_ids.items.len) {
+            const seg_id = self.retry_ids.items[i];
+            const path = self.pathAlloc(seg_id) catch {
+                i += 1;
+                continue;
+            };
+            const delete_result = self.storage.deleteFileAbsolute(path);
+            self.allocator.free(path);
+            delete_result catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => {
+                    i += 1;
+                    continue;
+                },
+            };
+            self.completed_ids.append(self.allocator, seg_id) catch {
+                i += 1;
+                continue;
+            };
+            _ = self.retry_ids.swapRemove(i);
+        }
+    }
+
+    fn hasRetirementWork(self: *RetiredSegmentFileDeleter) bool {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        return self.completed_ids.items.len != 0 or self.retry_ids.items.len != 0;
+    }
+
     fn cleanup(self: *RetiredSegmentFileDeleter) index_mod.RetiredSegmentCleanup {
         return .{
             .ptr = self,
@@ -488,9 +568,27 @@ const RetiredSegmentFileDeleter = struct {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         if (!self.delete_enabled) return;
-        const path = self.pathAlloc(seg_id) catch return;
+        const path = self.pathAlloc(seg_id) catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment path allocation failed segment={d}: {s}", .{ seg_id, @errorName(err) });
+            }
+            self.retry_ids.append(self.allocator, seg_id) catch {};
+            return;
+        };
         defer self.allocator.free(path);
-        self.storage.deleteFileAbsolute(path) catch {};
+        self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                if (builtin.os.tag != .freestanding) {
+                    std.log.warn("retired text segment cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
+                }
+                self.retry_ids.append(self.allocator, seg_id) catch {};
+                return;
+            },
+        };
+        // OOM here affects only prompt marker compaction. The durable retirement
+        // marker remains the source of truth and writable open will reconcile it.
+        self.completed_ids.append(self.allocator, seg_id) catch {};
     }
 };
 
@@ -680,6 +778,7 @@ const meta_committed_lsn = "committed_lsn";
 const meta_next_seg_id = "next_seg_id";
 const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
+const meta_retired_segment_prefix = "retired_segment:";
 const meta_segment_range_prefix = "segment_range:";
 pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
@@ -865,6 +964,7 @@ pub const PersistentIndex = struct {
     const MainTxn = struct {
         read: ?backend_erased.NamespaceReadTxn = null,
         write: ?backend_erased.NamespaceWriteTxn = null,
+        retirement_cleanup_started: bool = false,
 
         const ReadAdapter = backend_adapter.NamespaceReadTxn(MainTxn, MainKeyspace, .{
             .abort = abort,
@@ -1309,6 +1409,7 @@ pub const PersistentIndex = struct {
         if (pi.segment_files) |*store| {
             pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
             pi.writer.setRetiredSegmentCleanup(pi.retired_segment_file_deleter.?.cleanup());
+            if (!opts.read_only) pi.reconcileRetiredSegmentFilesLocked();
         }
 
         return pi;
@@ -1327,6 +1428,7 @@ pub const PersistentIndex = struct {
     pub fn close(self: *PersistentIndex) void {
         self.lockStorage();
         self.writer.deinit();
+        self.flushCompletedRetirementMarkersLocked();
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
@@ -1340,7 +1442,13 @@ pub const PersistentIndex = struct {
     /// reclaim files after storage has been rolled back to a durable snapshot.
     pub fn abandonAfterCrash(self: *PersistentIndex) void {
         self.lockStorage();
-        if (self.retired_segment_file_deleter) |deleter| deleter.disarm();
+        if (self.retired_segment_file_deleter) |deleter| {
+            // Disarming here is too late to order against the storage rollback.
+            // Keep the call defensive in optimized builds, but make misuse fail
+            // loudly in Debug so every modeled-crash owner establishes the fence.
+            std.debug.assert(deleter.isDisarmed());
+            deleter.disarm();
+        }
         self.writer.deinit();
         self.wal.abandonAfterCrash();
         self.main_store.deinit();
@@ -1349,6 +1457,165 @@ pub const PersistentIndex = struct {
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
         self.* = undefined;
+    }
+
+    /// Fence delayed cleanup before a modeled device rolls its namespace back.
+    /// On return, no retired-segment callback is executing and future callbacks
+    /// owned by this generation are inert. Callers must invoke this before the
+    /// rollback, then use abandonAfterCrash() to tear down the stale generation.
+    pub fn prepareForCrashRollback(self: *PersistentIndex) void {
+        self.lockStorage();
+        defer self.unlockStorage();
+        if (self.retired_segment_file_deleter) |deleter| deleter.disarm();
+    }
+
+    fn clearCompletedRetirementMarkersInTxn(self: *PersistentIndex, txn: *MainTxn) !void {
+        if (txn.retirement_cleanup_started) return;
+        txn.retirement_cleanup_started = true;
+        const deleter = self.retired_segment_file_deleter orelse return;
+        const store = &(self.segment_files orelse return);
+        deleter.retryFailedDeletes();
+        const completed_ids = deleter.snapshotCompletedIds(self.alloc) catch return;
+        defer self.alloc.free(completed_ids);
+        if (completed_ids.len == 0) return;
+
+        const pending_ids = self.alloc.alloc(u64, completed_ids.len) catch return;
+        defer self.alloc.free(pending_ids);
+        var pending_count: usize = 0;
+        for (completed_ids) |seg_id| {
+            const retired_key = retiredSegmentMetaKey(seg_id);
+            if (txn.get(.meta, &retired_key)) |_| {
+                pending_ids[pending_count] = seg_id;
+                pending_count += 1;
+            } else |err| switch (err) {
+                error.NotFound => deleter.acknowledgeCompletedId(seg_id),
+                else => return err,
+            }
+        }
+        if (pending_count == 0) return;
+
+        store.syncDeletes() catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment directory sync deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        for (pending_ids[0..pending_count]) |seg_id| {
+            const retired_key = retiredSegmentMetaKey(seg_id);
+            txn.delete(.meta, &retired_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
+
+    fn flushCompletedRetirementMarkersLocked(self: *PersistentIndex) void {
+        if (self.read_only) return;
+        const deleter = self.retired_segment_file_deleter orelse return;
+        if (!deleter.hasRetirementWork()) return;
+        var txn = self.beginWriteMainTxn() catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        self.clearCompletedRetirementMarkersInTxn(&txn) catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        txn.commit() catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment marker flush commit deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        txn_open = false;
+    }
+
+    /// Durable retirement markers make delayed callbacks an optimization. A
+    /// writable owner retries every pending unlink on open, clearing a marker
+    /// only after the shared segment directory has been synchronized.
+    fn reconcileRetiredSegmentFilesLocked(self: *PersistentIndex) void {
+        if (self.read_only) return;
+        const store = &(self.segment_files orelse return);
+
+        var txn = self.beginWriteMainTxn() catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment reconciliation deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+
+        const retired_ids = loadRetiredSegmentIdsFromTxn(&txn, self.alloc) catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment scan deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        defer self.alloc.free(retired_ids);
+        if (retired_ids.len == 0) {
+            txn.abort();
+            txn_open = false;
+            return;
+        }
+
+        var reclaimed_ids = std.ArrayListUnmanaged(u64).empty;
+        defer reclaimed_ids.deinit(self.alloc);
+        for (retired_ids) |seg_id| {
+            const active_key = activeSegmentMetaKey(seg_id);
+            const is_active = if (txn.get(.meta, &active_key)) |_| true else |err| switch (err) {
+                error.NotFound => false,
+                else => {
+                    if (builtin.os.tag != .freestanding) {
+                        std.log.warn("retired text segment active check deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
+                    }
+                    continue;
+                },
+            };
+            if (!is_active) {
+                store.deleteChecked(seg_id) catch |err| {
+                    if (builtin.os.tag != .freestanding) {
+                        std.log.warn("retired text segment reconciliation deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
+                    }
+                    continue;
+                };
+            }
+            reclaimed_ids.append(self.alloc, seg_id) catch return;
+        }
+
+        if (reclaimed_ids.items.len > 0) {
+            store.syncDeletes() catch |err| {
+                if (builtin.os.tag != .freestanding) {
+                    std.log.warn("retired text segment reconciliation sync deferred: {s}", .{@errorName(err)});
+                }
+                return;
+            };
+            for (reclaimed_ids.items) |seg_id| {
+                const retired_key = retiredSegmentMetaKey(seg_id);
+                txn.delete(.meta, &retired_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => {
+                        if (builtin.os.tag != .freestanding) {
+                            std.log.warn("retired text segment marker cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
+                        }
+                        return;
+                    },
+                };
+            }
+        }
+        txn.commit() catch |err| {
+            if (builtin.os.tag != .freestanding) {
+                std.log.warn("retired text segment reconciliation commit deferred: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        txn_open = false;
     }
 
     pub fn resetAllForRebuild(self: *PersistentIndex) !void {
@@ -1392,21 +1659,23 @@ pub const PersistentIndex = struct {
             };
             try self.deleteSegmentRange(&txn, seg_id);
             try self.updateActiveSegments(&txn, seg_id, .remove);
-            self.deleteSegmentFile(seg_id);
         }
-        txn.delete(.meta, meta_committed_lsn) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
         try saveNextSegmentId(&txn, replacement_writer.next_segment_id);
         try txn.commit();
 
-        try self.wal.truncateAfter(0);
-        self.committed_lsn = 0;
-
+        // The catalog transaction is the logical reset commit. Retaining the
+        // committed WAL watermark makes every pre-reset record ineligible for
+        // replay, even if the process crashes immediately after this point.
+        // Normal post-reset indexing advances and truncates the WAL later.
         self.writer.deinit();
         self.writer = replacement_writer;
         replacement_writer_moved = true;
+
+        // Physical reclamation follows publication. Failures are recoverable
+        // through the retirement markers committed above.
+        if (self.retired_segment_file_deleter) |deleter| {
+            for (active_ids) |seg_id| RetiredSegmentFileDeleter.delete(deleter, seg_id);
+        }
     }
 
     pub fn sync(self: *PersistentIndex, force: bool) !void {
@@ -2765,13 +3034,19 @@ pub const PersistentIndex = struct {
     }
 
     fn updateActiveSegments(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, op: enum { add, remove }) !void {
-        _ = self;
+        try self.clearCompletedRetirementMarkersInTxn(txn);
         const marker_key = activeSegmentMetaKey(seg_id);
         switch (op) {
             .add => try txn.put(.meta, &marker_key, &.{1}),
-            .remove => txn.delete(.meta, &marker_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
+            .remove => {
+                txn.delete(.meta, &marker_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                if (self.segment_files != null) {
+                    const retired_key = retiredSegmentMetaKey(seg_id);
+                    try txn.put(.meta, &retired_key, &.{1});
+                }
             },
         }
         txn.delete(.meta, meta_active_segments) catch |err| switch (err) {
@@ -2893,6 +3168,14 @@ pub const PersistentIndex = struct {
 };
 
 fn loadActiveSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) ![]u64 {
+    return try loadSegmentIdsForMetaPrefix(txn, alloc, meta_active_segment_prefix);
+}
+
+fn loadRetiredSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) ![]u64 {
+    return try loadSegmentIdsForMetaPrefix(txn, alloc, meta_retired_segment_prefix);
+}
+
+fn loadSegmentIdsForMetaPrefix(txn: *PersistentIndex.MainTxn, alloc: Allocator, prefix: []const u8) ![]u64 {
     var cursor = txn.openCursor(.meta) catch |err| switch (err) {
         error.NotFound => return try alloc.alloc(u64, 0),
         else => return err,
@@ -2902,11 +3185,11 @@ fn loadActiveSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) 
     var seg_ids = std.ArrayListUnmanaged(u64).empty;
     errdefer seg_ids.deinit(alloc);
 
-    var entry = try cursor.seekAtOrAfter(meta_active_segment_prefix);
+    var entry = try cursor.seekAtOrAfter(prefix);
     while (entry) |item| : (entry = try cursor.next()) {
-        if (!std.mem.startsWith(u8, item.key, meta_active_segment_prefix)) break;
-        if (item.key.len != meta_active_segment_prefix.len + 8) continue;
-        try seg_ids.append(alloc, std.mem.readInt(u64, item.key[meta_active_segment_prefix.len..][0..8], .big));
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (item.key.len != prefix.len + 8) continue;
+        try seg_ids.append(alloc, std.mem.readInt(u64, item.key[prefix.len..][0..8], .big));
     }
     return try seg_ids.toOwnedSlice(alloc);
 }
@@ -2922,6 +3205,13 @@ fn activeSegmentMetaKey(seg_id: u64) [meta_active_segment_prefix.len + 8]u8 {
     var key: [meta_active_segment_prefix.len + 8]u8 = undefined;
     @memcpy(key[0..meta_active_segment_prefix.len], meta_active_segment_prefix);
     key[meta_active_segment_prefix.len..][0..8].* = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+    return key;
+}
+
+fn retiredSegmentMetaKey(seg_id: u64) [meta_retired_segment_prefix.len + 8]u8 {
+    var key: [meta_retired_segment_prefix.len + 8]u8 = undefined;
+    @memcpy(key[0..meta_retired_segment_prefix.len], meta_retired_segment_prefix);
+    key[meta_retired_segment_prefix.len..][0..8].* = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
     return key;
 }
 
@@ -4222,7 +4512,7 @@ test "removed segment high-water survives close with a retained snapshot" {
     try std.testing.expectEqual(@as(u64, 2), verified.snapshot().segments[0].id);
 }
 
-test "crash abandonment disarms retained segment cleanup" {
+test "crash rollback fence disarms retained segment cleanup" {
     if (!supports_main_lmdb) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -4241,6 +4531,7 @@ test "crash abandonment disarms retained segment cleanup" {
 
     const retired_path = try idx.segment_files.?.pathAlloc(1);
     defer alloc.free(retired_path);
+    idx.prepareForCrashRollback();
     idx.abandonAfterCrash();
     retained.release();
     retained_open = false;
@@ -5256,7 +5547,10 @@ test "persistent modeled full-text compaction publish faults stay green" {
         const compacted = try buildCompactedTextSegment(alloc);
         defer alloc.free(compacted);
         try pi.replaceSegmentsCatalogOnlyForTest(&.{ 1, 2 }, compacted);
-        try crashReopenModeledPersistentIndex(alloc, &pi, &device_model, opts);
+        pi.prepareForCrashRollback();
+        try device_model.device().crash();
+        pi.abandonAfterCrash();
+        pi = try PersistentIndex.open(alloc, opts);
         try expectPersistentTextCompactionView(alloc, &pi, 1, 0, 1, 1);
     }
 
@@ -5276,11 +5570,106 @@ test "persistent modeled full-text compaction publish faults stay green" {
 
         const compacted = try buildCompactedTextSegment(alloc);
         defer alloc.free(compacted);
+        const retired_path = try pi.segment_files.?.pathAlloc(1);
+        defer alloc.free(retired_path);
         try device_model.injectDeleteFailureForPathContains("1.seg");
         try pi.replaceSegments(&.{ 1, 2 }, compacted);
-        try crashReopenModeledPersistentIndex(alloc, &pi, &device_model, opts);
+        _ = try device_model.fileSize(retired_path);
+        {
+            var txn = try pi.beginReadMainTxn();
+            defer txn.abort();
+            const retired_key = retiredSegmentMetaKey(1);
+            _ = try txn.get(.meta, &retired_key);
+        }
+        pi.prepareForCrashRollback();
+        try device_model.device().crash();
+        pi.abandonAfterCrash();
+        pi = try PersistentIndex.open(alloc, opts);
         try expectPersistentTextCompactionView(alloc, &pi, 1, 0, 1, 1);
+        try std.testing.expectError(error.FileNotFound, device_model.fileSize(retired_path));
+        {
+            var txn = try pi.beginReadMainTxn();
+            defer txn.abort();
+            const retired_key = retiredSegmentMetaKey(1);
+            try std.testing.expectError(error.NotFound, txn.get(.meta, &retired_key));
+        }
     }
+}
+
+test "persistent modeled reset publishes before reclamation and fences crash cleanup" {
+    const alloc = std.testing.allocator;
+    var runtime = storage_sim.Runtime.init(alloc);
+    defer runtime.deinit();
+    var device_model = storage_sim.ModeledDevice.init(alloc);
+    defer device_model.deinit();
+
+    const path: [*:0]const u8 = "/persistent-reset-crash-fence";
+    const opts = persistentModeledOptionsToIndexOptions(path, .{}, &device_model, &runtime);
+    var pi = try PersistentIndex.open(alloc, opts);
+    defer pi.close();
+
+    const segment = try buildSimpleSegment(alloc, "doc:old", "old");
+    defer alloc.free(segment);
+    try pi.indexSegment(segment);
+    try crashReopenModeledPersistentIndex(alloc, &pi, &device_model, opts);
+
+    const retained = pi.acquireSnapshot();
+    var retained_open = true;
+    defer if (retained_open) retained.release();
+    const retired_path = try pi.segment_files.?.pathAlloc(1);
+    defer alloc.free(retired_path);
+
+    try pi.resetAllForRebuild();
+    try std.testing.expectEqual(@as(u32, 0), pi.snapshot().liveDocCount());
+
+    // Fence callbacks before rollback. The modeled device restores the old
+    // durable directory entry, and releasing the pre-reset snapshot afterward
+    // must not delete that restored generation's file.
+    pi.prepareForCrashRollback();
+    try device_model.device().crash();
+    _ = try device_model.fileSize(retired_path);
+    pi.abandonAfterCrash();
+    retained.release();
+    retained_open = false;
+    _ = try device_model.fileSize(retired_path);
+
+    pi = try PersistentIndex.open(alloc, opts);
+    try std.testing.expectEqual(@as(u32, 0), pi.snapshot().liveDocCount());
+    try std.testing.expectError(error.FileNotFound, device_model.fileSize(retired_path));
+    var txn = try pi.beginReadMainTxn();
+    defer txn.abort();
+    const retired_key = retiredSegmentMetaKey(1);
+    try std.testing.expectError(error.NotFound, txn.get(.meta, &retired_key));
+}
+
+test "persistent modeled reset commit failure preserves the published generation" {
+    const alloc = std.testing.allocator;
+    var runtime = storage_sim.Runtime.init(alloc);
+    defer runtime.deinit();
+    var device_model = storage_sim.ModeledDevice.init(alloc);
+    defer device_model.deinit();
+
+    const path: [*:0]const u8 = "/persistent-reset-catalog-fault";
+    const opts = persistentModeledOptionsToIndexOptions(path, .{}, &device_model, &runtime);
+    var pi = try PersistentIndex.open(alloc, opts);
+    defer pi.close();
+
+    const segment = try buildSimpleSegment(alloc, "doc:old", "old");
+    defer alloc.free(segment);
+    try pi.indexSegment(segment);
+    try crashReopenModeledPersistentIndex(alloc, &pi, &device_model, opts);
+
+    const old_path = try pi.segment_files.?.pathAlloc(1);
+    defer alloc.free(old_path);
+    try device_model.injectSyncFailureForPathContains("/index/");
+    try expectModeledPersistentReplaceError(pi.resetAllForRebuild());
+    try std.testing.expectEqual(@as(u32, 1), pi.snapshot().liveDocCount());
+    _ = try device_model.fileSize(old_path);
+
+    try crashReopenModeledPersistentIndex(alloc, &pi, &device_model, opts);
+    try std.testing.expectEqual(@as(u32, 1), pi.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(alloc, pi.snapshot(), "old"));
+    _ = try device_model.fileSize(old_path);
 }
 
 fn runPersistentSoak(alloc: Allocator) !void {
