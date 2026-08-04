@@ -52,6 +52,8 @@ pub var test_task_begin_entered: std.atomic.Value(bool) = .init(false);
 pub var test_release_after_task_begin: std.atomic.Value(bool) = .init(false);
 pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
 pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_execute_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_finish_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
 
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
@@ -365,13 +367,13 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             while (!test_release_after_task_begin.load(.acquire)) std.Thread.yield() catch {};
         }
 
-        var result = index_manager_mod.IndexManager.executeTextMergeTask(work_alloc, &task) catch |err| {
+        var result = executeTextMergeTaskForRuntime(work_alloc, &task) catch |err| {
             // Once a task has borrowed an index runtime it must retire its
             // scheduler state before a graceful stop can complete. Structural
             // mutation waits for stop before taking the apply lock, so this
             // acquisition cannot form a shutdown lock cycle.
             lockApplyExclusive(self.apply_mutex);
-            if (err == error.ResourceBudgetExceeded) {
+            if (isRecoverableMergeAdmissionError(err)) {
                 self.index_manager.cancelTextMergeTask(&task);
                 self.apply_mutex.unlockExclusive();
                 self.signalProducerAdmissionChanged();
@@ -385,7 +387,13 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         defer result.deinit(work_alloc);
 
         lockApplyExclusive(self.apply_mutex);
-        _ = self.index_manager.finishTextMergeTask(&task, &result) catch |err| {
+        _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result) catch |err| {
+            if (isRecoverableMergeAdmissionError(err)) {
+                self.index_manager.cancelTextMergeTask(&task);
+                self.apply_mutex.unlockExclusive();
+                self.signalProducerAdmissionChanged();
+                return false;
+            }
             self.index_manager.noteTextMergeFailure(&task, err);
             self.apply_mutex.unlockExclusive();
             self.signalProducerAdmissionChanged();
@@ -848,6 +856,48 @@ fn consumeTestStartFailure() bool {
             .acq_rel,
             .acquire,
         )) |actual| {
+            remaining = actual;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn isRecoverableMergeAdmissionError(err: anyerror) bool {
+    return switch (err) {
+        error.ResourceBudgetExceeded,
+        error.PersistentDescriptorAdmissionExhausted,
+        => true,
+        else => false,
+    };
+}
+
+fn executeTextMergeTaskForRuntime(
+    allocator: Allocator,
+    task: *const index_manager_mod.IndexManager.TextMergeTask,
+) !index_manager_mod.IndexManager.TextMergeResult {
+    if (builtin.is_test and consumeTestFailure(&test_execute_admission_failures_remaining)) {
+        return error.PersistentDescriptorAdmissionExhausted;
+    }
+    return try index_manager_mod.IndexManager.executeTextMergeTask(allocator, task);
+}
+
+fn finishTextMergeTaskForRuntime(
+    index_manager: *index_manager_mod.IndexManager,
+    task: *const index_manager_mod.IndexManager.TextMergeTask,
+    result: *index_manager_mod.IndexManager.TextMergeResult,
+) !bool {
+    if (builtin.is_test and consumeTestFailure(&test_finish_admission_failures_remaining)) {
+        return error.PersistentDescriptorAdmissionExhausted;
+    }
+    return try index_manager.finishTextMergeTask(task, result);
+}
+
+fn consumeTestFailure(counter: *std.atomic.Value(u32)) bool {
+    var remaining = counter.load(.acquire);
+    while (remaining != 0) {
+        if (counter.cmpxchgWeak(remaining, remaining - 1, .acq_rel, .acquire)) |actual| {
             remaining = actual;
             continue;
         }

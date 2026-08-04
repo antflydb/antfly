@@ -70797,6 +70797,78 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
+test "db text merge descriptor admission failures retry without quarantine" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Publish enough independent segments to make a merge immediately
+    // schedulable without relying on a background index worker.
+    for (0..12) |i| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc:{d}", .{i});
+        var stored_buf: [96]u8 = undefined;
+        const stored = try std.fmt.bufPrint(&stored_buf, "{{\"body\":\"admission retry {d}\"}}", .{i});
+        var body_buf: [48]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "admission retry {d}", .{i});
+        const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = body }};
+        const docs = [_]introducer_mod.TextDocument{.{
+            .id = id,
+            .stored_data = stored,
+            .text_fields = &fields,
+            .doc_ordinal = @intCast(i + 1),
+        }};
+        _ = try db.indexTextKernelDocuments("ft_v1", &docs);
+    }
+
+    const resources = db.core.batchExecutionResources();
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{ .enabled = true },
+    );
+    defer runtime.deinit();
+    defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+    defer text_merge_runtime_mod.test_finish_admission_failures_remaining.store(0, .release);
+
+    text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1, .release);
+    try std.testing.expect(!try runtime.runOnce());
+    var stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.in_flight_merges);
+
+    text_merge_runtime_mod.test_finish_admission_failures_remaining.store(1, .release);
+    try std.testing.expect(!try runtime.runOnce());
+    stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.in_flight_merges);
+
+    // Both canceled tasks must remain immediately schedulable. A subsequent
+    // healthy pass drains the debt without waiting for quarantine expiry.
+    while (try runtime.runOnce()) {}
+    stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.pending_indexes);
+}
+
 test "db text merge backpressure drains sustained segment debt to low watermark" {
     const alloc = std.testing.allocator;
 

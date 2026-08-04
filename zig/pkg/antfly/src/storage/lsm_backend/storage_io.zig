@@ -413,6 +413,10 @@ pub const FileTrailer = struct {
     }
 };
 
+/// Borrowed, type-erased storage view. The provider which produced this value
+/// must outlive every call through it. Callers that launch work beyond a call
+/// boundary must use a provider operation whose returned handle owns its own
+/// lifetime (for example RangeReadFuture or AtomicWriteSink).
 pub const Storage = struct {
     pub const Trailer = FileTrailer;
 
@@ -1367,10 +1371,10 @@ pub const NativeStoragePool = struct {
 };
 
 const NativeStorageState = struct {
-    // Storage handles are copyable vtable values and do not have a destructor.
-    // Keep the runtime and fd cache behind a ref-counted state, and leave a
-    // closed tombstone behind after final release so stale copied handles fail
-    // with StorageClosed instead of dereferencing freed memory.
+    // Storage values returned by NativeStorage.storage() borrow their owner and
+    // must not outlive it. Operations which do outlive a call (range futures,
+    // descriptor permits, and atomic writers) explicitly retain this state.
+    // Reclaim it once the owner and all such operations release their refs.
     allocator: Allocator,
     refs: std.atomic.Value(usize) = .init(1),
     closing: std.atomic.Value(bool) = .init(false),
@@ -1380,8 +1384,8 @@ const NativeStorageState = struct {
 
     fn create(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !*NativeStorageState {
         if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
-        const state = try std.heap.page_allocator.create(NativeStorageState);
-        errdefer std.heap.page_allocator.destroy(state);
+        const state = try allocator.create(NativeStorageState);
+        errdefer allocator.destroy(state);
         state.* = undefined;
         state.allocator = allocator;
         state.refs = .init(1);
@@ -1463,7 +1467,8 @@ const NativeStorageState = struct {
         self.fd_cache.invalidateNamespace(self.cache_namespace);
         self.fd_cache.signalAdmissionChanged(self.threaded.io());
         self.threaded.deinit();
-        self.refs.store(0, .release);
+        const allocator = self.allocator;
+        allocator.destroy(self);
     }
 
     fn invalidatePath(self: *NativeStorageState, path: []const u8) void {
@@ -1907,6 +1912,8 @@ else blk: {
         }
 
         pub fn storage(self: *NativeStorage) Storage {
+            // The returned view borrows self.state; retained child operations
+            // keep the state alive independently until their own deinit.
             return .{
                 .ptr = self.state,
                 .vtable = &threaded_only_vtable,
@@ -3747,24 +3754,15 @@ test "shared native fd admission wait is cancellation aware" {
     try std.testing.expectEqual(@as(usize, 2), stats.fd_admitted_descriptors);
 }
 
-test "native copied storage handle fails closed after owner deinit" {
+test "native storage state is reclaimed after owner deinit" {
     if (!supports_native_storage) return error.SkipZigTest;
 
-    var native = try NativeStorage.init(std.testing.allocator, .threaded);
-    const copied = native.storage();
-    const path = "/tmp/antfly-storage-closed-handle-file";
-    try native.storage().writeFileAbsolute(path, "hello");
-    native.deinit();
-
-    try std.testing.expectError(error.StorageClosed, copied.createDirPath("/tmp/antfly-storage-closed-handle"));
-    try std.testing.expectError(error.StorageClosed, copied.readFileAlloc(std.testing.allocator, path, 64));
-    try std.testing.expectError(error.StorageClosed, copied.fileSize(path));
-    try std.testing.expectError(error.StorageClosed, copied.readFileTrailerAlloc(std.testing.allocator, path, 2));
-    try std.testing.expectEqual(@as(u64, 0), copied.nowNs());
-
-    var cleanup_native = try NativeStorage.init(std.testing.allocator, .threaded);
-    defer cleanup_native.deinit();
-    cleanup_native.storage().deleteFileAbsolute(path) catch {};
+    // std.testing.allocator reports any state or runtime allocation left by
+    // these repeated complete lifecycles.
+    for (0..64) |_| {
+        var native = try NativeStorage.init(std.testing.allocator, .threaded);
+        native.deinit();
+    }
 }
 
 test "native atomic write sink retains invalidation state past storage deinit" {
