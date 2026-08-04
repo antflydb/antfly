@@ -469,11 +469,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
             }
-            if (self.backpressureBlockedByQuarantine()) {
-                self.recordBackpressureTerminal(.merge_failed);
-                return error.TextMergeBackpressureUnavailable;
-            }
-
             const io = self.io_impl.?.io();
             self.mutex.lockUncancelable(io);
             if (self.admission_closed) {
@@ -505,6 +500,14 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             lockApplyShared(self.apply_mutex);
             const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
             const active_segments = self.index_manager.textActiveSegmentCountSnapshot(index_name);
+            // Quarantine is exceptional, so keep the common admission path to
+            // one catalog scan. When it is present, capture the target index's
+            // state under the same apply-lock epoch as the global byte state.
+            const global_quarantine_blocked = quarantineBlocks(stats_snapshot);
+            const index_quarantine_blocked = if (stats_snapshot.quarantined_segments > 0)
+                quarantineBlocks(self.index_manager.textMergeStatsSnapshotForIndex(index_name))
+            else
+                false;
             self.apply_mutex.unlockShared();
 
             self.mutex.lockUncancelable(io);
@@ -532,7 +535,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
             const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
-            if (segments_admissible and ((request_oversized_bytes and no_existing_debt) or (!request_oversized_bytes and bytes_admissible))) {
+            const request_bytes_admissible = if (request_oversized_bytes) no_existing_debt else bytes_admissible;
+            if (segments_admissible and request_bytes_admissible) {
                 const owned_index_name = if (segment_count > 0)
                     self.ensureProducerReservationIndexLocked(index_name) catch |err| {
                         self.mutex.unlock(io);
@@ -551,6 +555,18 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.unlock(io);
                 if (admitted_from_queue) self.signalProducerAdmissionChanged();
                 return .{ .runtime = self, .index_name = owned_index_name, .segment_count = segment_count, .byte_count = byte_count };
+            }
+            // A failed merge only makes admission terminal when that failure
+            // prevents the specific constrained dimension from draining.
+            // Segment fan-out is per-index; bytes are process-global. In
+            // particular, quarantine must never reject a publication that
+            // already fits, nor leak one index's segment failure into another.
+            if ((!segments_admissible and index_quarantine_blocked) or
+                (!request_bytes_admissible and global_quarantine_blocked))
+            {
+                self.mutex.unlock(io);
+                self.recordBackpressureTerminal(.merge_failed);
+                return error.TextMergeBackpressureUnavailable;
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
             waiter.waiting_for_bytes = segments_admissible;
@@ -742,10 +758,14 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         lockApplyShared(self.apply_mutex);
         const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
         self.apply_mutex.unlockShared();
-        return stats_snapshot.pending_segments > 0 and
-            stats_snapshot.quarantined_segments >= stats_snapshot.pending_segments;
+        return quarantineBlocks(stats_snapshot);
     }
 };
+
+fn quarantineBlocks(stats: types.TextMergeStats) bool {
+    return stats.pending_segments > 0 and
+        stats.quarantined_segments >= stats.pending_segments;
+}
 
 fn workerMain(runtime: *TextMergeRuntime) void {
     while (true) {

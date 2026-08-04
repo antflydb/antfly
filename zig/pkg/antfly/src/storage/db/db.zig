@@ -71190,6 +71190,121 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     try std.testing.expectEqual(@as(u64, 24), text_index.snapshot().liveDocCount());
 }
 
+test "db text merge producer admission isolates quarantined dimensions" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "quarantined", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "healthy", .kind = .full_text, .config_json = "{}" });
+
+    const resources = db.core.batchExecutionResources();
+    const index_opts: index_manager_mod.IndexBatchOptions = .{
+        .compact_text = false,
+        .defer_text_compaction = true,
+    };
+    {
+        lockApply(&db);
+        defer db.core.unlockApply();
+        const writes = [_]types.BatchWrite{
+            .{ .key = "doc:0", .value = "{\"body\":\"quarantine admission\"}" },
+            .{ .key = "doc:0-live", .value = "{\"body\":\"quarantine admission\"}" },
+        };
+        try resources.store.putBatch(&.{
+            .{ .key = writes[0].key, .value = writes[0].value },
+            .{ .key = writes[1].key, .value = writes[1].value },
+        }, &.{});
+        try resources.index_manager.indexTextBatchByNameWithOptions(resources.store, "quarantined", &writes, index_opts);
+    }
+    {
+        lockApply(&db);
+        defer db.core.unlockApply();
+        const writes = [_]types.BatchWrite{.{ .key = "doc:1", .value = "{\"body\":\"quarantine admission\"}" }};
+        try resources.store.putBatch(&.{.{ .key = writes[0].key, .value = writes[0].value }}, &.{});
+        try resources.index_manager.indexTextBatchByNameWithOptions(resources.store, "quarantined", &writes, index_opts);
+    }
+
+    // A deletion makes the two-segment index merge-eligible below the normal
+    // tier threshold, giving the test an exact all-quarantined backlog.
+    lockApply(&db);
+    db.core.index_manager.deleteTextBatchByNameWithOptions(
+        "quarantined",
+        &.{"doc:0"},
+        .{ .compact_text = false, .defer_text_compaction = true },
+    ) catch |err| {
+        db.core.unlockApply();
+        return err;
+    };
+    db.core.unlockApply();
+
+    var failed_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer failed_task.deinit(alloc);
+    try std.testing.expectEqualStrings("quarantined", failed_task.index_name);
+    resources.index_manager.noteTextMergeFailure(&failed_task, error.InvalidChunk);
+
+    const quarantined_stats = resources.index_manager.textMergeStatsSnapshotForIndex("quarantined");
+    try std.testing.expectEqual(@as(u64, 2), quarantined_stats.pending_segments);
+    try std.testing.expectEqual(quarantined_stats.pending_segments, quarantined_stats.quarantined_segments);
+
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 3,
+            .resume_pending_segments = 2,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer runtime.deinit();
+
+    // Quarantine is not itself a publication fence: work that fits remains
+    // admissible both on the failed index and on an independent index.
+    var below_limit = try runtime.acquireProducerPermit("quarantined", 1, 0);
+    below_limit.release();
+    var independent = try runtime.acquireProducerPermit("healthy", 3, 0);
+    try std.testing.expectError(
+        error.TextMergeBackpressureTimeout,
+        runtime.acquireProducerPermit("healthy", 1, 0),
+    );
+    independent.release();
+
+    // Once the per-index segment dimension is actually blocked, an
+    // all-quarantined target reports the terminal merge failure immediately.
+    try std.testing.expectError(
+        error.TextMergeBackpressureUnavailable,
+        runtime.acquireProducerPermit("quarantined", 2, 0),
+    );
+
+    var byte_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 0,
+            .resume_pending_segments = 0,
+            .max_pending_bytes = 1,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer byte_runtime.deinit();
+    try std.testing.expectError(
+        error.TextMergeBackpressureUnavailable,
+        byte_runtime.acquireProducerPermit("healthy", 0, 1),
+    );
+}
+
 test "db text kernel admits natural segments below hard segment limit" {
     const alloc = std.testing.allocator;
 
