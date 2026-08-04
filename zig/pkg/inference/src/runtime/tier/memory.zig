@@ -1025,12 +1025,11 @@ fn liveHostMemoryHeadroom(total_bytes: usize) usize {
     return @min(preferred, total_bytes / 2);
 }
 
-/// macOS's raw Mach page queues are intentionally conservative because they do
-/// not expose the kernel's full compressed-memory pressure calculation. Allow
-/// a bounded small-load grace window when that raw count dips below the stable
-/// node headroom. Keeping the window proportional to the machine while capped
-/// prevents a large model from consuming most of the remaining reclaimable
-/// pages merely because the system-wide residency limit has room.
+/// macOS pressure availability and the raw-page fallback both need a bounded
+/// small-load grace window below the stable node headroom. Keeping the window
+/// proportional to the machine while capped prevents a large model from
+/// consuming most of the remaining reclaimable capacity merely because the
+/// system-wide residency limit has room.
 fn macosLiveAdmissionGrace(total_bytes: usize) usize {
     return clampBytes(total_bytes / 32, mib(256), gib(2));
 }
@@ -1038,12 +1037,11 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// Determine how much of the current availability sample must remain unused.
 ///
 /// Linux MemAvailable is designed as an allocation-availability estimate, so
-/// retain the complete node headroom there. macOS exposes only raw Mach page
-/// queues to this daemon: they omit compressed memory that the kernel can
-/// reclaim and can therefore fall below the stable node headroom during normal
-/// operation. The stable shared admission limit already retains that full
-/// headroom against Antfly residency. For this second, live-pressure gate keep
-/// a bounded emergency reserve instead of subtracting the node reserve twice.
+/// retain the complete node headroom there. macOS supplies a system pressure
+/// percentage, with raw Mach page queues as a conservative fallback. The stable
+/// shared admission limit already retains full node headroom against Antfly
+/// residency. For this second, live-pressure gate keep a bounded emergency
+/// reserve instead of subtracting the node reserve twice.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
