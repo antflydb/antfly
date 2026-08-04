@@ -568,7 +568,7 @@ test "bounded merge splits output and preserves live documents" {
     try std.testing.expectEqual(@as(u32, 3), total_docs);
 }
 
-test "merge policy picks small segments and applyMerge replaces them" {
+test "merge policy drains a small-segment backlog and applyMerge replaces it" {
     const alloc = std.testing.allocator;
     const introducer = @import("introducer.zig");
 
@@ -618,14 +618,17 @@ test "merge policy picks small segments and applyMerge replaces them" {
     const planned = (try policy.plan(alloc, infos)).?;
     defer alloc.free(planned);
 
-    try std.testing.expectEqual(@as(usize, 2), planned.len);
+    // All three floor-sized segments are above the two-segment tier budget.
+    // Draining the full eligible fan-in is the behavior that prevents a
+    // sustained producer from outrunning pairwise compaction.
+    try std.testing.expectEqual(@as(usize, 3), planned.len);
 
     const merged = try mergeSegments(alloc, writer.snapshot(), planned);
     defer alloc.free(merged);
 
     try applyMerge(&writer, planned, merged);
 
-    try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), writer.snapshot().segments.len);
 
     const results = try writer.snapshot().search(alloc, "body", &.{ "hello", "world" }, 10);
     defer alloc.free(results.hits);

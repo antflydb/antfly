@@ -3437,6 +3437,9 @@ test "native fd cache retries an open that straddles a mutation fence" {
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
 
     var path_buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-invalidation-race-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
@@ -3474,23 +3477,25 @@ test "native fd cache retries an open that straddles a mutation fence" {
         }
     };
     var reader = Reader{ .storage = native.storage(), .path = path };
-    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
-    var reader_joined = false;
-    defer if (!reader_joined) {
+    var reader_future = std.Io.async(io, Reader.run, .{&reader});
+    var reader_awaited = false;
+    defer if (!reader_awaited) {
         test_fd_cache_release_after_open.store(true, .release);
-        reader_thread.join();
+        reader_future.await(io);
     };
 
-    var spins: usize = 0;
-    while (!test_fd_cache_open_paused.load(.acquire) and spins < 100_000) : (spins += 1) std.Thread.yield() catch {};
+    for (0..10_000) |_| {
+        if (test_fd_cache_open_paused.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     try std.testing.expect(test_fd_cache_open_paused.load(.acquire));
 
     try renameAbsoluteDirectPosix(replacement_path, path);
     native.state.invalidateRename(replacement_path, path);
 
     test_fd_cache_release_after_open.store(true, .release);
-    reader_thread.join();
-    reader_joined = true;
+    reader_future.await(io);
+    reader_awaited = true;
     try std.testing.expect(reader.err == null);
     try std.testing.expectEqualStrings("new", reader.bytes[0..]);
 }
@@ -3686,6 +3691,9 @@ test "transient native writes wait before opening at descriptor capacity" {
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
 
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
     var path_buf: [256]u8 = undefined;
@@ -3709,27 +3717,27 @@ test "transient native writes wait before opening at descriptor capacity" {
     };
     var failed = std.atomic.Value(bool).init(false);
     var worker = Worker{ .storage = native.storage(), .path = path, .failed = &failed };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    var thread_joined = false;
-    defer if (!thread_joined) {
+    var future = std.Io.async(io, Worker.run, .{&worker});
+    var future_awaited = false;
+    defer if (!future_awaited) {
         if (permit_active) {
             occupying_permit.release();
             permit_active = false;
         }
-        thread.join();
+        future.await(io);
     };
 
-    var spins: usize = 0;
-    while (pool.snapshotStats().fd_admission_waiters == 0 and spins < 100_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+    for (0..10_000) |_| {
+        if (pool.snapshotStats().fd_admission_waiters > 0) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
     try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admission_waiters);
 
     occupying_permit.release();
     permit_active = false;
-    thread.join();
-    thread_joined = true;
+    future.await(io);
+    future_awaited = true;
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
 }
@@ -3912,7 +3920,7 @@ test "shared native fd cache blocks before opening more than 64 files across sto
         namespace: u64,
         io: std.Io,
         path: []const u8,
-        release_all: *std.atomic.Value(bool),
+        release_all: *std.Io.Event,
         acquired: *std.atomic.Value(usize),
         failures: *std.atomic.Value(usize),
 
@@ -3922,40 +3930,46 @@ test "shared native fd cache blocks before opening more than 64 files across sto
                 return;
             };
             _ = self.acquired.fetchAdd(1, .release);
-            while (!self.release_all.load(.acquire)) std.Thread.yield() catch {};
+            self.release_all.waitUncancelable(self.io);
             self.cache.release(self.io, entry);
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    // Every task intentionally holds a lease or waits in descriptor admission.
+    // Give the threaded test executor one slot per task so the harness itself
+    // cannot become the bottleneck before the >64 contention point is reached.
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .limited(worker_count),
+        .stack_size = 512 * 1024,
+    });
     defer io_impl.deinit();
-    var release_all = std.atomic.Value(bool).init(false);
+    const io = io_impl.io();
+    var release_all: std.Io.Event = .unset;
     var acquired = std.atomic.Value(usize).init(0);
     var failures = std.atomic.Value(usize).init(0);
     var workers: [worker_count]Worker = undefined;
-    var threads: [worker_count]std.Thread = undefined;
-    var threads_started: usize = 0;
-    defer {
-        release_all.store(true, .release);
-        for (threads[0..threads_started]) |thread| thread.join();
-    }
+    var group = std.Io.Group.init;
+    var group_awaited = false;
+    defer if (!group_awaited) {
+        release_all.set(io);
+        group.await(io) catch {};
+    };
     for (0..worker_count) |i| {
         workers[i] = .{
             .cache = stores[i % store_count].state.fdCache(),
             .namespace = stores[i % store_count].state.cache_namespace,
-            .io = io_impl.io(),
+            .io = io,
             .path = paths[i][0..path_lens[i]],
             .release_all = &release_all,
             .acquired = &acquired,
             .failures = &failures,
         };
-        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
-        threads_started += 1;
+        group.async(io, Worker.run, .{&workers[i]});
     }
 
-    var spins: usize = 0;
-    while ((acquired.load(.acquire) != transient_capacity or pool.snapshotStats().fd_admission_waiters == 0) and spins < 100_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+    for (0..10_000) |_| {
+        if (acquired.load(.acquire) == transient_capacity and pool.snapshotStats().fd_admission_waiters > 0) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
     }
     const blocked_stats = pool.snapshotStats();
     try std.testing.expectEqual(transient_capacity, acquired.load(.acquire));
@@ -3964,9 +3978,9 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     try std.testing.expect(blocked_stats.fd_admission_waiters > 0);
     try std.testing.expect(blocked_stats.fd_admission_waits > 0);
 
-    release_all.store(true, .release);
-    for (threads) |thread| thread.join();
-    threads_started = 0;
+    release_all.set(io);
+    try group.await(io);
+    group_awaited = true;
     try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
     try std.testing.expect(pool.snapshotStats().fd_cache_entries <= capacity);
 }
@@ -3988,21 +4002,19 @@ test "weighted native fd admission preserves FIFO progress" {
         io: std.Io,
         count: usize,
         acquired: *std.atomic.Value(bool),
-        release_gate: ?*const std.atomic.Value(bool),
+        release_gate: ?*std.Io.Event,
 
         fn run(self: *@This()) void {
             self.cache.reserveDescriptors(self.io, self.count) catch return;
             self.acquired.store(true, .release);
-            if (self.release_gate) |gate| {
-                while (!gate.load(.acquire)) std.Thread.yield() catch {};
-            }
+            if (self.release_gate) |gate| gate.waitUncancelable(self.io);
             self.cache.releaseDescriptors(self.io, self.count);
         }
     };
 
     var large_acquired = std.atomic.Value(bool).init(false);
     var small_acquired = std.atomic.Value(bool).init(false);
-    var release_large = std.atomic.Value(bool).init(false);
+    var release_large: std.Io.Event = .unset;
     var large = Worker{
         .cache = pool.fd_cache,
         .io = io,
@@ -4010,9 +4022,17 @@ test "weighted native fd admission preserves FIFO progress" {
         .acquired = &large_acquired,
         .release_gate = &release_large,
     };
-    const large_thread = try std.Thread.spawn(.{}, Worker.run, .{&large});
-    defer large_thread.join();
-    while (pool.snapshotStats().fd_admission_waiters < 1) std.Thread.yield() catch {};
+    var large_future = std.Io.async(io, Worker.run, .{&large});
+    var large_awaited = false;
+    defer if (!large_awaited) {
+        release_large.set(io);
+        large_future.await(io);
+    };
+    for (0..10_000) |_| {
+        if (pool.snapshotStats().fd_admission_waiters >= 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(pool.snapshotStats().fd_admission_waiters >= 1);
 
     var small = Worker{
         .cache = pool.fd_cache,
@@ -4021,24 +4041,47 @@ test "weighted native fd admission preserves FIFO progress" {
         .acquired = &small_acquired,
         .release_gate = null,
     };
-    const small_thread = try std.Thread.spawn(.{}, Worker.run, .{&small});
-    defer small_thread.join();
-    while (pool.snapshotStats().fd_admission_waiters < 2) std.Thread.yield() catch {};
+    var small_future = std.Io.async(io, Worker.run, .{&small});
+    var small_awaited = false;
+    defer if (!small_awaited) {
+        // The small request is queued behind the large request. Unblock the
+        // older request first on every error path so cleanup cannot deadlock
+        // while awaiting the younger future.
+        release_large.set(io);
+        small_future.await(io);
+    };
+    for (0..10_000) |_| {
+        if (pool.snapshotStats().fd_admission_waiters >= 2) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(pool.snapshotStats().fd_admission_waiters >= 2);
 
     // One released descriptor would admit the younger one-fd request, but it
     // must remain queued so capacity can accumulate for the older request.
     pool.fd_cache.releaseDescriptors(io, 1);
     held_descriptors -= 1;
-    for (0..1_000) |_| std.Thread.yield() catch {};
+    try io.sleep(.fromMilliseconds(10), .awake);
     try std.testing.expect(!large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
 
     pool.fd_cache.releaseDescriptors(io, 1);
     held_descriptors -= 1;
-    while (!large_acquired.load(.acquire)) std.Thread.yield() catch {};
+    for (0..10_000) |_| {
+        if (large_acquired.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
-    release_large.store(true, .release);
-    while (!small_acquired.load(.acquire)) std.Thread.yield() catch {};
+    release_large.set(io);
+    for (0..10_000) |_| {
+        if (small_acquired.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(small_acquired.load(.acquire));
+    large_future.await(io);
+    large_awaited = true;
+    small_future.await(io);
+    small_awaited = true;
 }
 
 test "shared native fd admission wait is cancellation aware" {
@@ -4050,6 +4093,7 @@ test "shared native fd admission wait is cancellation aware" {
     defer native.deinit();
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
+    const io = io_impl.io();
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
     var second_path_buf: [256]u8 = undefined;
     const second_path = try std.fmt.bufPrint(&second_path_buf, "/tmp/antfly-storage-fd-cancel-{d}-waiting", .{nonce});
@@ -4064,7 +4108,7 @@ test "shared native fd admission wait is cancellation aware" {
     defer transient_b.release();
 
     var future = try native.storage().beginReadFileRangeAllocWithRuntime(
-        ReadRuntime.init(io_impl.io()),
+        ReadRuntime.init(io),
         std.testing.allocator,
         second_path,
         0,
@@ -4073,9 +4117,9 @@ test "shared native fd admission wait is cancellation aware" {
     var future_active = true;
     defer if (future_active) future.cancel();
 
-    var spins: usize = 0;
-    while (pool.snapshotStats().fd_admission_waiters == 0 and spins < 100_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+    for (0..10_000) |_| {
+        if (pool.snapshotStats().fd_admission_waiters > 0) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admission_waiters);
     future.cancel();
