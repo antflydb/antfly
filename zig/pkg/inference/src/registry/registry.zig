@@ -296,7 +296,7 @@ pub const ModelRegistry = struct {
 
         const kind = switch (kind_mode) {
             .manifest => blk: {
-                var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch break :blk inferModelKindFromPath(model_path);
+                var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
                 defer manifest.deinit();
                 break :blk modelKindFromManifestType(manifest.model_type);
             },

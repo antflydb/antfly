@@ -133,6 +133,21 @@ pub const PromptCacheConfig = struct {
     }
 };
 
+test "extraction resolution distinguishes absence resource pressure and internal failure" {
+    try std.testing.expectEqual(
+        ExtractionResolutionFailure.not_found,
+        classifyExtractionResolutionFailure(error.ModelNotFound),
+    );
+    try std.testing.expectEqual(
+        ExtractionResolutionFailure.resource_exhausted,
+        classifyExtractionResolutionFailure(error.OutOfMemory),
+    );
+    try std.testing.expectEqual(
+        ExtractionResolutionFailure.internal,
+        classifyExtractionResolutionFailure(error.Unexpected),
+    );
+}
+
 test "prompt cache config reports node target in bytes" {
     const cfg = PromptCacheConfig{ .enabled = true, .max_bytes_mb = 512 };
     try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
@@ -1439,6 +1454,20 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     }
 
     return counts;
+}
+
+const ExtractionResolutionFailure = enum {
+    not_found,
+    resource_exhausted,
+    internal,
+};
+
+fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailure {
+    return switch (err) {
+        error.ModelNotFound => .not_found,
+        error.OutOfMemory => .resource_exhausted,
+        else => .internal,
+    };
 }
 
 pub const Node = struct {
@@ -6842,8 +6871,14 @@ pub const Node = struct {
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
         };
-        var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch |err| switch (classifyExtractionResolutionFailure(err)) {
+            .not_found => return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
+            .resource_exhausted => return err,
+            .internal => return ctx.status(500).json(.{
+                .@"error" = "MODEL_RESOLUTION_FAILED",
+                .message = @errorName(err),
+            }),
+        };
         defer extractor.deinit(ctx.allocator);
 
         const results = (if (has_texts)

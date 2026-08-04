@@ -448,13 +448,35 @@ const audio_projection_candidates = [_][]const u8{
 /// Subdirectories to search for ONNX files.
 const onnx_subdirs = [_][]const u8{ "", "onnx" };
 
+/// Optional metadata files may be malformed or use fields newer than this
+/// binary understands. Keep those paths best-effort, but never reinterpret
+/// resource exhaustion as absent metadata.
+fn ignoreNonResourceMetadataError(result: anytype) !void {
+    result catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+}
+
+fn readOptionalMetadataFile(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    name: []const u8,
+) !?[]u8 {
+    return c_file.readFileFromDir(allocator, model_dir_path, name) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+}
+
 /// Load a model manifest by inspecting the directory contents and parsing configs.
 pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
     var manifest = ModelManifest{ .allocator = allocator };
+    errdefer manifest.deinit();
 
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
         manifest.gguf_path = try allocator.dupe(u8, model_dir_path);
-        applyGgufTokenizerMetadata(&manifest, allocator, std.fs.path.dirname(model_dir_path) orelse ".", model_dir_path) catch {};
+        try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(&manifest, allocator, std.fs.path.dirname(model_dir_path) orelse ".", model_dir_path));
         return manifest;
     }
 
@@ -463,42 +485,42 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     }
 
     // Try to parse config.json, then clip_config.json for CLIPCLAP-style repos.
-    if (c_file.readFileFromDir(allocator, model_dir_path, "config.json")) |config_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "config.json")) |config_bytes| {
         defer allocator.free(config_bytes);
-        parseConfigJson(&manifest, allocator, config_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
+    }
     if (manifest.native_arch_hint == .none and manifest.max_position_embeddings == 512 and manifest.hidden_size == 768) {
-        if (c_file.readFileFromDir(allocator, model_dir_path, "clip_config.json")) |config_bytes| {
+        if (try readOptionalMetadataFile(allocator, model_dir_path, "clip_config.json")) |config_bytes| {
             defer allocator.free(config_bytes);
-            parseConfigJson(&manifest, allocator, config_bytes) catch {};
-        } else |_| {}
+            try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
+        }
     }
 
     // Try to parse model_manifest.json
-    if (c_file.readFileFromDir(allocator, model_dir_path, "model_manifest.json")) |manifest_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        parseModelManifestJson(&manifest, allocator, manifest_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseModelManifestJson(&manifest, allocator, manifest_bytes));
+    }
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_bundle.json")) |bundle_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes));
+    }
     if (shouldParseClipclapGgufVariant(allocator, model_dir_path)) {
-        parseInferenceVariantsFile(&manifest, allocator, model_dir_path) catch {};
+        try parseOptionalInferenceVariantsFile(&manifest, allocator, model_dir_path);
     }
 
     // Try to parse gliner_config.json (for GLiNER NER models)
-    if (c_file.readFileFromDir(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
         defer allocator.free(gliner_bytes);
-        parseGlinerConfig(&manifest, allocator, gliner_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseGlinerConfig(&manifest, allocator, gliner_bytes));
+    }
 
     // Try to parse added_tokens.json (for GLiNER special token IDs)
-    if (c_file.readFileFromDir(allocator, model_dir_path, "added_tokens.json")) |at_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "added_tokens.json")) |at_bytes| {
         defer allocator.free(at_bytes);
-        parseAddedTokens(&manifest, at_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
+    }
 
     // Auto-detect ONNX files unless a mixed single-repo ClipClap checkout was
     // explicitly resolved to its GGUF pair. The GGUF pair embeds projection
@@ -541,30 +563,30 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     }
 
     // Load chat template (from chat_template.jinja file)
-    if (c_file.readFileFromDir(allocator, model_dir_path, "chat_template.jinja")) |ct| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "chat_template.jinja")) |ct| {
         if (std.mem.trim(u8, ct, &.{ ' ', '\t', '\n', '\r' }).len > 0) {
             manifest.chat_template = ct;
         } else {
             allocator.free(ct);
         }
-    } else |_| {}
+    }
 
     // Load special tokens from tokenizer_config.json
-    if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer.json")) |tok_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "tokenizer.json")) |tok_bytes| {
         defer allocator.free(tok_bytes);
-        parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes) catch {};
-    } else |_| {}
-    if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer_config.json")) |tc_bytes| {
+        try ignoreNonResourceMetadataError(parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes));
+    }
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "tokenizer_config.json")) |tc_bytes| {
         defer allocator.free(tc_bytes);
-        parseTokenizerConfig(&manifest, allocator, tc_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseTokenizerConfig(&manifest, allocator, tc_bytes));
+    }
 
     if (manifest.gguf_path) |gguf_path| {
-        applyGgufTokenizerMetadata(&manifest, allocator, model_dir_path, gguf_path) catch {};
+        try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(&manifest, allocator, model_dir_path, gguf_path));
     }
 
     applyImplicitSparseOutputLayout(&manifest, model_dir_path);
-    applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try applyImplicitModelTypeHints(&manifest, model_dir_path);
 
     return manifest;
 }
@@ -576,6 +598,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
 /// to expose text/image/audio listing metadata.
 pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
     var manifest = ModelManifest{ .allocator = allocator };
+    errdefer manifest.deinit();
 
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
         manifest.gguf_path = try allocator.dupe(u8, model_dir_path);
@@ -586,37 +609,37 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         manifest.model_type = model_type;
     }
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "config.json")) |config_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "config.json")) |config_bytes| {
         defer allocator.free(config_bytes);
-        parseListingConfigJson(&manifest, allocator, config_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseListingConfigJson(&manifest, allocator, config_bytes));
+    }
     if (manifest.native_arch_hint == .none and manifest.config_model_arch.len == 0) {
-        if (c_file.readFileFromDir(allocator, model_dir_path, "clip_config.json")) |config_bytes| {
+        if (try readOptionalMetadataFile(allocator, model_dir_path, "clip_config.json")) |config_bytes| {
             defer allocator.free(config_bytes);
-            parseListingConfigJson(&manifest, allocator, config_bytes) catch {};
-        } else |_| {}
+            try ignoreNonResourceMetadataError(parseListingConfigJson(&manifest, allocator, config_bytes));
+        }
     }
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "model_manifest.json")) |manifest_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        parseModelManifestJson(&manifest, allocator, manifest_bytes) catch {};
-    } else |_| {}
+        try ignoreNonResourceMetadataError(parseModelManifestJson(&manifest, allocator, manifest_bytes));
+    }
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_bundle.json")) |bundle_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
-    } else |_| {}
-    parseInferenceVariantsFile(&manifest, allocator, model_dir_path) catch {};
+        try ignoreNonResourceMetadataError(parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes));
+    }
+    try parseOptionalInferenceVariantsFile(&manifest, allocator, model_dir_path);
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
         defer allocator.free(gliner_bytes);
-        parseGlinerConfig(&manifest, allocator, gliner_bytes) catch {};
-    } else |_| {}
-    if (c_file.readFileFromDir(allocator, model_dir_path, "added_tokens.json")) |at_bytes| {
+        try ignoreNonResourceMetadataError(parseGlinerConfig(&manifest, allocator, gliner_bytes));
+    }
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "added_tokens.json")) |at_bytes| {
         defer allocator.free(at_bytes);
-        parseAddedTokens(&manifest, at_bytes) catch {};
-    } else |_| {}
-    applyListingGlinerHint(&manifest, allocator, model_dir_path);
+        try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
+    }
+    try applyListingGlinerHint(&manifest, allocator, model_dir_path);
 
     if (!manifest.isClipclapGgufBundle()) {
         if (manifest.onnx_path == null) manifest.onnx_path = try findFileInSubdirs(allocator, model_dir_path, &onnx_candidates, &onnx_subdirs);
@@ -641,23 +664,23 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.gguf_projector_path == null) manifest.gguf_projector_path = try findFirstGgufInDir(allocator, model_dir_path, true);
 
     applyImplicitSparseOutputLayout(&manifest, model_dir_path);
-    applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try applyImplicitModelTypeHints(&manifest, model_dir_path);
 
     return manifest;
 }
 
-fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) void {
+fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) !void {
     if (manifest.gliner_model_type.len > 0) return;
     if (!std.mem.eql(u8, manifest.config_model_arch, "extractor") and !hasGlinerPathHint(model_dir_path)) return;
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "special_tokens_map.json")) |tokens_bytes| {
+    if (try readOptionalMetadataFile(allocator, model_dir_path, "special_tokens_map.json")) |tokens_bytes| {
         defer allocator.free(tokens_bytes);
         if (!listingSpecialTokensMapHasGlinerMarkers(tokens_bytes)) return;
-    } else |_| {
+    } else {
         return;
     }
 
-    manifest.gliner_model_type = allocator.dupe(u8, "gliner2") catch "";
+    manifest.gliner_model_type = try allocator.dupe(u8, "gliner2");
 }
 
 fn listingSpecialTokensMapHasGlinerMarkers(json_bytes: []const u8) bool {
@@ -675,14 +698,14 @@ fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, model_dir_path: []c
     }
 }
 
-fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) void {
+fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
     if (inferGlinerModelType(manifest, model_dir_path)) |gliner_type| {
         if (manifest.gliner_model_type.len > 0 and !std.mem.eql(u8, manifest.gliner_model_type, gliner_type)) {
             manifest.allocator.free(manifest.gliner_model_type);
             manifest.gliner_model_type = "";
         }
         if (manifest.gliner_model_type.len == 0) {
-            manifest.gliner_model_type = manifest.allocator.dupe(u8, gliner_type) catch "";
+            manifest.gliner_model_type = try manifest.allocator.dupe(u8, gliner_type);
         }
     }
 
@@ -1127,8 +1150,9 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     if (obj.get("model_type")) |v| {
         if (v == .string) {
             const s = v.string;
+            const config_model_arch = try allocator.dupe(u8, s);
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
-            manifest.config_model_arch = allocator.dupe(u8, s) catch "";
+            manifest.config_model_arch = config_model_arch;
             if (std.mem.eql(u8, s, "roberta") or std.mem.eql(u8, s, "xlm-roberta")) {
                 manifest.bert_model_type = .roberta;
             } else if (std.mem.eql(u8, s, "distilbert")) {
@@ -1199,8 +1223,9 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     if (obj.get("model_type")) |v| {
         if (v == .string) {
             const s = v.string;
+            const config_model_arch = try allocator.dupe(u8, s);
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
-            manifest.config_model_arch = allocator.dupe(u8, s) catch "";
+            manifest.config_model_arch = config_model_arch;
             if (std.mem.eql(u8, s, "whisper")) {
                 manifest.native_arch_hint = .whisper;
             } else if (std.mem.eql(u8, s, "florence2") or
@@ -1257,6 +1282,43 @@ fn isJinaV5TextEmbeddingConfig(obj: *const std.json.ObjectMap) bool {
         jsonStringArrayContains(arch, "JinaEmbeddingsV5Model");
 }
 
+fn deinitOwnedStringArray(allocator: std.mem.Allocator, items: [][]const u8) void {
+    if (items.len == 0) return;
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn dupeJsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    if (value != .array) return &.{};
+
+    var items = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+
+    for (value.array.items) |item| {
+        if (item != .string) continue;
+        const owned = try allocator.dupe(u8, item.string);
+        items.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
+
+    if (items.items.len == 0) return &.{};
+    return try items.toOwnedSlice(allocator);
+}
+
+fn replaceOwnedStringArray(
+    allocator: std.mem.Allocator,
+    target: *[][]const u8,
+    replacement: [][]const u8,
+) void {
+    deinitOwnedStringArray(allocator, target.*);
+    target.* = replacement;
+}
+
 fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
@@ -1275,57 +1337,24 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     }
 
     if (obj.get("tasks")) |v| {
-        if (v == .array) {
-            var tasks = std.ArrayListUnmanaged([]const u8).empty;
-            for (v.array.items) |item| {
-                if (item == .string) {
-                    const task = allocator.dupe(u8, item.string) catch continue;
-                    tasks.append(allocator, task) catch {
-                        allocator.free(task);
-                        continue;
-                    };
-                }
-            }
-            if (tasks.items.len > 0) {
-                manifest.tasks = tasks.toOwnedSlice(allocator) catch &.{};
-            }
+        const tasks = try dupeJsonStringArray(allocator, v);
+        if (tasks.len > 0) {
+            replaceOwnedStringArray(allocator, &manifest.tasks, tasks);
         }
     }
 
     // Parse capabilities array
     if (obj.get("capabilities")) |v| {
-        if (v == .array) {
-            var caps = std.ArrayListUnmanaged([]const u8).empty;
-            for (v.array.items) |item| {
-                if (item == .string) {
-                    const cap = allocator.dupe(u8, item.string) catch continue;
-                    caps.append(allocator, cap) catch {
-                        allocator.free(cap);
-                        continue;
-                    };
-                }
-            }
-            if (caps.items.len > 0) {
-                manifest.capabilities = caps.toOwnedSlice(allocator) catch &.{};
-            }
+        const capabilities = try dupeJsonStringArray(allocator, v);
+        if (capabilities.len > 0) {
+            replaceOwnedStringArray(allocator, &manifest.capabilities, capabilities);
         }
     }
 
     if (obj.get("inputs")) |v| {
-        if (v == .array) {
-            var inputs = std.ArrayListUnmanaged([]const u8).empty;
-            for (v.array.items) |item| {
-                if (item == .string) {
-                    const input = allocator.dupe(u8, item.string) catch continue;
-                    inputs.append(allocator, input) catch {
-                        allocator.free(input);
-                        continue;
-                    };
-                }
-            }
-            if (inputs.items.len > 0) {
-                manifest.inputs = inputs.toOwnedSlice(allocator) catch &.{};
-            }
+        const inputs = try dupeJsonStringArray(allocator, v);
+        if (inputs.len > 0) {
+            replaceOwnedStringArray(allocator, &manifest.inputs, inputs);
         }
     }
 
@@ -1364,42 +1393,21 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
     }
     if (obj.get("model_type")) |v| {
         if (v == .string and v.string.len > 0) {
+            const gliner_model_type = try allocator.dupe(u8, v.string);
             if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
-            manifest.gliner_model_type = allocator.dupe(u8, v.string) catch "";
+            manifest.gliner_model_type = gliner_model_type;
         }
     }
     if (obj.get("default_labels")) |v| {
-        if (v == .array) {
-            var labels = std.ArrayListUnmanaged([]const u8).empty;
-            for (v.array.items) |item| {
-                if (item == .string) {
-                    const lbl = allocator.dupe(u8, item.string) catch continue;
-                    labels.append(allocator, lbl) catch {
-                        allocator.free(lbl);
-                        continue;
-                    };
-                }
-            }
-            if (labels.items.len > 0) {
-                manifest.gliner_default_labels = labels.toOwnedSlice(allocator) catch &.{};
-            }
+        const labels = try dupeJsonStringArray(allocator, v);
+        if (labels.len > 0) {
+            replaceOwnedStringArray(allocator, &manifest.gliner_default_labels, labels);
         }
     }
     if (obj.get("relation_labels")) |v| {
-        if (v == .array) {
-            var labels = std.ArrayListUnmanaged([]const u8).empty;
-            for (v.array.items) |item| {
-                if (item == .string) {
-                    const lbl = allocator.dupe(u8, item.string) catch continue;
-                    labels.append(allocator, lbl) catch {
-                        allocator.free(lbl);
-                        continue;
-                    };
-                }
-            }
-            if (labels.items.len > 0) {
-                manifest.gliner_relation_labels = labels.toOwnedSlice(allocator) catch &.{};
-            }
+        const labels = try dupeJsonStringArray(allocator, v);
+        if (labels.len > 0) {
+            replaceOwnedStringArray(allocator, &manifest.gliner_relation_labels, labels);
         }
     }
     if (obj.get("relation_threshold")) |v| {
@@ -1411,20 +1419,9 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
                 if (tasks_v.object.get("relations")) |relations_v| {
                     if (relations_v == .object) {
                         if (relations_v.object.get("default_relation_labels")) |labels_v| {
-                            if (labels_v == .array) {
-                                var labels = std.ArrayListUnmanaged([]const u8).empty;
-                                for (labels_v.array.items) |item| {
-                                    if (item == .string) {
-                                        const lbl = allocator.dupe(u8, item.string) catch continue;
-                                        labels.append(allocator, lbl) catch {
-                                            allocator.free(lbl);
-                                            continue;
-                                        };
-                                    }
-                                }
-                                if (labels.items.len > 0) {
-                                    manifest.gliner_relation_labels = labels.toOwnedSlice(allocator) catch &.{};
-                                }
+                            const labels = try dupeJsonStringArray(allocator, labels_v);
+                            if (labels.len > 0) {
+                                replaceOwnedStringArray(allocator, &manifest.gliner_relation_labels, labels);
                             }
                         }
                         if (manifest.gliner_relation_threshold == 0) {
@@ -1447,15 +1444,17 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
     var family: ?[]const u8 = null;
     if (obj.get("family")) |v| {
         if (v == .string and v.string.len > 0) {
+            const inference_bundle_family = try allocator.dupe(u8, v.string);
             if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
-            manifest.inference_bundle_family = allocator.dupe(u8, v.string) catch "";
+            manifest.inference_bundle_family = inference_bundle_family;
             family = v.string;
         }
     }
     if (obj.get("wrapper")) |v| {
         if (v == .string and v.string.len > 0 and family != null and std.mem.eql(u8, family.?, "gliner2_split_bundle/v1")) {
+            const gliner_model_type = try allocator.dupe(u8, v.string);
             if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
-            manifest.gliner_model_type = allocator.dupe(u8, v.string) catch "";
+            manifest.gliner_model_type = gliner_model_type;
         }
     }
     if (family) |bundle_family| {
@@ -1490,8 +1489,9 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
                 }
             }
             manifest.native_arch_hint = .clip;
+            const config_model_arch = try allocator.dupe(u8, "clipclap");
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
-            manifest.config_model_arch = allocator.dupe(u8, "clipclap") catch "";
+            manifest.config_model_arch = config_model_arch;
             try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
         }
         if (std.mem.eql(u8, bundle_family, "florence2_gguf_bundle/v1")) {
@@ -1596,10 +1596,14 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
 }
 
-fn parseInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) !void {
-    const variants_bytes = try c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json");
+fn parseOptionalInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) !void {
+    const variants_bytes = (try readOptionalMetadataFile(
+        allocator,
+        model_dir_path,
+        "antfly_inference_variants.json",
+    )) orelse return;
     defer allocator.free(variants_bytes);
-    try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
+    try ignoreNonResourceMetadataError(parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes));
 }
 
 fn parseGliner2InferenceVariantsJson(
@@ -1977,7 +1981,7 @@ test "rerank model name overrides sequence classifier config" {
         .allocator = std.testing.allocator,
         .model_type = .classifier,
     };
-    applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
+    try applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
     try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
 }
 
