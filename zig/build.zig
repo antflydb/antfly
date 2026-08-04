@@ -5290,6 +5290,7 @@ pub fn build(b: *std.Build) void {
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
             "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
+            "prepared writer open reclaims descriptor capacity from startup cache",
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",

@@ -2740,25 +2740,39 @@ pub const ProvisionedTableWriteCache = struct {
         excluded_group_id: u64,
         excluded_table_name: []const u8,
     ) !bool {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        return try self.evictOneInactiveEntryForDescriptorPressureAssumeLifecycleLocked(
+            excluded_group_id,
+            excluded_table_name,
+        );
+    }
+
+    fn evictOneInactiveEntryForDescriptorPressureAssumeLifecycleLocked(
+        self: *ProvisionedTableWriteCache,
+        excluded_group_id: ?u64,
+        excluded_table_name: []const u8,
+    ) !bool {
         var entry_index: usize = 0;
         while (entry_index < self.entries.items.len) : (entry_index += 1) {
             const entry = self.entries.items[entry_index];
-            if (entry.group_id == excluded_group_id and
-                std.mem.eql(u8, entry.table_name, excluded_table_name)) continue;
+            if (excluded_group_id) |excluded| {
+                if (entry.group_id == excluded and
+                    std.mem.eql(u8, entry.table_name, excluded_table_name)) continue;
+            }
             if (self.bulkIngestSessionActiveForTable(entry.table_name)) continue;
 
-            lockAtomic(&self.entry_lifecycle_mutex);
             const inactive = entry.active_leases == 0 and
                 !entry.bulk_ingest_session_open and
                 !entry.auto_bulk_ingest_session_open and
                 !entry.auto_bulk_ingest_finishing;
-            self.entry_lifecycle_mutex.unlock();
             if (!inactive) continue;
 
-            // The lifecycle helper rechecks active_leases under its mutex, so
-            // a concurrent final release is harmless and no lease can appear
-            // while the source state mutex remains held.
-            if (try self.retireInactiveEntryAtIndexForCloseLocked(entry_index)) return true;
+            try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
+            _ = self.entries.orderedRemove(entry_index);
+            entry.retired = true;
+            self.queueEntryForCloseAssumeLifecycleLocked(entry);
+            return true;
         }
         return false;
     }
@@ -5198,6 +5212,61 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    /// Reclaim an idle lifetime-descriptor owner from either cache while no
+    /// cache-open lock is held by the caller. Cross-cache reclamation is rare,
+    /// so use the full transition lock order here: both cache-open locks by
+    /// address, source state, then both lifecycle locks by address. This keeps
+    /// descriptor pressure from introducing a lock inversion with cache
+    /// rebinding, HA transitions, or startup-cache adoption.
+    fn reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
+        self: *ProvisionedTableWriteSource,
+        opening_cache: *ProvisionedTableWriteCache,
+        excluded_group_id: u64,
+        excluded_table_name: []const u8,
+    ) !bool {
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+
+        // Read bindings only after the transition helper owns source state, and
+        // touch only caches whose lifecycle locks it now holds.
+        const write_cache = self.write_cache;
+        const startup_cache = self.startup_write_cache;
+        const opening_is_write = write_cache != null and write_cache.? == opening_cache;
+        const opening_is_startup = startup_cache != null and startup_cache.? == opening_cache;
+        if (!opening_is_write and !opening_is_startup) return false;
+
+        const other_cache: ?*ProvisionedTableWriteCache = if (opening_is_write)
+            if (startup_cache != opening_cache) startup_cache else null
+        else if (write_cache != opening_cache)
+            write_cache
+        else
+            null;
+        if (other_cache == null) return false;
+
+        // Prefer the other cache because the opening cache was checked
+        // immediately before entering this coordinated slow path. Recheck the
+        // opening cache only if its state changed while its lock was dropped.
+        var evicted = try other_cache.?.evictOneInactiveEntryForDescriptorPressureAssumeLifecycleLocked(
+            // The same group may have an idle stale-generation startup owner;
+            // only the opening cache must protect its target entry.
+            null,
+            excluded_table_name,
+        );
+        if (!evicted) {
+            evicted = try opening_cache.evictOneInactiveEntryForDescriptorPressureAssumeLifecycleLocked(
+                excluded_group_id,
+                excluded_table_name,
+            );
+        }
+        if (!evicted) return false;
+
+        // DB.close releases persistent lock permits. Keep both open locks until
+        // every queued victim is closed, then let the caller reacquire its cache
+        // and revalidate the prepared-open state before retrying disk I/O.
+        locks.drainAndRelease();
+        return true;
+    }
+
     pub fn init(replica_root_dir: []const u8, catalog: table_catalog.CatalogSource) ProvisionedTableWriteSource {
         return .{
             .replica_root_dir = replica_root_dir,
@@ -7115,197 +7184,224 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         lockAtomic(&cache.open_mutex);
-        defer cache.open_mutex.unlock();
+        var cache_open_locked = true;
+        defer if (cache_open_locked) cache.open_mutex.unlock();
 
-        while (true) {
-            lockAtomic(&self.local_db_mutex);
-            const open_state = cache.getOrPrepareOpenLocked(
-                group_id,
-                lsm_root_generation,
-                table_name,
-                expected_identity_namespace,
-                preloaded_metadata,
-            ) catch |err| {
-                self.local_db_mutex.unlock();
-                return err;
-            };
-            switch (open_state) {
-                .cached => |cached_value| {
-                    var cached = cached_value;
-                    if (ensure_auto_bulk_now_ns) |now_ns| {
-                        cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns) catch |err| {
-                            self.local_db_mutex.unlock();
-                            cached.deinit(cache.alloc);
-                            return err;
-                        };
-                    }
-                    self.local_db_mutex.unlock();
-                    errdefer cached.deinit(cache.alloc);
-                    try validateProvisionedDbIdentityNamespaceWithPolicy(
-                        identity_namespace,
-                        identity_validation,
-                        cached.db,
-                    );
-                    prepared_open.?.deinit(cache.alloc);
-                    prepared_open = null;
-                    if (mode == .default or mode == .default_async) {
-                        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
-                    }
-                    return cached;
-                },
-                .prepared => |prepared| {
-                    self.local_db_mutex.unlock();
-                    prepared_open.?.deinit(cache.alloc);
-                    prepared_open = prepared;
-                    break;
-                },
-                .pending_close => {
-                    self.local_db_mutex.unlock();
-                    cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
-                    continue;
-                },
-            }
-        }
-
-        if (preloaded_metadata) |metadata| {
-            if (metadata.metadata_source == .supplied) {
-                if (metadata.indexes_json) |value| {
-                    prepared_open.?.indexes_json = try cache.alloc.dupe(u8, value);
-                }
-                if (metadata.schema_json) |value| {
-                    prepared_open.?.schema_json = try cache.alloc.dupe(u8, value);
-                }
-            }
-        } else if (try loadTableManagedMetadata(cache.alloc, self.catalog, table_name)) |metadata| {
-            prepared_open.?.indexes_json = metadata.indexes_json;
-            prepared_open.?.schema_json = metadata.schema_json;
-        }
-
-        const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
-        var opened: ?db_mod.DB = while (true) {
-            const open_result: anyerror!db_mod.DB = if (consumeTestWriterOpenPersistentDescriptorFailure())
-                error.PersistentDescriptorAdmissionExhausted
-            else if (prepared_open.?.indexes_json) |value|
-                openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
-                    cache.alloc,
-                    path,
-                    value,
-                    cache.lsm_cache,
-                    cache.hbc_cache,
+        prepared_open_retry: while (true) {
+            while (true) {
+                lockAtomic(&self.local_db_mutex);
+                const open_state = cache.getOrPrepareOpenLocked(
+                    group_id,
                     lsm_root_generation,
-                    cache.resource_manager,
-                    mode,
-                    cache.backend_runtime,
-                    self.antfly_provider,
-                    self.secret_store,
-                    cache.remote_content,
-                    identity_namespace,
-                    .{
-                        .drain_resolver_backfill = false,
-                        .inference_api_url = self.inference_api_url,
+                    table_name,
+                    expected_identity_namespace,
+                    preloaded_metadata,
+                ) catch |err| {
+                    self.local_db_mutex.unlock();
+                    return err;
+                };
+                switch (open_state) {
+                    .cached => |cached_value| {
+                        var cached = cached_value;
+                        if (ensure_auto_bulk_now_ns) |now_ns| {
+                            cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns) catch |err| {
+                                self.local_db_mutex.unlock();
+                                cached.deinit(cache.alloc);
+                                return err;
+                            };
+                        }
+                        self.local_db_mutex.unlock();
+                        errdefer cached.deinit(cache.alloc);
+                        try validateProvisionedDbIdentityNamespaceWithPolicy(
+                            identity_namespace,
+                            identity_validation,
+                            cached.db,
+                        );
+                        prepared_open.?.deinit(cache.alloc);
+                        prepared_open = null;
+                        if (mode == .default or mode == .default_async) {
+                            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+                        }
+                        return cached;
+                    },
+                    .prepared => |prepared| {
+                        self.local_db_mutex.unlock();
+                        prepared_open.?.deinit(cache.alloc);
+                        prepared_open = prepared;
+                        break;
+                    },
+                    .pending_close => {
+                        self.local_db_mutex.unlock();
+                        cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+                        continue;
+                    },
+                }
+            }
+
+            if (preloaded_metadata) |metadata| {
+                if (metadata.metadata_source == .supplied) {
+                    if (metadata.indexes_json) |value| {
+                        prepared_open.?.indexes_json = try cache.alloc.dupe(u8, value);
+                    }
+                    if (metadata.schema_json) |value| {
+                        prepared_open.?.schema_json = try cache.alloc.dupe(u8, value);
+                    }
+                }
+            } else if (try loadTableManagedMetadata(cache.alloc, self.catalog, table_name)) |metadata| {
+                prepared_open.?.indexes_json = metadata.indexes_json;
+                prepared_open.?.schema_json = metadata.schema_json;
+            }
+
+            const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
+            var retry_prepared_open = false;
+            var opened: ?db_mod.DB = while (true) {
+                const open_result: anyerror!db_mod.DB = if (consumeTestWriterOpenPersistentDescriptorFailure())
+                    error.PersistentDescriptorAdmissionExhausted
+                else if (prepared_open.?.indexes_json) |value|
+                    openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                        cache.alloc,
+                        path,
+                        value,
+                        cache.lsm_cache,
+                        cache.hbc_cache,
+                        lsm_root_generation,
+                        cache.resource_manager,
+                        mode,
+                        cache.backend_runtime,
+                        self.antfly_provider,
+                        self.secret_store,
+                        cache.remote_content,
+                        identity_namespace,
+                        .{
+                            .drain_resolver_backfill = false,
+                            .inference_api_url = self.inference_api_url,
+                            .ha_write_gate = self.ha_write_gate,
+                            .ha_async_effect_mirror = effective_ha_mirror,
+                            .ha_async_batch_mirror = effective_ha_mirror,
+                            .ha_async_metadata_mirror = effective_ha_mirror,
+                            .identity_validation = identity_validation,
+                        },
+                    )
+                else
+                    db_mod.DB.open(cache.alloc, path, .{
+                        .lsm_cache = cache.lsm_cache,
+                        .hbc_cache = cache.hbc_cache,
+                        .lsm_root_generation = lsm_root_generation,
+                        .resource_manager = cache.resource_manager,
+                        .backend_runtime = cache.backend_runtime,
+                        .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
+                        .identity_namespace = identity_namespace,
+                        .prefer_existing_identity_namespace = identity_namespace != null,
                         .ha_write_gate = self.ha_write_gate,
                         .ha_async_effect_mirror = effective_ha_mirror,
                         .ha_async_batch_mirror = effective_ha_mirror,
                         .ha_async_metadata_mirror = effective_ha_mirror,
-                        .identity_validation = identity_validation,
-                    },
-                )
-            else
-                db_mod.DB.open(cache.alloc, path, .{
-                    .lsm_cache = cache.lsm_cache,
-                    .hbc_cache = cache.hbc_cache,
-                    .lsm_root_generation = lsm_root_generation,
-                    .resource_manager = cache.resource_manager,
-                    .backend_runtime = cache.backend_runtime,
-                    .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
-                    .identity_namespace = identity_namespace,
-                    .prefer_existing_identity_namespace = identity_namespace != null,
-                    .ha_write_gate = self.ha_write_gate,
-                    .ha_async_effect_mirror = effective_ha_mirror,
-                    .ha_async_batch_mirror = effective_ha_mirror,
-                    .ha_async_metadata_mirror = effective_ha_mirror,
-                    .open_mode = switch (mode) {
-                        .default => .writer,
-                        .default_async, .writer_no_replay => .writer_no_replay,
-                        .startup_catch_up, .restore_repair => .writer_no_replay,
-                        .query_readonly => .query_readonly,
-                        .status_only => .status_only,
-                    },
-                    .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
-                    .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
-                    .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
-                    .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                    .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                    .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                });
+                        .open_mode = switch (mode) {
+                            .default => .writer,
+                            .default_async, .writer_no_replay => .writer_no_replay,
+                            .startup_catch_up, .restore_repair => .writer_no_replay,
+                            .query_readonly => .query_readonly,
+                            .status_only => .status_only,
+                        },
+                        .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
+                        .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
+                        .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
+                        .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                        .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                        .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                    });
 
-            const opened_value = open_result catch |err| switch (err) {
-                error.PersistentDescriptorAdmissionExhausted => {
-                    lockAtomic(&self.local_db_mutex);
-                    const evicted = cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name) catch |evict_err| {
+                const opened_value = open_result catch |err| switch (err) {
+                    error.PersistentDescriptorAdmissionExhausted => {
+                        lockAtomic(&self.local_db_mutex);
+                        const evicted = cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name) catch |evict_err| {
+                            self.local_db_mutex.unlock();
+                            return evict_err;
+                        };
                         self.local_db_mutex.unlock();
-                        return evict_err;
-                    };
-                    self.local_db_mutex.unlock();
-                    if (!evicted) return err;
+                        if (!evicted) {
+                            // The process pool is shared by the serving and startup
+                            // caches. Drop the currently-held open lock before the
+                            // coordinated slow path acquires both caches in address
+                            // order, then revalidate this prepared open after the
+                            // victim has synchronously released its lifetime FDs.
+                            cache.open_mutex.unlock();
+                            cache_open_locked = false;
+                            const cross_cache_evicted = self.reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
+                                cache,
+                                group_id,
+                                table_name,
+                            ) catch |reclaim_err| {
+                                lockAtomic(&cache.open_mutex);
+                                cache_open_locked = true;
+                                return reclaim_err;
+                            };
+                            lockAtomic(&cache.open_mutex);
+                            cache_open_locked = true;
+                            if (!cross_cache_evicted) return err;
+                            retry_prepared_open = true;
+                            break null;
+                        }
 
-                    // This path already owns cache.open_mutex. Close the
-                    // selected DB synchronously so its lifetime lock permits
-                    // are released before retrying the physical open.
-                    cache.drainPendingClosesAssumeOpenMutexHeld();
-                    continue;
-                },
-                else => return err,
+                        // This path already owns cache.open_mutex. Close the
+                        // selected DB synchronously so its lifetime lock permits
+                        // are released before retrying the physical open.
+                        cache.drainPendingClosesAssumeOpenMutexHeld();
+                        continue;
+                    },
+                    else => return err,
+                };
+                break opened_value;
             };
-            break opened_value;
-        };
-        defer if (opened) |*db| db.close();
-        if (local_persisted_metadata and prepared_open.?.schema_json == null) {
-            prepared_open.?.schema_json = (try loadLocalTableSchemaJson(cache.alloc, &opened.?)) orelse
-                return error.MissingLocalTableManifest;
-        }
-        try validateProvisionedDbIdentityNamespaceWithPolicy(
-            identity_namespace,
-            identity_validation,
-            &opened.?,
-        );
-
-        var cached = blk: {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            try cache.reserveRetiredEntriesCapacityLocked(1);
-            const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
-            if (mode == .default or mode == .default_async) {
-                adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
+            if (retry_prepared_open) continue :prepared_open_retry;
+            defer if (opened) |*db| db.close();
+            if (local_persisted_metadata and prepared_open.?.schema_json == null) {
+                prepared_open.?.schema_json = (try loadLocalTableSchemaJson(cache.alloc, &opened.?)) orelse
+                    return error.MissingLocalTableManifest;
             }
-            if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
-            break :blk adopted;
-        };
-        errdefer {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            cache.retireFailedOpenLocked(&cached);
+            try validateProvisionedDbIdentityNamespaceWithPolicy(
+                identity_namespace,
+                identity_validation,
+                &opened.?,
+            );
+
+            var cached = blk: {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                try cache.reserveRetiredEntriesCapacityLocked(1);
+                const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+                if (mode == .default or mode == .default_async) {
+                    adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
+                }
+                if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
+                break :blk adopted;
+            };
+            errdefer {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                cache.retireFailedOpenLocked(&cached);
+            }
+            // .default_async opens run on the raft apply thread
+            // (applyReplicatedBatchGroupLocal). Draining resolver backfill there
+            // blocks the raft loop on the promotion pipeline, whose cross-shard
+            // entity upserts need raft applies that are queued behind this very
+            // open — observed as a full apply wedge (batch writes timing out
+            // cluster-wide) in the multinode autograph e2e. The promotion and
+            // resolution workers started by this open drain the same backlog
+            // asynchronously instead.
+            if (managedDbOpenModeDrainsResolverBackfill(mode)) {
+                try cached.db.drainResolverBackfill();
+            }
+            // DB.open starts and resumes derived workers before the cache can
+            // attach its provisioned visibility hook. A short persisted replay
+            // tail can therefore finish during open and miss the post-watermark
+            // callback entirely. Seed the status cache once after hook attachment;
+            // later watermark advances continue to publish through the hook.
+            if (mode == .default or mode == .default_async) {
+                _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, cached.db);
+            }
+            return cached;
         }
-        // .default_async opens run on the raft apply thread
-        // (applyReplicatedBatchGroupLocal). Draining resolver backfill there
-        // blocks the raft loop on the promotion pipeline, whose cross-shard
-        // entity upserts need raft applies that are queued behind this very
-        // open — observed as a full apply wedge (batch writes timing out
-        // cluster-wide) in the multinode autograph e2e. The promotion and
-        // resolution workers started by this open drain the same backlog
-        // asynchronously instead.
-        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
-            try cached.db.drainResolverBackfill();
-        }
-        // DB.open starts and resumes derived workers before the cache can
-        // attach its provisioned visibility hook. A short persisted replay
-        // tail can therefore finish during open and miss the post-watermark
-        // callback entirely. Seed the status cache once after hook attachment;
-        // later watermark advances continue to publish through the hook.
-        if (mode == .default or mode == .default_async) {
-            _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, cached.db);
-        }
-        return cached;
     }
 
     fn getOrOpenCachedDbModeForReplicatedApply(
@@ -22727,6 +22823,91 @@ test "prepared writer open evicts an inactive sibling group before retrying desc
 
     try std.testing.expect(!(try cache.evictOneInactiveEntryForDescriptorPressureLocked(9999, "unrelated")));
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+}
+
+test "prepared writer open reclaims descriptor capacity from startup cache" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cross-cache-descriptor-pressure", .{tmp.sub_path});
+    defer alloc.free(root);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+    defer alloc.free(db_path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "docs", .indexes_json = tables_api.default_indexes_json },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, &startup_cache);
+
+    var victim = try startup_cache.getOrOpenLockedMode(
+        db_path,
+        Catalog.iface(),
+        7001,
+        1,
+        "docs",
+        .startup_catch_up,
+    );
+    victim.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
+
+    test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
+    defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
+    var active = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &write_cache,
+        db_path,
+        7001,
+        2,
+        "docs",
+        .default_async,
+        null,
+        null,
+        null,
+    );
+    defer active.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 7001), write_cache.entries.items[0].group_id);
+    try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
+    try std.testing.expectEqual(@as(usize, 0), startup_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
 }
 
 test "forwarded write sources use the local writer owner dirty lifecycle" {
