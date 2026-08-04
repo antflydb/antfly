@@ -8296,14 +8296,13 @@ fn executeDebertaFfnForwardLinear(
         traceDebertaFfnForwardLinearDecline("missing_input", input_id, weight_id, bias_id, base_add_id, rows, in_dim, out_dim, null);
         return null;
     };
-    const input = blk: {
-        if (try makeMetalDeviceResident(cb, input_raw)) |device_input| {
-            values[@intCast(input_id)] = device_input;
-            value_device[@intCast(input_id)] = device_id;
-            break :blk device_input;
-        }
-        break :blk input_raw;
-    };
+    // This region only needs a resident view for the dispatch. Replacing the
+    // graph slot would either drop the old slot ownership or require plumbing
+    // runtime-transfer ownership through this helper. Keep the promotion
+    // local and release only the temporary handle we own.
+    const resident_input = try temporaryMetalResidentValue(cb, input_raw);
+    defer resident_input.deinit(cb);
+    const input = resident_input.value;
     const base = (try cb.decoderRuntimeApplyLinear(&.{
         .slot = prepared_slot,
         .input = input,

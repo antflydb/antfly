@@ -5833,6 +5833,23 @@ int termite_metal_decode_runtime_force_planned_compute_barrier(termite_metal_dec
     return 0;
 }
 
+// A shared planned encoder can use MTLDispatchTypeConcurrent. Range tracking
+// orders this fused call against neighboring calls, while an explicit barrier
+// is still required between dispatches inside the call when a later kernel
+// reads an intermediate written by an earlier kernel.
+static void termite_metal_concurrent_planned_dependency_barrier(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    BOOL encoder_owned
+) {
+    if (runtime == NULL || encoder == nil || encoder_owned || !termite_metal_concurrent_planned_dispatch_enabled()) return;
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    runtime->active_frame_planned_barrier_count += 1;
+    if (termite_metal_planned_access_profile_enabled()) {
+        runtime->active_frame_planned_access_barriers += 1;
+    }
+}
+
 static int termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(
     termite_metal_decode_runtime *runtime,
     id<MTLBuffer> input_buffer,
@@ -27398,6 +27415,18 @@ int termite_metal_decode_runtime_lora_linear_f32_device(
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, after_b_buffer) != 0) return -7;
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, output_buffer) != 0) return -7;
         }
+        termite_metal_planned_encoder_range accesses[7];
+        if (termite_metal_planned_range_make(input_buffer, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -8) != 0 ||
+            termite_metal_planned_range_make(base_buffer, base_offset, base_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -8) != 0 ||
+            termite_metal_planned_range_make(lora_a_buffer, lora_a_offset, a_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -8) != 0 ||
+            termite_metal_planned_range_make(lora_b_buffer, lora_b_offset, b_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -8) != 0 ||
+            termite_metal_planned_range_make(after_a_buffer, after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -8) != 0 ||
+            termite_metal_planned_range_make(after_b_buffer, after_b_offset, after_b_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -8) != 0 ||
+            termite_metal_planned_range_make(output_buffer, output_offset, base_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[6], -8) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 7, -8) != 0)
+        {
+            return -8;
+        }
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR, &encoder_owned);
         if (encoder == nil) return -8;
@@ -27424,6 +27453,7 @@ int termite_metal_decode_runtime_lora_linear_f32_device(
         const size_t total_after_a = rows * rank;
         [encoder dispatchThreads:MTLSizeMake(total_after_a, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_after_a_f32_pipeline, total_after_a), 1, 1)];
+        termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         [encoder setComputePipelineState:runtime->lora_finish_f32_pipeline];
         [encoder setBuffer:base_buffer offset:base_offset atIndex:0];
         [encoder setBuffer:after_a_buffer offset:after_a_offset atIndex:1];
@@ -27508,6 +27538,18 @@ int termite_metal_decode_runtime_lora_backward_f32_device(
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_a_buffer) != 0) return -8;
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_b_buffer) != 0) return -8;
         }
+        termite_metal_planned_encoder_range accesses[7];
+        if (termite_metal_planned_range_make(input_buffer, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+            termite_metal_planned_range_make(after_a_buffer, after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
+            termite_metal_planned_range_make(lora_b_buffer, lora_b_offset, b_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -9) != 0 ||
+            termite_metal_planned_range_make(output_grad_buffer, output_grad_offset, output_grad_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -9) != 0 ||
+            termite_metal_planned_range_make(grad_after_a_buffer, grad_after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -9) != 0 ||
+            termite_metal_planned_range_make(grad_a_buffer, grad_a_offset, grad_a_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -9) != 0 ||
+            termite_metal_planned_range_make(grad_b_buffer, grad_b_offset, grad_b_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[6], -9) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 7, -9) != 0)
+        {
+            return -9;
+        }
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR, &encoder_owned);
         if (encoder == nil) return -9;
@@ -27527,6 +27569,7 @@ int termite_metal_decode_runtime_lora_backward_f32_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(total_after_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         const size_t total_grad_a = rank * in_dim;
         [encoder setComputePipelineState:runtime->lora_grad_a_f32_pipeline];
         [encoder setBuffer:grad_after_a_buffer offset:grad_after_a_offset atIndex:0];
@@ -27595,6 +27638,16 @@ int termite_metal_decode_runtime_lora_backward_b_f32_device(
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, output_grad_buffer) != 0) return -8;
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_after_a_buffer) != 0) return -8;
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_b_transposed_buffer) != 0) return -8;
+        }
+        termite_metal_planned_encoder_range accesses[5];
+        if (termite_metal_planned_range_make(after_a_buffer, after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+            termite_metal_planned_range_make(lora_b_buffer, lora_b_offset, b_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
+            termite_metal_planned_range_make(output_grad_buffer, output_grad_offset, output_grad_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -9) != 0 ||
+            termite_metal_planned_range_make(grad_after_a_buffer, grad_after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -9) != 0 ||
+            termite_metal_planned_range_make(grad_b_transposed_buffer, grad_b_transposed_offset, grad_b_transposed_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -9) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 5, -9) != 0)
+        {
+            return -9;
         }
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR, &encoder_owned);
@@ -27688,6 +27741,18 @@ int termite_metal_decode_runtime_lora_backward_rank1_f32_device(
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_a_buffer) != 0) return -8;
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_b_buffer) != 0) return -8;
         }
+        termite_metal_planned_encoder_range accesses[7];
+        if (termite_metal_planned_range_make(input_buffer, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+            termite_metal_planned_range_make(after_a_buffer, after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
+            termite_metal_planned_range_make(lora_b_buffer, lora_b_offset, b_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -9) != 0 ||
+            termite_metal_planned_range_make(output_grad_buffer, output_grad_offset, output_grad_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -9) != 0 ||
+            termite_metal_planned_range_make(grad_after_a_buffer, grad_after_a_offset, after_a_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -9) != 0 ||
+            termite_metal_planned_range_make(grad_a_buffer, grad_a_offset, grad_a_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -9) != 0 ||
+            termite_metal_planned_range_make(grad_b_buffer, grad_b_offset, grad_b_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[6], -9) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 7, -9) != 0)
+        {
+            return -9;
+        }
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR, &encoder_owned);
         if (encoder == nil) return -9;
@@ -27701,6 +27766,7 @@ int termite_metal_decode_runtime_lora_backward_rank1_f32_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:5];
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(total_fused, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         [encoder setComputePipelineState:runtime->lora_grad_a_f32_pipeline];
         [encoder setBuffer:grad_after_a_buffer offset:grad_after_a_offset atIndex:0];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:1];

@@ -2589,7 +2589,7 @@ fn fillInferenceBuffers(
     const first_pos = first_pos_buf[0..seq_len];
     const e_pos = e_tok_pos_buf[0..entity_types.len];
     const e_end = e_tok_end_buf[0..entity_types.len];
-    _ = tokenizer.encodeInto(allocator, text, entity_types, tok_ids, tok_mask, words_mask, first_pos, e_pos, e_end);
+    _ = try tokenizer.encodeInto(allocator, text, entity_types, tok_ids, tok_mask, words_mask, first_pos, e_pos, e_end);
 
     @memset(targets, 0.0);
     for (0..seq_len) |idx| {

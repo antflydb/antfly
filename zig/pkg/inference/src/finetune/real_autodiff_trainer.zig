@@ -1750,8 +1750,21 @@ pub const RealAutodiffTrainer = struct {
                     .v = try self.downloadTrainingStateTensor(owned_data, device.v),
                 };
             } else {
-                const state = self.optimizer_state.param_states.get(slot.name) orelse return error.MissingOptimizerState;
-                moments = .{ .m = state.m, .v = state.v };
+                if (self.optimizer_state.param_states.get(slot.name)) |state| {
+                    moments = .{ .m = state.m, .v = state.v };
+                } else {
+                    // Adam state is created lazily on the first host step.
+                    // Conditional task-head families mirror torch grad=None:
+                    // a family that never appeared has no optimizer state and
+                    // a per-parameter step of zero. Persist explicit zero
+                    // moments so the checkpoint remains self-contained and
+                    // can create that state normally when it is restored.
+                    if (slot.adam_step_count != 0) return error.MissingOptimizerState;
+                    moments = .{
+                        .m = try self.allocTrainingStateZeros(owned_data, slot.weights.len),
+                        .v = try self.allocTrainingStateZeros(owned_data, slot.weights.len),
+                    };
+                }
             }
             if (weights.len != slot.weights.len or moments.m.len != slot.weights.len or moments.v.len != slot.weights.len) {
                 return error.CheckpointSizeMismatch;
@@ -1772,6 +1785,18 @@ pub const RealAutodiffTrainer = struct {
         const values = try self.allocator.alloc(f32, 1);
         errdefer self.allocator.free(values);
         values[0] = @floatFromInt(value);
+        try owned_data.append(self.allocator, values);
+        return values;
+    }
+
+    fn allocTrainingStateZeros(
+        self: *RealAutodiffTrainer,
+        owned_data: *std.ArrayListUnmanaged([]f32),
+        len: usize,
+    ) ![]f32 {
+        const values = try self.allocator.alloc(f32, len);
+        errdefer self.allocator.free(values);
+        @memset(values, 0.0);
         try owned_data.append(self.allocator, values);
         return values;
     }
@@ -3483,6 +3508,51 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     try testing.expectEqual(@as(u64, 3), trainer.optimizerSteps());
     try testing.expectEqual(@as(u32, 3), restored.step_count);
     try testing.expectEqual(@as(u32, 3), trainer.lora_params.items[0].adam_step_count);
+}
+
+test "RealAutodiffTrainer: checkpoint persists zero Adam state for a never-stepped conditional family" {
+    const allocator = testing.allocator;
+    const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
+    var trainer = try RealAutodiffTrainer.init(allocator, dummy_cb, .{
+        .lora = .{ .rank = 1, .alpha = 1.0, .target_patterns = &.{"classifier"} },
+    });
+    defer trainer.deinit();
+
+    try trainer.registerConditionalOptimizerFamily("classifier.");
+    const weights = try allocator.dupe(f32, &.{ 1.0, -2.0 });
+    const grad_accum = try allocator.alloc(f32, weights.len);
+    @memset(grad_accum, 0.0);
+    const dims = try allocator.dupe(i32, &.{2});
+    const name = try allocator.dupe(u8, "classifier.0.weight.lora_A");
+    trainer.lora_params.append(allocator, .{
+        .name = name,
+        .weights = weights,
+        .grad_accum = grad_accum,
+        .node_id = null_node,
+        .dims = dims,
+    }) catch |err| {
+        allocator.free(name);
+        allocator.free(weights);
+        allocator.free(grad_accum);
+        allocator.free(dims);
+        return err;
+    };
+    // The family never appeared, so the host optimizer correctly has no
+    // lazily-created ParamState for this slot.
+    try testing.expect(trainer.optimizer_state.param_states.get(name) == null);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/never_stepped.safetensors", .{tmp.sub_path});
+    defer allocator.free(path);
+    try trainer.saveTrainingState(path, null, null);
+
+    try trainer.loadTrainingState(path, null);
+    const restored = trainer.optimizer_state.param_states.get(name).?;
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0 }, restored.m);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0 }, restored.v);
+    try testing.expectEqual(@as(u32, 0), restored.step_count);
+    try testing.expectEqual(@as(u32, 0), trainer.lora_params.items[0].adam_step_count);
 }
 
 test "RealAutodiffTrainer: training state without per-slot adam steps falls back to the optimizer step count" {

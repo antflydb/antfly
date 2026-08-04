@@ -1584,7 +1584,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             var batch_has_nonentity_structure = false;
             switch (opts.objective) {
                 .token => {
-                    target_stats = fillBatchBuffers(
+                    target_stats = try fillBatchBuffers(
                         allocator,
                         &tokenizer,
                         entity_types,
@@ -3177,7 +3177,7 @@ fn prepareTrainerInputForBatch(
     var target_slice: []const f32 = undefined;
     switch (opts.objective) {
         .token => {
-            _ = fillBatchBuffers(
+            _ = try fillBatchBuffers(
                 allocator,
                 tokenizer,
                 entity_types,
@@ -4067,7 +4067,7 @@ fn fillBatchBuffers(
     input_ids: []i64,
     attention_mask: []f32,
     targets: []f32,
-) BatchTargetStats {
+) !BatchTargetStats {
     const sl: usize = seq_len;
     const nc: usize = num_classes;
     var stats = BatchTargetStats{ .entity_type_count = entity_types.len };
@@ -4092,7 +4092,7 @@ fn fillBatchBuffers(
         const e_pos = e_tok_pos_buf[0..@min(entity_types.len, e_tok_pos_buf.len)];
         const e_end = e_tok_end_buf[0..@min(entity_types.len, e_tok_end_buf.len)];
 
-        const result = tokenizer.encodeInto(
+        const result = try tokenizer.encodeInto(
             allocator,
             example.text,
             entity_types,

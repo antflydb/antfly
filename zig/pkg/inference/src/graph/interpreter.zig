@@ -287,6 +287,12 @@ fn containsCt(values: []const CT, needle: CT) bool {
     return false;
 }
 
+fn nullCtAliases(values: []?CT, needle: CT) void {
+    for (values) |*value| {
+        if (value.* == needle) value.* = null;
+    }
+}
+
 fn graphExecTraceEnabled() bool {
     const value = platform.env.getenv("TERMITE_GRAPH_EXEC_TRACE") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
@@ -628,8 +634,6 @@ pub fn execute(
     const donated_values = try allocator.alloc(bool, count);
     defer allocator.free(donated_values);
     @memset(donated_values, false);
-    var freed_values = std.ArrayListUnmanaged(CT).empty;
-    defer freed_values.deinit(allocator);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
             if (ri.node_id >= count) continue;
@@ -799,9 +803,12 @@ pub fn execute(
                             continue;
                         }
                     }
+                    // Clear every alias before releasing the handle. Keeping
+                    // raw addresses of already-freed handles is ABA-unsafe:
+                    // the allocator may recycle an address for a later live
+                    // tensor during this same execution.
+                    nullCtAliases(values, ct);
                     cb.free(ct);
-                    try freed_values.append(allocator, ct);
-                    values[input_id] = null;
                 }
             }
         }
@@ -847,7 +854,6 @@ pub fn execute(
     //    graph nodes, and ExecutionResult owns that handle until deinit.
     for (0..count) |i| {
         if (values[i] == null) continue;
-        if (containsCt(freed_values.items, values[i].?)) continue;
         if (containsCt(outputs, values[i].?)) continue;
         // Skip output nodes — caller frees via ExecutionResult.deinit
         var is_output = false;
@@ -863,7 +869,9 @@ pub fn execute(
         if (rt_values[i] != null and !donated_values[i]) continue;
         // Free any remaining handles (parameters, donated inputs, or
         // intermediates that weren't caught by liveness-based freeing)
-        cb.free(values[i].?);
+        const ct = values[i].?;
+        nullCtAliases(values, ct);
+        cb.free(ct);
     }
 
     // 8. Free MoE routing state from the last layer.
@@ -3616,6 +3624,19 @@ test "computeReachable skips vjp_alternate subgraph" {
         if (r) reachable_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 4), reachable_count);
+}
+
+test "nullCtAliases clears every slot for a released handle" {
+    const first: CT = @ptrFromInt(0x1000);
+    const second: CT = @ptrFromInt(0x2000);
+    var values = [_]?CT{ first, second, first, null };
+
+    nullCtAliases(&values, first);
+
+    try std.testing.expect(values[0] == null);
+    try std.testing.expect(values[1] == second);
+    try std.testing.expect(values[2] == null);
+    try std.testing.expect(values[3] == null);
 }
 
 test "computeLastUse tracks dependencies" {

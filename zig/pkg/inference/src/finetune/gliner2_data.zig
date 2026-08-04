@@ -394,7 +394,7 @@ pub const Tokenizer = struct {
         first_token_positions: []i32,
         e_token_positions: []i32,
         e_token_end_positions: []i32,
-    ) EncodeIntoResult {
+    ) !EncodeIntoResult {
         @memset(input_ids, 0);
         @memset(attention_mask, 0);
         @memset(words_mask, 0);
@@ -405,14 +405,14 @@ pub const Tokenizer = struct {
         const max_length = input_ids.len;
         var pos: usize = 0;
         if (self.use_gliner2_hf_prompt) {
-            pos = self.encodeHFFragmentIntoAllocating(allocator, "(", input_ids, attention_mask, pos, max_length) catch pos;
+            pos = try self.encodeHFFragmentIntoAllocating(allocator, "(", input_ids, attention_mask, pos, max_length);
             if (pos < max_length) {
                 input_ids[pos] = self.p_token_id;
                 attention_mask[pos] = 1;
                 pos += 1;
             }
-            pos = self.encodeHFFragmentIntoAllocating(allocator, "entities", input_ids, attention_mask, pos, max_length) catch pos;
-            pos = self.encodeHFFragmentIntoAllocating(allocator, "(", input_ids, attention_mask, pos, max_length) catch pos;
+            pos = try self.encodeHFFragmentIntoAllocating(allocator, "entities", input_ids, attention_mask, pos, max_length);
+            pos = try self.encodeHFFragmentIntoAllocating(allocator, "(", input_ids, attention_mask, pos, max_length);
 
             for (entity_types, 0..) |entity_type, i| {
                 if (pos >= max_length) break;
@@ -421,7 +421,7 @@ pub const Tokenizer = struct {
                 pos += 1;
                 if (pos >= max_length) break;
                 const label_start = pos - 1;
-                const new_pos = self.encodeHFFragmentIntoAllocating(allocator, entity_type, input_ids, attention_mask, pos, max_length) catch pos;
+                const new_pos = try self.encodeHFFragmentIntoAllocating(allocator, entity_type, input_ids, attention_mask, pos, max_length);
                 if (new_pos >= max_length and i + 1 < entity_types.len) {
                     break;
                 }
@@ -429,8 +429,8 @@ pub const Tokenizer = struct {
                 e_token_positions[i] = @intCast(label_start);
                 e_token_end_positions[i] = @intCast(pos);
             }
-            pos = self.encodeHFFragmentIntoAllocating(allocator, ")", input_ids, attention_mask, pos, max_length) catch pos;
-            pos = self.encodeHFFragmentIntoAllocating(allocator, ")", input_ids, attention_mask, pos, max_length) catch pos;
+            pos = try self.encodeHFFragmentIntoAllocating(allocator, ")", input_ids, attention_mask, pos, max_length);
+            pos = try self.encodeHFFragmentIntoAllocating(allocator, ")", input_ids, attention_mask, pos, max_length);
 
             if (pos < max_length) {
                 input_ids[pos] = self.sep_text_token_id;
@@ -444,9 +444,9 @@ pub const Tokenizer = struct {
                 if (num_words_hf >= first_token_positions.len) break;
                 if (pos >= max_length) break;
                 first_token_positions[num_words_hf] = @intCast(pos);
-                const lower_word = std.ascii.allocLowerString(allocator, word) catch break;
+                const lower_word = try std.ascii.allocLowerString(allocator, word);
                 defer allocator.free(lower_word);
-                const next_pos = self.encodeHFFragmentIntoAllocating(allocator, lower_word, input_ids, attention_mask, pos, max_length) catch pos;
+                const next_pos = try self.encodeHFFragmentIntoAllocating(allocator, lower_word, input_ids, attention_mask, pos, max_length);
                 if (next_pos == pos) break;
                 for (pos..next_pos) |token_pos| words_mask[token_pos] = @intCast(num_words_hf + 1);
                 pos = next_pos;
@@ -456,7 +456,7 @@ pub const Tokenizer = struct {
             const needs_period = trimmed_text.len == 0 or !(trimmed_text[trimmed_text.len - 1] == '.' or trimmed_text[trimmed_text.len - 1] == '!' or trimmed_text[trimmed_text.len - 1] == '?');
             if (needs_period and num_words_hf < first_token_positions.len and pos < max_length) {
                 first_token_positions[num_words_hf] = @intCast(pos);
-                const next_pos = self.encodeHFFragmentIntoAllocating(allocator, ".", input_ids, attention_mask, pos, max_length) catch pos;
+                const next_pos = try self.encodeHFFragmentIntoAllocating(allocator, ".", input_ids, attention_mask, pos, max_length);
                 if (next_pos != pos) {
                     for (pos..next_pos) |token_pos| words_mask[token_pos] = @intCast(num_words_hf + 1);
                     pos = next_pos;
@@ -1749,7 +1749,7 @@ fn measureSimpleExampleEncoding(
     const e_token_end_positions = try allocator.alloc(i32, entity_types.len);
     defer allocator.free(e_token_end_positions);
 
-    const encoded = tokenizer.encodeInto(
+    const encoded = try tokenizer.encodeInto(
         allocator,
         example.text,
         entity_types,
@@ -1828,7 +1828,7 @@ pub fn buildSimpleBatchInto(
         const input_offset = b * workspace.max_length;
         const ftp_offset = b * workspace.max_words_per_sample;
         const e_offset = b * workspace.num_entity_types;
-        const encode_result = tokenizer.encodeInto(
+        const encode_result = try tokenizer.encodeInto(
             workspace.allocator,
             ex.text,
             entity_types,
@@ -4244,6 +4244,70 @@ test "build simple gliner2 batch" {
     try std.testing.expectEqual(@as(usize, 1), batch.batch_size);
     try std.testing.expect(batch.input_ids.len == 64);
     try std.testing.expect(batch.span_labels.len == batch.max_spans * entity_types.len);
+}
+
+test "GLiNER2 HF prompt encoding propagates entity-label normalizer failures" {
+    const allocator = std.testing.allocator;
+    var tokenizer = Tokenizer{
+        .use_gliner2_hf_prompt = true,
+        .hf_normalizer_contract = .pinned_fastino_unicode15,
+    };
+    defer tokenizer.deinit(allocator);
+
+    var input_ids: [64]i32 = undefined;
+    var attention_mask: [64]i32 = undefined;
+    var words_mask: [64]i32 = undefined;
+    var first_token_positions: [16]i32 = undefined;
+    var e_token_positions: [1]i32 = undefined;
+    var e_token_end_positions: [1]i32 = undefined;
+    const entity_types = [_][]const u8{"cafe\u{0301}"};
+
+    try std.testing.expectError(
+        error.UnsupportedTokenizerNormalization,
+        tokenizer.encodeInto(
+            allocator,
+            "plain text",
+            &entity_types,
+            &input_ids,
+            &attention_mask,
+            &words_mask,
+            &first_token_positions,
+            &e_token_positions,
+            &e_token_end_positions,
+        ),
+    );
+}
+
+test "GLiNER2 HF prompt encoding propagates text normalizer failures" {
+    const allocator = std.testing.allocator;
+    var tokenizer = Tokenizer{
+        .use_gliner2_hf_prompt = true,
+        .hf_normalizer_contract = .pinned_fastino_unicode15,
+    };
+    defer tokenizer.deinit(allocator);
+
+    var input_ids: [64]i32 = undefined;
+    var attention_mask: [64]i32 = undefined;
+    var words_mask: [64]i32 = undefined;
+    var first_token_positions: [16]i32 = undefined;
+    var e_token_positions: [1]i32 = undefined;
+    var e_token_end_positions: [1]i32 = undefined;
+    const entity_types = [_][]const u8{"person"};
+
+    try std.testing.expectError(
+        error.UnsupportedTokenizerNormalization,
+        tokenizer.encodeInto(
+            allocator,
+            "cafe\u{0301} remains visible",
+            &entity_types,
+            &input_ids,
+            &attention_mask,
+            &words_mask,
+            &first_token_positions,
+            &e_token_positions,
+            &e_token_end_positions,
+        ),
+    );
 }
 
 test "decode gliner2 span predictions from score grid" {

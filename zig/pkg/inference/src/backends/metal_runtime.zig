@@ -3980,7 +3980,14 @@ pub fn decoderRuntimeFfnGeluBackwardChainF32Device(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        first.deinit();
+        second_branch.deinit();
+        upstream.deinit();
+        gelu.deinit();
+        output.deinit();
+        return null;
+    }
     return .{
         .first = first,
         .second_branch = second_branch,
@@ -4058,7 +4065,12 @@ pub fn decoderRuntimeFfnGeluBackwardOutputF32Device(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        first.deinit();
+        gelu.deinit();
+        output.deinit();
+        return null;
+    }
     return .{ .first = first, .gelu = gelu, .output = output };
 }
 
@@ -4164,7 +4176,10 @@ pub fn decoderRuntimeMaskedBceWithLogitsLossDevice(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4204,7 +4219,10 @@ pub fn decoderRuntimeMaskedBceWithLogitsBackwardDevice(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4464,7 +4482,10 @@ pub fn decoderRuntimeGatherAxis0AddBiasF32_2DDevice(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4929,7 +4950,10 @@ pub fn decoderRuntimeDisentangledRelativeAttentionBackwardF32Device(self: anytyp
         packed_out.deviceHandle(),
         base + (3 * total + rel_total) * f,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        packed_out.deinit();
+        return null;
+    }
     return packed_out;
 }
 
@@ -5216,7 +5240,10 @@ pub fn decoderRuntimeDotGeneralRank1F32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -5285,7 +5312,12 @@ pub fn decoderRuntimeLoraLinearF32Device(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        after_a.deinit();
+        after_b.deinit();
+        output.deinit();
+        return null;
+    }
     return .{
         .after_a = after_a,
         .after_b = after_b,
@@ -5365,7 +5397,12 @@ pub fn decoderRuntimeLoraLinearBackwardF32Device(
             grad_b.deviceHandle(),
             grad_b.deviceByteOffset(),
         );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        grad_after_a.deinit();
+        grad_a.deinit();
+        grad_b.deinit();
+        return null;
+    }
     return .{
         .grad_after_a = grad_after_a,
         .grad_a = grad_a,
@@ -5412,7 +5449,11 @@ pub fn decoderRuntimeLoraLinearBackwardBF32Device(
         grad_b_transposed.deviceHandle(),
         grad_b_transposed.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        grad_after_a.deinit();
+        grad_b_transposed.deinit();
+        return null;
+    }
     return .{
         .grad_after_a = grad_after_a,
         .grad_b_transposed = grad_b_transposed,
@@ -5490,7 +5531,10 @@ pub fn decoderRuntimeScatterAddAxis0F32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -5684,7 +5728,10 @@ pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: Met
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 

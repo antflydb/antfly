@@ -143,7 +143,7 @@ fn fillBatchBuffers(
     input_ids: []i64,
     attention_mask: []f32,
     targets: []f32,
-) BatchTargetStats {
+) !BatchTargetStats {
     const sl: usize = seq_len;
     const nc: usize = num_classes;
     var stats = BatchTargetStats{};
@@ -166,7 +166,7 @@ fn fillBatchBuffers(
         const e_pos = e_tok_pos_buf[0..@min(entity_types.len, e_tok_pos_buf.len)];
         const e_end = e_tok_end_buf[0..@min(entity_types.len, e_tok_end_buf.len)];
 
-        const result = tokenizer.encodeInto(
+        const result = try tokenizer.encodeInto(
             allocator,
             example.text,
             entity_types,
@@ -254,7 +254,7 @@ fn decodeFixedTextTopEntity(
     var infer_input_ids: [SEQ_LEN]i64 = undefined;
     var infer_attention_mask: [SEQ_LEN]f32 = undefined;
     var infer_targets: [SEQ_LEN * NUM_CLASSES]f32 = undefined;
-    const infer_stats = fillBatchBuffers(
+    const infer_stats = try fillBatchBuffers(
         allocator,
         tokenizer,
         entity_types,
@@ -382,7 +382,7 @@ fn ensureFixedTextGraphBuilt(
     var infer_input_ids: [SEQ_LEN]i64 = undefined;
     var infer_attention_mask: [SEQ_LEN]f32 = undefined;
     var infer_targets: [SEQ_LEN * NUM_CLASSES]f32 = undefined;
-    const infer_stats = fillBatchBuffers(
+    const infer_stats = try fillBatchBuffers(
         allocator,
         tokenizer,
         entity_types,
@@ -657,7 +657,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
         padded_examples[i] = examples[i % examples.len];
     }
 
-    const target_stats = fillBatchBuffers(
+    const target_stats = try fillBatchBuffers(
         allocator,
         &tokenizer,
         entity_types,

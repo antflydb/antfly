@@ -35,6 +35,8 @@ Metal sibling additionally skips off macOS.
 Environment overrides:
     TERMITE_GLINER2_PARITY_MODEL_DIR   (default: /private/tmp/termite-models/gliner2)
     TERMITE_GLINER2_PARITY_PYTHON     (default: /private/tmp/gliner2-parity-venv/bin/python)
+    TERMITE_GLINER2_PARITY_UPSTREAM_SOURCE (default: /private/tmp/gliner2-oracle)
+    TERMITE_GLINER2_REQUIRE_PARITY     fail collection instead of skipping when prerequisites are absent
 """
 
 from __future__ import annotations
@@ -89,6 +91,8 @@ FULL_TASK_PARITY_FIXTURES = [
 
 MODEL_DIR = Path(os.environ.get("TERMITE_GLINER2_PARITY_MODEL_DIR", "/private/tmp/termite-models/gliner2"))
 PARITY_PYTHON = Path(os.environ.get("TERMITE_GLINER2_PARITY_PYTHON", "/private/tmp/gliner2-parity-venv/bin/python"))
+UPSTREAM_SOURCE = Path(os.environ.get("TERMITE_GLINER2_PARITY_UPSTREAM_SOURCE", "/private/tmp/gliner2-oracle"))
+REQUIRE_PARITY = os.environ.get("TERMITE_GLINER2_REQUIRE_PARITY", "").strip().lower() not in {"", "0", "false", "no"}
 
 
 def _skip_reason() -> str | None:
@@ -96,6 +100,8 @@ def _skip_reason() -> str | None:
         return f"GLiNER2 model bundle not found at {MODEL_DIR}"
     if not PARITY_PYTHON.exists():
         return f"parity Python environment not found at {PARITY_PYTHON}"
+    if not (UPSTREAM_SOURCE / ".git").exists():
+        return f"pinned GLiNER2 upstream checkout not found at {UPSTREAM_SOURCE}"
     if shutil.which("zig") is None:
         return "zig compiler not on PATH"
     if not COMPARE_SCRIPT.exists():
@@ -106,6 +112,8 @@ def _skip_reason() -> str | None:
 
 
 _reason = _skip_reason()
+if REQUIRE_PARITY and _reason is not None:
+    raise RuntimeError(f"GLiNER2 Python/Zig parity was required but cannot run: {_reason}")
 pytestmark = [
     pytest.mark.skipif(_reason is not None, reason=_reason or ""),
     pytest.mark.slow,
@@ -123,6 +131,7 @@ def test_gliner2_lora_python_zig_strict_parity(tmp_path: Path):
         "--model-dir", str(MODEL_DIR),
         "--python-model", str(MODEL_DIR),
         "--python-bin", str(PARITY_PYTHON),
+        "--upstream-source", str(UPSTREAM_SOURCE),
         "--train-data", str(TRAIN_FIXTURE),
         "--out-dir", str(out_dir),
         "--zig-objective", "gliner2-total-loss",
@@ -215,6 +224,7 @@ def test_gliner2_lora_metal_strict_parity(tmp_path: Path):
         "--model-dir", str(MODEL_DIR),
         "--python-model", str(MODEL_DIR),
         "--python-bin", str(PARITY_PYTHON),
+        "--upstream-source", str(UPSTREAM_SOURCE),
         "--train-data", str(TRAIN_FIXTURE),
         "--out-dir", str(out_dir),
         "--zig-objective", "gliner2-total-loss",
@@ -299,6 +309,7 @@ def test_gliner2_lora_metal_full_task_strict_parity(
         "--model-dir", str(MODEL_DIR),
         "--python-model", str(MODEL_DIR),
         "--python-bin", str(PARITY_PYTHON),
+        "--upstream-source", str(UPSTREAM_SOURCE),
         "--train-data", str(fixture),
         "--out-dir", str(out_dir),
         "--zig-objective", "gliner2-total-loss",
@@ -391,6 +402,7 @@ def test_gliner2_lora_all_task_multi_step_roundtrip(tmp_path: Path):
         "--model-dir", str(MODEL_DIR),
         "--python-model", str(MODEL_DIR),
         "--python-bin", str(PARITY_PYTHON),
+        "--upstream-source", str(UPSTREAM_SOURCE),
         "--train-data", str(fixture),
         "--out-dir", str(out_dir),
         "--zig-objective", "gliner2-total-loss",
@@ -488,6 +500,7 @@ def test_gliner2_lora_full_task_strict_parity(
         "--model-dir", str(MODEL_DIR),
         "--python-model", str(MODEL_DIR),
         "--python-bin", str(PARITY_PYTHON),
+        "--upstream-source", str(UPSTREAM_SOURCE),
         "--train-data", str(fixture),
         "--out-dir", str(out_dir),
         "--zig-objective", "gliner2-total-loss",

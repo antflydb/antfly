@@ -6523,7 +6523,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return err,
         };
-        errdefer input_tensor.deinit();
+        var input_tensor_owned = true;
+        errdefer if (input_tensor_owned) input_tensor.deinit();
         if (!input_tensor.isDevice()) {
             input_tensor.deinit();
             if (trace) std.debug.print("metal_reduce_prim: decline=full2d_not_device op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
@@ -6537,6 +6538,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         const input_ct = try self.ctFromOwnedMetalTensor(input_tensor);
+        input_tensor_owned = false;
         defer freeOp(self, input_ct);
         _ = try self.withLogicalShape(input_ct, input_shape);
 
