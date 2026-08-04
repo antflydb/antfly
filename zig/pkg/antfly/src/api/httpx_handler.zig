@@ -1950,10 +1950,7 @@ pub const AntflyApiHandler = struct {
             }
             std.log.debug("create table request rejected: {} body_len={d}", .{ err, body_data.len });
             _ = ctx.status(400);
-            if (err == error.InvalidCreateTableSchemaRequest) {
-                return ctx.text(table_contract.createTableRequestErrorMessage(body_data));
-            }
-            return ctx.text("invalid create table request");
+            return ctx.text(table_contract.createTableRequestErrorMessage(err, body_data));
         };
         defer create_req.deinit(alloc);
         const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -2283,8 +2280,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
-        const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(body_data);
-        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch {
+        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
+        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |err| {
+            invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
             _ = ctx.status(400);
             return ctx.text(invalid_schema_message);
         };

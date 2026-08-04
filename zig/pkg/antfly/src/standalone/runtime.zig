@@ -1603,7 +1603,10 @@ pub fn runFromIterator(
         ),
     });
     if (node_backend_runtime.ptr().io()) |io| antfly_node.attachIo(io);
-    try antfly_node.warmConfiguredModels(alloc);
+    antfly_node.warmConfiguredModels(alloc) catch |err| {
+        std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
+        return err;
+    };
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.

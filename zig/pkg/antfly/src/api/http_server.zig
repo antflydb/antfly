@@ -5835,10 +5835,7 @@ pub const ApiHttpServer = struct {
                         return err;
                     }
                     std.log.debug("create table request rejected: {} body_len={d}", .{ err, req.body.len });
-                    if (err == error.InvalidCreateTableSchemaRequest) {
-                        return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(req.body));
-                    }
-                    return try textResponse(self.alloc, 400, "invalid create table request");
+                    return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, req.body));
                 };
                 defer create_req.deinit(self.alloc);
                 const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -5974,8 +5971,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
                 defer self.alloc.free(table_name);
-                const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(req.body);
-                const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
+                var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, req.body);
+                const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch |err| {
+                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, req.body);
                     return try textResponse(self.alloc, 400, invalid_schema_message);
                 };
                 defer self.alloc.free(schema_json);
@@ -24263,6 +24261,16 @@ test "api http server updates local table schema through bound write source" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
 
+    var managed_version_resp = try server.handle(.{
+        .method = .PUT,
+        .uri = "/tables/docs/schema",
+        .content_type = "application/json",
+        .body = "{\"version\":7}",
+    });
+    defer managed_version_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), managed_version_resp.status);
+    try std.testing.expectEqualStrings("schema.version is managed by Antfly; omit it", managed_version_resp.body);
+
     const schema_body = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}}}}}}";
     var update_resp = try server.handle(.{
         .method = .PUT,
@@ -28328,6 +28336,45 @@ test "api http server rejects unsupported table index before metadata publicatio
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqual(@as(usize, 0), source.create_calls);
+}
+
+test "api http server rejects caller-managed schema version before metadata publication" {
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = "{\"schema\":{\"version\":7}}",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("schema.version is managed by Antfly; omit it", resp.body);
     try std.testing.expectEqual(@as(usize, 0), source.create_calls);
 }
 

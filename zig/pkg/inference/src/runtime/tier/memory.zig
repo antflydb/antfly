@@ -559,6 +559,9 @@ pub const AdmissionController = struct {
     live_mutex: std.atomic.Mutex = .unlocked,
     live_capacity_bytes: usize = 0,
     live_pending_bytes: usize = 0,
+    /// Suppress a warning storm while repeated requests are denied by the
+    /// same live-memory pressure condition. A successful new epoch clears it.
+    live_denial_reported: bool = false,
     /// Aggregate accounting is retained for observability and for the optional
     /// process-owner resource budget. Host memory is enforced against the
     /// shared physical domain, while workload/device policy is enforced against
@@ -820,7 +823,35 @@ pub const AdmissionController = struct {
             currentSystemMemoryInfo()
         else
             null;
-        return self.tryReserveLiveCapacityLocked(incremental_bytes, info);
+        const starts_new_epoch = self.live_pending_bytes == 0;
+        const reserved = self.tryReserveLiveCapacityLocked(incremental_bytes, info) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable and !self.live_denial_reported) {
+                if (info) |memory_info| {
+                    const available = memory_info.available_bytes orelse 0;
+                    const reserve = liveHostAdmissionReserve(memory_info);
+                    std.log.warn(
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s}",
+                        .{
+                            incremental_bytes,
+                            self.live_pending_bytes,
+                            available,
+                            reserve,
+                            available -| reserve,
+                            @tagName(memory_info.availability_basis),
+                        },
+                    );
+                } else {
+                    std.log.warn(
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} capacity_bytes={d} basis=shared_epoch",
+                        .{ incremental_bytes, self.live_pending_bytes, self.live_capacity_bytes },
+                    );
+                }
+                self.live_denial_reported = true;
+            }
+            return err;
+        };
+        if (starts_new_epoch) self.live_denial_reported = false;
+        return reserved;
     }
 
     fn tryReserveLiveCapacityWithInfo(
@@ -2130,6 +2161,7 @@ test "macOS system memory probe reports bounded availability" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const info = probeSystemMemoryInfoMacos() orelse return error.TestUnexpectedResult;
     const available = info.available_bytes orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(AvailabilityBasis.macos_memory_pressure, info.availability_basis);
     try std.testing.expect(available <= info.total_bytes);
 }
 
