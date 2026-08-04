@@ -296,9 +296,12 @@ pub const PromotionRuntime = struct {
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     worker_started: std.atomic.Value(bool) = .init(false),
-    worker_wake_generation: std.atomic.Value(u64) = .init(0),
+    // A 32-bit generation doubles as the std.Io futex word. Advancing it before
+    // every wake makes the predicate check + wait sequence race-free: a wake
+    // that lands just before the wait changes the expected value, so the wait
+    // returns immediately instead of sleeping on a missed notification.
+    worker_wake_generation: std.atomic.Value(u32) = .init(0),
     worker_mutex: Io.Mutex = .init,
-    worker_cond: Io.Condition = .init,
     io_impl: ?*background_runtime_mod.IoImpl,
     future: ?Io.Future(void),
 
@@ -403,16 +406,13 @@ pub const PromotionRuntime = struct {
         self.shutdown_flag.store(false, .release);
         self.future = try io.concurrent(workerMain, .{self});
         self.worker_started.store(true, .release);
-        self.worker_cond.broadcast(io);
+        self.signalWorker(io);
     }
 
     pub fn stop(self: *PromotionRuntime) void {
         self.shutdown_flag.store(true, .release);
         if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.worker_mutex.lockUncancelable(io);
-            self.worker_cond.broadcast(io);
-            self.worker_mutex.unlock(io);
+            self.signalWorker(io_impl.io());
         }
         if (self.future) |*future| {
             if (self.io_impl) |io_impl| {
@@ -426,18 +426,37 @@ pub const PromotionRuntime = struct {
     fn wakeWorker(self: *PromotionRuntime) void {
         if (!self.worker_started.load(.acquire)) return;
         const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
-        self.worker_mutex.lockUncancelable(io);
-        self.recordWorkerWake();
-        self.worker_cond.broadcast(io);
-        self.worker_mutex.unlock(io);
+        self.signalWorker(io_impl.io());
     }
 
     fn recordWorkerWake(self: *PromotionRuntime) void {
         _ = self.worker_wake_generation.fetchAdd(1, .release);
     }
 
-    fn shouldDelayBlockedRetry(self: *PromotionRuntime, observed_wake_generation: u64) bool {
+    fn signalWorker(self: *PromotionRuntime, io: Io) void {
+        self.recordWorkerWake();
+        io.futexWake(u32, &self.worker_wake_generation.raw, std.math.maxInt(u32));
+    }
+
+    fn waitForWorkerSignal(self: *PromotionRuntime, io: Io, observed_wake_generation: u32, timeout_ms: ?i64) bool {
+        if (self.worker_wake_generation.load(.acquire) != observed_wake_generation) return true;
+        if (timeout_ms) |milliseconds| {
+            io.futexWaitTimeout(
+                u32,
+                &self.worker_wake_generation.raw,
+                observed_wake_generation,
+                .{ .duration = .{
+                    .raw = Io.Duration.fromMilliseconds(milliseconds),
+                    .clock = .awake,
+                } },
+            ) catch return self.worker_wake_generation.load(.acquire) != observed_wake_generation;
+        } else {
+            io.futexWaitUncancelable(u32, &self.worker_wake_generation.raw, observed_wake_generation);
+        }
+        return self.worker_wake_generation.load(.acquire) != observed_wake_generation;
+    }
+
+    fn shouldDelayBlockedRetry(self: *PromotionRuntime, observed_wake_generation: u32) bool {
         return !self.shutdown_flag.load(.acquire) and
             self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire) and
             self.worker_wake_generation.load(.acquire) == observed_wake_generation;
@@ -520,13 +539,15 @@ pub const PromotionRuntime = struct {
         var retry_delay_ms = blocked_retry_min_interval_ms;
         var retry_wake_generation = self.worker_wake_generation.load(.acquire);
         while (!self.shutdown_flag.load(.acquire)) {
-            self.worker_mutex.lockUncancelable(io);
-            while (!self.shutdown_flag.load(.acquire) and
-                self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
-            {
-                self.worker_cond.waitUncancelable(io, &self.worker_mutex);
+            if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) {
+                const idle_wake_generation = self.worker_wake_generation.load(.acquire);
+                if (!self.shutdown_flag.load(.acquire) and
+                    self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
+                {
+                    _ = self.waitForWorkerSignal(io, idle_wake_generation, null);
+                }
+                continue;
             }
-            self.worker_mutex.unlock(io);
             if (self.shutdown_flag.load(.acquire)) break;
 
             if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
@@ -537,7 +558,7 @@ pub const PromotionRuntime = struct {
                 }
                 self.catchUp() catch |err| {
                     std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
-                    io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+                    _ = self.waitForWorkerSignal(io, wake_generation, 50);
                     continue;
                 };
                 if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
@@ -548,7 +569,7 @@ pub const PromotionRuntime = struct {
                     // It runs only while work is pending and backs off so
                     // long-lived follower shards do not create a hot loop.
                     if (self.shouldDelayBlockedRetry(wake_generation)) {
-                        io.sleep(Io.Duration.fromMilliseconds(retry_delay_ms), .awake) catch {};
+                        _ = self.waitForWorkerSignal(io, wake_generation, retry_delay_ms);
                         retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
                     }
                 } else {
@@ -1214,6 +1235,27 @@ test "PromotionRuntime pending retry delay backs off to a bounded maximum" {
     try testing.expectEqual(@as(i64, 100), nextBlockedRetryIntervalMs(50));
     try testing.expectEqual(@as(i64, 1000), nextBlockedRetryIntervalMs(800));
     try testing.expectEqual(@as(i64, 1000), nextBlockedRetryIntervalMs(1000));
+}
+
+test "PromotionRuntime pending retry wait is interrupted by a worker signal" {
+    var io_impl = std.Io.Threaded.init(testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var runtime: PromotionRuntime = undefined;
+    runtime.worker_wake_generation = .init(0);
+    const observed_wake_generation = runtime.worker_wake_generation.load(.acquire);
+
+    const Wake = struct {
+        fn run(wake_io: Io, promotion: *PromotionRuntime) void {
+            wake_io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+            promotion.signalWorker(wake_io);
+        }
+    };
+    var wake = try io.concurrent(Wake.run, .{ io, &runtime });
+    defer _ = wake.await(io);
+
+    try testing.expect(runtime.waitForWorkerSignal(io, observed_wake_generation, 60 * 1000));
 }
 
 test "catchUpWindow with no matching records returns from_sequence" {

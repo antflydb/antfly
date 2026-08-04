@@ -132,20 +132,6 @@ fn parsePositiveU64(value: []const u8) !u64 {
     return parsed;
 }
 
-fn parseMaxLoadedModelsOverride(args: []const []const u8) !?usize {
-    var override: ?usize = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (!std.mem.eql(u8, args[i], "--max-loaded-models")) continue;
-        if (i + 1 >= args.len) return error.InvalidArguments;
-        // Zero deliberately means unlimited, matching NodeConfig and the JSON
-        // run configuration contract.
-        override = try std.fmt.parseInt(usize, args[i + 1], 10);
-        i += 1;
-    }
-    return override;
-}
-
 fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
     if (values.len == 0) return &.{};
     const out = try allocator.alloc(inference.server.WarmModel, values.len);
@@ -261,7 +247,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var models_dir: []const u8 = defaultModelsDir(allocator);
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
-    const max_loaded_models_override = try parseMaxLoadedModelsOverride(args);
+    const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
     var allow_unknown_models = false;
     var models_overridden = false;
@@ -527,25 +513,6 @@ fn printUsage(usage_name: []const u8) void {
         \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
         \\
     , .{ usage_name, usage_name });
-}
-
-test "run cli parses max loaded models residency override" {
-    try std.testing.expectEqual(
-        @as(?usize, 1),
-        try parseMaxLoadedModelsOverride(&.{ "--host", "127.0.0.1", "--max-loaded-models", "1" }),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, 4),
-        try parseMaxLoadedModelsOverride(&.{ "--max-loaded-models", "2", "--max-loaded-models", "4" }),
-    );
-    try std.testing.expectError(
-        error.InvalidArguments,
-        parseMaxLoadedModelsOverride(&.{"--max-loaded-models"}),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, 0),
-        try parseMaxLoadedModelsOverride(&.{ "--max-loaded-models", "0" }),
-    );
 }
 
 test "run config parses shared scraping fields and ignores api_url" {

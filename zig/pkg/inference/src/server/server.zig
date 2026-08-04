@@ -1447,6 +1447,7 @@ pub const Node = struct {
     session_manager: backends_mod.SessionManager,
     model_manager: model_manager_mod.ModelManager,
     registry: registry_mod.ModelRegistry,
+    extraction_reader_resolver: extractors_mod.ReaderResolver,
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
@@ -1463,6 +1464,7 @@ pub const Node = struct {
             .session_manager = backends_mod.SessionManager.init(allocator),
             .model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator)),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
+            .extraction_reader_resolver = extractors_mod.ReaderResolver.init(allocator),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
@@ -1520,6 +1522,7 @@ pub const Node = struct {
     pub fn deinit(self: *Node) void {
         self.model_manager.deinit();
         self.registry.deinit();
+        self.extraction_reader_resolver.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
         var compatibility_it = self.compatibility_cache.iterator();
@@ -2382,6 +2385,7 @@ pub const Node = struct {
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
+            .reader_resolver = &self.extraction_reader_resolver,
         };
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, parsed_inputs.images.items.len > 0);
         defer extractor.deinit(allocator);
@@ -6836,6 +6840,7 @@ pub const Node = struct {
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
+            .reader_resolver = &self.extraction_reader_resolver,
         };
         var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
@@ -8736,6 +8741,7 @@ test "download remote content accepts data uri" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .extraction_reader_resolver = undefined,
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
@@ -8755,6 +8761,7 @@ test "download remote content blocks private ip urls when configured" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .extraction_reader_resolver = undefined,
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
@@ -8772,6 +8779,7 @@ test "download remote content blocks hosts outside allowlist" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .extraction_reader_resolver = undefined,
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
