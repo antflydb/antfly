@@ -70869,6 +70869,93 @@ test "db text merge descriptor admission failures retry without quarantine" {
     try std.testing.expectEqual(@as(u64, 0), stats.pending_indexes);
 }
 
+test "db text merge shutdown cancels a worker blocked on descriptor admission" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    const resources = db.core.batchExecutionResources();
+    const io = db.backend_runtime.io() orelse return error.SkipZigTest;
+
+    var pool = lsm_backend_mod.storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer pool.deinit();
+    try pool.reserveDescriptorsForTest(io, 2);
+    var held_descriptors = true;
+    defer if (held_descriptors) pool.releaseDescriptorsForTest(io, 2);
+
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{ .enabled = true },
+    );
+    defer runtime.deinit();
+    runtime.setNativeStoragePoolForTest(&pool);
+
+    text_merge_runtime_mod.test_wait_for_fd_admission.store(true, .release);
+    text_merge_runtime_mod.test_fd_admission_entered.store(false, .release);
+    text_merge_runtime_mod.test_fd_admission_canceled.store(false, .release);
+    defer {
+        text_merge_runtime_mod.test_wait_for_fd_admission.store(false, .release);
+        text_merge_runtime_mod.test_fd_admission_entered.store(false, .release);
+        text_merge_runtime_mod.test_fd_admission_canceled.store(false, .release);
+    }
+    try runtime.start();
+
+    var admission_blocked = false;
+    for (0..5_000) |_| {
+        const stats = pool.snapshotStats();
+        if (text_merge_runtime_mod.test_fd_admission_entered.load(.acquire) and stats.fd_admission_waiters == 1) {
+            admission_blocked = true;
+            break;
+        }
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!admission_blocked) return error.TestTimeout;
+
+    const Stop = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        completed: std.atomic.Value(bool) = .init(false),
+        stopped: bool = false,
+
+        fn run(self: *@This()) void {
+            self.stopped = self.runtime.stop();
+            self.completed.store(true, .release);
+        }
+    };
+    var stop = Stop{ .runtime = &runtime };
+    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    var stop_joined = false;
+    defer if (!stop_joined) {
+        if (held_descriptors) {
+            pool.releaseDescriptorsForTest(io, 2);
+            held_descriptors = false;
+        }
+        stop_thread.join();
+    };
+
+    for (0..1_000) |_| {
+        if (stop.completed.load(.acquire)) break;
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!stop.completed.load(.acquire)) return error.TestTimeout;
+    stop_thread.join();
+    stop_joined = true;
+
+    try std.testing.expect(stop.stopped);
+    try std.testing.expect(text_merge_runtime_mod.test_fd_admission_canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+    pool.releaseDescriptorsForTest(io, 2);
+    held_descriptors = false;
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
 test "db text merge backpressure drains sustained segment debt to low watermark" {
     const alloc = std.testing.allocator;
 

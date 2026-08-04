@@ -480,11 +480,11 @@ const TextMergeScheduler = struct {
     }
 
     fn schedule(entry: *IndexManager.TextIndex) void {
-        entry.compaction_pending = true;
+        entry.compaction_pending.store(true, .release);
     }
 
     fn noteComplete(entry: *IndexManager.TextIndex) void {
-        entry.compaction_pending = false;
+        entry.compaction_pending.store(false, .release);
     }
 
     fn select(self: *TextMergeScheduler, entries: []IndexManager.TextIndex) ?usize {
@@ -492,7 +492,7 @@ const TextMergeScheduler = struct {
         const start = if (self.next_index < entries.len) self.next_index else 0;
         for (0..entries.len) |offset| {
             const idx = (start + offset) % entries.len;
-            if (entries[idx].compaction_pending) {
+            if (entries[idx].compaction_pending.load(.acquire)) {
                 self.next_index = (idx + 1) % entries.len;
                 return idx;
             }
@@ -981,7 +981,10 @@ pub const IndexManager = struct {
         runtime_schema: ?schema_mod.TableSchema,
         rebuild_root_path: []u8,
         persistent: persistent_mod.PersistentIndex,
-        compaction_pending: bool = false,
+        // Per-index derived workers can publish independently. Stats and
+        // producer admission sample this bit without taking every index's
+        // apply mutex, so it must not be a plain concurrently-mutated bool.
+        compaction_pending: std.atomic.Value(bool) = .init(false),
 
         pub fn lockAnalysisShared(self: *TextIndex) void {
             self.analysis_mutex.lockShared();
@@ -2154,8 +2157,9 @@ pub const IndexManager = struct {
         );
 
         const rebuilt = entry.persistent.snapshot().liveDocCount();
-        entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
-        if (entry.compaction_pending) {
+        const compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
+        entry.compaction_pending.store(compaction_pending, .release);
+        if (compaction_pending) {
             TextMergeScheduler.schedule(entry);
         } else {
             TextMergeScheduler.noteComplete(entry);
@@ -7628,12 +7632,14 @@ pub const IndexManager = struct {
         return self.textMergeStatsWithPrune(false);
     }
 
-    /// Allocation-free live query fan-out for producer admission. The caller
-    /// holds the apply lock shared, so the catalog entry and snapshot remain
-    /// stable for the duration of this observation.
+    /// Allocation-free live query fan-out for producer admission. Per-index
+    /// publishers do not take the DB-wide apply lock, so retain the lock-free
+    /// snapshot while reading it.
     pub fn textActiveSegmentCountSnapshot(self: *IndexManager, index_name: []const u8) u64 {
         const entry = self.textIndexEntry(index_name) orelse return 0;
-        return @intCast(entry.persistent.snapshot().segments.len);
+        const snap = entry.persistent.acquireSnapshot();
+        defer snap.release();
+        return @intCast(snap.segments.len);
     }
 
     fn textMergeStatsWithPrune(self: *IndexManager, prune_expired: bool) types.TextMergeStats {
@@ -7666,22 +7672,24 @@ pub const IndexManager = struct {
         };
 
         for (self.text_indexes.items) |*entry| {
-            const snap = entry.persistent.snapshot();
+            const snap = entry.persistent.acquireSnapshot();
             stats.active_indexes += 1;
             stats.active_segments +|= snap.segments.len;
             stats.max_active_segments_per_index = @max(stats.max_active_segments_per_index, snap.segments.len);
-            if (!entry.compaction_pending) continue;
-            stats.pending_indexes += 1;
-            stats.pending_segments += snap.segments.len;
-            for (snap.segments) |seg| {
-                const segment_bytes: u64 = @intCast(seg.data.bytes().len);
-                stats.pending_bytes +|= segment_bytes;
-                if (seg.data.isFileBacked()) {
-                    stats.pending_mmap_bytes +|= segment_bytes;
-                } else {
-                    stats.pending_heap_bytes +|= segment_bytes;
+            if (entry.compaction_pending.load(.acquire)) {
+                stats.pending_indexes += 1;
+                stats.pending_segments += snap.segments.len;
+                for (snap.segments) |seg| {
+                    const segment_bytes: u64 = @intCast(seg.data.bytes().len);
+                    stats.pending_bytes +|= segment_bytes;
+                    if (seg.data.isFileBacked()) {
+                        stats.pending_mmap_bytes +|= segment_bytes;
+                    } else {
+                        stats.pending_heap_bytes +|= segment_bytes;
+                    }
                 }
             }
+            snap.release();
         }
         self.accountFullTextPendingBytes(stats.pending_heap_bytes) catch {};
         return stats;
@@ -7725,11 +7733,12 @@ pub const IndexManager = struct {
         };
 
         const entry = self.textIndexEntry(index_name) orelse return stats;
-        const snap = entry.persistent.snapshot();
+        const snap = entry.persistent.acquireSnapshot();
+        defer snap.release();
         stats.active_indexes = 1;
         stats.active_segments = snap.segments.len;
         stats.max_active_segments_per_index = snap.segments.len;
-        if (entry.compaction_pending) {
+        if (entry.compaction_pending.load(.acquire)) {
             stats.pending_indexes = 1;
             stats.pending_segments = snap.segments.len;
             for (snap.segments) |seg| {
@@ -9221,7 +9230,7 @@ pub const IndexManager = struct {
         switch (opened) {
             .full_text => |entry| {
                 try self.text_indexes.append(self.alloc, entry);
-                if (entry.compaction_pending) {
+                if (entry.compaction_pending.load(.acquire)) {
                     TextMergeScheduler.schedule(&self.text_indexes.items[self.text_indexes.items.len - 1]);
                 }
             },
@@ -9418,7 +9427,10 @@ pub const IndexManager = struct {
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
-                entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
+                entry.compaction_pending.store(
+                    try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy()),
+                    .release,
+                );
                 if (openProfileEnabled()) {
                     logOpenIndexProfile(.{
                         .kind = cfg.kind,
@@ -10361,7 +10373,7 @@ pub const IndexManager = struct {
             break :blk entry.persistent.replaceSegmentsIfActiveManyPreparedWithDeletes(old_ids, prepared_segments, publication_deletes.bitmaps) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 else => {
-                    if (builtin.os.tag != .freestanding) {
+                    if (builtin.os.tag != .freestanding and err != error.Canceled) {
                         std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                     }
                     return err;
@@ -10373,7 +10385,7 @@ pub const IndexManager = struct {
             break :blk entry.persistent.replaceSegmentsIfActiveManyOwnedWithDeletes(old_ids, segments, publication_deletes.bitmaps) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 else => {
-                    if (builtin.os.tag != .freestanding) {
+                    if (builtin.os.tag != .freestanding and err != error.Canceled) {
                         std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                     }
                     return err;
@@ -10810,7 +10822,7 @@ pub const IndexManager = struct {
         switch (entry.*) {
             .full_text => |index| {
                 self.text_indexes.appendAssumeCapacity(index);
-                if (index.compaction_pending) TextMergeScheduler.schedule(&self.text_indexes.items[self.text_indexes.items.len - 1]);
+                if (index.compaction_pending.load(.acquire)) TextMergeScheduler.schedule(&self.text_indexes.items[self.text_indexes.items.len - 1]);
             },
             .dense_vector => |index_value| {
                 const index = index_value;
@@ -12095,7 +12107,7 @@ pub const IndexManager = struct {
         if (!stats.touched()) return;
         const compaction_due = stats.deleted_any or textCompactionDue(&entry.persistent, opts) or opts.defer_text_compaction;
         if (!compaction_due) return;
-        if (opts.defer_text_compaction and entry.compaction_pending) return;
+        if (opts.defer_text_compaction and entry.compaction_pending.load(.acquire)) return;
         if (!try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.noteComplete(entry);
             return;
@@ -23520,7 +23532,7 @@ test "text merge task carries concurrent deletes into publication" {
     const busy_task = try manager.beginTextMergeTask();
     text_entry.apply_mutex.unlock();
     try std.testing.expect(busy_task == null);
-    try std.testing.expect(text_entry.compaction_pending);
+    try std.testing.expect(text_entry.compaction_pending.load(.acquire));
 
     var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     defer task.deinit(alloc);
@@ -23892,7 +23904,7 @@ test "text merge failure quarantines source segments" {
     }
 
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-    try std.testing.expect(entry.compaction_pending);
+    try std.testing.expect(entry.compaction_pending.load(.acquire));
     try std.testing.expect(entry.persistent.snapshot().segments.len >= default_merge_policy.max_segments_per_tier);
 }
 
@@ -24150,19 +24162,19 @@ test "force compact skips clean text indexes" {
 
     const entry_before = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(usize, 1), entry_before.persistent.snapshot().segments.len);
-    try std.testing.expect(!entry_before.compaction_pending);
+    try std.testing.expect(!entry_before.compaction_pending.load(.acquire));
 
     try manager.compactAllTextIndexes();
 
     const entry_after_compact = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(usize, 1), entry_after_compact.persistent.snapshot().segments.len);
-    try std.testing.expect(!entry_after_compact.compaction_pending);
+    try std.testing.expect(!entry_after_compact.compaction_pending.load(.acquire));
 
     try manager.forceCompactAllTextIndexes();
 
     const entry_after = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(usize, 1), entry_after.persistent.snapshot().segments.len);
-    try std.testing.expect(!entry_after.compaction_pending);
+    try std.testing.expect(!entry_after.compaction_pending.load(.acquire));
 }
 
 test "force compact accounts text merge buffers via resource manager" {
@@ -24300,7 +24312,7 @@ test "best effort force compact defers under text merge pressure" {
 
     const entry_after = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry_after.persistent.snapshot().segments.len >= 2);
-    try std.testing.expect(entry_after.compaction_pending);
+    try std.testing.expect(entry_after.compaction_pending.load(.acquire));
 }
 
 test "best effort force compact stops on resource budget rejection" {
@@ -24362,7 +24374,7 @@ test "best effort force compact stops on resource budget rejection" {
 
     const entry_after = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry_after.persistent.snapshot().segments.len >= 2);
-    try std.testing.expect(entry_after.compaction_pending);
+    try std.testing.expect(entry_after.compaction_pending.load(.acquire));
 
     const resource_stats = resource_manager.snapshot();
     try std.testing.expect(
@@ -24445,13 +24457,13 @@ test "best effort force compact resumes after modeled reopen under relaxed press
         }
 
         const entry_before = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-        try std.testing.expect(entry_before.compaction_pending);
+        try std.testing.expect(entry_before.compaction_pending.load(.acquire));
         try std.testing.expect(entry_before.persistent.snapshot().segments.len >= 2);
 
         try manager.bestEffortForceCompactAllTextIndexes();
 
         const entry_after = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-        try std.testing.expect(entry_after.compaction_pending);
+        try std.testing.expect(entry_after.compaction_pending.load(.acquire));
         try std.testing.expect(entry_after.persistent.snapshot().segments.len >= 2);
     }
 
@@ -24473,13 +24485,13 @@ test "best effort force compact resumes after modeled reopen under relaxed press
     try manager_reopened.load(&store_reopened);
 
     const reopened_entry = manager_reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-    try std.testing.expect(reopened_entry.compaction_pending);
+    try std.testing.expect(reopened_entry.compaction_pending.load(.acquire));
     try std.testing.expect(reopened_entry.persistent.snapshot().segments.len >= 2);
 
     try manager_reopened.drainScheduledTextMerges();
 
     const drained_entry = manager_reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-    try std.testing.expect(!drained_entry.compaction_pending);
+    try std.testing.expect(!drained_entry.compaction_pending.load(.acquire));
     try std.testing.expect(drained_entry.persistent.snapshot().segments.len <= default_merge_policy.max_segments_per_tier);
 }
 

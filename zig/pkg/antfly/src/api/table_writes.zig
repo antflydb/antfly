@@ -9732,6 +9732,13 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmNativeStorageStatsBestEffort(self: *ProvisionedTableWriteSource) ?lsm_backend.NativeStorageStats {
+        // The descriptor pool belongs to BackendRuntime, not to any cached DB.
+        // Sampling it directly keeps process-wide admission pressure visible
+        // while the table cache is empty or its state lock is contended.
+        if (self.backend_runtime) |runtime| return runtime.snapshotNativeStorageStats();
+
+        // Standalone callers may not bind a backend runtime. Preserve their
+        // legacy per-DB fallback while a cache entry is available.
         if (!self.local_db_mutex.tryLock()) return null;
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return null;
@@ -27047,6 +27054,31 @@ test "provisioned table write source runtime status is best effort when local db
 
     const statuses = try source.source().localRuntimeStatuses(std.testing.allocator, "docs");
     try std.testing.expect(statuses == null);
+}
+
+test "provisioned native storage metrics bypass an empty busy write cache" {
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(
+        std.testing.allocator,
+        .{ .backend = .manual },
+    );
+    defer backend_runtime.deinit();
+
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-native-storage-stats",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.backend_runtime = &backend_runtime;
+
+    // The metrics path must not depend on a table-cache entry or its mutex:
+    // the admission domain exists at BackendRuntime/process scope.
+    try std.testing.expect(source.local_db_mutex.tryLock());
+    defer source.local_db_mutex.unlock();
+
+    const expected = backend_runtime.snapshotNativeStorageStats();
+    const actual = source.lsmNativeStorageStatsBestEffort() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(expected.fd_admission_capacity > 0);
+    try std.testing.expectEqualDeep(expected, actual);
 }
 
 test "provisioned table write source cold status delegates to refresh owner" {

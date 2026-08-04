@@ -5024,6 +5024,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
+            "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",

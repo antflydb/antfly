@@ -55,6 +55,9 @@ pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
 pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_execute_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_finish_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_wait_for_fd_admission: std.atomic.Value(bool) = .init(false);
+pub var test_fd_admission_entered: std.atomic.Value(bool) = .init(false);
+pub var test_fd_admission_canceled: std.atomic.Value(bool) = .init(false);
 
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
@@ -240,6 +243,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn setNativeStoragePoolForTest(self: *TextMergeRuntime, pool: *storage_io_mod.NativeStoragePool) void {
+        if (!builtin.is_test) unreachable;
+        std.debug.assert(self.future == null);
+        self.native_storage_pool = pool;
+    }
+
     /// Bound a single publication below the configured high watermark while
     /// retaining the configured low-watermark space for the live index
     /// baseline. Callers chunk larger batches at this boundary.
@@ -339,7 +348,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.unlock(io);
         self.native_storage_pool.signalAdmissionChanged(io);
 
-        _ = self.future.?.await(io);
+        // A merge can be asleep in descriptor admission, whose predicate is
+        // owned by the process-wide pool and does not change when this runtime
+        // shuts down. Cancel wakes that Io cancellation point and still joins
+        // the worker before returning.
+        self.future.?.cancel(io);
         self.future = null;
         return true;
     }
@@ -379,6 +392,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             // mutation waits for stop before taking the apply lock, so this
             // acquisition cannot form a shutdown lock cycle.
             lockApplyExclusive(self.apply_mutex);
+            if (err == error.Canceled) {
+                self.index_manager.cancelTextMergeTask(&task);
+                self.apply_mutex.unlockExclusive();
+                self.signalProducerAdmissionChanged();
+                return err;
+            }
             if (isRecoverableMergeAdmissionError(err)) {
                 self.index_manager.cancelTextMergeTask(&task);
                 self.deferForFdAdmissionError(err, execute_fd_epoch);
@@ -396,6 +415,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         lockApplyExclusive(self.apply_mutex);
         const finish_fd_epoch = self.native_storage_pool.admissionEpoch();
         _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result) catch |err| {
+            if (err == error.Canceled) {
+                self.index_manager.cancelTextMergeTask(&task);
+                self.apply_mutex.unlockExclusive();
+                self.signalProducerAdmissionChanged();
+                return err;
+            }
             if (isRecoverableMergeAdmissionError(err)) {
                 self.index_manager.cancelTextMergeTask(&task);
                 self.deferForFdAdmissionError(err, finish_fd_epoch);
@@ -797,9 +822,19 @@ fn quarantineBlocks(stats: types.TextMergeStats) bool {
 }
 
 fn workerMain(runtime: *TextMergeRuntime) void {
+    if (builtin.is_test and test_wait_for_fd_admission.swap(false, .acq_rel)) {
+        test_fd_admission_entered.store(true, .release);
+        const io = runtime.io_impl.?.io();
+        runtime.native_storage_pool.reserveDescriptorsForTest(io, 1) catch |err| {
+            if (err == error.Canceled) test_fd_admission_canceled.store(true, .release);
+            return;
+        };
+        runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
+    }
     while (true) {
         if (isShutdown(runtime)) return;
         const ran = runtime.runOnce() catch |err| {
+            if (err == error.Canceled) return;
             if (err == error.ResourceBudgetExceeded) {
                 sleepMs(runtime, runtime.config.error_interval_ms);
                 continue;

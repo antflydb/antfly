@@ -808,6 +808,11 @@ else
             entries: BucketMap = .empty,
             lru_head: ?*Entry = null,
             lru_tail: ?*Entry = null,
+            // Incremented before every mutation fence affecting this shard.
+            // Cache misses open outside the shard lock, then compare the
+            // observed epoch before insertion so an invalidate/rename cannot
+            // be lost in that window.
+            invalidation_epoch: u64 = 0,
         };
 
         const AdmissionWaiter = struct {
@@ -934,6 +939,8 @@ else
             const locked = lockAtomic(&shard.mutex);
             defer if (locked) shard.mutex.unlock();
 
+            shard.invalidation_epoch +%= 1;
+
             var matched_any = false;
             if (shard.entries.getPtr(path_hash)) |bucket| {
                 for (bucket.items) |entry| {
@@ -954,6 +961,7 @@ else
         fn invalidateTree(self: *FdCache, namespace: u64, path: []const u8) void {
             for (self.shards) |*shard| {
                 const locked = lockAtomic(&shard.mutex);
+                shard.invalidation_epoch +%= 1;
 
                 var current = shard.lru_head;
                 while (current) |entry| {
@@ -976,6 +984,7 @@ else
         fn invalidateNamespace(self: *FdCache, namespace: u64) void {
             for (self.shards) |*shard| {
                 const locked = lockAtomic(&shard.mutex);
+                shard.invalidation_epoch +%= 1;
                 var current = shard.lru_head;
                 while (current) |entry| {
                     const next = entry.lru_next;
@@ -992,56 +1001,81 @@ else
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
-            {
-                const locked = lockAtomic(&shard.mutex);
-                defer if (locked) shard.mutex.unlock();
-
-                if (self.findEntryLocked(shard, namespace, path_hash, path)) |entry| {
-                    entry.ref_count += 1;
-                    entry.last_access = self.nextAccessLocked();
-                    self.touchEntryLocked(shard, entry);
-                    return entry;
-                }
-            }
-
             const owned_path = try self.allocator.dupeZ(u8, path);
-            errdefer self.allocator.free(owned_path);
+            var owned_path_active = true;
+            errdefer if (owned_path_active) self.allocator.free(owned_path);
 
-            try self.reserveDescriptors(io, 1);
-            var descriptor_reserved = true;
-            errdefer if (descriptor_reserved) self.releaseDescriptors(io, 1);
-
-            const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{
-                .ACCMODE = .RDONLY,
-                .CLOEXEC = true,
-            }, 0);
-            errdefer closeFd(fd);
-
-            const entry = try self.allocator.create(Entry);
-            errdefer self.allocator.destroy(entry);
-            entry.* = .{
-                .namespace = namespace,
-                .path_hash = path_hash,
-                .path = owned_path,
-                .fd = fd,
-                .ref_count = 1,
-                .last_access = self.nextAccessLocked(),
-            };
-
-            {
+            while (true) {
+                var observed_invalidation_epoch: u64 = 0;
                 const locked = lockAtomic(&shard.mutex);
-                errdefer if (locked) shard.mutex.unlock();
+                if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
+                    existing.ref_count += 1;
+                    existing.last_access = self.nextAccessLocked();
+                    self.touchEntryLocked(shard, existing);
+                    if (locked) shard.mutex.unlock();
+                    self.allocator.free(owned_path);
+                    owned_path_active = false;
+                    return existing;
+                }
+                observed_invalidation_epoch = shard.invalidation_epoch;
+                if (locked) shard.mutex.unlock();
+
+                try self.reserveDescriptors(io, 1);
+                var descriptor_reserved = true;
+                errdefer if (descriptor_reserved) self.releaseDescriptors(io, 1);
+
+                const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{
+                    .ACCMODE = .RDONLY,
+                    .CLOEXEC = true,
+                }, 0);
+                var fd_open = true;
+                errdefer if (fd_open) closeFd(fd);
+
+                if (builtin.is_test and test_fd_cache_pause_after_open.load(.acquire)) {
+                    test_fd_cache_open_paused.store(true, .release);
+                    while (!test_fd_cache_release_after_open.load(.acquire)) std.Thread.yield() catch {};
+                }
+
+                const entry = try self.allocator.create(Entry);
+                var entry_active = true;
+                errdefer if (entry_active) self.allocator.destroy(entry);
+                entry.* = .{
+                    .namespace = namespace,
+                    .path_hash = path_hash,
+                    .path = owned_path,
+                    .fd = fd,
+                    .ref_count = 1,
+                    .last_access = self.nextAccessLocked(),
+                };
+
+                const insertion_locked = lockAtomic(&shard.mutex);
+                errdefer if (insertion_locked) shard.mutex.unlock();
 
                 if (self.findEntryLocked(shard, namespace, path_hash, owned_path)) |existing| {
                     existing.ref_count += 1;
                     existing.last_access = self.nextAccessLocked();
                     self.touchEntryLocked(shard, existing);
-                    if (locked) shard.mutex.unlock();
-                    entry.deinit(self.allocator);
+                    if (insertion_locked) shard.mutex.unlock();
+                    closeFd(fd);
+                    fd_open = false;
                     self.allocator.destroy(entry);
+                    entry_active = false;
+                    self.allocator.free(owned_path);
+                    owned_path_active = false;
                     descriptor_reserved = false;
                     self.releaseDescriptors(io, 1);
                     return existing;
+                }
+
+                if (shard.invalidation_epoch != observed_invalidation_epoch) {
+                    if (insertion_locked) shard.mutex.unlock();
+                    closeFd(fd);
+                    fd_open = false;
+                    self.allocator.destroy(entry);
+                    entry_active = false;
+                    descriptor_reserved = false;
+                    self.releaseDescriptors(io, 1);
+                    continue;
                 }
 
                 const bucket = try shard.entries.getOrPut(self.allocator, path_hash);
@@ -1049,11 +1083,14 @@ else
                 try bucket.value_ptr.append(self.allocator, entry);
                 self.linkEntryLocked(shard, entry);
                 _ = self.cache_entry_count.fetchAdd(1, .monotonic);
-                if (locked) shard.mutex.unlock();
-            }
+                if (insertion_locked) shard.mutex.unlock();
 
-            descriptor_reserved = false;
-            return entry;
+                entry_active = false;
+                fd_open = false;
+                owned_path_active = false;
+                descriptor_reserved = false;
+                return entry;
+            }
         }
 
         fn release(self: *FdCache, io: std.Io, entry: *Entry) void {
@@ -1396,6 +1433,16 @@ pub const NativeStoragePool = struct {
     pub fn signalAdmissionChanged(self: *NativeStoragePool, io: std.Io) void {
         self.fd_cache.signalAdmissionChanged(io);
     }
+
+    pub fn reserveDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) !void {
+        if (!builtin.is_test) unreachable;
+        try self.fd_cache.reserveDescriptors(io, count);
+    }
+
+    pub fn releaseDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) void {
+        if (!builtin.is_test) unreachable;
+        self.fd_cache.releaseDescriptors(io, count);
+    }
 };
 
 const NativeStorageState = struct {
@@ -1504,6 +1551,10 @@ const NativeStorageState = struct {
         allocator.destroy(self);
     }
 
+    /// Mutation paths call invalidation before and after the filesystem
+    /// operation. The first pass retires cached entries; the second changes
+    /// the epoch for a miss that opened the old inode inside the mutation
+    /// window but had not inserted it yet.
     fn invalidatePath(self: *NativeStorageState, path: []const u8) void {
         self.fdCache().invalidatePath(self.cache_namespace, path);
         self.fdCache().signalAdmissionChanged(self.threaded.io());
@@ -1861,6 +1912,7 @@ else blk: {
             fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 self.state.invalidatePath(path);
+                defer self.state.invalidatePath(path);
                 switch (self.runtime) {
                     .threaded => |*threaded| try writeFileAbsoluteWithIo(threaded.io(), path, contents),
                     .evented => |*evented| try writeFileAbsoluteWithIo(evented.io(), path, contents),
@@ -1870,6 +1922,7 @@ else blk: {
             fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 self.state.invalidatePath(path);
+                defer self.state.invalidatePath(path);
                 switch (self.runtime) {
                     .threaded => |*threaded| try appendFileAbsoluteWithIo(threaded.io(), path, contents, sync),
                     .evented => |*evented| try appendFileAbsoluteWithIo(evented.io(), path, contents, sync),
@@ -1900,6 +1953,7 @@ else blk: {
             fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 self.state.invalidateRename(old_path, new_path);
+                defer self.state.invalidateRename(old_path, new_path);
                 switch (self.runtime) {
                     .threaded => |*threaded| try renamePathWithIo(threaded.io(), old_path, new_path),
                     .evented => |*evented| try renamePathWithIo(evented.io(), old_path, new_path),
@@ -1909,6 +1963,7 @@ else blk: {
             fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 self.state.invalidatePath(path);
+                defer self.state.invalidatePath(path);
                 switch (self.runtime) {
                     .threaded => |*threaded| try deleteFilePathWithIo(threaded.io(), path),
                     .evented => |*evented| try deleteFilePathWithIo(evented.io(), path),
@@ -1918,6 +1973,7 @@ else blk: {
             fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 self.state.invalidateTree(path);
+                defer self.state.invalidateTree(path);
                 switch (self.runtime) {
                     .threaded => |*threaded| try std.Io.Dir.cwd().deleteTree(threaded.io(), path),
                     .evented => |*evented| try std.Io.Dir.cwd().deleteTree(evented.io(), path),
@@ -2123,6 +2179,7 @@ else blk: {
             var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
             defer permit.release();
             permit.state.invalidatePath(path);
+            defer permit.state.invalidatePath(path);
             try writeFileAbsoluteWithIo(permit.io, path, contents);
         }
 
@@ -2131,6 +2188,7 @@ else blk: {
             var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
             defer permit.release();
             permit.state.invalidatePath(path);
+            defer permit.state.invalidatePath(path);
             try appendFileAbsoluteWithIo(permit.io, path, contents, sync);
         }
 
@@ -2158,6 +2216,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             retained.invalidateRename(old_path, new_path);
+            defer retained.invalidateRename(old_path, new_path);
             try renamePathWithIo(retained.threaded.io(), old_path, new_path);
         }
 
@@ -2166,6 +2225,7 @@ else blk: {
             const retained = try state.retain();
             defer retained.release();
             retained.invalidatePath(path);
+            defer retained.invalidatePath(path);
             if (comptime supports_posix_fd_cache) {
                 // unlink(2) does not open a descriptor. Keeping rollback
                 // deletion outside admission guarantees an unpublished file
@@ -2183,6 +2243,7 @@ else blk: {
             var permit = try state.acquireFdPermits(3);
             defer permit.release();
             permit.state.invalidateTree(path);
+            defer permit.state.invalidateTree(path);
             try std.Io.Dir.cwd().deleteTreeMinStackSize(permit.io, path);
         }
 
@@ -2707,13 +2768,16 @@ const NativeBufferedAtomicWriteSink = struct {
         self.state.invalidatePath(self.tmp_path);
         writeFileAbsoluteWithIo(io, self.tmp_path, self.out.items) catch |err| {
             deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.state.invalidatePath(self.tmp_path);
             return err;
         };
         syncFileContentsPathWithIo(io, self.tmp_path) catch |err| {
             deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.state.invalidatePath(self.tmp_path);
             return err;
         };
         self.state.invalidateRename(self.tmp_path, self.final_path);
+        defer self.state.invalidateRename(self.tmp_path, self.final_path);
         renamePathWithIo(io, self.tmp_path, self.final_path) catch |err| {
             deleteFilePathWithIo(io, self.tmp_path) catch {};
             return err;
@@ -2725,6 +2789,7 @@ const NativeBufferedAtomicWriteSink = struct {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         self.state.invalidatePath(self.tmp_path);
         deleteFilePathWithIo(self.state.threaded.io(), self.tmp_path) catch {};
+        self.state.invalidatePath(self.tmp_path);
         self.deinit();
     }
 };
@@ -2854,6 +2919,7 @@ const NativeAtomicWriteSink = struct {
             self.fd = -1;
             self.state.invalidatePath(self.tmp_path);
             deleteFilePathPosix(self.tmp_path) catch {};
+            self.state.invalidatePath(self.tmp_path);
             return err;
         };
         closeFd(self.fd);
@@ -2865,6 +2931,7 @@ const NativeAtomicWriteSink = struct {
         // the destination.
 
         self.state.invalidateRename(self.tmp_path, self.final_path);
+        defer self.state.invalidateRename(self.tmp_path, self.final_path);
         renameAbsoluteDirectPosix(self.tmp_path, self.final_path) catch |err| {
             deleteFilePathPosix(self.tmp_path) catch {};
             return err;
@@ -2880,6 +2947,7 @@ const NativeAtomicWriteSink = struct {
         }
         self.state.invalidatePath(self.tmp_path);
         deleteFilePathPosix(self.tmp_path) catch {};
+        self.state.invalidatePath(self.tmp_path);
         self.deinit();
     }
 };
@@ -3125,6 +3193,9 @@ fn tempSiblingPath(allocator: Allocator, path: []const u8) ![]u8 {
 }
 
 var atomic_write_nonce: CounterU64 = .init(0);
+var test_fd_cache_pause_after_open: std.atomic.Value(bool) = .init(false);
+var test_fd_cache_open_paused: std.atomic.Value(bool) = .init(false);
+var test_fd_cache_release_after_open: std.atomic.Value(bool) = .init(false);
 
 fn hashPath(path: []const u8) u64 {
     return std.hash.Wyhash.hash(0x6d3b7a1db6f9c24f, path);
@@ -3345,6 +3416,71 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native fd cache retries an open that straddles a mutation fence" {
+    if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-invalidation-race-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+    try native.storage().writeFileAbsolute(path, "old");
+
+    var replacement_buf: [288]u8 = undefined;
+    const replacement_path = try std.fmt.bufPrint(&replacement_buf, "{s}.replacement", .{path});
+    defer native.storage().deleteFileAbsolute(replacement_path) catch {};
+    try native.storage().writeFileAbsolute(replacement_path, "new");
+
+    // Model the first half of the mutation fence before the reader opens the
+    // old inode. Only the matching post-rename fence can make this miss retry.
+    native.state.invalidateRename(replacement_path, path);
+
+    test_fd_cache_pause_after_open.store(true, .release);
+    test_fd_cache_open_paused.store(false, .release);
+    test_fd_cache_release_after_open.store(false, .release);
+    defer {
+        test_fd_cache_pause_after_open.store(false, .release);
+        test_fd_cache_open_paused.store(false, .release);
+        test_fd_cache_release_after_open.store(true, .release);
+    }
+
+    const Reader = struct {
+        storage: Storage,
+        path: []const u8,
+        bytes: [3]u8 = undefined,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.storage.readFileRangeInto(std.heap.page_allocator, self.path, 0, &self.bytes) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var reader = Reader{ .storage = native.storage(), .path = path };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        test_fd_cache_release_after_open.store(true, .release);
+        reader_thread.join();
+    };
+
+    var spins: usize = 0;
+    while (!test_fd_cache_open_paused.load(.acquire) and spins < 100_000) : (spins += 1) std.Thread.yield() catch {};
+    try std.testing.expect(test_fd_cache_open_paused.load(.acquire));
+
+    try renameAbsoluteDirectPosix(replacement_path, path);
+    native.state.invalidateRename(replacement_path, path);
+
+    test_fd_cache_release_after_open.store(true, .release);
+    reader_thread.join();
+    reader_joined = true;
+    try std.testing.expect(reader.err == null);
+    try std.testing.expectEqualStrings("new", reader.bytes[0..]);
 }
 
 test "native atomic write finish retains admission through parent sync" {
