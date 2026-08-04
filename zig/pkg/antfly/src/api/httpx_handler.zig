@@ -1950,10 +1950,7 @@ pub const AntflyApiHandler = struct {
             }
             std.log.debug("create table request rejected: {} body_len={d}", .{ err, body_data.len });
             _ = ctx.status(400);
-            if (err == error.InvalidCreateTableSchemaRequest) {
-                return ctx.text(table_contract.createTableRequestErrorMessage(body_data));
-            }
-            return ctx.text("invalid create table request");
+            return ctx.text(table_contract.createTableRequestErrorMessage(err, body_data));
         };
         defer create_req.deinit(alloc);
         const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -2283,8 +2280,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
-        const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(body_data);
-        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch {
+        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
+        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |err| {
+            invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
             _ = ctx.status(400);
             return ctx.text(invalid_schema_message);
         };
@@ -2292,7 +2290,7 @@ pub const AntflyApiHandler = struct {
 
         const table_before = try self.api_server.loadOwnedTableRecord(alloc, decoded_table_name);
         if (table_before == null) {
-            self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
+            _ = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => {
                     _ = ctx.status(400);
                     return ctx.text(invalid_schema_message);
@@ -2301,7 +2299,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(404);
                     return ctx.text("not found");
                 },
-                error.UnsupportedOperation => {
+                error.UnsupportedOperation => blk: {
                     const table_writes_source = self.api_server.table_writes orelse {
                         _ = ctx.status(404);
                         return ctx.text("not found");
@@ -2316,6 +2314,7 @@ pub const AntflyApiHandler = struct {
                         _ = ctx.status(404);
                         return ctx.text("not found");
                     };
+                    break :blk null;
                 },
                 else => return err,
             };
@@ -2327,7 +2326,7 @@ pub const AntflyApiHandler = struct {
         defer metadata_table_manager.freeTable(alloc, table_before.?);
 
         var local_schema_applied = false;
-        self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
+        const committed_version = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest => {
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
@@ -2336,7 +2335,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
-            error.UnsupportedOperation => {
+            error.UnsupportedOperation => blk: {
                 const table_writes_source = self.api_server.table_writes orelse {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
@@ -2349,15 +2348,20 @@ pub const AntflyApiHandler = struct {
                     else => return write_err,
                 };
                 local_schema_applied = true;
+                break :blk null;
             },
             else => return err,
         };
-        const expected_table = try tables_api.applySchemaUpdateRecord(alloc, &table_before.?, schema_json);
-        defer metadata_table_manager.freeTable(alloc, expected_table);
-        self.api_server.waitForMetadataProjection(decoded_table_name, expected_table.schema_json, expected_table.indexes_json) catch |err| switch (err) {
+        var expectation = try self.api_server.schemaProjectionExpectationAlloc(alloc, &table_before.?, schema_json, committed_version);
+        defer expectation.deinit(alloc);
+        self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
             error.TableVisibilityTimeout => {
                 _ = ctx.status(500);
                 return ctx.text("schema update did not converge");
+            },
+            error.TableGenerationChanged => {
+                _ = ctx.status(409);
+                return ctx.text("schema update was superseded; retry request");
             },
             else => return err,
         };

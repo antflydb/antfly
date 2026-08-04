@@ -2038,7 +2038,22 @@ pub const Node = struct {
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
-        for (self.config.preload) |model| try self.warmModel(allocator, model);
+        for (self.config.preload) |model| {
+            self.warmModel(allocator, model) catch |err| {
+                if (model.backend) |backend| {
+                    std.log.err(
+                        "failed to warm configured inference model kind={s} model={s} backend={s} err={}",
+                        .{ @tagName(model.kind), model.name, @tagName(backend), err },
+                    );
+                } else {
+                    std.log.err(
+                        "failed to warm configured inference model kind={s} model={s} backend=auto err={}",
+                        .{ @tagName(model.kind), model.name, err },
+                    );
+                }
+                return err;
+            };
+        }
     }
 
     pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
