@@ -747,6 +747,7 @@ pub const StatusSource = struct {
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
+        update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -819,9 +820,15 @@ pub const StatusSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name);
     }
 
-    pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    /// Returns the generation committed by an authoritative backend when the
+    /// source supports versioned results. Legacy/direct sources return null.
+    pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !?u32 {
+        if (self.vtable.update_schema_versioned) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        }
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        return null;
     }
 
     pub fn createIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -971,6 +978,10 @@ pub const StatusSource = struct {
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
+                _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
+            }
+
+            fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
                 return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
             }
 
@@ -1066,6 +1077,7 @@ pub const StatusSource = struct {
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
             .update_schema = Gen.updateSchema,
+            .update_schema_versioned = Gen.updateSchemaVersioned,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
@@ -1185,7 +1197,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     try svc.runRound();
 }
 
-fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -1193,8 +1205,10 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
+    const version = try tables_api.schemaVersion(updated.schema_json);
     try svc.replaceTableDefinition(table.*, updated);
     try svc.runRound();
+    return version;
 }
 
 fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -5980,18 +5994,19 @@ pub const ApiHttpServer = struct {
 
                 const table_before = try self.loadOwnedTableRecord(self.alloc, table_name);
                 if (table_before == null) {
-                    self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
+                    _ = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                         error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
                         error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => {
+                        error.UnsupportedOperation => blk: {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                             _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                                 error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                                 else => return write_err,
                             } orelse return try textResponse(self.alloc, 404, "not found");
+                            break :blk null;
                         },
                         else => return err,
                     };
@@ -6003,26 +6018,28 @@ pub const ApiHttpServer = struct {
                 defer metadata_table_manager.freeTable(self.alloc, table_before.?);
 
                 var local_schema_applied = false;
-                self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
+                const committed_version = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                     error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
                     error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.UnsupportedOperation => {
+                    error.UnsupportedOperation => blk: {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
                         _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                             else => return write_err,
                         };
                         local_schema_applied = true;
+                        break :blk null;
                     },
                     else => return err,
                 };
-                const expected_table = try tables_api.applySchemaUpdateRecord(self.alloc, &table_before.?, schema_json);
-                defer metadata_table_manager.freeTable(self.alloc, expected_table);
-                self.waitForMetadataProjection(table_name, expected_table.schema_json, expected_table.indexes_json) catch |err| switch (err) {
+                var expectation = try self.schemaProjectionExpectationAlloc(self.alloc, &table_before.?, schema_json, committed_version);
+                defer expectation.deinit(self.alloc);
+                self.waitForSchemaUpdateProjection(table_name, expectation, committed_version) catch |err| switch (err) {
                     error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
+                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "schema update was superseded; retry request"),
                     else => return err,
                 };
                 self.reconcileProjectedSchemaUpdate(self.alloc, table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
@@ -6403,6 +6420,72 @@ pub const ApiHttpServer = struct {
         defer arena_impl.deinit();
         const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
         return try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+    }
+
+    pub const SchemaProjectionExpectation = struct {
+        schema_json: []u8,
+        indexes_json: ?[]u8 = null,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.schema_json);
+            if (self.indexes_json) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    /// Build a projection target from the generation actually committed by
+    /// metadata. Falling back to local prediction is retained only for legacy
+    /// sources that cannot return an authoritative generation.
+    pub fn schemaProjectionExpectationAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_before: *const metadata_table_manager.TableRecord,
+        schema_json: []const u8,
+        committed_version: ?u32,
+    ) !SchemaProjectionExpectation {
+        _ = self;
+        if (committed_version) |version| {
+            return .{ .schema_json = try tables_api.normalizeSchemaVersion(alloc, schema_json, version) };
+        }
+
+        const expected = try tables_api.applySchemaUpdateRecord(alloc, table_before, schema_json);
+        defer metadata_table_manager.freeTable(alloc, expected);
+        const expected_schema_json = try alloc.dupe(u8, expected.schema_json);
+        errdefer alloc.free(expected_schema_json);
+        const expected_indexes_json = try alloc.dupe(u8, expected.indexes_json);
+        return .{
+            .schema_json = expected_schema_json,
+            .indexes_json = expected_indexes_json,
+        };
+    }
+
+    pub fn waitForSchemaUpdateProjection(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        expectation: SchemaProjectionExpectation,
+        committed_version: ?u32,
+    ) !void {
+        const version = committed_version orelse
+            return self.waitForMetadataProjection(table_name, expectation.schema_json, expectation.indexes_json);
+
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            const projected = try self.loadOwnedTableRecord(self.alloc, table_name);
+            if (projected) |table| {
+                defer metadata_table_manager.freeTable(self.alloc, table);
+                const projected_version = try tables_api.schemaVersion(table.schema_json);
+                if (projected_version > version) return error.TableGenerationChanged;
+                if (projected_version == version and
+                    try tables_api.schemasSemanticallyEqual(self.alloc, table.schema_json, expectation.schema_json))
+                {
+                    return;
+                }
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_interval_ns);
+        }
     }
 
     /// Starts local materialization only after the metadata definition is
@@ -28299,6 +28382,142 @@ test "api http server create table with local writes waits for projected presenc
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+}
+
+test "schema projection expectation uses backend committed generation" {
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const source = StatusSource{
+        .ptr = undefined,
+        .vtable = &.{ .status = FakeSource.status },
+    };
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source, null, null);
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    var authoritative = try server.schemaProjectionExpectationAlloc(
+        std.testing.allocator,
+        &table,
+        "{\"default_type\":\"doc\"}",
+        3,
+    );
+    defer authoritative.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 3), try tables_api.schemaVersion(authoritative.schema_json));
+    try std.testing.expectEqual(@as(?[]u8, null), authoritative.indexes_json);
+
+    var legacy = try server.schemaProjectionExpectationAlloc(
+        std.testing.allocator,
+        &table,
+        "{\"default_type\":\"doc\"}",
+        null,
+    );
+    defer legacy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), try tables_api.schemaVersion(legacy.schema_json));
+    try std.testing.expect(legacy.indexes_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy.indexes_json.?, "full_text_index_v2") != null);
+}
+
+test "status source prefers authoritative schema generation result" {
+    const FakeSource = struct {
+        legacy_calls: usize = 0,
+        versioned_calls: usize = 0,
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn legacy(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_calls += 1;
+        }
+
+        fn versioned(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.versioned_calls += 1;
+            return 7;
+        }
+    };
+
+    var fake = FakeSource{};
+    const source = StatusSource{
+        .ptr = &fake,
+        .vtable = &.{
+            .status = FakeSource.status,
+            .update_schema = FakeSource.legacy,
+            .update_schema_versioned = FakeSource.versioned,
+        },
+    };
+    try std.testing.expectEqual(@as(?u32, 7), try source.updateSchema(std.testing.allocator, "docs", "{}"));
+    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.versioned_calls);
+}
+
+test "schema projection detects a superseding backend generation" {
+    const FakeSource = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = "{\"version\":3,\"default_type\":\"doc\"}",
+            .indexes_json = "{\"full_text_index_v3\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var fake = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, fake.iface(), null, null);
+    var expectation = try server.schemaProjectionExpectationAlloc(
+        std.testing.allocator,
+        &fake.table,
+        "{\"default_type\":\"doc\"}",
+        3,
+    );
+    defer expectation.deinit(std.testing.allocator);
+
+    try server.waitForSchemaUpdateProjection("docs", expectation, 3);
+    fake.table.schema_json = "{\"version\":4,\"default_type\":\"other\"}";
+    try std.testing.expectError(
+        error.TableGenerationChanged,
+        server.waitForSchemaUpdateProjection("docs", expectation, 3),
+    );
 }
 
 test "api http server rejects unsupported table index before metadata publication" {

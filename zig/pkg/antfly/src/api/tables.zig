@@ -2724,7 +2724,7 @@ fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
     };
 }
 
-fn schemaVersion(schema_json: []const u8) !u32 {
+pub fn schemaVersion(schema_json: []const u8) !u32 {
     if (schema_json.len == 0) return 0;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, schema_json, .{});
     defer parsed.deinit();
@@ -2740,7 +2740,7 @@ fn schemaVersion(schema_json: []const u8) !u32 {
     };
 }
 
-fn schemasSemanticallyEqual(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
+pub fn schemasSemanticallyEqual(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
     // Version is backend-owned, so derive both schemas at the same synthetic
     // generation and compare their canonical runtime behavior. This treats
     // omitted fields and their explicit defaults as equal, ignores object key
