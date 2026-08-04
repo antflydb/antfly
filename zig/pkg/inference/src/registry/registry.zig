@@ -1271,14 +1271,24 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
 }
 
 /// Resolve a model name by variant suffix.
-/// If `requested` isn't found in the directory, looks for entries prefixed with
-/// "requested-" and returns the shortest match. Matches Go inference's resolveVariant.
+/// If `requested` isn't found in the directory, looks for sibling entries
+/// prefixed with "requested-" and returns the shortest deterministic match.
+/// `requested` may include an owner directory (for example `owner/model`).
+/// Matches Go inference's resolveVariant.
 /// Uses Io-based dir iteration (Zig 0.16).
 pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) ?[]const u8 {
-    const prefix = std.fmt.allocPrint(allocator, "{s}-", .{requested}) catch return null;
+    const requested_dir = std.fs.path.dirname(requested);
+    const requested_name = std.fs.path.basename(requested);
+    const prefix = std.fmt.allocPrint(allocator, "{s}-", .{requested_name}) catch return null;
     defer allocator.free(prefix);
 
-    var dir = Dir.cwd().openDir(io, models_dir, .{ .iterate = true }) catch return null;
+    const search_dir = if (requested_dir) |relative_dir|
+        std.fs.path.join(allocator, &.{ models_dir, relative_dir }) catch return null
+    else
+        allocator.dupe(u8, models_dir) catch return null;
+    defer allocator.free(search_dir);
+
+    var dir = Dir.cwd().openDir(io, search_dir, .{ .iterate = true }) catch return null;
     defer dir.close(io);
 
     var best_name: ?[]const u8 = null;
@@ -1287,7 +1297,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
     while (iter.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, prefix)) {
-            if (best_name == null or entry.name.len < best_name.?.len) {
+            if (best_name == null or entry.name.len < best_name.?.len or
+                (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
+            {
                 if (best_name) |old| allocator.free(old);
                 best_name = allocator.dupe(u8, entry.name) catch continue;
             }
@@ -1295,7 +1307,7 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
     }
 
     if (best_name) |bn| {
-        const result = std.fs.path.join(allocator, &.{ models_dir, bn }) catch {
+        const result = std.fs.path.join(allocator, &.{ search_dir, bn }) catch {
             allocator.free(bn);
             return null;
         };
@@ -1339,4 +1351,23 @@ test "explicit model variants use distinct stable install directories" {
     try std.testing.expect(!std.mem.eql(u8, q4, q8));
     try std.testing.expect(std.mem.startsWith(u8, q4, "/models/owner/model--antfly-"));
     try std.testing.expectEqualStrings("/models/owner/model", auto);
+}
+
+test "resolveVariant finds nested explicit variant install" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
+    const resolved = resolveVariant(allocator, io, models_dir, "owner/model") orelse
+        return error.ExpectedVariantResolution;
+    defer allocator.free(resolved);
+
+    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
 }

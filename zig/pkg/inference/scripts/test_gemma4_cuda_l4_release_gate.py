@@ -175,41 +175,44 @@ class L4ReleaseGateTest(unittest.TestCase):
     def test_release_scope_is_target_only(self) -> None:
         self.assertEqual("target_only", RELEASE_SCOPE)
 
-    def test_workflow_runs_mtp_only_as_non_gating_nightly_diagnostics(self) -> None:
-        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
-        start = workflow.index("- name: Collect experimental fixed-corpus MTP diagnostics")
-        end = workflow.index("- name: Publish evidence summary", start)
-        mtp_step = workflow[start:end]
-        self.assertIn("if: ${{ (inputs.gate || 'nightly') == 'nightly' }}", mtp_step)
-        self.assertIn("continue-on-error: true", mtp_step)
-        missing_draft = mtp_step[mtp_step.index('if [[ ! -f "$MTP_DRAFT_MODEL" ]]'):mtp_step.index("exit 0")]
+    def test_cuda_evidence_is_an_explicitly_flagged_e2e_lane(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[4]
+        self.assertFalse((repo_root / ".github/workflows/cuda-gemma4-l4.yml").exists())
+        test_source = (repo_root / "zig/e2e/inference/test_cuda_gemma4_l4.py").read_text(encoding="utf-8")
+        self.assertIn('ENABLE_ENV = "ANTFLY_E2E_CUDA_GEMMA4_L4"', test_source)
+        self.assertIn("pytest.mark.cuda_l4", test_source)
+        self.assertIn('os.environ.get(ENABLE_ENV) != "1"', test_source)
+
+    def test_e2e_runs_mtp_only_as_non_gating_nightly_diagnostics(self) -> None:
+        runner = (pathlib.Path(__file__).resolve().parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text(encoding="utf-8")
+        start = runner.index("# Nightly-mode MTP is collection-only")
+        end = runner.index('python3 - "$evidence_dir/release_summary.json"', start)
+        mtp_step = runner[start:end]
+        self.assertIn('if [[ "$mode" == "nightly" ]]', mtp_step)
+        self.assertIn('|| mtp_status=$?', mtp_step)
+        missing_draft = mtp_step[mtp_step.index('if [[ ! -f "$mtp_draft_model" ]]'):mtp_step.index("else")]
         self.assertIn("diagnostic_status=skipped_missing_draft", missing_draft)
         self.assertIn('> "$mtp_dir/mtp_collection_profile.txt"', missing_draft)
         self.assertIn("release_contract=none; experimental diagnostic only", mtp_step)
 
-    def test_cuda_evidence_workflow_sets_runner_temp_caches_at_runtime(self) -> None:
-        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
-        prepare = workflow[workflow.index("- name: Prepare CUDA evidence inputs"):workflow.index("- name: Check generated CUDA sources")]
-        self.assertNotIn("${{ runner.temp }}", workflow)
-        self.assertIn('ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-local"', prepare)
-        self.assertIn('ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-global"', prepare)
-        self.assertIn('>> "$GITHUB_ENV"', prepare)
+    def test_cuda_evidence_e2e_uses_local_overridable_caches(self) -> None:
+        runner = (pathlib.Path(__file__).resolve().parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text(encoding="utf-8")
+        self.assertNotIn("GITHUB_ENV", runner)
+        self.assertIn('ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$evidence_dir/zig-local-cache}"', runner)
+        self.assertIn('ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$evidence_dir/zig-global-cache}"', runner)
 
-    def test_workflow_requires_out_of_band_long_e2e_lock_sha256(self) -> None:
-        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
-        prepare = workflow[workflow.index("- name: Prepare CUDA evidence inputs"):workflow.index("- name: Check generated CUDA sources")]
-        lane = workflow[
-            workflow.index("- name: Gate E2B warm-server long-context E2E"):
-            workflow.index("- name: Validate E4B warm-server long-context correctness/regression")
+    def test_e2e_requires_out_of_band_long_e2e_lock_sha256(self) -> None:
+        runner = (pathlib.Path(__file__).resolve().parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text(encoding="utf-8")
+        lane = runner[
+            runner.index('if [[ "$long_e2e_configured" -eq 3 ]]', runner.index('"${release_args[@]}"')):
+            runner.index('if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"'))
         ]
-        self.assertEqual(2, workflow.count("      long_e2e_lock_sha256:"))
-        self.assertIn("vars.ANTFLY_CUDA_LONG_E2E_LOCK_SHA256", workflow)
-        self.assertIn('long_e2e_values=("$LLAMA_SERVER_BIN" "$LONG_E2E_LOCK" "$LONG_E2E_LOCK_SHA256")', prepare)
-        self.assertIn('[[ "$long_e2e_configured" -ne 3 ]]', prepare)
-        self.assertIn("LLAMA_SERVER_BIN, LONG_E2E_LOCK, and LONG_E2E_LOCK_SHA256 must be configured together", prepare)
-        self.assertIn('[[ ! "$LONG_E2E_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]', prepare)
-        self.assertIn('--model "$E2B_MODEL"', lane)
-        self.assertIn('--lockfile-sha256 "$LONG_E2E_LOCK_SHA256"', lane)
+        self.assertIn('long_e2e_values=("$llama_server_bin" "$long_e2e_lock" "$long_e2e_lock_sha256")', runner)
+        self.assertIn('[[ "$long_e2e_configured" -ne 0 && "$long_e2e_configured" -ne 3 ]]', runner)
+        self.assertIn("LLAMA_SERVER_BIN, LONG_E2E_LOCK, and LONG_E2E_LOCK_SHA256 must be configured together", runner)
+        self.assertIn('require_sha256 "LONG_E2E_LOCK_SHA256" "$long_e2e_lock_sha256"', runner)
+        self.assertIn('--model "$e2b_model"', lane)
+        self.assertIn('--lockfile-sha256 "$long_e2e_lock_sha256"', lane)
         self.assertIn('|| benchmark_rc=$?', lane)
         self.assertIn('merge_gemma4_long_e2e_release_summary.py', lane)
 
@@ -262,32 +265,26 @@ class L4ReleaseGateTest(unittest.TestCase):
 
     def test_release_publication_does_not_depend_on_unpublished_cuda_artifact(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[4]
-        workflow = (repo / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
         release = (repo / ".github/workflows/antfly-release.yml").read_text(encoding="utf-8")
         archive_builder = (repo / "scripts/packaging/build_zig_release_archive.sh").read_text(encoding="utf-8")
-        self.assertIn("schedule:", workflow)
-        self.assertIn("workflow_dispatch:", workflow)
+        self.assertFalse((repo / ".github/workflows/cuda-gemma4-l4.yml").exists())
         self.assertNotIn("uses: ./.github/workflows/cuda-gemma4-l4.yml", release)
         self.assertIn("-Dcuda=false", archive_builder)
         publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
         self.assertNotIn("cuda-gemma4-release-gate", publish)
 
-    def test_workflow_requires_dedicated_runner_labels(self) -> None:
-        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
-        configure = workflow[workflow.index("  configure:"):workflow.index("  l4-evidence:")]
-        evidence = workflow[workflow.index("  l4-evidence:"):]
-        self.assertIn("ANTFLY_CUDA_L4_RUNNER_LABELS_JSON must be configured for release gates", configure)
-        self.assertIn("a dedicated L4 runner label", configure)
-        self.assertIn("enabled=false", configure)
-        self.assertIn("if: ${{ needs.configure.outputs.enabled == 'true' }}", evidence)
-        self.assertNotIn("|| '[\"self-hosted\"]'", evidence)
+    def test_e2e_requires_an_actual_l4_sm89_device(self) -> None:
+        runner = (pathlib.Path(__file__).resolve().parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text(encoding="utf-8")
+        self.assertIn('nvidia-smi --id="$CUDA_VISIBLE_DEVICES" --query-gpu=name,driver_version,compute_cap', runner)
+        self.assertIn('"$gpu_info" != *"L4"* || "$gpu_info" != *"8.9"*', runner)
+        self.assertIn("cuda_l4 E2E requires an NVIDIA L4 with compute capability 8.9", runner)
 
-    def test_workflow_uses_accepted_release_and_batching_regression_floors(self) -> None:
-        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
-        self.assertIn("--enforce-performance --min-comparable-ratio 0.70 --verify-artifacts", workflow)
-        batching = workflow[workflow.index("- name: Validate Polar4 server batching"):workflow.index("- name: Collect fixed E2B", workflow.index("- name: Validate Polar4 server batching"))]
+    def test_e2e_uses_accepted_release_and_batching_regression_floors(self) -> None:
+        runner = (pathlib.Path(__file__).resolve().parents[4] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text(encoding="utf-8")
+        self.assertIn("--enforce-performance --min-comparable-ratio 0.70 --verify-artifacts", runner)
+        batching = runner[runner.index('python3 "$inference_dir/scripts/benchmark_gemma4_cuda_batching.py"'):runner.index("release_args=(")]
         self.assertIn("--min-c2-speedup 0.40", batching)
-        self.assertNotIn('if [[ "$CUDA_RELEASE_MODE" == "nightly" ]]', batching)
+        self.assertNotIn('if [[ "$mode" == "nightly" ]]', batching)
 
     def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:
         profile = frozen_profile()

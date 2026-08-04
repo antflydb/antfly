@@ -56,7 +56,6 @@ This directory tracks major features and architectural changes in Antfly. Each d
 | Reader Interface (OCR/Vision) | [reader-integration.md](completed/reader-integration.md) | TrOCR, Donut, Florence-2, multi-stage readers |
 | INT8 Fixups | [int8-fixups.md](completed/int8-fixups.md) | Worker pool and SIMD optimization for quantized inference |
 | Termite Enhancements | [../termite-enhancements.md](termite-enhancements.md) | Ollama parity: lazy loading, queuing, metrics, caching |
-| Inference Chat Command | [inference-chat-command.md](completed/inference-chat-command.md) | `antfly inference chat`: alias auto-pull + REPL; gemma4 channel-projection and sampled-decoding fixes |
 
 ### Document Processing & API
 

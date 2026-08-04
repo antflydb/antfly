@@ -1542,57 +1542,50 @@ class LockTests(unittest.TestCase):
                     benchmark.validate_args(namespace, fixture)
                 setattr(namespace, field, 1.02)
 
-    def test_l4_workflow_requires_locked_long_e2e_for_release(self) -> None:
-        workflow = (SCRIPTS.parents[3] / ".github/workflows/cuda-gemma4-l4.yml").read_text()
-        prepare = workflow[workflow.index("- name: Prepare CUDA evidence inputs"):workflow.index("- name: Check generated CUDA sources")]
-        lane = workflow[
-            workflow.index("- name: Gate E2B warm-server long-context E2E"):
-            workflow.index("- name: Validate E4B warm-server long-context correctness/regression")
+    def test_l4_e2e_requires_locked_long_e2e_for_release(self) -> None:
+        runner = (SCRIPTS.parents[3] / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh").read_text()
+        lane = runner[
+            runner.index('if [[ "$long_e2e_configured" -eq 3 ]]', runner.index('"${release_args[@]}"')):
+            runner.index('if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"'))
         ]
-        e4b_lane = workflow[
-            workflow.index("- name: Validate E4B warm-server long-context correctness/regression"):
-            workflow.index("- name: Collect experimental fixed-corpus MTP diagnostics")
+        e4b_lane = runner[
+            runner.index('if [[ -n "$e4b_qat_model" ]]', runner.index('"${release_args[@]}"')):
+            runner.index("# Nightly-mode MTP is collection-only")
         ]
-        self.assertIn("long_e2e_configured", prepare)
-        self.assertIn("if [[ \"$long_e2e_configured\" -eq 0 ]]", prepare)
-        self.assertIn('if [[ "$CUDA_RELEASE_MODE" == "release" ]]', prepare)
-        self.assertIn("Release mode requires LLAMA_SERVER_BIN", prepare)
-        self.assertIn("Release mode requires E4B_QAT_MODEL and reviewed frozen E4B regression evidence", prepare)
-        self.assertIn("e4b_regression_configured", prepare)
-        self.assertIn("E4B_BASELINE_EVIDENCE, E4B_BASELINE_SHA256, E4B_REGRESSION_LOCK, and E4B_REGRESSION_LOCK_SHA256", prepare)
-        self.assertIn('[[ ! "$E4B_BASELINE_SHA256" =~ ^[0-9a-f]{64}$ ]]', prepare)
-        self.assertIn('[[ ! "$E4B_REGRESSION_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]', prepare)
-        self.assertIn('E2B_MODELS_DIR="$(dirname "$(dirname "$E2B_MODEL")")"', prepare)
-        self.assertIn('E4B_MODELS_DIR="$(dirname "$(dirname "$E4B_QAT_MODEL")")"', prepare)
-        self.assertIn('long_e2e_lock_sha256:', workflow)
-        self.assertIn("vars.ANTFLY_CUDA_LONG_E2E_LOCK_SHA256", workflow)
-        self.assertIn("$LONG_E2E_LOCK_SHA256", prepare)
-        self.assertIn('[[ ! "$LONG_E2E_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]', prepare)
+        self.assertIn("long_e2e_configured", runner)
+        self.assertIn('elif [[ "$mode" == "release" ]]', runner)
+        self.assertIn("release mode requires LLAMA_SERVER_BIN", runner)
+        self.assertIn("release mode requires E4B_QAT_MODEL and reviewed frozen E4B regression evidence", runner)
+        self.assertIn("e4b_regression_configured", runner)
+        self.assertIn("E4B_BASELINE_EVIDENCE, E4B_BASELINE_SHA256, E4B_REGRESSION_LOCK, and E4B_REGRESSION_LOCK_SHA256", runner)
+        self.assertIn('require_sha256 "E4B_BASELINE_SHA256" "$e4b_baseline_sha256"', runner)
+        self.assertIn('require_sha256 "E4B_REGRESSION_LOCK_SHA256" "$e4b_regression_lock_sha256"', runner)
+        self.assertIn('e2b_models_dir="$(dirname "$(dirname "$e2b_model")")"', runner)
+        self.assertIn('e4b_models_dir="$(dirname "$(dirname "$e4b_qat_model")")"', runner)
+        self.assertIn("$long_e2e_lock_sha256", runner)
         self.assertIn(
             "LLAMA_SERVER_BIN, LONG_E2E_LOCK, and LONG_E2E_LOCK_SHA256 must be configured together",
-            prepare,
+            runner,
         )
-        self.assertIn("steps.prepare.outputs.long_e2e_enabled == 'true'", lane)
         self.assertIn("--profile headline", lane)
         self.assertIn("--warmups 2", lane)
         self.assertIn("--repeats 10", lane)
-        self.assertIn('--lockfile-sha256 "$LONG_E2E_LOCK_SHA256"', lane)
-        self.assertIn('--model "$E2B_MODEL"', lane)
-        self.assertIn('--models-dir "$E2B_MODELS_DIR"', lane)
+        self.assertIn('--lockfile-sha256 "$long_e2e_lock_sha256"', lane)
+        self.assertIn('--model "$e2b_model"', lane)
+        self.assertIn('--models-dir "$e2b_models_dir"', lane)
         self.assertIn('benchmark_rc=0', lane)
         self.assertIn('|| benchmark_rc=$?', lane)
         self.assertIn("merge_gemma4_long_e2e_release_summary.py", lane)
         self.assertIn('"$benchmark_rc"', lane)
         self.assertIn("--require-lock", lane)
-        self.assertIn("steps.prepare.outputs.e4b_regression_enabled == 'true'", e4b_lane)
-        self.assertIn('--model "$E4B_QAT_MODEL"', e4b_lane)
-        self.assertIn('--models-dir "$E4B_MODELS_DIR"', e4b_lane)
+        self.assertIn('--model "$e4b_qat_model"', e4b_lane)
+        self.assertIn('--models-dir "$e4b_models_dir"', e4b_lane)
         self.assertIn("--profile e4b-regression", e4b_lane)
-        self.assertIn('if [[ "$GEMMA4_E4B_REGRESSION_ENFORCED" == "true" ]]', e4b_lane)
-        self.assertIn('--baseline-evidence "$E4B_BASELINE_EVIDENCE"', e4b_lane)
-        self.assertIn('--baseline-sha256 "$E4B_BASELINE_SHA256"', e4b_lane)
-        self.assertIn('--lockfile "$E4B_REGRESSION_LOCK"', e4b_lane)
-        self.assertIn('--lockfile-sha256 "$E4B_REGRESSION_LOCK_SHA256"', e4b_lane)
+        self.assertIn('if [[ "$e4b_regression_configured" -eq 4 ]]', e4b_lane)
+        self.assertIn('--baseline-evidence "$e4b_baseline_evidence"', e4b_lane)
+        self.assertIn('--baseline-sha256 "$e4b_baseline_sha256"', e4b_lane)
+        self.assertIn('--lockfile "$e4b_regression_lock"', e4b_lane)
+        self.assertIn('--lockfile-sha256 "$e4b_regression_lock_sha256"', e4b_lane)
         self.assertIn("--enforce-performance", e4b_lane)
         self.assertIn("--collect-only", e4b_lane)
         self.assertIn("args+=(--repeats 3 --collect-only)", e4b_lane)

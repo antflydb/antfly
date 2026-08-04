@@ -2302,13 +2302,13 @@ pub const LoadedModel = struct {
         defer self.embedding_session_lock.unlock();
 
         for (declaredOptionalSessions(&self.manifest)) |declared| {
-            switch (declared.kind) {
+            _ = switch (declared.kind) {
                 .vision => try self.ensureOptionalSession(.vision, &self.vision_session, &self.vision_resource_lease, declared.path),
                 .audio => try self.ensureOptionalSession(.audio, &self.audio_session, &self.audio_resource_lease, declared.path),
                 .text_projection => try self.ensureOptionalSession(.text_projection, &self.text_projection, &self.text_projection_resource_lease, declared.path),
                 .visual_projection => try self.ensureOptionalSession(.visual_projection, &self.visual_projection, &self.visual_projection_resource_lease, declared.path),
                 .audio_projection => try self.ensureOptionalSession(.audio_projection, &self.audio_projection, &self.audio_projection_resource_lease, declared.path),
-            }
+            };
         }
         if (!self.declaredOptionalSessionsMaterializedUnlocked())
             return error.OptionalSessionMaterializationIncomplete;

@@ -25,6 +25,7 @@ Set ANTFLY_INFERENCE_ML_DIR to control where Traditional ML predictors are store
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -365,7 +366,11 @@ def inference_command() -> list[str]:
 
 
 def _model_path(spec: ModelSpec) -> Path:
-    return models_dir() / spec.repo
+    legacy_path = models_dir() / spec.repo
+    if spec.variant == "auto":
+        return legacy_path
+    variant_hash = hashlib.sha256(spec.variant.encode()).hexdigest()[:16]
+    return legacy_path.with_name(f"{legacy_path.name}--antfly-{variant_hash}")
 
 
 def _looks_like_model_dir(path: Path) -> bool:
@@ -444,8 +449,12 @@ def _looks_like_model_dir(path: Path) -> bool:
 def model_available(spec: ModelSpec) -> bool:
     """Check if a model is already downloaded."""
 
-    path = find_local_model_path(spec.request_name, spec.task)
-    if path is None:
+    path = _model_path(spec)
+    if not _looks_like_model_dir(path):
+        # Preserve compatibility with models pulled before explicit variants
+        # received distinct install directories.
+        path = models_dir() / spec.repo
+    if not _looks_like_model_dir(path):
         return False
     return all((path / extra).exists() for extra in spec.extra_files)
 
@@ -463,7 +472,16 @@ def find_local_model_path(name: str, task_hint: str | None = None) -> Path | Non
         return None
 
     root = models_dir()
-    candidates: list[Path] = [root / name]
+    legacy_path = root / name
+    candidates: list[Path] = [legacy_path]
+    # Explicit variants are installed beside the legacy path so multiple
+    # formats/quantizations can coexist. Bare names retain compatibility by
+    # selecting a completed variant deterministically when no legacy install
+    # exists; callers that know the variant use `_model_path` instead.
+    try:
+        candidates.extend(sorted(legacy_path.parent.glob(f"{legacy_path.name}--antfly-*")))
+    except OSError:
+        pass
 
     seen: set[Path] = set()
     for candidate in candidates:
@@ -493,8 +511,12 @@ def spec_for_name(name: str, task_hint: str | None = None) -> ModelSpec | None:
 def ensure_model(spec: ModelSpec) -> Path:
     """Download a model with `antfly inference pull` if not already present."""
 
-    if (existing := find_local_model_path(spec.request_name, spec.task)) is not None:
-        return existing
+    expected = _model_path(spec)
+    if _looks_like_model_dir(expected):
+        return expected
+    legacy = models_dir() / spec.repo
+    if _looks_like_model_dir(legacy):
+        return legacy
 
     command = [
         *inference_command(),
@@ -509,8 +531,8 @@ def ensure_model(spec: ModelSpec) -> Path:
     print(f"Downloading {spec.pull_ref}")
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
-    resolved = find_local_model_path(spec.request_name, spec.task)
-    if resolved is None:
+    resolved = _model_path(spec)
+    if not _looks_like_model_dir(resolved):
         raise RuntimeError(f"antfly inference pull finished but could not locate {spec.request_name} in {models_dir()}")
     return resolved
 

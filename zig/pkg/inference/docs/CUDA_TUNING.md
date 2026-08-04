@@ -767,39 +767,25 @@ zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
 
 ## L4 Release Evidence
 
-`.github/workflows/cuda-gemma4-l4.yml` is the GPU-only evidence lane. It runs
-nightly and on manual dispatch; pull requests remain CPU-only and run the
-generator plus benchmark/validator contract tests in `Zig Tests`.
+`zig/e2e/inference/test_cuda_gemma4_l4.py` is the explicitly flagged GPU
+evidence lane. Ordinary PR and scheduled CI do not run it. Select it on a
+dedicated L4 with `ANTFLY_E2E_CUDA_GEMMA4_L4=1` and `pytest -m cuda_l4`.
 
-Configure the self-hosted runner with repository variables rather than adding a
-hard-coded label to the workflow:
+The runner accepts local environment inputs rather than repository variables:
 
-- `ANTFLY_CUDA_L4_RUNNER_LABELS_JSON`: JSON runner-label array, for example
-  `["self-hosted","linux","x64","gpu-l4"]`.
-- `ANTFLY_CUDA_E2B_MODEL` and `ANTFLY_CUDA_GEMMA12B_Q4_MODEL`: absolute GGUF
-  paths on that runner. Workflow inputs override these for a manual run.
-- `ANTFLY_CUDA_LLAMA_CPP_BIN`: absolute `llama-completion` path; it defaults to
-  `/tmp/llama.cpp/build/bin/llama-completion` for the existing benchmark host.
-- `ANTFLY_CUDA_LLAMA_SERVER_BIN`, `ANTFLY_CUDA_LONG_E2E_LOCK`, and
-  `ANTFLY_CUDA_LONG_E2E_LOCK_SHA256`: pinned comparator inputs for the strict
-  E2B warm-server long-context headline. They are mandatory for `gate=release`
-  and optional as a complete set for nightly collection. The lock must attest
-  the E2B GGUF selected by `ANTFLY_CUDA_E2B_MODEL`; the digest is reviewed and
-  stored out of band from the lockfile. Partial configuration, a malformed
-  digest, or a lockfile digest mismatch fails closed.
-- `ANTFLY_CUDA_E4B_QAT_MODEL` and `ANTFLY_CUDA_E4B_MODELS_DIR`: E4B
-  correctness/regression-lane model inputs. The models root may be omitted when
-  it can be derived from the GGUF path.
-- `ANTFLY_CUDA_E4B_BASELINE_EVIDENCE`, `ANTFLY_CUDA_E4B_BASELINE_SHA256`,
-  `ANTFLY_CUDA_E4B_REGRESSION_LOCK`, and
-  `ANTFLY_CUDA_E4B_REGRESSION_LOCK_SHA256`: the reviewed frozen E4B F16
-  regression bundle and its out-of-band digests. Release mode requires these
-  together with the E4B model and enforces the 1.03 TTFT/decode/total-latency
-  regression ceiling. Nightly may omit the E4B lane, collect correctness only
-  when just the model is configured, or enforce the same frozen regression when
-  all four reviewed inputs are present. E4B never substitutes for the E2B
-  llama.cpp-superiority headline.
-- `ANTFLY_CUDA_VISIBLE_DEVICES`: optional CUDA device index, defaulting to `0`.
+- `E2B_MODEL`, `GEMMA12B_Q4_MODEL`, and `LLAMA_CPP_BIN`: absolute target GGUF
+  and pinned comparator paths.
+- `LLAMA_SERVER_BIN`, `LONG_E2E_LOCK`, and `LONG_E2E_LOCK_SHA256`: pinned
+  comparator inputs for the strict E2B warm-server headline. They are required
+  as a complete set in release mode. The digest is reviewed and stored out of
+  band from the lockfile; partial configuration, malformed digests, and
+  mismatches fail closed.
+- `E4B_QAT_MODEL` and optional `E4B_MODELS_DIR`: E4B regression model inputs.
+- `E4B_BASELINE_EVIDENCE`, `E4B_BASELINE_SHA256`, `E4B_REGRESSION_LOCK`, and
+  `E4B_REGRESSION_LOCK_SHA256`: the reviewed frozen E4B regression bundle.
+  Release mode requires the complete bundle and enforces the 1.03
+  TTFT/decode/total-latency regression ceiling.
+- `CUDA_VISIBLE_DEVICES`: selected L4, defaulting to `0`.
 
 The gate refuses a device other than a single NVIDIA L4 / SM89, checks generated
 sources and checked-in CUDA artifacts, builds ReleaseFast, and runs
@@ -815,13 +801,13 @@ MMV/MM/pair/pair-Q8/down-Q8 routes. Generated-route hit and promotion evidence
 remains a separate exact-token kernel-candidate gate because the fixed release
 prompt does not exercise every generated row bucket.
 
-Nightly evidence also runs the fixed five-pair score-prework screening profile
+The qualification also runs the fixed five-pair score-prework screening profile
 with the checked-in long-context fixture, F16 KV, and 300 output tokens. The
 fixture path materializes the locked 8,251-byte rendered chat prompt and passes
 those bytes through the raw-prompt path, then requires both arms to report the
 same 2,051 prompt token IDs. The screen is gating for the nightly candidate lane
 and its raw samples, summary, logs, timing files, and content-addressed manifest
-are uploaded with the other L4 evidence. Release mode uses the stronger locked
+are written with the other L4 evidence. Release mode also uses the stronger locked
 E2B warm-server lane below; the candidate screen is diagnostic kernel
 qualification and does not substitute for the end-to-end comparator.
 
@@ -832,25 +818,44 @@ a model-level validation run. Per-route `DISABLE_` variables override the
 matching opt-in, and `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0=1` is the
 single emergency rollback for all generated Q4_0 routes and candidates.
 
-Use manual `gate=release` to collect CUDA evidence for the commit intended for
-release. Tag release archives are explicitly built with `-Dcuda=false`, so tag
-publication does not invoke or claim certification from this lane. Its
-`release_scope` is `target_only`: CUDA MTP is not executed or certified. That mode
-requires the E2B comparable llama.cpp ratio to be at least `0.70` and a token
-throughput CV no higher than `0.02`; `0.80` remains the future optimization
-target. Nightly collection keeps the same correctness/replay contract without
-asserting the performance floor.
-Each run uploads `release_summary.json`, `release_provenance.json`, paired raw
-logs/timing, and 12B timing evidence. When configured, the long-E2E evidence
-path, SHA-256, contract, comparison, and verdict are merged into the canonical
-machine-readable `release_summary.json`. The E4B correctness/regression
-collection is merged separately into the same summary; either lane failing
-makes its `passed` field false, so the workflow conclusion and canonical JSON
-cannot disagree.
+Run the release lane on a dedicated NVIDIA L4 for the commit intended for release:
 
-CUDA MTP diagnostics run only in `gate=nightly`. They are experimental,
-optional, and non-gating, and they make no production-readiness or
-llama.cpp-superiority claim. Strict CUDA MTP certification is follow-up work.
+```sh
+ANTFLY_E2E_CUDA_GEMMA4_L4=1 \
+CUDA_RELEASE_MODE=release \
+CUDA_EVIDENCE_DIR=/tmp/antfly-cuda-gemma4-l4 \
+E2B_MODEL=/path/to/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+GEMMA12B_Q4_MODEL=/path/to/gemma-4-12B-it-Q4_K_M.gguf \
+LLAMA_CPP_BIN=/path/to/llama-completion \
+LLAMA_SERVER_BIN=/path/to/llama-server \
+LONG_E2E_LOCK=/path/to/headline.lock.json \
+LONG_E2E_LOCK_SHA256=<reviewed-sha256> \
+E4B_QAT_MODEL=/path/to/gemma-4-E4B-it-qat-q4_0.gguf \
+E4B_BASELINE_EVIDENCE=/path/to/e4b-baseline.json \
+E4B_BASELINE_SHA256=<reviewed-sha256> \
+E4B_REGRESSION_LOCK=/path/to/e4b-regression.lock.json \
+E4B_REGRESSION_LOCK_SHA256=<reviewed-sha256> \
+  uv run --project zig/e2e/inference pytest -m cuda_l4 \
+    zig/e2e/inference/test_cuda_gemma4_l4.py
+```
+
+`zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh --help` documents the complete
+input contract.
+Tag release archives are built with `-Dcuda=false`, so publication does not
+implicitly claim qualification from this lane. Its `release_scope` is
+`target_only`: CUDA MTP is not certified. Release mode requires an E2B
+comparable llama.cpp ratio of at least `0.70` and token-throughput CV no higher
+than `0.02`; `0.80` remains the future optimization target. Nightly mode keeps
+the correctness/replay contract without enforcing that performance floor.
+
+Each run writes `release_summary.json`, `release_provenance.json`, paired raw
+logs/timing, and 12B timing evidence under `CUDA_EVIDENCE_DIR`. Locked headline
+and E4B evidence are merged into the same fail-closed summary, so a nonzero E2E
+result and its canonical JSON cannot disagree.
+
+CUDA MTP diagnostics run only in `CUDA_RELEASE_MODE=nightly`. They are
+experimental, optional, and non-gating, and they make no production-readiness
+or llama.cpp-superiority claim. Strict CUDA MTP certification is follow-up work.
 
 For an equivalent local evidence run after a ReleaseFast CUDA build:
 

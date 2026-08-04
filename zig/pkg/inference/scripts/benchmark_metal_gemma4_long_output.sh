@@ -374,7 +374,19 @@ case "$OUT_DIR" in
     exit 2
     ;;
 esac
-llama_binary_file_type="$(/usr/bin/file -b "$LLAMA_CPP_BIN_RESOLVED" 2>/dev/null || true)"
+file_bin="$(command -v file 2>/dev/null || true)"
+if [[ -z "$file_bin" || ! -x "$file_bin" ]]; then
+  echo "file utility not found; install it to identify the llama.cpp comparator binary" >&2
+  exit 2
+fi
+if ! llama_binary_file_type="$("$file_bin" -b "$LLAMA_CPP_BIN_RESOLVED" 2>/dev/null)"; then
+  echo "failed to identify llama.cpp comparator binary: $LLAMA_CPP_BIN_RESOLVED" >&2
+  exit 2
+fi
+if [[ -z "$llama_binary_file_type" ]]; then
+  echo "file utility returned an empty type for llama.cpp comparator: $LLAMA_CPP_BIN_RESOLVED" >&2
+  exit 2
+fi
 if [[ "$llama_binary_file_type" == Mach-O* ]]; then
   llama_loader_audit_mode="dyld_print_libraries_preflight"
 elif [[ "$allow_noncanonical_policy" == true ]]; then

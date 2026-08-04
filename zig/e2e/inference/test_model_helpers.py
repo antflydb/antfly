@@ -6,6 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+import hashlib
 import json
 
 from . import models
@@ -15,7 +16,9 @@ from .models import (
     DEFAULT_TOOL_GENERATOR_MODEL,
     _env_model_specs,
     _looks_like_model_dir,
+    _model_path,
     bootstrap_models_for_listing,
+    find_local_model_path,
 )
 
 
@@ -35,6 +38,28 @@ def test_completed_nested_model_payload_is_available(tmp_path):
     (model_dir / "onnx" / "model.onnx").write_bytes(b"complete")
 
     assert _looks_like_model_dir(model_dir)
+
+
+def test_explicit_variant_uses_registry_install_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    spec = models.ModelSpec(
+        name="model",
+        repo="owner/model",
+        task="generators",
+        variant="gguf:Q4_K_M",
+    )
+    variant_hash = hashlib.sha256(spec.variant.encode()).hexdigest()[:16]
+
+    assert _model_path(spec) == tmp_path / "owner" / f"model--antfly-{variant_hash}"
+
+
+def test_bare_model_name_finds_completed_explicit_variant(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    model_dir = tmp_path / "owner" / "model--antfly-0123456789abcdef"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"complete")
+
+    assert find_local_model_path("owner/model") == model_dir
 
 
 def test_unsupported_framework_bin_is_not_a_completed_model(tmp_path):

@@ -1057,12 +1057,13 @@ class CandidateParityTest(unittest.TestCase):
             self.assertEqual(1802, artifact_check.call_args.args[0].timeout_sec)
 
     def test_l4_nightly_runs_fixed_long_context_candidate_screen(self):
-        workflow = (
-            pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml"
+        runner = (
+            pathlib.Path(__file__).resolve().parents[4]
+            / "zig/e2e/inference/run_cuda_gemma4_l4_e2e.sh"
         ).read_text(encoding="utf-8")
-        lane = workflow[
-            workflow.index("- name: Screen score-prework on fixed long context"):
-            workflow.index("- name: Validate Polar4 server batching")
+        lane = runner[
+            runner.index("scripts/validate_gemma4_cuda_candidate.py"):
+            runner.index('python3 "$inference_dir/scripts/benchmark_gemma4_cuda_batching.py"')
         ]
         self.assertIn("--kernel-id cuda.attention.gqa.decode.score_prework", lane)
         self.assertIn("--qualification-profile screening", lane)
