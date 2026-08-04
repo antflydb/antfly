@@ -29,6 +29,10 @@ pub const std_options: std.Options = .{
 
 pub fn main(init: std.process.Init) void {
     mainImpl(init) catch |err| {
+        // Keep the concrete Zig error in the container log. The human-friendly
+        // fallback below is useful context, but on its own it makes a startup
+        // CrashLoopBackOff impossible to diagnose.
+        std.debug.print("antfly: startup error={}\n", .{err});
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
