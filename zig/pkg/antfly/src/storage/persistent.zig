@@ -877,10 +877,13 @@ pub const PreparedMergeSegment = struct {
     id: u64,
     data: index_mod.SegmentData,
     key_range: SegmentKeyRange,
+    /// Owns the prepared list and key-range metadata. It must remain alive
+    /// until the prepared merge is either published or discarded.
+    staging_alloc: Allocator,
 
-    pub fn deinit(self: *PreparedMergeSegment, alloc: Allocator) void {
-        self.data.deinit(alloc);
-        self.key_range.deinit(alloc);
+    pub fn deinit(self: *PreparedMergeSegment, data_alloc: Allocator) void {
+        self.data.deinit(data_alloc);
+        self.key_range.deinit(self.staging_alloc);
         self.* = undefined;
     }
 };
@@ -2497,8 +2500,27 @@ pub const PersistentIndex = struct {
         segment_bytes_list: [][]u8,
         replacement_deleted: ?[]const ?roaring.RoaringBitmap,
     ) !bool {
+        return try self.replaceSegmentsIfActiveManyOwnedWithDeletesAndScratch(
+            self.alloc,
+            old_seg_ids,
+            segment_bytes_list,
+            replacement_deleted,
+        );
+    }
+
+    /// Heap-backed merge publication with caller-budgeted transient staging.
+    /// `scratch_alloc` owns the consumed input list and its segment buffers as
+    /// well as arrays and serialized tombstones that die before return. The
+    /// durable segment copy and published snapshot use the persistent allocator.
+    pub fn replaceSegmentsIfActiveManyOwnedWithDeletesAndScratch(
+        self: *PersistentIndex,
+        scratch_alloc: Allocator,
+        old_seg_ids: []const u64,
+        segment_bytes_list: [][]u8,
+        replacement_deleted: ?[]const ?roaring.RoaringBitmap,
+    ) !bool {
         if (old_seg_ids.len == 0) {
-            freeOwnedSegmentList(self.alloc, segment_bytes_list);
+            freeOwnedSegmentList(scratch_alloc, segment_bytes_list);
             return false;
         }
         if (segment_bytes_list.len == 0) {
@@ -2506,16 +2528,26 @@ pub const PersistentIndex = struct {
         }
         if (replacement_deleted) |deleted| {
             if (deleted.len != segment_bytes_list.len) {
-                freeOwnedSegmentList(self.alloc, segment_bytes_list);
+                freeOwnedSegmentList(scratch_alloc, segment_bytes_list);
                 return error.InvalidDeletionSnapshot;
             }
         }
         self.lockStorage();
         defer self.unlockStorage();
 
-        const new_seg_ids = try self.reserveSegmentIds(segment_bytes_list.len);
-        defer self.alloc.free(new_seg_ids);
-        return try self.replaceSegmentsWithReservedIdsOwned(old_seg_ids, new_seg_ids, segment_bytes_list, replacement_deleted, true);
+        const new_seg_ids = self.reserveSegmentIds(scratch_alloc, segment_bytes_list.len) catch |err| {
+            freeOwnedSegmentList(scratch_alloc, segment_bytes_list);
+            return err;
+        };
+        defer scratch_alloc.free(new_seg_ids);
+        return try self.replaceSegmentsWithReservedIdsOwned(
+            scratch_alloc,
+            old_seg_ids,
+            new_seg_ids,
+            segment_bytes_list,
+            replacement_deleted,
+            true,
+        );
     }
 
     pub fn prepareMergedSegmentToFile(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, segment_indices: []const usize) ![]PreparedMergeSegment {
@@ -2523,9 +2555,8 @@ pub const PersistentIndex = struct {
     }
 
     /// File-backed merge with an explicit allocator for task-local working
-    /// state. Published mappings, key ranges, and the returned prepared list
-    /// remain owned by the persistent index allocator; only temporary merge
-    /// buffers use `work_alloc`.
+    /// state. The returned prepared list retains `work_alloc` for its key-range
+    /// metadata and must be published or discarded before that allocator dies.
     pub fn prepareMergedSegmentToFileWithAllocator(
         self: *PersistentIndex,
         work_alloc: Allocator,
@@ -2541,6 +2572,26 @@ pub const PersistentIndex = struct {
     pub fn prepareMergedSegmentToFileWithAllocatorAndDeletes(
         self: *PersistentIndex,
         work_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+        deleted_docs: ?[]const ?roaring.RoaringBitmap,
+    ) ![]PreparedMergeSegment {
+        return try self.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
+            work_alloc,
+            work_alloc,
+            snap,
+            segment_indices,
+            deleted_docs,
+        );
+    }
+
+    /// Variant for callers whose transient accounting allocator is scoped to
+    /// the build call. Retained result metadata uses `staging_alloc`, which
+    /// must remain alive until publication or discard.
+    pub fn prepareMergedSegmentToFileWithAllocatorsAndDeletes(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        staging_alloc: Allocator,
         snap: *const index_mod.IndexSnapshot,
         segment_indices: []const usize,
         deleted_docs: ?[]const ?roaring.RoaringBitmap,
@@ -2602,16 +2653,17 @@ pub const PersistentIndex = struct {
         var data: ?index_mod.SegmentData = .fromMapped(try publication_admission.mapFile(path));
         errdefer if (data) |*segment_data| segment_data.deinit(self.alloc);
 
-        var key_range = try extractSegmentKeyRange(self.alloc, data.?.bytes());
-        errdefer key_range.deinit(self.alloc);
+        var key_range = try extractSegmentKeyRange(staging_alloc, data.?.bytes());
+        errdefer key_range.deinit(staging_alloc);
         key_range.seg_id = new_seg_id;
 
-        const prepared = try self.alloc.alloc(PreparedMergeSegment, 1);
-        errdefer self.alloc.free(prepared);
+        const prepared = try staging_alloc.alloc(PreparedMergeSegment, 1);
+        errdefer staging_alloc.free(prepared);
         prepared[0] = .{
             .id = new_seg_id,
             .data = data.?,
             .key_range = key_range,
+            .staging_alloc = staging_alloc,
         };
         data = null;
         return prepared;
@@ -2629,12 +2681,27 @@ pub const PersistentIndex = struct {
         prepared_segments: []PreparedMergeSegment,
         replacement_deleted: ?[]const ?roaring.RoaringBitmap,
     ) !bool {
+        return try self.replaceSegmentsIfActiveManyPreparedWithDeletesAndScratch(
+            self.alloc,
+            old_seg_ids,
+            prepared_segments,
+            replacement_deleted,
+        );
+    }
+
+    /// File-backed merge publication with caller-budgeted transient staging.
+    pub fn replaceSegmentsIfActiveManyPreparedWithDeletesAndScratch(
+        self: *PersistentIndex,
+        scratch_alloc: Allocator,
+        old_seg_ids: []const u64,
+        prepared_segments: []PreparedMergeSegment,
+        replacement_deleted: ?[]const ?roaring.RoaringBitmap,
+    ) !bool {
         if (old_seg_ids.len == 0) {
             self.discardPreparedMergeSegments(prepared_segments);
             return false;
         }
         if (prepared_segments.len == 0) {
-            self.alloc.free(prepared_segments);
             return try self.removeSegmentsIfActive(old_seg_ids);
         }
         if (replacement_deleted) |deleted| {
@@ -2647,6 +2714,7 @@ pub const PersistentIndex = struct {
         self.lockStorage();
         defer self.unlockStorage();
 
+        const staging_alloc = prepared_segments[0].staging_alloc;
         var published_to_writer = false;
         defer {
             if (!published_to_writer) {
@@ -2657,14 +2725,14 @@ pub const PersistentIndex = struct {
                 }
             } else {
                 for (prepared_segments) |*segment| {
-                    segment.key_range.deinit(self.alloc);
+                    segment.key_range.deinit(segment.staging_alloc);
                 }
             }
-            self.alloc.free(prepared_segments);
+            staging_alloc.free(prepared_segments);
         }
 
-        const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
-        defer self.alloc.free(replacements);
+        const replacements = try scratch_alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
+        defer scratch_alloc.free(replacements);
         for (prepared_segments, 0..) |*segment, i| {
             replacements[i] = .{
                 .id = segment.id,
@@ -2679,8 +2747,8 @@ pub const PersistentIndex = struct {
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
 
-        const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
-        defer self.alloc.free(active_ids);
+        const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
+        defer scratch_alloc.free(active_ids);
         for (old_seg_ids) |old_id| {
             if (!containsSegmentId(active_ids, old_id)) {
                 txn.abort();
@@ -2688,7 +2756,7 @@ pub const PersistentIndex = struct {
             }
         }
 
-        var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, replacements);
+        var writer_publication = try self.writer.prepareSegmentsManyDataWithScratch(scratch_alloc, old_seg_ids, replacements);
         defer writer_publication.abort();
 
         for (old_seg_ids) |old_id| {
@@ -2706,13 +2774,13 @@ pub const PersistentIndex = struct {
         }
 
         for (prepared_segments, 0..) |*segment, i| {
-            try self.saveSegmentRange(&txn, segment.id, segment.key_range);
+            try self.saveSegmentRangeWithAllocator(scratch_alloc, &txn, segment.id, segment.key_range);
             try self.updateActiveSegments(&txn, segment.id, .add);
             if (replacement_deleted) |deleted| {
                 if (deleted[i]) |*bitmap| {
                     if (!bitmap.isEmpty()) {
-                        const bitmap_bytes = try bitmap.toBytes(self.alloc);
-                        defer self.alloc.free(bitmap_bytes);
+                        const bitmap_bytes = try bitmap.toBytes(scratch_alloc);
+                        defer scratch_alloc.free(bitmap_bytes);
                         const segment_key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
                         try txn.put(.deletions, &segment_key, bitmap_bytes);
                     }
@@ -2727,12 +2795,14 @@ pub const PersistentIndex = struct {
     }
 
     pub fn discardPreparedMergeSegments(self: *PersistentIndex, prepared_segments: []PreparedMergeSegment) void {
+        if (prepared_segments.len == 0) return;
+        const staging_alloc = prepared_segments[0].staging_alloc;
         for (prepared_segments) |*segment| {
             const id = segment.id;
             segment.deinit(self.alloc);
             self.deleteSegmentFile(id);
         }
-        self.alloc.free(prepared_segments);
+        staging_alloc.free(prepared_segments);
     }
 
     pub fn removeSegmentsIfActive(self: *PersistentIndex, old_seg_ids: []const u64) !bool {
@@ -2764,8 +2834,8 @@ pub const PersistentIndex = struct {
         return seg_id;
     }
 
-    fn reserveSegmentIds(self: *PersistentIndex, count: usize) ![]u64 {
-        const seg_ids = try self.alloc.alloc(u64, count);
+    fn reserveSegmentIds(self: *PersistentIndex, alloc: Allocator, count: usize) ![]u64 {
+        const seg_ids = try alloc.alloc(u64, count);
         self.writer.lockMutex();
         defer self.writer.mu.unlock();
         for (seg_ids, 0..) |*seg_id, i| {
@@ -2962,6 +3032,7 @@ pub const PersistentIndex = struct {
 
     fn replaceSegmentsWithReservedIdsOwned(
         self: *PersistentIndex,
+        scratch_alloc: Allocator,
         old_seg_ids: []const u64,
         new_seg_ids: []const u64,
         segment_bytes_list: [][]u8,
@@ -2969,19 +3040,19 @@ pub const PersistentIndex = struct {
         require_active: bool,
     ) !bool {
         std.debug.assert(new_seg_ids.len == segment_bytes_list.len);
-        defer freeOwnedSegmentList(self.alloc, segment_bytes_list);
+        defer freeOwnedSegmentList(scratch_alloc, segment_bytes_list);
         if (replacement_deleted) |deleted| {
             if (deleted.len != segment_bytes_list.len) return error.InvalidDeletionSnapshot;
         }
 
-        var key_ranges = try self.alloc.alloc(SegmentKeyRange, segment_bytes_list.len);
+        var key_ranges = try scratch_alloc.alloc(SegmentKeyRange, segment_bytes_list.len);
         var key_ranges_initialized: usize = 0;
         defer {
-            for (key_ranges[0..key_ranges_initialized]) |*range| range.deinit(self.alloc);
-            self.alloc.free(key_ranges);
+            for (key_ranges[0..key_ranges_initialized]) |*range| range.deinit(scratch_alloc);
+            scratch_alloc.free(key_ranges);
         }
 
-        var replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, segment_bytes_list.len);
+        var replacements = try scratch_alloc.alloc(index_mod.ReplacementSegmentData, segment_bytes_list.len);
         var replacements_initialized: usize = 0;
         var published_to_writer = false;
         defer {
@@ -2991,11 +3062,11 @@ pub const PersistentIndex = struct {
                     self.deleteSegmentFile(replacement.id);
                 }
             }
-            self.alloc.free(replacements);
+            scratch_alloc.free(replacements);
         }
 
         for (segment_bytes_list, 0..) |segment_bytes, i| {
-            key_ranges[i] = try extractSegmentKeyRange(self.alloc, segment_bytes);
+            key_ranges[i] = try extractSegmentKeyRange(scratch_alloc, segment_bytes);
             key_ranges[i].seg_id = new_seg_ids[i];
             key_ranges_initialized += 1;
 
@@ -3014,8 +3085,8 @@ pub const PersistentIndex = struct {
         errdefer txn.abort();
 
         if (require_active) {
-            const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
-            defer self.alloc.free(active_ids);
+            const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
+            defer scratch_alloc.free(active_ids);
             for (old_seg_ids) |old_id| {
                 if (!containsSegmentId(active_ids, old_id)) {
                     txn.abort();
@@ -3024,7 +3095,7 @@ pub const PersistentIndex = struct {
             }
         }
 
-        var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, replacements);
+        var writer_publication = try self.writer.prepareSegmentsManyDataWithScratch(scratch_alloc, old_seg_ids, replacements);
         defer writer_publication.abort();
 
         for (segment_bytes_list, 0..) |segment_bytes, i| {
@@ -3033,8 +3104,8 @@ pub const PersistentIndex = struct {
             if (replacement_deleted) |deleted| {
                 if (deleted[i]) |*bitmap| {
                     if (!bitmap.isEmpty()) {
-                        const bitmap_bytes = try bitmap.toBytes(self.alloc);
-                        defer self.alloc.free(bitmap_bytes);
+                        const bitmap_bytes = try bitmap.toBytes(scratch_alloc);
+                        defer scratch_alloc.free(bitmap_bytes);
                         try txn.put(.deletions, &new_seg_key, bitmap_bytes);
                     }
                 }
@@ -3056,7 +3127,7 @@ pub const PersistentIndex = struct {
         }
 
         for (key_ranges[0..key_ranges_initialized]) |key_range| {
-            try self.saveSegmentRange(&txn, key_range.seg_id, key_range);
+            try self.saveSegmentRangeWithAllocator(scratch_alloc, &txn, key_range.seg_id, key_range);
             try self.updateActiveSegments(&txn, key_range.seg_id, .add);
         }
         try txn.commit();
@@ -3179,9 +3250,20 @@ pub const PersistentIndex = struct {
         seg_id: u64,
         key_range: SegmentKeyRange,
     ) !void {
+        return try self.saveSegmentRangeWithAllocator(self.alloc, txn, seg_id, key_range);
+    }
+
+    fn saveSegmentRangeWithAllocator(
+        self: *PersistentIndex,
+        alloc: Allocator,
+        txn: *MainTxn,
+        seg_id: u64,
+        key_range: SegmentKeyRange,
+    ) !void {
+        _ = self;
         const range_key = segmentRangeMetaKey(seg_id);
-        var buf = try self.alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
-        defer self.alloc.free(buf);
+        var buf = try alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
+        defer alloc.free(buf);
         buf[0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.min_doc_key.len))));
         @memcpy(buf[4..][0..key_range.min_doc_key.len], key_range.min_doc_key);
         const max_off = 4 + key_range.min_doc_key.len;
@@ -4063,6 +4145,37 @@ test "persistent index replaceSegmentsIfActiveManyOwned publishes bounded merge 
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
     try std.testing.expectEqualStrings("doc:a", ranges[0].min_doc_key);
     try std.testing.expectEqualStrings("doc:z", ranges[1].min_doc_key);
+}
+
+test "persistent budgeted merge publication consumes input when id staging is denied" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var pi = try PersistentIndex.open(alloc, .{ .path = path });
+    defer pi.close();
+
+    const source = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(source);
+    try pi.indexSegment(source);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const scratch_alloc = failing.allocator();
+    const replacements = try scratch_alloc.alloc([]u8, 1);
+    replacements[0] = try scratch_alloc.dupe(u8, source);
+    failing.fail_index = failing.alloc_index;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pi.replaceSegmentsIfActiveManyOwnedWithDeletesAndScratch(
+            scratch_alloc,
+            &.{1},
+            replacements,
+            null,
+        ),
+    );
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "persistent merge replacement carries deletion bitmap across reopen" {

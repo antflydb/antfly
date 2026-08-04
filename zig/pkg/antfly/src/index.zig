@@ -1032,6 +1032,7 @@ pub const IndexWriter = struct {
         writer: *IndexWriter,
         snapshot: *IndexSnapshot,
         retired: []SegmentEntry,
+        staging_alloc: Allocator,
         carried_count: usize,
         next_segment_id: u64,
         active: bool = true,
@@ -1047,7 +1048,7 @@ pub const IndexWriter = struct {
                 std.debug.assert(seg.shared.retired_cleanup == null);
                 seg.shared.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
             }
-            if (self.retired.len > 0) writer.alloc.free(self.retired);
+            if (self.retired.len > 0) self.staging_alloc.free(self.retired);
 
             writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
             writer.next_epoch += 1;
@@ -1068,7 +1069,7 @@ pub const IndexWriter = struct {
             writer.alloc.free(self.snapshot.segments);
             self.snapshot.global_total_field_len.deinit(writer.alloc);
             writer.alloc.destroy(self.snapshot);
-            if (self.retired.len > 0) writer.alloc.free(self.retired);
+            if (self.retired.len > 0) self.staging_alloc.free(self.retired);
             writer.mu.unlock();
             self.active = false;
         }
@@ -1580,14 +1581,29 @@ pub const IndexWriter = struct {
     /// Stage every fallible allocation needed to replace segments while
     /// holding the writer serialization mutex. Callers must publish or abort.
     pub fn prepareSegmentsManyData(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
+        return try self.prepareSegmentsManyDataWithScratch(self.alloc, old_ids, replacements);
+    }
+
+    /// Prepare a durable replacement snapshot while charging short-lived
+    /// staging arrays to the caller's admitted work allocator. Every object
+    /// retained by the published snapshot still uses the writer allocator;
+    /// only the replacement-reader pointer array and retired-entry staging are
+    /// scratch. `scratch_alloc` must remain alive until the returned operation
+    /// is published or aborted.
+    pub fn prepareSegmentsManyDataWithScratch(
+        self: *IndexWriter,
+        scratch_alloc: Allocator,
+        old_ids: []const u64,
+        replacements: []ReplacementSegmentData,
+    ) !PreparedSegmentReplacement {
         if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
 
         self.lockMutex();
         errdefer self.mu.unlock();
 
-        const replacement_readers = try self.alloc.alloc(segment_mod.SegmentReader, replacements.len);
+        const replacement_readers = try scratch_alloc.alloc(segment_mod.SegmentReader, replacements.len);
         var replacement_readers_initialized: usize = 0;
-        defer self.alloc.free(replacement_readers);
+        defer scratch_alloc.free(replacement_readers);
         errdefer {
             for (replacement_readers[0..replacement_readers_initialized]) |*reader| reader.deinit();
         }
@@ -1618,8 +1634,8 @@ pub const IndexWriter = struct {
 
         const new_segments = try self.alloc.alloc(SegmentEntry, keep_count + replacements.len);
         errdefer self.alloc.free(new_segments);
-        const retired = try self.alloc.alloc(SegmentEntry, retire_count);
-        errdefer self.alloc.free(retired);
+        const retired = try scratch_alloc.alloc(SegmentEntry, retire_count);
+        errdefer scratch_alloc.free(retired);
         var idx: usize = 0;
         var ret_idx: usize = 0;
         for (old.segments) |seg| {
@@ -1695,6 +1711,7 @@ pub const IndexWriter = struct {
             .writer = self,
             .snapshot = new_snap,
             .retired = retired,
+            .staging_alloc = scratch_alloc,
             .carried_count = keep_count,
             .next_segment_id = next_segment_id,
         };
