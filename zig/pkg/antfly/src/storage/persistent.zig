@@ -2416,6 +2416,7 @@ pub const PersistentIndex = struct {
     /// The caller owns the returned delete infos and must release them with
     /// `freeDeleteInfos` on this index.
     pub fn deleteByIdsTracked(self: *PersistentIndex, doc_ids: []const []const u8) ![]index_mod.IndexWriter.DeleteInfo {
+        if (doc_ids.len == 0) return try self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
         self.lockStorage();
         defer self.unlockStorage();
 
@@ -3466,6 +3467,16 @@ fn buildSimpleSegment(alloc: Allocator, doc_id: []const u8, term: []const u8) ![
     try seg_writer.addStoredDoc(doc_id, "{}");
 
     return seg_writer.build();
+}
+
+test "tracked empty deletion returns before touching index storage" {
+    const alloc = std.testing.allocator;
+    var index: PersistentIndex = undefined;
+    index.alloc = alloc;
+
+    const delete_infos = try index.deleteByIdsTracked(&.{});
+    defer index.freeDeleteInfos(delete_infos);
+    try std.testing.expectEqual(@as(usize, 0), delete_infos.len);
 }
 
 fn buildMultiDocSegment(alloc: Allocator, docs: []const struct { doc_id: []const u8, term: []const u8 }) ![]u8 {
