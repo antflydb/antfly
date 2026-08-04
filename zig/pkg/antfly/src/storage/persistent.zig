@@ -508,11 +508,59 @@ const RetiredSegmentFileDeleter = struct {
     fn acknowledgeCompletedId(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
-        for (self.completed_ids.items, 0..) |candidate, i| {
+        removeId(&self.completed_ids, seg_id);
+    }
+
+    fn containsId(ids: []const u64, seg_id: u64) bool {
+        return std.mem.indexOfScalar(u64, ids, seg_id) != null;
+    }
+
+    fn removeId(ids: *std.ArrayListUnmanaged(u64), seg_id: u64) void {
+        for (ids.items, 0..) |candidate, i| {
             if (candidate != seg_id) continue;
-            _ = self.completed_ids.swapRemove(i);
+            _ = ids.swapRemove(i);
             return;
         }
+    }
+
+    fn appendUnique(self: *RetiredSegmentFileDeleter, ids: *std.ArrayListUnmanaged(u64), seg_id: u64) !void {
+        if (!containsId(ids.items, seg_id)) try ids.append(self.allocator, seg_id);
+    }
+
+    /// Record a stale retirement marker for a segment which is still active.
+    /// Any queued unlink must be cancelled before the marker is cleared.
+    fn completeWithoutDelete(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return;
+        removeId(&self.retry_ids, seg_id);
+        try self.appendUnique(&self.completed_ids, seg_id);
+    }
+
+    /// Attempt one unlink and retain failures in the live owner. The durable
+    /// retirement marker remains authoritative if even queue allocation fails.
+    fn deleteOrQueue(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return;
+
+        const path = self.pathAlloc(seg_id) catch {
+            try self.appendUnique(&self.retry_ids, seg_id);
+            return;
+        };
+        defer self.allocator.free(path);
+        self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                try self.appendUnique(&self.retry_ids, seg_id);
+                if (builtin.os.tag != .freestanding) {
+                    std.log.warn("retired text segment cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
+                }
+                return;
+            },
+        };
+        try self.appendUnique(&self.completed_ids, seg_id);
+        removeId(&self.retry_ids, seg_id);
     }
 
     fn retryFailedDeletes(self: *RetiredSegmentFileDeleter) void {
@@ -536,7 +584,7 @@ const RetiredSegmentFileDeleter = struct {
                     continue;
                 },
             };
-            self.completed_ids.append(self.allocator, seg_id) catch {
+            self.appendUnique(&self.completed_ids, seg_id) catch {
                 i += 1;
                 continue;
             };
@@ -565,30 +613,11 @@ const RetiredSegmentFileDeleter = struct {
 
     fn delete(ptr: *anyopaque, seg_id: u64) void {
         const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
-        platform_sync.lockYielding(&self.delete_mu);
-        defer self.delete_mu.unlock();
-        if (!self.delete_enabled) return;
-        const path = self.pathAlloc(seg_id) catch |err| {
+        self.deleteOrQueue(seg_id) catch |err| {
             if (builtin.os.tag != .freestanding) {
-                std.log.warn("retired text segment path allocation failed segment={d}: {s}", .{ seg_id, @errorName(err) });
+                std.log.warn("retired text segment cleanup could not be queued segment={d}: {s}", .{ seg_id, @errorName(err) });
             }
-            self.retry_ids.append(self.allocator, seg_id) catch {};
-            return;
         };
-        defer self.allocator.free(path);
-        self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => {
-                if (builtin.os.tag != .freestanding) {
-                    std.log.warn("retired text segment cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
-                }
-                self.retry_ids.append(self.allocator, seg_id) catch {};
-                return;
-            },
-        };
-        // OOM here affects only prompt marker compaction. The durable retirement
-        // marker remains the source of truth and writable open will reconcile it.
-        self.completed_ids.append(self.allocator, seg_id) catch {};
     }
 };
 
@@ -935,6 +964,7 @@ pub const PersistentIndex = struct {
     main_store_owner: MainStoreOwner,
     segment_files: ?SegmentFileStore,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
+    retirement_reconcile_pending: bool = false,
     wal: wal_mod.WAL,
     committed_lsn: u64,
     main_backend: MainBackend,
@@ -1474,7 +1504,23 @@ pub const PersistentIndex = struct {
         txn.retirement_cleanup_started = true;
         const deleter = self.retired_segment_file_deleter orelse return;
         const store = &(self.segment_files orelse return);
+
+        // Retry work discovered by an earlier transaction once per subsequent
+        // publication boundary. Newly discovered failures wait for the next
+        // boundary, avoiding a tight retry loop on a persistent I/O failure.
         deleter.retryFailedDeletes();
+        if (self.retirement_reconcile_pending) {
+            if (self.discoverRetiredSegmentFilesInTxn(txn)) {
+                self.retirement_reconcile_pending = false;
+            } else |err| {
+                // Reconciliation is maintenance, not a publication
+                // prerequisite. Preserve the pending bit and let the write
+                // proceed; a later transaction retries the scan.
+                if (builtin.os.tag != .freestanding) {
+                    std.log.warn("retired text segment reconciliation deferred: {s}", .{@errorName(err)});
+                }
+            }
+        }
         const completed_ids = deleter.snapshotCompletedIds(self.alloc) catch return;
         defer self.alloc.free(completed_ids);
         if (completed_ids.len == 0) return;
@@ -1512,7 +1558,7 @@ pub const PersistentIndex = struct {
     fn flushCompletedRetirementMarkersLocked(self: *PersistentIndex) void {
         if (self.read_only) return;
         const deleter = self.retired_segment_file_deleter orelse return;
-        if (!deleter.hasRetirementWork()) return;
+        if (!self.retirement_reconcile_pending and !deleter.hasRetirementWork()) return;
         var txn = self.beginWriteMainTxn() catch |err| {
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
@@ -1536,86 +1582,32 @@ pub const PersistentIndex = struct {
         txn_open = false;
     }
 
-    /// Durable retirement markers make delayed callbacks an optimization. A
-    /// writable owner retries every pending unlink on open, clearing a marker
-    /// only after the shared segment directory has been synchronized.
+    /// Discover durable retirement work on open. Failed scans stay pending;
+    /// failed unlinks are retained by the live owner and retried at the next
+    /// segment publication boundary (or close), without rescanning the catalog.
     fn reconcileRetiredSegmentFilesLocked(self: *PersistentIndex) void {
         if (self.read_only) return;
-        const store = &(self.segment_files orelse return);
+        if (self.segment_files == null or self.retired_segment_file_deleter == null) return;
+        self.retirement_reconcile_pending = true;
+        self.flushCompletedRetirementMarkersLocked();
+    }
 
-        var txn = self.beginWriteMainTxn() catch |err| {
-            if (builtin.os.tag != .freestanding) {
-                std.log.warn("retired text segment reconciliation deferred: {s}", .{@errorName(err)});
-            }
-            return;
-        };
-        var txn_open = true;
-        defer if (txn_open) txn.abort();
-
-        const retired_ids = loadRetiredSegmentIdsFromTxn(&txn, self.alloc) catch |err| {
-            if (builtin.os.tag != .freestanding) {
-                std.log.warn("retired text segment scan deferred: {s}", .{@errorName(err)});
-            }
-            return;
-        };
+    fn discoverRetiredSegmentFilesInTxn(self: *PersistentIndex, txn: *MainTxn) !void {
+        const deleter = self.retired_segment_file_deleter orelse return;
+        const retired_ids = try loadRetiredSegmentIdsFromTxn(txn, self.alloc);
         defer self.alloc.free(retired_ids);
-        if (retired_ids.len == 0) {
-            txn.abort();
-            txn_open = false;
-            return;
-        }
-
-        var reclaimed_ids = std.ArrayListUnmanaged(u64).empty;
-        defer reclaimed_ids.deinit(self.alloc);
         for (retired_ids) |seg_id| {
             const active_key = activeSegmentMetaKey(seg_id);
             const is_active = if (txn.get(.meta, &active_key)) |_| true else |err| switch (err) {
                 error.NotFound => false,
-                else => {
-                    if (builtin.os.tag != .freestanding) {
-                        std.log.warn("retired text segment active check deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
-                    }
-                    continue;
-                },
+                else => return err,
             };
-            if (!is_active) {
-                store.deleteChecked(seg_id) catch |err| {
-                    if (builtin.os.tag != .freestanding) {
-                        std.log.warn("retired text segment reconciliation deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
-                    }
-                    continue;
-                };
-            }
-            reclaimed_ids.append(self.alloc, seg_id) catch return;
-        }
-
-        if (reclaimed_ids.items.len > 0) {
-            store.syncDeletes() catch |err| {
-                if (builtin.os.tag != .freestanding) {
-                    std.log.warn("retired text segment reconciliation sync deferred: {s}", .{@errorName(err)});
-                }
-                return;
-            };
-            for (reclaimed_ids.items) |seg_id| {
-                const retired_key = retiredSegmentMetaKey(seg_id);
-                txn.delete(.meta, &retired_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => {
-                        if (builtin.os.tag != .freestanding) {
-                            std.log.warn("retired text segment marker cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
-                        }
-                        return;
-                    },
-                };
+            if (is_active) {
+                try deleter.completeWithoutDelete(seg_id);
+            } else {
+                try deleter.deleteOrQueue(seg_id);
             }
         }
-        txn.commit() catch |err| {
-            if (builtin.os.tag != .freestanding) {
-                std.log.warn("retired text segment reconciliation commit deferred: {s}", .{@errorName(err)});
-            }
-            return;
-        };
-        txn_open = false;
     }
 
     pub fn resetAllForRebuild(self: *PersistentIndex) !void {
@@ -5546,12 +5538,37 @@ test "persistent modeled full-text compaction publish faults stay green" {
 
         const compacted = try buildCompactedTextSegment(alloc);
         defer alloc.free(compacted);
+        const retired_path = try pi.segment_files.?.pathAlloc(1);
+        defer alloc.free(retired_path);
         try pi.replaceSegmentsCatalogOnlyForTest(&.{ 1, 2 }, compacted);
         pi.prepareForCrashRollback();
         try device_model.device().crash();
         pi.abandonAfterCrash();
+
+        // The first writable owner sees the durable retirement marker, but its
+        // initial unlink fails. The next ordinary segment publication must
+        // retry from live-owner state rather than requiring another restart.
+        try device_model.injectDeleteFailureForPathContains("1.seg");
         pi = try PersistentIndex.open(alloc, opts);
         try expectPersistentTextCompactionView(alloc, &pi, 1, 0, 1, 1);
+        _ = try device_model.fileSize(retired_path);
+        {
+            var txn = try pi.beginReadMainTxn();
+            defer txn.abort();
+            const retired_key = retiredSegmentMetaKey(1);
+            _ = try txn.get(.meta, &retired_key);
+        }
+
+        const followup = try buildSimpleSegment(alloc, "doc:followup", "followup");
+        defer alloc.free(followup);
+        try pi.indexSegment(followup);
+        try std.testing.expectError(error.FileNotFound, device_model.fileSize(retired_path));
+        {
+            var txn = try pi.beginReadMainTxn();
+            defer txn.abort();
+            const retired_key = retiredSegmentMetaKey(1);
+            try std.testing.expectError(error.NotFound, txn.get(.meta, &retired_key));
+        }
     }
 
     {
