@@ -80,6 +80,7 @@ const macos = if (builtin.os.tag == .macos) struct {
         host_info_out: host_info64_t,
         host_info_out_cnt: *mach_msg_type_number_t,
     ) kern_return_t;
+    pub extern fn memorystatus_get_level(level: *u32) c_int;
 } else struct {};
 
 pub const ResidencyTier = planner.ResidencyTier;
@@ -116,6 +117,7 @@ pub const SystemMemoryInfo = struct {
 
 pub const AvailabilityBasis = enum {
     mem_available,
+    macos_memory_pressure,
     macos_reclaimable_pages,
 };
 
@@ -557,6 +559,9 @@ pub const AdmissionController = struct {
     live_mutex: std.atomic.Mutex = .unlocked,
     live_capacity_bytes: usize = 0,
     live_pending_bytes: usize = 0,
+    /// Suppress a warning storm while repeated requests are denied by the
+    /// same live-memory pressure condition. A successful new epoch clears it.
+    live_denial_reported: bool = false,
     /// Aggregate accounting is retained for observability and for the optional
     /// process-owner resource budget. Host memory is enforced against the
     /// shared physical domain, while workload/device policy is enforced against
@@ -818,7 +823,35 @@ pub const AdmissionController = struct {
             currentSystemMemoryInfo()
         else
             null;
-        return self.tryReserveLiveCapacityLocked(incremental_bytes, info);
+        const starts_new_epoch = self.live_pending_bytes == 0;
+        const reserved = self.tryReserveLiveCapacityLocked(incremental_bytes, info) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable and !self.live_denial_reported) {
+                if (info) |memory_info| {
+                    const available = memory_info.available_bytes orelse 0;
+                    const reserve = liveHostAdmissionReserve(memory_info);
+                    std.log.warn(
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s}",
+                        .{
+                            incremental_bytes,
+                            self.live_pending_bytes,
+                            available,
+                            reserve,
+                            available -| reserve,
+                            @tagName(memory_info.availability_basis),
+                        },
+                    );
+                } else {
+                    std.log.warn(
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} capacity_bytes={d} basis=shared_epoch",
+                        .{ incremental_bytes, self.live_pending_bytes, self.live_capacity_bytes },
+                    );
+                }
+                self.live_denial_reported = true;
+            }
+            return err;
+        };
+        if (starts_new_epoch) self.live_denial_reported = false;
+        return reserved;
     }
 
     fn tryReserveLiveCapacityWithInfo(
@@ -992,12 +1025,11 @@ fn liveHostMemoryHeadroom(total_bytes: usize) usize {
     return @min(preferred, total_bytes / 2);
 }
 
-/// macOS's raw Mach page queues are intentionally conservative because they do
-/// not expose the kernel's full compressed-memory pressure calculation. Allow
-/// a bounded small-load grace window when that raw count dips below the stable
-/// node headroom. Keeping the window proportional to the machine while capped
-/// prevents a large model from consuming most of the remaining reclaimable
-/// pages merely because the system-wide residency limit has room.
+/// macOS pressure availability and the raw-page fallback both need a bounded
+/// small-load grace window below the stable node headroom. Keeping the window
+/// proportional to the machine while capped prevents a large model from
+/// consuming most of the remaining reclaimable capacity merely because the
+/// system-wide residency limit has room.
 fn macosLiveAdmissionGrace(total_bytes: usize) usize {
     return clampBytes(total_bytes / 32, mib(256), gib(2));
 }
@@ -1005,18 +1037,17 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// Determine how much of the current availability sample must remain unused.
 ///
 /// Linux MemAvailable is designed as an allocation-availability estimate, so
-/// retain the complete node headroom there. macOS exposes only raw Mach page
-/// queues to this daemon: they omit compressed memory that the kernel can
-/// reclaim and can therefore fall below the stable node headroom during normal
-/// operation. The stable shared admission limit already retains that full
-/// headroom against Antfly residency. For this second, live-pressure gate keep
-/// a bounded emergency reserve instead of subtracting the node reserve twice.
+/// retain the complete node headroom there. macOS supplies a system pressure
+/// percentage, with raw Mach page queues as a conservative fallback. The stable
+/// shared admission limit already retains full node headroom against Antfly
+/// residency. For this second, live-pressure gate keep a bounded emergency
+/// reserve instead of subtracting the node reserve twice.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
         .mem_available => @min(available, node_headroom),
-        .macos_reclaimable_pages => blk: {
+        .macos_memory_pressure, .macos_reclaimable_pages => blk: {
             const normal_capacity = available -| node_headroom;
             const emergency_reserve = @min(
                 available,
@@ -1198,17 +1229,34 @@ fn probeSystemMemoryInfoMacos() ?SystemMemoryInfo {
         return .{ .total_bytes = @intCast(total_raw), .available_bytes = null };
     }
 
-    const available_pages = macosReclaimablePageCount(
+    const reclaimable_pages = macosReclaimablePageCount(
         vm_stats.free_count,
         vm_stats.inactive_count,
         vm_stats.speculative_count,
     );
-    const available_bytes_u64 = available_pages * @as(u64, @intCast(page_size));
+    const reclaimable_bytes = reclaimable_pages * @as(u64, @intCast(page_size));
+    var pressure_level: u32 = 0;
+    const pressure_available_bytes = if (macos.memorystatus_get_level(&pressure_level) == 0)
+        macosMemoryPressureAvailableBytes(total_raw, pressure_level)
+    else
+        null;
     return .{
         .total_bytes = @intCast(total_raw),
-        .available_bytes = @intCast(@min(available_bytes_u64, total_raw)),
-        .availability_basis = .macos_reclaimable_pages,
+        // `memorystatus_get_level` is the same system-wide free percentage
+        // reported by memory_pressure(1). Unlike the raw Mach page queues, it
+        // accounts for reclaimable file cache and therefore remains meaningful
+        // on warm macOS hosts. Keep the page-queue estimate as a fallback.
+        .available_bytes = @intCast(@min(pressure_available_bytes orelse reclaimable_bytes, total_raw)),
+        .availability_basis = if (pressure_available_bytes != null)
+            .macos_memory_pressure
+        else
+            .macos_reclaimable_pages,
     };
+}
+
+fn macosMemoryPressureAvailableBytes(total_bytes: u64, free_percent: u32) ?u64 {
+    if (free_percent > 100) return null;
+    return @intCast((@as(u128, total_bytes) * free_percent) / 100);
 }
 
 /// Mach reports speculative pages as a subset of `free_count`; adding
@@ -2094,6 +2142,25 @@ test "macOS reclaimable pages do not double count speculative pages" {
         @as(u64, 300),
         macosReclaimablePageCount(100, 200, 50),
     );
+}
+
+test "macOS memory pressure availability includes reclaimable cache" {
+    try std.testing.expectEqual(
+        @as(?u64, 12 * 1024 * 1024 * 1024),
+        macosMemoryPressureAvailableBytes(24 * 1024 * 1024 * 1024, 50),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        macosMemoryPressureAvailableBytes(24 * 1024 * 1024 * 1024, 101),
+    );
+}
+
+test "macOS system memory probe reports bounded availability" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const info = probeSystemMemoryInfoMacos() orelse return error.TestUnexpectedResult;
+    const available = info.available_bytes orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(AvailabilityBasis.macos_memory_pressure, info.availability_basis);
+    try std.testing.expect(available <= info.total_bytes);
 }
 
 test "macOS live admission preserves an emergency reserve under scarcity" {

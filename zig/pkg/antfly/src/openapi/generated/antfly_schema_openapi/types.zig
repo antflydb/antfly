@@ -86,7 +86,7 @@ pub const DynamicTemplate = struct {
 
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
-    /// Version of the schema. Used for migrations.
+    /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?i64 = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
