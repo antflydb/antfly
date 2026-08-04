@@ -437,6 +437,20 @@ const NativeSegmentPublicationAdmission = struct {
 };
 
 const RetiredSegmentFileDeleter = struct {
+    const RetryEntry = struct {
+        seg_id: u64,
+        failure_count: u8 = 0,
+        next_attempt_ns: u64 = 0,
+    };
+
+    // Keep retirement maintenance below a small, deterministic foreground
+    // budget. Inspection is memory-only; attempts may issue filesystem calls.
+    const retry_attempts_per_boundary: usize = 8;
+    const retry_inspections_per_boundary: usize = 64;
+    const completed_markers_per_boundary: usize = 64;
+    const retry_base_delay_ns: u64 = 10 * std.time.ns_per_ms;
+    const retry_max_delay_ns: u64 = 5 * std.time.ns_per_s;
+
     allocator: Allocator,
     root_dir: []u8,
     storage: storage_io.Storage,
@@ -445,7 +459,12 @@ const RetiredSegmentFileDeleter = struct {
     delete_mu: std.atomic.Mutex = .unlocked,
     delete_enabled: bool = true,
     completed_ids: std.ArrayListUnmanaged(u64) = .empty,
-    retry_ids: std.ArrayListUnmanaged(u64) = .empty,
+    completed_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    retry_entries: std.ArrayListUnmanaged(RetryEntry) = .empty,
+    retry_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    retry_cursor: usize = 0,
+    retry_attempts: u64 = 0,
+    retry_failures: u64 = 0,
 
     fn init(allocator: Allocator, store: *const SegmentFileStore) !*RetiredSegmentFileDeleter {
         const deleter = try allocator.create(RetiredSegmentFileDeleter);
@@ -472,7 +491,9 @@ const RetiredSegmentFileDeleter = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         self.completed_ids.deinit(allocator);
-        self.retry_ids.deinit(allocator);
+        self.completed_positions.deinit(allocator);
+        self.retry_entries.deinit(allocator);
+        self.retry_positions.deinit(allocator);
         if (self.native_storage_lease) |*lease| lease.deinit();
         allocator.free(self.root_dir);
         allocator.destroy(self);
@@ -499,32 +520,68 @@ const RetiredSegmentFileDeleter = struct {
         return !self.delete_enabled;
     }
 
-    fn snapshotCompletedIds(self: *RetiredSegmentFileDeleter, allocator: Allocator) ![]u64 {
+    fn snapshotCompletedIds(self: *RetiredSegmentFileDeleter, allocator: Allocator, max_count: usize) ![]u64 {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
-        return try allocator.dupe(u64, self.completed_ids.items);
+        const count = @min(max_count, self.completed_ids.items.len);
+        return try allocator.dupe(u64, self.completed_ids.items[0..count]);
     }
 
     fn acknowledgeCompletedId(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
-        removeId(&self.completed_ids, seg_id);
+        self.removeCompletedLocked(seg_id);
     }
 
-    fn containsId(ids: []const u64, seg_id: u64) bool {
-        return std.mem.indexOfScalar(u64, ids, seg_id) != null;
+    fn appendCompletedLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        const position = try self.completed_positions.getOrPut(self.allocator, seg_id);
+        if (position.found_existing) return;
+        errdefer _ = self.completed_positions.remove(seg_id);
+        position.value_ptr.* = self.completed_ids.items.len;
+        try self.completed_ids.append(self.allocator, seg_id);
     }
 
-    fn removeId(ids: *std.ArrayListUnmanaged(u64), seg_id: u64) void {
-        for (ids.items, 0..) |candidate, i| {
-            if (candidate != seg_id) continue;
-            _ = ids.swapRemove(i);
-            return;
+    fn removeCompletedLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
+        const removed = self.completed_positions.fetchRemove(seg_id) orelse return;
+        const position = removed.value;
+        const last_position = self.completed_ids.items.len - 1;
+        const moved_id = self.completed_ids.items[last_position];
+        _ = self.completed_ids.swapRemove(position);
+        if (position != last_position) self.completed_positions.getPtr(moved_id).?.* = position;
+    }
+
+    fn enqueueRetryLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        const position = try self.retry_positions.getOrPut(self.allocator, seg_id);
+        if (position.found_existing) return;
+        errdefer _ = self.retry_positions.remove(seg_id);
+        position.value_ptr.* = self.retry_entries.items.len;
+        try self.retry_entries.append(self.allocator, .{ .seg_id = seg_id });
+    }
+
+    fn enqueueRetry(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return;
+        try self.enqueueRetryLocked(seg_id);
+    }
+
+    fn removeRetryLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
+        const removed = self.retry_positions.fetchRemove(seg_id) orelse return;
+        const position = removed.value;
+        const last_position = self.retry_entries.items.len - 1;
+        const moved_entry = self.retry_entries.items[last_position];
+        _ = self.retry_entries.swapRemove(position);
+        if (position != last_position) self.retry_positions.getPtr(moved_entry.seg_id).?.* = position;
+        if (self.retry_entries.items.len == 0) {
+            self.retry_cursor = 0;
+        } else {
+            self.retry_cursor %= self.retry_entries.items.len;
         }
     }
 
-    fn appendUnique(self: *RetiredSegmentFileDeleter, ids: *std.ArrayListUnmanaged(u64), seg_id: u64) !void {
-        if (!containsId(ids.items, seg_id)) try ids.append(self.allocator, seg_id);
+    fn retryDelayNs(failure_count: u8) u64 {
+        const exponent: u6 = @intCast(@min(@as(u8, 9), failure_count -| 1));
+        return @min(retry_base_delay_ns << exponent, retry_max_delay_ns);
     }
 
     /// Record a stale retirement marker for a segment which is still active.
@@ -533,8 +590,8 @@ const RetiredSegmentFileDeleter = struct {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         if (!self.delete_enabled) return;
-        removeId(&self.retry_ids, seg_id);
-        try self.appendUnique(&self.completed_ids, seg_id);
+        self.removeRetryLocked(seg_id);
+        try self.appendCompletedLocked(seg_id);
     }
 
     /// Attempt one unlink and retain failures in the live owner. The durable
@@ -545,22 +602,22 @@ const RetiredSegmentFileDeleter = struct {
         if (!self.delete_enabled) return;
 
         const path = self.pathAlloc(seg_id) catch {
-            try self.appendUnique(&self.retry_ids, seg_id);
+            try self.enqueueRetryLocked(seg_id);
             return;
         };
         defer self.allocator.free(path);
         self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
-                try self.appendUnique(&self.retry_ids, seg_id);
+                try self.enqueueRetryLocked(seg_id);
                 if (builtin.os.tag != .freestanding) {
                     std.log.warn("retired text segment cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
                 }
                 return;
             },
         };
-        try self.appendUnique(&self.completed_ids, seg_id);
-        removeId(&self.retry_ids, seg_id);
+        try self.appendCompletedLocked(seg_id);
+        self.removeRetryLocked(seg_id);
     }
 
     fn retryFailedDeletes(self: *RetiredSegmentFileDeleter) void {
@@ -568,11 +625,30 @@ const RetiredSegmentFileDeleter = struct {
         defer self.delete_mu.unlock();
         if (!self.delete_enabled) return;
 
-        var i: usize = 0;
-        while (i < self.retry_ids.items.len) {
-            const seg_id = self.retry_ids.items[i];
+        const now_ns = platform_time.monotonicNs();
+        const inspection_limit = @min(retry_inspections_per_boundary, self.retry_entries.items.len);
+        var inspections: usize = 0;
+        var attempts: usize = 0;
+        while (inspections < inspection_limit and
+            attempts < retry_attempts_per_boundary and
+            self.retry_entries.items.len > 0)
+        {
+            const position = self.retry_cursor % self.retry_entries.items.len;
+            const entry = &self.retry_entries.items[position];
+            inspections += 1;
+            if (entry.next_attempt_ns > now_ns) {
+                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
+                continue;
+            }
+
+            const seg_id = entry.seg_id;
+            attempts += 1;
+            self.retry_attempts +|= 1;
             const path = self.pathAlloc(seg_id) catch {
-                i += 1;
+                entry.failure_count +|= 1;
+                entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
+                self.retry_failures +|= 1;
+                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
                 continue;
             };
             const delete_result = self.storage.deleteFileAbsolute(path);
@@ -580,22 +656,29 @@ const RetiredSegmentFileDeleter = struct {
             delete_result catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => {
-                    i += 1;
+                    entry.failure_count +|= 1;
+                    entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
+                    self.retry_failures +|= 1;
+                    self.retry_cursor = (position + 1) % self.retry_entries.items.len;
                     continue;
                 },
             };
-            self.appendUnique(&self.completed_ids, seg_id) catch {
-                i += 1;
+            self.appendCompletedLocked(seg_id) catch {
+                entry.failure_count +|= 1;
+                entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
+                self.retry_failures +|= 1;
+                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
                 continue;
             };
-            _ = self.retry_ids.swapRemove(i);
+            self.removeRetryLocked(seg_id);
+            if (self.retry_entries.items.len > 0) self.retry_cursor = position % self.retry_entries.items.len;
         }
     }
 
     fn hasRetirementWork(self: *RetiredSegmentFileDeleter) bool {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
-        return self.completed_ids.items.len != 0 or self.retry_ids.items.len != 0;
+        return self.completed_ids.items.len != 0 or self.retry_entries.items.len != 0;
     }
 
     fn cleanup(self: *RetiredSegmentFileDeleter) index_mod.RetiredSegmentCleanup {
@@ -1521,7 +1604,7 @@ pub const PersistentIndex = struct {
                 }
             }
         }
-        const completed_ids = deleter.snapshotCompletedIds(self.alloc) catch return;
+        const completed_ids = deleter.snapshotCompletedIds(self.alloc, RetiredSegmentFileDeleter.completed_markers_per_boundary) catch return;
         defer self.alloc.free(completed_ids);
         if (completed_ids.len == 0) return;
 
@@ -3845,6 +3928,43 @@ test "retired segment cleanup outlives persistent index close" {
         error.FileNotFound,
         verifier.storage().readFileAlloc(alloc, retired_path_b, 64),
     );
+}
+
+test "retired segment cleanup bounds maintenance work per publication boundary" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var pi = try PersistentIndex.open(alloc, .{ .path = path });
+    defer pi.close();
+    const deleter = pi.retired_segment_file_deleter orelse return error.TestUnexpectedResult;
+
+    const queued = RetiredSegmentFileDeleter.retry_attempts_per_boundary * 3;
+    for (0..queued) |offset| try deleter.enqueueRetry(10_000 + @as(u64, @intCast(offset)));
+
+    deleter.retryFailedDeletes();
+    {
+        platform_sync.lockYielding(&deleter.delete_mu);
+        defer deleter.delete_mu.unlock();
+        try std.testing.expectEqual(RetiredSegmentFileDeleter.retry_attempts_per_boundary, deleter.completed_ids.items.len);
+        try std.testing.expectEqual(queued - RetiredSegmentFileDeleter.retry_attempts_per_boundary, deleter.retry_entries.items.len);
+        try std.testing.expectEqual(@as(u64, RetiredSegmentFileDeleter.retry_attempts_per_boundary), deleter.retry_attempts);
+        try std.testing.expectEqual(deleter.completed_ids.items.len, deleter.completed_positions.count());
+        try std.testing.expectEqual(deleter.retry_entries.items.len, deleter.retry_positions.count());
+        for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = std.math.maxInt(u64);
+    }
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(u64, RetiredSegmentFileDeleter.retry_attempts_per_boundary), deleter.retry_attempts);
+
+    for (0..RetiredSegmentFileDeleter.completed_markers_per_boundary + 3) |offset| {
+        try deleter.completeWithoutDelete(20_000 + @as(u64, @intCast(offset)));
+    }
+    const completed_snapshot = try deleter.snapshotCompletedIds(alloc, RetiredSegmentFileDeleter.completed_markers_per_boundary);
+    defer alloc.free(completed_snapshot);
+    try std.testing.expectEqual(RetiredSegmentFileDeleter.completed_markers_per_boundary, completed_snapshot.len);
 }
 
 test "persistent index replaceSegments updates segment key range metadata" {
