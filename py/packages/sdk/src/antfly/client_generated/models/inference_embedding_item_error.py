@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="InferenceEmbeddingItemError")
 
@@ -22,6 +23,7 @@ class InferenceEmbeddingItemError:
         stage (InferenceEmbeddingItemErrorStage): Pipeline stage that classified the failure
         retryable (bool): Whether retrying the same item may succeed
         status (int): HTTP-style status classification for this item
+        retry_after_ms (int | None | Unset): Minimum retry delay in milliseconds for a retryable transient failure
     """
 
     index: int
@@ -30,6 +32,7 @@ class InferenceEmbeddingItemError:
     stage: InferenceEmbeddingItemErrorStage
     retryable: bool
     status: int
+    retry_after_ms: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +48,12 @@ class InferenceEmbeddingItemError:
 
         status = self.status
 
+        retry_after_ms: int | None | Unset
+        if isinstance(self.retry_after_ms, Unset):
+            retry_after_ms = UNSET
+        else:
+            retry_after_ms = self.retry_after_ms
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -57,6 +66,8 @@ class InferenceEmbeddingItemError:
                 "status": status,
             }
         )
+        if retry_after_ms is not UNSET:
+            field_dict["retry_after_ms"] = retry_after_ms
 
         return field_dict
 
@@ -75,6 +86,15 @@ class InferenceEmbeddingItemError:
 
         status = d.pop("status")
 
+        def _parse_retry_after_ms(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        retry_after_ms = _parse_retry_after_ms(d.pop("retry_after_ms", UNSET))
+
         inference_embedding_item_error = cls(
             index=index,
             code=code,
@@ -82,6 +102,7 @@ class InferenceEmbeddingItemError:
             stage=stage,
             retryable=retryable,
             status=status,
+            retry_after_ms=retry_after_ms,
         )
 
         inference_embedding_item_error.additional_properties = d

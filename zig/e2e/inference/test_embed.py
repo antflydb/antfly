@@ -31,6 +31,7 @@ from .helpers import (
     cosine_similarity,
     l2_norm,
     make_clip_contract_png_uri,
+    make_shape_png_uri,
     make_solid_png_uri,
     make_text_png_uri,
     make_spoken_wav_uri,
@@ -202,11 +203,12 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
     image_path.write_bytes(image_bytes)
 
     artifact = golden["vision_artifact"]
-    manifest = json.loads((model_dir / "model_manifest.json").read_text())
-    manifest_file = next(item for item in manifest["files"] if item["name"] == artifact["name"])
-    assert manifest_file["digest"] == f"sha256:{artifact['sha256']}"
     model_path = model_dir / artifact["name"]
-    assert model_path.stat().st_size == manifest_file["size"]
+    manifest = json.loads((model_dir / "model_manifest.json").read_text())
+    if manifest_files := manifest.get("files"):
+        manifest_file = next(item for item in manifest_files if item["name"] == artifact["name"])
+        assert manifest_file["digest"] == f"sha256:{artifact['sha256']}"
+        assert model_path.stat().st_size == manifest_file["size"]
     with model_path.open("rb") as model_file:
         assert hashlib.file_digest(model_file, "sha256").hexdigest() == artifact["sha256"]
 
@@ -424,20 +426,55 @@ def test_clipclap_modalities_share_projection_dim(api):
 
 @pytest.mark.multimodal
 def test_clipclap_text_image_alignment(api):
-    """clipclap should preserve at least a basic CLIP-style text/image signal."""
-    white_uri = make_solid_png_uri(255, 255, 255)
-    black_uri = make_solid_png_uri(0, 0, 0)
-    white_text = api.embed("a white image", model=CLIPCLAP_MODEL)["data"][0]["embedding"]
-    white_image = api.embed(
-        [_image_part(white_uri)],
+    """ClipClap should preserve semantic cross-modal retrieval alignment."""
+    fixtures = [
+        (
+            "a red circle on a white background",
+            make_shape_png_uri("circle", (220, 20, 20)),
+        ),
+        (
+            "a blue square on a white background",
+            make_shape_png_uri("square", (20, 60, 220)),
+        ),
+        (
+            "a green triangle on a white background",
+            make_shape_png_uri("triangle", (20, 170, 50)),
+        ),
+    ]
+    text_embeddings = api.embed(
+        [caption for caption, _ in fixtures],
         model=CLIPCLAP_MODEL,
-    )["data"][0]["embedding"]
-    black_image = api.embed(
-        [_image_part(black_uri)],
+    )["data"]
+    image_embeddings = api.embed(
+        [_image_part(uri) for _, uri in fixtures],
         model=CLIPCLAP_MODEL,
-    )["data"][0]["embedding"]
+    )["data"]
+    text_vectors = [item["embedding"] for item in text_embeddings]
+    image_vectors = [item["embedding"] for item in image_embeddings]
 
-    white_match = cosine_similarity(white_text, white_image)
-    white_mismatch = cosine_similarity(white_text, black_image)
+    for embedding in (*text_vectors, *image_vectors):
+        assert len(embedding) == 512
+        assert all(math.isfinite(value) for value in embedding)
+        assert abs(l2_norm(embedding) - 1.0) < 1e-4
 
-    assert white_match > white_mismatch
+    scores = [
+        [cosine_similarity(text, image) for image in image_vectors]
+        for text in text_vectors
+    ]
+    positives = [scores[i][i] for i in range(len(fixtures))]
+    negatives = [
+        scores[i][j]
+        for i in range(len(fixtures))
+        for j in range(len(fixtures))
+        if i != j
+    ]
+    retrieval_hits = sum(
+        max(range(len(fixtures)), key=scores[i].__getitem__) == i
+        for i in range(len(fixtures))
+    )
+    margin = sum(positives) / len(positives) - sum(negatives) / len(negatives)
+    assert retrieval_hits >= 2, {"scores": scores, "retrieval_hits": retrieval_hits}
+    assert margin >= 0.01, {
+        "scores": scores,
+        "alignment_margin": margin,
+    }

@@ -31,6 +31,15 @@ mkdir -p "$HOME" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 target="${ANTFLY_CI_ZIG_TARGET:-x86_64-linux-gnu}"
 cpu="${ANTFLY_CI_ZIG_CPU:-baseline}"
 optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-Debug}"
+strip="${ANTFLY_CI_ZIG_STRIP:-false}"
+
+case "$strip" in
+  true|false) ;;
+  *)
+    echo "ANTFLY_CI_ZIG_STRIP must be true or false, got: $strip" >&2
+    exit 2
+    ;;
+esac
 
 cd "$repo_root/zig"
 
@@ -41,6 +50,7 @@ zig build \
   -Dtarget="$target" \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \
+  -Dstrip="$strip" \
   -Dedition=full \
   install
 

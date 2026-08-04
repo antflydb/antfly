@@ -184,12 +184,25 @@ def collect_local_schema_refs(value: object) -> set[str]:
 
 
 def referenced_inference_schema_names(inference: dict) -> set[str]:
-    schemas = inference.get("components", {}).get("schemas", {})
+    components = inference.get("components", {})
+    schemas = components.get("schemas", {})
     if not isinstance(schemas, dict):
         return set()
 
+    # Response/request-body/parameter components are public roots just like
+    # paths. A schema referenced only through a reusable response must still be
+    # copied into the joined contract before refs are namespaced.
+    component_roots = {
+        name: value
+        for name, value in components.items()
+        if name != "schemas"
+    }
     seen: set[str] = set()
-    pending = list(collect_local_schema_refs(inference.get("paths", {})) | PUBLIC_INFERENCE_SCHEMA_ROOTS)
+    pending = list(
+        collect_local_schema_refs(inference.get("paths", {}))
+        | collect_local_schema_refs(component_roots)
+        | PUBLIC_INFERENCE_SCHEMA_ROOTS
+    )
     while pending:
         name = pending.pop()
         if name in seen:

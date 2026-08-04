@@ -207,6 +207,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
+    var max_loaded_models: usize = 10;
     var budget_overrides_mb = BudgetOverridesMb{};
     var allow_unknown_models = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -221,6 +222,12 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             models_dir = args.next() orelse models_dir;
         } else if (std.mem.eql(u8, arg, "--ml-dir")) {
             ml_dir = args.next() orelse ml_dir;
+        } else if (std.mem.eql(u8, arg, "--max-loaded-models")) {
+            max_loaded_models = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.InvalidArguments,
+                10,
+            );
         } else if (std.mem.eql(u8, arg, "--host-budget-mb")) {
             budget_overrides_mb.host_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--backend-budget-mb")) {
@@ -245,6 +252,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
+        .max_loaded_models = max_loaded_models,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
         .allow_unknown_models = allow_unknown_models,
@@ -599,6 +607,7 @@ fn printUsage() void {
         \\  --port <port>    Listen port (default: 8090)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --max-loaded-models <n> Maximum resident models; 0 disables the count limit (default: 10)
         \\  --host-budget-mb <n>      Native generation host budget override
         \\  --backend-budget-mb <n>   Native generation backend budget override
         \\  --combined-budget-mb <n>  Native generation combined budget override
