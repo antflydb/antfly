@@ -586,7 +586,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 return error.TextMergeBackpressureUnavailable;
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
-            waiter.waiting_for_bytes = segments_admissible;
+            // The shared byte dimension imposes cross-index FIFO whenever it
+            // blocks this request, including when the per-index segment
+            // dimension is blocked at the same time.
+            waiter.waiting_for_bytes = !request_bytes_admissible;
             if (!recorded_wait) {
                 self.backpressure_events += 1;
                 recorded_wait = true;

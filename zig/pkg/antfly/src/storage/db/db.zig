@@ -71117,6 +71117,136 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     cross_index_joined = true;
     try std.testing.expect(cross_index_acquired.load(.acquire));
 
+    // A waiter blocked on both dimensions still owns FIFO priority for the
+    // process-wide byte dimension. A younger request for another index must
+    // not consume the remaining bytes merely because the older waiter is also
+    // blocked on its index-local segment ceiling.
+    const mixed_byte_limit = resources.index_manager.textMergeStatsSnapshot().pending_bytes +| 100;
+    var mixed_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 100,
+            .resume_pending_segments = 50,
+            .max_pending_bytes = mixed_byte_limit,
+            .backpressure_max_wait_ms = 2_000,
+        },
+    );
+    defer mixed_runtime.deinit();
+    var mixed_segment_blocker = try mixed_runtime.acquireProducerPermit("mixed-a", 100, 0);
+    var mixed_segment_blocker_active = true;
+    defer if (mixed_segment_blocker_active) mixed_segment_blocker.release();
+    var mixed_byte_blocker = try mixed_runtime.acquireProducerPermit("mixed-byte", 0, 80);
+    var mixed_byte_blocker_active = true;
+    defer if (mixed_byte_blocker_active) mixed_byte_blocker.release();
+
+    const MixedWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        index_name: []const u8,
+        segment_count: u64,
+        byte_count: u64,
+        acquisition_counter: *std.atomic.Value(u32),
+        acquisition_order: *std.atomic.Value(u32),
+        release_gate: *const std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit(self.index_name, self.segment_count, self.byte_count) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.acquisition_order.store(self.acquisition_counter.fetchAdd(1, .acq_rel) + 1, .release);
+            while (!self.release_gate.load(.acquire)) std.Thread.yield() catch {};
+            permit.release();
+        }
+    };
+    var mixed_acquisition_counter = std.atomic.Value(u32).init(0);
+    var mixed_older_order = std.atomic.Value(u32).init(0);
+    var mixed_younger_order = std.atomic.Value(u32).init(0);
+    var mixed_release = std.atomic.Value(bool).init(false);
+    var mixed_older_failed = std.atomic.Value(bool).init(false);
+    var mixed_younger_failed = std.atomic.Value(bool).init(false);
+    var mixed_older = MixedWaiter{
+        .runtime = &mixed_runtime,
+        .index_name = "mixed-a",
+        .segment_count = 1,
+        .byte_count = 90,
+        .acquisition_counter = &mixed_acquisition_counter,
+        .acquisition_order = &mixed_older_order,
+        .release_gate = &mixed_release,
+        .failed = &mixed_older_failed,
+    };
+    const mixed_events_before = mixed_runtime.stats().backpressure_events;
+    const mixed_older_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_older});
+    var mixed_older_joined = false;
+    defer if (!mixed_older_joined) {
+        if (mixed_segment_blocker_active) {
+            mixed_segment_blocker.release();
+            mixed_segment_blocker_active = false;
+        }
+        if (mixed_byte_blocker_active) {
+            mixed_byte_blocker.release();
+            mixed_byte_blocker_active = false;
+        }
+        mixed_release.store(true, .release);
+        mixed_older_thread.join();
+    };
+    const mixed_older_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(mixed_runtime.stats().backpressure_events > mixed_events_before);
+
+    var mixed_younger = MixedWaiter{
+        .runtime = &mixed_runtime,
+        .index_name = "mixed-b",
+        .segment_count = 1,
+        .byte_count = 20,
+        .acquisition_counter = &mixed_acquisition_counter,
+        .acquisition_order = &mixed_younger_order,
+        .release_gate = &mixed_release,
+        .failed = &mixed_younger_failed,
+    };
+    const mixed_younger_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_younger});
+    var mixed_younger_joined = false;
+    defer if (!mixed_younger_joined) {
+        if (mixed_segment_blocker_active) {
+            mixed_segment_blocker.release();
+            mixed_segment_blocker_active = false;
+        }
+        if (mixed_byte_blocker_active) {
+            mixed_byte_blocker.release();
+            mixed_byte_blocker_active = false;
+        }
+        mixed_release.store(true, .release);
+        mixed_younger_thread.join();
+    };
+    const mixed_younger_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(mixed_runtime.stats().backpressure_events >= mixed_events_before + 2);
+    try std.testing.expectEqual(@as(u32, 0), mixed_older_order.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
+
+    mixed_segment_blocker.release();
+    mixed_segment_blocker_active = false;
+    mixed_byte_blocker.release();
+    mixed_byte_blocker_active = false;
+    const mixed_older_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(u32, 1), mixed_older_order.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
+    try std.testing.expect(!mixed_older_failed.load(.acquire));
+    try std.testing.expect(!mixed_younger_failed.load(.acquire));
+    mixed_release.store(true, .release);
+    mixed_older_thread.join();
+    mixed_older_joined = true;
+    const mixed_younger_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(u32, 2), mixed_younger_order.load(.acquire));
+    mixed_younger_thread.join();
+    mixed_younger_joined = true;
+
     var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
     var blocking_active = true;
     defer if (blocking_active) blocking_permit.release();
