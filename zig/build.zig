@@ -5288,7 +5288,7 @@ pub fn build(b: *std.Build) void {
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
-            "descriptor pressure evicts an inactive writer cache before retrying open",
+            "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",

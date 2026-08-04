@@ -1078,6 +1078,10 @@ else
                 _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
                 return;
             }
+            if (self.admission_head == null and self.persistentDescriptorsPreventTransientProgress(count)) {
+                _ = self.persistent_admission_failures.fetchAdd(1, .monotonic);
+                return error.PersistentDescriptorAdmissionExhausted;
+            }
 
             var waiter = AdmissionWaiter{ .count = count };
             self.enqueueAdmissionWaiter(&waiter);
@@ -1096,8 +1100,32 @@ else
                     self.admission_changed.broadcast(io);
                     return;
                 }
+                // A transient holder can eventually release and wake us. A
+                // pool occupied only by lifetime descriptors cannot make
+                // progress until a backend is closed, and the caller may own
+                // the cache-open lock required to choose that victim. Surface
+                // the persistent-pressure error instead of sleeping forever.
+                if (self.admission_head == &waiter and self.persistentDescriptorsPreventTransientProgress(count)) {
+                    _ = self.persistent_admission_failures.fetchAdd(1, .monotonic);
+                    return error.PersistentDescriptorAdmissionExhausted;
+                }
                 try self.admission_changed.wait(io, &self.admission_mutex);
             }
+        }
+
+        fn persistentDescriptorsPreventTransientProgress(self: *FdCache, count: usize) bool {
+            const persistent = self.persistent_descriptors.load(.acquire);
+            const admitted = self.admitted_descriptors.load(.acquire);
+            if (admitted != persistent) return false;
+
+            const unused_reserve = self.persistent_reserve -| persistent;
+            const remaining_capacity = self.capacity -| persistent;
+            const open_headroom = if (remaining_capacity >= self.persistent_open_headroom)
+                self.persistent_open_headroom
+            else
+                0;
+            const transient_capacity = self.capacity - @max(unused_reserve, open_headroom);
+            return count > transient_capacity -| admitted;
         }
 
         fn makeCapacityAvailable(self: *FdCache, count: usize) bool {
@@ -3387,6 +3415,33 @@ test "persistent path lock exhaustion fails without waiting" {
     const stats = pool.snapshotStats();
     try std.testing.expectEqual(@as(usize, 0), stats.fd_admission_waiters);
     try std.testing.expectEqual(@as(u64, 1), stats.fd_persistent_admission_failures);
+}
+
+test "transient admission fails fast when only persistent descriptors prevent progress" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+    defer pool.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    // Two lifetime descriptors consume the transient ceiling after open
+    // headroom is retained. No short-lived holder can wake an admission wait,
+    // so a cache owner must be allowed to close an idle backend instead.
+    try pool.fd_cache.reservePersistentDescriptors(io, 2);
+    var persistent_held = true;
+    defer if (persistent_held) pool.fd_cache.releasePersistentDescriptors(io, 2);
+    try std.testing.expectError(
+        error.PersistentDescriptorAdmissionExhausted,
+        pool.fd_cache.reserveDescriptors(io, 1),
+    );
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+
+    pool.fd_cache.releasePersistentDescriptors(io, 2);
+    persistent_held = false;
+    try pool.fd_cache.reserveDescriptors(io, 1);
+    defer pool.fd_cache.releaseDescriptors(io, 1);
 }
 
 test "persistent path locks honor an explicitly configured pool" {

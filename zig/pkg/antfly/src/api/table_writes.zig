@@ -2729,46 +2729,36 @@ pub const ProvisionedTableWriteCache = struct {
         removed.deinit(self.alloc);
     }
 
-    /// Retire one cache-resident table that can immediately release persistent
-    /// descriptors. The source state mutex prevents new leases while the
-    /// candidate is selected; the lifecycle mutex makes the active-lease check
-    /// race-free with outstanding lease releases.
-    fn evictOneInactiveTableForDescriptorPressureLocked(
+    /// Retire one cache-resident DB that can immediately release persistent
+    /// descriptors. Eviction is entry-granular: one busy shard must not pin
+    /// every idle shard of the same table, and table metadata remains hot.
+    /// The source state mutex prevents new leases while the candidate is
+    /// selected; the lifecycle mutex makes the active-lease check race-free
+    /// with outstanding lease releases.
+    fn evictOneInactiveEntryForDescriptorPressureLocked(
         self: *ProvisionedTableWriteCache,
+        excluded_group_id: u64,
         excluded_table_name: []const u8,
     ) !bool {
-        var metadata_index: usize = 0;
-        while (metadata_index < self.table_metadata.items.len) : (metadata_index += 1) {
-            const table_name = self.table_metadata.items[metadata_index].table_name;
-            if (std.mem.eql(u8, table_name, excluded_table_name)) continue;
-            if (self.bulkIngestSessionActiveForTable(table_name)) continue;
+        var entry_index: usize = 0;
+        while (entry_index < self.entries.items.len) : (entry_index += 1) {
+            const entry = self.entries.items[entry_index];
+            if (entry.group_id == excluded_group_id and
+                std.mem.eql(u8, entry.table_name, excluded_table_name)) continue;
+            if (self.bulkIngestSessionActiveForTable(entry.table_name)) continue;
 
-            var has_entry = false;
-            var inactive = true;
             lockAtomic(&self.entry_lifecycle_mutex);
-            for (self.entries.items) |entry| {
-                if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-                has_entry = true;
-                if (entry.active_leases != 0 or
-                    entry.bulk_ingest_session_open or
-                    entry.auto_bulk_ingest_session_open or
-                    entry.auto_bulk_ingest_finishing)
-                {
-                    inactive = false;
-                    break;
-                }
-            }
+            const inactive = entry.active_leases == 0 and
+                !entry.bulk_ingest_session_open and
+                !entry.auto_bulk_ingest_session_open and
+                !entry.auto_bulk_ingest_finishing;
             self.entry_lifecycle_mutex.unlock();
-            if (!has_entry or !inactive) continue;
+            if (!inactive) continue;
 
-            // Reserve before the eviction hook publishes cache invalidations.
-            // Once this succeeds, retirement and queueing are allocation-free.
-            try self.reserveDbEntryRetirementsForTableLocked(table_name);
-            if (self.table_eviction_hook) |hook| hook.notify(self, table_name);
-            try self.retireDbEntriesForTableLocked(table_name);
-            var removed = self.table_metadata.orderedRemove(metadata_index);
-            removed.deinit(self.alloc);
-            return true;
+            // The lifecycle helper rechecks active_leases under its mutex, so
+            // a concurrent final release is harmless and no lease can appear
+            // while the source state mutex remains held.
+            if (try self.retireInactiveEntryAtIndexForCloseLocked(entry_index)) return true;
         }
         return false;
     }
@@ -6802,11 +6792,11 @@ pub const ProvisionedTableWriteSource = struct {
                 },
                 error.PersistentDescriptorAdmissionExhausted => {
                     var evicted_cache: ?*ProvisionedTableWriteCache = null;
-                    if (try cache.evictOneInactiveTableForDescriptorPressureLocked(table_name)) {
+                    if (try cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name)) {
                         evicted_cache = cache;
                     } else if (self.startup_write_cache) |startup| {
                         if (startup != cache and
-                            try startup.evictOneInactiveTableForDescriptorPressureLocked(table_name))
+                            try startup.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name))
                         {
                             evicted_cache = startup;
                         }
@@ -7192,59 +7182,83 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
-        var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
-                cache.alloc,
-                path,
-                value,
-                cache.lsm_cache,
-                cache.hbc_cache,
-                lsm_root_generation,
-                cache.resource_manager,
-                mode,
-                cache.backend_runtime,
-                self.antfly_provider,
-                self.secret_store,
-                cache.remote_content,
-                identity_namespace,
-                .{
-                    .drain_resolver_backfill = false,
-                    .inference_api_url = self.inference_api_url,
+        var opened: ?db_mod.DB = while (true) {
+            const open_result: anyerror!db_mod.DB = if (consumeTestWriterOpenPersistentDescriptorFailure())
+                error.PersistentDescriptorAdmissionExhausted
+            else if (prepared_open.?.indexes_json) |value|
+                openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                    cache.alloc,
+                    path,
+                    value,
+                    cache.lsm_cache,
+                    cache.hbc_cache,
+                    lsm_root_generation,
+                    cache.resource_manager,
+                    mode,
+                    cache.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    cache.remote_content,
+                    identity_namespace,
+                    .{
+                        .drain_resolver_backfill = false,
+                        .inference_api_url = self.inference_api_url,
+                        .ha_write_gate = self.ha_write_gate,
+                        .ha_async_effect_mirror = effective_ha_mirror,
+                        .ha_async_batch_mirror = effective_ha_mirror,
+                        .ha_async_metadata_mirror = effective_ha_mirror,
+                        .identity_validation = identity_validation,
+                    },
+                )
+            else
+                db_mod.DB.open(cache.alloc, path, .{
+                    .lsm_cache = cache.lsm_cache,
+                    .hbc_cache = cache.hbc_cache,
+                    .lsm_root_generation = lsm_root_generation,
+                    .resource_manager = cache.resource_manager,
+                    .backend_runtime = cache.backend_runtime,
+                    .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
+                    .identity_namespace = identity_namespace,
+                    .prefer_existing_identity_namespace = identity_namespace != null,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
                     .ha_async_metadata_mirror = effective_ha_mirror,
-                    .identity_validation = identity_validation,
+                    .open_mode = switch (mode) {
+                        .default => .writer,
+                        .default_async, .writer_no_replay => .writer_no_replay,
+                        .startup_catch_up, .restore_repair => .writer_no_replay,
+                        .query_readonly => .query_readonly,
+                        .status_only => .status_only,
+                    },
+                    .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
+                    .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
+                    .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
+                    .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                    .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                    .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                });
+
+            const opened_value = open_result catch |err| switch (err) {
+                error.PersistentDescriptorAdmissionExhausted => {
+                    lockAtomic(&self.local_db_mutex);
+                    const evicted = cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name) catch |evict_err| {
+                        self.local_db_mutex.unlock();
+                        return evict_err;
+                    };
+                    self.local_db_mutex.unlock();
+                    if (!evicted) return err;
+
+                    // This path already owns cache.open_mutex. Close the
+                    // selected DB synchronously so its lifetime lock permits
+                    // are released before retrying the physical open.
+                    cache.drainPendingClosesAssumeOpenMutexHeld();
+                    continue;
                 },
-            )
-        else
-            try db_mod.DB.open(cache.alloc, path, .{
-                .lsm_cache = cache.lsm_cache,
-                .hbc_cache = cache.hbc_cache,
-                .lsm_root_generation = lsm_root_generation,
-                .resource_manager = cache.resource_manager,
-                .backend_runtime = cache.backend_runtime,
-                .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
-                .identity_namespace = identity_namespace,
-                .prefer_existing_identity_namespace = identity_namespace != null,
-                .ha_write_gate = self.ha_write_gate,
-                .ha_async_effect_mirror = effective_ha_mirror,
-                .ha_async_batch_mirror = effective_ha_mirror,
-                .ha_async_metadata_mirror = effective_ha_mirror,
-                .open_mode = switch (mode) {
-                    .default => .writer,
-                    .default_async, .writer_no_replay => .writer_no_replay,
-                    .startup_catch_up, .restore_repair => .writer_no_replay,
-                    .query_readonly => .query_readonly,
-                    .status_only => .status_only,
-                },
-                .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
-                .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
-                .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
-                .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-            });
+                else => return err,
+            };
+            break opened_value;
+        };
         defer if (opened) |*db| db.close();
         if (local_persisted_metadata and prepared_open.?.schema_json == null) {
             prepared_open.?.schema_json = (try loadLocalTableSchemaJson(cache.alloc, &opened.?)) orelse
@@ -22637,7 +22651,7 @@ test "writer cache eviction retires dirty ownership after the last cache owner" 
     try std.testing.expectEqual(@as(u64, 9), read_cache.table_epochs.get("docs").?);
 }
 
-test "descriptor pressure evicts an inactive writer cache before retrying open" {
+test "prepared writer open evicts an inactive sibling group before retrying descriptor pressure" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -22664,12 +22678,11 @@ test "descriptor pressure evicts an inactive writer cache before retrying open" 
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{
-                    .{ .table_id = 7, .name = "victim", .indexes_json = tables_api.default_indexes_json },
-                    .{ .table_id = 8, .name = "active", .indexes_json = tables_api.default_indexes_json },
+                    .{ .table_id = 7, .name = "docs", .indexes_json = tables_api.default_indexes_json },
                 })[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
                     .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
-                    .{ .group_id = 7002, .table_id = 8, .start_key = "", .end_key = null },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "", .end_key = null },
                 })[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -22687,25 +22700,32 @@ test "descriptor pressure evicts an inactive writer cache before retrying open" 
     defer source.deinit();
     source.write_cache = &cache;
 
-    var victim = try cache.getOrOpenLocked(victim_path, Catalog.iface(), 7001, 1, "victim");
+    var victim = try cache.getOrOpenLocked(victim_path, Catalog.iface(), 7001, 1, "docs");
     victim.deinit(alloc);
 
     test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
     defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
-    lockAtomic(&source.local_db_mutex);
-    var active = source.getOrOpenCachedDbModeAlreadyLocked(&cache, active_path, 7002, 1, "active", .default_async) catch |err| {
-        source.local_db_mutex.unlock();
-        return err;
-    };
-    source.local_db_mutex.unlock();
+    var active = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &cache,
+        active_path,
+        7002,
+        1,
+        "docs",
+        .default_async,
+        null,
+        null,
+        null,
+    );
     defer active.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
-    try std.testing.expectEqualStrings("active", cache.entries.items[0].table_name);
+    try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
+    try std.testing.expectEqualStrings("docs", cache.entries.items[0].table_name);
     try std.testing.expectEqual(@as(usize, 0), cache.closing_entries.items.len);
     try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
 
-    try std.testing.expect(!(try cache.evictOneInactiveTableForDescriptorPressureLocked("unrelated")));
+    try std.testing.expect(!(try cache.evictOneInactiveEntryForDescriptorPressureLocked(9999, "unrelated")));
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
 }
 
