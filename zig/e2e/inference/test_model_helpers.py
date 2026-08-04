@@ -11,6 +11,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 
+import pytest
 import requests
 
 from . import models
@@ -65,7 +66,9 @@ def test_managed_download_in_progress_invalidates_completed_first_shard(tmp_path
     model_dir = tmp_path / "owner" / "interrupted-between-files"
     model_dir.mkdir(parents=True)
     (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"first")
-    (model_dir / ".antfly-download-in-progress").write_text('{"version":1,"state":"in_progress"}')
+    (model_dir / ".antfly-download-in-progress").write_text(
+        '{"version":1,"state":"in_progress"}'
+    )
 
     assert not _looks_like_model_dir(model_dir)
 
@@ -126,14 +129,18 @@ def test_reader_environment_override_preserves_curated_variant(monkeypatch):
 
 
 def test_generator_environment_override_preserves_curated_variant(monkeypatch):
-    monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "ggml-org/gemma-4-e2b-it-gguf")
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "ggml-org/gemma-4-e2b-it-gguf"
+    )
 
     specs = _env_model_specs()
     gemma = next(spec for spec in specs if spec.repo == "ggml-org/gemma-4-e2b-it-gguf")
 
     assert gemma.pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0"
 
-    monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "unsloth/Qwen3-1.7B-GGUF")
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "unsloth/Qwen3-1.7B-GGUF"
+    )
     specs = _env_model_specs()
     qwen = next(spec for spec in specs if spec.repo == "unsloth/Qwen3-1.7B-GGUF")
     assert qwen.pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
@@ -168,7 +175,9 @@ def test_explicit_large_generator_is_bootstrapped(monkeypatch):
     for env_name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
-    monkeypatch.setenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL)
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
+    )
     monkeypatch.setattr(models, "model_available", lambda spec: False)
     pulled = []
     monkeypatch.setattr(models, "ensure_model", pulled.append)
@@ -182,29 +191,157 @@ def test_explicit_large_generator_is_bootstrapped(monkeypatch):
     assert pulled[0].projector == "Q8_0"
 
 
-def test_gemma_pull_requests_q8_projector(monkeypatch, tmp_path):
+def test_gemma_pull_repairs_managed_cache_missing_q8_projector(monkeypatch, tmp_path):
     spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
     assert spec is not None
     monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
     monkeypatch.setattr(models, "inference_command", lambda: ["antfly", "inference"])
-    monkeypatch.setattr(
-        models,
-        "find_local_model_path",
-        lambda *_args: None if not calls else tmp_path / DEFAULT_GENERATOR_MODEL,
+
+    model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
+    model_dir.mkdir(parents=True)
+    decoder = model_dir / "gemma-4-e2b-it-Q4_0.gguf"
+    decoder.write_bytes(b"decoder")
+    completion_path = model_dir / models.MANAGED_DOWNLOAD_COMPLETE
+    completion_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "artifacts": [{"path": decoder.name, "size": decoder.stat().st_size}],
+            }
+        )
     )
+
     calls: list[list[str]] = []
+
+    def repair(command, **_kwargs):
+        calls.append(command)
+        projector = model_dir / "mmproj-gemma-4-e2b-it-Q8_0.gguf"
+        projector.write_bytes(b"projector")
+        completion_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "artifacts": [
+                        {"path": decoder.name, "size": decoder.stat().st_size},
+                        {
+                            "path": projector.name,
+                            "size": projector.stat().st_size,
+                        },
+                    ],
+                }
+            )
+        )
+        return SimpleNamespace(returncode=0)
+
     monkeypatch.setattr(
         models.subprocess,
         "run",
-        lambda command, **_kwargs: calls.append(command)
-        or SimpleNamespace(returncode=0),
+        repair,
     )
 
-    models.ensure_model(spec)
+    assert not models.model_available(spec)
+    assert models.ensure_model(spec) == model_dir
 
     assert calls
     projector_index = calls[0].index("--projector")
     assert calls[0][projector_index + 1] == "Q8_0"
+    assert models.model_available(spec)
+
+
+def test_gemma_matching_managed_projector_skips_pull(monkeypatch, tmp_path):
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+
+    model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
+    model_dir.mkdir(parents=True)
+    decoder = model_dir / "gemma-4-e2b-it-Q4_0.gguf"
+    projector = model_dir / "nested" / "mmproj-gemma-4-e2b-it-Q8_0.gguf"
+    projector.parent.mkdir()
+    decoder.write_bytes(b"decoder")
+    projector.write_bytes(b"projector")
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": decoder.name, "size": decoder.stat().st_size},
+                    {
+                        "path": projector.relative_to(model_dir).as_posix(),
+                        "size": projector.stat().st_size,
+                    },
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        models.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("complete model must not be pulled again")
+        ),
+    )
+
+    assert models.model_available(spec)
+    assert models.ensure_model(spec) == model_dir
+
+
+def test_gemma_wrong_projector_quant_does_not_satisfy_spec(monkeypatch, tmp_path):
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+
+    model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
+    model_dir.mkdir(parents=True)
+    decoder = model_dir / "gemma-4-e2b-it-Q4_0.gguf"
+    projector = model_dir / "mmproj-gemma-4-e2b-it-BF16.gguf"
+    decoder.write_bytes(b"decoder")
+    projector.write_bytes(b"projector")
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": decoder.name, "size": decoder.stat().st_size},
+                    {"path": projector.name, "size": projector.stat().st_size},
+                ],
+            }
+        )
+    )
+
+    assert not models.model_available(spec)
+
+
+def test_gemma_pull_fails_closed_when_requested_projector_is_not_published(
+    monkeypatch, tmp_path
+):
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    monkeypatch.setattr(models, "inference_command", lambda: ["antfly", "inference"])
+
+    model_dir = tmp_path / DEFAULT_GENERATOR_MODEL
+
+    def incomplete_pull(*_args, **_kwargs):
+        model_dir.mkdir(parents=True)
+        decoder = model_dir / "gemma-4-e2b-it-Q4_0.gguf"
+        decoder.write_bytes(b"decoder")
+        (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "artifacts": [
+                        {"path": decoder.name, "size": decoder.stat().st_size}
+                    ],
+                }
+            )
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(models.subprocess, "run", incomplete_pull)
+
+    with pytest.raises(RuntimeError, match="missing projector Q8_0"):
+        models.ensure_model(spec)
 
 
 def _response(status: int, body: dict) -> requests.Response:

@@ -469,6 +469,26 @@ fn readOptionalMetadataFile(
     };
 }
 
+test "optional metadata preserves non-missing open failures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "not-a-directory", .data = "file" });
+
+    const model_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "not-a-directory",
+    });
+    defer allocator.free(model_path);
+
+    try std.testing.expectError(
+        error.NotDir,
+        readOptionalMetadataFile(allocator, model_path, "model_manifest.json"),
+    );
+}
+
 /// Load a model manifest by inspecting the directory contents and parsing configs.
 pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
     var manifest = ModelManifest{ .allocator = allocator };
@@ -1032,7 +1052,41 @@ fn isGlinerHeadGgufFileName(name: []const u8) bool {
         (std.mem.startsWith(u8, name, "gliner2-head.") and std.mem.endsWith(u8, name, ".gguf"));
 }
 
+const projector_quant_preference = [_][]const u8{
+    "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "F16", "BF16",
+};
+
+fn fileNameHasDelimitedTokenIgnoreCase(name: []const u8, token: []const u8) bool {
+    if (token.len == 0 or name.len < token.len) return false;
+    var start: usize = 0;
+    while (start + token.len <= name.len) : (start += 1) {
+        if (!std.ascii.eqlIgnoreCase(name[start .. start + token.len], token)) continue;
+        const left_boundary = start == 0 or switch (name[start - 1]) {
+            '-', '_', '.' => true,
+            else => false,
+        };
+        const end = start + token.len;
+        const right_boundary = end == name.len or switch (name[end]) {
+            '-', '_', '.' => true,
+            else => false,
+        };
+        if (left_boundary and right_boundary) return true;
+    }
+    return false;
+}
+
+fn projectorPreferenceRank(name: []const u8) u8 {
+    for (projector_quant_preference, 0..) |quant, rank| {
+        if (fileNameHasDelimitedTokenIgnoreCase(name, quant)) return @intCast(rank);
+    }
+    return std.math.maxInt(u8);
+}
+
 fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_projector: bool) !?[]const u8 {
+    var best_projector_name: ?[]u8 = null;
+    defer if (best_projector_name) |name| allocator.free(name);
+    var best_projector_rank: u8 = std.math.maxInt(u8);
+
     if (!c_file.link_libc) {
         var dir = Dir.cwd().openDir(std.Options.debug_io, base_dir, .{ .iterate = true }) catch return null;
         defer dir.close(std.Options.debug_io);
@@ -1043,8 +1097,18 @@ fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_p
             if (!std.mem.endsWith(u8, name, ".gguf")) continue;
             if (isGlinerHeadGgufFileName(name)) continue;
             if (isGgufProjectorFileName(name) != want_projector) continue;
-            return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
+            if (!want_projector) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
+            const rank = projectorPreferenceRank(name);
+            if (best_projector_name == null or rank < best_projector_rank or
+                (rank == best_projector_rank and std.mem.lessThan(u8, name, best_projector_name.?)))
+            {
+                const owned_name = try allocator.dupe(u8, name);
+                if (best_projector_name) |old_name| allocator.free(old_name);
+                best_projector_name = owned_name;
+                best_projector_rank = rank;
+            }
         }
+        if (best_projector_name) |name| return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
         return null;
     }
 
@@ -1062,8 +1126,18 @@ fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_p
         if (!std.mem.endsWith(u8, name, ".gguf")) continue;
         if (isGlinerHeadGgufFileName(name)) continue;
         if (isGgufProjectorFileName(name) != want_projector) continue;
-        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
+        if (!want_projector) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
+        const rank = projectorPreferenceRank(name);
+        if (best_projector_name == null or rank < best_projector_rank or
+            (rank == best_projector_rank and std.mem.lessThan(u8, name, best_projector_name.?)))
+        {
+            const owned_name = try allocator.dupe(u8, name);
+            if (best_projector_name) |old_name| allocator.free(old_name);
+            best_projector_name = owned_name;
+            best_projector_rank = rank;
+        }
     }
+    if (best_projector_name) |name| return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
     return null;
 }
 
@@ -3005,6 +3079,27 @@ test "manifest gguf discovery separates decoder and projector files" {
 
     try std.testing.expect(std.mem.endsWith(u8, decoder, "gemma-4-e2b-it-Q8_0.gguf"));
     try std.testing.expect(std.mem.endsWith(u8, projector, "mmproj-gemma-4-e2b-it-f16.gguf"));
+}
+
+test "manifest gguf discovery prefers q8 projector over stale dense sidecars" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write dense projectors first to ensure filesystem iteration order cannot
+    // override the bounded-residency preference used by managed downloads.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-BF16.gguf", .data = "bf16" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-F16.gguf", .data = "f16" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-Q8_0.gguf", .data = "q8" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma-4-e2b-it-Q4_0.gguf", .data = "decoder" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    const projector = try findFirstGgufInDir(allocator, model_dir, true) orelse return error.TestExpectedProjectorGguf;
+    defer allocator.free(projector);
+    try std.testing.expect(std.mem.endsWith(u8, projector, "mmproj-gemma-4-e2b-it-Q8_0.gguf"));
 }
 
 test "manifest gguf discovery handles google gemma4 e4b qat layout" {

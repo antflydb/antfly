@@ -32,9 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ANTFLY_BIN_CANDIDATES = (
-    REPO_ROOT / "zig-out" / "bin" / "antfly",
-)
+DEFAULT_ANTFLY_BIN_CANDIDATES = (REPO_ROOT / "zig-out" / "bin" / "antfly",)
 MANAGED_DOWNLOAD_IN_PROGRESS = ".antfly-download-in-progress"
 MANAGED_DOWNLOAD_PLAN = ".antfly-download-plan.json"
 MANAGED_DOWNLOAD_COMPLETE = ".antfly-download-complete.json"
@@ -326,7 +324,11 @@ def models_dir() -> Path:
         directory = Path(configured)
     else:
         home = os.environ.get("HOME")
-        directory = Path(home) / ".antfly" / "inference" / "models" if home else Path("./models")
+        directory = (
+            Path(home) / ".antfly" / "inference" / "models"
+            if home
+            else Path("./models")
+        )
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -339,7 +341,9 @@ def ml_dir() -> Path:
         directory = Path(configured)
     else:
         home = os.environ.get("HOME")
-        directory = Path(home) / ".antfly" / "inference" / "ml" if home else Path("./ml")
+        directory = (
+            Path(home) / ".antfly" / "inference" / "ml" if home else Path("./ml")
+        )
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -370,58 +374,81 @@ def _model_path(spec: ModelSpec) -> Path:
     return models_dir() / spec.repo
 
 
+def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
+    """Return validated receipt paths, or None for an unmanaged directory.
+
+    An empty tuple means a receipt exists but is invalid. Keeping that distinct
+    from an unmanaged directory prevents a corrupt managed download from being
+    accepted by the legacy filesystem scan.
+    """
+
+    completion_path = path / MANAGED_DOWNLOAD_COMPLETE
+    if not completion_path.exists():
+        return None
+
+    root = path.resolve()
+    try:
+        with completion_path.open(encoding="utf-8") as receipt:
+            serialized = receipt.read(MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES + 1)
+        if len(serialized) > MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES:
+            return ()
+        completion = json.loads(serialized)
+        artifacts = completion["artifacts"]
+    except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+        return ()
+    if type(completion.get("version")) is not int or completion["version"] != 1:
+        return ()
+    if not isinstance(artifacts, list) or not artifacts:
+        return ()
+
+    artifact_paths: list[str] = []
+    has_supported_payload = False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            return ()
+        artifact_path = artifact.get("path")
+        artifact_size = artifact.get("size")
+        if (
+            not isinstance(artifact_path, str)
+            or type(artifact_size) is not int
+            or artifact_size < 0
+        ):
+            return ()
+        relative = PurePosixPath(artifact_path)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in ("", ".", "..") for part in relative.parts)
+            or "\\" in artifact_path
+        ):
+            return ()
+        candidate = path.joinpath(*relative.parts)
+        try:
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_relative_to(root) or not resolved.is_file():
+                return ()
+            if resolved.stat().st_size != artifact_size:
+                return ()
+        except OSError:
+            return ()
+        artifact_paths.append(artifact_path)
+        if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
+            has_supported_payload = True
+    return tuple(artifact_paths) if has_supported_payload else ()
+
+
 def _looks_like_model_dir(path: Path) -> bool:
     if not path.is_dir():
         return False
 
-    if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (path / MANAGED_DOWNLOAD_PLAN).exists():
+    if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (
+        path / MANAGED_DOWNLOAD_PLAN
+    ).exists():
         return False
 
-    completion_path = path / MANAGED_DOWNLOAD_COMPLETE
-    if completion_path.exists():
-        root = path.resolve()
-        try:
-            with completion_path.open(encoding="utf-8") as receipt:
-                serialized = receipt.read(MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES + 1)
-            if len(serialized) > MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES:
-                return False
-            completion = json.loads(serialized)
-            artifacts = completion["artifacts"]
-        except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
-            return False
-        if type(completion.get("version")) is not int or completion["version"] != 1:
-            return False
-        if not isinstance(artifacts, list) or not artifacts:
-            return False
-
-        has_supported_payload = False
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                return False
-            artifact_path = artifact.get("path")
-            artifact_size = artifact.get("size")
-            if not isinstance(artifact_path, str) or type(artifact_size) is not int or artifact_size < 0:
-                return False
-            relative = PurePosixPath(artifact_path)
-            if (
-                relative.is_absolute()
-                or not relative.parts
-                or any(part in ("", ".", "..") for part in relative.parts)
-                or "\\" in artifact_path
-            ):
-                return False
-            candidate = path.joinpath(*relative.parts)
-            try:
-                resolved = candidate.resolve(strict=True)
-                if not resolved.is_relative_to(root) or not resolved.is_file():
-                    return False
-                if resolved.stat().st_size != artifact_size:
-                    return False
-            except OSError:
-                return False
-            if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
-                has_supported_payload = True
-        return has_supported_payload and not (
+    managed_artifacts = _validated_managed_artifacts(path)
+    if managed_artifacts is not None:
+        return bool(managed_artifacts) and not (
             (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
             or (path / MANAGED_DOWNLOAD_PLAN).exists()
         )
@@ -443,13 +470,66 @@ def _looks_like_model_dir(path: Path) -> bool:
     )
 
 
+def _is_projector_gguf(artifact_path: str) -> bool:
+    name = PurePosixPath(artifact_path).name
+    if not name.lower().endswith(".gguf"):
+        return False
+    stem = name[: -len(".gguf")].lower()
+    return (
+        stem == "mmproj"
+        or stem.startswith(("mmproj-", "mmproj_"))
+        or stem.endswith(("-mmproj", "_mmproj"))
+    )
+
+
+def _projector_matches(artifact_path: str, selector: str) -> bool:
+    if not selector or not _is_projector_gguf(artifact_path):
+        return False
+    name = PurePosixPath(artifact_path).name
+    if artifact_path == selector or name == selector:
+        return True
+
+    stem = name[: -len(".gguf")].lower()
+    quant = selector.lower()
+    start = 0
+    boundaries = "-_."
+    while (start := stem.find(quant, start)) >= 0:
+        end = start + len(quant)
+        if (start == 0 or stem[start - 1] in boundaries) and (
+            end == len(stem) or stem[end] in boundaries
+        ):
+            return True
+        start += 1
+    return False
+
+
+def _model_satisfies_spec(path: Path, spec: ModelSpec) -> bool:
+    if not all((path / extra).exists() for extra in spec.extra_files):
+        return False
+    if spec.projector is None:
+        return True
+
+    managed_artifacts = _validated_managed_artifacts(path)
+    if managed_artifacts is not None:
+        candidates = managed_artifacts
+    else:
+        candidates = (
+            candidate.relative_to(path).as_posix()
+            for candidate in path.rglob("*.gguf")
+            if candidate.is_file()
+        )
+    return any(
+        _projector_matches(candidate, spec.projector) for candidate in candidates
+    )
+
+
 def model_available(spec: ModelSpec) -> bool:
     """Check if a model is already downloaded."""
 
     path = find_local_model_path(spec.request_name, spec.task)
     if path is None:
         return False
-    return all((path / extra).exists() for extra in spec.extra_files)
+    return _model_satisfies_spec(path, spec)
 
 
 def _dynamic_spec(name: str, task: str) -> ModelSpec:
@@ -495,7 +575,8 @@ def spec_for_name(name: str, task_hint: str | None = None) -> ModelSpec | None:
 def ensure_model(spec: ModelSpec) -> Path:
     """Download a model with `antfly inference pull` if not already present."""
 
-    if (existing := find_local_model_path(spec.request_name, spec.task)) is not None:
+    existing = find_local_model_path(spec.request_name, spec.task)
+    if existing is not None and _model_satisfies_spec(existing, spec):
         return existing
 
     command = [
@@ -515,7 +596,18 @@ def ensure_model(spec: ModelSpec) -> Path:
 
     resolved = find_local_model_path(spec.request_name, spec.task)
     if resolved is None:
-        raise RuntimeError(f"antfly inference pull finished but could not locate {spec.request_name} in {models_dir()}")
+        raise RuntimeError(
+            f"antfly inference pull finished but could not locate {spec.request_name} in {models_dir()}"
+        )
+    if not _model_satisfies_spec(resolved, spec):
+        requirement = (
+            f"projector {spec.projector}"
+            if spec.projector is not None
+            else "required artifacts"
+        )
+        raise RuntimeError(
+            f"antfly inference pull finished but {spec.request_name} is missing {requirement}"
+        )
     return resolved
 
 
@@ -526,7 +618,9 @@ def ensure_model_by_name(name: str, task_hint: str | None = None) -> Path | None
     return ensure_model(spec)
 
 
-def default_generator_model_name(available_generators: set[str] | None = None) -> str | None:
+def default_generator_model_name(
+    available_generators: set[str] | None = None,
+) -> str | None:
     override = os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL")
     if override:
         return override
@@ -580,7 +674,11 @@ def find_tool_model_name(available_generators: set[str] | None = None) -> str | 
     seen: set[Path] = set()
     root = models_dir()
     if root.exists():
-        for pattern in ("**/genai_config.json", "**/special_tokens_map.json", "**/tokenizer_config.json"):
+        for pattern in (
+            "**/genai_config.json",
+            "**/special_tokens_map.json",
+            "**/tokenizer_config.json",
+        ):
             for metadata_path in root.glob(pattern):
                 model_path = metadata_path.parent
                 if model_path in seen:
@@ -621,7 +719,9 @@ def detect_multimodal_generator(model_path: Path) -> bool:
     archs = config.get("architectures")
     if isinstance(archs, list):
         for arch in archs:
-            if isinstance(arch, str) and ("ConditionalGeneration" in arch or "Vision" in arch):
+            if isinstance(arch, str) and (
+                "ConditionalGeneration" in arch or "Vision" in arch
+            ):
                 return True
 
     processor_path = model_path / "processor_config.json"
@@ -636,7 +736,9 @@ def detect_multimodal_generator(model_path: Path) -> bool:
     return False
 
 
-def find_multimodal_generator_model_name(available_generators: set[str] | None = None) -> str | None:
+def find_multimodal_generator_model_name(
+    available_generators: set[str] | None = None,
+) -> str | None:
     """Find a local multimodal generator model name for E2E tests."""
 
     override = os.environ.get("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL")
@@ -670,7 +772,9 @@ def find_multimodal_generator_model_name(available_generators: set[str] | None =
     return DEFAULT_MULTIMODAL_GENERATOR_MODEL
 
 
-def request_model_name(path: str, payload: dict | None) -> tuple[str | None, str | None]:
+def request_model_name(
+    path: str, payload: dict | None
+) -> tuple[str | None, str | None]:
     body = payload if isinstance(payload, dict) else {}
     model = body.get("model")
     if isinstance(model, str) and model.strip():
@@ -779,7 +883,9 @@ def bootstrap_models_for_listing(listing: dict) -> bool:
 def prefetch_curated_models() -> None:
     seen: set[tuple[str, str]] = set()
     planned: list[ModelSpec] = []
-    planned.extend(spec for spec in CURATED_MODELS if not spec.large or run_large_model_tests())
+    planned.extend(
+        spec for spec in CURATED_MODELS if not spec.large or run_large_model_tests()
+    )
     planned.extend(_env_model_specs())
 
     for spec in planned:
