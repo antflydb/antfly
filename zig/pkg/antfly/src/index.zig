@@ -1564,7 +1564,7 @@ pub const IndexWriter = struct {
     /// Stage every fallible allocation needed to replace segments while
     /// holding the writer serialization mutex. Callers must publish or abort.
     pub fn prepareSegmentsManyData(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
-        if (replacements.len == 0) return error.EmptySegmentReplacement;
+        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
 
         self.lockMutex();
         errdefer self.mu.unlock();
@@ -1687,53 +1687,8 @@ pub const IndexWriter = struct {
     /// Atomically remove one or more segments without replacement.
     pub fn removeSegments(self: *IndexWriter, old_ids: []const u64) !void {
         if (old_ids.len == 0) return;
-
-        self.lockMutex();
-        defer self.mu.unlock();
-
-        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
-
-        var keep_count: usize = 0;
-        var retire_count: usize = 0;
-        for (old.segments) |*seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
-            if (is_old) {
-                retire_count += 1;
-            } else {
-                keep_count += 1;
-            }
-        }
-
-        const new_segments = try self.alloc.alloc(SegmentEntry, keep_count);
-        errdefer self.alloc.free(new_segments);
-        const retired = try self.alloc.alloc(SegmentEntry, retire_count);
-        errdefer self.alloc.free(retired);
-        var idx: usize = 0;
-        var ret_idx: usize = 0;
-        for (old.segments) |seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
-            if (is_old) {
-                retired[ret_idx] = seg;
-                ret_idx += 1;
-            } else {
-                new_segments[idx] = seg;
-                idx += 1;
-            }
-        }
-
-        try self.rebuildSnapshot(new_segments, keep_count, retired);
+        var prepared = try self.prepareSegmentsManyData(old_ids, &.{});
+        prepared.publish();
     }
 
     /// Set deletion bitmap for a segment by ID (for recovery).
