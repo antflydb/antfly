@@ -35594,7 +35594,8 @@ test "provisioned table write source create table provisions local indexes and s
         for (write_cache.table_metadata.items) |metadata| {
             if (!std.mem.eql(u8, metadata.table_name, "docs")) continue;
             try std.testing.expectEqualStrings(updated_schema_json, metadata.schema_json orelse "");
-            try std.testing.expectEqualStrings(Catalog.indexes_json, metadata.indexes_json);
+            try std.testing.expect(metadata.indexes_json != null);
+            try std.testing.expectEqualStrings(Catalog.indexes_json, metadata.indexes_json.?);
             break;
         } else return error.TestUnexpectedResult;
     }

@@ -117,7 +117,11 @@ jobs:
 
       - name: Install Playwright OS Dependencies
         working-directory: ts/apps/antfarm
-        timeout-minutes: 10
+        # ARC package mirrors can take more than ten minutes to serve the
+        # Ubuntu browser dependency set even when apt is making progress.
+        # Keep this below the job timeout while avoiding false cancellations
+        # before Playwright itself runs.
+        timeout-minutes: 20
         run: |
           set -euxo pipefail
           time pnpm exec playwright install-deps chromium

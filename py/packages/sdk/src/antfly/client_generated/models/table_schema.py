@@ -21,7 +21,8 @@ class TableSchema:
     """Schema definition for a table with multiple document types
 
     Attributes:
-        version (int | Unset): Version of the schema. Used for migrations.
+        version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
+            requests.
         default_type (str | Unset): Default type to use from the document_types.
         enforce_types (bool | Unset): Whether to enforce that documents must match one of the provided document types.
             If false, documents not matching any type will be accepted but not indexed.

@@ -3041,11 +3041,11 @@ pub const Node = struct {
             self.warmModel(allocator, model) catch |err| {
                 const backend_name = if (model.backend) |backend| @tagName(backend) else "auto";
                 if (!builtin.is_test) {
-                    std.log.err("warming configured model failed kind={s} model={s} backend={s}: {s}", .{
+                    std.log.err("failed to warm configured inference model kind={s} model={s} backend={s} err={}", .{
                         @tagName(model.kind),
                         model.name,
                         backend_name,
-                        @errorName(err),
+                        err,
                     });
                 }
                 return err;

@@ -8856,9 +8856,9 @@ export interface components {
         TableSchema: {
             /**
              * Format: uint32
-             * @description Version of the schema. Used for migrations.
+             * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
-            version?: number;
+            readonly version?: number;
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
