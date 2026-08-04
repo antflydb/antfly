@@ -12894,6 +12894,11 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
 
         fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            _ = try updateSchemaOnService(service, alloc, table_name, schema_json);
+        }
+
+        fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
             return try updateSchemaOnService(service, alloc, table_name, schema_json);
         }
 
@@ -12917,6 +12922,7 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             .create_table = V.createTable,
             .drop_table = V.dropTable,
             .update_schema = V.updateSchema,
+            .update_schema_versioned = V.updateSchemaVersioned,
             .create_index = V.createIndex,
             .drop_index = V.dropIndex,
         },
