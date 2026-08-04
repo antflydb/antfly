@@ -62,12 +62,35 @@ pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const
     try validateIndexesValue(parsed.value, true);
 }
 
-fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+fn initialFullTextIndexNameAlloc(alloc: std.mem.Allocator, schema_version: u32) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{schema_version});
+}
+
+fn defaultIndexesJsonForSchemaVersionAlloc(alloc: std.mem.Allocator, schema_version: u32) ![]u8 {
+    if (schema_version == 0) return try alloc.dupe(u8, default_indexes_json);
+    const name = try initialFullTextIndexNameAlloc(alloc, schema_version);
+    defer alloc.free(name);
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"{s}\":{{\"name\":\"{s}\",\"type\":\"full_text\"}}}}",
+        .{ name, name },
+    );
+}
+
+fn normalizeRawCreateTableIndexesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    schema_version: u32,
+) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try out.appendSlice(alloc, default_indexes_json);
+    const initial_full_text_name = try initialFullTextIndexNameAlloc(alloc, schema_version);
+    defer alloc.free(initial_full_text_name);
+    const initial_indexes_json = try defaultIndexesJsonForSchemaVersionAlloc(alloc, schema_version);
+    defer alloc.free(initial_indexes_json);
+    try out.appendSlice(alloc, initial_indexes_json);
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
@@ -78,7 +101,7 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
             const index_type = if (config == .object) config.object.get("type") else null;
             const is_full_text = index_type == null or
                 (index_type.? == .string and std.mem.eql(u8, index_type.?.string, "full_text"));
-            if (std.mem.eql(u8, name, "full_text_index_v0")) {
+            if (std.mem.eql(u8, name, initial_full_text_name)) {
                 // Public creates are normalized once by the data API and again
                 // by metadata. Accept the canonical entry on that second hop,
                 // but never let its reserved name select another index kind.
@@ -690,6 +713,16 @@ pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8)
     return parseCreateTableRequestWithOptions(alloc, body, true);
 }
 
+fn requestedSchemaVersion(value: std.json.Value) !u32 {
+    if (value != .object) return error.InvalidCreateTableRequest;
+    const version = value.object.get("version") orelse return 0;
+    return switch (version) {
+        .null => 0,
+        .integer => |integer| std.math.cast(u32, integer) orelse error.InvalidCreateTableRequest,
+        else => error.InvalidCreateTableRequest,
+    };
+}
+
 fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, comptime allow_private_index_fields: bool) !CreateTableRequest {
     if (body.len == 0) return .{};
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -703,6 +736,8 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     var req: CreateTableRequest = .{};
     errdefer req.deinit(alloc);
 
+    var schema_version: u32 = 0;
+
     if (root.get("num_shards")) |value| {
         if (value != .null) req.num_shards = try parseU32Field(value);
     }
@@ -713,16 +748,6 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             else => return error.InvalidCreateTableRequest,
         };
     }
-    if (root.get("indexes")) |value| {
-        if (value != .null) {
-            try validateIndexesValue(value, allow_private_index_fields);
-            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value);
-            defer alloc.free(normalized_indexes_json);
-            req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
-        } else req.indexes_json = try alloc.dupe(u8, default_indexes_json);
-    } else {
-        req.indexes_json = try alloc.dupe(u8, default_indexes_json);
-    }
     if (root.get("schema")) |value| {
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
@@ -732,7 +757,8 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
                 else => return err,
             };
             defer alloc.free(validated_schema);
-            const normalized_schema = normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
+            schema_version = try requestedSchemaVersion(value);
+            const normalized_schema = normalizeSchemaVersion(alloc, validated_schema, schema_version) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -745,6 +771,16 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             req.schema_json = normalized_schema;
             normalized_schema_owned = false;
         }
+    }
+    if (root.get("indexes")) |value| {
+        if (value != .null) {
+            try validateIndexesValue(value, allow_private_index_fields);
+            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value, schema_version);
+            defer alloc.free(normalized_indexes_json);
+            req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
+        } else req.indexes_json = try defaultIndexesJsonForSchemaVersionAlloc(alloc, schema_version);
+    } else {
+        req.indexes_json = try defaultIndexesJsonForSchemaVersionAlloc(alloc, schema_version);
     }
     if (root.get("replication_sources")) |value| {
         if (value != .null) {
@@ -3798,6 +3834,51 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
     try std.testing.expectEqualStrings(default_indexes_json, parsed.indexes_json.?);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
+}
+
+test "create table preserves a caller supplied schema version in table status" {
+    var parsed = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"schema\":{\"version\":7,\"document_schemas\":{\"file\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true}}}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "{\"version\":7,\"document_schemas\":{\"file\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true}}}}",
+        parsed.schema_json.?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v7\"") != null);
+
+    const forwarded = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":{s},\"indexes\":{s}}}",
+        .{ parsed.schema_json.?, parsed.indexes_json.? },
+    );
+    defer std.testing.allocator.free(forwarded);
+    var stored = try parseStoredCreateTableRequest(std.testing.allocator, forwarded);
+    defer stored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(parsed.schema_json.?, stored.schema_json.?);
+    try std.testing.expectEqualStrings(parsed.indexes_json.?, stored.indexes_json.?);
+
+    var table_records = [_]metadata_table_manager.TableRecord{deriveTableRecord("repro437", stored)};
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = table_records[0..],
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+    const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "repro437")).?;
+    defer std.testing.allocator.free(encoded);
+
+    var status = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer status.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 7),
+        status.value.object.get("schema").?.object.get("version").?.integer,
+    );
 }
 
 test "create table raw parser merges default full text with quickstart embedding index" {
