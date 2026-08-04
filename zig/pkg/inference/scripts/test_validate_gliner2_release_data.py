@@ -13,6 +13,7 @@ from validate_gliner2_release_data import (
     base_model_fingerprint,
     digest,
     load_dataset,
+    peft_adapter_fingerprint,
     record_tasks,
     sha256_file,
     validate_release_artifact_provenance,
@@ -29,6 +30,15 @@ def dataset(records: list[str], texts: list[str], tasks: frozenset[str] = ALL_TA
 
 
 class ReleaseDataValidationTest(unittest.TestCase):
+    def test_peft_fingerprint_accepts_standard_adapter_without_zig_task_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter_dir = Path(tmp)
+            (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+            self.assertRegex(peft_adapter_fingerprint(adapter_dir), r"^sha256:[0-9a-f]{64}$")
+            with self.assertRaisesRegex(ValueError, "task_head.safetensors"):
+                adapter_bundle_fingerprint(adapter_dir)
+
     def test_base_model_fingerprint_accepts_absent_optional_spm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
@@ -139,6 +149,8 @@ class ReleaseDataValidationTest(unittest.TestCase):
             manifest = {
                 "schema_version": "gliner2_autodiff_training/v3",
                 "backend": "Metal",
+                "training_precision": "fp32",
+                "optimizer_state_precision": "fp32",
                 "compiled_required": True,
                 "objective": "gliner2-total-loss",
                 "lora_only_trainables": True,
@@ -230,7 +242,7 @@ class ReleaseDataValidationTest(unittest.TestCase):
                     original = manifest[key]
                     manifest[key] = bad_value
                     (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, "Metal training with compiled_required"):
+                    with self.assertRaisesRegex(ValueError, "METAL training with compiled_required"):
                         validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
                     manifest[key] = original
 
@@ -271,6 +283,52 @@ class ReleaseDataValidationTest(unittest.TestCase):
                     (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "release adapter step"):
                         validate_release_artifact_provenance(model_dir, train_path, adapter_dir)
+            write_metal_steps(1)
+
+            cuda_step = {
+                **metal_step,
+                "optimizer_backend": "cuda",
+                "graph_executor_command_dispatches": 0,
+                "graph_executor_planned_dispatches": 2,
+                "cuda_h2d_bytes": 4096,
+                "cuda_training_input_uploads": 4,
+                "cuda_training_input_upload_bytes": 4096,
+                "cuda_d2h_bytes": 8,
+                "cuda_largest_d2h_transfer_bytes": 4,
+                "cuda_to_float32_calls": 2,
+                "cuda_upload_synchronizations": 0,
+                "cuda_packed_attention_forward_calls": 1,
+                "cuda_packed_attention_backward_calls": 1,
+                "cuda_exact_gelu_forward_calls": 1,
+                "cuda_exact_gelu_backward_calls": 1,
+            }
+            manifest["backend"] = "CUDA"
+            (adapter_dir / "training_metrics.jsonl").write_text(json.dumps(cuda_step) + "\n", encoding="utf-8")
+            (adapter_dir / "training_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            validate_release_artifact_provenance(model_dir, train_path, adapter_dir, backend="cuda")
+            for key, bad_value in (
+                ("cuda_d2h_bytes", 9),
+                ("cuda_largest_d2h_transfer_bytes", 5),
+                ("cuda_to_float32_calls", 3),
+                ("cuda_upload_synchronizations", 2),
+            ):
+                with self.subTest(cuda_runtime_metric=key, bad_value=bad_value):
+                    bad_cuda_step = dict(cuda_step)
+                    bad_cuda_step[key] = bad_value
+                    (adapter_dir / "training_metrics.jsonl").write_text(
+                        json.dumps(bad_cuda_step) + "\n", encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, "disallowed CUDA transfer or synchronization"):
+                        validate_release_artifact_provenance(
+                            model_dir,
+                            train_path,
+                            adapter_dir,
+                            backend="cuda",
+                        )
+            (adapter_dir / "training_metrics.jsonl").write_text(json.dumps(cuda_step) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "METAL training"):
+                validate_release_artifact_provenance(model_dir, train_path, adapter_dir, backend="metal")
+            manifest["backend"] = "Metal"
             write_metal_steps(1)
 
             bad_shape_cache_values = (

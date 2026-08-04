@@ -236,7 +236,53 @@ pub const TrainStepProfile = struct {
     metal_deberta_attention_gemm_calls: u64 = 0,
     metal_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_deberta_attention_legacy_calls: u64 = 0,
+    cuda_device_allocations: u64 = 0,
+    cuda_device_frees: u64 = 0,
+    cuda_h2d_bytes: u64 = 0,
+    cuda_d2h_bytes: u64 = 0,
+    cuda_largest_d2h_transfer_bytes: u64 = 0,
+    cuda_to_float32_calls: u64 = 0,
+    cuda_download_alloc_calls: u64 = 0,
+    cuda_stream_synchronizations: u64 = 0,
+    cuda_upload_synchronizations: u64 = 0,
+    cuda_temp_cache_hits: u64 = 0,
+    cuda_temp_cache_misses: u64 = 0,
+    cuda_kernel_launches: u64 = 0,
+    cuda_packed_attention_forward_calls: u64 = 0,
+    cuda_packed_attention_backward_calls: u64 = 0,
+    cuda_exact_gelu_forward_calls: u64 = 0,
+    cuda_exact_gelu_backward_calls: u64 = 0,
+    cuda_training_input_uploads: u64 = 0,
+    cuda_training_input_upload_bytes: u64 = 0,
 };
+
+pub fn recordTrainingRuntimeProfile(
+    profile: anytype,
+    before: ops_mod.TrainingRuntimeStats,
+    after: ops_mod.TrainingRuntimeStats,
+) void {
+    profile.cuda_device_allocations = after.device_allocations -| before.device_allocations;
+    profile.cuda_device_frees = after.device_frees -| before.device_frees;
+    profile.cuda_h2d_bytes = after.h2d_bytes -| before.h2d_bytes;
+    profile.cuda_d2h_bytes = after.d2h_bytes -| before.d2h_bytes;
+    // The backend retains a lifetime maximum. Clamp it to this step's total
+    // so a checkpoint download between steps cannot poison later hot-step
+    // telemetry with a stale large transfer.
+    profile.cuda_largest_d2h_transfer_bytes = @min(after.largest_d2h_transfer_bytes, profile.cuda_d2h_bytes);
+    profile.cuda_to_float32_calls = after.to_float32_calls -| before.to_float32_calls;
+    profile.cuda_download_alloc_calls = after.download_alloc_calls -| before.download_alloc_calls;
+    profile.cuda_stream_synchronizations = after.stream_synchronizations -| before.stream_synchronizations;
+    profile.cuda_upload_synchronizations = after.upload_synchronizations -| before.upload_synchronizations;
+    profile.cuda_temp_cache_hits = after.temp_cache_hits -| before.temp_cache_hits;
+    profile.cuda_temp_cache_misses = after.temp_cache_misses -| before.temp_cache_misses;
+    profile.cuda_kernel_launches = after.kernel_launches -| before.kernel_launches;
+    profile.cuda_packed_attention_forward_calls = after.packed_attention_forward_calls -| before.packed_attention_forward_calls;
+    profile.cuda_packed_attention_backward_calls = after.packed_attention_backward_calls -| before.packed_attention_backward_calls;
+    profile.cuda_exact_gelu_forward_calls = after.exact_gelu_forward_calls -| before.exact_gelu_forward_calls;
+    profile.cuda_exact_gelu_backward_calls = after.exact_gelu_backward_calls -| before.exact_gelu_backward_calls;
+    profile.cuda_training_input_uploads = after.training_input_uploads -| before.training_input_uploads;
+    profile.cuda_training_input_upload_bytes = after.training_input_upload_bytes -| before.training_input_upload_bytes;
+}
 
 pub const CheckpointSummary = struct {
     strategy: checkpoint.CheckpointStrategy,
@@ -350,6 +396,9 @@ pub const CompiledTrainSession = struct {
     loss_output_index: usize = 0,
     build_profile: TrainStepProfile = .{},
     cached_metal_graph_executor_plan: ?CachedMetalGraphExecutorPlan = null,
+    cached_cuda_graph_executor_plan: ?CachedCudaGraphExecutorPlan = null,
+    cached_cuda_constants: std.AutoHashMapUnmanaged(NodeId, CT) = .empty,
+    cached_cuda_constants_backend: ?*const ComputeBackend = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -456,6 +505,12 @@ pub const CompiledTrainSession = struct {
 
     pub fn deinit(self: *CompiledTrainSession) void {
         if (self.cached_metal_graph_executor_plan) |*cached| cached.deinit();
+        if (self.cached_cuda_graph_executor_plan) |*cached| cached.deinit();
+        if (self.cached_cuda_constants_backend) |backend| {
+            var constant_it = self.cached_cuda_constants.iterator();
+            while (constant_it.next()) |entry| backend.free(entry.value_ptr.*);
+        }
+        self.cached_cuda_constants.deinit(self.allocator);
         self.analysis.deinit(self.allocator);
         self.graph.deinit();
         self.allocator.free(self.id_map);
@@ -473,6 +528,19 @@ pub const CompiledTrainSession = struct {
         unsupported_ops: usize = 0,
 
         fn deinit(self: *CachedMetalGraphExecutorPlan) void {
+            self.buffer_plan.deinit();
+            self.base_plan.deinit();
+            self.base_plan.allocator.free(self.assignments);
+            self.* = undefined;
+        }
+    };
+
+    const CachedCudaGraphExecutorPlan = struct {
+        base_plan: partition_mod.PartitionPlan,
+        buffer_plan: buffer_plan_mod.BufferPlan,
+        assignments: []device_mesh.DeviceId,
+
+        fn deinit(self: *CachedCudaGraphExecutorPlan) void {
             self.buffer_plan.deinit();
             self.base_plan.deinit();
             self.base_plan.allocator.free(self.assignments);
@@ -519,6 +587,14 @@ pub const CompiledTrainSession = struct {
             }
         }
 
+        if (cb.kind() == .cuda) {
+            try self.ensureCachedCudaConstants(cb);
+            var constants = self.cached_cuda_constants.iterator();
+            while (constants.next()) |entry| {
+                try rt_list.append(self.allocator, .{ .node_id = entry.key_ptr.*, .value = entry.value_ptr.* });
+            }
+        }
+
         const rt_slice: ?[]const RuntimeInput = if (rt_list.items.len > 0) rt_list.items else null;
 
         const execute_start = nowNs();
@@ -554,6 +630,10 @@ pub const CompiledTrainSession = struct {
         }
 
         if (try self.executeWithSingleMetalGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile)) |result| {
+            return result;
+        }
+
+        if (try self.executeWithSingleCudaGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile)) |result| {
             return result;
         }
 
@@ -741,6 +821,7 @@ pub const CompiledTrainSession = struct {
         initial_profile: TrainStepProfile,
     ) !TrainStepResult {
         var profile = initial_profile;
+        const training_runtime_before = cb.trainingRuntimeStats();
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         const execute_start = nowNs();
 
@@ -823,6 +904,7 @@ pub const CompiledTrainSession = struct {
         }
 
         profile.extract_ns = elapsedNs(extract_start);
+        recordTrainingRuntimeProfile(&profile, training_runtime_before, cb.trainingRuntimeStats());
         profile.total_ns = elapsedNs(total_start);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         compiledDiag(
@@ -1043,6 +1125,68 @@ pub const CompiledTrainSession = struct {
         );
     }
 
+    fn executeWithSingleCudaGraphExecutor(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?[]const RuntimeInput,
+        retain_device_gradients: bool,
+        total_start: u64,
+        execute_start: u64,
+        profile: *TrainStepProfile,
+    ) !?TrainStepResult {
+        if (cb.kind() != .cuda) return null;
+        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+        if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+
+        const runtime_before = cb.trainingRuntimeStats();
+        const cached = try self.cachedCudaGraphExecutorPlan(profile);
+        var dpp = multi_executor.DevicePartitionPlan{
+            .base = cached.base_plan,
+            .device_assignment = cached.assignments,
+            .allocator = self.allocator,
+        };
+        var devices_buf = [_]device_mesh.DeviceEntry{
+            .{ .id = 0, .backend = cb, .kind = .cuda },
+        };
+        var mesh = try device_mesh.DeviceMesh.init(self.allocator, devices_buf[0..]);
+        defer mesh.deinit();
+
+        var multi_result = try multi_executor.executeMultiDevice(
+            self.allocator,
+            &self.graph,
+            &dpp,
+            &mesh,
+            .{
+                .runtime_inputs = runtime_inputs,
+                .cached_analysis = self.analysis,
+                .cached_buffer_plan = &cached.buffer_plan,
+                .collect_partition_stats = true,
+                .preserve_runtime_input_residency = true,
+            },
+        );
+        defer multi_result.deinit(&mesh);
+
+        profile.execute_ns = elapsedNs(execute_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        profile.graph_executor_partitions = multi_result.stats.partitions_executed;
+        profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
+        profile.graph_executor_planned_dispatches = multi_result.stats.planned_operator_dispatches;
+        profile.graph_executor_interpreter_fallbacks = multi_result.stats.interpreter_fallbacks;
+        profile.graph_executor_device_outputs = @intCast(multi_result.outputs.len);
+        profile.graph_executor_device_output_parameter = @intCast(multi_result.outputs.len -| 1);
+
+        var result = try self.extractTrainStepResultFromGraphOutputs(
+            cb,
+            &mesh,
+            &multi_result,
+            retain_device_gradients,
+            total_start,
+            profile,
+        );
+        recordTrainingRuntimeProfile(&result.profile, runtime_before, cb.trainingRuntimeStats());
+        return result;
+    }
+
     fn cachedMetalGraphExecutorPlan(
         self: *CompiledTrainSession,
         cb: *const ComputeBackend,
@@ -1091,6 +1235,80 @@ pub const CompiledTrainSession = struct {
         return &self.cached_metal_graph_executor_plan.?;
     }
 
+    fn cachedCudaGraphExecutorPlan(
+        self: *CompiledTrainSession,
+        profile: *TrainStepProfile,
+    ) !*const CachedCudaGraphExecutorPlan {
+        if (self.cached_cuda_graph_executor_plan) |*cached| {
+            profile.graph_executor_plan_cache_hits += 1;
+            return cached;
+        }
+
+        profile.graph_executor_plan_cache_misses += 1;
+        const plan_start = nowNs();
+        var base_plan = try self.buildSingleCudaGraphExecutorPlan();
+        errdefer base_plan.deinit();
+        const buffer_plan_start = nowNs();
+        var graph_buffer_plan = try buffer_plan_mod.build(self.allocator, &self.graph, &base_plan, .{});
+        errdefer graph_buffer_plan.deinit();
+        try graph_buffer_plan.validate(&self.graph, &base_plan);
+        profile.graph_executor_buffer_plan_build_ns += elapsedNs(buffer_plan_start);
+
+        const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
+        errdefer self.allocator.free(assignments);
+        @memset(assignments, 0);
+        self.cached_cuda_graph_executor_plan = .{
+            .base_plan = base_plan,
+            .buffer_plan = graph_buffer_plan,
+            .assignments = assignments,
+        };
+        profile.graph_executor_plan_build_ns += elapsedNs(plan_start);
+        return &self.cached_cuda_graph_executor_plan.?;
+    }
+
+    fn ensureCachedCudaConstants(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+    ) !void {
+        if (self.cached_cuda_constants_backend) |backend| {
+            if (backend != cb) return error.CompiledSessionBackendChanged;
+            return;
+        }
+
+        errdefer {
+            var it = self.cached_cuda_constants.iterator();
+            while (it.next()) |entry| cb.free(entry.value_ptr.*);
+            self.cached_cuda_constants.clearRetainingCapacity();
+        }
+        const count: usize = @intCast(self.graph.nodeCount());
+        for (0..count) |index| {
+            const node_id: NodeId = @intCast(index);
+            const node = self.graph.node(node_id);
+            switch (node.op) {
+                .constant => |attrs| {
+                    const constant = try self.graph.constantDataAsF32(
+                        self.allocator,
+                        node.output_shape.dtype,
+                        attrs.data_offset,
+                        attrs.data_len,
+                    );
+                    defer constant.deinit(self.allocator);
+                    var shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
+                    const rank = node.output_shape.rank();
+                    for (0..rank) |axis| shape_buf[axis] = @intCast(node.output_shape.dim(@intCast(axis)));
+                    const tensor = if (rank > 1)
+                        try cb.fromFloat32Shape(constant.data, shape_buf[0..rank])
+                    else
+                        try cb.fromFloat32(constant.data);
+                    errdefer cb.free(tensor);
+                    try self.cached_cuda_constants.put(self.allocator, node_id, tensor);
+                },
+                else => {},
+            }
+        }
+        self.cached_cuda_constants_backend = cb;
+    }
+
     fn attachCachedMetalExecutors(
         self: *CompiledTrainSession,
         cb: *const ComputeBackend,
@@ -1129,6 +1347,38 @@ pub const CompiledTrainSession = struct {
             .external_inputs = external_inputs,
         };
 
+        return .{
+            .partitions = partitions,
+            .node_assignment = node_assignment,
+            .node_operator_plans = node_operator_plans,
+            .allocator = self.allocator,
+        };
+    }
+
+    fn buildSingleCudaGraphExecutorPlan(self: *CompiledTrainSession) !partition_mod.PartitionPlan {
+        const count: usize = @intCast(self.graph.nodeCount());
+        const partitions = try self.allocator.alloc(partition_mod.Partition, 1);
+        errdefer self.allocator.free(partitions);
+        const node_ids = try self.allocator.alloc(NodeId, count);
+        errdefer self.allocator.free(node_ids);
+        const node_assignment = try self.allocator.alloc(u32, count);
+        errdefer self.allocator.free(node_assignment);
+        const node_operator_plans = try self.allocator.alloc(?@import("operator_plan.zig").OperatorPlan, count);
+        errdefer self.allocator.free(node_operator_plans);
+        const external_inputs = try self.allocator.alloc(partition_mod.ExternalInput, 0);
+        errdefer self.allocator.free(external_inputs);
+
+        for (0..count) |i| {
+            node_ids[i] = @intCast(i);
+            node_assignment[i] = 0;
+            node_operator_plans[i] = null;
+        }
+        partitions[0] = .{
+            .backend = .cuda,
+            .device_id = 0,
+            .node_ids = node_ids,
+            .external_inputs = external_inputs,
+        };
         return .{
             .partitions = partitions,
             .node_assignment = node_assignment,

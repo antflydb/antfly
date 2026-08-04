@@ -1,6 +1,6 @@
 # Fine-Tuning in antfly-inference-zig
 
-antfly-inference-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in pure Zig and run on CPU (BLAS) or Apple Silicon (MLX) — no CUDA dependencies.
+antfly-inference-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in Zig and run on CPU (BLAS), Apple Silicon (Metal/MLX), or supported NVIDIA GPUs through the CUDA backend. CUDA is only a runtime/build dependency when that backend is selected; the native and Metal paths do not require it.
 
 ---
 

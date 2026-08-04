@@ -23,7 +23,8 @@ TASK_KINDS = frozenset({"entities", "classifications", "json_structures", "relat
 MODEL_FINGERPRINT_FILES = (
     *(entry.relative_path for entry in MODEL_FINGERPRINT_ENTRIES),
 )
-ADAPTER_BUNDLE_FILES = ("adapter_model.safetensors", "adapter_config.json", "task_head.safetensors")
+PEFT_ADAPTER_FILES = ("adapter_model.safetensors", "adapter_config.json")
+ADAPTER_BUNDLE_FILES = (*PEFT_ADAPTER_FILES, "task_head.safetensors")
 FULL_TASK_OBJECTIVE = "gliner2-total-loss"
 
 
@@ -79,17 +80,28 @@ def base_model_fingerprint(model_dir: Path) -> str:
     return contract_directory_fingerprint(model_dir, MODEL_FINGERPRINT_ENTRIES)
 
 
+def peft_adapter_fingerprint(adapter_dir: Path) -> str:
+    return directory_fingerprint(adapter_dir, PEFT_ADAPTER_FILES)
+
+
 def adapter_bundle_fingerprint(adapter_dir: Path) -> str:
     return directory_fingerprint(adapter_dir, ADAPTER_BUNDLE_FILES)
 
 
-def production_metal_step_metrics(adapter_dir: Path, expected_steps: int) -> list[dict[str, Any]]:
-    """Load retained step evidence proving the release adapter trained on Metal."""
+def production_accelerator_step_metrics(
+    adapter_dir: Path,
+    expected_steps: int,
+    backend: str,
+) -> list[dict[str, Any]]:
+    """Load retained step evidence proving the selected accelerator trained the adapter."""
+    if backend not in {"metal", "cuda"}:
+        raise ValueError(f"unsupported release accelerator backend: {backend}")
+    backend_label = backend.upper()
     metrics_path = adapter_dir / "training_metrics.jsonl"
     try:
         lines = metrics_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        raise ValueError(f"release adapter has no retained Metal training metrics: {metrics_path}: {exc}") from exc
+        raise ValueError(f"release adapter has no retained {backend_label} training metrics: {metrics_path}: {exc}") from exc
     steps: list[dict[str, Any]] = []
     for line_no, raw in enumerate(lines, 1):
         if not raw.strip():
@@ -97,15 +109,16 @@ def production_metal_step_metrics(adapter_dir: Path, expected_steps: int) -> lis
         try:
             row = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"release adapter has invalid retained Metal training metrics at line {line_no}: {exc}") from exc
+            raise ValueError(f"release adapter has invalid retained {backend_label} training metrics at line {line_no}: {exc}") from exc
         if not isinstance(row, dict):
             raise ValueError(f"release adapter training metric line {line_no} must be an object")
         if row.get("event") == "step":
             steps.append(row)
     if len(steps) != expected_steps:
         raise ValueError(
-            f"release adapter retained Metal training metrics have {len(steps)} steps, expected {expected_steps}"
+            f"release adapter retained {backend_label} training metrics have {len(steps)} steps, expected {expected_steps}"
         )
+    cuda_upload_synchronization_total = 0
     for index, row in enumerate(steps, 1):
         integer_zero_fields = (
             "device_trainable_transfer_count",
@@ -116,22 +129,72 @@ def production_metal_step_metrics(adapter_dir: Path, expected_steps: int) -> lis
         positive_integer_fields = (
             "device_trainable_bytes",
             "graph_executor_partitions",
-            "graph_executor_command_dispatches",
-            "graph_executor_planned_dispatches",
         )
-        if row.get("step") != index or row.get("optimizer_backend") != "metal":
-            raise ValueError(f"release adapter step {index} was not executed by the Metal optimizer")
+        if row.get("step") != index or row.get("optimizer_backend") != backend:
+            raise ValueError(f"release adapter step {index} was not executed by the {backend_label} optimizer")
         if any(type(row.get(name)) is not int or row[name] != 0 for name in integer_zero_fields):
             raise ValueError(
                 f"release adapter step {index} has device transfers, interpreter fallback, or true host output"
             )
         if any(type(row.get(name)) is not int or row[name] <= 0 for name in positive_integer_fields):
             raise ValueError(f"release adapter step {index} lacks compiled device-resident dispatch evidence")
+        command_dispatches = row.get("graph_executor_command_dispatches")
+        planned_dispatches = row.get("graph_executor_planned_dispatches")
+        if (
+            type(command_dispatches) is not int
+            or type(planned_dispatches) is not int
+            or command_dispatches < 0
+            or planned_dispatches < 0
+            or command_dispatches + planned_dispatches <= 0
+        ):
+            raise ValueError(f"release adapter step {index} lacks compiled device-resident dispatch evidence")
         if (
             "graph_executor_fallback_reason" not in row
             or row.get("graph_executor_fallback_reason") not in (None, "")
         ):
             raise ValueError(f"release adapter step {index} reports a graph-executor fallback reason")
+        if backend == "cuda":
+            cuda_integer_fields = (
+                "cuda_h2d_bytes",
+                "cuda_training_input_uploads",
+                "cuda_training_input_upload_bytes",
+                "cuda_d2h_bytes",
+                "cuda_largest_d2h_transfer_bytes",
+                "cuda_to_float32_calls",
+                "cuda_upload_synchronizations",
+                "cuda_packed_attention_forward_calls",
+                "cuda_packed_attention_backward_calls",
+                "cuda_exact_gelu_forward_calls",
+                "cuda_exact_gelu_backward_calls",
+            )
+            if any(type(row.get(name)) is not int or row[name] < 0 for name in cuda_integer_fields):
+                raise ValueError(f"release adapter step {index} lacks complete CUDA runtime telemetry")
+            if (
+                row["cuda_training_input_uploads"] <= 0
+                or row["cuda_training_input_upload_bytes"] <= 0
+                or row["cuda_h2d_bytes"] < row["cuda_training_input_upload_bytes"]
+            ):
+                raise ValueError(f"release adapter step {index} does not account for full-step CUDA input H2D")
+            if (
+                row["cuda_d2h_bytes"] > 8
+                or row["cuda_largest_d2h_transfer_bytes"] > 4
+                or row["cuda_to_float32_calls"] > 2
+                or row["cuda_upload_synchronizations"] > (1 if index == 1 else 0)
+            ):
+                raise ValueError(f"release adapter step {index} has disallowed CUDA transfer or synchronization telemetry")
+            cuda_upload_synchronization_total += row["cuda_upload_synchronizations"]
+            if any(
+                row[name] <= 0
+                for name in (
+                    "cuda_packed_attention_forward_calls",
+                    "cuda_packed_attention_backward_calls",
+                    "cuda_exact_gelu_forward_calls",
+                    "cuda_exact_gelu_backward_calls",
+                )
+            ):
+                raise ValueError(f"release adapter step {index} lacks required CUDA fused-kernel coverage")
+    if backend == "cuda" and cuda_upload_synchronization_total > 1:
+        raise ValueError("release adapter has more than one cold-start CUDA upload synchronization")
     return steps
 
 
@@ -160,7 +223,11 @@ def validate_release_artifact_provenance(
     adapter_dir: Path,
     train_record_count: int | None = None,
     eval_data: Path | None = None,
+    backend: str = "metal",
 ) -> None:
+    backend = backend.lower()
+    if backend not in {"metal", "cuda"}:
+        raise ValueError(f"unsupported release accelerator backend: {backend}")
     if not train_data.is_file():
         raise ValueError("release adapter provenance requires --train to be one JSONL file")
     manifest = json_object(adapter_dir / "training_manifest.json", "Zig training manifest")
@@ -170,8 +237,10 @@ def validate_release_artifact_provenance(
         raise ValueError("release adapter has an unsupported Zig training manifest")
     if manifest.get("objective") != FULL_TASK_OBJECTIVE or manifest.get("lora_only_trainables") is not True:
         raise ValueError("release adapter was not produced by LoRA-only full-task training")
-    if str(manifest.get("backend", "")).lower() != "metal" or manifest.get("compiled_required") is not True:
-        raise ValueError("release adapter provenance requires Metal training with compiled_required=true")
+    if str(manifest.get("backend", "")).lower() != backend or manifest.get("compiled_required") is not True:
+        raise ValueError(f"release adapter provenance requires {backend.upper()} training with compiled_required=true")
+    if manifest.get("training_precision") != "fp32" or manifest.get("optimizer_state_precision") != "fp32":
+        raise ValueError("release adapter provenance requires FP32 training and optimizer state")
     lora_dropout = manifest.get("lora_dropout")
     span_negative_mask_rate = manifest.get("span_negative_mask_rate")
     if (
@@ -413,7 +482,7 @@ def validate_release_artifact_provenance(
         or restored_epochs > epochs
     ):
         raise ValueError("release adapter has inconsistent resumed-run accounting")
-    production_metal_step_metrics(adapter_dir, micro_batch_steps)
+    production_accelerator_step_metrics(adapter_dir, micro_batch_steps, backend)
     expected_train = sha256_file(train_data)
     if manifest.get("train_data_sha256") != expected_train:
         raise ValueError("release adapter training-data fingerprint does not match --train")
@@ -594,6 +663,7 @@ def main() -> int:
     parser.add_argument("--comparison-records", type=int)
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--release-adapter-dir", type=Path)
+    parser.add_argument("--backend", choices=("metal", "cuda"), default="metal")
     parser.add_argument(
         "--smoke-dir",
         type=Path,
@@ -630,6 +700,7 @@ def main() -> int:
                 args.release_adapter_dir,
                 train.record_count,
                 args.eval,
+                args.backend,
             )
     except ValueError as exc:
         parser.error(str(exc))

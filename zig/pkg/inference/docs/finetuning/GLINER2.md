@@ -1,8 +1,8 @@
-# Production GLiNER2 Finetuning with Zig and Metal
+# Production GLiNER2 Finetuning with Zig, Metal, and CUDA
 
 This is the operator and release contract for GLiNER2 finetuning in Antfly.
 The production implementation is the Zig trainer, Zig graph runtime, and Zig
-Metal kernels. A pinned upstream Python checkout is used only as a correctness
+Metal/CUDA kernels. A pinned upstream Python checkout is used only as a correctness
 oracle and performance baseline; it is not a deployed dependency. There is no
 Go implementation, Go runtime dependency, or Go parity target in this flow.
 
@@ -13,13 +13,13 @@ The branch contains a complete full-task LoRA lifecycle:
 - upstream `{input, output}` GLiNER2 JSONL preprocessing for entities,
   classifications, JSON structures, relations, and count supervision;
 - DeBERTa encoder and all GLiNER2 task heads in the Zig autodiff graph;
-- LoRA-only training on the native interpreter or the resident Metal runtime;
+- LoRA-only training on the native interpreter or a resident Metal/CUDA runtime;
 - bounded shape-specialized graph caching, gradient accumulation, clipping,
   AdamW, schedulers, checkpoint retention, exact resume, held-out loss,
   early stopping, and best-checkpoint selection;
 - saved-adapter validation and native held-out full-task scoring;
 - transactional merged-model materialization and reload inspection;
-- deterministic Python/Zig correctness gates, native/Metal gradient gates,
+- deterministic Python/Zig correctness gates, native/accelerator gradient gates,
   repeated production-shape performance gates, and a five-seed statistical
   convergence contract.
 
@@ -49,10 +49,11 @@ the training manifest.
 
 ## Runtime correctness and safety
 
-The same graph owns native and Metal training. The required backend parity
+The same graph owns native, Metal, and CUDA training. The required backend parity
 test compares token, span-start, and full GLiNER2 total-loss gradients for
 every trainable parameter. `TERMITE_REQUIRE_METAL_TESTS=1` makes a disabled
 Metal build or missing device an error instead of a skip.
+`TERMITE_REQUIRE_CUDA_TESTS=1` provides the equivalent fail-closed CUDA gate.
 
 The full-task parity defect fixed on this branch was native buffer donation
 through zero-copy reshape aliases: an early loss branch could overwrite
@@ -66,11 +67,36 @@ removes the previous full source-row scan from every output element while
 preserving deterministic native/Metal equality; the focused parity fixture
 crosses both 256-row and 256-column tile boundaries.
 
-For production-length Metal training, the fused DeBERTa attention path is a
-safety requirement. A Metal run with sequence length at least 128 fails before
-training if that path is disabled. Production Metal runs should also use
-`--compiled-required`; checkpoint/resume then cannot silently cross between
-compiled and interpreter execution.
+For production-length Metal training, the fused DeBERTa attention path remains
+a safety requirement: a Metal run with sequence length at least 128 fails
+before training if that path is disabled. CUDA provides dedicated forward and
+two-stage backward DeBERTa kernels at the same production geometry. Production
+accelerator runs should use `--compiled-required`; checkpoint/resume then
+cannot silently cross between compiled and interpreter execution.
+The CUDA training executor caches a single-device partition and buffer plan,
+keeps graph constants and runtime placeholders resident, uses page-locked
+asynchronous input staging, and applies clipping plus AdamW as batched device
+operations. Step metrics expose CUDA allocation/free counts, H2D/D2H bytes,
+stream and upload synchronizations, cache hits/misses, launches, packed
+attention calls, exact-GELU calls, and the count and byte volume of runtime-input
+uploads. CUDA telemetry spans the complete trainer step, beginning before input
+staging and ending after the resident optimizer update. Strict comparisons
+require nonzero, fully accounted asynchronous input H2D while separately
+rejecting trainable/optimizer-state transfers, a zero-dispatch executor,
+interpreter fallbacks, true host graph outputs, missing fused attention/GELU
+coverage, or bulk D2H traffic.
+The public step contract downloads exactly two independent f32 scalars—loss
+and gradient norm—so strict readiness allows eight total D2H bytes while still
+limiting every individual transfer to four bytes and rejecting a third host
+materialization.
+At most one pinned-upload synchronization is allowed on the first compiled
+optimizer step; every later retained step must report zero.
+Held-out evaluation intentionally uses the eager device interpreter for its
+objective-specific graph while still dispatching Metal/CUDA kernels. This
+keeps `--eval-data`, early stopping, and best-checkpoint selection compatible
+with compiled-required training without moving evaluation to CPU. CUDA memory
+preflight compares the incremental training estimate with live free VRAM and
+reserves 10% of total VRAM for driver/library workspaces.
 
 ## Recipe lifecycle
 
@@ -171,6 +197,21 @@ zig build -Dmetal=true train-gliner2-autodiff -- \
   --checkpoint-every-epochs 1 --checkpoint-keep-last 3 \
   --eval-every-epochs 1 --early-stopping-patience 2
 
+# Full-task resident-CUDA training. Use the SM matching the deployment GPU;
+# fatbin is the portable release artifact across the checked-in SM set.
+zig build -Dcuda=true -Dcuda-artifacts=fatbin \
+  train-gliner2-autodiff -- \
+  --model-dir /models/gliner2 \
+  --train-data /data/train.jsonl \
+  --eval-data /data/eval.jsonl \
+  --out-dir /runs/gliner2/cuda-adapter \
+  --objective gliner2-total-loss \
+  --lora-only-trainables \
+  --backend cuda --compiled-required \
+  --seq-len 128 --batch-size 32 \
+  --checkpoint-every-epochs 1 --checkpoint-keep-last 3 \
+  --eval-every-epochs 1 --early-stopping-patience 2
+
 # Structural/runtime artifact validation
 zig build validate-gliner2-autodiff-run -- \
   /runs/gliner2/adapter --out /runs/gliner2/validation.json
@@ -236,15 +277,44 @@ Generate a convergence summary from five paired runs:
 python3.12 scripts/summarize_gliner2_convergence.py \
   --input /runs/gliner2/convergence-study.json \
   --output /runs/gliner2/convergence-summary.json \
-  --upstream-source /src/GLiNER2
+  --upstream-source /src/GLiNER2 \
+  --model-dir /models/gliner2 \
+  --train-data /data/train.jsonl \
+  --eval-data /data/eval.jsonl \
+  --zig-backend cuda
 ```
 
+Cross-implementation held-out reports fingerprint the standard PEFT files
+(`adapter_config.json` and `adapter_model.safetensors`) consumed by the pinned
+upstream decoder. Zig release finalization separately retains the stricter
+three-file bundle fingerprint, including `task_head.safetensors`.
+
 Then run the authoritative gate with the model, release adapter, disjoint
-datasets, pinned checkout, convergence summary, and all nine `--heldout-min`
-values:
+datasets, pinned checkout, convergence summary, current CUDA hardware matrix,
+and all nine `--heldout-min` values. Produce one source-bound lane on each
+required GPU, then aggregate the reports:
+
+```sh
+python3.12 scripts/qualify_gliner2_cuda_hardware.py \
+  --output /runs/gliner2/cuda-lane.json
+
+# After collecting reports from A100 (SM80), L4 (SM89), and H100 (SM90):
+python3.12 scripts/summarize_gliner2_cuda_hardware.py \
+  --report /runs/gliner2/cuda-sm80.json \
+  --report /runs/gliner2/cuda-sm89.json \
+  --report /runs/gliner2/cuda-sm90.json \
+  --output /runs/gliner2/cuda-hardware-matrix.json
+```
+
+Each lane verifies the checked-in CUDA 13.2 artifacts, runs the complete FP32
+gradient/update/checkpoint parity suite, and runs memcheck, initcheck, and
+racecheck. The matrix rejects missing architectures, mismatched GPU identities,
+failed sanitizers, non-FP32 evidence, and reports whose source fingerprint no
+longer matches the checkout.
 
 ```sh
 scripts/run_gliner2_lora_production_readiness.sh \
+  --zig-backend cuda --zig-cuda-artifacts fatbin \
   --model-dir /models/gliner2 \
   --release-adapter-dir /runs/gliner2/adapter \
   --train-data /data/train.jsonl \
@@ -252,6 +322,7 @@ scripts/run_gliner2_lora_production_readiness.sh \
   --python-bin /usr/local/bin/python3.12 \
   --upstream-source /src/GLiNER2 \
   --convergence-summary /runs/gliner2/convergence-summary.json \
+  --cuda-hardware-qualification /runs/gliner2/cuda-hardware-matrix.json \
   --heldout-min entities.micro_f1=0.70 \
   --heldout-min entities.exact_match=0.50 \
   --heldout-min classifications.micro_f1=0.75 \
@@ -264,16 +335,49 @@ scripts/run_gliner2_lora_production_readiness.sh \
 ```
 
 The wrapper requires five production-shape performance runs, deterministic
-correctness and update parity, median warm Metal step time no slower than the
-Python baseline (and no run above 1.10x), pinned-oracle held-out quality, Zig
+correctness and update parity, median warm accelerator step time no slower than
+the Python baseline (and no run above 1.10x), pinned-oracle held-out quality, Zig
 native held-out quality under the same normalization, five-seed convergence,
-and consistent model/train/eval fingerprints. The experimental head-MLP
-fusion gate is reported separately unless explicitly required.
+consistent model/train/eval fingerprints, and a current FP32 L4/A100/H100
+sanitizer/parity matrix. The experimental head-MLP
+fusion gate is Metal-only and is reported separately unless explicitly required.
+Production performance runs use isolated seeds `11,23,37,53,71` by default;
+`--seeds` can override the sequence but its count must match `--runs`. CUDA's
+batch-32 timing lane is checkpoint-free on both implementations because the L4
+profile fits without recomputation.
 
 Deterministic summed-loss comparisons use a combined `1e-4` absolute and
 `5e-6` relative tolerance. The absolute floor keeps small component losses
 strict, while the relative term prevents the same floating-point accumulation
 noise from failing only because a production batch contains more summed terms.
+
+For an apples-to-apples CUDA comparison, the harness synchronizes both CUDA
+runtimes around measured steps and records the PyTorch GPU name:
+
+```sh
+python3.12 scripts/compare_gliner2_lora_python_zig.py \
+  --model-dir /models/gliner2 \
+  --python-model /models/gliner2 \
+  --train-data /data/train.jsonl \
+  --upstream-source /src/GLiNER2 \
+  --python-device cuda \
+  --zig-backend cuda --zig-build-cuda \
+  --zig-cuda-artifacts fatbin \
+  --deterministic --dump-parity --dump-optimizer-parity --strict
+```
+
+`portable` embeds PTX and depends on the installed driver accepting the PTX
+version emitted by the CUDA toolkit. Use an SM-specific artifact (for example
+`sm89` on an NVIDIA L4) when validating against an older driver, and use
+`fatbin` for the checked-in multi-architecture release bundle.
+
+The production contract is explicitly FP32 for graph tensors, trainables, and
+AdamW state, matching the pinned Fastino/PyTorch oracle. Training manifests,
+deterministic comparisons, convergence summaries, hardware lanes, and final
+readiness reports all bind that precision. BF16 remains a separately gated
+follow-on: it must not replace the FP32 path until loss/gradient/update parity,
+five-seed quality, and the L4 plus A100/H100 release matrix pass under a new
+explicit precision contract.
 
 The batch-32 Metal profile chunks structure-loss span work in groups of 16
 samples. On the synthetic all-task diagnostic this reduced the device-owned
@@ -294,6 +398,9 @@ zig build test-gliner2-graph-cache -Doptimize=ReleaseSafe -Dmetal=true
 zig build test-gliner2-native-eval -Doptimize=ReleaseSafe
 TERMITE_REQUIRE_METAL_TESTS=1 zig build \
   test-gliner2-backend-grad-parity -Dmetal=true -Doptimize=ReleaseSafe
+TERMITE_REQUIRE_CUDA_TESTS=1 zig build \
+  test-gliner2-backend-grad-parity -Dcuda=true \
+  -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast
 
 cd scripts
 python3.12 -m unittest \
@@ -305,11 +412,20 @@ python3.12 -m unittest \
   test_evaluate_gliner2_full_task.py \
   test_evaluate_gliner2_native_release_smoke.py \
   test_summarize_gliner2_convergence.py \
+  test_summarize_gliner2_cuda_hardware.py \
   test_finalize_gliner2_readiness.py
 ```
 
 CI runs the Python contract tests on Python 3.12 and the required native/Metal
-gradient gate on a macOS runner. Real-model release readiness still requires
+gradient gate on a macOS runner. Relevant Zig changes also require the
+self-hosted CUDA job, which emits a source-bound lane after artifact validation,
+the fail-closed full-task parity, resident post-step evaluation, resident
+optimizer, VRAM query, checkpoint/resume, memcheck, initcheck, and racecheck.
+Manual workflow dispatch additionally runs SM80, SM89, and SM90 lanes and emits
+the hardware-matrix artifact required by CUDA production readiness. The scoped readiness command trains on
+the selected accelerator but evaluates saved full-task adapters on native by
+default; `--eval-backend` and `--eval-compiled-required` control that policy
+independently. Real-model release readiness still requires
 operator-supplied model, train/eval data, upstream checkout, and retained run
 artifacts; tests without those inputs validate the code contracts, not model
 quality.

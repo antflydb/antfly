@@ -14,6 +14,14 @@ import benchmark_gliner2_lora_perf as benchmark
 
 
 class BenchmarkGateTest(unittest.TestCase):
+    def test_args_with_seed_replaces_or_appends_seed(self) -> None:
+        self.assertEqual(["--steps", "4", "--seed", "23"], benchmark.args_with_seed(["--steps", "4"], 23))
+        self.assertEqual(["--seed", "37", "--steps", "4"], benchmark.args_with_seed(["--seed", "11", "--steps", "4"], 37))
+
+    def test_production_wrapper_uses_five_isolated_seeds(self) -> None:
+        wrapper = (Path(__file__).resolve().parent / "run_gliner2_lora_perf_gate.sh").read_text(encoding="utf-8")
+        self.assertIn('perf_seeds="11,23,37,53,71"', wrapper)
+
     def test_production_readiness_uses_uninstrumented_warm_gate(self) -> None:
         wrapper = (
             Path(__file__).resolve().parent / "run_gliner2_lora_production_readiness.sh"

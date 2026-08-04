@@ -6,11 +6,12 @@ usage() {
 Usage:
   scripts/run_gliner2_lora_perf_gate.sh [options] [-- extra compare args]
 
-Runs the repeated GLiNER2 LoRA Python/Zig benchmark harness with stable Metal
-training defaults and optional pass/fail thresholds.
+Runs the repeated GLiNER2 LoRA Python/Zig benchmark harness with stable
+accelerator training defaults and optional pass/fail thresholds.
 
 Options:
   --runs N                         Repeated comparison runs (default: 3)
+  --seeds CSV                      Isolated per-run seeds (count must match --runs)
   --out-dir DIR                    Output directory (default: /private/tmp/termite-gliner2-lora-perf-gate)
   --model-dir DIR                  Zig model dir (default: /private/tmp/termite-models/gliner2)
   --python-model PATH_OR_ID        Python model path/id (default: model dir)
@@ -18,6 +19,8 @@ Options:
   --eval-data FILE                 Disjoint eval JSONL validated but not scored by --production-ready
   --python-bin FILE                Python executable (default: /private/tmp/gliner2-parity-venv/bin/python)
   --upstream-source DIR            Clean checkout of the pinned Python oracle commit
+  --zig-backend metal|cuda         Zig accelerator under test (default: metal)
+  --zig-cuda-artifacts NAME        portable, sm89, or fatbin (default: fatbin)
   --include-python                 Run upstream Python side as timing target
   --compare-steps N                Steps per comparison run (default: 1; production: 4)
   --production-batch32             Use the production batch-32/seq-128 LoRA profile
@@ -105,6 +108,7 @@ resolve_executable_path() {
 
 runs=3
 runs_explicit=0
+perf_seeds=""
 out_dir="/private/tmp/termite-gliner2-lora-perf-gate"
 model_dir="/private/tmp/termite-models/gliner2"
 model_dir_explicit=0
@@ -114,6 +118,8 @@ train_data_explicit=0
 eval_data=""
 python_bin="/private/tmp/gliner2-parity-venv/bin/python"
 upstream_source=""
+zig_backend="metal"
+zig_cuda_artifacts="fatbin"
 include_python=0
 compare_steps=1
 compare_steps_explicit=0
@@ -166,6 +172,10 @@ while [[ $# -gt 0 ]]; do
       runs_explicit=1
       shift 2
       ;;
+    --seeds)
+      perf_seeds="${2:?missing value for --seeds}"
+      shift 2
+      ;;
     --out-dir)
       out_dir="${2:?missing value for --out-dir}"
       shift 2
@@ -194,6 +204,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --upstream-source)
       upstream_source="${2:?missing value for --upstream-source}"
+      shift 2
+      ;;
+    --zig-backend)
+      zig_backend="${2:?missing value for --zig-backend}"
+      if [[ "${zig_backend}" != "metal" && "${zig_backend}" != "cuda" ]]; then
+        echo "--zig-backend must be metal or cuda" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --zig-cuda-artifacts)
+      zig_cuda_artifacts="${2:?missing value for --zig-cuda-artifacts}"
+      if [[ "${zig_cuda_artifacts}" != "portable" && "${zig_cuda_artifacts}" != "sm89" && "${zig_cuda_artifacts}" != "fatbin" ]]; then
+        echo "--zig-cuda-artifacts must be portable, sm89, or fatbin" >&2
+        exit 2
+      fi
       shift 2
       ;;
     --include-python)
@@ -432,13 +458,22 @@ if (( production_ready )); then
 elif (( warm_research && ! runs_explicit )); then
   runs=3
 fi
+if (( production_ready )) && [[ -z "${perf_seeds}" ]]; then
+  if (( runs == 5 )); then
+    perf_seeds="11,23,37,53,71"
+  elif (( runs == 3 )); then
+    perf_seeds="11,37,71"
+  fi
+fi
 if (( include_python )) && [[ -z "${upstream_source}" ]]; then
   echo "--upstream-source is required whenever the Python oracle runs" >&2
   exit 2
 fi
 
 if (( production_batch32 )); then
-  promote_gather_inputs=1
+  if [[ "${zig_backend}" == "metal" ]]; then
+    promote_gather_inputs=1
+  fi
   hf_gliner2_snapshot=""
   if [[ -n "${HF_HOME:-}" ]]; then
     hf_gliner2_snapshot="${HF_HOME}/hub/models--fastino--gliner2-base-v1/snapshots/f5b2ecedebe4381b088c1cf276f5bf72a52cac54"
@@ -455,12 +490,12 @@ if (( production_batch32 )); then
       train_data="/private/tmp/gliner2_ner_batch32_train.jsonl"
     fi
   fi
-  if (( production_ready )) && [[ -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" ]] && (( production_ready )) && [[ -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
     # The graph-executor metric counts every simultaneously live device-owned
     # tensor, not RSS. Batch-32 full-task traces stabilize near 2.5 GiB after
     # span bucketing and head/encoder regions; retain a strict 3 GiB ceiling.
     max_zig_metal_peak_live_bytes_median=3221225472
-  elif [[ -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
+  elif [[ "${zig_backend}" == "metal" && -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
     max_zig_metal_peak_live_bytes_median=5583457485
   fi
   if [[ -z "${warn_zig_median_ms}" ]]; then
@@ -469,46 +504,46 @@ if (( production_batch32 )); then
   if [[ -z "${max_zig_median_ms}" ]]; then
     max_zig_median_ms=18000
   fi
-  if [[ -z "${max_true_host_output_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${max_true_host_output_median}" ]]; then
     if (( promote_gather_inputs )); then
       max_true_host_output_median=0
     else
       max_true_host_output_median=23
     fi
   fi
-  if [[ -z "${warn_parameter_materialization_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${warn_parameter_materialization_median}" ]]; then
     warn_parameter_materialization_median=331
   fi
-  if [[ -z "${max_fallback_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${max_fallback_median}" ]]; then
     max_fallback_median=0
   fi
-  if [[ -z "${max_command_dispatch_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${max_command_dispatch_median}" ]]; then
     max_command_dispatch_median=6250
   fi
-  if (( op_stats )) && [[ -z "${max_dot_general_count_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" ]] && (( op_stats )) && [[ -z "${max_dot_general_count_median}" ]]; then
     # The reviewed batch-32/seq-128 all-task graph emits exactly 1,102 timed
     # dot_general commands; retain a zero-slack regression ceiling.
     max_dot_general_count_median=1102
   fi
-  if (( op_stats && promote_gather_inputs )) && [[ -z "${max_gather_host_output_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" ]] && (( op_stats && promote_gather_inputs )) && [[ -z "${max_gather_host_output_median}" ]]; then
     max_gather_host_output_median=0
   fi
-  if [[ -z "${max_zig_low_rank_lora_backward_region_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${max_zig_low_rank_lora_backward_region_median}" ]]; then
     max_zig_low_rank_lora_backward_region_median=0
   fi
-  if [[ -z "${min_zig_residual_layernorm_region_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${min_zig_residual_layernorm_region_median}" ]]; then
     min_zig_residual_layernorm_region_median=12
   fi
-  if [[ -z "${max_zig_scaffold_region_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${max_zig_scaffold_region_median}" ]]; then
     max_zig_scaffold_region_median=0
   fi
-  if [[ -z "${max_zig_encoder_lora_fallback_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${max_zig_encoder_lora_fallback_median}" ]]; then
     max_zig_encoder_lora_fallback_median=0
   fi
-  if [[ -z "${min_zig_lora_backward_region_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${min_zig_lora_backward_region_median}" ]]; then
     min_zig_lora_backward_region_median=100
   fi
-  if [[ -z "${min_zig_rank_adapter_backward_region_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" && -z "${min_zig_rank_adapter_backward_region_median}" ]]; then
     min_zig_rank_adapter_backward_region_median=100
   fi
   if (( include_python && ! warm_research && ! warm_production_ready )) && [[ -z "${max_zig_python_step_ratio_median}" ]]; then
@@ -523,20 +558,22 @@ if (( production_batch32 )); then
   if (( warm_production_ready )) && [[ -z "${max_zig_python_warm_step_ratio_any_run}" ]]; then
     max_zig_python_warm_step_ratio_any_run=1.10
   fi
-  if (( production_ready )) && [[ -z "${max_zig_metal_planned_barriers_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" ]] && (( production_ready )) && [[ -z "${max_zig_metal_planned_barriers_median}" ]]; then
     # Default production graph (head fusion disabled) is stable at 81 planned
     # barriers; the experimental head lane retains its stricter 40 limit.
     max_zig_metal_planned_barriers_median=81
   fi
-  if (( production_ready )) && [[ -z "${max_zig_metal_planned_scopes_median}" ]]; then
+  if [[ "${zig_backend}" == "metal" ]] && (( production_ready )) && [[ -z "${max_zig_metal_planned_scopes_median}" ]]; then
     # The reviewed default graph reports 125.5 mean planned scopes. Keep a
     # half-scope rounding allowance while rejecting the next full-scope step.
     max_zig_metal_planned_scopes_median=126
   fi
-  export TERMITE_METAL_BUFFER_REUSE_STATS="${TERMITE_METAL_BUFFER_REUSE_STATS:-1}"
-  export TERMITE_METAL_FRAME_CHUNK_OPS="${TERMITE_METAL_FRAME_CHUNK_OPS:-128}"
-  export TERMITE_GRAPH_EXECUTOR_STATS="${TERMITE_GRAPH_EXECUTOR_STATS:-1}"
-  export TERMITE_METAL_ENABLE_DEBERTA_ENCODER_LAYER_LORA_REGION=1
+  if [[ "${zig_backend}" == "metal" ]]; then
+    export TERMITE_METAL_BUFFER_REUSE_STATS="${TERMITE_METAL_BUFFER_REUSE_STATS:-1}"
+    export TERMITE_METAL_FRAME_CHUNK_OPS="${TERMITE_METAL_FRAME_CHUNK_OPS:-128}"
+    export TERMITE_GRAPH_EXECUTOR_STATS="${TERMITE_GRAPH_EXECUTOR_STATS:-1}"
+    export TERMITE_METAL_ENABLE_DEBERTA_ENCODER_LAYER_LORA_REGION=1
+  fi
 fi
 
 # The benchmark runs from repo_root. Freeze every filesystem argument against
@@ -612,6 +649,9 @@ bench_args=(
   "--runs" "${runs}"
   "--out-dir" "${out_dir}"
 )
+if [[ -n "${perf_seeds}" ]]; then
+  bench_args+=("--seeds" "${perf_seeds}")
+fi
 if (( op_stats )); then
   bench_args+=("--op-stats")
 fi
@@ -719,8 +759,7 @@ if (( production_ready )); then
 fi
 
 compare_args=(
-  "--zig-backend" "metal"
-  "--zig-build-metal"
+  "--zig-backend" "${zig_backend}"
   "--model-dir" "${model_dir}"
   "--python-model" "${python_model}"
   "--python-bin" "${python_bin}"
@@ -740,8 +779,7 @@ compare_args=(
 )
 if (( production_batch32 )); then
   compare_args=(
-    "--zig-backend" "metal"
-    "--zig-build-metal"
+    "--zig-backend" "${zig_backend}"
     "--model-dir" "${model_dir}"
     "--python-model" "${python_model}"
     "--python-bin" "${python_bin}"
@@ -760,12 +798,24 @@ if (( production_batch32 )); then
     "--span-negative-mask-rate" "0"
     "--span-loss-reduction" "sum"
     "--zig-objective" "gliner2-total-loss"
-    "--activation-checkpointing"
-    "--activation-checkpoint-interval" "1"
-    "--activation-checkpoint-strategy" "parameters-only"
     "--structure-span-chunk-samples" "16"
     "--timeout-seconds" "900"
   )
+fi
+if [[ "${zig_backend}" == "cuda" ]]; then
+  # A CUDA-vs-auto comparison can silently put the oracle on CPU when its
+  # environment is incomplete. Also keep the standard performance lane
+  # checkpoint-free on both sides; the L4 profile fits without recomputation.
+  compare_args+=("--zig-build-cuda" "--zig-cuda-artifacts" "${zig_cuda_artifacts}" "--python-device" "cuda")
+else
+  compare_args+=("--zig-build-metal")
+  if (( production_batch32 )); then
+    compare_args+=(
+      "--activation-checkpointing"
+      "--activation-checkpoint-interval" "1"
+      "--activation-checkpoint-strategy" "parameters-only"
+    )
+  fi
 fi
 if (( include_python )); then
   compare_args+=("--upstream-source" "${upstream_source}")

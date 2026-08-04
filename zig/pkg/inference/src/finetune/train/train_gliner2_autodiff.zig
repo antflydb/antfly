@@ -49,6 +49,7 @@
 //   --seed <n>                   RNG seed (default: 42)
 //   --initial-adapter-checkpoint <path>
 //                                  Optional PEFT safetensors checkpoint used to seed LoRA weights
+//   --backend <name>              auto, cuda, metal, or native (default: auto)
 //   --lora-only-trainables       Freeze regular task-head params; train LoRA only
 //   --eval-every-epochs <n>      Evaluate every N epochs (default: 1 with --eval-data)
 //   --eval-batch-size <n>        Logical held-out batch size (default: 8)
@@ -64,6 +65,7 @@ const inference = @import("inference_internal");
 const ml = @import("ml");
 const native_compute = inference.native_compute.native;
 const metal_compute = if (build_options.enable_metal) inference.native_compute.metal else struct {};
+const cuda_compute = if (build_options.enable_cuda) inference.native_compute.cuda else struct {};
 const gpu_hosted_store = inference.native_compute.gpu_hosted_store;
 const metal_runtime = inference.metal_runtime;
 const compat = inference.io.compat;
@@ -151,6 +153,7 @@ const Options = struct {
 
 const Gliner2TrainBackend = enum {
     auto,
+    cuda,
     metal,
     native,
 };
@@ -675,6 +678,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // of which backend branch we take.
     var metal_ws: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
+    var cuda_backend: if (build_options.enable_cuda) cuda_compute.CudaCompute else void = undefined;
     var native_ws: native_compute.WeightStore = undefined;
     var native_backend: native_compute.NativeCompute = undefined;
 
@@ -687,9 +691,26 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         (!force_native and metal_runtime.metalDeviceAvailable())
     else
         false;
-    const selected_backend = selectBackend(opts.backend, force_native, metal_runtime_available) catch |err| {
+    var cuda_init_error: ?anyerror = null;
+    var cuda_initialized = false;
+    const should_probe_cuda = !force_native and
+        (opts.backend == .cuda or (opts.backend == .auto and !metal_runtime_available));
+    const cuda_runtime_available = if (comptime build_options.enable_cuda) blk: {
+        if (!should_probe_cuda) break :blk false;
+        cuda_backend = cuda_compute.CudaCompute.init(allocator) catch |err| {
+            cuda_init_error = err;
+            break :blk false;
+        };
+        cuda_initialized = true;
+        break :blk true;
+    } else false;
+    const selected_backend = selectBackend(opts.backend, force_native, metal_runtime_available, cuda_runtime_available) catch |err| {
         switch (err) {
             error.MetalBackendUnavailable => print("error: --backend metal requested but Metal is not built or no Metal device is available\n", .{}),
+            error.CudaBackendUnavailable => if (cuda_init_error) |init_err|
+                print("error: --backend cuda initialization failed: {s}\n", .{@errorName(init_err)})
+            else
+                print("error: --backend cuda requested but CUDA is not built or no CUDA device is available\n", .{}),
         }
         return err;
     };
@@ -728,6 +749,26 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             errdefer metal_backend.deinit();
             break :blk metal_backend.computeBackend();
         } else unreachable;
+    } else if (selected_backend == .cuda) blk: {
+        if (comptime build_options.enable_cuda) {
+            if (!cuda_initialized) return error.CudaBackendUnavailable;
+            errdefer cuda_backend.deinit();
+            native_ws = .{
+                .allocator = allocator,
+                .resident_weights = .{},
+                .lazy_weights = .{},
+            };
+            errdefer deinitNativeWeightStore(allocator, &native_ws);
+            safetensors_source = try loadSafetensorsIntoNativeStore(allocator, &native_ws, st_path, "CUDA staging");
+            if (opts.objective != .gliner2_total_loss) {
+                try initClassifierHeadInNativeStore(allocator, &native_ws, opts.seed, deberta_config.hidden_size, opts.num_classes);
+            }
+            try initParityTopLevelWeightsNative(allocator, &native_ws, deberta_config.hidden_size);
+
+            try cuda_backend.requireProfile(.gliner2_training);
+            try populateCudaWeights(allocator, &cuda_backend, &native_ws);
+            break :blk cuda_backend.computeBackend();
+        } else unreachable;
     } else blk: {
         // ── Native CPU/BLAS fallback ─────────────────────────────────
         native_ws = .{
@@ -737,28 +778,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         };
         errdefer deinitNativeWeightStore(allocator, &native_ws);
 
-        if (SafetensorsSource.initAbsolute(allocator, st_path)) |src| {
-            safetensors_source = src;
-            const ws = src.weightSource();
-            if (ws.listNames(allocator)) |names| {
-                defer allocator.free(names);
-                var loaded_count: usize = 0;
-                for (names) |name| {
-                    if (ws.getTensor(name)) |lw| {
-                        const stripped = stripEncoderPrefix(name);
-                        const owned_name = try allocator.dupe(u8, stripped);
-                        errdefer allocator.free(owned_name);
-                        try native_ws.resident_weights.put(allocator, owned_name, lw);
-                        loaded_count += 1;
-                    } else |_| {}
-                }
-                print("  loaded {d} weights (native) from {s}\n", .{ loaded_count, st_path });
-            } else |err| {
-                print("warning: could not list weights: {}\n", .{err});
-            }
-        } else |err| {
-            return err;
-        }
+        safetensors_source = try loadSafetensorsIntoNativeStore(allocator, &native_ws, st_path, "native");
 
         if (opts.objective != .gliner2_total_loss) {
             try initClassifierHeadInNativeStore(allocator, &native_ws, opts.seed, deberta_config.hidden_size, opts.num_classes);
@@ -770,11 +790,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     };
     defer switch (selected_backend) {
         .native => deinitNativeWeightStore(allocator, &native_ws),
+        .cuda => if (comptime build_options.enable_cuda) deinitNativeWeightStore(allocator, &native_ws),
         .metal => if (comptime build_options.enable_metal) deinitGpuHostedWeightStore(allocator, &metal_ws),
         else => {},
     };
     defer switch (selected_backend) {
         .metal => if (comptime build_options.enable_metal) metal_backend.deinit(),
+        .cuda => if (comptime build_options.enable_cuda) cuda_backend.deinit(),
         else => {},
     };
 
@@ -947,6 +969,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 deberta_config.hidden_size,
                 effective_num_classes,
             ),
+            .cuda => if (comptime build_options.enable_cuda) {
+                try initClassifierHeadInNativeStore(
+                    allocator,
+                    &native_ws,
+                    opts.seed,
+                    deberta_config.hidden_size,
+                    effective_num_classes,
+                );
+                try populateCudaNamedWeight(allocator, &cuda_backend, &native_ws, "task_classifier.weight");
+                try populateCudaNamedWeight(allocator, &cuda_backend, &native_ws, "task_classifier.bias");
+            },
             else => unreachable,
         }
     }
@@ -1093,11 +1126,41 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             max_schema_tasks,
         );
         estimated_peak_bytes = est;
-        // Budget against the OS's memory report. Prefer *available* memory (accounts
-        // for the base model + other processes already resident) at 80%; fall back to
-        // 60% of physical when the OS doesn't report available. Works on macOS and
-        // Linux (via /proc/meminfo); on unsupported hosts the whole check is skipped.
-        if (inference.runtime.tier.memory.currentSystemMemoryInfo()) |mem_info| {
+        if (selected_backend == .cuda) {
+            if (comptime build_options.enable_cuda) {
+                // CUDA weights are already resident at this point, so compare
+                // the non-weight portion of the peak estimate with currently
+                // free VRAM. Keep ten percent of total VRAM uncommitted for
+                // driver/library workspaces and allocator fragmentation.
+                const device_memory = try cuda_backend.deviceMemoryInfo();
+                const estimated_weight_bytes = estimateTrainingWeightBytes(
+                    @intCast(deberta_config.vocab_size),
+                    @intCast(deberta_config.hidden_size),
+                    @intCast(deberta_config.intermediate_size),
+                    @intCast(deberta_config.num_hidden_layers),
+                );
+                const incremental_estimate = est -| estimated_weight_bytes;
+                const reserve = @as(u64, @intCast(device_memory.total_bytes)) / 10;
+                const free_vram: u64 = @intCast(device_memory.free_bytes);
+                const budget = free_vram -| reserve;
+                print("  estimated CUDA incremental peak: {d:.2} GiB (budget {d:.2} GiB; free {d:.2} GiB of {d:.2} GiB VRAM)\n", .{
+                    @as(f64, @floatFromInt(incremental_estimate)) / (1024.0 * 1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(budget)) / (1024.0 * 1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(free_vram)) / (1024.0 * 1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(device_memory.total_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                });
+                if (incremental_estimate > budget and !opts.allow_large_memory) {
+                    print("error: estimated CUDA peak exceeds the safe free-VRAM budget; lower --batch-size or --seq-len, enable activation checkpointing, or pass --allow-large-memory to proceed anyway\n", .{});
+                    return error.EstimatedCudaMemoryExceedsBudget;
+                }
+                if (incremental_estimate > budget) {
+                    print("warning: --allow-large-memory set; proceeding past the safe CUDA VRAM budget\n", .{});
+                }
+            } else unreachable;
+            // Unified-memory Metal and native execution continue to budget
+            // against the OS report. Prefer available memory at 80%; fall back
+            // to 60% of physical memory when no available figure is exposed.
+        } else if (inference.runtime.tier.memory.currentSystemMemoryInfo()) |mem_info| {
             const total: u64 = @intCast(mem_info.total_bytes);
             const basis_bytes: u64 = if (mem_info.available_bytes) |a| @intCast(a) else total;
             const budget: u64 = if (mem_info.available_bytes != null) basis_bytes * 8 / 10 else basis_bytes * 6 / 10;
@@ -1265,11 +1328,11 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     const checkpointing_enabled = opts.checkpoint_every_epochs > 0 or opts.resume_checkpoint != null or opts.eval_data != null;
     if (checkpointing_enabled and train_data_sha256 == null) return error.CheckpointRequiresSingleTrainingFile;
     if (checkpointing_enabled and opts.initial_adapter_checkpoint != null) return error.CheckpointWithInitialAdapterUnsupported;
-    if (checkpointing_enabled and selected_backend == .metal and !opts.compiled_required) {
-        // A permissive Metal run may switch between compiled and interpreter
+    if (checkpointing_enabled and (selected_backend == .metal or selected_backend == .cuda) and !opts.compiled_required) {
+        // A permissive accelerator run may switch between compiled and interpreter
         // execution across process boundaries. Require one execution contract
         // so a checkpoint resume cannot silently change numerical order.
-        return error.MetalCheckpointRequiresCompiledExecution;
+        return error.AcceleratorCheckpointRequiresCompiledExecution;
     }
     const training_executable_sha256 = if (checkpointing_enabled)
         try selfExecutableSha256Alloc(allocator)
@@ -1328,7 +1391,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .seed = opts.seed,
             .regular_trainable_params = regular_trainable_params,
             .execution_engine = switch (selected_backend) {
-                .metal => .compiled_metal,
+                .metal, .cuda => .compiled_device,
                 else => .interpreter,
             },
             .compiled_required = opts.compiled_required,
@@ -1406,7 +1469,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var batch_records = try allocator.alloc(gliner2_data.UpstreamRecord, bs);
     defer allocator.free(batch_records);
 
-    if (opts.initial_adapter_checkpoint != null or opts.resume_checkpoint != null) {
+    const prepare_accelerator_training = selected_backend == .metal or selected_backend == .cuda;
+    if (prepare_accelerator_training or opts.initial_adapter_checkpoint != null or opts.resume_checkpoint != null) {
         try ensureTrainerGraphBuiltFromFirstBatch(
             allocator,
             opts,
@@ -1439,6 +1503,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             trainer.optimizerSteps(),
         });
     }
+    if (prepare_accelerator_training) try trainer.prepareDeviceTraining();
 
     const resumed_micro_batches = trainer.microBatchSteps();
     const resumed_optimizer_steps = trainer.optimizerSteps();
@@ -1766,7 +1831,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 // those dumps there and still emit the component-loss debug
                 // (which the parity harness reads).
                 // ponytail: Metal full-task parity only needs total/classification debug; the legacy span dump is schema-unsafe there.
-                if (gliner_ctx.config.structure_max_instances == 1 and selected_backend != .metal) {
+                if (gliner_ctx.config.structure_max_instances == 1 and selected_backend == .native) {
                     const logits = try gliner2_autodiff.spanStartLogitsForBatch(
                         allocator,
                         &trainer,
@@ -2294,6 +2359,24 @@ fn writeStepMetric(
         .metal_deberta_attention_gemm_calls = timing.profile.metal_deberta_attention_gemm_calls,
         .metal_deberta_attention_gemm_fallbacks = timing.profile.metal_deberta_attention_gemm_fallbacks,
         .metal_deberta_attention_legacy_calls = timing.profile.metal_deberta_attention_legacy_calls,
+        .cuda_device_allocations = timing.profile.cuda_device_allocations,
+        .cuda_device_frees = timing.profile.cuda_device_frees,
+        .cuda_h2d_bytes = timing.profile.cuda_h2d_bytes,
+        .cuda_d2h_bytes = timing.profile.cuda_d2h_bytes,
+        .cuda_largest_d2h_transfer_bytes = timing.profile.cuda_largest_d2h_transfer_bytes,
+        .cuda_to_float32_calls = timing.profile.cuda_to_float32_calls,
+        .cuda_download_alloc_calls = timing.profile.cuda_download_alloc_calls,
+        .cuda_stream_synchronizations = timing.profile.cuda_stream_synchronizations,
+        .cuda_upload_synchronizations = timing.profile.cuda_upload_synchronizations,
+        .cuda_temp_cache_hits = timing.profile.cuda_temp_cache_hits,
+        .cuda_temp_cache_misses = timing.profile.cuda_temp_cache_misses,
+        .cuda_kernel_launches = timing.profile.cuda_kernel_launches,
+        .cuda_packed_attention_forward_calls = timing.profile.cuda_packed_attention_forward_calls,
+        .cuda_packed_attention_backward_calls = timing.profile.cuda_packed_attention_backward_calls,
+        .cuda_exact_gelu_forward_calls = timing.profile.cuda_exact_gelu_forward_calls,
+        .cuda_exact_gelu_backward_calls = timing.profile.cuda_exact_gelu_backward_calls,
+        .cuda_training_input_uploads = timing.profile.cuda_training_input_uploads,
+        .cuda_training_input_upload_bytes = timing.profile.cuda_training_input_upload_bytes,
         .trainer_total_ms = nsToMillis(timing.profile.total_ns),
         .peak_resident_bytes = timing.profile.peak_resident_bytes,
         .supervised_tokens_per_second = timing.supervisedTokensPerSecond(target_stats),
@@ -2482,6 +2565,8 @@ fn writeTrainingManifest(
         .artifact_family_version = run_validation.expected_artifact_family_version,
         .model_dir = opts.model_dir,
         .backend = backend_label,
+        .training_precision = "fp32",
+        .optimizer_state_precision = "fp32",
         .compiled_required = opts.compiled_required,
         .graph_shape_policy = if (opts.objective == .gliner2_total_loss) "batch-local-v2" else "fixed",
         .graph_seq_bucket_multiple = if (opts.objective == .gliner2_total_loss) @as(?u32, 8) else null,
@@ -4192,6 +4277,7 @@ fn stripEncoderPrefix(name: []const u8) []const u8 {
 
 fn parseBackend(value: []const u8) ?Gliner2TrainBackend {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     return null;
@@ -4230,10 +4316,12 @@ fn selectBackend(
     requested: Gliner2TrainBackend,
     force_native: bool,
     metal_available: bool,
+    cuda_available: bool,
 ) !Gliner2TrainBackend {
     if (force_native) return .native;
     return switch (requested) {
-        .auto => if (metal_available) .metal else .native,
+        .auto => if (metal_available) .metal else if (cuda_available) .cuda else .native,
+        .cuda => if (cuda_available) .cuda else error.CudaBackendUnavailable,
         .metal => if (metal_available) .metal else error.MetalBackendUnavailable,
         .native => .native,
     };
@@ -4255,12 +4343,72 @@ test "Metal GLiNER2 training rejects the unsafe legacy DeBERTa attention path" {
     );
 }
 
+test "GLiNER2 backend selection includes CUDA" {
+    try std.testing.expect(try selectBackend(.auto, false, false, true) == .cuda);
+    try std.testing.expect(try selectBackend(.cuda, false, false, true) == .cuda);
+    try std.testing.expectError(error.CudaBackendUnavailable, selectBackend(.cuda, false, false, false));
+    try std.testing.expect(try selectBackend(.auto, false, true, true) == .metal);
+    try std.testing.expect(try selectBackend(.auto, true, true, true) == .native);
+}
+
 fn backendLabel(backend: Gliner2TrainBackend) []const u8 {
     return switch (backend) {
         .auto => "auto",
+        .cuda => "CUDA",
         .metal => "Metal",
         .native => "native CPU/BLAS",
     };
+}
+
+fn loadSafetensorsIntoNativeStore(
+    allocator: std.mem.Allocator,
+    weight_store: *native_compute.WeightStore,
+    st_path: []const u8,
+    backend_name: []const u8,
+) !*SafetensorsSource {
+    const source = try SafetensorsSource.initAbsolute(allocator, st_path);
+    errdefer source.weightSource().deinit();
+    const ws = source.weightSource();
+    const names = try ws.listNames(allocator);
+    defer allocator.free(names);
+    var loaded_count: usize = 0;
+    for (names) |name| {
+        const loaded = ws.getTensor(name) catch continue;
+        const stripped = stripEncoderPrefix(name);
+        const owned_name = try allocator.dupe(u8, stripped);
+        errdefer allocator.free(owned_name);
+        try weight_store.resident_weights.put(allocator, owned_name, loaded);
+        loaded_count += 1;
+    }
+    print("  loaded {d} weights ({s}) from {s}\n", .{ loaded_count, backend_name, st_path });
+    return source;
+}
+
+fn populateCudaWeights(
+    allocator: std.mem.Allocator,
+    cuda: anytype,
+    store: *native_compute.WeightStore,
+) !void {
+    if (comptime !build_options.enable_cuda) return error.CudaBackendUnavailable;
+    var it = store.resident_weights.iterator();
+    while (it.next()) |entry| {
+        const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(owned_key);
+        try cuda.insertWeightFromLoaded(owned_key, entry.value_ptr);
+    }
+}
+
+fn populateCudaNamedWeight(
+    allocator: std.mem.Allocator,
+    cuda: anytype,
+    store: *native_compute.WeightStore,
+    name: []const u8,
+) !void {
+    if (comptime !build_options.enable_cuda) return error.CudaBackendUnavailable;
+    const loaded = store.resident_weights.getPtr(name) orelse return error.MissingWeight;
+    const owned_key = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_key);
+    try cuda.insertWeightFromLoaded(owned_key, loaded);
 }
 
 fn loadSafetensorsIntoGpuHostedStore(
@@ -5176,17 +5324,7 @@ fn estimateTrainingPeakBytes(
     const head_dim = hidden_size / @max(num_heads, 1);
     const bh = saturatedProduct(&.{ batch_size, num_heads });
     const ss = saturatedProduct(&.{ seq_len, seq_len });
-    const encoder_layer_weights = saturatedSum(&.{
-        saturatedProduct(&.{ 4, hidden_size, hidden_size }),
-        saturatedProduct(&.{ 2, hidden_size, intermediate_size }),
-    });
-    const weights = saturatedProduct(&.{
-        saturatedSum(&.{
-            saturatedProduct(&.{ vocab_size, hidden_size }),
-            saturatedProduct(&.{ num_layers, encoder_layer_weights }),
-        }),
-        f32_size,
-    });
+    const weights = estimateTrainingWeightBytes(vocab_size, hidden_size, intermediate_size, num_layers);
     const attn_per_layer = saturatedProduct(&.{
         saturatedSum(&.{
             saturatedProduct(&.{ bh, ss, head_dim }),
@@ -5251,6 +5389,25 @@ fn estimateTrainingPeakBytes(
     return saturatedSum(&.{ weights, encoder_live, head_live });
 }
 
+fn estimateTrainingWeightBytes(
+    vocab_size: u64,
+    hidden_size: u64,
+    intermediate_size: u64,
+    num_layers: u64,
+) u64 {
+    const encoder_layer_weights = saturatedSum(&.{
+        saturatedProduct(&.{ 4, hidden_size, hidden_size }),
+        saturatedProduct(&.{ 2, hidden_size, intermediate_size }),
+    });
+    return saturatedProduct(&.{
+        saturatedSum(&.{
+            saturatedProduct(&.{ vocab_size, hidden_size }),
+            saturatedProduct(&.{ num_layers, encoder_layer_weights }),
+        }),
+        @sizeOf(f32),
+    });
+}
+
 fn saturatedProduct(values: []const u64) u64 {
     var result: u64 = 1;
     for (values) |value| result = std.math.mul(u64, result, value) catch return std.math.maxInt(u64);
@@ -5286,6 +5443,16 @@ test "full-task memory estimate grows with instance and schema tensors and satur
             1,
         ),
     );
+}
+
+test "CUDA memory preflight separates resident weights from incremental peak" {
+    const weights = estimateTrainingWeightBytes(128_100, 768, 3072, 12);
+    const peak = estimateTrainingPeakBytes(128_100, 768, 3072, 12, 12, 2, 64, false, true, true, 512, 4, 1, 1);
+    try std.testing.expect(weights > 0);
+    try std.testing.expect(peak > weights);
+    const free_vram: u64 = 20 * 1024 * 1024 * 1024;
+    const total_vram: u64 = 24 * 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u64, 18_897_856_103), free_vram - total_vram / 10);
 }
 
 fn metalBufferReuseEnabledForPreflight() bool {
@@ -5341,7 +5508,7 @@ fn printUsage() void {
         \\                            Retain the newest N periodic checkpoints (default: 3; 0 = all)
         \\  --resume-checkpoint <path>
         \\                            Resume an epoch-boundary checkpoint in the same output directory
-        \\                            (Metal checkpoint/save/resume also requires --compiled-required)
+        \\                            (accelerator checkpoint/save/resume also requires --compiled-required)
         \\  --eval-every-epochs <n>   Run held-out loss every N complete epochs (default: 1)
         \\  --eval-batch-size <n>     Logical held-out batch size (default: 8; no drop-last)
         \\  --early-stopping-patience <n>
@@ -5352,16 +5519,16 @@ fn printUsage() void {
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --seed <n>                RNG seed (default: 42)
         \\  --initial-adapter-checkpoint <path> Seed LoRA weights from a PEFT safetensors checkpoint
-        \\  --backend <name>          auto, metal, or native (default: auto)
+        \\  --backend <name>          auto, cuda, metal, or native (default: auto)
         \\  --compiled-required       Fail if the requested compiled backend cannot run
         \\  --lora-only-trainables    Freeze regular task-head params; train LoRA params only
         \\  --deterministic           Disable per-step stochastic regularization (forces lora-dropout=0
         \\                            and span-negative-mask-rate=0; prints a warning when overriding)
         \\                            and pin gliner2-total-loss training data order (no epoch shuffle)
         \\  --allow-large-memory      Proceed even when the estimated peak memory exceeds the safe
-        \\                            budget (~60% of physical RAM); risks a system-wide OOM
+        \\                            budget (free VRAM on CUDA, physical RAM otherwise); risks OOM
         \\  --activation-checkpointing Recompute non-checkpoint activations during backward to lower
-        \\                            Metal peak memory for large batch/seq runs
+        \\                            accelerator peak memory for large batch/seq runs
         \\  --activation-checkpoint-interval <n>
         \\                            Save every Nth checkpoint boundary (default: 1)
         \\  --activation-checkpoint-strategy <name>

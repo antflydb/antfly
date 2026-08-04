@@ -54,24 +54,6 @@ const optimizers = ml.graph.optimizers;
 const ops_mod = @import("../ops/ops.zig");
 const CT = ops_mod.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
-const build_options = @import("build_options");
-const metal_compute = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {
-    pub const MetalCompute = struct {
-        pub const TrainingSumSquaresInput = struct {
-            tensor: CT,
-            elem_count: usize,
-        };
-        pub const TrainingAdamWBatchInput = struct {
-            weight: CT,
-            grad: CT,
-            m: CT,
-            v: CT,
-            elem_count: usize,
-            bias_correction1: f32,
-            bias_correction2: f32,
-        };
-    };
-};
 const training = @import("../graph/training.zig");
 
 const coord_mod = @import("training_memory_coordinator.zig");
@@ -204,8 +186,9 @@ pub const TrainerConfig = struct {
     /// Opaque context pointer forwarded to `reduce_device_grads`.
     reduce_device_grads_ctx: ?*anyopaque = null,
     /// Execution engine for the gradient graph. The interpreter preserves
-    /// historical behavior. `compiled_metal` caches the autodiff graph and
-    /// keeps trainable optimizer state on Metal.
+    /// historical behavior. `compiled_device` caches the autodiff graph and
+    /// keeps trainable optimizer state on any backend exposing device-training
+    /// operations. `compiled_metal` remains a compatibility spelling.
     execution_engine: TrainingExecutionEngine = .interpreter,
     /// When true, fail instead of silently falling back to interpreter if the
     /// requested compiled engine cannot be prepared.
@@ -229,6 +212,7 @@ pub const TrainerConfig = struct {
 
 pub const TrainingExecutionEngine = enum {
     interpreter,
+    compiled_device,
     compiled_metal,
 };
 
@@ -497,9 +481,27 @@ pub const StepProfile = struct {
     metal_deberta_attention_gemm_calls: u64 = 0,
     metal_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_deberta_attention_legacy_calls: u64 = 0,
+    cuda_device_allocations: u64 = 0,
+    cuda_device_frees: u64 = 0,
+    cuda_h2d_bytes: u64 = 0,
+    cuda_d2h_bytes: u64 = 0,
+    cuda_largest_d2h_transfer_bytes: u64 = 0,
+    cuda_to_float32_calls: u64 = 0,
+    cuda_download_alloc_calls: u64 = 0,
+    cuda_stream_synchronizations: u64 = 0,
+    cuda_upload_synchronizations: u64 = 0,
+    cuda_temp_cache_hits: u64 = 0,
+    cuda_temp_cache_misses: u64 = 0,
+    cuda_kernel_launches: u64 = 0,
+    cuda_packed_attention_forward_calls: u64 = 0,
+    cuda_packed_attention_backward_calls: u64 = 0,
+    cuda_exact_gelu_forward_calls: u64 = 0,
+    cuda_exact_gelu_backward_calls: u64 = 0,
+    cuda_training_input_uploads: u64 = 0,
+    cuda_training_input_upload_bytes: u64 = 0,
 };
 
-pub const OptimizerBackend = enum { host, metal };
+pub const OptimizerBackend = enum { host, metal, cuda };
 
 const ExecutionMode = enum {
     train,
@@ -792,6 +794,19 @@ pub const RealAutodiffTrainer = struct {
         );
     }
 
+    /// Finish one-time device optimizer allocation and weight upload before a
+    /// caller starts recording training-step latency or transfer telemetry.
+    /// Checkpoint restore already uses the same idempotent initializer, so it
+    /// is safe to call after either fresh or resumed setup.
+    pub fn prepareDeviceTraining(self: *RealAutodiffTrainer) !void {
+        if (!self.deviceOptimizerRequested()) return;
+        if (self.graph_state == null) return error.GraphNotBuilt;
+        try self.ensureDeviceOptimizerSlots();
+        // Close the initialization stream interval before measured steps.
+        // CUDA also uses this safe boundary to recycle its pinned upload ring.
+        try self.compute_backend.trainingSynchronize();
+    }
+
     fn findInactiveGraph(self: *const RealAutodiffTrainer, signature: GraphSignature) ?usize {
         for (self.inactive_graphs.items, 0..) |entry, index| {
             if (GraphSignature.eql(entry.signature, signature)) return index;
@@ -884,9 +899,16 @@ pub const RealAutodiffTrainer = struct {
 
     pub fn ensureCompiledSessionBuilt(self: *RealAutodiffTrainer, trainable: []const []const u8) !bool {
         if (self.config.execution_engine == .interpreter) return false;
-        if (self.config.execution_engine == .compiled_metal and self.compute_backend.kind() != .metal) {
-            if (self.config.compiled_required) return error.CompiledMetalRequiresMetalBackend;
-            return false;
+        switch (self.config.execution_engine) {
+            .interpreter => unreachable,
+            .compiled_device => if (!self.compute_backend.supportsDeviceTraining()) {
+                if (self.config.compiled_required) return error.DeviceTrainingUnavailable;
+                return false;
+            },
+            .compiled_metal => if (self.compute_backend.kind() != .metal or !self.compute_backend.supportsDeviceTraining()) {
+                if (self.config.compiled_required) return error.CompiledMetalRequiresMetalBackend;
+                return false;
+            },
         }
         if (self.compiled_session == null) {
             const gs = &(self.graph_state orelse return error.GraphNotBuilt);
@@ -1185,6 +1207,16 @@ pub const RealAutodiffTrainer = struct {
 
     fn runStep(self: *RealAutodiffTrainer, input: TrainerInput, mode: ExecutionMode) !StepResult {
         const total_start_ns = monotonicNowNs();
+        // Sample before graph selection and runtime-input staging. The
+        // executor also records a narrower internal profile, but the public
+        // step contract must include all H2D/D2H and synchronization work
+        // performed on behalf of this training step.
+        const training_runtime_before = self.compute_backend.trainingRuntimeStats();
+        // Initialization, checkpoint save, and checkpoint restore may
+        // legitimately transfer resident optimizer state between steps. The
+        // release metric is a hot-step invariant, so report only transfers
+        // initiated while executing this step instead of the lifetime total.
+        const device_optimizer_transfers_start = self.device_optimizer_transfers;
         var profile = StepProfile{};
 
         // 1. Lazy graph construction.
@@ -1193,7 +1225,8 @@ pub const RealAutodiffTrainer = struct {
         profile.graph_build_ns = elapsedNs(graph_build_start_ns, monotonicNowNs());
         const gs = &self.graph_state.?;
         const use_device_optimizer = mode == .train and self.deviceOptimizerRequested();
-        const use_cached_runtime_inputs = use_device_optimizer and self.compute_backend.kind() == .metal;
+        const use_cached_runtime_inputs = use_device_optimizer and
+            (self.compute_backend.kind() == .metal or self.compute_backend.kind() == .cuda);
         if (use_device_optimizer) {
             compiledDiag(
                 "device optimizer slots begin lora_slots={} regular_slots={} rss={}",
@@ -1205,13 +1238,17 @@ pub const RealAutodiffTrainer = struct {
                 .{ self.device_trainable_bytes, self.device_optimizer_transfers, currentResidentBytes() },
             );
             profile.optimizer_backend = self.deviceOptimizerBackend();
-            profile.device_resident_transfer_count = self.device_optimizer_transfers;
+            profile.device_resident_transfer_count = self.device_optimizer_transfers - device_optimizer_transfers_start;
             profile.device_trainable_bytes = self.device_trainable_bytes;
         }
 
         // 2. Optional activation-budget reservation via the coordinator.
+        var lora_blocks_pinned = false;
+        defer if (lora_blocks_pinned) self.unpinAllLoraBlocks() catch {};
         if (self.coord != null) {
             try self.reserveActivationBudget(input);
+            // Set this before pinning so a partial pin failure is also cleaned up.
+            lora_blocks_pinned = true;
             try self.pinAllLoraBlocks();
         }
 
@@ -1530,8 +1567,28 @@ pub const RealAutodiffTrainer = struct {
         profile.metal_deberta_attention_gemm_calls = step_result.profile.metal_deberta_attention_gemm_calls;
         profile.metal_deberta_attention_gemm_fallbacks = step_result.profile.metal_deberta_attention_gemm_fallbacks;
         profile.metal_deberta_attention_legacy_calls = step_result.profile.metal_deberta_attention_legacy_calls;
-        defer step_result.deinit();
+        profile.cuda_device_allocations = step_result.profile.cuda_device_allocations;
+        profile.cuda_device_frees = step_result.profile.cuda_device_frees;
+        profile.cuda_h2d_bytes = step_result.profile.cuda_h2d_bytes;
+        profile.cuda_d2h_bytes = step_result.profile.cuda_d2h_bytes;
+        profile.cuda_largest_d2h_transfer_bytes = step_result.profile.cuda_largest_d2h_transfer_bytes;
+        profile.cuda_to_float32_calls = step_result.profile.cuda_to_float32_calls;
+        profile.cuda_download_alloc_calls = step_result.profile.cuda_download_alloc_calls;
+        profile.cuda_stream_synchronizations = step_result.profile.cuda_stream_synchronizations;
+        profile.cuda_upload_synchronizations = step_result.profile.cuda_upload_synchronizations;
+        profile.cuda_temp_cache_hits = step_result.profile.cuda_temp_cache_hits;
+        profile.cuda_temp_cache_misses = step_result.profile.cuda_temp_cache_misses;
+        profile.cuda_kernel_launches = step_result.profile.cuda_kernel_launches;
+        profile.cuda_packed_attention_forward_calls = step_result.profile.cuda_packed_attention_forward_calls;
+        profile.cuda_packed_attention_backward_calls = step_result.profile.cuda_packed_attention_backward_calls;
+        profile.cuda_exact_gelu_forward_calls = step_result.profile.cuda_exact_gelu_forward_calls;
+        profile.cuda_exact_gelu_backward_calls = step_result.profile.cuda_exact_gelu_backward_calls;
+        profile.cuda_training_input_uploads = step_result.profile.cuda_training_input_uploads;
+        profile.cuda_training_input_upload_bytes = step_result.profile.cuda_training_input_upload_bytes;
+        var step_result_live = true;
+        defer if (step_result_live) step_result.deinit();
         const loss_value = step_result.loss;
+        if (!std.math.isFinite(loss_value)) return error.NonFiniteTrainingLoss;
 
         var grad_norm: f32 = 0.0;
         var stepped = false;
@@ -1543,7 +1600,7 @@ pub const RealAutodiffTrainer = struct {
                 const accum_steps: u32 = @max(self.config.grad_accum_steps, 1);
                 const scale: f32 = 1.0 / @as(f32, @floatFromInt(accum_steps));
                 const direct_device_step = use_device_optimizer and
-                    self.compute_backend.kind() == .metal and
+                    (self.compute_backend.kind() == .metal or self.compute_backend.kind() == .cuda) and
                     accum_steps == 1 and
                     self.config.reduce_device_grads == null and
                     self.config.reduce_grads == null;
@@ -1592,6 +1649,7 @@ pub const RealAutodiffTrainer = struct {
                         try self.deviceGlobalGradNorm()
                     else
                         self.globalGradNorm();
+                    if (!std.math.isFinite(grad_norm)) return error.NonFiniteGradientNorm;
                     if (!use_device_optimizer and self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm) {
                         const clip = self.config.max_grad_norm / (grad_norm + 1e-6);
                         for (self.lora_params.items) |*slot| {
@@ -1638,13 +1696,26 @@ pub const RealAutodiffTrainer = struct {
         profile.optimizer_update_ns = elapsedNs(optimizer_update_start_ns, monotonicNowNs());
 
         // 7. Release pinned LoRA blocks.
-        if (self.coord != null) {
+        if (lora_blocks_pinned) {
             try self.unpinAllLoraBlocks();
+            lora_blocks_pinned = false;
         }
 
         if (mode == .train) self.step_count += 1;
-        profile.device_resident_transfer_count = self.device_optimizer_transfers;
+        profile.device_resident_transfer_count = self.device_optimizer_transfers - device_optimizer_transfers_start;
         profile.device_trainable_bytes = self.device_trainable_bytes;
+        // Device gradient outputs are step-local. Release them before the
+        // final runtime snapshot so allocation/free telemetry covers the same
+        // complete step boundary as transfer and synchronization telemetry.
+        step_result.deinit();
+        step_result_live = false;
+        // Overwrite the executor-local CUDA counters with the complete step
+        // delta, including cached input overwrites and the resident optimizer.
+        training.recordTrainingRuntimeProfile(
+            &profile,
+            training_runtime_before,
+            self.compute_backend.trainingRuntimeStats(),
+        );
         profile.total_ns = elapsedNs(total_start_ns, monotonicNowNs());
         return .{
             .loss = loss_value,
@@ -1840,39 +1911,39 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn uploadRestoredOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
         const state = self.optimizer_state.param_states.get(slot.name) orelse return error.MissingOptimizerState;
         const device = if (slot.device) |*value| value else return error.DeviceOptimizerNotInitialized;
-        const metal = try self.metalCompute();
-        const restored_m = try metal.trainingUploadF32(state.m, slot.dims);
+        // `ensureDeviceOptimizerSlots` is intentionally idempotent and may
+        // find an already-resident weight from before checkpoint loading.
+        // Restore the checkpointed host value into that stable device buffer;
+        // otherwise resumed CUDA training silently continues from the stale
+        // pre-load weight while using the restored Adam moments.
+        try self.compute_backend.trainingOverwriteF32(device.weight, slot.weights, slot.dims);
+        const restored_m = try self.compute_backend.fromFloat32Shape(state.m, slot.dims);
         errdefer self.compute_backend.free(restored_m);
-        const restored_v = try metal.trainingUploadF32(state.v, slot.dims);
+        const restored_v = try self.compute_backend.fromFloat32Shape(state.v, slot.dims);
         errdefer self.compute_backend.free(restored_v);
         self.compute_backend.free(device.m);
         self.compute_backend.free(device.v);
         device.m = restored_m;
         device.v = restored_v;
-        self.device_optimizer_transfers += 2;
+        self.device_optimizer_transfers += 3;
     }
 
     // ── Internals ────────────────────────────────────────────────────────
 
-    fn metalCompute(self: *RealAutodiffTrainer) !*metal_compute.MetalCompute {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-        if (self.compute_backend.kind() != .metal) return error.MetalBackendUnavailable;
-        return @ptrCast(@alignCast(self.compute_backend.ptr));
-    }
-
     fn deviceOptimizerRequested(self: *const RealAutodiffTrainer) bool {
         return switch (self.config.execution_engine) {
             .interpreter => false,
-            .compiled_metal => self.compute_backend.kind() == .metal,
+            .compiled_device => self.compute_backend.supportsDeviceTraining(),
+            .compiled_metal => self.compute_backend.kind() == .metal and self.compute_backend.supportsDeviceTraining(),
         };
     }
 
     fn deviceOptimizerBackend(self: *const RealAutodiffTrainer) OptimizerBackend {
         return switch (self.compute_backend.kind()) {
             .metal => .metal,
+            .cuda => .cuda,
             else => .host,
         };
     }
@@ -1888,6 +1959,7 @@ pub const RealAutodiffTrainer = struct {
     ) !void {
         const ct = try self.ensureCachedRuntimeTensor(cache, data, dims);
         try rt.put(self.allocator, node_id, ct);
+        errdefer _ = rt.remove(node_id);
         try borrowed_rt.put(self.allocator, node_id, {});
     }
 
@@ -1897,11 +1969,9 @@ pub const RealAutodiffTrainer = struct {
         data: []const f32,
         dims: []const i32,
     ) !CT {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-        const metal = try self.metalCompute();
         if (cache.tensor) |ct| {
             if (cache.elem_count == data.len and std.mem.eql(i32, cache.dims, dims)) {
-                try metal.trainingOverwriteF32(ct, data, dims);
+                try self.compute_backend.trainingOverwriteF32(ct, data, dims);
                 return ct;
             }
             self.compute_backend.free(ct);
@@ -1910,7 +1980,15 @@ pub const RealAutodiffTrainer = struct {
             cache.dims = &.{};
             cache.elem_count = 0;
         }
-        const ct = try metal.trainingUploadF32(data, dims);
+        const ct = if (self.compute_backend.kind() == .cuda) blk: {
+            // Allocate cached CUDA inputs without an unclassified H2D copy so
+            // both initial population and subsequent overwrites contribute to
+            // the dedicated runtime-input upload counters.
+            const device_ct = try self.compute_backend.trainingZeroF32(data.len, dims);
+            errdefer self.compute_backend.free(device_ct);
+            try self.compute_backend.trainingOverwriteF32(device_ct, data, dims);
+            break :blk device_ct;
+        } else try self.compute_backend.fromFloat32Shape(data, dims);
         errdefer self.compute_backend.free(ct);
         cache.dims = try self.allocator.dupe(i32, dims);
         cache.elem_count = data.len;
@@ -1992,26 +2070,20 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn ensureDeviceOptimizerSlots(self: *RealAutodiffTrainer) !void {
-        switch (self.compute_backend.kind()) {
-            .metal => {
-                if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-                const metal = try self.metalCompute();
-                for (self.lora_params.items) |*slot| try self.ensureMetalDeviceOptimizerSlot(metal, slot);
-                for (self.regular_params.items) |*slot| try self.ensureMetalDeviceOptimizerSlot(metal, slot);
-            },
-            else => return error.DeviceOptimizerBackendUnavailable,
-        }
+        if (!self.compute_backend.supportsDeviceTraining()) return error.DeviceOptimizerBackendUnavailable;
+        for (self.lora_params.items) |*slot| try self.ensureDeviceOptimizerSlot(slot);
+        for (self.regular_params.items) |*slot| try self.ensureDeviceOptimizerSlot(slot);
     }
 
-    fn ensureMetalDeviceOptimizerSlot(self: *RealAutodiffTrainer, metal: *metal_compute.MetalCompute, slot: *ParamSlot) !void {
+    fn ensureDeviceOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
         if (slot.device != null) return;
-        const weight = try metal.trainingUploadF32(slot.weights, slot.dims);
+        const weight = try self.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
         errdefer self.compute_backend.free(weight);
-        const grad_accum = try metal.trainingZeroF32(slot.weights.len, slot.dims);
+        const grad_accum = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(grad_accum);
-        const m = try metal.trainingZeroF32(slot.weights.len, slot.dims);
+        const m = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(m);
-        const v = try metal.trainingZeroF32(slot.weights.len, slot.dims);
+        const v = try self.compute_backend.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(v);
         slot.device = .{
             .weight = weight,
@@ -2049,14 +2121,7 @@ pub const RealAutodiffTrainer = struct {
         first: bool,
     ) !void {
         const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
-        switch (self.compute_backend.kind()) {
-            .metal => {
-                if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-                const metal = try self.metalCompute();
-                try metal.trainingAccumulateF32(device.grad_accum, grad_ct, slot.weights.len, scale, first);
-            },
-            else => return error.DeviceOptimizerBackendUnavailable,
-        }
+        try self.compute_backend.trainingAccumulateF32(device.grad_accum, grad_ct, slot.weights.len, scale, first);
     }
 
     fn syncDeviceGradAccumToHost(self: *RealAutodiffTrainer) !void {
@@ -2079,12 +2144,10 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn replaceDeviceGradAccumSlotFromHost(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
         const device = slot.device orelse return;
-        const metal = try self.metalCompute();
-        const host_ct = try metal.trainingUploadF32(slot.grad_accum, slot.dims);
+        const host_ct = try self.compute_backend.fromFloat32Shape(slot.grad_accum, slot.dims);
         defer self.compute_backend.free(host_ct);
-        try metal.trainingAccumulateF32(device.grad_accum, host_ct, slot.weights.len, 1.0, true);
+        try self.compute_backend.trainingAccumulateF32(device.grad_accum, host_ct, slot.weights.len, 1.0, true);
         self.device_optimizer_transfers += 1;
     }
 
@@ -2141,58 +2204,21 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn deviceGlobalGradNorm(self: *RealAutodiffTrainer) !f32 {
-        if (self.compute_backend.kind() == .metal) return try self.metalDeviceGlobalGradNorm();
-        var total: f64 = 0.0;
+        var inputs = try std.ArrayList(ops_mod.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
+        defer inputs.deinit(self.allocator);
         for (self.lora_params.items) |*slot| {
             const device = slot.device orelse continue;
-            const sumsq = try self.deviceSumSquares(device.grad_accum, slot.weights.len);
-            total += @as(f64, sumsq);
+            try inputs.append(self.allocator, .{ .tensor = device.grad_accum, .elem_count = slot.weights.len });
         }
         for (self.regular_params.items) |*slot| {
             const device = slot.device orelse continue;
-            const sumsq = try self.deviceSumSquares(device.grad_accum, slot.weights.len);
-            total += @as(f64, sumsq);
+            try inputs.append(self.allocator, .{ .tensor = device.grad_accum, .elem_count = slot.weights.len });
         }
-        return @floatCast(@sqrt(total));
+        return @sqrt(try self.compute_backend.trainingSumSquaresManyF32(inputs.items));
     }
 
     fn deviceGlobalGradNormFromResult(self: *RealAutodiffTrainer, result: *const training.TrainStepResult) !f32 {
-        if (self.compute_backend.kind() == .metal) return try self.metalDeviceGlobalGradNormFromResult(result);
-        var total: f64 = 0.0;
-        for (self.lora_params.items) |*slot| {
-            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-            const sumsq = try self.deviceSumSquares(grad, slot.weights.len);
-            total += @as(f64, sumsq);
-        }
-        for (self.regular_params.items) |*slot| {
-            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-            const sumsq = try self.deviceSumSquares(grad, slot.weights.len);
-            total += @as(f64, sumsq);
-        }
-        return @floatCast(@sqrt(total));
-    }
-
-    fn metalDeviceGlobalGradNorm(self: *RealAutodiffTrainer) !f32 {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-        const metal = try self.metalCompute();
-        var inputs = try std.ArrayList(metal_compute.MetalCompute.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
-        defer inputs.deinit(self.allocator);
-        for (self.lora_params.items) |*slot| {
-            const device = slot.device orelse continue;
-            try inputs.append(self.allocator, .{ .tensor = device.grad_accum, .elem_count = slot.weights.len });
-        }
-        for (self.regular_params.items) |*slot| {
-            const device = slot.device orelse continue;
-            try inputs.append(self.allocator, .{ .tensor = device.grad_accum, .elem_count = slot.weights.len });
-        }
-        const sumsq = try metal.trainingSumSquaresManyF32(inputs.items);
-        return @sqrt(sumsq);
-    }
-
-    fn metalDeviceGlobalGradNormFromResult(self: *RealAutodiffTrainer, result: *const training.TrainStepResult) !f32 {
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-        const metal = try self.metalCompute();
-        var inputs = try std.ArrayList(metal_compute.MetalCompute.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
+        var inputs = try std.ArrayList(ops_mod.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
         defer inputs.deinit(self.allocator);
         for (self.lora_params.items) |*slot| {
             const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
@@ -2202,7 +2228,7 @@ pub const RealAutodiffTrainer = struct {
             const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
             try inputs.append(self.allocator, .{ .tensor = grad, .elem_count = slot.weights.len });
         }
-        const sumsq = try metal.trainingSumSquaresManyF32(inputs.items);
+        const sumsq = try self.compute_backend.trainingSumSquaresManyF32(inputs.items);
         const kernel_norm: f32 = @sqrt(sumsq);
         self.debugCompareDeviceGradNorm(result, kernel_norm);
         return kernel_norm;
@@ -2259,17 +2285,6 @@ pub const RealAutodiffTrainer = struct {
         );
     }
 
-    fn deviceSumSquares(self: *RealAutodiffTrainer, input: CT, elem_count: usize) !f32 {
-        return switch (self.compute_backend.kind()) {
-            .metal => blk: {
-                if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-                const metal = try self.metalCompute();
-                break :blk try metal.trainingSumSquaresF32(input, elem_count);
-            },
-            else => error.DeviceOptimizerBackendUnavailable,
-        };
-    }
-
     /// Where one device AdamW step reads each parameter's gradient from.
     pub const DeviceAdamWGradSource = union(enum) {
         /// The slot's own device accumulator, filled over the window.
@@ -2289,8 +2304,8 @@ pub const RealAutodiffTrainer = struct {
     fn buildDeviceAdamWBatch(
         self: *RealAutodiffTrainer,
         grad_source: DeviceAdamWGradSource,
-    ) ![]metal_compute.MetalCompute.TrainingAdamWBatchInput {
-        var batch = try std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput).initCapacity(
+    ) ![]ops_mod.TrainingAdamWBatchInput {
+        var batch = try std.ArrayList(ops_mod.TrainingAdamWBatchInput).initCapacity(
             self.allocator,
             self.lora_params.items.len + self.regular_params.items.len,
         );
@@ -2302,7 +2317,7 @@ pub const RealAutodiffTrainer = struct {
 
     fn appendDeviceAdamWBatchSlots(
         self: *RealAutodiffTrainer,
-        batch: *std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput),
+        batch: *std.ArrayList(ops_mod.TrainingAdamWBatchInput),
         slots: []ParamSlot,
         grad_source: DeviceAdamWGradSource,
     ) !void {
@@ -2346,12 +2361,10 @@ pub const RealAutodiffTrainer = struct {
         defer self.allocator.free(batch);
         try self.zeroGatedDeviceGradAccum();
         if (batch.len == 0) return;
-        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-        const metal = try self.metalCompute();
         const opt = self.config.optimizer;
         var frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
         errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
-        try metal.trainingAdamWManyF32(batch, .{
+        try self.compute_backend.trainingAdamWManyF32(batch, .{
             .lr = lr,
             .beta1 = opt.beta1,
             .beta2 = opt.beta2,
@@ -2361,6 +2374,7 @@ pub const RealAutodiffTrainer = struct {
         });
         try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
         frame_active = false;
+        try self.compute_backend.trainingSynchronize();
         self.commitDeviceAdamWStepCounts();
     }
 
@@ -2378,9 +2392,7 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn stepDeviceAdamWFrom(self: *RealAutodiffTrainer, grad_source: DeviceAdamWGradSource, lr: f32, grad_scale: f32) !void {
-        if (self.compute_backend.kind() == .metal) return self.stepDeviceAdamWBatch(grad_source, lr, grad_scale);
-        for (self.lora_params.items) |*slot| try self.stepDeviceAdamWSlotGated(slot, grad_source, lr, grad_scale);
-        for (self.regular_params.items) |*slot| try self.stepDeviceAdamWSlotGated(slot, grad_source, lr, grad_scale);
+        return self.stepDeviceAdamWBatch(grad_source, lr, grad_scale);
     }
 
     /// Single-slot form of the batched step, for device backends without a
@@ -2427,14 +2439,7 @@ pub const RealAutodiffTrainer = struct {
     fn zeroDeviceGradAccum(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
         @memset(slot.grad_accum, 0);
         const device = slot.device orelse return;
-        switch (self.compute_backend.kind()) {
-            .metal => {
-                if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-                const metal = try self.metalCompute();
-                try metal.trainingAccumulateF32(device.grad_accum, device.grad_accum, slot.weights.len, 0.0, true);
-            },
-            else => return error.DeviceOptimizerBackendUnavailable,
-        }
+        try self.compute_backend.trainingAccumulateF32(device.grad_accum, device.grad_accum, slot.weights.len, 0.0, true);
     }
 
     fn stepDeviceAdamWSlotWithGrad(
@@ -2448,23 +2453,23 @@ pub const RealAutodiffTrainer = struct {
     ) !void {
         const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
         const opt = self.config.optimizer;
-        switch (self.compute_backend.kind()) {
-            .metal => {
-                if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-                const metal = try self.metalCompute();
-                try metal.trainingAdamWF32(device.weight, grad, device.m, device.v, slot.weights.len, .{
-                    .lr = lr,
-                    .beta1 = opt.beta1,
-                    .beta2 = opt.beta2,
-                    .eps = opt.eps,
-                    .weight_decay = opt.weight_decay,
-                    .bias_correction1 = bias_correction1,
-                    .bias_correction2 = bias_correction2,
-                    .grad_scale = grad_scale,
-                });
-            },
-            else => return error.DeviceOptimizerBackendUnavailable,
-        }
+        const batch = [_]ops_mod.TrainingAdamWBatchInput{.{
+            .weight = device.weight,
+            .grad = grad,
+            .m = device.m,
+            .v = device.v,
+            .elem_count = slot.weights.len,
+            .bias_correction1 = bias_correction1,
+            .bias_correction2 = bias_correction2,
+        }};
+        try self.compute_backend.trainingAdamWManyF32(&batch, .{
+            .lr = lr,
+            .beta1 = opt.beta1,
+            .beta2 = opt.beta2,
+            .eps = opt.eps,
+            .weight_decay = opt.weight_decay,
+            .grad_scale = grad_scale,
+        });
         @memset(slot.grad_accum, 0);
     }
 

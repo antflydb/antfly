@@ -33,8 +33,8 @@ from gliner2_release_contract import (
     verify_upstream_checkout,
 )
 from validate_gliner2_release_data import (
-    adapter_bundle_fingerprint,
     base_model_fingerprint,
+    peft_adapter_fingerprint,
     sha256_file,
 )
 
@@ -62,17 +62,51 @@ STOCK_STOCHASTIC_TRAINING_POLICY = {
     "zig_span_negative_mask_rate": 0.5,
     "rng_streams": "independent",
 }
-REQUIRED_STOCHASTIC_STRICT_CHECKS = (
+COMMON_STOCHASTIC_STRICT_CHECKS = (
     "requested_step_count_valid",
     "adapter_roundtrip_ok",
-    "metal_manifest_backend_is_metal",
-    "metal_optimizer_backend_is_metal",
-    "metal_device_resident_transfers_zero",
-    "metal_finite_step_loss",
-    "metal_graph_executor_fallback_reasons_empty",
-    "metal_graph_executor_true_host_outputs_zero",
-    "metal_interpreter_fallbacks_within_threshold",
 )
+BACKEND_STOCHASTIC_STRICT_CHECKS = {
+    "metal": (
+        "metal_manifest_backend_is_metal",
+        "metal_optimizer_backend_is_metal",
+        "metal_device_resident_transfers_zero",
+        "metal_finite_step_loss",
+        "metal_training_precision_fp32",
+        "metal_graph_executor_fallback_reasons_empty",
+        "metal_graph_executor_true_host_outputs_zero",
+        "metal_interpreter_fallbacks_within_threshold",
+    ),
+    "cuda": (
+        "cuda_manifest_backend_is_cuda",
+        "cuda_optimizer_backend_is_cuda",
+        "cuda_device_resident_transfers_zero",
+        "cuda_device_trainables_resident",
+        "cuda_finite_step_loss",
+        "cuda_finite_grad_norm",
+        "cuda_training_precision_fp32",
+        "cuda_runtime_telemetry_present",
+        "cuda_full_step_h2d_accounted",
+        "cuda_parameter_state_h2d_zero",
+        "cuda_graph_executor_dispatches_nonzero",
+        "cuda_graph_executor_fallback_reasons_empty",
+        "cuda_graph_executor_true_host_outputs_zero",
+        "cuda_interpreter_fallbacks_within_threshold",
+        "cuda_bulk_d2h_eliminated",
+        "cuda_d2h_within_threshold",
+        "cuda_only_scalar_metrics_downloaded",
+        "cuda_upload_synchronizations_bounded",
+        "cuda_packed_attention_exercised",
+        "cuda_exact_gelu_exercised",
+    ),
+}
+
+
+def required_stochastic_strict_checks(zig_backend: str) -> tuple[str, ...]:
+    try:
+        return COMMON_STOCHASTIC_STRICT_CHECKS + BACKEND_STOCHASTIC_STRICT_CHECKS[zig_backend]
+    except KeyError as exc:
+        raise ValueError(f"unsupported Zig convergence backend: {zig_backend}") from exc
 
 
 def is_sha256(value: Any) -> bool:
@@ -191,6 +225,7 @@ def side_training_evidence(
     side: str,
     requested_steps: int,
     verified_oracle: dict[str, str],
+    zig_backend: str = "metal",
 ) -> tuple[int, list[float], dict[str, Any] | None]:
     result = comparison.get(side)
     if not isinstance(result, dict) or result.get("returncode") != 0:
@@ -209,8 +244,10 @@ def side_training_evidence(
         rows = result.get("training_metrics")
         if not isinstance(manifest, dict):
             raise ValueError("Zig training manifest evidence is missing")
-        if manifest.get("backend") != "metal" or manifest.get("objective") != "gliner2-total-loss":
-            raise ValueError("Zig trainer evidence is not a Metal full-task run")
+        if str(manifest.get("backend", "")).lower() != zig_backend or manifest.get("objective") != "gliner2-total-loss":
+            raise ValueError(f"Zig trainer evidence is not a {zig_backend.upper()} full-task run")
+        if manifest.get("training_precision") != "fp32" or manifest.get("optimizer_state_precision") != "fp32":
+            raise ValueError("Zig trainer evidence is not the production FP32 precision contract")
         if manifest.get("lora_only_trainables") is not True:
             raise ValueError("Zig trainer evidence is not LoRA-only")
         steps = manifest.get("optimizer_steps")
@@ -261,11 +298,12 @@ def evaluation_evidence(
         raise ValueError(f"{label} does not use the canonical scoring runtime")
     if not oracle_runtime_matches(report.get("oracle"), verified_oracle):
         raise ValueError(f"{label} oracle metadata is missing, unpinned, or imported outside its checkout")
-    if not isinstance(artifacts, dict) or artifacts != {
-        "base_model_fingerprint_sha256": fingerprints["base_model"],
-        "adapter_bundle_fingerprint_sha256": adapter_fingerprint,
-        "eval_data_fingerprint_sha256": fingerprints["eval_data"],
-    }:
+    if (
+        not isinstance(artifacts, dict)
+        or artifacts.get("base_model_fingerprint_sha256") != fingerprints["base_model"]
+        or artifacts.get("peft_adapter_fingerprint_sha256") != adapter_fingerprint
+        or artifacts.get("eval_data_fingerprint_sha256") != fingerprints["eval_data"]
+    ):
         raise ValueError(f"{label} artifact fingerprints do not match the selected evidence")
     metrics = report.get("metrics")
     if not isinstance(metrics, dict) or any(metric(metrics, key) is None for key in REQUIRED_MINIMA):
@@ -278,6 +316,7 @@ def stochastic_comparison_errors(
     summary: dict[str, Any],
     python_result: dict[str, Any],
     zig_result: dict[str, Any],
+    zig_backend: str = "metal",
 ) -> list[str]:
     """Reject deterministic-core or weakened runs from the statistical gate."""
     errors: list[str] = []
@@ -340,7 +379,7 @@ def stochastic_comparison_errors(
     if summary.get("strict_mode") is not True or not isinstance(strict_checks, dict):
         errors.append("comparison must complete with strict runtime/artifact gating enabled")
     else:
-        failed = [name for name in REQUIRED_STOCHASTIC_STRICT_CHECKS if strict_checks.get(name) is not True]
+        failed = [name for name in required_stochastic_strict_checks(zig_backend) if strict_checks.get(name) is not True]
         if failed:
             errors.append("required strict checks did not pass: " + ", ".join(failed))
     return errors
@@ -355,6 +394,7 @@ def materialize_study(
     eval_data: Path,
     fingerprints: dict[str, str],
     verified_oracle: dict[str, str],
+    zig_backend: str = "metal",
 ) -> dict[str, Any]:
     manifest_dir = manifest_dir.expanduser().resolve()
     model_dir = model_dir.expanduser().resolve()
@@ -407,17 +447,17 @@ def materialize_study(
             or config.get("model_fingerprint_sha256") != fingerprints["base_model"]
             or config.get("training_data_fingerprint_sha256") != fingerprints["train_data"]
             or config.get("scoring_normalization") != CANONICAL_NORMALIZATION
-            or config.get("zig_backend") != "metal"
+            or config.get("zig_backend") != zig_backend
             or config.get("zig_objective") != "gliner2-total-loss"
             or config.get("zig_lora_only_trainables") is not True
             or not oracle_subset_matches(config.get("oracle"), verified_oracle)
         ):
-            raise ValueError(f"{label} comparison configuration is not the selected stochastic Metal study")
+            raise ValueError(f"{label} comparison configuration is not the selected stochastic {zig_backend.upper()} study")
         python_result = comparison.get("python")
         zig_result = comparison.get("zig")
         if not isinstance(summary, dict) or not isinstance(python_result, dict) or not isinstance(zig_result, dict):
             raise ValueError(f"{label} comparison report is missing its summary or trainer results")
-        stochastic_errors = stochastic_comparison_errors(config, summary, python_result, zig_result)
+        stochastic_errors = stochastic_comparison_errors(config, summary, python_result, zig_result, zig_backend)
         if stochastic_errors:
             raise ValueError(f"{label} is not a stock-stochastic Fastino study: {'; '.join(stochastic_errors)}")
         requested_steps = config.get("steps")
@@ -437,13 +477,13 @@ def materialize_study(
         adapter_fingerprints: dict[str, str] = {}
         for side in SIDES:
             try:
-                adapter_fingerprints[side] = adapter_bundle_fingerprint(adapter_dirs[side])
+                adapter_fingerprints[side] = peft_adapter_fingerprint(adapter_dirs[side])
             except (OSError, ValueError) as exc:
                 raise ValueError(f"{label} {side} adapter bundle is missing or invalid: {exc}") from exc
         sides: dict[str, dict[str, Any]] = {}
         for side in SIDES:
             steps, losses, side_oracle = side_training_evidence(
-                comparison, side, requested_steps, verified_oracle
+                comparison, side, requested_steps, verified_oracle, zig_backend
             )
             eval_key = f"{side}_evaluation"
             evaluation = json_object(report_paths[eval_key], f"{label} {side} evaluation")
@@ -487,6 +527,8 @@ def materialize_study(
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
         "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
+        "accelerator_backend": zig_backend,
+        "training_precision": "fp32",
         "fingerprints": fingerprints,
         "artifact_paths": {
             "base_model": str(model_dir),
@@ -658,6 +700,8 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
         "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
+        "accelerator_backend": payload.get("accelerator_backend", "metal"),
+        "training_precision": payload.get("training_precision", "fp32"),
         "fingerprints": fingerprints,
         "artifact_paths": payload.get("artifact_paths"),
         "seed_count": len(runs),
@@ -672,7 +716,7 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
 
 PROJECTION_KEYS = (
     "contract", "evidence_contract", "evidence_bound", "pass", "failures", "oracle",
-    "normalization", "unicode_version", "training_policy", "fingerprints", "artifact_paths", "seed_count",
+    "normalization", "unicode_version", "training_policy", "accelerator_backend", "training_precision", "fingerprints", "artifact_paths", "seed_count",
     "minimums", "thresholds", "loss_curve_policy", "stochastic_policy", "runs", "metrics",
 )
 
@@ -715,6 +759,7 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
             "package_versions": package_versions,
         }
         manifest = json_object(manifest_path, "convergence evidence manifest")
+        zig_backend = str(summary.get("accelerator_backend", "metal"))
         derived = materialize_study(
             manifest,
             manifest_dir=manifest_path.parent,
@@ -723,6 +768,7 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
             eval_data=paths["eval_data"],
             fingerprints=fingerprints,
             verified_oracle=oracle,
+            zig_backend=zig_backend,
         )
         rebuilt = summarize(derived)
         if summary_projection(rebuilt) != summary_projection(summary):
@@ -742,6 +788,7 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--train-data", type=Path, required=True)
     parser.add_argument("--eval-data", type=Path, required=True)
+    parser.add_argument("--zig-backend", choices=("metal", "cuda"), default="metal")
     args = parser.parse_args()
     args.input = args.input.expanduser().resolve()
     args.output = args.output.expanduser().resolve()
@@ -773,6 +820,7 @@ def main() -> int:
             eval_data=eval_data,
             fingerprints=fingerprints,
             verified_oracle=oracle,
+            zig_backend=args.zig_backend,
         )
         summary = summarize(derived)
         summary["source"] = {
