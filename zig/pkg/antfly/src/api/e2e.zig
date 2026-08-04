@@ -1328,13 +1328,15 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(usize, 1), parsed_index_list_after_delete.value.len);
     try std.testing.expectEqualStrings("full_text_index_v1", parsed_index_list_after_delete.value[0].config.name);
 
-    var after_delete_writer = provisioned_write_source.leaseManagedWriterGroupForTransition(group_id) orelse
-        return error.TestUnexpectedResult;
-    defer after_delete_writer.deinit(std.testing.allocator);
-    const provisioned_indexes_after_delete = try after_delete_writer.db.listIndexes(std.testing.allocator);
-    defer db_mod.types.freeIndexConfigs(std.testing.allocator, provisioned_indexes_after_delete);
-    for (provisioned_indexes_after_delete) |cfg| {
-        try std.testing.expect(!std.mem.eql(u8, cfg.name, "embed_idx"));
+    {
+        var after_delete_writer = provisioned_write_source.leaseManagedWriterGroupForTransition(group_id) orelse
+            return error.TestUnexpectedResult;
+        defer after_delete_writer.deinit(std.testing.allocator);
+        const provisioned_indexes_after_delete = try after_delete_writer.db.listIndexes(std.testing.allocator);
+        defer db_mod.types.freeIndexConfigs(std.testing.allocator, provisioned_indexes_after_delete);
+        for (provisioned_indexes_after_delete) |cfg| {
+            try std.testing.expect(!std.mem.eql(u8, cfg.name, "embed_idx"));
+        }
     }
 
     _ = try client.dropTable(base_uri, "docs");

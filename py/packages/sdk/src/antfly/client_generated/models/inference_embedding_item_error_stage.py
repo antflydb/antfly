@@ -8,6 +8,7 @@ class InferenceEmbeddingItemErrorStage(str, Enum):
     IMAGE_DECODE = "image_decode"
     IMAGE_INFERENCE = "image_inference"
     INFERENCE = "inference"
+    MODEL_ADMISSION = "model_admission"
     PARSE = "parse"
     TEXT_INFERENCE = "text_inference"
 

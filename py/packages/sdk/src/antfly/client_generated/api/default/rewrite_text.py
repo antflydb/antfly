@@ -8,6 +8,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.inference_error import InferenceError
 from ...models.inference_rewrite_request import InferenceRewriteRequest
 from ...models.inference_rewrite_response import InferenceRewriteResponse
+from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
 from ...types import Response
 
 
@@ -32,7 +33,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> InferenceError | InferenceRewriteResponse | None:
+) -> InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError | None:
     if response.status_code == 200:
         response_200 = InferenceRewriteResponse.from_dict(response.json())
 
@@ -54,7 +55,7 @@ def _parse_response(
         return response_500
 
     if response.status_code == 503:
-        response_503 = InferenceError.from_dict(response.json())
+        response_503 = InferenceTransientCapacityError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +67,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[InferenceError | InferenceRewriteResponse]:
+) -> Response[InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,7 +80,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRewriteRequest,
-) -> Response[InferenceError | InferenceRewriteResponse]:
+) -> Response[InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError]:
     """Rewrite text using Seq2Seq models
 
      Rewrite/transform text using Seq2Seq models (T5, FLAN-T5, BART, etc.).
@@ -105,7 +106,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceError | InferenceRewriteResponse]
+        Response[InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -123,7 +124,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRewriteRequest,
-) -> InferenceError | InferenceRewriteResponse | None:
+) -> InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError | None:
     """Rewrite text using Seq2Seq models
 
      Rewrite/transform text using Seq2Seq models (T5, FLAN-T5, BART, etc.).
@@ -149,7 +150,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceError | InferenceRewriteResponse
+        InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError
     """
 
     return sync_detailed(
@@ -162,7 +163,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRewriteRequest,
-) -> Response[InferenceError | InferenceRewriteResponse]:
+) -> Response[InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError]:
     """Rewrite text using Seq2Seq models
 
      Rewrite/transform text using Seq2Seq models (T5, FLAN-T5, BART, etc.).
@@ -188,7 +189,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceError | InferenceRewriteResponse]
+        Response[InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -204,7 +205,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRewriteRequest,
-) -> InferenceError | InferenceRewriteResponse | None:
+) -> InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError | None:
     """Rewrite text using Seq2Seq models
 
      Rewrite/transform text using Seq2Seq models (T5, FLAN-T5, BART, etc.).
@@ -230,7 +231,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceError | InferenceRewriteResponse
+        InferenceError | InferenceRewriteResponse | InferenceTransientCapacityError
     """
 
     return (

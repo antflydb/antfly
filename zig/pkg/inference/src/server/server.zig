@@ -1123,6 +1123,36 @@ fn rejectDisallowedModel(
     }
 }
 
+const transient_capacity_retry_after_seconds = "1";
+const transient_capacity_retry_after_ms = 1000;
+
+fn transientCapacityFailureResponse(
+    ctx: *httpx.Context,
+    code: []const u8,
+    message: []const u8,
+    reason: []const u8,
+) !httpx.Response {
+    // Retry-After is expressed in seconds by HTTP. The millisecond field keeps
+    // SDK clients from having to parse headers and makes retryability explicit.
+    try ctx.setHeader("Retry-After", transient_capacity_retry_after_seconds);
+    return ctx.status(503).json(.{
+        .@"error" = code,
+        .message = message,
+        .reason = reason,
+        .retryable = true,
+        .retry_after_ms = transient_capacity_retry_after_ms,
+    });
+}
+
+fn modelResourceBusyResponse(ctx: *httpx.Context) !httpx.Response {
+    return transientCapacityFailureResponse(
+        ctx,
+        "MODEL_RESOURCE_BUSY",
+        "insufficient inference capacity is currently available",
+        "inference_capacity",
+    );
+}
+
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
         error.UnknownModelCompatibility => ctx.status(400).json(.{
@@ -1137,10 +1167,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "model resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
-            .@"error" = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-        }),
+        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -1154,10 +1181,7 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
-            .@"error" = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-        }),
+        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "INFERENCE_FAILED",
             .message = @errorName(err),
@@ -1673,11 +1697,14 @@ pub const Node = struct {
         const model = model_handle.get();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        var asset_lease = model.acquireEmbeddingAssetLease(false);
+        defer asset_lease.release();
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var pipeline = model.embeddingPipeline(allocator);
         const vectors = try pipeline.embed(texts);
+        asset_lease.release();
         errdefer freeDirectDenseVectors(allocator, vectors);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return vectors;
@@ -2055,6 +2082,8 @@ pub const Node = struct {
                 allocator.free(sparse);
             }
         } else {
+            var asset_lease = model.acquireEmbeddingAssetLease(false);
+            defer asset_lease.release();
             try model.ensureEmbeddingAssets(true, false, false);
             var pipeline = model.embeddingPipeline(allocator);
             const embeddings = try pipeline.embed(&texts);
@@ -2152,10 +2181,24 @@ pub const Node = struct {
         defer parsed.deinit(allocator);
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
 
-        try model.ensureEmbeddingAssets(parsed.texts.items.len > 0, parsed.images.items.len > 0, parsed.audio.items.len > 0);
+        var asset_lease = model.acquireEmbeddingAssetLease(parsed.audio.items.len > 0);
+        defer asset_lease.release();
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var pipeline = model.embeddingPipeline(allocator);
-        const vectors = try embedDenseInputs(allocator, &pipeline, &parsed);
+        var pipeline = try prepareInitialDenseEmbeddingPipeline(model, allocator, &parsed);
+        var audio_asset_guard = AudioEmbeddingAssetGuard.init(
+            model,
+            parsed.audio.items.len > 0,
+        );
+        defer audio_asset_guard.deinit();
+        const vectors = try embedDenseInputs(
+            allocator,
+            &pipeline,
+            &parsed,
+            model,
+            &audio_asset_guard,
+            &asset_lease,
+        );
+        asset_lease.release();
         errdefer freeDirectDenseVectors(allocator, vectors);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return vectors;
@@ -2549,10 +2592,12 @@ pub const Node = struct {
             self.metrics.incError();
             self.metrics.recordQueueRejection(requested_units);
             self.updateQueueMetrics();
-            const resp = try ctx.status(503).json(.{
-                .@"error" = "SERVICE_UNAVAILABLE",
-                .message = "server at capacity, try again later",
-            });
+            const resp = try transientCapacityFailureResponse(
+                ctx,
+                "SERVICE_UNAVAILABLE",
+                "server at capacity, try again later",
+                "request_queue",
+            );
             return resp;
         };
         self.updateQueueMetrics();
@@ -2764,14 +2809,15 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
         }
 
-        model.ensureEmbeddingAssets(
-            inputs.texts.items.len > 0,
-            inputs.images.items.len > 0,
-            inputs.audio.items.len > 0,
-        ) catch |err|
+        var asset_lease = model.acquireEmbeddingAssetLease(inputs.audio.items.len > 0);
+        defer asset_lease.release();
+        var pipeline = prepareInitialDenseEmbeddingPipeline(model, ctx.allocator, &inputs) catch |err|
             return inferenceFailureResponse(ctx, err);
-
-        var pipeline = model.embeddingPipeline(ctx.allocator);
+        var audio_asset_guard = AudioEmbeddingAssetGuard.init(
+            model,
+            inputs.audio.items.len > 0,
+        );
+        defer audio_asset_guard.deinit();
         applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, request) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -2789,13 +2835,15 @@ pub const Node = struct {
 
         switch (request.error_policy) {
             .fail_fast => {
-                const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err| {
-                    const failure = embedDenseInputFailure(err);
-                    return ctx.status(failure.status).json(.{
-                        .@"error" = failure.code,
-                        .message = failure.message,
-                    });
-                };
+                const embeddings = embedDenseInputs(
+                    ctx.allocator,
+                    &pipeline,
+                    &inputs,
+                    model,
+                    &audio_asset_guard,
+                    &asset_lease,
+                ) catch |err| return embedDenseInputFailureResponse(ctx, err);
+                asset_lease.release();
                 logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
                 defer {
                     for (embeddings) |e| ctx.allocator.free(e);
@@ -2817,7 +2865,15 @@ pub const Node = struct {
                 return http_response;
             },
             .per_item => {
-                var partial = try embedDenseInputsPartial(ctx.allocator, &pipeline, &inputs);
+                var partial = try embedDenseInputsPartial(
+                    ctx.allocator,
+                    &pipeline,
+                    &inputs,
+                    model,
+                    &audio_asset_guard,
+                    &asset_lease,
+                );
+                asset_lease.release();
                 logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
                 defer partial.deinit(ctx.allocator);
                 const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, prompt_tokens) catch |err| switch (err) {
@@ -3862,10 +3918,7 @@ pub const Node = struct {
                 .@"error" = "MODEL_RESOURCE_LIMIT",
                 .message = "request exceeds the configured inference resource budget",
             }),
-            error.ResourceTemporarilyUnavailable => return ctx.status(503).json(.{
-                .@"error" = "MODEL_RESOURCE_BUSY",
-                .message = "insufficient inference capacity is currently available",
-            }),
+            error.ResourceTemporarilyUnavailable => return modelResourceBusyResponse(ctx),
         };
         defer admission_lease.release();
 
@@ -4428,12 +4481,26 @@ pub const Node = struct {
                 .code = "MODEL_RESOURCE_BUSY",
                 .message = "insufficient inference capacity is currently available",
                 .retryable = true,
+                .retry_after_ms = transient_capacity_retry_after_ms,
             },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
                 .message = @errorName(err),
                 .retryable = true,
             },
+        };
+    }
+
+    fn batchAdmissionError(err: anyerror) api.GenerateBatchError {
+        const retryable = err == error.ResourceTemporarilyUnavailable;
+        return .{
+            .code = if (retryable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+            .message = if (retryable)
+                "insufficient inference capacity is currently available"
+            else
+                "request exceeds the configured inference resource budget",
+            .retryable = retryable,
+            .retry_after_ms = if (retryable) transient_capacity_retry_after_ms else null,
         };
     }
 
@@ -4792,11 +4859,7 @@ pub const Node = struct {
                         &task_run_budgets[pos],
                         resource_estimate,
                     ) catch |err| {
-                        results[idx].@"error" = .{
-                            .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
-                            .message = @errorName(err),
-                            .retryable = err == error.ResourceTemporarilyUnavailable,
-                        };
+                        results[idx].@"error" = batchAdmissionError(err);
                         pending[idx] = false;
                         continue;
                     };
@@ -4815,11 +4878,7 @@ pub const Node = struct {
                             &shared_run_budget,
                             resource_estimates[pos].?,
                         ) catch |err| {
-                            results[idx].@"error" = .{
-                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
-                                .message = @errorName(err),
-                                .retryable = err == error.ResourceTemporarilyUnavailable,
-                            };
+                            results[idx].@"error" = batchAdmissionError(err);
                             pending[idx] = false;
                             continue;
                         };
@@ -4952,11 +5011,7 @@ pub const Node = struct {
                             &shared_run_budget,
                             resource_estimate,
                         ) catch |err| {
-                            results[idx].@"error" = .{
-                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
-                                .message = @errorName(err),
-                                .retryable = err == error.ResourceTemporarilyUnavailable,
-                            };
+                            results[idx].@"error" = batchAdmissionError(err);
                             pending[idx] = false;
                             continue;
                         };
@@ -8384,6 +8439,29 @@ test "generate batch queue units sum pending generation work" {
     try std.testing.expectEqual(expected, node.estimateGenerateBatchQueueUnits(parsed.value.requests, owned_messages, pending[0..]));
 }
 
+test "generate batch capacity errors include actionable retry metadata" {
+    const busy_load = Node.batchModelLoadError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_load.code);
+    try std.testing.expectEqual(true, busy_load.retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        busy_load.retry_after_ms,
+    );
+
+    const busy_admission = Node.batchAdmissionError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_admission.code);
+    try std.testing.expectEqual(true, busy_admission.retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        busy_admission.retry_after_ms,
+    );
+
+    const permanent = Node.batchAdmissionError(error.ResourceLimitExceeded);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", permanent.code);
+    try std.testing.expectEqual(false, permanent.retryable);
+    try std.testing.expectEqual(@as(?i64, null), permanent.retry_after_ms);
+}
+
 test "read batch downloaded byte accounting enforces aggregate cap" {
     const item = scraping.DownloadedContent{
         .content_type = @constCast("image/png"),
@@ -8408,6 +8486,54 @@ test "read queue units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_queue_max_tokens + 1));
     try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
+}
+
+test "fail-fast embedding capacity response exposes retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/embeddings");
+    defer request.deinit();
+
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try embedDenseInputFailureResponse(
+        &ctx,
+        error.ResourceTemporarilyUnavailable,
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(
+        transient_capacity_retry_after_seconds,
+        response.header("Retry-After").?,
+    );
+
+    const RetryBody = struct {
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        retryable: bool,
+        retry_after_ms: i64,
+    };
+    var parsed = try std.json.parseFromSlice(
+        RetryBody,
+        allocator,
+        response.body.?,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", parsed.value.@"error");
+    try std.testing.expectEqualStrings(
+        "insufficient inference capacity is currently available",
+        parsed.value.message,
+    );
+    try std.testing.expectEqualStrings("inference_capacity", parsed.value.reason);
+    try std.testing.expect(parsed.value.retryable);
+    try std.testing.expectEqual(
+        @as(i64, transient_capacity_retry_after_ms),
+        parsed.value.retry_after_ms,
+    );
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {
@@ -9329,6 +9455,17 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
     };
 }
 
+fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceTemporarilyUnavailable) {
+        return modelResourceBusyResponse(ctx);
+    }
+    const failure = embedDenseInputFailure(err);
+    return ctx.status(failure.status).json(.{
+        .@"error" = failure.code,
+        .message = failure.message,
+    });
+}
+
 const EmbedItemError = struct {
     index: i64,
     code: []const u8,
@@ -9336,6 +9473,7 @@ const EmbedItemError = struct {
     stage: []const u8,
     retryable: bool,
     status: u16,
+    retry_after_ms: ?i64 = null,
 };
 
 const EmbedPartialSummary = struct {
@@ -9407,6 +9545,7 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
             .stage = stage,
             .retryable = true,
             .status = 503,
+            .retry_after_ms = transient_capacity_retry_after_ms,
         },
         else => .{
             .index = @intCast(index),
@@ -9494,10 +9633,105 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
     };
 }
 
+fn prepareInitialDenseEmbeddingPipeline(
+    model: *model_manager_mod.LoadedModel,
+    allocator: std.mem.Allocator,
+    inputs: *const ParsedDenseEmbedInputs,
+) !embedding_mod.EmbeddingPipeline {
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+    if (inputs.audio.items.len > 0) {
+        // Audio is deliberately the only optional phase admitted up front.
+        // Text/image assets are admitted after the audio outputs are copied.
+        try model.ensureAudioEmbeddingAssetsLocked();
+    } else {
+        try model.ensurePrimaryEmbeddingAssetsLocked(
+            inputs.texts.items.len > 0,
+            inputs.images.items.len > 0,
+        );
+    }
+    return model.embeddingPipelineLocked(allocator);
+}
+
+fn admitPrimaryDenseEmbeddingAssetsAfterAudio(
+    model: *model_manager_mod.LoadedModel,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    inputs: *const ParsedDenseEmbedInputs,
+) !void {
+    if (inputs.texts.items.len == 0 and inputs.images.items.len == 0) return;
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+    try model.ensurePrimaryEmbeddingAssetsLocked(
+        inputs.texts.items.len > 0,
+        inputs.images.items.len > 0,
+    );
+    model.bindEmbeddingPipelineAssetsLocked(pipeline);
+}
+
+const PartialPrimaryDenseEmbeddingAdmission = struct {
+    text_error: ?anyerror = null,
+    image_error: ?anyerror = null,
+};
+
+fn admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(
+    model: *model_manager_mod.LoadedModel,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    inputs: *const ParsedDenseEmbedInputs,
+) PartialPrimaryDenseEmbeddingAdmission {
+    var admission = PartialPrimaryDenseEmbeddingAdmission{};
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+
+    if (inputs.texts.items.len > 0) {
+        model.ensurePrimaryEmbeddingAssetsLocked(true, false) catch |err| {
+            admission.text_error = err;
+        };
+    }
+    if (inputs.images.items.len > 0) {
+        model.ensurePrimaryEmbeddingAssetsLocked(false, true) catch |err| {
+            admission.image_error = err;
+        };
+    }
+    model.bindEmbeddingPipelineAssetsLocked(pipeline);
+    return admission;
+}
+
+fn releaseAudioDenseEmbeddingAssets(model: *model_manager_mod.LoadedModel) void {
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+    model.releaseAudioEmbeddingAssetsLocked();
+}
+
+/// Owns the ephemeral audio sidecars from successful admission until the
+/// audio phase has either materialized its outputs or unwound. Keeping this
+/// ownership explicit closes the sessions on every error path before the
+/// caller releases its exclusive embedding-asset lease.
+const AudioEmbeddingAssetGuard = struct {
+    model: *model_manager_mod.LoadedModel,
+    held: bool,
+
+    fn init(model: *model_manager_mod.LoadedModel, held: bool) AudioEmbeddingAssetGuard {
+        return .{ .model = model, .held = held };
+    }
+
+    fn release(self: *AudioEmbeddingAssetGuard) void {
+        if (!self.held) return;
+        releaseAudioDenseEmbeddingAssets(self.model);
+        self.held = false;
+    }
+
+    fn deinit(self: *AudioEmbeddingAssetGuard) void {
+        self.release();
+    }
+};
+
 fn embedDenseInputs(
     allocator: std.mem.Allocator,
     pipeline: *embedding_mod.EmbeddingPipeline,
     inputs: *const ParsedDenseEmbedInputs,
+    model: *model_manager_mod.LoadedModel,
+    audio_asset_guard: *AudioEmbeddingAssetGuard,
+    asset_lease: *model_manager_mod.EmbeddingAssetLease,
 ) ![][]f32 {
     const embeddings = try allocator.alloc([]f32, inputs.total_count);
     errdefer allocator.free(embeddings);
@@ -9508,6 +9742,37 @@ fn embedDenseInputs(
     errdefer {
         for (embeddings, 0..) |embedding, i| {
             if (filled[i]) allocator.free(embedding);
+        }
+    }
+
+    // Materialize the audio outputs while its ephemeral sidecars are resident,
+    // release them, and only then admit reusable text/image sidecars.
+    if (inputs.audio.items.len > 0) {
+        {
+            defer audio_asset_guard.release();
+            const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
+            defer allocator.free(audio_inputs);
+            for (inputs.audio.items, 0..) |item, i| {
+                audio_inputs[i] = .{
+                    .bytes = item.bytes,
+                    .decode_options = .{
+                        .mime_hint = item.mime_type,
+                    },
+                };
+            }
+
+            const audio_embeddings = try pipeline.embedEncodedAudio(audio_inputs);
+            defer allocator.free(audio_embeddings);
+            for (inputs.audio.items, 0..) |item, i| {
+                embeddings[item.index] = audio_embeddings[i];
+                filled[item.index] = true;
+            }
+        }
+        if (inputs.texts.items.len > 0 or inputs.images.items.len > 0) {
+            asset_lease.downgradeExclusiveToShared();
+            try admitPrimaryDenseEmbeddingAssetsAfterAudio(model, pipeline, inputs);
+        } else {
+            asset_lease.release();
         }
     }
 
@@ -9537,26 +9802,6 @@ fn embedDenseInputs(
         }
     }
 
-    if (inputs.audio.items.len > 0) {
-        const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
-        defer allocator.free(audio_inputs);
-        for (inputs.audio.items, 0..) |item, i| {
-            audio_inputs[i] = .{
-                .bytes = item.bytes,
-                .decode_options = .{
-                    .mime_hint = item.mime_type,
-                },
-            };
-        }
-
-        const audio_embeddings = try pipeline.embedEncodedAudio(audio_inputs);
-        defer allocator.free(audio_embeddings);
-        for (inputs.audio.items, 0..) |item, i| {
-            embeddings[item.index] = audio_embeddings[i];
-            filled[item.index] = true;
-        }
-    }
-
     for (filled) |was_filled| {
         if (!was_filled) return error.MissingEmbeddingResult;
     }
@@ -9568,23 +9813,54 @@ fn embedDenseInputsPartial(
     allocator: std.mem.Allocator,
     pipeline: *embedding_mod.EmbeddingPipeline,
     inputs: *const ParsedDenseEmbedInputs,
+    model: *model_manager_mod.LoadedModel,
+    audio_asset_guard: *AudioEmbeddingAssetGuard,
+    asset_lease: *model_manager_mod.EmbeddingAssetLease,
 ) !DenseEmbedPartialResult {
-    const partial_embeddings = try allocator.alloc(?[]f32, inputs.total_count);
-    errdefer allocator.free(partial_embeddings);
-    const empty_errors = try allocator.alloc(EmbedItemError, 0);
-
-    var result = DenseEmbedPartialResult{
-        .embeddings = partial_embeddings,
-        .errors = empty_errors,
-    };
-    @memset(result.embeddings, null);
+    var result = try initDenseEmbedPartialResult(allocator, inputs.total_count);
     errdefer result.deinit(allocator);
 
     var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
     errdefer errors.deinit(allocator);
     try errors.appendSlice(allocator, inputs.parse_errors.items);
 
-    if (inputs.texts.items.len > 0) {
+    var primary_admission = PartialPrimaryDenseEmbeddingAdmission{};
+    if (inputs.audio.items.len > 0) {
+        {
+            defer audio_asset_guard.release();
+            const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
+            defer allocator.free(audio_inputs);
+            for (inputs.audio.items, 0..) |item, i| {
+                audio_inputs[i] = .{
+                    .bytes = item.bytes,
+                    .decode_options = .{ .mime_hint = item.mime_type },
+                };
+            }
+
+            if (pipeline.embedEncodedAudio(audio_inputs)) |embeddings| {
+                defer allocator.free(embeddings);
+                for (inputs.audio.items, 0..) |item, i| {
+                    result.embeddings[item.index] = embeddings[i];
+                }
+            } else |_| {
+                try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
+            }
+        }
+        if (inputs.texts.items.len > 0 or inputs.images.items.len > 0) {
+            asset_lease.downgradeExclusiveToShared();
+            primary_admission = admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(model, pipeline, inputs);
+        } else {
+            asset_lease.release();
+        }
+        if (primary_admission.text_error) |err| {
+            try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.texts.items, err, "model_admission");
+        }
+        if (primary_admission.image_error) |err| {
+            try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.images.items, err, "model_admission");
+        }
+    }
+
+    if (primary_admission.text_error == null and inputs.texts.items.len > 0) {
         const texts = try allocator.alloc([]const u8, inputs.texts.items.len);
         defer allocator.free(texts);
         for (inputs.texts.items, 0..) |item, i| texts[i] = item.text;
@@ -9599,7 +9875,7 @@ fn embedDenseInputsPartial(
         }
     }
 
-    if (inputs.images.items.len > 0) {
+    if (primary_admission.image_error == null and inputs.images.items.len > 0) {
         const images = try allocator.alloc([]const u8, inputs.images.items.len);
         defer allocator.free(images);
         for (inputs.images.items, 0..) |item, i| images[i] = item.bytes;
@@ -9611,26 +9887,6 @@ fn embedDenseInputsPartial(
             }
         } else |_| {
             try embedImageInputsIndividually(allocator, pipeline, inputs.images.items, images, &errors, &result);
-        }
-    }
-
-    if (inputs.audio.items.len > 0) {
-        const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
-        defer allocator.free(audio_inputs);
-        for (inputs.audio.items, 0..) |item, i| {
-            audio_inputs[i] = .{
-                .bytes = item.bytes,
-                .decode_options = .{ .mime_hint = item.mime_type },
-            };
-        }
-
-        if (pipeline.embedEncodedAudio(audio_inputs)) |embeddings| {
-            defer allocator.free(embeddings);
-            for (inputs.audio.items, 0..) |item, i| {
-                result.embeddings[item.index] = embeddings[i];
-            }
-        } else |_| {
-            try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
         }
     }
 
@@ -9653,6 +9909,29 @@ fn embedDenseInputsPartial(
     allocator.free(result.errors);
     result.errors = owned_errors;
     return result;
+}
+
+fn initDenseEmbedPartialResult(allocator: std.mem.Allocator, total_count: usize) !DenseEmbedPartialResult {
+    const embeddings = try allocator.alloc(?[]f32, total_count);
+    errdefer allocator.free(embeddings);
+    const errors = try allocator.alloc(EmbedItemError, 0);
+    @memset(embeddings, null);
+    return .{
+        .embeddings = embeddings,
+        .errors = errors,
+    };
+}
+
+fn appendDenseEmbeddingItemErrors(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayListUnmanaged(EmbedItemError),
+    items: anytype,
+    err: anyerror,
+    stage: []const u8,
+) !void {
+    for (items) |item| {
+        try errors.append(allocator, embedItemFailure(item.index, err, stage));
+    }
 }
 
 fn embedTextInputsIndividually(
@@ -10036,6 +10315,86 @@ test "Antfly inference per-item dense parser records invalid media and keeps sib
     try std.testing.expectEqualStrings("INVALID_MEDIA", inputs.parse_errors.items[0].code);
     try std.testing.expectEqualStrings("parse", inputs.parse_errors.items[0].stage);
     try std.testing.expectEqual(false, inputs.parse_errors.items[0].retryable);
+}
+
+test "dense partial result cleanup owns every allocation exactly once" {
+    const Probe = struct {
+        fn failAfterPopulating(allocator: std.mem.Allocator) !void {
+            var result = try initDenseEmbedPartialResult(allocator, 2);
+            errdefer result.deinit(allocator);
+            result.embeddings[0] = try allocator.dupe(f32, &.{ 1.0, 2.0 });
+            return error.InjectedFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFailure, Probe.failAfterPopulating(std.testing.allocator));
+}
+
+test "audio embedding asset guard releases admission on early failure" {
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.embedding_session_lock = .unlocked;
+    model.audio_session = null;
+    model.audio_projection = null;
+    model.audio_resource_lease = null;
+    model.audio_projection_resource_lease = null;
+
+    var guard = AudioEmbeddingAssetGuard.init(&model, true);
+    const Probe = struct {
+        fn fail(owned: *AudioEmbeddingAssetGuard) !void {
+            defer owned.deinit();
+            return error.InjectedFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFailure, Probe.fail(&guard));
+    try std.testing.expect(!guard.held);
+    guard.deinit();
+}
+
+test "primary embedding admission failures are recorded per affected item" {
+    const allocator = std.testing.allocator;
+    const texts = [_]ParsedTextEmbedInput{
+        .{ .index = 1, .text = "first" },
+        .{ .index = 3, .text = "second" },
+    };
+    var image_bytes = [_]u8{ 1, 2, 3 };
+    const images = [_]ParsedBinaryEmbedInput{
+        .{ .index = 4, .bytes = &image_bytes, .mime_type = "image/png" },
+    };
+    var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
+    defer errors.deinit(allocator);
+
+    try appendDenseEmbeddingItemErrors(
+        allocator,
+        &errors,
+        &texts,
+        error.ResourceTemporarilyUnavailable,
+        "model_admission",
+    );
+    try appendDenseEmbeddingItemErrors(
+        allocator,
+        &errors,
+        &images,
+        error.ResourceLimitExceeded,
+        "model_admission",
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), errors.items.len);
+    try std.testing.expectEqual(@as(i64, 1), errors.items[0].index);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", errors.items[0].code);
+    try std.testing.expectEqual(@as(u16, 503), errors.items[0].status);
+    try std.testing.expect(errors.items[0].retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        errors.items[0].retry_after_ms,
+    );
+    try std.testing.expectEqual(@as(i64, 3), errors.items[1].index);
+    try std.testing.expectEqualStrings("model_admission", errors.items[1].stage);
+    try std.testing.expectEqual(@as(i64, 4), errors.items[2].index);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", errors.items[2].code);
+    try std.testing.expectEqual(@as(u16, 400), errors.items[2].status);
+    try std.testing.expect(!errors.items[2].retryable);
+    try std.testing.expectEqual(@as(?i64, null), errors.items[2].retry_after_ms);
 }
 
 fn expectJsonNumber(expected: f64, value: std.json.Value) !void {

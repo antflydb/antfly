@@ -5490,8 +5490,30 @@ pub const DataServer = struct {
                 return;
             }
 
-            if (allow_remote_forward and local_status_missing) {
-                if (try self.forwardRaftBatchToPlacementReplica(alloc, group_id, table_name, req, local_node_id, deadline_ns, refresh_metadata)) return;
+            // A hosted replica can temporarily have a stale, leaderless local
+            // view even while another placement replica knows the leader. Let
+            // only the originating request, which refreshes metadata, escape
+            // that view. An internal group request may still follow the known
+            // leader below, but must not bounce through leaderless replicas.
+            if (shouldForwardRaftBatchToPlacementReplica(
+                allow_remote_forward,
+                refresh_metadata,
+                local_status_missing,
+                leader_node_id,
+            )) {
+                const escape_leaderless_local = refresh_metadata and
+                    !local_status_missing and
+                    leader_node_id == null;
+                if (try self.forwardRaftBatchToPlacementReplica(
+                    alloc,
+                    group_id,
+                    table_name,
+                    req,
+                    local_node_id,
+                    deadline_ns,
+                    refresh_metadata,
+                    escape_leaderless_local,
+                )) return;
             }
 
             if (allow_remote_forward) {
@@ -5607,6 +5629,7 @@ pub const DataServer = struct {
         local_node_id: u64,
         deadline_ns: u64,
         refresh_metadata: bool,
+        allow_local_placement_source: bool,
     ) !bool {
         const remote_metadata = self.remote_metadata orelse return false;
         var snapshot = if (refresh_metadata)
@@ -5615,26 +5638,23 @@ pub const DataServer = struct {
             (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
 
-        var local_has_placement = false;
-        var target_node_id: ?u64 = null;
+        var preferred_node_id: ?u64 = null;
         if (findMergedSnapshotGroupStatus(snapshot.merged_group_statuses, group_id)) |status| {
             if (status.leader_known and status.leader_store_id != 0) {
                 if (findSnapshotStore(snapshot.stores, status.leader_store_id)) |store| {
-                    target_node_id = store.node_id;
+                    preferred_node_id = store.node_id;
                 }
             }
         }
-        for (snapshot.placement_intents) |intent| {
-            if (intent.record.group_id != group_id) continue;
-            if (intent.record.local_node_id == local_node_id) {
-                local_has_placement = true;
-                continue;
-            }
-            if (target_node_id == null) target_node_id = intent.record.local_node_id;
-        }
-        if (local_has_placement or target_node_id == null or target_node_id.? == local_node_id) return false;
+        const target_node_id = remoteRaftBatchPlacementNode(
+            group_id,
+            local_node_id,
+            preferred_node_id,
+            snapshot.placement_intents,
+            allow_local_placement_source,
+        ) orelse return false;
 
-        const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id.?) orelse return false;
+        const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return false;
         if (target_store.api_url.len == 0) return false;
 
         var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
@@ -5658,6 +5678,42 @@ pub const DataServer = struct {
         };
         response.deinit(alloc);
         return true;
+    }
+
+    fn shouldForwardRaftBatchToPlacementReplica(
+        allow_remote_forward: bool,
+        refresh_metadata: bool,
+        local_status_missing: bool,
+        leader_node_id: ?u64,
+    ) bool {
+        if (!allow_remote_forward) return false;
+        if (local_status_missing) return true;
+        return refresh_metadata and leader_node_id == null;
+    }
+
+    fn remoteRaftBatchPlacementNode(
+        group_id: u64,
+        local_node_id: u64,
+        preferred_node_id: ?u64,
+        placement_intents: []const antfly.raft.PlacementIntent,
+        allow_local_placement_source: bool,
+    ) ?u64 {
+        var fallback: ?u64 = null;
+        var preferred: ?u64 = null;
+        var local_has_placement = false;
+        for (placement_intents) |intent| {
+            if (intent.record.group_id != group_id) continue;
+            const node_id = intent.record.local_node_id;
+            if (node_id == local_node_id) {
+                local_has_placement = true;
+                continue;
+            }
+            if (!antfly.raft.placementMayLeadMembershipTransition(intent)) continue;
+            if (preferred_node_id != null and node_id == preferred_node_id.?) preferred = node_id;
+            if (fallback == null) fallback = node_id;
+        }
+        if (local_has_placement and !allow_local_placement_source) return null;
+        return preferred orelse fallback;
     }
 
     fn dataRaftBatchHttpTimeoutMs(deadline_ns: u64) u32 {
@@ -24144,4 +24200,49 @@ test "data raft forwarding classifies deadline and transport failures as retryab
     try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.ConnectionResetByPeer));
     try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.LeaderUnavailable));
     try std.testing.expect(!DataServer.isRetryableDataRaftForwardError(error.OutOfMemory));
+}
+
+test "data raft batch forwarding escapes a leaderless local placement" {
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 101 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 102 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 3, .local_node_id = 103 } },
+        .{ .record = .{ .group_id = 7002, .replica_id = 4, .local_node_id = 104 } },
+        .{ .record = .{ .group_id = 7003, .replica_id = 5, .local_node_id = 105 }, .serving_state = .planned },
+        .{ .record = .{ .group_id = 7003, .replica_id = 6, .local_node_id = 106 } },
+    };
+
+    try std.testing.expectEqual(
+        @as(?u64, 102),
+        DataServer.remoteRaftBatchPlacementNode(7001, 101, null, &intents, true),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 103),
+        DataServer.remoteRaftBatchPlacementNode(7001, 101, 103, &intents, true),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        DataServer.remoteRaftBatchPlacementNode(7002, 104, null, &intents, true),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        DataServer.remoteRaftBatchPlacementNode(7001, 101, 103, &intents, false),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 106),
+        DataServer.remoteRaftBatchPlacementNode(7003, 999, null, &intents, false),
+    );
+
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        true,
+        false,
+        null,
+    ));
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        false,
+        false,
+        null,
+    ));
 }

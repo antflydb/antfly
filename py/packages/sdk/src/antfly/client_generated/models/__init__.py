@@ -319,6 +319,7 @@ from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
 from .inference_error import InferenceError
+from .inference_error_reason import InferenceErrorReason
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
@@ -422,6 +423,8 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_transient_capacity_error import InferenceTransientCapacityError
+from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -992,6 +995,7 @@ __all__ = (
     "InferenceEmbedResponse",
     "InferenceEmbedResponseObject",
     "InferenceError",
+    "InferenceErrorReason",
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
@@ -1096,6 +1100,8 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
+    "InferenceTransientCapacityError",
+    "InferenceTransientCapacityErrorReason",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",

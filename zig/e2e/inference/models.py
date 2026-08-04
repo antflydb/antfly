@@ -222,12 +222,15 @@ GENERATOR_MODELS = [
         name="gemma-4-e2b-it-gguf",
         repo="ggml-org/gemma-4-e2b-it-gguf",
         task="generators",
+        variant="gguf:Q4_0",
         large=True,
     ),
     ModelSpec(
         name="Qwen3-1.7B-GGUF",
         repo="unsloth/Qwen3-1.7B-GGUF",
         task="generators",
+        variant="gguf:Q4_K_M",
+        large=True,
     ),
     ModelSpec(
         name="Llama-3.2-1B-Instruct-GGUF",
@@ -239,7 +242,7 @@ GENERATOR_MODELS = [
 
 
 DEFAULT_GENERATOR_MODEL = "unsloth/Qwen3-1.7B-GGUF"
-DEFAULT_TOOL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
+DEFAULT_TOOL_GENERATOR_MODEL = DEFAULT_GENERATOR_MODEL
 DEFAULT_MULTIMODAL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 
 CURATED_MODELS = [
@@ -654,6 +657,8 @@ def find_multimodal_generator_model_name(available_generators: set[str] | None =
                 return model_name
 
     if available_generators is not None:
+        # The curated fallback is capability-reviewed and remains usable when
+        # a GGUF package does not carry Hugging Face processor metadata.
         if DEFAULT_MULTIMODAL_GENERATOR_MODEL in available_generators:
             return DEFAULT_MULTIMODAL_GENERATOR_MODEL
         return None
@@ -741,13 +746,15 @@ def bootstrap_models_for_listing(listing: dict) -> bool:
     if not inference_download_enabled():
         return False
 
+    env_specs = _env_model_specs()
+    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in env_specs}
     planned: list[ModelSpec] = []
     for category, spec in LISTING_BOOTSTRAP.items():
         if listing.get(category):
             continue
         planned.append(spec)
 
-    planned.extend(_env_model_specs())
+    planned.extend(env_specs)
 
     changed = False
     seen: set[tuple[str, str]] = set()
@@ -756,7 +763,7 @@ def bootstrap_models_for_listing(listing: dict) -> bool:
         if key in seen:
             continue
         seen.add(key)
-        if spec.large and not run_large_model_tests():
+        if spec.large and key not in explicit_keys and not run_large_model_tests():
             continue
         if model_available(spec):
             continue
