@@ -67,6 +67,7 @@ class ModelSpec:
     multilingual: bool = False
     large: bool = False
     extra_files: tuple[str, ...] = field(default_factory=tuple)
+    projector: str | None = None
 
     @property
     def request_name(self) -> str:
@@ -224,6 +225,7 @@ GENERATOR_MODELS = [
         task="generators",
         variant="gguf:Q4_0",
         large=True,
+        projector="Q8_0",
     ),
     ModelSpec(
         name="Qwen3-1.7B-GGUF",
@@ -503,6 +505,8 @@ def ensure_model(spec: ModelSpec) -> Path:
         "--tasks",
         TASK_NAME_BY_DIR[spec.task],
     ]
+    if spec.projector is not None:
+        command.extend(["--projector", spec.projector])
     configured_models_dir = os.environ.get("ANTFLY_INFERENCE_MODELS_DIR")
     if configured_models_dir:
         command.extend(["--models-dir", str(models_dir())])

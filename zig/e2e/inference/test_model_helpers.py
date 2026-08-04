@@ -7,8 +7,14 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import json
+import tempfile
+import threading
+from types import SimpleNamespace
+
+import requests
 
 from . import models
+from .conftest import InferenceServer, capacity_retry_delay, retry_transient_capacity
 from .models import (
     DEFAULT_GENERATOR_MODEL,
     DEFAULT_MULTIMODAL_GENERATOR_MODEL,
@@ -173,3 +179,165 @@ def test_explicit_large_generator_is_bootstrapped(monkeypatch):
     assert bootstrap_models_for_listing(listing)
     assert [spec.repo for spec in pulled] == [DEFAULT_GENERATOR_MODEL]
     assert pulled[0].pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0"
+    assert pulled[0].projector == "Q8_0"
+
+
+def test_gemma_pull_requests_q8_projector(monkeypatch, tmp_path):
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    monkeypatch.setattr(models, "inference_command", lambda: ["antfly", "inference"])
+    monkeypatch.setattr(
+        models,
+        "find_local_model_path",
+        lambda *_args: None if not calls else tmp_path / DEFAULT_GENERATOR_MODEL,
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        models.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(command)
+        or SimpleNamespace(returncode=0),
+    )
+
+    models.ensure_model(spec)
+
+    assert calls
+    projector_index = calls[0].index("--projector")
+    assert calls[0][projector_index + 1] == "Q8_0"
+
+
+def _response(status: int, body: dict) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response.headers["content-type"] = "application/json"
+    response._content = json.dumps(body).encode()
+    return response
+
+
+def test_capacity_retry_requires_explicit_retry_contract():
+    retryable = _response(
+        503,
+        {
+            "error": "MODEL_RESOURCE_BUSY",
+            "retryable": True,
+            "retry_after_ms": 1250,
+        },
+    )
+    assert capacity_retry_delay(retryable, 0.25) == 1.25
+    assert (
+        capacity_retry_delay(_response(503, {"error": "MODEL_RESOURCE_BUSY"}), 0.25)
+        is None
+    )
+    assert capacity_retry_delay(_response(500, {"retryable": True}), 0.25) is None
+
+
+def test_capacity_retry_uses_header_fallback_and_sanitizes_delay():
+    retryable = _response(
+        503,
+        {"error": "MODEL_RESOURCE_BUSY", "retryable": True},
+    )
+    retryable.headers["Retry-After"] = "2"
+    assert capacity_retry_delay(retryable, 0.25) == 2
+
+    retryable._content = json.dumps(
+        {
+            "error": "MODEL_RESOURCE_BUSY",
+            "retryable": True,
+            "retry_after_ms": float("nan"),
+        }
+    ).encode()
+    assert capacity_retry_delay(retryable, 0.25) == 0.25
+
+
+def test_capacity_retry_closes_rejection_and_replays_after_delay():
+    busy = _response(
+        503,
+        {"error": "MODEL_RESOURCE_BUSY", "retryable": True, "retry_after_ms": 1000},
+    )
+    success = _response(200, {"ok": True})
+    now = [10.0]
+    sends = []
+
+    def sleep(delay):
+        now[0] += delay
+
+    result = retry_transient_capacity(
+        busy,
+        lambda: sends.append(True) or success,
+        timeout=5,
+        clock=lambda: now[0],
+        sleeper=sleep,
+    )
+
+    assert result is success
+    assert sends == [True]
+    assert busy.raw is None or busy._content_consumed
+    assert now[0] == 11.0
+
+
+def test_capacity_retry_preserves_last_response_at_deadline():
+    busy = _response(
+        503,
+        {"error": "MODEL_RESOURCE_BUSY", "retryable": True, "retry_after_ms": 1000},
+    )
+    result = retry_transient_capacity(
+        busy,
+        lambda: (_ for _ in ()).throw(AssertionError("must not replay")),
+        timeout=0.5,
+        clock=lambda: 1.0,
+        sleeper=lambda _delay: None,
+    )
+    assert result is busy
+
+
+def test_capacity_retry_bounds_attempts_under_zero_delay():
+    responses = [
+        _response(
+            503,
+            {"error": "MODEL_RESOURCE_BUSY", "retryable": True, "retry_after_ms": 0},
+        )
+        for _ in range(4)
+    ]
+    sends = []
+    result = retry_transient_capacity(
+        responses[0],
+        lambda: sends.append(True) or responses[len(sends)],
+        timeout=30,
+        max_attempts=2,
+        clock=lambda: 0,
+        sleeper=lambda _delay: None,
+    )
+    assert result is responses[2]
+    assert len(sends) == 2
+
+
+def test_live_server_tail_read_does_not_move_shared_output_offset():
+    server = InferenceServer.__new__(InferenceServer)
+    server.output = tempfile.TemporaryFile(mode="w+b")
+    try:
+        server.output.write(b"prefix\nactionable backend error\n")
+        server.output.seek(3)
+        position = server.output.tell()
+
+        assert "actionable backend error" in server.read_output()
+        assert server.output.tell() == position
+    finally:
+        server.output.close()
+
+
+def test_live_server_http_diagnostic_is_reported_once(capsys):
+    server = InferenceServer.__new__(InferenceServer)
+    server.output = tempfile.TemporaryFile(mode="w+b")
+    server.output.write(b"backend failed to load tensor\n")
+    server.proc = SimpleNamespace(poll=lambda: None)
+    server.http_failure_reported = False
+    server._diagnostic_lock = threading.Lock()
+    try:
+        server.report_http_failure_once()
+        server.report_http_failure_once()
+        captured = capsys.readouterr()
+        assert captured.err.count("backend failed to load tensor") == 1
+        assert "still running" in captured.err
+    finally:
+        server.output.close()

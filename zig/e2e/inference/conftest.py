@@ -35,11 +35,14 @@ Usage:
     ANTFLY_INFERENCE_URL=https://inference.example.com ANTFLY_INFERENCE_TOKEN=... uv run --project e2e/inference pytest e2e/inference
 """
 
+import math
 import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 
 import pytest
@@ -51,6 +54,14 @@ API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
 DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
 SERVER_OUTPUT_LIMIT = 64 * 1024
+CAPACITY_RETRY_TIMEOUT = float(
+    os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_TIMEOUT", "30")
+)
+CAPACITY_RETRY_MAX_ATTEMPTS = int(
+    os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_MAX_ATTEMPTS", "5")
+)
+MIN_CAPACITY_RETRY_DELAY = 0.05
+MAX_CAPACITY_RETRY_DELAY = 5.0
 _LOCAL_SERVERS_BY_URL: dict[str, "InferenceServer"] = {}
 
 
@@ -95,6 +106,65 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
+def _response_json(response) -> dict:
+    if not response.headers.get("content-type", "").startswith("application/json"):
+        return {}
+    try:
+        value = response.json()
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def capacity_retry_delay(response, fallback_delay: float) -> float | None:
+    """Return the bounded retry delay for an admission rejection, if any."""
+
+    if response.status_code != 503:
+        return None
+    body = _response_json(response)
+    if body.get("error") != "MODEL_RESOURCE_BUSY" or body.get("retryable") is not True:
+        return None
+    retry_after_ms = body.get("retry_after_ms")
+    if type(retry_after_ms) in (int, float):
+        delay = float(retry_after_ms) / 1000
+    else:
+        try:
+            delay = float(response.headers["Retry-After"])
+        except (KeyError, TypeError, ValueError):
+            delay = fallback_delay
+    if not math.isfinite(delay) or delay < 0:
+        delay = fallback_delay
+    return min(max(delay, MIN_CAPACITY_RETRY_DELAY), MAX_CAPACITY_RETRY_DELAY)
+
+
+def retry_transient_capacity(
+    response,
+    send,
+    timeout: float = CAPACITY_RETRY_TIMEOUT,
+    max_attempts: int = CAPACITY_RETRY_MAX_ATTEMPTS,
+    *,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+):
+    """Retry requests rejected before execution by transient admission pressure."""
+
+    deadline = clock() + max(0.0, timeout)
+    fallback_delay = 0.25
+    attempts = 0
+    while (delay := capacity_retry_delay(response, fallback_delay)) is not None:
+        if attempts >= max(0, max_attempts):
+            break
+        now = clock()
+        if now + delay > deadline:
+            break
+        response.close()
+        sleeper(delay)
+        response = send()
+        attempts += 1
+        fallback_delay = min(fallback_delay * 2, MAX_CAPACITY_RETRY_DELAY)
+    return response
+
+
 class InferenceServer:
     """Manages a local inference server process."""
 
@@ -109,6 +179,8 @@ class InferenceServer:
     ):
         self.url = f"http://{host}:{port}"
         self.failure_reported = False
+        self.http_failure_reported = False
+        self._diagnostic_lock = threading.Lock()
         self.output = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen(
             [
@@ -139,10 +211,21 @@ class InferenceServer:
 
     def read_output(self) -> str:
         self.output.flush()
-        self.output.seek(0, os.SEEK_END)
-        size = self.output.tell()
-        self.output.seek(max(0, size - SERVER_OUTPUT_LIMIT))
-        return self.output.read(SERVER_OUTPUT_LIMIT).decode(errors="replace")
+        descriptor = self.output.fileno()
+        size = os.fstat(descriptor).st_size
+        offset = max(0, size - SERVER_OUTPUT_LIMIT)
+        if hasattr(os, "pread"):
+            data = os.pread(descriptor, SERVER_OUTPUT_LIMIT, offset)
+        elif self.proc.poll() is not None:  # pragma: no cover - Windows fallback after exit.
+            position = self.output.tell()
+            try:
+                self.output.seek(offset)
+                data = self.output.read(SERVER_OUTPUT_LIMIT)
+            finally:
+                self.output.seek(position)
+        else:  # pragma: no cover - never move a live child's shared file offset.
+            return "<output tail unavailable while this platform's server is running>"
+        return data.decode(errors="replace")
 
     def failure_diagnostic(self) -> str:
         returncode = self.proc.poll()
@@ -157,6 +240,15 @@ class InferenceServer:
         else:
             status = f"exited with status {returncode}"
         return f"Local inference server {status}. Output tail:\n{self.read_output()}"
+
+    def report_http_failure_once(self) -> None:
+        """Expose backend logs for a live local server without moving its write offset."""
+
+        with self._diagnostic_lock:
+            if self.http_failure_reported:
+                return
+            self.http_failure_reported = True
+            print(self.failure_diagnostic(), file=sys.stderr, flush=True)
 
     def stop(self, close_output: bool = True):
         if self.proc and self.proc.poll() is None:
@@ -243,28 +335,41 @@ def api(base_url):
             self.s = session
             self.url = base_url
 
-        def _request(self, method: str, path: str, *, json=None, retry_on_missing_model: bool = True, **kwargs):
+        def _request(
+            self,
+            method: str,
+            path: str,
+            *,
+            json=None,
+            retry_on_missing_model: bool = True,
+            **kwargs,
+        ):
             request = getattr(self.s, method)
             normalized_path = api_path(path)
             kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
-            try:
-                response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
-            except requests.RequestException as exc:
-                local_server = _LOCAL_SERVERS_BY_URL.get(self.url)
-                if local_server is not None and local_server.proc.poll() is not None:
-                    local_server.failure_reported = True
-                    raise AssertionError(local_server.failure_diagnostic()) from exc
-                raise
-            if retry_on_missing_model and maybe_pull_missing_model(normalized_path, json, response):
-                response.close()
+            local_server = _LOCAL_SERVERS_BY_URL.get(self.url)
+
+            def send():
                 try:
-                    response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
+                    return request(f"{self.url}{normalized_path}", json=json, **kwargs)
                 except requests.RequestException as exc:
-                    local_server = _LOCAL_SERVERS_BY_URL.get(self.url)
-                    if local_server is not None and local_server.proc.poll() is not None:
+                    if (
+                        local_server is not None
+                        and local_server.proc.poll() is not None
+                    ):
                         local_server.failure_reported = True
                         raise AssertionError(local_server.failure_diagnostic()) from exc
                     raise
+
+            response = send()
+            if retry_on_missing_model and maybe_pull_missing_model(
+                normalized_path, json, response
+            ):
+                response.close()
+                response = send()
+            response = retry_transient_capacity(response, send)
+            if response.status_code >= 500 and local_server is not None:
+                local_server.report_http_failure_once()
             return response
 
         def post(self, path: str, json=None, **kwargs):

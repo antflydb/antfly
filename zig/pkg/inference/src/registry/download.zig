@@ -263,9 +263,12 @@ const gguf_quant_preference = [_][]const u8{
     "Q2_K",
 };
 
-/// Preferred external multimodal projector GGUF payloads, best quality first.
+/// Preferred external multimodal projector GGUF payloads for automatic pulls.
+/// Q8 is effectively lossless for projector inference while avoiding the
+/// roughly 2x residency and download cost of F16/BF16. Users who need a dense
+/// projector can still select it explicitly with `--projector BF16`.
 const gguf_projector_preference = [_][]const u8{
-    "f16", "bf16", "F16", "BF16", "Q8_0", "q8_0", "Q6_K", "q6_k", "Q5_K_M", "q5_k_m", "Q4_K_M", "q4_k_m",
+    "Q8_0", "q8_0", "Q6_K", "q6_k", "Q5_K_M", "q5_k_m", "Q4_K_M", "q4_k_m", "f16", "bf16", "F16", "BF16",
 };
 
 fn basename(path: []const u8) []const u8 {
@@ -2600,7 +2603,25 @@ test "projector-only selection finds mmproj gguf" {
     try std.testing.expect(try appendBestGgufProjectorFile(allocator, &to_download, &files));
 
     try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
-    try std.testing.expectEqualStrings("mmproj-gemma-4-e2b-it-f16.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("nested/mmproj-gemma-4-e2b-it-q8_0.gguf", to_download.items[0].name);
+}
+
+test "automatic projector selection prefers q8 while dense remains explicit" {
+    const allocator = std.testing.allocator;
+    const files = [_]HubFile{
+        .{ .name = "mmproj-gemma-4-E2B-it-BF16.gguf", .size = 928 * 1024 * 1024 },
+        .{ .name = "mmproj-gemma-4-E2B-it-Q8_0.gguf", .size = 480 * 1024 * 1024 },
+    };
+
+    var automatic = std.ArrayListUnmanaged(HubFile).empty;
+    defer automatic.deinit(allocator);
+    try std.testing.expect(try appendSelectedGgufProjectorFile(allocator, &automatic, &files, .auto));
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E2B-it-Q8_0.gguf", automatic.items[0].name);
+
+    var explicit = std.ArrayListUnmanaged(HubFile).empty;
+    defer explicit.deinit(allocator);
+    try std.testing.expect(try appendSelectedGgufProjectorFile(allocator, &explicit, &files, .{ .match = "BF16" }));
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E2B-it-BF16.gguf", explicit.items[0].name);
 }
 
 test "gguf selection honors requested projector suffix" {
