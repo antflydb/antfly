@@ -322,8 +322,20 @@ const SegmentFileStore = struct {
     }
 
     fn publish(self: *SegmentFileStore, seg_id: u64, bytes: []const u8) !index_mod.SegmentData {
+        return try self.publishImpl(seg_id, bytes, true);
+    }
+
+    /// Re-materializes an already committed segment. A failed replacement
+    /// must retain whichever final path is present so the committed inline
+    /// bytes can be retried on the next open.
+    fn publishExisting(self: *SegmentFileStore, seg_id: u64, bytes: []const u8) !index_mod.SegmentData {
+        return try self.publishImpl(seg_id, bytes, false);
+    }
+
+    fn publishImpl(self: *SegmentFileStore, seg_id: u64, bytes: []const u8, delete_final_on_error: bool) !index_mod.SegmentData {
         const path = try self.pathAlloc(seg_id);
         defer self.allocator.free(path);
+        errdefer if (delete_final_on_error) self.delete(seg_id);
 
         if (self.storage_owner) |owner| {
             var admission = try NativeSegmentPublicationAdmission.init(owner);
@@ -410,6 +422,7 @@ const RetiredSegmentFileDeleter = struct {
     root_dir: []u8,
     storage: storage_io.Storage,
     native_storage_lease: ?storage_io.NativeStorage.Lease = null,
+    refs: std.atomic.Value(usize) = .init(1),
 
     fn init(allocator: Allocator, store: *const SegmentFileStore) !*RetiredSegmentFileDeleter {
         const deleter = try allocator.create(RetiredSegmentFileDeleter);
@@ -426,17 +439,31 @@ const RetiredSegmentFileDeleter = struct {
         return deleter;
     }
 
-    fn deinit(self: *RetiredSegmentFileDeleter) void {
+    fn retain(ptr: *anyopaque) void {
+        const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *RetiredSegmentFileDeleter) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         if (self.native_storage_lease) |*lease| lease.deinit();
         allocator.free(self.root_dir);
         allocator.destroy(self);
     }
 
+    fn releaseContext(ptr: *anyopaque) void {
+        const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
+        self.release();
+    }
+
     fn cleanup(self: *RetiredSegmentFileDeleter) index_mod.RetiredSegmentCleanup {
         return .{
             .ptr = self,
             .delete = delete,
+            .retain_context = retain,
+            .release_context = releaseContext,
         };
     }
 
@@ -1156,7 +1183,7 @@ pub const PersistentIndex = struct {
                 };
                 var segment_data: ?index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
                     break :blk if (segment_files) |*store|
-                        try store.publish(seg_id, bytes)
+                        try store.publishExisting(seg_id, bytes)
                     else
                         index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, bytes));
                 } else if (segment_files) |*store| blk: {
@@ -1275,7 +1302,7 @@ pub const PersistentIndex = struct {
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
-        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
+        if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
         self.* = undefined;
@@ -1289,7 +1316,7 @@ pub const PersistentIndex = struct {
         self.wal.abandonAfterCrash();
         self.main_store.deinit();
         self.main_store_owner.abandonAfterCrash(self.alloc);
-        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
+        if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
         self.* = undefined;
@@ -1470,29 +1497,36 @@ pub const PersistentIndex = struct {
             segment_data = try self.materializeSegmentData(seg_id, owned.?);
             segment_data.?.madviseAccessPattern();
             if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
-        }
-        errdefer {
-            if (segment_data) |*data| data.deinit(self.alloc);
-            if (self.segment_files != null) self.deleteSegmentFile(seg_id);
-        }
-
-        // 4. Persist metadata.
-        const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, owned.?, lsn);
-        if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
-
-        if (self.segment_files == null) {
+        } else {
             segment_data = index_mod.SegmentData.fromOwnedHeap(owned.?);
             owned = null;
         }
+        var rollback_segment = true;
+        errdefer {
+            if (rollback_segment) {
+                if (segment_data) |*data| data.deinit(self.alloc);
+                if (self.segment_files != null) self.deleteSegmentFile(seg_id);
+            }
+        }
 
-        // 5. Add to in-memory writer (addSegmentWithIdData will acquire the lock itself)
+        var replacement = [_]index_mod.ReplacementSegmentData{.{
+            .id = seg_id,
+            .data = segment_data.?,
+        }};
+        var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        defer writer_publication.abort();
+
+        // 4. Persist metadata.
+        const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        try self.persistSegment(seg_id, segment_data.?.bytes(), lsn);
+        if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
+
+        // 5. Every fallible snapshot allocation was staged before catalog
+        // commit. Publication is now infallible and transfers segment_data.
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        self.writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
-            if (builtin.os.tag != .freestanding) std.log.err("text segment snapshot publish failed: {s}", .{@errorName(err)});
-            return err;
-        };
+        writer_publication.publish();
         segment_data = null;
+        rollback_segment = false;
         if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
 
         // 6. Truncate WAL
@@ -1563,14 +1597,19 @@ pub const PersistentIndex = struct {
         const reserve_id_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         const seg_id = self.reserveSegmentId();
         if (profile_enabled) reserve_id_ns = platform_time.monotonicNs() - reserve_id_start_ns;
+        var rollback_segment = true;
+        errdefer if (rollback_segment) self.deleteSegmentFile(seg_id);
 
         const store = &self.segment_files.?;
+        const storage_owner = store.storage_owner.?;
+        var publication_admission = try NativeSegmentPublicationAdmission.init(storage_owner);
+        defer publication_admission.deinit();
         const path = try store.pathAlloc(seg_id);
         defer store.allocator.free(path);
 
         const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         const begin_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        var writer = try publication_admission.beginAtomicWrite(self.alloc, path);
         if (profile_enabled) begin_write_ns = platform_time.monotonicNs() - begin_write_start_ns;
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
@@ -1591,7 +1630,7 @@ pub const PersistentIndex = struct {
         if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
 
         const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var segment_data: ?index_mod.SegmentData = .fromMapped(store.mapFile(path) catch |err| {
+        var segment_data: ?index_mod.SegmentData = .fromMapped(publication_admission.mapFile(path) catch |err| {
             if (builtin.os.tag != .freestanding) std.log.err("text segment map failed: {s}", .{@errorName(err)});
             return err;
         });
@@ -1599,7 +1638,6 @@ pub const PersistentIndex = struct {
         if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
         errdefer {
             if (segment_data) |*data| data.deinit(self.alloc);
-            self.deleteSegmentFile(seg_id);
         }
 
         const key_range_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
@@ -1609,6 +1647,13 @@ pub const PersistentIndex = struct {
         };
         if (profile_enabled) key_range_ns = platform_time.monotonicNs() - key_range_start_ns;
         defer key_range.deinit(self.alloc);
+
+        var replacement = [_]index_mod.ReplacementSegmentData{.{
+            .id = seg_id,
+            .data = segment_data.?,
+        }};
+        var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        defer writer_publication.abort();
 
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         self.lockStorage();
@@ -1638,8 +1683,9 @@ pub const PersistentIndex = struct {
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.writer.addSegmentWithIdData(seg_id, segment_data.?);
+        writer_publication.publish();
         segment_data = null;
+        rollback_segment = false;
         if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
 
         if (profile_enabled) {
@@ -1845,10 +1891,29 @@ pub const PersistentIndex = struct {
         defer alloc.free(existing_dest_ids);
         var existing_dest = std.AutoHashMapUnmanaged(u64, void).empty;
         defer existing_dest.deinit(alloc);
-        try existing_dest.ensureTotalCapacity(alloc, @intCast(existing_dest_ids.len));
+        try existing_dest.ensureTotalCapacity(alloc, @intCast(existing_dest_ids.len + plan.len));
         for (existing_dest_ids) |seg_id| {
             existing_dest.putAssumeCapacity(seg_id, {});
         }
+
+        var replacements = try alloc.alloc(index_mod.ReplacementSegmentData, plan.len);
+        defer alloc.free(replacements);
+        var replacement_deleted = try alloc.alloc(?roaring.RoaringBitmap, plan.len);
+        defer {
+            for (replacement_deleted) |*deleted| {
+                if (deleted.*) |*bitmap| bitmap.deinit();
+            }
+            alloc.free(replacement_deleted);
+        }
+        @memset(replacement_deleted, null);
+        var replacements_initialized: usize = 0;
+        var writer_published = false;
+        defer if (!writer_published) {
+            for (replacements[0..replacements_initialized]) |*replacement| {
+                replacement.data.deinit(dest.alloc);
+                dest.deleteSegmentFile(replacement.id);
+            }
+        };
 
         var copied: usize = 0;
         var doc_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -1858,54 +1923,15 @@ pub const PersistentIndex = struct {
         }
         for (plan) |entry| {
             if (entry.class != .right_only) continue;
-            if (existing_dest.contains(entry.seg_id)) continue;
 
             const seg_bytes = try self.readSegmentBytesAlloc(&source_txn, alloc, entry.seg_id);
             defer alloc.free(seg_bytes);
-            var segment_data: ?index_mod.SegmentData = try dest.materializeSegmentData(entry.seg_id, seg_bytes);
-            defer if (segment_data) |*data| data.deinit(alloc);
-
-            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, entry.seg_id));
-            if (dest.segment_files == null) try dest_txn.put(.segments, &seg_key, seg_bytes);
-            const deletion_bytes = source_txn.get(.deletions, &seg_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            if (deletion_bytes) |bytes| {
-                try dest_txn.put(.deletions, &seg_key, bytes);
-            }
-
-            try dest.saveSegmentRange(&dest_txn, entry.seg_id, .{
-                .seg_id = entry.seg_id,
-                .min_doc_key = entry.min_doc_key,
-                .max_doc_key = entry.max_doc_key,
-            });
-            try dest.updateActiveSegments(&dest_txn, entry.seg_id, .add);
-            try existing_dest.put(alloc, entry.seg_id, {});
-            copied += 1;
-        }
-        try dest_txn.commit();
-
-        for (plan) |entry| {
-            if (entry.class != .right_only) continue;
-
-            const seg_bytes = try self.readSegmentBytesAlloc(&source_txn, alloc, entry.seg_id);
-            defer alloc.free(seg_bytes);
-            try dest.writer.addSegmentWithIdData(entry.seg_id, try dest.materializeSegmentData(entry.seg_id, seg_bytes));
 
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, entry.seg_id));
             const deletion_bytes = source_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
-            if (deletion_bytes) |bytes| {
-                var bitmap = try roaring.RoaringBitmap.fromBytes(self.alloc, bytes);
-                if (!bitmap.isEmpty()) {
-                    dest.writer.setDeletionBitmap(entry.seg_id, bitmap);
-                } else {
-                    bitmap.deinit();
-                }
-            }
 
             if (collect_doc_keys) {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
@@ -1915,7 +1941,45 @@ pub const PersistentIndex = struct {
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
                 }
             }
+
+            if (existing_dest.contains(entry.seg_id)) continue;
+
+            if (deletion_bytes) |bytes| {
+                var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                if (!bitmap.isEmpty()) {
+                    replacement_deleted[replacements_initialized] = bitmap;
+                } else {
+                    bitmap.deinit();
+                }
+                try dest_txn.put(.deletions, &seg_key, bytes);
+            }
+
+            replacements[replacements_initialized] = .{
+                .id = entry.seg_id,
+                .data = try dest.materializeSegmentData(entry.seg_id, seg_bytes),
+                .deleted = if (replacement_deleted[replacements_initialized]) |*bitmap| bitmap else null,
+            };
+            replacements_initialized += 1;
+
+            if (dest.segment_files == null) try dest_txn.put(.segments, &seg_key, seg_bytes);
+            try dest.saveSegmentRange(&dest_txn, entry.seg_id, .{
+                .seg_id = entry.seg_id,
+                .min_doc_key = entry.min_doc_key,
+                .max_doc_key = entry.max_doc_key,
+            });
+            try dest.updateActiveSegments(&dest_txn, entry.seg_id, .add);
+            existing_dest.putAssumeCapacity(entry.seg_id, {});
+            copied += 1;
         }
+
+        var writer_publication: ?index_mod.IndexWriter.PreparedSegmentReplacement = null;
+        defer if (writer_publication) |*publication| publication.abort();
+        if (replacements_initialized > 0) {
+            writer_publication = try dest.writer.prepareSegmentsManyData(&.{}, replacements[0..replacements_initialized]);
+        }
+        try dest_txn.commit();
+        if (writer_publication) |*publication| publication.publish();
+        writer_published = true;
 
         return .{
             .transferred_segments = copied,
@@ -2422,6 +2486,13 @@ pub const PersistentIndex = struct {
             }
         }
 
+        var replacement = [_]index_mod.ReplacementSegmentData{.{
+            .id = new_seg_id,
+            .data = segment_data.?,
+        }};
+        var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, &replacement);
+        defer writer_publication.abort();
+
         const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_id));
         if (self.segment_files == null) try txn.put(.segments, &new_seg_key, owned);
 
@@ -2443,7 +2514,7 @@ pub const PersistentIndex = struct {
         try self.updateActiveSegments(&txn, new_seg_id, .add);
         try txn.commit();
 
-        try self.writer.replaceSegmentsData(old_seg_ids, new_seg_id, segment_data.?);
+        writer_publication.publish();
         segment_data = null;
         return true;
     }
@@ -2668,13 +2739,23 @@ pub const PersistentIndex = struct {
     fn replayWalEntry(self: *PersistentIndex, lsn: u64, segment_bytes: []const u8) !void {
         const seg_id = self.writer.next_segment_id;
         var segment_data: ?index_mod.SegmentData = try self.materializeSegmentData(seg_id, segment_bytes);
+        var rollback_segment = true;
         errdefer {
-            if (segment_data) |*data| data.deinit(self.alloc);
-            self.deleteSegmentFile(seg_id);
+            if (rollback_segment) {
+                if (segment_data) |*data| data.deinit(self.alloc);
+                self.deleteSegmentFile(seg_id);
+            }
         }
+        var replacement = [_]index_mod.ReplacementSegmentData{.{
+            .id = seg_id,
+            .data = segment_data.?,
+        }};
+        var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        defer writer_publication.abort();
         try self.persistSegment(seg_id, segment_bytes, lsn);
-        try self.writer.addSegmentWithIdData(seg_id, segment_data.?);
+        writer_publication.publish();
         segment_data = null;
+        rollback_segment = false;
         try self.wal.truncate(lsn);
     }
 
@@ -3298,6 +3379,141 @@ test "native segment publication admits writer and mmap before creating output" 
     try std.testing.expectEqualStrings("published", published.bytes());
     published.deinit(alloc);
     store.delete(2);
+
+    // A failure after atomic rename is still owned by this unpublished
+    // operation. Empty files deterministically fail mmap validation and must
+    // not remain as orphan segment artifacts.
+    try std.testing.expectError(error.EmptySegment, store.publish(3, ""));
+    const empty_segment_path = try store.pathAlloc(3);
+    defer alloc.free(empty_segment_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        store.storage.readFileAlloc(alloc, empty_segment_path, 64),
+    );
+}
+
+test "native sink publication admits writer and mmap before invoking builder" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    const path_span = std.mem.span(path);
+    defer cleanupPersistDir(path);
+
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 16);
+    defer pool.deinit();
+    var pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_lsm_options = .{ .flush_threshold = 1, .native_storage_pool = &pool },
+        .wal_lsm_options = .{ .native_storage_pool = &pool },
+    });
+    defer pi.close();
+
+    var locks = std.ArrayListUnmanaged(storage_io.NativePathLockFile).empty;
+    defer {
+        for (locks.items) |*lock| lock.close();
+        locks.deinit(alloc);
+    }
+    var exhausted = false;
+    for (0..32) |i| {
+        const lock_path = try std.fmt.allocPrint(alloc, "{s}/sink-admission-{d}.lock", .{ path_span, i });
+        defer alloc.free(lock_path);
+        var lock = storage_io.openNativePathLockFileWithPool(alloc, lock_path, .{ .create_if_missing = true }, &pool) catch |err| switch (err) {
+            error.PersistentDescriptorAdmissionExhausted => {
+                exhausted = true;
+                break;
+            },
+            else => return err,
+        };
+        locks.append(alloc, lock) catch |err| {
+            lock.close();
+            return err;
+        };
+    }
+    try std.testing.expect(exhausted);
+
+    const segment = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(segment);
+    const CopyBuilder = struct {
+        bytes: []const u8,
+        calls: *usize,
+
+        fn build(ptr: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls.* += 1;
+            try sink.appendSlice(self.bytes);
+        }
+    };
+    var calls: usize = 0;
+    var builder = CopyBuilder{ .bytes = segment, .calls = &calls };
+    try std.testing.expectError(
+        error.PersistentDescriptorAdmissionExhausted,
+        pi.indexSegmentFromSinkBuilder(&builder, CopyBuilder.build),
+    );
+    try std.testing.expectEqual(@as(usize, 0), calls);
+
+    for (locks.items) |*lock| lock.close();
+    locks.clearRetainingCapacity();
+
+    try std.testing.expectEqual(segment.len, try pi.indexSegmentFromSinkBuilder(&builder, CopyBuilder.build));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(u32, 1), pi.snapshot().liveDocCount());
+}
+
+test "retired segment cleanup outlives persistent index close" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var pi = try PersistentIndex.open(alloc, .{ .path = path });
+    var pi_active = true;
+    defer if (pi_active) pi.close();
+
+    const seg_a = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(seg_a);
+    try pi.indexSegment(seg_a);
+    const seg_b = try buildSimpleSegment(alloc, "doc:b", "beta");
+    defer alloc.free(seg_b);
+    try pi.indexSegment(seg_b);
+
+    const held = pi.acquireSnapshot();
+    var held_active = true;
+    defer if (held_active) held.release();
+
+    const merged = try buildMultiDocSegment(alloc, &.{
+        .{ .doc_id = "doc:a", .term = "alpha" },
+        .{ .doc_id = "doc:b", .term = "beta" },
+    });
+    defer alloc.free(merged);
+    try pi.replaceSegments(&.{ 1, 2 }, merged);
+
+    const retired_path_a = try pi.segment_files.?.pathAlloc(1);
+    defer alloc.free(retired_path_a);
+    const retired_path_b = try pi.segment_files.?.pathAlloc(2);
+    defer alloc.free(retired_path_b);
+
+    pi.close();
+    pi_active = false;
+
+    var verifier = try storage_io.NativeStorage.init(alloc, .threaded);
+    defer verifier.deinit();
+    const pinned = try verifier.storage().readFileAlloc(alloc, retired_path_a, std.math.maxInt(usize));
+    alloc.free(pinned);
+
+    held.release();
+    held_active = false;
+    try std.testing.expectError(
+        error.FileNotFound,
+        verifier.storage().readFileAlloc(alloc, retired_path_a, 64),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        verifier.storage().readFileAlloc(alloc, retired_path_b, 64),
+    );
 }
 
 test "persistent index replaceSegments updates segment key range metadata" {

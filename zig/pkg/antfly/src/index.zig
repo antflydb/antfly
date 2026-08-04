@@ -284,9 +284,18 @@ pub const ReplacementSegmentData = struct {
 pub const RetiredSegmentCleanup = struct {
     ptr: *anyopaque,
     delete: *const fn (ptr: *anyopaque, seg_id: u64) void,
+    retain_context: ?*const fn (ptr: *anyopaque) void = null,
+    release_context: ?*const fn (ptr: *anyopaque) void = null,
+
+    fn retained(self: RetiredSegmentCleanup) RetiredSegmentCleanup {
+        std.debug.assert((self.retain_context == null) == (self.release_context == null));
+        if (self.retain_context) |retain_context| retain_context(self.ptr);
+        return self;
+    }
 
     fn run(self: RetiredSegmentCleanup, seg_id: u64) void {
         self.delete(self.ptr, seg_id);
+        if (self.release_context) |release_context| release_context(self.ptr);
     }
 };
 
@@ -1019,7 +1028,8 @@ pub const IndexWriter = struct {
             for (self.snapshot.segments[0..self.carried_count]) |*seg| seg.retain();
             for (self.retired) |*seg| {
                 seg.data.madviseDiscardCleanPages();
-                seg.shared.retired_cleanup = writer.retired_segment_cleanup;
+                std.debug.assert(seg.shared.retired_cleanup == null);
+                seg.shared.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
             }
             if (self.retired.len > 0) writer.alloc.free(self.retired);
 
@@ -1356,7 +1366,10 @@ pub const IndexWriter = struct {
         // holds a reference on `old`, so no releaseRef can be completing
         // concurrently for segments old references.
         for (new_segments[0..carried_count]) |*seg| seg.retain();
-        for (retired) |*seg| seg.shared.retired_cleanup = self.retired_segment_cleanup;
+        for (retired) |*seg| {
+            std.debug.assert(seg.shared.retired_cleanup == null);
+            seg.shared.retired_cleanup = if (self.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
+        }
         if (retired.len > 0) self.alloc.free(retired);
 
         // Atomic swap so concurrent readers see a consistent pointer.
