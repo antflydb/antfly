@@ -21,6 +21,7 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
+const storage_io_mod = @import("../../lsm_backend/storage_io.zig");
 
 pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,
@@ -142,6 +143,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     alloc: Allocator,
     io_impl: ?*Io.Threaded,
+    native_storage_pool: *storage_io_mod.NativeStoragePool,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     config: Config,
@@ -164,6 +166,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     producer_admission_head: ?*ProducerAdmissionWaiter = null,
     producer_admission_tail: ?*ProducerAdmissionWaiter = null,
     admission_closed: bool = false,
+    fd_retry_epoch: ?u32 = null,
     future: ?Io.Future(void) = null,
 
     pub const ProducerPermit = struct {
@@ -222,6 +225,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .native_storage_pool = backend_runtime.nativeStoragePool(),
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
             .config = config,
@@ -333,6 +337,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notified = true;
         self.cond.broadcast(io);
         self.mutex.unlock(io);
+        self.native_storage_pool.signalAdmissionChanged(io);
 
         _ = self.future.?.await(io);
         self.future = null;
@@ -367,6 +372,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             while (!test_release_after_task_begin.load(.acquire)) std.Thread.yield() catch {};
         }
 
+        const execute_fd_epoch = self.native_storage_pool.admissionEpoch();
         var result = executeTextMergeTaskForRuntime(work_alloc, &task) catch |err| {
             // Once a task has borrowed an index runtime it must retire its
             // scheduler state before a graceful stop can complete. Structural
@@ -375,6 +381,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             lockApplyExclusive(self.apply_mutex);
             if (isRecoverableMergeAdmissionError(err)) {
                 self.index_manager.cancelTextMergeTask(&task);
+                self.deferForFdAdmissionError(err, execute_fd_epoch);
                 self.apply_mutex.unlockExclusive();
                 self.signalProducerAdmissionChanged();
                 return false;
@@ -387,9 +394,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         defer result.deinit(work_alloc);
 
         lockApplyExclusive(self.apply_mutex);
+        const finish_fd_epoch = self.native_storage_pool.admissionEpoch();
         _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result) catch |err| {
             if (isRecoverableMergeAdmissionError(err)) {
                 self.index_manager.cancelTextMergeTask(&task);
+                self.deferForFdAdmissionError(err, finish_fd_epoch);
                 self.apply_mutex.unlockExclusive();
                 self.signalProducerAdmissionChanged();
                 return false;
@@ -707,6 +716,15 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         std.Io.futexWake(io, u32, &self.producer_wait_epoch.raw, std.math.maxInt(u32));
     }
 
+    fn deferForFdAdmissionError(self: *TextMergeRuntime, err: anyerror, operation_epoch: u32) void {
+        if (err != error.PersistentDescriptorAdmissionExhausted) return;
+        const current_epoch = self.native_storage_pool.admissionEpoch();
+        // Park only if capacity was stable for the entire failed operation.
+        // If it changed, retry once against the new state; a second failure at
+        // that epoch will park without losing the intervening wakeup.
+        self.fd_retry_epoch = if (current_epoch == operation_epoch) current_epoch else null;
+    }
+
     fn isAdmissionClosed(self: *TextMergeRuntime) bool {
         const io_impl = self.io_impl orelse return self.admission_closed;
         const io = io_impl.io();
@@ -790,8 +808,21 @@ fn workerMain(runtime: *TextMergeRuntime) void {
             continue;
         };
         if (ran) continue;
+        if (runtime.fd_retry_epoch != null) {
+            waitForFdAdmissionChange(runtime);
+            continue;
+        }
         waitForWork(runtime);
     }
+}
+
+fn waitForFdAdmissionChange(runtime: *TextMergeRuntime) void {
+    const observed_epoch = runtime.fd_retry_epoch orelse return;
+    const io = runtime.io_impl.?.io();
+    while (!isShutdown(runtime) and runtime.native_storage_pool.admissionEpoch() == observed_epoch) {
+        runtime.native_storage_pool.waitForAdmissionChange(io, observed_epoch) catch return;
+    }
+    runtime.fd_retry_epoch = null;
 }
 
 fn waitForWork(runtime: *TextMergeRuntime) void {

@@ -416,7 +416,9 @@ pub const FileTrailer = struct {
 /// Borrowed, type-erased storage view. The provider which produced this value
 /// must outlive every call through it. Callers that launch work beyond a call
 /// boundary must use a provider operation whose returned handle owns its own
-/// lifetime (for example RangeReadFuture or AtomicWriteSink).
+/// lifetime (for example RangeReadFuture or AtomicWriteSink). Native callers
+/// that retain a Storage view itself must retain a NativeStorage.Lease and
+/// obtain the view from that lease.
 pub const Storage = struct {
     pub const Trailer = FileTrailer;
 
@@ -742,6 +744,8 @@ const buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
 
 const FdCache = if (!supports_posix_fd_cache)
     struct {
+        admission_epoch: std.atomic.Value(u32) = .init(0),
+
         pub fn init(_: Allocator, _: usize) FdCache {
             return .{};
         }
@@ -773,6 +777,9 @@ const FdCache = if (!supports_posix_fd_cache)
         pub fn reservePersistentDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
         pub fn releasePersistentDescriptors(_: *FdCache, _: std.Io, _: usize) void {}
         pub fn signalAdmissionChanged(_: *FdCache, _: std.Io) void {}
+        pub fn admissionEpoch(_: *const FdCache) u32 {
+            return 0;
+        }
     }
 else
     struct {
@@ -820,6 +827,7 @@ else
         admission_waiters: std.atomic.Value(usize) = .init(0),
         admission_waits: CounterU64 = .init(0),
         persistent_admission_failures: CounterU64 = .init(0),
+        admission_epoch: std.atomic.Value(u32) = .init(0),
         admission_mutex: std.Io.Mutex = .init,
         admission_changed: std.Io.Condition = .init,
         admission_head: ?*AdmissionWaiter = null,
@@ -1193,6 +1201,7 @@ else
             if (count == 0) return;
             const previous = self.admitted_descriptors.fetchSub(count, .acq_rel);
             std.debug.assert(previous >= count);
+            _ = self.admission_epoch.fetchAdd(1, .release);
             self.signalAdmissionChanged(io);
         }
 
@@ -1204,6 +1213,7 @@ else
         }
 
         fn signalAdmissionChanged(self: *FdCache, io: std.Io) void {
+            std.Io.futexWake(io, u32, &self.admission_epoch.raw, std.math.maxInt(u32));
             // The registering waiter always performs a final capacity/eviction
             // check, so skipping the uncontended mutex on the hot release path
             // cannot lose progress.
@@ -1213,6 +1223,10 @@ else
             // request allowed to claim newly available capacity.
             self.admission_changed.broadcast(io);
             self.admission_mutex.unlock(io);
+        }
+
+        fn admissionEpoch(self: *const FdCache) u32 {
+            return self.admission_epoch.load(.acquire);
         }
 
         fn evictOne(self: *FdCache) bool {
@@ -1272,6 +1286,7 @@ else
                 std.debug.assert(entry.ref_count == 0);
                 _ = self.cache_entry_count.fetchSub(1, .monotonic);
                 _ = self.admitted_descriptors.fetchSub(1, .monotonic);
+                _ = self.admission_epoch.fetchAdd(1, .release);
                 entry.deinit(self.allocator);
                 self.allocator.destroy(entry);
                 return;
@@ -1368,6 +1383,19 @@ pub const NativeStoragePool = struct {
     pub fn snapshotStats(self: *const NativeStoragePool) NativeStorageStats {
         return self.fd_cache.snapshotStats();
     }
+
+    pub fn admissionEpoch(self: *const NativeStoragePool) u32 {
+        return self.fd_cache.admissionEpoch();
+    }
+
+    pub fn waitForAdmissionChange(self: *const NativeStoragePool, io: std.Io, observed_epoch: u32) !void {
+        if (self.admissionEpoch() != observed_epoch) return;
+        try std.Io.futexWait(io, u32, &self.fd_cache.admission_epoch.raw, observed_epoch);
+    }
+
+    pub fn signalAdmissionChanged(self: *NativeStoragePool, io: std.Io) void {
+        self.fd_cache.signalAdmissionChanged(io);
+    }
 };
 
 const NativeStorageState = struct {
@@ -1439,18 +1467,23 @@ const NativeStorageState = struct {
 
     fn retain(self: *NativeStorageState) !*NativeStorageState {
         while (true) {
-            if (self.closing.load(.acquire)) return error.StorageClosed;
             const current = self.refs.load(.acquire);
             if (current == 0) return error.StorageClosed;
             if (self.refs.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |_| {
                 continue;
             }
-            if (self.closing.load(.acquire)) {
-                self.release();
-                return error.StorageClosed;
-            }
             return self;
         }
+    }
+
+    fn acquireLease(self: *NativeStorageState) !*NativeStorageState {
+        if (self.closing.load(.acquire)) return error.StorageClosed;
+        const retained = try self.retain();
+        if (self.closing.load(.acquire)) {
+            retained.release();
+            return error.StorageClosed;
+        }
+        return retained;
     }
 
     fn closeStorageRef(self: *NativeStorageState) void {
@@ -1502,6 +1535,26 @@ pub const NativeFdPermit = struct {
         self.active = false;
         self.cache.releaseDescriptors(self.io, self.count);
         self.state.release();
+    }
+
+    fn take(self: *NativeFdPermit) NativeFdPermit {
+        std.debug.assert(self.active);
+        std.debug.assert(self.count == 1);
+        const owned = self.*;
+        self.active = false;
+        return owned;
+    }
+
+    pub fn splitOne(self: *NativeFdPermit) !NativeFdPermit {
+        if (!self.active or self.count <= 1) return error.InvalidNativeFdPermit;
+        const retained = try self.state.retain();
+        self.count -= 1;
+        return .{
+            .state = retained,
+            .cache = self.cache,
+            .io = self.io,
+            .count = 1,
+        };
     }
 };
 
@@ -1591,6 +1644,13 @@ else
 
 pub const NativeStorage = if (!supports_native_storage)
     struct {
+        pub const Lease = struct {
+            pub fn deinit(_: *Lease) void {}
+            pub fn storage(_: *Lease) Storage {
+                @panic("native storage is unavailable on this target");
+            }
+        };
+
         pub fn init(_: Allocator, _: RuntimeKind) !NativeStorage {
             return error.UnsupportedNativeStorageRuntime;
         }
@@ -1606,6 +1666,22 @@ pub const NativeStorage = if (!supports_native_storage)
         }
 
         pub fn acquireFdPermit(_: *NativeStorage) !NativeFdPermit {
+            return error.UnsupportedNativeStorageRuntime;
+        }
+
+        pub fn acquireFdPermits(_: *NativeStorage, _: usize) !NativeFdPermit {
+            return error.UnsupportedNativeStorageRuntime;
+        }
+
+        pub fn acquireLease(_: *NativeStorage) !Lease {
+            return error.UnsupportedNativeStorageRuntime;
+        }
+
+        pub fn beginAtomicWriteWithPermit(_: *NativeStorage, _: Allocator, _: []const u8, _: *NativeFdPermit) !AtomicWriteSink {
+            return error.UnsupportedNativeStorageRuntime;
+        }
+
+        pub fn validateFdPermit(_: *NativeStorage, _: *const NativeFdPermit) !void {
             return error.UnsupportedNativeStorageRuntime;
         }
 
@@ -1867,6 +1943,27 @@ else blk: {
     break :blk struct {
         state: *NativeStorageState,
 
+        pub const Lease = struct {
+            state: *NativeStorageState,
+            active: bool = true,
+
+            /// Returns a borrowed view whose lifetime is bounded by this lease.
+            pub fn storage(self: *Lease) Storage {
+                std.debug.assert(self.active);
+                return .{
+                    .ptr = self.state,
+                    .vtable = &threaded_only_vtable,
+                };
+            }
+
+            pub fn deinit(self: *Lease) void {
+                if (!self.active) return;
+                self.active = false;
+                self.state.release();
+                self.* = undefined;
+            }
+        };
+
         const threaded_only_vtable: Storage.VTable = .{
             .create_dir_path = createDirPath,
             .read_file_alloc = readFileAlloc,
@@ -1909,6 +2006,32 @@ else blk: {
 
         pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
             return try self.state.acquireFdPermit();
+        }
+
+        pub fn acquireFdPermits(self: *NativeStorage, count: usize) !NativeFdPermit {
+            if (count == 0) return error.InvalidNativeFdPermit;
+            return try self.state.acquireFdPermits(count);
+        }
+
+        /// Keeps the native state and its threaded I/O runtime alive after the
+        /// owning NativeStorage begins shutdown. No new lease may be acquired
+        /// once shutdown has started.
+        pub fn acquireLease(self: *NativeStorage) !Lease {
+            return .{ .state = try self.state.acquireLease() };
+        }
+
+        pub fn beginAtomicWriteWithPermit(
+            self: *NativeStorage,
+            allocator: Allocator,
+            path: []const u8,
+            permit: *NativeFdPermit,
+        ) !AtomicWriteSink {
+            if (!permit.active or permit.count != 1 or permit.state != self.state) return error.InvalidNativeFdPermit;
+            return try NativeAtomicWriteSink.createWithPermit(allocator, path, self.state, permit);
+        }
+
+        pub fn validateFdPermit(self: *NativeStorage, permit: *const NativeFdPermit) !void {
+            if (!permit.active or permit.count != 1 or permit.state != self.state) return error.InvalidNativeFdPermit;
         }
 
         pub fn storage(self: *NativeStorage) Storage {
@@ -2040,10 +2163,17 @@ else blk: {
 
         fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermit();
-            defer permit.release();
-            permit.state.invalidatePath(path);
-            try deleteFilePathWithIo(permit.io, path);
+            const retained = try state.retain();
+            defer retained.release();
+            retained.invalidatePath(path);
+            if (comptime supports_posix_fd_cache) {
+                // unlink(2) does not open a descriptor. Keeping rollback
+                // deletion outside admission guarantees an unpublished file
+                // can be removed even while the FD budget is saturated.
+                try deleteFilePathPosix(path);
+            } else {
+                try deleteFilePathWithIo(retained.threaded.io(), path);
+            }
         }
 
         fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
@@ -2626,6 +2756,22 @@ const NativeAtomicWriteSink = struct {
             return error.DurableAtomicRenameUnsupported;
         }
 
+        var fd_permit = try state.acquireFdPermit();
+        errdefer fd_permit.release();
+        return try createWithPermit(allocator, path, state, &fd_permit);
+    }
+
+    fn createWithPermit(
+        allocator: Allocator,
+        path: []const u8,
+        state: *NativeStorageState,
+        permit: *NativeFdPermit,
+    ) !AtomicWriteSink {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+            return error.DurableAtomicRenameUnsupported;
+        }
+        if (!permit.active or permit.count != 1 or permit.state != state) return error.InvalidNativeFdPermit;
+
         const final_path = try allocator.dupe(u8, path);
         errdefer allocator.free(final_path);
 
@@ -2634,8 +2780,6 @@ const NativeAtomicWriteSink = struct {
 
         const retained = try state.retain();
         errdefer retained.release();
-        var fd_permit = try retained.acquireFdPermit();
-        errdefer fd_permit.release();
         const fd = try createAtomicWriteFdPosix(tmp_path);
         errdefer closeFd(fd);
 
@@ -2644,7 +2788,7 @@ const NativeAtomicWriteSink = struct {
         self.* = .{
             .allocator = allocator,
             .state = retained,
-            .fd_permit = fd_permit,
+            .fd_permit = permit.take(),
             .final_path = final_path,
             .tmp_path = tmp_path,
             .fd = fd,
@@ -3763,6 +3907,25 @@ test "native storage state is reclaimed after owner deinit" {
         var native = try NativeStorage.init(std.testing.allocator, .threaded);
         native.deinit();
     }
+}
+
+test "native storage lease owns state past owner deinit" {
+    if (!supports_native_storage) return error.SkipZigTest;
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-owned-lease-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    var lease = try native.acquireLease();
+    defer lease.deinit();
+    native.deinit();
+
+    const storage_view = lease.storage();
+    try storage_view.writeFileAbsolute(path, "owned lease");
+    defer storage_view.deleteFileAbsolute(path) catch {};
+    const loaded = try storage_view.readFileAlloc(std.testing.allocator, path, 64);
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings("owned lease", loaded);
 }
 
 test "native atomic write sink retains invalidation state past storage deinit" {

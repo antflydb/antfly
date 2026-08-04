@@ -325,6 +325,21 @@ const SegmentFileStore = struct {
         const path = try self.pathAlloc(seg_id);
         defer self.allocator.free(path);
 
+        if (self.storage_owner) |owner| {
+            var admission = try NativeSegmentPublicationAdmission.init(owner);
+            defer admission.deinit();
+            var writer = try admission.beginAtomicWrite(self.allocator, path);
+            var active = true;
+            defer if (active) writer.abort();
+            try writer.appendSlice(bytes);
+            active = false;
+            writer.finish() catch |err| {
+                if (builtin.os.tag != .freestanding) std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            return .fromMapped(try admission.mapFile(path));
+        }
+
         var writer = try self.storage.beginAtomicWrite(self.allocator, path);
         var active = true;
         defer if (active) writer.abort();
@@ -338,10 +353,7 @@ const SegmentFileStore = struct {
             return err;
         };
 
-        if (self.storage_owner == null) {
-            return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
-        }
-        return .fromMapped(try self.mapFile(path));
+        return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
     }
 
     fn mapPublished(self: *SegmentFileStore, seg_id: u64) !index_mod.SegmentData {
@@ -358,24 +370,65 @@ const SegmentFileStore = struct {
     }
 };
 
+/// Reserves the writer and mmap descriptor slots as one publication admission
+/// before any expensive segment construction begins. The writer consumes one
+/// permit; the second remains held across rename and the final mmap open.
+const NativeSegmentPublicationAdmission = struct {
+    owner: *storage_io.NativeStorage,
+    writer_permit: storage_io.NativeFdPermit,
+    map_permit: storage_io.NativeFdPermit,
+
+    fn init(owner: *storage_io.NativeStorage) !NativeSegmentPublicationAdmission {
+        var map_permit = try owner.acquireFdPermits(2);
+        errdefer map_permit.release();
+        const writer_permit = try map_permit.splitOne();
+        return .{
+            .owner = owner,
+            .writer_permit = writer_permit,
+            .map_permit = map_permit,
+        };
+    }
+
+    fn deinit(self: *NativeSegmentPublicationAdmission) void {
+        self.writer_permit.release();
+        self.map_permit.release();
+        self.* = undefined;
+    }
+
+    fn beginAtomicWrite(self: *NativeSegmentPublicationAdmission, allocator: Allocator, path: []const u8) !storage_io.AtomicWriteSink {
+        return try self.owner.beginAtomicWriteWithPermit(allocator, path, &self.writer_permit);
+    }
+
+    fn mapFile(self: *NativeSegmentPublicationAdmission, path: []const u8) ![]align(std.heap.page_size_min) u8 {
+        try self.owner.validateFdPermit(&self.map_permit);
+        return try mapSegmentFile(path);
+    }
+};
+
 const RetiredSegmentFileDeleter = struct {
     allocator: Allocator,
     root_dir: []u8,
     storage: storage_io.Storage,
+    native_storage_lease: ?storage_io.NativeStorage.Lease = null,
 
     fn init(allocator: Allocator, store: *const SegmentFileStore) !*RetiredSegmentFileDeleter {
         const deleter = try allocator.create(RetiredSegmentFileDeleter);
         errdefer allocator.destroy(deleter);
+        var native_storage_lease: ?storage_io.NativeStorage.Lease = null;
+        errdefer if (native_storage_lease) |*lease| lease.deinit();
+        if (store.storage_owner) |owner| native_storage_lease = try owner.acquireLease();
         deleter.* = .{
             .allocator = allocator,
             .root_dir = try allocator.dupe(u8, store.root_dir),
-            .storage = store.storage,
+            .storage = if (native_storage_lease) |*lease| lease.storage() else store.storage,
+            .native_storage_lease = native_storage_lease,
         };
         return deleter;
     }
 
     fn deinit(self: *RetiredSegmentFileDeleter) void {
         const allocator = self.allocator;
+        if (self.native_storage_lease) |*lease| lease.deinit();
         allocator.free(self.root_dir);
         allocator.destroy(self);
     }
@@ -2033,7 +2086,9 @@ pub const PersistentIndex = struct {
             if (frozen.len != segment_indices.len) return error.InvalidDeletionSnapshot;
         }
         const store = &(self.segment_files orelse return error.Unsupported);
-        if (store.storage_owner == null) return error.Unsupported;
+        const storage_owner = store.storage_owner orelse return error.Unsupported;
+        var publication_admission = try NativeSegmentPublicationAdmission.init(storage_owner);
+        defer publication_admission.deinit();
 
         const new_seg_id = self.reserveSegmentId();
         errdefer self.deleteSegmentFile(new_seg_id);
@@ -2065,7 +2120,7 @@ pub const PersistentIndex = struct {
         const path = try store.pathAlloc(new_seg_id);
         defer store.allocator.free(path);
 
-        var writer = try store.storage.beginAtomicWrite(work_alloc, path);
+        var writer = try publication_admission.beginAtomicWrite(work_alloc, path);
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
@@ -2080,7 +2135,7 @@ pub const PersistentIndex = struct {
         writer_active = false;
         try writer.finish();
 
-        var data: ?index_mod.SegmentData = try store.mapPublished(new_seg_id);
+        var data: ?index_mod.SegmentData = .fromMapped(try publication_admission.mapFile(path));
         errdefer if (data) |*segment_data| segment_data.deinit(self.alloc);
 
         var key_range = try extractSegmentKeyRange(self.alloc, data.?.bytes());
@@ -3191,6 +3246,58 @@ test "persistent index persists segment key ranges across reopen" {
         try std.testing.expectEqualStrings("doc:m", ranges[1].min_doc_key);
         try std.testing.expectEqualStrings("doc:z", ranges[1].max_doc_key);
     }
+}
+
+test "native segment publication admits writer and mmap before creating output" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    const path_span = std.mem.span(path);
+    defer cleanupPersistDir(path);
+
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 4);
+    defer pool.deinit();
+    var store = try SegmentFileStore.open(alloc, path_span, null, true, .threaded, &pool);
+    defer store.close();
+
+    const lock_path_a = try std.fmt.allocPrint(alloc, "{s}/publication-a.lock", .{path_span});
+    defer alloc.free(lock_path_a);
+    const lock_path_b = try std.fmt.allocPrint(alloc, "{s}/publication-b.lock", .{path_span});
+    defer alloc.free(lock_path_b);
+    var lock_a = try storage_io.openNativePathLockFileWithPool(alloc, lock_path_a, .{ .create_if_missing = true }, &pool);
+    var lock_a_active = true;
+    defer if (lock_a_active) lock_a.close();
+    var lock_b = try storage_io.openNativePathLockFileWithPool(alloc, lock_path_b, .{ .create_if_missing = true }, &pool);
+    var lock_b_active = true;
+    defer if (lock_b_active) lock_b.close();
+
+    // Two lifetime descriptors leave no safe two-slot publication window.
+    // Admission must fail before the atomic writer creates the segment file.
+    try std.testing.expectError(
+        error.PersistentDescriptorAdmissionExhausted,
+        store.publish(1, "not published"),
+    );
+
+    lock_b.close();
+    lock_b_active = false;
+    lock_a.close();
+    lock_a_active = false;
+
+    const segment_path = try store.pathAlloc(1);
+    defer alloc.free(segment_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        store.storage.readFileAlloc(alloc, segment_path, 64),
+    );
+
+    // With the two-slot window available, the writer consumes one reservation
+    // and mmap uses the other without any intervening admission request.
+    var published = try store.publish(2, "published");
+    try std.testing.expectEqualStrings("published", published.bytes());
+    published.deinit(alloc);
+    store.delete(2);
 }
 
 test "persistent index replaceSegments updates segment key range metadata" {
