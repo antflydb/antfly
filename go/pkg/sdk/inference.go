@@ -24,6 +24,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"time"
 	"unsafe"
 
 	chunking "github.com/antflydb/antfly/go/pkg/libaf/chunking"
@@ -100,6 +101,55 @@ type InferenceClient struct {
 	baseURL string
 }
 
+// InferenceCapacityError is returned when an inference request was rejected
+// before execution because model or request-queue capacity is temporarily
+// unavailable. Callers can use errors.As and retry after RetryAfter.
+type InferenceCapacityError struct {
+	Code       string
+	Message    string
+	Reason     string
+	RetryAfter time.Duration
+}
+
+func (e *InferenceCapacityError) Error() string {
+	return fmt.Sprintf("inference capacity unavailable (%s): %s; retry after %s", e.Code, e.Message, e.RetryAfter)
+}
+
+// Temporary reports that the request can be retried after RetryAfter.
+func (e *InferenceCapacityError) Temporary() bool { return true }
+
+func validInferenceCapacityError(body *oapi.TransientCapacity) bool {
+	reason := string(body.Reason)
+	retryAfterMs := int64(body.RetryAfterMs)
+	const maxDurationMillis = int64((1<<63 - 1) / int64(time.Millisecond))
+	return bool(body.Retryable) &&
+		body.Message != "" &&
+		(reason == "inference_capacity" || reason == "request_queue") &&
+		retryAfterMs > 0 && retryAfterMs <= maxDurationMillis
+}
+
+func inferenceCapacityError(body *oapi.TransientCapacity) error {
+	reason := string(body.Reason)
+	retryAfterMs := int64(body.RetryAfterMs)
+	return &InferenceCapacityError{
+		Code:       body.Error,
+		Message:    body.Message,
+		Reason:     reason,
+		RetryAfter: time.Duration(retryAfterMs) * time.Millisecond,
+	}
+}
+
+func inferenceResponseErrorWithCapacity(
+	statusCode int,
+	body []byte,
+	capacity *oapi.TransientCapacity,
+) error {
+	if capacity != nil && validInferenceCapacityError(capacity) {
+		return inferenceCapacityError(capacity)
+	}
+	return inferenceResponseError(statusCode, body)
+}
+
 // NewInferenceClient creates a new inference client.
 // The baseURL should be the server address (e.g., "http://localhost:8080").
 // Legacy base URLs ending in /ai/v1 are accepted and normalized.
@@ -152,7 +202,7 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.StatusCode() != http.StatusOK {
@@ -197,7 +247,7 @@ func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, inp
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.StatusCode() != http.StatusOK {
@@ -242,7 +292,7 @@ func (c *InferenceClient) EmbedJSON(ctx context.Context, model string, input []s
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
@@ -292,7 +342,7 @@ func (c *InferenceClient) Chunk(ctx context.Context, text string, config ChunkCo
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -346,7 +396,7 @@ func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType 
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -369,7 +419,7 @@ func (c *InferenceClient) Rerank(ctx context.Context, model string, query string
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -404,7 +454,7 @@ func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionReques
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -553,7 +603,7 @@ func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs 
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -579,7 +629,7 @@ func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -603,7 +653,7 @@ type GenerateConfig struct {
 	// TopK preserves the legacy positive convenience setting.
 	TopK int
 	// TopKOverride sends the exact value, including zero, and takes precedence over TopK.
-	TopKOverride           *int
+	TopKOverride *int
 	// EnableThinking controls chat templates that expose the Hugging Face-
 	// compatible enable_thinking variable. Nil preserves the model default;
 	// a pointer to false explicitly opens the public final response channel.
@@ -703,7 +753,7 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.JSON200 == nil {
@@ -740,13 +790,12 @@ func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input [
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	if resp.StatusCode() != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
-
 	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
 	switch contentType {
 	case "application/json":
@@ -781,7 +830,7 @@ func (c *InferenceClient) SparseEmbedJSON(ctx context.Context, model string, inp
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
 		return nil, err
 	}
 	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))

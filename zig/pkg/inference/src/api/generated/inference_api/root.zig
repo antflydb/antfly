@@ -119,5 +119,6 @@ pub const ToolChoiceFunction = types.ToolChoiceFunction;
 pub const TranscribeObject = types.TranscribeObject;
 pub const TranscribeRequest = types.TranscribeRequest;
 pub const TranscribeResponse = types.TranscribeResponse;
+pub const TransientCapacityError = types.TransientCapacityError;
 pub const VADOptions = types.VADOptions;
 pub const SchemasConfig = types.SchemasConfig;

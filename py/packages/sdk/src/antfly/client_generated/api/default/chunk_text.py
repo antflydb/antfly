@@ -8,6 +8,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.inference_chunk_request import InferenceChunkRequest
 from ...models.inference_chunk_response import InferenceChunkResponse
 from ...models.inference_error import InferenceError
+from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
 from ...types import Response
 
 
@@ -32,7 +33,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> InferenceChunkResponse | InferenceError | None:
+) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     if response.status_code == 200:
         response_200 = InferenceChunkResponse.from_dict(response.json())
 
@@ -54,7 +55,7 @@ def _parse_response(
         return response_500
 
     if response.status_code == 503:
-        response_503 = InferenceError.from_dict(response.json())
+        response_503 = InferenceTransientCapacityError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +67,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[InferenceChunkResponse | InferenceError]:
+) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,7 +80,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> Response[InferenceChunkResponse | InferenceError]:
+) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -108,7 +109,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceChunkResponse | InferenceError]
+        Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -126,7 +127,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> InferenceChunkResponse | InferenceError | None:
+) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -155,7 +156,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceChunkResponse | InferenceError
+        InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
     """
 
     return sync_detailed(
@@ -168,7 +169,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> Response[InferenceChunkResponse | InferenceError]:
+) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -197,7 +198,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceChunkResponse | InferenceError]
+        Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -213,7 +214,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> InferenceChunkResponse | InferenceError | None:
+) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -242,7 +243,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceChunkResponse | InferenceError
+        InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
     """
 
     return (

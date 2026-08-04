@@ -8,6 +8,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.inference_error import InferenceError
 from ...models.inference_transcribe_request import InferenceTranscribeRequest
 from ...models.inference_transcribe_response import InferenceTranscribeResponse
+from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
 from ...types import Response
 
 
@@ -32,7 +33,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> InferenceError | InferenceTranscribeResponse | None:
+) -> InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError | None:
     if response.status_code == 200:
         response_200 = InferenceTranscribeResponse.from_dict(response.json())
 
@@ -59,7 +60,7 @@ def _parse_response(
         return response_500
 
     if response.status_code == 503:
-        response_503 = InferenceError.from_dict(response.json())
+        response_503 = InferenceTransientCapacityError.from_dict(response.json())
 
         return response_503
 
@@ -71,7 +72,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[InferenceError | InferenceTranscribeResponse]:
+) -> Response[InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -84,7 +85,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceTranscribeRequest,
-) -> Response[InferenceError | InferenceTranscribeResponse]:
+) -> Response[InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError]:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -132,7 +133,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceError | InferenceTranscribeResponse]
+        Response[InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -150,7 +151,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceTranscribeRequest,
-) -> InferenceError | InferenceTranscribeResponse | None:
+) -> InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError | None:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -198,7 +199,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceError | InferenceTranscribeResponse
+        InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError
     """
 
     return sync_detailed(
@@ -211,7 +212,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceTranscribeRequest,
-) -> Response[InferenceError | InferenceTranscribeResponse]:
+) -> Response[InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError]:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -259,7 +260,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceError | InferenceTranscribeResponse]
+        Response[InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -275,7 +276,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceTranscribeRequest,
-) -> InferenceError | InferenceTranscribeResponse | None:
+) -> InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError | None:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -323,7 +324,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceError | InferenceTranscribeResponse
+        InferenceError | InferenceTranscribeResponse | InferenceTransientCapacityError
     """
 
     return (

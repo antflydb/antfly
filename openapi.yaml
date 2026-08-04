@@ -6114,6 +6114,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '500':
           description: Internal server error
           content:
@@ -6128,13 +6132,6 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '401':
           description: Authentication is enabled and valid credentials were not supplied
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '503':
-          description: The unified Antfly server also returns this status when authentication is enabled
-            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -6197,15 +6194,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '503':
-          description: The unified Antfly server also returns this status when authentication is enabled
-            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -6279,15 +6273,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '503':
-          description: The unified Antfly server also returns this status when authentication is enabled
-            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -6370,12 +6361,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Reranking service unavailable (no models configured). The unified Antfly server
-            also returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -6497,12 +6485,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured). The unified Antfly server
-            also returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '507':
           description: Generation request exceeds the configured memory budget
           content:
@@ -6582,12 +6567,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable. The unified Antfly server also returns this status
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
             when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -6658,12 +6640,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured). The unified Antfly server
-            also returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '507':
           description: Generation request exceeds the configured memory budget
           content:
@@ -6736,12 +6715,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured). The unified Antfly server
-            also returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -6873,12 +6849,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Reader service unavailable (no models configured). The unified Antfly server also
-            returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -6978,12 +6951,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Transcription service unavailable (no models configured). The unified Antfly server
-            also returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -7059,12 +7029,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Extraction service unavailable (no models configured). The unified Antfly server
-            also returns this status when authentication is enabled but its backend is not ready.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '401':
           description: Authentication is enabled and valid credentials were not supplied
           content:
@@ -7238,6 +7205,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '500':
           description: Internal server error
           content:
@@ -7252,13 +7223,6 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '401':
           description: Authentication is enabled and valid credentials were not supplied
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '503':
-          description: The unified Antfly server also returns this status when authentication is enabled
-            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -20592,14 +20556,55 @@ components:
       properties:
         error:
           type: string
-          description: Machine-readable code or concise error message
+          description: Stable machine-readable error code
         message:
           type: string
-          description: Human-readable error detail
+          description: Human-readable error description
+        reason:
+          type: string
+          description: Machine-readable capacity source when the failure is retryable
+          enum:
+            - inference_capacity
+            - request_queue
         retryable:
           type: boolean
           x-go-type-skip-optional-pointer: false
           description: Whether retrying the request may succeed
+        retry_after_ms:
+          type: integer
+          minimum: 0
+          description: Minimum retry delay in milliseconds
+    InferenceTransientCapacityError:
+      type: object
+      description: Actionable retry contract for temporary inference-capacity failures.
+      required:
+        - error
+        - message
+        - reason
+        - retryable
+        - retry_after_ms
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code
+        message:
+          type: string
+          description: Human-readable error description
+        reason:
+          type: string
+          description: Machine-readable capacity source
+          enum:
+            - inference_capacity
+            - request_queue
+        retryable:
+          type: boolean
+          enum:
+            - true
+          description: Always true for a transient-capacity response
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds
     InferencePredictRequest:
       type: object
       required:
@@ -20851,6 +20856,7 @@ components:
             - text_inference
             - image_inference
             - audio_inference
+            - model_admission
             - inference
         retryable:
           type: boolean
@@ -20858,6 +20864,11 @@ components:
         status:
           type: integer
           description: HTTP-style status classification for this item
+        retry_after_ms:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Minimum retry delay in milliseconds for a retryable transient failure
     InferenceEmbeddingBatchSummary:
       type: object
       description: Counts for per-item embedding responses
@@ -21923,6 +21934,7 @@ components:
       required:
         - code
         - message
+        - retryable
       properties:
         code:
           type: string
@@ -21933,6 +21945,11 @@ components:
         retryable:
           type: boolean
           default: false
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Minimum retry delay in milliseconds for a retryable capacity failure.
     InferenceGenerateBatchResultItem:
       type: object
       required:
@@ -23466,6 +23483,19 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    TransientCapacity:
+      description: Inference capacity is temporarily unavailable
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InferenceTransientCapacityError'
 x-tagGroups:
   - name: Antfly
     tags:

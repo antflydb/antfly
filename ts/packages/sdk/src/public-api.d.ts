@@ -11093,12 +11093,38 @@ export interface components {
             retrieved_ids?: string[];
         };
         InferenceError: {
-            /** @description Machine-readable code or concise error message */
+            /** @description Stable machine-readable error code */
             error: string;
-            /** @description Human-readable error detail */
+            /** @description Human-readable error description */
             message?: string;
+            /**
+             * @description Machine-readable capacity source when the failure is retryable
+             * @enum {string}
+             */
+            reason?: "inference_capacity" | "request_queue";
             /** @description Whether retrying the request may succeed */
             retryable?: boolean;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms?: number;
+        };
+        /** @description Actionable retry contract for temporary inference-capacity failures. */
+        InferenceTransientCapacityError: {
+            /** @description Stable machine-readable error code */
+            error: string;
+            /** @description Human-readable error description */
+            message: string;
+            /**
+             * @description Machine-readable capacity source
+             * @enum {string}
+             */
+            reason: "inference_capacity" | "request_queue";
+            /**
+             * @description Always true for a transient-capacity response
+             * @enum {boolean}
+             */
+            retryable: true;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms: number;
         };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
@@ -11218,11 +11244,13 @@ export interface components {
              * @description Pipeline stage that classified the failure
              * @enum {string}
              */
-            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "model_admission" | "inference";
             /** @description Whether retrying the same item may succeed */
             retryable: boolean;
             /** @description HTTP-style status classification for this item */
             status: number;
+            /** @description Minimum retry delay in milliseconds for a retryable transient failure */
+            retry_after_ms?: number | null;
         };
         /** @description Counts for per-item embedding responses */
         InferenceEmbeddingBatchSummary: {
@@ -11908,7 +11936,9 @@ export interface components {
             code: string;
             message: string;
             /** @default false */
-            retryable?: boolean;
+            retryable: boolean;
+            /** @description Minimum retry delay in milliseconds for a retryable capacity failure. */
+            retry_after_ms?: number | null;
         };
         InferenceGenerateBatchResultItem: {
             custom_id: string;
@@ -12837,6 +12867,17 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Inference capacity is temporarily unavailable */
+        TransientCapacity: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["InferenceTransientCapacityError"];
             };
         };
     };
@@ -16204,15 +16245,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chunkText: {
@@ -16264,15 +16298,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankMultimodalPrompts: {
@@ -16360,15 +16387,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankPrompts: {
@@ -16429,15 +16449,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reranking service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateContent: {
@@ -16529,15 +16542,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
             /** @description Generation request exceeds the configured memory budget */
             507: {
                 headers: {
@@ -16607,15 +16613,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chatCompletions: {
@@ -16707,15 +16706,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
             /** @description Generation request exceeds the configured memory budget */
             507: {
                 headers: {
@@ -16785,15 +16777,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     readImages: {
@@ -16881,15 +16866,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reader service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     transcribeAudio: {
@@ -16950,15 +16928,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Transcription service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     extract: {
@@ -17046,15 +17017,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Extraction service unavailable (no models configured). The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listModels: {
@@ -17198,15 +17162,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listPredictors: {

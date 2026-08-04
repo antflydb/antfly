@@ -391,6 +391,8 @@ pub const EmbeddingItemError = struct {
     retryable: bool,
     /// HTTP-style status classification for this item
     status: i64,
+    /// Minimum retry delay in milliseconds for a retryable transient failure
+    retry_after_ms: ?i64 = null,
 };
 
 /// A single embedding result
@@ -412,12 +414,16 @@ pub const EmbeddingUsage = struct {
 };
 
 pub const Error = struct {
-    /// Machine-readable code or concise error message
+    /// Stable machine-readable error code
     @"error": []const u8,
-    /// Human-readable error detail
+    /// Human-readable error description
     message: ?[]const u8 = null,
+    /// Machine-readable capacity source when the failure is retryable
+    reason: ?[]const u8 = null,
     /// Whether retrying the request may succeed
     retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: ?i64 = null,
 };
 
 pub const ExtractFieldValue = struct {
@@ -524,7 +530,9 @@ pub const GenerateBatchError = struct {
     /// Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate media-budget failures.
     code: []const u8,
     message: []const u8,
-    retryable: ?bool = null,
+    retryable: bool,
+    /// Minimum retry delay in milliseconds for a retryable capacity failure.
+    retry_after_ms: ?i64 = null,
 };
 
 /// Batch execution mode. Only synchronous batches are implemented.
@@ -1384,6 +1392,20 @@ pub const TranscribeResponse = struct {
     /// Name of model used for transcription
     model: []const u8,
     usage: GenerateUsage,
+};
+
+/// Actionable retry contract for temporary inference-capacity failures.
+pub const TransientCapacityError = struct {
+    /// Stable machine-readable error code
+    @"error": []const u8,
+    /// Human-readable error description
+    message: []const u8,
+    /// Machine-readable capacity source
+    reason: []const u8,
+    /// Always true for a transient-capacity response
+    retryable: bool,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: i64,
 };
 
 pub const VADOptions = antfly_chunking_api_openapi.VADOptions;

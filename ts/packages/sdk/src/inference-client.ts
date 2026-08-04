@@ -25,6 +25,7 @@ import type {
   RerankResponse,
   RewriteResponse,
   TranscribeResponse,
+  TransientCapacityError,
 } from "./inference-types.js";
 import type { paths } from "./public-api.js";
 
@@ -45,6 +46,36 @@ export class InferenceAPIError extends Error {
     super(`inference request failed (${status}): ${detail}`);
     this.name = "InferenceAPIError";
   }
+}
+
+/** Structured temporary-capacity failure with an actionable backoff delay. */
+export class InferenceCapacityError extends InferenceAPIError {
+  readonly code: string;
+  readonly reason: TransientCapacityError["reason"];
+  readonly retryAfterMs: number;
+  readonly retryable = true as const;
+
+  constructor(details: TransientCapacityError) {
+    super(503, details.error, `${details.message} (${details.error})`, true);
+    this.name = "InferenceCapacityError";
+    this.code = details.error;
+    this.reason = details.reason;
+    this.retryAfterMs = details.retry_after_ms;
+  }
+}
+
+function isTransientCapacityError(value: unknown): value is TransientCapacityError {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.error === "string" &&
+    typeof candidate.message === "string" &&
+    (candidate.reason === "inference_capacity" || candidate.reason === "request_queue") &&
+    candidate.retryable === true &&
+    typeof candidate.retry_after_ms === "number" &&
+    Number.isFinite(candidate.retry_after_ms) &&
+    candidate.retry_after_ms > 0
+  );
 }
 
 export class InferenceClient {
@@ -571,6 +602,9 @@ export class InferenceClient {
 }
 
 function inferenceAPIError(status: number, error: InferenceError | unknown): InferenceAPIError {
+  if (status === 503 && isTransientCapacityError(error)) {
+    return new InferenceCapacityError(error);
+  }
   const payload =
     typeof error === "object" && error !== null ? (error as Partial<InferenceError>) : {};
   const code = typeof payload.error === "string" ? payload.error : undefined;

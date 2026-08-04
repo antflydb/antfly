@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Client, InferenceAPIError, InferenceClient, serializeEmbeddings } from "../src/index.js";
+import {
+  Client,
+  InferenceAPIError,
+  InferenceCapacityError,
+  InferenceClient,
+  serializeEmbeddings,
+} from "../src/index.js";
 
 describe("InferenceClient", () => {
   it("should create a client with base config", () => {
@@ -601,6 +607,34 @@ describe("InferenceClient with mock fetch", () => {
         retryable: false,
       });
     });
+
+    it("should preserve structured transient capacity errors", async () => {
+      const capacity = {
+        error: "MODEL_RESOURCE_BUSY",
+        message: "insufficient inference capacity is currently available",
+        reason: "inference_capacity",
+        retryable: true,
+        retry_after_ms: 1000,
+      };
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: () => Promise.resolve(capacity),
+        text: () => Promise.resolve(JSON.stringify(capacity)),
+        headers: new Headers({ "Content-Type": "application/json", "Retry-After": "1" }),
+      } as Response);
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const error = await client.embed("busy-model", ["test"]).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(InferenceCapacityError);
+      expect(error).toMatchObject({
+        code: "MODEL_RESOURCE_BUSY",
+        reason: "inference_capacity",
+        retryable: true,
+        retryAfterMs: 1000,
+      });
+    });
   });
 
   describe("embedBinary (dense-vector compatibility helper)", () => {
@@ -662,6 +696,30 @@ describe("InferenceClient with mock fetch", () => {
       expect(options?.headers).toBeDefined();
       const headers = options?.headers as Record<string, string>;
       expect(headers.Accept).toBe("application/octet-stream");
+    });
+
+    it("should parse capacity metadata from JSON error responses", async () => {
+      const capacity = {
+        error: "SERVICE_UNAVAILABLE",
+        message: "server at capacity, try again later",
+        reason: "request_queue",
+        retryable: true,
+        retry_after_ms: 1000,
+      };
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(capacity), {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Retry-After": "1" },
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const error = await client
+        .embedBinary("busy-model", ["test"])
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(InferenceCapacityError);
+      expect(error).toMatchObject({ reason: "request_queue", retryAfterMs: 1000 });
     });
 
     it("should handle empty embeddings in binary response", async () => {
