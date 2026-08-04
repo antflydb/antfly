@@ -16749,6 +16749,14 @@ pub extern fn termite_metal_decode_runtime_reset_attention_span_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_acquire_paged_kv_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot_out: *usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_release_paged_kv_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -16758,9 +16766,13 @@ pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     v_row_stride: usize,
 ) c_int;
 
-/// Mirror of the C-side `TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY` used to
-/// bound slot indices on the Zig side. Keep in sync with metal_kernels.m.
-pub const attention_span_slot_capacity: usize = 256;
+/// Mirrors the C-side attention-span namespaces. Legacy/direct attention owns
+/// the lower 256 slots; device-paged KV hooks lease from the upper 256 so a
+/// retained radix prefix cannot be overwritten by an intervening request.
+pub const legacy_attention_span_slot_capacity: usize = 256;
+pub const paged_kv_slot_capacity: usize = 256;
+pub const paged_kv_slot_base: usize = legacy_attention_span_slot_capacity;
+pub const attention_span_slot_capacity: usize = legacy_attention_span_slot_capacity + paged_kv_slot_capacity;
 pub extern fn termite_metal_decode_runtime_attention_span(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,

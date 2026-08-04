@@ -187,6 +187,7 @@ pub const Config = struct {
             pub const Mode = enum {
                 simple,
                 block_hash,
+                radix,
             };
 
             enabled: bool = false,
@@ -1891,6 +1892,8 @@ fn promptCacheFromOpenApi(
         .simple
     else if (std.mem.eql(u8, mode_name, "block_hash"))
         .block_hash
+    else if (std.mem.eql(u8, mode_name, "radix"))
+        .radix
     else
         return error.InvalidConfig;
     const max_bytes_mb = std.math.cast(usize, config.max_bytes_mb orelse 512) orelse return error.InvalidConfig;
@@ -2972,6 +2975,14 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expectEqual(@as(usize, 512), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 64), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 300_000), cfg.inference.prompt_cache.ttl_ms);
+}
+
+test "common config parses opt-in radix prompt cache mode" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc, "{\"inference\":{\"api_url\":\"http://127.0.0.1:8090\",\"prompt_cache\":{\"enabled\":true,\"mode\":\"radix\"}}}");
+    defer cfg.deinit();
+    try std.testing.expect(cfg.inference.prompt_cache.enabled);
+    try std.testing.expectEqual(Config.InferenceConfig.PromptCacheConfig.Mode.radix, cfg.inference.prompt_cache.mode);
 }
 
 test "common config can disable health server" {

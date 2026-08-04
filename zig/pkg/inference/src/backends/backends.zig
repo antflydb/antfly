@@ -634,6 +634,7 @@ test {
     _ = session_pool;
     _ = native;
     _ = activations;
+    _ = metal_kv_storage;
     _ = session_factory;
     _ = imported_onnx_session;
 }

@@ -26,11 +26,12 @@
 //!   device→device blit), f16 (device f32→half convert kernel), and int8
 //!   per-head (device quantize with threadgroup tree reduction over
 //!   head_dim). int4, fp8, bf16 still fall through to the host path.
-//! - Multi-sequence via a (sequence_id, layer_index) → slot map. Slots are
-//!   reclaimed on `releaseSequence`. Capacity-exhaustion returns
-//!   `error.DeviceWriteFallback` so callers downgrade gracefully. Kernel
-//!   encode failures also return `DeviceWriteFallback`; the hook contract is
-//!   best-effort, not a fatal runtime boundary.
+//! - Full-history paged KV uses one device page pool per layer. Physical page
+//!   offsets are the storage runtime's reference-counted block ids, so cached
+//!   prefixes remain resident after the request that populated them exits.
+//!   Sliding-window rings remain sequence-owned because their cyclic physical
+//!   offsets intentionally alias across logical pages. Capacity-exhaustion
+//!   returns `error.DeviceWriteFallback` so callers downgrade gracefully.
 //! - Caller is responsible for keeping the host KvPool in sync if any path
 //!   still reads from it. In the full Phase 6 rollout `ensurePagedKvSuffixWritten`
 //!   calls the device path first and skips the host write when the hook
@@ -38,6 +39,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const block = @import("../runtime/kv/block.zig");
 const storage_runtime = @import("../runtime/kv/storage_runtime.zig");
 const pool_mod = @import("../runtime/kv/pool.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");
@@ -87,6 +89,23 @@ const SlotKey = struct {
     layer_index: u32,
 };
 
+/// Per-sequence view into a backing slot. Full-history bindings for the same
+/// layer share a slot but keep sequence-local layout and position metadata.
+/// Ring bindings own a dedicated slot and are reclaimed with the sequence.
+const SlotBinding = struct {
+    slot: usize,
+    ring_page_count: usize = 0,
+    sequence_owned: bool = false,
+    logical_contiguous: bool = false,
+    physical_base_tokens: usize = 0,
+    written_tokens: usize = 0,
+    position_offset: usize = 0,
+
+    fn ownsSlot(self: SlotBinding) bool {
+        return self.sequence_owned;
+    }
+};
+
 pub const MetalKvStorage = struct {
     allocator: std.mem.Allocator,
     runtime: *metal_runtime.RawMetalDecodeRuntime,
@@ -94,24 +113,17 @@ pub const MetalKvStorage = struct {
     num_kv_heads: u32,
     head_dim: u32,
     page_size_tokens: u16,
-    /// (seq, layer) → slot. Inserted on first write for the pair; removed and
-    /// the slot returned to `free_slots` when the sequence is released.
-    slot_map: std.AutoHashMapUnmanaged(SlotKey, usize) = .empty,
-    /// Slot indices reclaimed from released sequences, consumed LIFO before
-    /// bumping `next_slot`. Reclaimed slots have their backing MTLBuffers
-    /// preserved for capacity reuse but their slot metadata reset so the C
-    /// kernel's incremental-append check starts clean for the next tenant.
-    free_slots: std.ArrayListUnmanaged(usize) = .empty,
-    /// Highest slot index handed out so far + 1. Grows until it hits the
-    /// runtime's attention_span_slot_capacity; after that only `free_slots`
-    /// entries can be acquired and exhaustion signals fallback.
-    next_slot: usize = 0,
-    /// True when logical KV rows for this slot map to a single contiguous
-    /// physical token range. Raw f32 device gathers can then expose a borrowed
-    /// view at `slot_physical_base_tokens[slot]`; non-contiguous tables must
-    /// use the paged attention operator or a gathered-span fallback.
-    slot_logical_contiguous: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
-    slot_physical_base_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
+    /// (seq, layer) → sequence-local view of a device slot.
+    slot_map: std.AutoHashMapUnmanaged(SlotKey, SlotBinding) = .empty,
+    /// Stable layer → slot mapping for full-history paged KV. These slots are
+    /// never reset at a request boundary: retained block ids, rather than a
+    /// transient sequence id, own the bytes stored at each physical page.
+    global_layer_slots: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    /// Physical slots are leased by the shared raw runtime rather than handed
+    /// out independently by each hook. A prompt-cache hook can persist across
+    /// requests while request-local hooks use the same runtime, so local bump
+    /// allocators would alias and corrupt retained KV pages.
+    leased_slots: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
     slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
     slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
     slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
@@ -142,30 +154,74 @@ pub const MetalKvStorage = struct {
         return self;
     }
 
-    /// Acquire a slot for the given (sequence, layer) pair. Reuses the slot
-    /// already bound to this pair if one exists, otherwise pulls from the
-    /// free list, otherwise bumps `next_slot` up to the capacity ceiling.
-    /// Returns `error.DeviceWriteFallback` when exhausted so the caller can
-    /// downgrade to the host path for this write.
-    fn acquireSlot(self: *MetalKvStorage, key: SlotKey) !usize {
-        if (self.slot_map.get(key)) |slot| return slot;
-        const slot: usize = if (self.free_slots.pop()) |reused| blk: {
-            _ = metal_runtime.termite_metal_decode_runtime_reset_attention_span_slot(self.runtime, reused);
-            break :blk reused;
-        } else if (self.next_slot < metal_runtime.attention_span_slot_capacity) blk: {
-            const s = self.next_slot;
-            self.next_slot += 1;
-            break :blk s;
-        } else {
+    fn allocateSlot(self: *MetalKvStorage) !usize {
+        var slot: usize = undefined;
+        if (metal_runtime.termite_metal_decode_runtime_acquire_paged_kv_slot(self.runtime, &slot) != 0)
             return error.DeviceWriteFallback;
-        };
-        self.slot_logical_contiguous[slot] = false;
-        self.slot_physical_base_tokens[slot] = 0;
+        if (slot >= self.leased_slots.len) {
+            _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
+            return error.DeviceWriteFallback;
+        }
+        self.leased_slots[slot] = true;
         self.slot_ring_page_count[slot] = 0;
         self.slot_ring_policy_initialized[slot] = false;
         self.slot_buffer_capacity_tokens[slot] = 0;
-        try self.slot_map.put(self.allocator, key, slot);
         return slot;
+    }
+
+    fn reclaimSlot(self: *MetalKvStorage, slot: usize) void {
+        if (slot >= self.leased_slots.len or !self.leased_slots[slot]) return;
+        _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
+        self.leased_slots[slot] = false;
+        self.slot_ring_page_count[slot] = 0;
+        self.slot_ring_policy_initialized[slot] = false;
+        self.slot_buffer_capacity_tokens[slot] = 0;
+    }
+
+    /// Bind a sequence/layer to either the layer-global full-history page pool
+    /// or a dedicated cyclic SWA ring. `paged` must be true before global
+    /// sharing is allowed; legacy contiguous writes remain sequence-owned.
+    fn acquireBinding(
+        self: *MetalKvStorage,
+        key: SlotKey,
+        ring_page_count: usize,
+        paged: bool,
+    ) !*SlotBinding {
+        if (self.slot_map.getPtr(key)) |binding| {
+            if (binding.ring_page_count != ring_page_count) return error.DeviceWriteFallback;
+            return binding;
+        }
+
+        const owns_slot = ring_page_count > 0 or !paged;
+        var global_created = false;
+        var owned_created = false;
+        var slot: usize = undefined;
+        errdefer {
+            if (global_created) _ = self.global_layer_slots.remove(key.layer_index);
+            if (global_created or owned_created) self.reclaimSlot(slot);
+        }
+        if (!owns_slot) {
+            if (self.global_layer_slots.get(key.layer_index)) |existing| {
+                slot = existing;
+            } else {
+                slot = try self.allocateSlot();
+                global_created = true;
+                try self.global_layer_slots.put(self.allocator, key.layer_index, slot);
+                self.slot_ring_page_count[slot] = 0;
+                self.slot_ring_policy_initialized[slot] = true;
+            }
+        } else {
+            slot = try self.allocateSlot();
+            owned_created = true;
+            _ = try self.configureSlotRingPolicy(slot, ring_page_count);
+        }
+
+        try self.slot_map.put(self.allocator, key, .{
+            .slot = slot,
+            .ring_page_count = ring_page_count,
+            .sequence_owned = owns_slot,
+        });
+        return self.slot_map.getPtr(key).?;
     }
 
     fn flagValueEnabled(value: []const u8) bool {
@@ -268,32 +324,22 @@ pub const MetalKvStorage = struct {
         return required;
     }
 
-    /// Release every slot bound to `sequence_id` back to the free pool and
-    /// reset their slot metadata so the next tenant re-encodes from scratch.
-    /// Safe to call for a sequence that holds no slots.
+    /// Remove every binding for `sequence_id`. Full-history page-pool slots
+    /// remain live because retained physical block ids may still reference
+    /// their bytes; only sequence-owned ring/legacy slots are reset/reclaimed.
     fn releaseSequenceSlots(self: *MetalKvStorage, sequence_id: storage_runtime.SequenceId) void {
         var it = self.slot_map.iterator();
-        var to_release: std.ArrayListUnmanaged(SlotKey) = .empty;
-        defer to_release.deinit(self.allocator);
+        var keys: [metal_runtime.attention_span_slot_capacity]SlotKey = undefined;
+        var key_count: usize = 0;
         while (it.next()) |entry| {
             if (entry.key_ptr.sequence_id != sequence_id) continue;
-            to_release.append(self.allocator, entry.key_ptr.*) catch {
-                // On allocation failure, reset the slot in place — we won't
-                // be able to reuse it, but we also won't double-bind it.
-                const slot = entry.value_ptr.*;
-                _ = metal_runtime.termite_metal_decode_runtime_reset_attention_span_slot(self.runtime, slot);
-                self.slot_buffer_capacity_tokens[slot] = 0;
-                continue;
-            };
+            if (key_count == keys.len) break;
+            keys[key_count] = entry.key_ptr.*;
+            key_count += 1;
         }
-        for (to_release.items) |key| {
+        for (keys[0..key_count]) |key| {
             if (self.slot_map.fetchRemove(key)) |removed| {
-                _ = metal_runtime.termite_metal_decode_runtime_reset_attention_span_slot(self.runtime, removed.value);
-                self.slot_buffer_capacity_tokens[removed.value] = 0;
-                self.free_slots.append(self.allocator, removed.value) catch {
-                    // If we can't record the reuse slot, the slot leaks for
-                    // this session — it still gets cleared on reset_state.
-                };
+                if (removed.value.ownsSlot()) self.reclaimSlot(removed.value.slot);
             }
         }
     }
@@ -373,17 +419,22 @@ pub const MetalKvStorage = struct {
         const expected_bytes = expected_elems * @sizeOf(f32);
         if (k.byte_len < expected_bytes or v.byte_len < expected_bytes) return error.InvalidKvShape;
 
-        const slot = try self.acquireSlot(.{
-            .sequence_id = write.sequence_id,
-            .layer_index = @intCast(write.layer_index),
-        });
         const requested_ring_pages = try requestedRingPageCount(
             write.page_size_tokens,
             write.sliding_window,
             write.max_inflight_tokens,
             write.allow_swa_ring,
         );
-        const ring_page_count = try self.configureSlotRingPolicy(slot, requested_ring_pages);
+        const binding = try self.acquireBinding(
+            .{
+                .sequence_id = write.sequence_id,
+                .layer_index = @intCast(write.layer_index),
+            },
+            requested_ring_pages,
+            write.logical_blocks != null,
+        );
+        const slot = binding.slot;
+        const ring_page_count = binding.ring_page_count;
         if (traceKvGather()) std.debug.print(
             "kv-write: seq={d} layer={d} suffix={d} total={d} slot={d} ring_pages={d}\n",
             .{ write.sequence_id, write.layer_index, write.suffix_token_count, write.total_token_count, slot, ring_page_count },
@@ -413,13 +464,13 @@ pub const MetalKvStorage = struct {
                 key_row_bytes,
                 v_row_stride,
             ) catch break :paged -9999;
-            self.slot_physical_base_tokens[slot] = if (ring_page_count > 0) 0 else block_offsets[0];
-            self.slot_logical_contiguous[slot] = ring_page_count == 0;
+            binding.physical_base_tokens = if (ring_page_count > 0) 0 else block_offsets[0];
+            binding.logical_contiguous = ring_page_count == 0;
             if (ring_page_count == 0) {
                 for (block_offsets, 0..) |offset, block_idx| {
-                    const expected = self.slot_physical_base_tokens[slot] + block_idx * @as(usize, write.page_size_tokens);
+                    const expected = binding.physical_base_tokens + block_idx * @as(usize, write.page_size_tokens);
                     if (offset != expected) {
-                        self.slot_logical_contiguous[slot] = false;
+                        binding.logical_contiguous = false;
                         break;
                     }
                 }
@@ -446,8 +497,8 @@ pub const MetalKvStorage = struct {
             );
         } else blk: {
             if (ring_page_count > 0) break :blk -9999;
-            self.slot_logical_contiguous[slot] = true;
-            self.slot_physical_base_tokens[slot] = 0;
+            binding.logical_contiguous = true;
+            binding.physical_base_tokens = 0;
             self.reserveSlotCapacity(
                 slot,
                 write.total_token_count,
@@ -474,6 +525,8 @@ pub const MetalKvStorage = struct {
             );
         };
         if (rc != 0) return error.DeviceWriteFallback;
+        binding.written_tokens = write.total_token_count;
+        binding.position_offset = write.position_offset;
     }
 
     fn reserveLayerKvDevice(
@@ -485,17 +538,22 @@ pub const MetalKvStorage = struct {
         const layout = self.rowLayout(reserve.num_kv_heads, reserve.head_dim);
         if (layout.key_row_bytes == 0 or layout.v_row_stride == 0) return error.InvalidKvShape;
 
-        const slot = try self.acquireSlot(.{
-            .sequence_id = reserve.sequence_id,
-            .layer_index = @intCast(reserve.layer_index),
-        });
         const requested_ring_pages = try requestedRingPageCount(
             reserve.page_size_tokens,
             reserve.sliding_window,
             reserve.max_inflight_tokens,
             reserve.allow_swa_ring,
         );
-        const ring_page_count = try self.configureSlotRingPolicy(slot, requested_ring_pages);
+        const binding = try self.acquireBinding(
+            .{
+                .sequence_id = reserve.sequence_id,
+                .layer_index = @intCast(reserve.layer_index),
+            },
+            requested_ring_pages,
+            reserve.logical_blocks != null,
+        );
+        const slot = binding.slot;
+        const ring_page_count = binding.ring_page_count;
         if (traceKvGather()) std.debug.print(
             "kv-reserve: seq={d} layer={d} capacity={d} slot={d} ring_pages={d}\n",
             .{ reserve.sequence_id, reserve.layer_index, reserve.token_capacity, slot, ring_page_count },
@@ -509,12 +567,12 @@ pub const MetalKvStorage = struct {
             const needed_blocks = std.math.divCeil(usize, reserve.token_capacity, reserve.page_size_tokens) catch break :blk reserve.token_capacity;
             if (logical_blocks.len < needed_blocks) break :blk reserve.token_capacity;
             var capacity_tokens: usize = 0;
-            self.slot_physical_base_tokens[slot] = std.math.mul(
+            binding.physical_base_tokens = std.math.mul(
                 usize,
                 @as(usize, logical_blocks[0]),
                 reserve.page_size_tokens,
             ) catch return error.KvCapacityTooSmall;
-            self.slot_logical_contiguous[slot] = true;
+            binding.logical_contiguous = true;
             for (logical_blocks[0..needed_blocks], 0..) |block_id, block_idx| {
                 const block_start = std.math.mul(
                     usize,
@@ -528,10 +586,10 @@ pub const MetalKvStorage = struct {
                 ) catch return error.KvCapacityTooSmall;
                 const expected = std.math.add(
                     usize,
-                    self.slot_physical_base_tokens[slot],
+                    binding.physical_base_tokens,
                     expected_delta,
                 ) catch return error.KvCapacityTooSmall;
-                if (block_start != expected) self.slot_logical_contiguous[slot] = false;
+                if (block_start != expected) binding.logical_contiguous = false;
                 const block_end = std.math.add(
                     usize,
                     block_start,
@@ -541,14 +599,15 @@ pub const MetalKvStorage = struct {
             }
             break :blk capacity_tokens;
         } else blk: {
-            self.slot_logical_contiguous[slot] = true;
-            self.slot_physical_base_tokens[slot] = 0;
+            binding.logical_contiguous = true;
+            binding.physical_base_tokens = 0;
             break :blk reserve.token_capacity;
         };
         if (ring_page_count > 0) {
-            self.slot_logical_contiguous[slot] = false;
-            self.slot_physical_base_tokens[slot] = 0;
+            binding.logical_contiguous = false;
+            binding.physical_base_tokens = 0;
         }
+        binding.position_offset = reserve.position_offset;
 
         try self.reserveSlotCapacity(
             slot,
@@ -562,8 +621,13 @@ pub const MetalKvStorage = struct {
 
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        for (&self.leased_slots, 0..) |*leased, slot| {
+            if (!leased.*) continue;
+            _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
+            leased.* = false;
+        }
         self.slot_map.deinit(allocator);
-        self.free_slots.deinit(allocator);
+        self.global_layer_slots.deinit(allocator);
         self.cyclic_page_table_cache.deinit(allocator);
         allocator.destroy(self);
     }
@@ -587,14 +651,15 @@ pub const MetalKvStorage = struct {
         if (k_out.len < expected_elems or v_out.len < expected_elems) return error.InvalidKvShape;
 
         if (traceKvGather()) std.debug.print("kv-read: seq={d} layer={d} tokens={d}\n", .{ gather.sequence_id, gather.layer_index, gather.token_count });
-        const slot = self.slot_map.get(.{
+        const binding = self.slot_map.get(.{
             .sequence_id = gather.sequence_id,
             .layer_index = @intCast(gather.layer_index),
         }) orelse return error.DeviceReadFallback;
-        if (self.slot_ring_page_count[slot] > 0) return error.RingKvRequiresPagedAttention;
-        if (!self.slot_logical_contiguous[slot]) return error.DeviceReadFallback;
+        const slot = binding.slot;
+        if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
+        if (!binding.logical_contiguous) return error.DeviceReadFallback;
+        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
-        if (info.tokens != 0 and info.tokens < gather.token_count) return error.DeviceReadFallback;
 
         const k_handle = info.encoded_key_handle orelse return error.DeviceReadFallback;
         const v_handle = info.v_handle orelse return error.DeviceReadFallback;
@@ -609,7 +674,7 @@ pub const MetalKvStorage = struct {
         const v_element_bytes: usize = if (self.format == .f16) @sizeOf(u16) else @sizeOf(f32);
         const key_bytes = gather.token_count * key_row_bytes;
         const v_byte_count = gather.token_count * v_row_stride * v_element_bytes;
-        const physical_base = self.slot_physical_base_tokens[slot];
+        const physical_base = binding.physical_base_tokens;
         const key_byte_offset = physical_base * key_row_bytes;
         const v_byte_offset = physical_base * v_row_stride * v_element_bytes;
         if (key_byte_offset + key_bytes > info.encoded_key_capacity or v_byte_offset + v_byte_count > info.v_capacity) return error.DeviceReadFallback;
@@ -674,20 +739,21 @@ pub const MetalKvStorage = struct {
         const byte_len = gather.token_count * token_width * @sizeOf(f32);
 
         if (traceKvGather()) std.debug.print("kv-read: seq={d} layer={d} tokens={d}\n", .{ gather.sequence_id, gather.layer_index, gather.token_count });
-        const slot = self.slot_map.get(.{
+        const binding = self.slot_map.get(.{
             .sequence_id = gather.sequence_id,
             .layer_index = @intCast(gather.layer_index),
         }) orelse return error.DeviceReadFallback;
-        if (self.slot_ring_page_count[slot] > 0) return error.RingKvRequiresPagedAttention;
-        if (!self.slot_logical_contiguous[slot]) return error.DeviceReadFallback;
+        const slot = binding.slot;
+        if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
+        if (!binding.logical_contiguous) return error.DeviceReadFallback;
+        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
-        if (info.tokens < gather.token_count) return error.DeviceReadFallback;
         if (info.key_row_bytes != token_width * @sizeOf(f32)) return error.DeviceReadFallback;
         if (info.v_row_stride != token_width) return error.DeviceReadFallback;
 
         const k_handle = info.encoded_key_handle orelse return error.DeviceReadFallback;
         const v_handle = info.v_handle orelse return error.DeviceReadFallback;
-        const byte_offset = self.slot_physical_base_tokens[slot] * token_width * @sizeOf(f32);
+        const byte_offset = binding.physical_base_tokens * token_width * @sizeOf(f32);
         if (byte_offset + byte_len > info.encoded_key_capacity or byte_offset + byte_len > info.v_capacity) return error.DeviceReadFallback;
 
         return .{
@@ -737,19 +803,18 @@ pub const MetalKvStorage = struct {
             .layer_index = @intCast(gather.layer_index),
         };
         const active_frame = metal_runtime.hasActiveFrame(self.runtime);
-        const slot = self.slot_map.get(key) orelse return error.DeviceReadFallback;
-        const ring_page_count = self.slot_ring_page_count[slot];
+        const binding = self.slot_map.get(key) orelse return error.DeviceReadFallback;
+        const slot = binding.slot;
+        const ring_page_count = binding.ring_page_count;
         const info_opt = self.slotInfo(slot) catch |err| blk: {
             if (!active_frame) return err;
             break :blk null;
         };
-        const position_offset = if (info_opt) |info| blk: {
-            if (ring_page_count == 0 and !active_frame and info.tokens < gather.token_count) return error.DeviceReadFallback;
-            if (ring_page_count == 0 and info.tokens != 0 and info.tokens < gather.token_count and !active_frame) return error.DeviceReadFallback;
+        if (!active_frame and binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        if (info_opt) |info| {
             if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) return error.DeviceReadFallback;
             if (info.v_row_stride != 0 and info.v_row_stride != token_width) return error.DeviceReadFallback;
-            break :blk info.position_offset;
-        } else 0;
+        }
         return .{
             .runtime = @ptrCast(self.runtime),
             .slot = slot,
@@ -760,7 +825,7 @@ pub const MetalKvStorage = struct {
             .v_row_stride = token_width,
             .page_size_tokens = self.page_size_tokens,
             .ring_page_count = ring_page_count,
-            .position_offset = position_offset,
+            .position_offset = binding.position_offset,
         };
     }
 
@@ -784,6 +849,17 @@ pub const MetalKvStorage = struct {
         );
         if (rc != 0) return error.InvalidSlot;
         return info;
+    }
+
+    /// Return the physical slot backing a sequence/layer view. Intended for
+    /// diagnostics and invariant tests; callers must not treat slot identity
+    /// as stable beyond the owning hook's lifetime.
+    pub fn boundSlot(self: *const MetalKvStorage, sequence_id: storage_runtime.SequenceId, layer_index: usize) ?usize {
+        const binding = self.slot_map.get(.{
+            .sequence_id = sequence_id,
+            .layer_index = std.math.cast(u32, layer_index) orelse return null,
+        }) orelse return null;
+        return binding.slot;
     }
 
     pub const SlotInfo = struct {
@@ -850,4 +926,130 @@ test "KeyFormat.fromKvDType covers supported dtypes" {
     try std.testing.expect(!KeyFormat.raw_f32.isCompressed());
     try std.testing.expect(!KeyFormat.f16.isCompressed());
     try std.testing.expect(KeyFormat.int8_per_head.isCompressed());
+}
+
+test "Metal paged KV hooks sharing a runtime lease disjoint slots" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const cached = try MetalKvStorage.create(allocator, runtime, .f16, 1, 2, 2);
+    defer cached.deviceWriteHook().deinit(allocator);
+    const cached_binding = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true);
+    const cached_slot = cached_binding.slot;
+
+    const request_local = try MetalKvStorage.create(allocator, runtime, .f32, 1, 2, 2);
+    const local_binding = try request_local.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true);
+    const local_slot = local_binding.slot;
+    try std.testing.expect(cached_slot >= metal_runtime.paged_kv_slot_base);
+    try std.testing.expect(local_slot >= metal_runtime.paged_kv_slot_base);
+    try std.testing.expect(cached_slot != local_slot);
+
+    // Returning a request-local hook publishes only its own lease. The cache
+    // still owns its original slot, while its next layer can reuse the slot
+    // that the completed request returned to the shared runtime.
+    request_local.deviceWriteHook().deinit(allocator);
+    const cached_layer_1 = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 1 }, 0, true);
+    try std.testing.expectEqual(local_slot, cached_layer_1.slot);
+    try std.testing.expect(cached_layer_1.slot != cached_slot);
+}
+
+test "Metal paged KV keeps layer-global pages across source sequence release" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    var storage = try storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 2,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    });
+    defer storage.deinit();
+    const metal_storage = try MetalKvStorage.create(allocator, runtime, .f32, 1, 2, 2);
+    storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
+
+    const input_bytes = 4 * @sizeOf(f32);
+    const k_handle = metal_runtime.termite_metal_buffer_alloc(runtime, input_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(k_handle);
+    const v_handle = metal_runtime.termite_metal_buffer_alloc(runtime, input_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(v_handle);
+
+    const source_id = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(source_id, 2);
+    const source_layers = [_]struct { k: [4]f32, v: [4]f32 }{
+        .{ .k = .{ 1, 2, 3, 4 }, .v = .{ 11, 12, 13, 14 } },
+        .{ .k = .{ 21, 22, 23, 24 }, .v = .{ 31, 32, 33, 34 } },
+    };
+    var original_slots: [2]usize = undefined;
+    for (source_layers, 0..) |layer, layer_index| {
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, k_handle, 0, &layer.k, input_bytes));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, v_handle, 0, &layer.v, input_bytes));
+        try storage.writeLayerKvSuffixDevice(.{
+            .sequence_id = source_id,
+            .layer_index = layer_index,
+            .total_token_count = 2,
+            .suffix_token_count = 2,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 2,
+        }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = input_bytes }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = input_bytes });
+        original_slots[layer_index] = metal_storage.slot_map.get(.{
+            .sequence_id = source_id,
+            .layer_index = @intCast(layer_index),
+        }).?.slot;
+        try std.testing.expectEqual(original_slots[layer_index], metal_storage.global_layer_slots.get(@intCast(layer_index)).?);
+    }
+    try std.testing.expect(original_slots[0] != original_slots[1]);
+
+    var retained: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer retained.deinit(allocator);
+    try storage.retainSequencePrefixBlocks(source_id, 2, &retained);
+    try storage.releaseSequence(source_id);
+    try std.testing.expect(metal_storage.slot_map.get(.{ .sequence_id = source_id, .layer_index = 0 }) == null);
+    try std.testing.expectEqual(original_slots[0], metal_storage.global_layer_slots.get(0).?);
+    try std.testing.expectEqual(original_slots[1], metal_storage.global_layer_slots.get(1).?);
+
+    const derived_id = try storage.attachSequenceWithRetainedBlocks(storage.poolId(), retained.items, 2);
+    storage.releaseRetainedBlocks(retained.items);
+    try storage.appendTokens(derived_id, 1);
+    const suffix_layers = [_]struct { k: [2]f32, v: [2]f32 }{
+        .{ .k = .{ 5, 6 }, .v = .{ 15, 16 } },
+        .{ .k = .{ 25, 26 }, .v = .{ 35, 36 } },
+    };
+    for (suffix_layers, 0..) |layer, layer_index| {
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, k_handle, 0, &layer.k, layer.k.len * @sizeOf(f32)));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, v_handle, 0, &layer.v, layer.v.len * @sizeOf(f32)));
+        try storage.writeLayerKvSuffixDevice(.{
+            .sequence_id = derived_id,
+            .layer_index = layer_index,
+            .total_token_count = 3,
+            .suffix_token_count = 1,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 2,
+        }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = layer.k.len * @sizeOf(f32) }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = layer.v.len * @sizeOf(f32) });
+        try std.testing.expectEqual(original_slots[layer_index], metal_storage.slot_map.get(.{
+            .sequence_id = derived_id,
+            .layer_index = @intCast(layer_index),
+        }).?.slot);
+        const gathered = try storage.gatherLayerKv(allocator, derived_id, layer_index, 3);
+        defer allocator.free(gathered.k);
+        defer allocator.free(gathered.v);
+        const expected_k = source_layers[layer_index].k ++ layer.k;
+        const expected_v = source_layers[layer_index].v ++ layer.v;
+        try std.testing.expectEqualSlices(f32, &expected_k, gathered.k);
+        try std.testing.expectEqualSlices(f32, &expected_v, gathered.v);
+    }
+    try storage.releaseSequence(derived_id);
 }

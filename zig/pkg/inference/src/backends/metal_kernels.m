@@ -32,7 +32,17 @@
 #define TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY 256
 #define TERMITE_METAL_RMS_NORM_SLOT_CAPACITY 512
 #define TERMITE_METAL_LINEAR_SLOT_CAPACITY 512
-#define TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY 256
+// Legacy eager/direct attention addresses slots by layer index. Device-paged
+// KV storage, on the other hand, can outlive a request (prompt/radix cache) and
+// therefore needs runtime-owned leases that cannot alias those legacy slots.
+// Keep the two physical namespaces disjoint while retaining 256 slots for
+// each path; backing MTLBuffers remain lazy, so the larger metadata table does
+// not reserve device memory up front.
+#define TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY 256
+#define TERMITE_METAL_PAGED_KV_SLOT_CAPACITY 256
+#define TERMITE_METAL_PAGED_KV_SLOT_BASE TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY
+#define TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY \
+    (TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY + TERMITE_METAL_PAGED_KV_SLOT_CAPACITY)
 #define TERMITE_METAL_SCRATCH_POOL_CAPACITY 16
 #define TERMITE_METAL_GENERATED_DECODE_THREADS 256u
 #define TERMITE_METAL_GENERATED_FLASH_THREADS 128u
@@ -1253,6 +1263,7 @@ typedef struct termite_metal_decode_runtime {
     size_t attention_span_slot_key_row_bytes[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
     size_t attention_span_slot_v_row_stride[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
     size_t attention_span_slot_position_offset[TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY];
+    _Atomic(uint8_t) attention_span_paged_slot_leased[TERMITE_METAL_PAGED_KV_SLOT_CAPACITY];
     // Phase 2 — activation scratch pool (Private storage). Without an active
     // frame, release returns the slot to the pool immediately. With an active
     // or submitted frame, release retires the slot until the frame finishes so
@@ -1616,6 +1627,14 @@ static void termite_metal_jit_exact_dispatch_stats_init(
 ) {
     for (size_t route = 0; route < TERMITE_METAL_JIT_EXACT_ROUTE_COUNT; ++route) {
         atomic_init(&runtime->jit_exact_dispatch_counts[route], 0u);
+    }
+}
+
+static void termite_metal_paged_kv_slot_leases_init(
+    termite_metal_decode_runtime *runtime
+) {
+    for (size_t slot = 0; slot < TERMITE_METAL_PAGED_KV_SLOT_CAPACITY; ++slot) {
+        atomic_init(&runtime->attention_span_paged_slot_leased[slot], 0);
     }
 }
 
@@ -15667,7 +15686,11 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     if (key_row_bytes > UINT32_MAX || base_key_row_bytes > UINT32_MAX || query_position_offset > UINT32_MAX || kv_position_offset > UINT32_MAX || sliding_window > UINT32_MAX || page_size > UINT32_MAX || block_count > UINT32_MAX) return failure_code;
     if (runtime->attention_paged_pipeline == nil) return failure_code;
     if (runtime->attention_span_encoded_key_buffers[slot] == nil || runtime->attention_span_v_buffers[slot] == nil) return failure_code;
-    if (runtime->attention_span_slot_tokens[slot] < kv_tokens || runtime->attention_span_slot_key_row_bytes[slot] != key_row_bytes || runtime->attention_span_slot_position_offset[slot] != kv_position_offset) return failure_code;
+    // Paged slots may be layer-global: sequence-local token counts and
+    // position offsets are carried by this invocation and its block table.
+    // Only the physical row layout is slot-global. Referenced page capacity is
+    // validated below before any buffer is bound.
+    if (runtime->attention_span_slot_key_row_bytes[slot] != key_row_bytes) return failure_code;
     if (runtime->attention_span_slot_v_row_stride[slot] > UINT32_MAX) return failure_code;
     if (sinks != NULL && sink_count < num_heads) return failure_code;
     if (block_count > SIZE_MAX / sizeof(uint32_t)) return failure_code;
@@ -18539,6 +18562,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         termite_metal_decode_runtime *runtime = calloc(1, sizeof(termite_metal_decode_runtime));
         if (runtime == NULL) return NULL;
         termite_metal_jit_exact_dispatch_stats_init(runtime);
+        termite_metal_paged_kv_slot_leases_init(runtime);
         runtime->device = device;
         runtime->queue = queue;
         runtime->library = library;
@@ -36080,7 +36104,7 @@ int termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_0_slot(
     float *output
 ) {
     if (runtime == NULL || q == NULL || k == NULL || v == NULL || residual == NULL || output == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     @autoreleasepool {
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
@@ -40253,6 +40277,74 @@ int termite_metal_decode_runtime_reset_attention_span_slot(
     return 0;
 }
 
+/// Atomically lease a slot from the device-paged KV namespace. Persistent
+/// prompt-cache hooks and request-local hooks can share one decoder runtime;
+/// leasing here (the actual owner of the slot table) prevents either hook
+/// from resetting or overwriting the other's retained pages. Legacy/direct
+/// attention occupies the disjoint lower namespace and cannot alias leases.
+int termite_metal_decode_runtime_acquire_paged_kv_slot(
+    termite_metal_decode_runtime *runtime,
+    size_t *slot_out
+) {
+    if (runtime == NULL || slot_out == NULL) return -1;
+    for (size_t local = 0; local < TERMITE_METAL_PAGED_KV_SLOT_CAPACITY; ++local) {
+        uint8_t expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(
+                &runtime->attention_span_paged_slot_leased[local],
+                &expected,
+                1,
+                memory_order_acq_rel,
+                memory_order_relaxed))
+        {
+            continue;
+        }
+        const size_t slot = TERMITE_METAL_PAGED_KV_SLOT_BASE + local;
+        // The lease excludes every other paged-KV owner while stale append
+        // metadata is cleared. Buffers stay allocated for capacity reuse.
+        runtime->attention_span_slot_tokens[slot] = 0;
+        runtime->attention_span_slot_key_row_bytes[slot] = 0;
+        runtime->attention_span_slot_v_row_stride[slot] = 0;
+        runtime->attention_span_slot_position_offset[slot] = 0;
+        *slot_out = slot;
+        return 0;
+    }
+    return -2;
+}
+
+/// Return a device-paged KV slot to the shared runtime. Metadata is cleared
+/// before publishing the slot as free; backing buffers remain reusable.
+int termite_metal_decode_runtime_release_paged_kv_slot(
+    termite_metal_decode_runtime *runtime,
+    size_t slot
+) {
+    if (runtime == NULL) return -1;
+    if (slot < TERMITE_METAL_PAGED_KV_SLOT_BASE ||
+        slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY)
+    {
+        return -2;
+    }
+    const size_t local = slot - TERMITE_METAL_PAGED_KV_SLOT_BASE;
+    uint8_t expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &runtime->attention_span_paged_slot_leased[local],
+            &expected,
+            2,
+            memory_order_acq_rel,
+            memory_order_relaxed))
+    {
+        return -3;
+    }
+    runtime->attention_span_slot_tokens[slot] = 0;
+    runtime->attention_span_slot_key_row_bytes[slot] = 0;
+    runtime->attention_span_slot_v_row_stride[slot] = 0;
+    runtime->attention_span_slot_position_offset[slot] = 0;
+    atomic_store_explicit(
+        &runtime->attention_span_paged_slot_leased[local],
+        0,
+        memory_order_release);
+    return 0;
+}
+
 /// Reserve backing buffers for a persistent attention-span slot without
 /// marking any logical tokens as written. MetalKvStorage uses this at
 /// sequence-growth boundaries so suffix writes do not have to reallocate or
@@ -40943,7 +41035,9 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     if (key_row_bytes > UINT32_MAX || base_key_row_bytes > UINT32_MAX || query_position_offset > UINT32_MAX || kv_position_offset > UINT32_MAX || sliding_window > UINT32_MAX || page_size > UINT32_MAX || block_count > UINT32_MAX) return -6;
     if (runtime->attention_paged_pipeline == nil) return -7;
     if (runtime->attention_span_encoded_key_buffers[slot] == nil || runtime->attention_span_v_buffers[slot] == nil) return -8;
-    if (runtime->attention_span_slot_tokens[slot] < kv_tokens || runtime->attention_span_slot_key_row_bytes[slot] != key_row_bytes || runtime->attention_span_slot_position_offset[slot] != kv_position_offset) return -9;
+    // Full-history page pools are shared by all sequences for a layer. Token
+    // count and position are request metadata, not slot ownership metadata.
+    if (runtime->attention_span_slot_key_row_bytes[slot] != key_row_bytes) return -9;
     if (runtime->attention_span_slot_v_row_stride[slot] > UINT32_MAX) return -10;
     if (sinks != NULL && sink_count < num_heads) return -11;
     if (block_count > SIZE_MAX / sizeof(uint32_t)) return -12;
@@ -42519,7 +42613,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block(
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || q == NULL || k == NULL || v == NULL || residual == NULL || output == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     @autoreleasepool {
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
@@ -42697,7 +42791,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot(
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || attention_input == NULL || k == NULL || v == NULL || residual == NULL || output == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     if (q_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -2;
     if (runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil) return -3;
@@ -42914,7 +43008,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_device(
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || q_handle == NULL || k == NULL || v == NULL || residual_handle == NULL || output_handle == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
@@ -43090,7 +43184,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_device_kv_device(
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || residual_handle == NULL || output_handle == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
@@ -43264,7 +43358,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device(
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || attention_input_handle == NULL || k == NULL || v == NULL || residual_handle == NULL || output_handle == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     if (q_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -2;
     if (runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil) return -3;
@@ -43478,7 +43572,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device_kv_de
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || attention_input_handle == NULL || k_handle == NULL || v_handle == NULL || residual_handle == NULL || output_handle == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     if (q_linear_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -2;
     if (runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil) return -3;
@@ -43691,7 +43785,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_devi
     termite_metal_attention_gated_block_timing *timing
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || residual_handle == NULL || output_handle == NULL) return -1;
-    if (layer_index >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
+    if (layer_index >= TERMITE_METAL_LEGACY_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (timing != NULL) memset(timing, 0, sizeof(*timing));
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);

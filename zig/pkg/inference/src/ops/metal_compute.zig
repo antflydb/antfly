@@ -21461,7 +21461,8 @@ test "metal_compute: metal kv geometric growth preserves f32 pages inside and ou
         },
     );
     const row_bytes = hidden_kv * @sizeOf(f32);
-    var slot_info = try device_storage.slotInfo(0);
+    const paged_slot = device_storage.boundSlot(metal_seq, 0) orelse return error.TestUnexpectedResult;
+    var slot_info = try device_storage.slotInfo(paged_slot);
     try std.testing.expectEqual(prefix_tokens * row_bytes, slot_info.encoded_key_capacity);
     try std.testing.expectEqual(prefix_tokens * row_bytes, slot_info.v_capacity);
 
@@ -21491,7 +21492,7 @@ test "metal_compute: metal kv geometric growth preserves f32 pages inside and ou
         },
     );
     try native_manager.writeLayerKvSuffix(native_seq, 0, ordinary_total_tokens, 1, &ordinary_k, &ordinary_v);
-    slot_info = try device_storage.slotInfo(0);
+    slot_info = try device_storage.slotInfo(paged_slot);
     try std.testing.expectEqual(@as(usize, 40) * row_bytes, slot_info.encoded_key_capacity);
     try std.testing.expectEqual(@as(usize, 40) * row_bytes, slot_info.v_capacity);
 
@@ -21526,7 +21527,7 @@ test "metal_compute: metal kv geometric growth preserves f32 pages inside and ou
     try metal_runtime.submitFrame(runtime);
     try metal_runtime.waitFrame(runtime);
     try native_manager.writeLayerKvSuffix(native_seq, 0, total_tokens, active_suffix_tokens, &active_k, &active_v);
-    slot_info = try device_storage.slotInfo(0);
+    slot_info = try device_storage.slotInfo(paged_slot);
     try std.testing.expectEqual(@as(usize, 64) * row_bytes, slot_info.encoded_key_capacity);
     try std.testing.expectEqual(@as(usize, 64) * row_bytes, slot_info.v_capacity);
 

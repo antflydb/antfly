@@ -3257,10 +3257,27 @@ pub const NativeGenerationPipeline = struct {
             if (cache_eligible) {
                 const page_size = cache.pageSize() orelse 0;
                 if (page_size > 0 and seq_len > page_size) {
-                    if (try cache.attachLongestPrefix(config.prompt_cache_key.?, token_ids[0..seq_len], seq_len - page_size)) |hit| {
-                        try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
-                        cached_prompt_tokens = hit.token_count;
-                        prefill_ids = token_ids[cached_prompt_tokens..seq_len];
+                    const maybe_hit = cache.attachLongestPrefix(
+                        config.prompt_cache_key.?,
+                        token_ids[0..seq_len],
+                        seq_len - page_size,
+                    ) catch |err| blk: {
+                        std.log.warn("prompt cache lookup failed; continuing without reuse: {s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (maybe_hit) |hit| {
+                        const seeded = blk: {
+                            decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count) catch |err| {
+                                cache.releaseAttachedPrefix(hit);
+                                std.log.warn("prompt cache seed failed; continuing without reuse: {s}", .{@errorName(err)});
+                                break :blk false;
+                            };
+                            break :blk true;
+                        };
+                        if (seeded) {
+                            cached_prompt_tokens = hit.token_count;
+                            prefill_ids = token_ids[cached_prompt_tokens..seq_len];
+                        }
                     }
                 }
             }
@@ -3290,7 +3307,11 @@ pub const NativeGenerationPipeline = struct {
             if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
                 if (config.prompt_cache_key) |cache_key| {
                     if (decode_state.sequence_id) |sequence_id| {
-                        try cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id);
+                        cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id) catch |err| {
+                            // Prompt caching is an optional acceleration. A
+                            // failed insertion must not discard valid logits.
+                            std.log.warn("prompt cache store failed; continuing without insertion: {s}", .{@errorName(err)});
+                        };
                     }
                 }
             }
@@ -3971,6 +3992,40 @@ pub const NativeGenerationPipeline = struct {
                 "standard decode returned tokens_generated={d} finish_reason={s} seq_len={d}",
                 .{ tokens_generated, finish_reason, seq_len },
             );
+        }
+
+        // Radix mode also learns reusable conversation continuations. The
+        // final sampled token has a logical KV slot but is not materialized
+        // until the next autoregressive forward pass, so retain only the
+        // prefix ending immediately before it. storeGeneratedPrefixFromSequence
+        // page-aligns that valid prefix and is a no-op for non-radix modes.
+        if (tokens_generated > 0) {
+            if (self.prompt_cache) |cache| {
+                const cache_eligible =
+                    config.prompt_cache_enabled and
+                    config.prompt_cache_key != null and
+                    prepared_multimodal_prompt == null and
+                    !use_speculative and
+                    config.cache_compaction_ratio == null and
+                    self.compiled_partition_backend == null and
+                    !NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config) and
+                    !self.gpt_config.isQwen35() and
+                    decode_state.isPaged() and
+                    decode_state.kv_manager == cache.managerPtr();
+                if (cache_eligible) {
+                    if (decode_state.sequence_id) |sequence_id| {
+                        cache.storeGeneratedPrefixFromSequence(
+                            config.prompt_cache_key.?,
+                            token_ids[0 .. seq_len - 1],
+                            sequence_id,
+                        ) catch |err| {
+                            // A cache admission failure must not discard an
+                            // otherwise complete generation response.
+                            std.log.warn("radix continuation cache store failed: {s}", .{@errorName(err)});
+                        };
+                    }
+                }
+            }
         }
 
         // Decode only the generated tokens. By default channel-aware models

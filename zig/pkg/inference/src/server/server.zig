@@ -291,6 +291,22 @@ fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.Bac
     };
 }
 
+fn promptCacheBackendEligible(mode: runtime.kv.prompt_cache.Mode, backend: runtime.kv.pool.BackendKind) bool {
+    return switch (backend) {
+        .native, .metal => true,
+        // CUDA still owns device KV by transient sequence id. Keep the new
+        // radix mode fail-closed there until its page pool has block lifetime.
+        .cuda => mode != .radix,
+    };
+}
+
+test "radix prompt cache is opt in and excludes CUDA device storage" {
+    try std.testing.expect(promptCacheBackendEligible(.radix, .metal));
+    try std.testing.expect(promptCacheBackendEligible(.radix, .native));
+    try std.testing.expect(!promptCacheBackendEligible(.radix, .cuda));
+    try std.testing.expect(promptCacheBackendEligible(.block_hash, .cuda));
+}
+
 fn generationKvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
@@ -807,13 +823,26 @@ fn shouldAutoUseMetalWholeModelGenerate(
     loaded_backend: backends_mod.BackendType,
     metal_executor_supported: bool,
     deepseek_compressed_cache: bool,
+    prompt_cache_requested: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
+    // An eligible cache request must stay on the eager paged-KV route. Silently
+    // auto-selecting whole-model compiled execution would ignore an explicit
+    // prompt_cache_key and make the opt-in cache appear enabled but inert.
+    if (prompt_cache_requested) return false;
     if (selection.eager_mode_requested) return false;
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
     return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
+}
+
+fn validatePromptCacheExecutionMode(
+    prompt_cache_requested: bool,
+    selection: GenerateBackendSelection,
+) !void {
+    if (prompt_cache_requested and selection.graph_mode_requested)
+        return error.PromptCacheCompiledModeUnsupported;
 }
 
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
@@ -4956,6 +4985,12 @@ pub const Node = struct {
                 },
             });
         };
+        validatePromptCacheExecutionMode(config.prompt_cache_enabled, backend_selection) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "UNSUPPORTED_FEATURE",
+                .message = "prompt caching requires eager generation; omit mode or set mode=eager",
+            });
+        };
         validateGenerateDraftBackend(backend_selection, effective_draft_model_name) catch {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -5296,6 +5331,7 @@ pub const Node = struct {
             model.session.backend(),
             graph_mod.metal_executor.supportsSession(model.session),
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            config.prompt_cache_enabled,
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
@@ -5684,7 +5720,7 @@ pub const Node = struct {
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
-        if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
+        if (config.prompt_cache_enabled and promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind) and
             effective_compiled_partition_backend == null and
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
@@ -5699,12 +5735,16 @@ pub const Node = struct {
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
                 const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err| {
                     self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    std.log.warn("prompt cache storage activation failed; using request-local KV: {s}", .{@errorName(err)});
+                    break :blk false;
                 };
                 const storage = if (ensured) |result| result.storage else break :blk false;
                 if (storage.device_write_hook == null) {
-                    cb.provisionKvDeviceWriteHook(storage) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    cb.provisionKvDeviceWriteHook(storage) catch |err| {
+                        self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                        std.log.warn("prompt cache device activation failed; using request-local KV: {s}", .{@errorName(err)});
+                        break :blk false;
+                    };
                 }
                 if (storage.device_write_hook == null) break :blk false;
                 active_kv_storage = storage;
@@ -5712,7 +5752,8 @@ pub const Node = struct {
             } else blk: {
                 const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(pool_config) catch |err| {
                     self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    std.log.warn("prompt cache activation failed; using request-local KV: {s}", .{@errorName(err)});
+                    break :blk false;
                 };
                 break :blk maybe_cache_pool_id != null;
             };
@@ -10449,6 +10490,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     var block_hash_evictions: u64 = 0;
     var block_hash_cached_blocks: u64 = 0;
     var block_hash_collision_guards: u64 = 0;
+    var radix_hits: u64 = 0;
+    var radix_misses: u64 = 0;
+    var radix_evictions: u64 = 0;
+    var radix_cached_nodes: u64 = 0;
+    var radix_collision_guards: u64 = 0;
     var it = models.iterator();
     while (it.next()) |entry| {
         const stats = entry.value_ptr.*.prompt_prefix_cache.stats();
@@ -10463,6 +10509,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
         block_hash_evictions += stats.block_hash_evictions;
         block_hash_cached_blocks += @intCast(stats.block_hash_cached_blocks);
         block_hash_collision_guards += stats.block_hash_collision_guards;
+        radix_hits += stats.radix_hits;
+        radix_misses += stats.radix_misses;
+        radix_evictions += stats.radix_evictions;
+        radix_cached_nodes += @intCast(stats.radix_cached_nodes);
+        radix_collision_guards += stats.radix_collision_guards;
     }
     try appendPromMetric(writer, "antfly_inference_prompt_cache_hits_total", "counter", "Total prompt prefix cache hits", hits);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_misses_total", "counter", "Total prompt prefix cache misses", misses);
@@ -10475,6 +10526,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_evictions_total", "counter", "Total block-hash prompt cache evictions", block_hash_evictions);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_cached_blocks", "gauge", "Block-hash prompt cache retained KV blocks", block_hash_cached_blocks);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_collision_guards_total", "counter", "Total block-hash prompt cache collisions detected", block_hash_collision_guards);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_hits_total", "counter", "Total radix prompt cache hits", radix_hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_misses_total", "counter", "Total radix prompt cache misses", radix_misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_evictions_total", "counter", "Total radix prompt cache node evictions", radix_evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_cached_nodes", "gauge", "Radix prompt cache retained nodes", radix_cached_nodes);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_collision_guards_total", "counter", "Total radix edge hash collisions detected", radix_collision_guards);
 }
 
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {
@@ -12849,15 +12905,24 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    try validatePromptCacheExecutionMode(true, auto_default);
+
+    const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
+    try std.testing.expectError(
+        error.PromptCacheCompiledModeUnsupported,
+        validatePromptCacheExecutionMode(true, explicit_compiled),
+    );
+    try validatePromptCacheExecutionMode(false, explicit_compiled);
 
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,

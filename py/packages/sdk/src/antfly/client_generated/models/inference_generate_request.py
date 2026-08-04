@@ -88,6 +88,9 @@ class InferenceGenerateRequest:
             requests without a key are never cached.
         prompt_cache (bool | Unset): inference-native prompt prefix cache control. False bypasses prompt cache for this
             request.
+            On Metal, an eligible cache request stays on the eager paged-attention path instead of
+            automatically selecting whole-model compiled execution. Explicit `mode: compiled` is
+            rejected while prompt caching is active.
         backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
             `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via

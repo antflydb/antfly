@@ -700,6 +700,13 @@ test "run config rejects unrepresentable prompt cache values" {
     try std.testing.expectError(error.InvalidPromptCacheConfig, parseRunConfig(allocator, ttl_overflow));
 }
 
+test "run config parses opt-in radix prompt cache mode" {
+    const parsed = try parseRunConfig(std.testing.allocator, "{\"prompt_cache\":{\"enabled\":true,\"mode\":\"radix\"}}");
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.prompt_cache.?.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.radix, parsed.value.prompt_cache.?.mode);
+}
+
 test "kernel JIT config defaults off and rejects invalid budgets" {
     const parsed = try parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{}}");
     defer parsed.deinit();

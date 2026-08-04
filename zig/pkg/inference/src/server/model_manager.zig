@@ -5092,6 +5092,19 @@ fn loadSessionForPreferredBackends(
                 admission_limits,
                 admission_plan.peak,
             ) catch |err| {
+                std.log.warn(
+                    "loadModel({s}) backend {s} admission failed: {s}; peak_host={d} peak_backend={d} host_limit={d} backend_limit={d} combined_limit={d}",
+                    .{
+                        model_dir,
+                        @tagName(backend),
+                        @errorName(err),
+                        admission_plan.peak.host_weight_bytes +| admission_plan.peak.host_kv_bytes +| admission_plan.peak.host_scratch_bytes,
+                        admission_plan.peak.backend_weight_bytes +| admission_plan.peak.backend_kv_bytes +| admission_plan.peak.backend_scratch_bytes,
+                        admission_limits.host_limit_bytes,
+                        admission_limits.backend_limit_bytes,
+                        admission_limits.combined_limit_bytes,
+                    },
+                );
                 if (first_err == null) first_err = err;
                 continue;
             };

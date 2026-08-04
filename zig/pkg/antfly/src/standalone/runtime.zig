@@ -1831,6 +1831,7 @@ fn applyCommonInferenceConfig(
         .mode = switch (cfg.inference.prompt_cache.mode) {
             .simple => .simple,
             .block_hash => .block_hash,
+            .radix => .radix,
         },
         .max_bytes_mb = cfg.inference.prompt_cache.max_bytes_mb,
         .min_tokens = cfg.inference.prompt_cache.min_tokens,
