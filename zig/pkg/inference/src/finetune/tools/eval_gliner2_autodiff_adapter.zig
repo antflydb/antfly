@@ -1691,7 +1691,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
             .seed = 42,
             .regular_trainable_params = &regular_trainable_params,
             .execution_engine = switch (selected_backend) {
-                .metal => .compiled_metal,
+                .metal => .compiled_device,
                 else => .interpreter,
             },
             .compiled_required = opts.compiled_required,

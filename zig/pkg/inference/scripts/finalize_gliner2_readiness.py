@@ -23,6 +23,7 @@ from summarize_gliner2_convergence import (
     STOCK_STOCHASTIC_TRAINING_POLICY,
     verify_summary_evidence,
 )
+from summarize_gliner2_cuda_hardware import CONTRACT as CUDA_HARDWARE_CONTRACT
 from validate_gliner2_release_data import adapter_bundle_fingerprint
 
 
@@ -42,6 +43,7 @@ def object_field(payload: dict[str, Any] | None, key: str) -> dict[str, Any]:
 
 def build_summary(
     *,
+    backend: str,
     default_rc: int,
     head_rc: int,
     quality_rc: int,
@@ -54,11 +56,24 @@ def build_summary(
     native_report: dict[str, Any] | None,
     convergence_report: dict[str, Any] | None,
     convergence_evidence_errors: list[str],
+    hardware_qualification: dict[str, Any] | None,
+    hardware_qualification_errors: list[str],
     release_adapter_fingerprint: str | None,
-    paths: dict[str, str],
+    release_manifest: dict[str, Any] | None,
+    paths: dict[str, str | None],
 ) -> dict[str, Any]:
+    if backend not in {"metal", "cuda"}:
+        raise ValueError(f"unsupported production backend: {backend}")
     integrity_errors: list[str] = []
-    default_ready = default_rc == 0 and isinstance(default_summary, dict) and default_summary.get("pass") is True
+    default_ready = bool(
+        default_rc == 0
+        and isinstance(default_summary, dict)
+        and default_summary.get("pass") is True
+        and default_summary.get("accelerator_backend") == backend
+        and default_summary.get("training_precision") == "fp32"
+        and default_summary.get("optimizer_state_precision") == "fp32"
+        and default_summary.get("precision_consistent") is True
+    )
     if default_rc == 0 and not default_ready:
         integrity_errors.append("deterministic parity/performance command returned success without a current passing summary")
 
@@ -111,6 +126,8 @@ def build_summary(
         and convergence_report.get("normalization") == CANONICAL_NORMALIZATION
         and convergence_report.get("unicode_version") == CANONICAL_UNICODE_VERSION
         and convergence_report.get("training_policy") == STOCK_STOCHASTIC_TRAINING_POLICY
+        and convergence_report.get("accelerator_backend") == backend
+        and convergence_report.get("training_precision") == "fp32"
         and convergence_report.get("thresholds") == {
             "max_mean_deficit": 0.02,
             "max_paired_deficit": 0.05,
@@ -145,6 +162,31 @@ def build_summary(
         and convergence_fingerprints.get("eval_data") == quality_artifacts.get("eval_data_fingerprint_sha256")
     )
 
+    release_adapter_ready = bool(
+        isinstance(release_manifest, dict)
+        and str(release_manifest.get("backend", "")).lower() == backend
+        and release_manifest.get("compiled_required") is True
+        and release_manifest.get("training_precision") == "fp32"
+        and release_manifest.get("optimizer_state_precision") == "fp32"
+    )
+    if not release_adapter_ready:
+        integrity_errors.append(
+            f"release adapter is not bound to compiled {backend.upper()} FP32 training and optimizer state"
+        )
+
+    hardware_ready = bool(
+        backend != "cuda"
+        or (
+            isinstance(hardware_qualification, dict)
+            and hardware_qualification.get("contract") == CUDA_HARDWARE_CONTRACT
+            and hardware_qualification.get("pass") is True
+            and hardware_qualification.get("training_precision") == "fp32"
+            and hardware_qualification.get("optimizer_state_precision") == "fp32"
+            and hardware_qualification.get("cuda_artifacts") == "fatbin"
+            and not hardware_qualification_errors
+        )
+    )
+
     head_ready = (
         None
         if skip_head_opt_in
@@ -167,13 +209,17 @@ def build_summary(
         blockers.append("five-seed Python/Zig held-out convergence gate failed or is missing")
     if not fingerprints_ready:
         blockers.append("model/train/eval/release-adapter fingerprints do not bind all readiness evidence to the same artifacts")
+    if not hardware_ready:
+        blockers.append("current FP32 CUDA sanitizer/parity qualification is missing for L4, A100, or H100")
     if not head_required_ready:
         blockers.append("required head opt-in gate failed")
     blockers.extend(integrity_errors)
     production_ready = not blockers
 
     return {
-        "contract": "gliner2_zig_metal_production_readiness/v1",
+        "contract": "gliner2_zig_accelerator_production_readiness/v2",
+        "accelerator_backend": backend,
+        "training_precision": "fp32",
         "production_ready": production_ready,
         "production_readiness_blockers": blockers,
         "checks": {
@@ -184,10 +230,13 @@ def build_summary(
             "five_seed_statistical_convergence": convergence_ready,
             "convergence_evidence_current": not convergence_evidence_errors,
             "artifact_fingerprints_consistent": fingerprints_ready,
+            "release_adapter_backend_and_precision": release_adapter_ready,
+            "required_hardware_matrix": hardware_ready,
             "required_head_opt_in": head_required_ready,
         },
         "policies": {
-            "production_implementation": "Zig GLiNER2 finetuning on the Zig Metal kernels/runtime",
+            "production_implementation": f"Zig GLiNER2 FP32 finetuning on the Zig {backend.upper()} kernels/runtime",
+            "supported_training_precision": "FP32 only; BF16/FP16 require separate parity, quality, performance, and hardware-matrix qualification",
             "python_role": "correctness oracle and performance baseline only; not a deployed runtime dependency",
             "stochastic_training": "Fastino retains pinned upstream sampling, schema conditioning, model dropout, negative masking, and shuffle; Zig records its disabled sampling/model-dropout policy plus enabled epoch shuffle and negative masking; paired independent-seed held-out result parity is required and exact Python RNG-stream equality is not required",
             "unsupported_training_unicode": "fail closed with record/field/code-point context; this is a supported-input boundary, not a readiness blocker",
@@ -198,7 +247,10 @@ def build_summary(
         "normalization": CANONICAL_NORMALIZATION,
         "unicode_version": CANONICAL_UNICODE_VERSION,
         "release_adapter_fingerprint_sha256": release_adapter_fingerprint,
+        "release_adapter_manifest": release_manifest,
         "convergence_evidence_errors": convergence_evidence_errors,
+        "hardware_qualification_errors": hardware_qualification_errors,
+        "hardware_qualification": hardware_qualification,
         "head_opt_in_ready": head_ready,
         "returncodes": {
             "default": default_rc,
@@ -232,6 +284,8 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--convergence-summary", type=Path, required=True)
     parser.add_argument("--release-adapter-dir", type=Path, required=True)
+    parser.add_argument("--backend", choices=("metal", "cuda"), required=True)
+    parser.add_argument("--hardware-qualification", type=Path)
     parser.add_argument("--default-rc", type=int, required=True)
     parser.add_argument("--head-rc", type=int, required=True)
     parser.add_argument("--quality-rc", type=int, required=True)
@@ -253,6 +307,11 @@ def main() -> int:
         "zig_native_heldout_quality": str(native_path),
         "convergence_summary": str(convergence_path),
         "release_adapter_dir": str(release_adapter_dir),
+        "cuda_hardware_qualification": (
+            str(args.hardware_qualification.expanduser().resolve())
+            if args.hardware_qualification is not None
+            else None
+        ),
     }
     convergence_report = load(convergence_path)
     convergence_evidence_errors = (
@@ -260,11 +319,26 @@ def main() -> int:
         if isinstance(convergence_report, dict)
         else ["convergence summary is missing or invalid"]
     )
+    hardware_qualification = (
+        load(args.hardware_qualification.expanduser().resolve())
+        if args.hardware_qualification is not None
+        else None
+    )
+    if args.backend == "cuda" and isinstance(hardware_qualification, dict):
+        from summarize_gliner2_cuda_hardware import verify_summary
+
+        hardware_qualification_errors = verify_summary(hardware_qualification, Path(__file__).resolve().parent.parent)
+    elif args.backend == "cuda":
+        hardware_qualification_errors = ["CUDA hardware qualification matrix is missing"]
+    else:
+        hardware_qualification_errors = []
     try:
         release_adapter_fingerprint = adapter_bundle_fingerprint(release_adapter_dir)
     except (OSError, ValueError):
         release_adapter_fingerprint = None
+    release_manifest = load(release_adapter_dir / "training_manifest.json")
     result = build_summary(
+        backend=args.backend,
         default_rc=args.default_rc,
         head_rc=args.head_rc,
         quality_rc=args.quality_rc,
@@ -277,7 +351,10 @@ def main() -> int:
         native_report=load(native_path) if args.native_rc == 0 else None,
         convergence_report=convergence_report,
         convergence_evidence_errors=convergence_evidence_errors,
+        hardware_qualification=hardware_qualification,
+        hardware_qualification_errors=hardware_qualification_errors,
         release_adapter_fingerprint=release_adapter_fingerprint,
+        release_manifest=release_manifest,
         paths=paths,
     )
     output = out_dir / "readiness_summary.json"

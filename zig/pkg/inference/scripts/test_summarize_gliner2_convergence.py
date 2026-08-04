@@ -24,7 +24,7 @@ from summarize_gliner2_convergence import (
     stochastic_comparison_errors,
     summarize,
 )
-from validate_gliner2_release_data import adapter_bundle_fingerprint
+from validate_gliner2_release_data import adapter_bundle_fingerprint, peft_adapter_fingerprint
 
 
 SHA_MODEL = "sha256:" + "1" * 64
@@ -114,6 +114,7 @@ class ConvergenceSummaryTest(unittest.TestCase):
             "metal_optimizer_backend_is_metal": True,
             "metal_device_resident_transfers_zero": True,
             "metal_finite_step_loss": True,
+            "metal_training_precision_fp32": True,
             "metal_graph_executor_fallback_reasons_empty": True,
             "metal_graph_executor_true_host_outputs_zero": True,
             "metal_interpreter_fallbacks_within_threshold": True,
@@ -169,6 +170,47 @@ class ConvergenceSummaryTest(unittest.TestCase):
         self.assertIn("metal_device_resident_transfers_zero", " ".join(
             stochastic_comparison_errors(config, failed_runtime, python_result, zig_result)
         ))
+
+        cuda_summary = copy.deepcopy(summary)
+        cuda_summary["strict_checks"] = {
+            "requested_step_count_valid": True,
+            "adapter_roundtrip_ok": True,
+            "cuda_manifest_backend_is_cuda": True,
+            "cuda_optimizer_backend_is_cuda": True,
+            "cuda_device_resident_transfers_zero": True,
+            "cuda_device_trainables_resident": True,
+            "cuda_finite_step_loss": True,
+            "cuda_finite_grad_norm": True,
+            "cuda_training_precision_fp32": True,
+            "cuda_runtime_telemetry_present": True,
+            "cuda_full_step_h2d_accounted": True,
+            "cuda_parameter_state_h2d_zero": True,
+            "cuda_graph_executor_dispatches_nonzero": True,
+            "cuda_graph_executor_fallback_reasons_empty": True,
+            "cuda_graph_executor_true_host_outputs_zero": True,
+            "cuda_interpreter_fallbacks_within_threshold": True,
+            "cuda_bulk_d2h_eliminated": True,
+            "cuda_d2h_within_threshold": True,
+            "cuda_only_scalar_metrics_downloaded": True,
+            "cuda_upload_synchronizations_bounded": True,
+            "cuda_packed_attention_exercised": True,
+            "cuda_exact_gelu_exercised": True,
+        }
+        self.assertEqual(
+            [],
+            stochastic_comparison_errors(config, cuda_summary, python_result, zig_result, "cuda"),
+        )
+        del cuda_summary["strict_checks"]["cuda_graph_executor_dispatches_nonzero"]
+        self.assertIn(
+            "cuda_graph_executor_dispatches_nonzero",
+            " ".join(stochastic_comparison_errors(config, cuda_summary, python_result, zig_result, "cuda")),
+        )
+        cuda_summary["strict_checks"]["cuda_graph_executor_dispatches_nonzero"] = True
+        cuda_summary["strict_checks"]["cuda_optimizer_backend_is_cuda"] = False
+        self.assertIn(
+            "cuda_optimizer_backend_is_cuda",
+            " ".join(stochastic_comparison_errors(config, cuda_summary, python_result, zig_result, "cuda")),
+        )
 
     def test_five_seed_quality_and_optimizer_contract_passes(self) -> None:
         result = summarize(passing_payload())
@@ -274,6 +316,7 @@ class ConvergenceSummaryTest(unittest.TestCase):
                             "metal_optimizer_backend_is_metal": True,
                             "metal_device_resident_transfers_zero": True,
                             "metal_finite_step_loss": True,
+                            "metal_training_precision_fp32": True,
                             "metal_graph_executor_fallback_reasons_empty": True,
                             "metal_graph_executor_true_host_outputs_zero": True,
                             "metal_interpreter_fallbacks_within_threshold": True,
@@ -298,6 +341,8 @@ class ConvergenceSummaryTest(unittest.TestCase):
                         "returncode": 0,
                         "training_manifest": {
                             "backend": "metal",
+                            "training_precision": "fp32",
+                            "optimizer_state_precision": "fp32",
                             "objective": "gliner2-total-loss",
                             "lora_only_trainables": True,
                             "deterministic": False,
@@ -337,6 +382,7 @@ class ConvergenceSummaryTest(unittest.TestCase):
                         "artifacts": {
                             "base_model_fingerprint_sha256": SHA_MODEL,
                             "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(adapter),
+                            "peft_adapter_fingerprint_sha256": peft_adapter_fingerprint(adapter),
                             "eval_data_fingerprint_sha256": SHA_EVAL,
                         },
                         "metrics": metrics(value),

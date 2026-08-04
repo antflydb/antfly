@@ -2053,6 +2053,9 @@ pub fn executeNode(
         },
 
         .fused_embedding_lookup => |attrs| {
+            if (try cb.embeddingLookupTensor(V.get(ins[0]), V.get(ins[1]), attrs.total, attrs.dim)) |device_result| {
+                return device_result;
+            }
             var owned_ids: ?[]i64 = null;
             defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
             const ids = blk: {
@@ -2095,6 +2098,7 @@ pub fn executeNode(
         },
 
         .fused_gelu_exact => {
+            if (try cb.geluExact(V.get(ins[0]))) |device_result| return device_result;
             return executeExactGeluFallback(graph.allocator, n.output_shape, cb, V.get(ins[0]));
         },
 
@@ -2356,6 +2360,15 @@ pub fn executeNode(
             // input2 = attn_bias [bh, S, S]. Slice the packed inputs back into
             // q/k/v and q_r/k_r, derive the padding mask from attn_bias, then
             // call the fused attention op (device kernel / host fallback).
+            if (try cb.disentangledRelativeAttentionPacked(
+                V.get(ins[0]),
+                V.get(ins[1]),
+                V.get(ins[2]),
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.head_dim,
+            )) |packed_result| return packed_result;
             const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
             const h: i64 = @intCast(attrs.num_heads * attrs.head_dim);
             const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
@@ -2381,6 +2394,16 @@ pub fn executeNode(
         .fused_disentangled_attention_backward => |attrs| {
             // input0/1/2 as forward; input3 = dOut [B*S, H]. Returns packed
             // grads [dQ;dK;dV;dQ_r;dK_r] = [3*B*S + 2*num_rel, H].
+            if (try cb.disentangledRelativeAttentionBackwardPacked(
+                V.get(ins[0]),
+                V.get(ins[1]),
+                V.get(ins[2]),
+                V.get(ins[3]),
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.head_dim,
+            )) |packed_result| return packed_result;
             const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
             const h: i64 = @intCast(attrs.num_heads * attrs.head_dim);
             const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);

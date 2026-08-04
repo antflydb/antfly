@@ -908,8 +908,15 @@ def summarize_component_deltas(deltas: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], zig_step_rows: list[dict[str, Any]], zig_manifest: dict[str, Any]) -> dict[str, Any] | None:
-    if args.zig_backend != "metal" and not args.zig_build_metal:
+def summarize_accelerator_readiness(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    zig_step_rows: list[dict[str, Any]],
+    zig_manifest: dict[str, Any],
+    backend: str,
+) -> dict[str, Any] | None:
+    build_requested = getattr(args, "zig_build_metal" if backend == "metal" else "zig_build_cuda", False)
+    if args.zig_backend != backend and not build_requested:
         return None
 
     optimizer_backends = sorted({
@@ -964,27 +971,133 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
     manifest_backend = str(zig_manifest.get("backend") or "")
     manifest_objective = str(zig_manifest.get("objective") or "")
     zig_metrics = report.get("zig", {}).get("metrics", {})
+    cuda_step_count = max(len(zig_step_rows), 1)
+    cuda_runtime_totals = {
+        key: sum(int(row.get(key) or 0) for row in zig_step_rows)
+        for key in (
+            "cuda_device_allocations",
+            "cuda_device_frees",
+            "cuda_h2d_bytes",
+            "cuda_d2h_bytes",
+            "cuda_to_float32_calls",
+            "cuda_download_alloc_calls",
+            "cuda_stream_synchronizations",
+            "cuda_upload_synchronizations",
+            "cuda_temp_cache_hits",
+            "cuda_temp_cache_misses",
+            "cuda_kernel_launches",
+            "cuda_packed_attention_forward_calls",
+            "cuda_packed_attention_backward_calls",
+            "cuda_exact_gelu_forward_calls",
+            "cuda_exact_gelu_backward_calls",
+            "cuda_training_input_uploads",
+            "cuda_training_input_upload_bytes",
+        )
+    }
+    cuda_largest_d2h_transfer_bytes = max(
+        [int(row.get("cuda_largest_d2h_transfer_bytes") or 0) for row in zig_step_rows] or [0]
+    )
+    cuda_max_h2d_bytes_per_step = max(
+        [int(row.get("cuda_h2d_bytes") or 0) for row in zig_step_rows] or [0]
+    )
+    cuda_max_d2h_bytes_per_step = max(
+        [int(row.get("cuda_d2h_bytes") or 0) for row in zig_step_rows] or [0]
+    )
+    cuda_max_to_float32_calls_per_step = max(
+        [int(row.get("cuda_to_float32_calls") or 0) for row in zig_step_rows] or [0]
+    )
+    cuda_max_training_input_upload_bytes_per_step = max(
+        [int(row.get("cuda_training_input_upload_bytes") or 0) for row in zig_step_rows] or [0]
+    )
     checks = {
         "zig_returncode_ok": report.get("zig", {}).get("returncode") == 0,
-        "manifest_backend_is_metal": manifest_backend.lower() == "metal",
+        "manifest_backend_matches": manifest_backend.lower() == backend,
         "manifest_objective_matches_request": manifest_objective == args.zig_objective,
         "finite_step_loss": finite_number(zig_metrics.get("step_loss")) or finite_number(zig_metrics.get("final_avg_loss")),
-        "finite_grad_norm": finite_number(zig_metrics.get("grad_norm")) if zig_metrics.get("grad_norm") is not None else True,
-        "optimizer_backend_is_metal": optimizer_backends == ["metal"] if optimizer_backends else False,
+        "finite_grad_norm": (
+            finite_number(zig_metrics.get("grad_norm"))
+            if backend == "cuda" or zig_metrics.get("grad_norm") is not None
+            else True
+        ),
+        "optimizer_backend_matches": optimizer_backends == [backend] if optimizer_backends else False,
         "device_resident_transfers_zero": max_device_resident_transfer_count == 0,
         "device_trainables_resident": max_device_trainable_bytes > 0,
+        "training_precision_fp32": (
+            zig_manifest.get("training_precision") == "fp32"
+            and zig_manifest.get("optimizer_state_precision") == "fp32"
+        ),
     }
+    # Preserve the existing Metal check names for report consumers while also
+    # emitting the corresponding CUDA names for the new fail-closed gate.
+    checks[f"manifest_backend_is_{backend}"] = checks["manifest_backend_matches"]
+    checks[f"optimizer_backend_is_{backend}"] = checks["optimizer_backend_matches"]
+    cuda_required_runtime_fields = (
+        "cuda_kernel_launches",
+        "cuda_h2d_bytes",
+        "cuda_training_input_uploads",
+        "cuda_training_input_upload_bytes",
+        "cuda_d2h_bytes",
+        "cuda_largest_d2h_transfer_bytes",
+        "cuda_to_float32_calls",
+        "cuda_upload_synchronizations",
+        "cuda_packed_attention_forward_calls",
+        "cuda_packed_attention_backward_calls",
+        "cuda_exact_gelu_forward_calls",
+        "cuda_exact_gelu_backward_calls",
+    )
+    cuda_telemetry_present = all(
+        all(type(row.get(field)) is int and row[field] >= 0 for field in cuda_required_runtime_fields)
+        for row in zig_step_rows
+    )
+    if backend == "cuda":
+        max_d2h = int(getattr(args, "cuda_max_d2h_bytes_per_step", 8))
+        max_single_d2h = int(getattr(args, "cuda_max_single_d2h_transfer_bytes", 4))
+        max_scalar_metric_downloads = int(getattr(args, "cuda_max_scalar_metric_downloads_per_step", 2))
+        checks["cuda_runtime_telemetry_present"] = bool(zig_step_rows) and cuda_telemetry_present
+        # Runtime inputs necessarily change every step. Require the complete
+        # step telemetry to include those uploads, while the independent
+        # device-resident transfer counter continues to reject parameter or
+        # optimizer-state round trips.
+        checks["cuda_full_step_h2d_accounted"] = bool(zig_step_rows) and cuda_telemetry_present and all(
+            int(row.get("cuda_training_input_uploads") or 0) > 0
+            and int(row.get("cuda_training_input_upload_bytes") or 0) > 0
+            and int(row.get("cuda_h2d_bytes") or 0) >= int(row.get("cuda_training_input_upload_bytes") or 0)
+            for row in zig_step_rows
+        )
+        checks["cuda_parameter_state_h2d_zero"] = checks["device_resident_transfers_zero"]
+        checks["cuda_d2h_bytes_per_step_within_threshold"] = cuda_max_d2h_bytes_per_step <= max_d2h
+        checks["cuda_bulk_d2h_eliminated"] = cuda_largest_d2h_transfer_bytes <= max_single_d2h
+        checks["cuda_only_scalar_metrics_downloaded"] = (
+            cuda_max_to_float32_calls_per_step <= max_scalar_metric_downloads
+        )
+        upload_syncs = [int(row.get("cuda_upload_synchronizations") or 0) for row in zig_step_rows]
+        checks["cuda_upload_synchronizations_bounded"] = (
+            bool(upload_syncs)
+            and cuda_telemetry_present
+            and
+            sum(upload_syncs) <= 1
+            and upload_syncs[0] <= 1
+            and all(value == 0 for value in upload_syncs[1:])
+        )
+        checks["cuda_packed_attention_exercised"] = (
+            cuda_runtime_totals["cuda_packed_attention_forward_calls"] > 0
+            and cuda_runtime_totals["cuda_packed_attention_backward_calls"] > 0
+        )
+        checks["cuda_exact_gelu_exercised"] = (
+            cuda_runtime_totals["cuda_exact_gelu_forward_calls"] > 0
+            and cuda_runtime_totals["cuda_exact_gelu_backward_calls"] > 0
+        )
     warnings: list[str] = []
     zero_dispatches = total_command_dispatches == 0 and total_planned_dispatches == 0
     graph_executor_requested = bool(
-        args.zig_backend == "metal" and getattr(args, "zig_training_graph_executor", False)
+        args.zig_backend == backend and getattr(args, "zig_training_graph_executor", False)
     )
     max_interpreter_fallbacks = int(getattr(args, "metal_max_interpreter_fallbacks", 64))
-    if graph_executor_requested and zig_step_rows:
+    if graph_executor_requested:
         # When the training graph executor was explicitly requested, zero
         # dispatches means every step silently fell back to interpreter-only
         # execution; that is a failing check (gated by --strict), not a warning.
-        checks["graph_executor_dispatches_nonzero"] = not zero_dispatches
+        checks["graph_executor_dispatches_nonzero"] = bool(zig_step_rows) and not zero_dispatches
         # A non-empty fallback reason is a FULL-STEP bail to the interpreter —
         # always a failure. The per-op interpreter-fallback count is a
         # perf/coverage signal gated by an explicit ceiling (regression guard
@@ -993,18 +1106,19 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         checks["graph_executor_true_host_outputs_zero"] = total_true_host_outputs == 0
         checks["interpreter_fallbacks_within_threshold"] = total_interpreter_fallbacks <= max_interpreter_fallbacks
     elif zero_dispatches:
-        warnings.append("Metal run reported no graph command/planned dispatches; check for interpreter-only execution")
+        warnings.append(f"{backend.upper()} run reported no graph command/planned dispatches; check for interpreter-only execution")
     if graph_executor_fallback_reasons:
         warnings.append(
-            "Metal run reported graph executor fallback reasons: " + ", ".join(graph_executor_fallback_reasons)
+            f"{backend.upper()} run reported graph executor fallback reasons: " + ", ".join(graph_executor_fallback_reasons)
         )
     if total_interpreter_fallbacks > 0:
-        warnings.append(f"Metal run reported {total_interpreter_fallbacks} interpreter fallbacks")
+        warnings.append(f"{backend.upper()} run reported {total_interpreter_fallbacks} interpreter fallbacks")
     if total_true_host_outputs > 0:
-        warnings.append(f"Metal run reported {total_true_host_outputs} true host outputs")
+        warnings.append(f"{backend.upper()} run reported {total_true_host_outputs} true host outputs")
     if total_parameter_materializations > 0:
-        warnings.append(f"Metal run reported {total_parameter_materializations} parameter materializations")
+        warnings.append(f"{backend.upper()} run reported {total_parameter_materializations} parameter materializations")
     return {
+        "backend": backend,
         "ok": all(checks.values()),
         "checks": checks,
         "warnings": warnings,
@@ -1023,7 +1137,22 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         "graph_executor_fallback_reasons": graph_executor_fallback_reasons,
         "max_interpreter_fallbacks_threshold": max_interpreter_fallbacks,
         "graph_executor_requested": graph_executor_requested,
+        "cuda_runtime_totals": cuda_runtime_totals if backend == "cuda" else None,
+        "cuda_max_h2d_bytes_per_step": cuda_max_h2d_bytes_per_step if backend == "cuda" else None,
+        "cuda_max_d2h_bytes_per_step": cuda_max_d2h_bytes_per_step if backend == "cuda" else None,
+        "cuda_max_to_float32_calls_per_step": cuda_max_to_float32_calls_per_step if backend == "cuda" else None,
+        "cuda_max_training_input_upload_bytes_per_step": cuda_max_training_input_upload_bytes_per_step if backend == "cuda" else None,
+        "cuda_largest_d2h_transfer_bytes": cuda_largest_d2h_transfer_bytes if backend == "cuda" else None,
+        "cuda_runtime_telemetry_present": cuda_telemetry_present if backend == "cuda" else None,
     }
+
+
+def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], zig_step_rows: list[dict[str, Any]], zig_manifest: dict[str, Any]) -> dict[str, Any] | None:
+    return summarize_accelerator_readiness(args, report, zig_step_rows, zig_manifest, "metal")
+
+
+def summarize_cuda_readiness(args: argparse.Namespace, report: dict[str, Any], zig_step_rows: list[dict[str, Any]], zig_manifest: dict[str, Any]) -> dict[str, Any] | None:
+    return summarize_accelerator_readiness(args, report, zig_step_rows, zig_manifest, "cuda")
 
 
 def parse_op_stat_items(payload: str) -> dict[str, dict[str, float]]:
@@ -1398,6 +1527,7 @@ p.add_argument("--lora-targets", required=True)
 p.add_argument("--seed", type=int, required=True)
 p.add_argument("--span-negative-mask-rate", type=float, required=True)
 p.add_argument("--sampling-policy", choices=("disabled", "upstream-default"), required=True)
+p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
 p.add_argument("--training-deterministic", action="store_true")
 p.add_argument("--disable-model-dropout", action="store_true")
 p.add_argument("--dump-parity", action="store_true")
@@ -1424,7 +1554,12 @@ AutoConfig.from_pretrained = _local_file_aware_auto_config
 gliner2_model.AutoConfig.from_pretrained = _local_file_aware_auto_config
 
 started = time.time()
+if args.device == "cuda" and not torch.cuda.is_available():
+    raise RuntimeError("--device cuda requested but torch.cuda.is_available() is false")
+device_name = "cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device)
+training_device = torch.device(device_name)
 model = Extractor.from_pretrained(args.model_dir, map_location="cpu")
+model.to(training_device)
 model.max_width = args.max_span_width
 model.config.max_width = args.max_span_width
 if hasattr(model, "span_rep") and hasattr(model.span_rep, "span_rep_layer") and hasattr(model.span_rep.span_rep_layer, "max_width"):
@@ -1633,6 +1768,10 @@ python_step_timings = []
 original_create_dataloader = trainer._create_dataloader
 original_prepare_data = trainer._prepare_data
 
+def synchronize_training_device():
+    if training_device.type == "cuda":
+        torch.cuda.synchronize(training_device)
+
 class TimedTrainingLoader:
     def __init__(self, inner, timings):
         self.inner = inner
@@ -1646,10 +1785,12 @@ class TimedTrainingLoader:
 
     def __iter__(self):
         for local_step, batch in enumerate(self.inner):
+            synchronize_training_device()
             started = time.perf_counter()
             try:
                 yield batch
             finally:
+                synchronize_training_device()
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 try:
                     batch_size = len(batch)
@@ -2229,6 +2370,7 @@ if args.dump_optimizer_parity:
 
     trainer._create_optimizer = _create_optimizer_with_dump
 result = trainer.train(train_data=args.train_data)
+synchronize_training_device()
 trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in trainer.model.parameters())
 payload = {
@@ -2245,6 +2387,8 @@ payload = {
     "trainable_parameters": trainable,
     "total_parameters": total,
     "torch_version": torch.__version__,
+    "device": str(training_device),
+    "cuda_device_name": torch.cuda.get_device_name(training_device) if training_device.type == "cuda" else None,
     "oracle": oracle,
     "sampling_policy": args.sampling_policy,
     "sampling_config": applied_sampling_config,
@@ -2758,6 +2902,7 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
         "--seed", str(args.seed),
         "--span-negative-mask-rate", str(args.span_negative_mask_rate),
         "--sampling-policy", args.python_sampling_policy,
+        "--device", args.python_device,
     ]
     if args.deterministic:
         cmd.append("--training-deterministic")
@@ -2791,13 +2936,17 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     zig_local_cache.mkdir(parents=True, exist_ok=True)
     zig_global_cache.mkdir(parents=True, exist_ok=True)
     enable_metal = args.zig_build_metal if args.zig_build_metal is not None else args.zig_backend == "metal"
+    enable_cuda = args.zig_build_cuda if args.zig_build_cuda is not None else args.zig_backend == "cuda"
     cmd = [
         "zig", "build",
         "--cache-dir", str(zig_local_cache),
         "--global-cache-dir", str(zig_global_cache),
         "-Donnx=false",
         f"-Dmetal={'true' if enable_metal else 'false'}",
+        f"-Dcuda={'true' if enable_cuda else 'false'}",
     ]
+    if enable_cuda:
+        cmd.append(f"-Dcuda-artifacts={args.zig_cuda_artifacts}")
     if args.zig_optimize is not None:
         cmd.append(f"-Doptimize={args.zig_optimize}")
     # Feed the Zig trainer the exact normalized upstream-format JSONL consumed
@@ -2855,6 +3004,8 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         ])
     if args.structure_span_chunk_samples > 0:
         cmd.extend(["--structure-span-chunk-samples", str(args.structure_span_chunk_samples)])
+    if args.zig_backend in ("metal", "cuda") and args.zig_training_graph_executor:
+        cmd.append("--compiled-required")
     initial_adapter_checkpoint = out_dir / "python" / "initial_adapter" / "adapter_weights.safetensors"
     if initial_adapter_checkpoint.exists():
         cmd.extend(["--initial-adapter-checkpoint", str(initial_adapter_checkpoint)])
@@ -2863,7 +3014,7 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     if args.dump_optimizer_parity:
         cmd.append("--dump-optimizer-parity")
     zig_env: dict[str, str] = {}
-    if args.zig_backend == "metal" and args.zig_training_graph_executor:
+    if args.zig_backend in ("metal", "cuda") and args.zig_training_graph_executor:
         zig_env["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
     result = run_command(cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env)
     result["cache_fallback"] = False
@@ -2890,6 +3041,7 @@ def main() -> int:
     p.add_argument("--train-data", type=Path, default=default_train_data())
     p.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     p.add_argument("--python-bin", default=DEFAULT_PYTHON)
+    p.add_argument("--python-device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument(
         "--upstream-source",
         type=Path,
@@ -2939,12 +3091,12 @@ def main() -> int:
         default=0,
         help="Split GLiNER2 structure-loss span work into sample chunks on the Zig side (0 disables)",
     )
-    p.add_argument("--zig-backend", default="native", choices=["native", "metal", "auto"])
+    p.add_argument("--zig-backend", default="native", choices=["native", "metal", "cuda", "auto"])
     p.add_argument(
         "--zig-training-graph-executor",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR for Zig Metal runs",
+        help="Require the backend training graph executor for Zig Metal/CUDA runs",
     )
     # Default to the production parity objective so component-loss parity
     # (classification/structure/count vs upstream) runs unless a caller
@@ -2957,6 +3109,31 @@ def main() -> int:
         help="Match upstream GLiNER2 LoRA training by freezing regular task-head params and optimizing only LoRA params",
     )
     p.add_argument("--zig-build-metal", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--zig-build-cuda", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument(
+        "--zig-cuda-artifacts",
+        choices=["portable", "sm89", "fatbin"],
+        default="fatbin",
+        help="CUDA artifact embedded in the Zig trainer build (fatbin is the production default)",
+    )
+    p.add_argument(
+        "--cuda-max-d2h-bytes-per-step",
+        type=int,
+        default=8,
+        help="Fail strict CUDA readiness when total per-step D2H traffic exceeds two f32 metrics (loss and grad norm)",
+    )
+    p.add_argument(
+        "--cuda-max-single-d2h-transfer-bytes",
+        type=int,
+        default=4,
+        help="Fail strict CUDA readiness when any single D2H transfer exceeds one f32 scalar",
+    )
+    p.add_argument(
+        "--cuda-max-scalar-metric-downloads-per-step",
+        type=int,
+        default=2,
+        help="Fail strict CUDA readiness when more than loss and grad norm are materialized on the host",
+    )
     p.add_argument(
         "--zig-optimize",
         choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"],
@@ -3073,6 +3250,8 @@ def main() -> int:
     args = p.parse_args()
     if args.structure_span_chunk_samples < 0:
         p.error("--structure-span-chunk-samples must be non-negative")
+    if args.zig_backend == "cuda" and not args.skip_python and args.python_device != "cuda":
+        p.error("CUDA comparisons require --python-device cuda; auto/CPU fallback is not release evidence")
     for name in (
         "loss_parity_tolerance",
         "loss_parity_relative_tolerance",
@@ -3186,10 +3365,13 @@ def main() -> int:
             "lora_targets": args.lora_targets,
             "seed": args.seed,
             "zig_backend": args.zig_backend,
+            "python_device": args.python_device,
             "zig_training_graph_executor": args.zig_training_graph_executor,
             "zig_objective": args.zig_objective,
             "zig_lora_only_trainables": args.zig_lora_only_trainables,
             "zig_build_metal": args.zig_build_metal,
+            "zig_build_cuda": args.zig_build_cuda,
+            "zig_cuda_artifacts": args.zig_cuda_artifacts,
             "zig_optimize": args.zig_optimize,
             "dump_parity": args.dump_parity,
             "dump_preprocess_parity": args.dump_preprocess_parity,
@@ -3619,6 +3801,33 @@ def main() -> int:
         "zig_graph_executor_parameter_materializations_avg": zig_step_avg("graph_executor_host_output_parameter"),
         "zig_graph_executor_host_output_unattributed_avg": zig_step_avg("graph_executor_host_output_unattributed"),
         "zig_graph_executor_device_output_parameter_avg": zig_step_avg("graph_executor_device_output_parameter"),
+        "zig_cuda_device_allocations_avg": zig_step_avg("cuda_device_allocations"),
+        "zig_cuda_device_frees_avg": zig_step_avg("cuda_device_frees"),
+        "zig_cuda_h2d_bytes_avg": zig_step_avg("cuda_h2d_bytes"),
+        "zig_cuda_h2d_bytes_max": max(
+            [int(row.get("cuda_h2d_bytes") or 0) for row in zig_step_rows] or [0]
+        ),
+        "zig_cuda_training_input_uploads_avg": zig_step_avg("cuda_training_input_uploads"),
+        "zig_cuda_training_input_upload_bytes_avg": zig_step_avg("cuda_training_input_upload_bytes"),
+        "zig_cuda_training_input_upload_bytes_max": max(
+            [int(row.get("cuda_training_input_upload_bytes") or 0) for row in zig_step_rows] or [0]
+        ),
+        "zig_cuda_d2h_bytes_avg": zig_step_avg("cuda_d2h_bytes"),
+        "zig_cuda_d2h_bytes_max": max(
+            [int(row.get("cuda_d2h_bytes") or 0) for row in zig_step_rows] or [0]
+        ),
+        "zig_cuda_largest_d2h_transfer_bytes_max": max(
+            [int(row.get("cuda_largest_d2h_transfer_bytes") or 0) for row in zig_step_rows] or [0]
+        ),
+        "zig_cuda_to_float32_calls_avg": zig_step_avg("cuda_to_float32_calls"),
+        "zig_cuda_to_float32_calls_max": max(
+            [int(row.get("cuda_to_float32_calls") or 0) for row in zig_step_rows] or [0]
+        ),
+        "zig_cuda_stream_synchronizations_avg": zig_step_avg("cuda_stream_synchronizations"),
+        "zig_cuda_upload_synchronizations_avg": zig_step_avg("cuda_upload_synchronizations"),
+        "zig_cuda_temp_cache_hits_avg": zig_step_avg("cuda_temp_cache_hits"),
+        "zig_cuda_temp_cache_misses_avg": zig_step_avg("cuda_temp_cache_misses"),
+        "zig_cuda_kernel_launches_avg": zig_step_avg("cuda_kernel_launches"),
         "zig_graph_executor_metal_gather_input_promotions_avg": zig_step_avg("graph_executor_metal_gather_input_promotions"),
         "zig_graph_executor_metal_gather_input_promotion_bytes_avg": zig_step_avg("graph_executor_metal_gather_input_promotion_bytes"),
         "zig_graph_executor_metal_gather_input_promotion_ms_avg": zig_step_avg("graph_executor_metal_gather_input_promotion_ms"),
@@ -3779,7 +3988,10 @@ def main() -> int:
         "python_preprocess_task_breakdown": python_task_breakdown,
         "zig_manifest_backend": zig_manifest.get("backend"),
         "zig_manifest_objective": zig_manifest.get("objective"),
+        "zig_training_precision": zig_manifest.get("training_precision"),
+        "zig_optimizer_state_precision": zig_manifest.get("optimizer_state_precision"),
         "metal_readiness": summarize_metal_readiness(args, report, zig_step_rows, zig_manifest),
+        "cuda_readiness": summarize_cuda_readiness(args, report, zig_step_rows, zig_manifest),
         "loss_parity_tolerance": args.loss_parity_tolerance,
         "loss_parity_relative_tolerance": args.loss_parity_relative_tolerance,
         "classification_debug_tolerance": args.classification_debug_tolerance,
@@ -3874,6 +4086,13 @@ def main() -> int:
         and report.get("zig", {}).get("returncode") == 0
     )
     metal_dispatch_applicable = metal_dispatch_check is not None and metal_backend_ran
+    cuda_readiness_summary = report["summary"].get("cuda_readiness") or {}
+    cuda_readiness_checks = cuda_readiness_summary.get("checks", {})
+    cuda_backend_ran = (
+        args.zig_backend == "cuda"
+        and not args.skip_zig
+        and report.get("zig", {}).get("returncode") == 0
+    )
     strict_checks: dict[str, bool | None] = {
         "requested_step_count_valid": bool(step_count_valid) if step_count_gate_applicable else None,
         "component_loss_parity_matches": component_loss_matches if component_loss_applicable else None,
@@ -3905,9 +4124,41 @@ def main() -> int:
             "metal_optimizer_backend_is_metal": _metal("optimizer_backend_is_metal"),
             "metal_device_resident_transfers_zero": _metal("device_resident_transfers_zero"),
             "metal_finite_step_loss": _metal("finite_step_loss"),
+            "metal_training_precision_fp32": _metal("training_precision_fp32"),
             "metal_graph_executor_fallback_reasons_empty": _metal("graph_executor_fallback_reasons_empty"),
             "metal_graph_executor_true_host_outputs_zero": _metal("graph_executor_true_host_outputs_zero"),
             "metal_interpreter_fallbacks_within_threshold": _metal("interpreter_fallbacks_within_threshold"),
+        })
+    if cuda_backend_ran:
+        # CUDA production training must prove that the graph executor ran. A
+        # generic device interpreter is useful for diagnostics, but it is not
+        # a compiled training path and must not satisfy a strict comparison.
+        def _cuda(name: str) -> bool:
+            # CUDA's production bundle is fail-closed: a successful process
+            # with an older/malformed metrics schema must fail, never turn a
+            # required runtime invariant into a skipped strict check.
+            return cuda_readiness_checks.get(name) is True
+        strict_checks.update({
+            "cuda_manifest_backend_is_cuda": _cuda("manifest_backend_is_cuda"),
+            "cuda_optimizer_backend_is_cuda": _cuda("optimizer_backend_is_cuda"),
+            "cuda_device_resident_transfers_zero": _cuda("device_resident_transfers_zero"),
+            "cuda_device_trainables_resident": _cuda("device_trainables_resident"),
+            "cuda_finite_step_loss": _cuda("finite_step_loss"),
+            "cuda_finite_grad_norm": _cuda("finite_grad_norm"),
+            "cuda_training_precision_fp32": _cuda("training_precision_fp32"),
+            "cuda_runtime_telemetry_present": _cuda("cuda_runtime_telemetry_present"),
+            "cuda_full_step_h2d_accounted": _cuda("cuda_full_step_h2d_accounted"),
+            "cuda_parameter_state_h2d_zero": _cuda("cuda_parameter_state_h2d_zero"),
+            "cuda_graph_executor_dispatches_nonzero": _cuda("graph_executor_dispatches_nonzero"),
+            "cuda_graph_executor_fallback_reasons_empty": _cuda("graph_executor_fallback_reasons_empty"),
+            "cuda_graph_executor_true_host_outputs_zero": _cuda("graph_executor_true_host_outputs_zero"),
+            "cuda_interpreter_fallbacks_within_threshold": _cuda("interpreter_fallbacks_within_threshold"),
+            "cuda_bulk_d2h_eliminated": _cuda("cuda_bulk_d2h_eliminated"),
+            "cuda_d2h_within_threshold": _cuda("cuda_d2h_bytes_per_step_within_threshold"),
+            "cuda_only_scalar_metrics_downloaded": _cuda("cuda_only_scalar_metrics_downloaded"),
+            "cuda_upload_synchronizations_bounded": _cuda("cuda_upload_synchronizations_bounded"),
+            "cuda_packed_attention_exercised": _cuda("cuda_packed_attention_exercised"),
+            "cuda_exact_gelu_exercised": _cuda("cuda_exact_gelu_exercised"),
         })
     if args.require_full_task_parity:
         # --require-full-task-parity (Phase 5 parity-envelope expansion):

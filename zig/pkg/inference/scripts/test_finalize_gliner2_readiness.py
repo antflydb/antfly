@@ -37,6 +37,10 @@ def evidence() -> dict:
     return {
         "default_summary": {
             "pass": True,
+            "accelerator_backend": "metal",
+            "training_precision": "fp32",
+            "optimizer_state_precision": "fp32",
+            "precision_consistent": True,
             "oracle": oracle,
             "oracle_valid_in_every_run": True,
             "model_fingerprint_sha256": SHA_MODEL,
@@ -81,6 +85,8 @@ def evidence() -> dict:
             "normalization": CANONICAL_NORMALIZATION,
             "unicode_version": CANONICAL_UNICODE_VERSION,
             "training_policy": STOCK_STOCHASTIC_TRAINING_POLICY,
+            "accelerator_backend": "metal",
+            "training_precision": "fp32",
             "thresholds": {"max_mean_deficit": 0.02, "max_paired_deficit": 0.05},
             "fingerprints": {"base_model": SHA_MODEL, "train_data": SHA_TRAIN, "eval_data": SHA_EVAL},
             "runs": [{"seed": seed, "pass": True} for seed in range(5)],
@@ -94,8 +100,18 @@ class ReadinessFinalizerTest(unittest.TestCase):
         values = evidence()
         values.update(overrides)
         convergence_evidence_errors = values.pop("convergence_evidence_errors", [])
+        hardware_qualification = values.pop("hardware_qualification", None)
+        hardware_qualification_errors = values.pop("hardware_qualification_errors", [])
         release_adapter_fingerprint = values.pop("release_adapter_fingerprint", SHA_ADAPTER)
+        release_manifest = values.pop("release_manifest", {
+            "backend": "Metal",
+            "compiled_required": True,
+            "training_precision": "fp32",
+            "optimizer_state_precision": "fp32",
+        })
+        backend = values.pop("backend", "metal")
         return build_summary(
+            backend=backend,
             default_rc=0,
             head_rc=0,
             quality_rc=0,
@@ -104,7 +120,10 @@ class ReadinessFinalizerTest(unittest.TestCase):
             require_head_opt_in=False,
             head_summary=None,
             convergence_evidence_errors=convergence_evidence_errors,
+            hardware_qualification=hardware_qualification,
+            hardware_qualification_errors=hardware_qualification_errors,
             release_adapter_fingerprint=release_adapter_fingerprint,
+            release_manifest=release_manifest,
             paths={},
             **values,
         )
@@ -113,6 +132,33 @@ class ReadinessFinalizerTest(unittest.TestCase):
         result = self.build()
         self.assertTrue(result["production_ready"], result["production_readiness_blockers"])
         self.assertEqual([], result["production_readiness_blockers"])
+        self.assertEqual("metal", result["accelerator_backend"])
+
+    def test_backend_and_precision_are_bound_end_to_end(self) -> None:
+        cuda_values = evidence()
+        cuda_values["default_summary"].update(accelerator_backend="cuda")
+        cuda_values["convergence_report"].update(accelerator_backend="cuda")
+        result = self.build(
+            backend="cuda",
+            hardware_qualification={
+                "contract": "gliner2_cuda_hardware_qualification_matrix/v1",
+                "pass": True,
+                "training_precision": "fp32",
+                "optimizer_state_precision": "fp32",
+                "cuda_artifacts": "fatbin",
+            },
+            release_manifest={
+                "backend": "CUDA",
+                "compiled_required": True,
+                "training_precision": "fp32",
+                "optimizer_state_precision": "fp32",
+            },
+            **cuda_values,
+        )
+        self.assertTrue(result["production_ready"], result["production_readiness_blockers"])
+        mislabeled = self.build(backend="cuda")
+        self.assertFalse(mislabeled["production_ready"])
+        self.assertFalse(mislabeled["checks"]["release_adapter_backend_and_precision"])
 
     def test_stochastic_and_fail_closed_unicode_are_policies_not_blockers(self) -> None:
         result = self.build()

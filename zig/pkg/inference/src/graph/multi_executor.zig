@@ -379,6 +379,7 @@ pub fn executeMultiDevice(
                         values[i] = rt_val;
                     }
                     value_device[i] = dev_id;
+                    if (collect_stats and part.backend == .cuda) exec_stats.planned_operator_dispatches += 1;
                     continue;
                 }
 
@@ -386,6 +387,13 @@ pub fn executeMultiDevice(
                 if (graph.node(node_id).op == .fused_from_float32) continue;
 
                 values[i] = try executeNode(graph, cb, values, node_id, &exec_state);
+                if (collect_stats) {
+                    if (part.backend == .cuda) {
+                        exec_stats.planned_operator_dispatches += 1;
+                    } else {
+                        exec_stats.interpreter_fallbacks += 1;
+                    }
+                }
                 value_device[i] = dev_id;
                 try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
                     allocator,

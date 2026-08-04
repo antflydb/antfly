@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score a Zig-produced PEFT adapter with the frozen upstream GLiNER2 decoder."""
+"""Score a standard PEFT adapter with the frozen upstream GLiNER2 decoder."""
 
 from __future__ import annotations
 
@@ -26,7 +26,11 @@ from gliner2_release_contract import (
     verify_canonical_python_runtime,
     verify_upstream_checkout,
 )
-from validate_gliner2_release_data import adapter_bundle_fingerprint, base_model_fingerprint
+from validate_gliner2_release_data import (
+    adapter_bundle_fingerprint,
+    base_model_fingerprint,
+    peft_adapter_fingerprint,
+)
 
 
 EVALUATION_CONTRACT = "gliner2_full_task_evaluation/v1"
@@ -721,7 +725,12 @@ def main() -> int:
             "eval_data": str(args.eval_data),
             "artifacts": {
                 "base_model_fingerprint_sha256": base_model_fingerprint(args.model_dir),
-                "adapter_bundle_fingerprint_sha256": adapter_bundle_fingerprint(args.adapter_dir),
+                "peft_adapter_fingerprint_sha256": peft_adapter_fingerprint(args.adapter_dir),
+                "adapter_bundle_fingerprint_sha256": (
+                    adapter_bundle_fingerprint(args.adapter_dir)
+                    if (args.adapter_dir / "task_head.safetensors").is_file()
+                    else None
+                ),
                 "eval_data_fingerprint_sha256": path_fingerprint(args.eval_data),
             },
         }

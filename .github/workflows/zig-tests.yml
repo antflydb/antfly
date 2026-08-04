@@ -189,6 +189,7 @@ jobs:
             test_evaluate_gliner2_full_task.py \
             test_evaluate_gliner2_native_release_smoke.py \
             test_summarize_gliner2_convergence.py \
+            test_summarize_gliner2_cuda_hardware.py \
             test_finalize_gliner2_readiness.py
 
       - name: Check GLiNER2 release wrappers
@@ -217,6 +218,113 @@ jobs:
         env:
           TERMITE_REQUIRE_METAL_TESTS: "1"
         run: zig build test-gliner2-backend-grad-parity -Dmetal=true -Doptimize=ReleaseSafe
+
+  gliner2-cuda-parity:
+    name: gliner2 native-CUDA finetuning gate
+    needs: changes
+    # This gate is mandatory for relevant changes. A missing/misconfigured GPU
+    # runner must leave the required check unsatisfied rather than silently
+    # turning CUDA coverage into a successful skip.
+    if: needs.changes.outputs.zig_tests == 'true' && github.event_name != 'schedule'
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Run source-bound CUDA parity and sanitizer qualification
+        working-directory: zig/pkg/inference
+        run: python3 scripts/qualify_gliner2_cuda_hardware.py --output gliner2-cuda-qualification.json
+
+      - name: Retain CUDA qualification evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: gliner2-cuda-qualification-required
+          path: |
+            zig/pkg/inference/gliner2-cuda-qualification.json
+            zig/pkg/inference/gliner2-cuda-qualification-logs/
+          if-no-files-found: error
+
+  gliner2-cuda-release-matrix:
+    name: gliner2 CUDA FP32 release qualification (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: sm80
+            runner: cuda-sm80
+          - arch: sm89
+            runner: cuda-sm89
+          - arch: sm90
+            runner: cuda-sm90
+    runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Run CUDA parity and sanitizer lane
+        working-directory: zig/pkg/inference
+        run: >-
+          python3 scripts/qualify_gliner2_cuda_hardware.py
+          --output gliner2-cuda-qualification-${{ matrix.arch }}.json
+
+      - name: Retain architecture lane
+        uses: actions/upload-artifact@v6
+        with:
+          name: gliner2-cuda-qualification-${{ matrix.arch }}
+          path: |
+            zig/pkg/inference/gliner2-cuda-qualification-${{ matrix.arch }}.json
+            zig/pkg/inference/gliner2-cuda-qualification-${{ matrix.arch }}-logs/
+          if-no-files-found: error
+
+  gliner2-cuda-release-matrix-summary:
+    name: gliner2 CUDA FP32 release matrix summary
+    if: github.event_name == 'workflow_dispatch'
+    needs: gliner2-cuda-release-matrix
+    runs-on: arc-antfly-standard
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Download CUDA qualification lanes
+        uses: actions/download-artifact@v6
+        with:
+          pattern: gliner2-cuda-qualification-sm*
+          path: zig/pkg/inference/cuda-qualification-lanes
+          merge-multiple: true
+
+      - name: Build fail-closed hardware matrix
+        working-directory: zig/pkg/inference
+        run: |
+          python3 scripts/summarize_gliner2_cuda_hardware.py \
+            --report cuda-qualification-lanes/gliner2-cuda-qualification-sm80.json \
+            --report cuda-qualification-lanes/gliner2-cuda-qualification-sm89.json \
+            --report cuda-qualification-lanes/gliner2-cuda-qualification-sm90.json \
+            --output gliner2-cuda-hardware-matrix.json
+
+      - name: Retain CUDA hardware matrix
+        uses: actions/upload-artifact@v6
+        with:
+          name: gliner2-cuda-hardware-matrix
+          path: zig/pkg/inference/gliner2-cuda-hardware-matrix.json
+          if-no-files-found: error
 
   backup-s3-integration:
     name: backup-s3-integration

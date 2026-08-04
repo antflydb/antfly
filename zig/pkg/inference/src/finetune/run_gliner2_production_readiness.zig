@@ -62,7 +62,9 @@ const Options = struct {
     grad_accum: []const u8 = "1",
     seed: []const u8 = "42",
     backend: []const u8 = "auto",
+    eval_backend: []const u8 = "native",
     compiled_required: bool = false,
+    eval_compiled_required: bool = false,
     activation_checkpointing: bool = false,
     activation_checkpoint_interval: []const u8 = "1",
     activation_checkpoint_strategy: []const u8 = "every-n-layers",
@@ -312,7 +314,10 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     try runCommand(init, allocator, "train-gliner2-autodiff", train_gliner2_autodiff.main, train_args_list.items);
 
     const metal_required = std.mem.eql(u8, opts.backend, "metal");
-    const device_optimizer_required = metal_required;
+    const cuda_required = std.mem.eql(u8, opts.backend, "cuda");
+    const device_optimizer_required = metal_required or cuda_required;
+    const required_backend = requiredAcceleratorBackend(opts.backend);
+    const required_optimizer_backend = requiredDeviceOptimizerBackend(opts.backend);
     const min_device_trainable_bytes: ?usize = opts.min_device_trainable_bytes orelse if (device_optimizer_required) @as(usize, 1) else null;
     var run_summary = try validation.validateRun(allocator, opts.out_dir, .{
         .require_loss_decrease = opts.require_loss_decrease,
@@ -325,15 +330,9 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .min_entity_labels = opts.min_unique_labels,
         .min_supervised_tokens = opts.min_supervised_tokens,
         .min_entity_tokens = opts.min_entity_tokens,
-        .require_backend = if (metal_required)
-            "Metal"
-        else
-            null,
+        .require_backend = required_backend,
         .require_objective = opts.objective,
-        .require_optimizer_backend = if (metal_required)
-            "metal"
-        else
-            null,
+        .require_optimizer_backend = required_optimizer_backend,
         .max_device_trainable_transfer_count = opts.max_device_trainable_transfer_count orelse opts.max_device_resident_transfer_count,
         .max_device_resident_transfer_count = opts.max_device_resident_transfer_count,
         .min_device_trainable_bytes = min_device_trainable_bytes,
@@ -433,6 +432,18 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     gliner2_data.freeDatasetReadinessSummary(allocator, &train_readiness);
 }
 
+fn requiredAcceleratorBackend(backend: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, backend, "metal")) return "Metal";
+    if (std.mem.eql(u8, backend, "cuda")) return "CUDA";
+    return null;
+}
+
+fn requiredDeviceOptimizerBackend(backend: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, backend, "metal")) return "metal";
+    if (std.mem.eql(u8, backend, "cuda")) return "cuda";
+    return null;
+}
+
 fn runQualityEval(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -448,7 +459,7 @@ fn runQualityEval(
         opts.eval_data,
         opts.entity_types_csv,
         "--backend",
-        opts.backend,
+        opts.eval_backend,
         "--seq-len",
         opts.seq_len,
         "--max-span-width",
@@ -474,7 +485,7 @@ fn runQualityEval(
     if (opts.quality_best_span_per_label_start) try quality_args_list.append(allocator, "--best-span-per-label-start");
     if (opts.quality_best_label_per_span_start) try quality_args_list.append(allocator, "--best-label-per-span-start");
     if (opts.quality_require_entitylike_span) try quality_args_list.append(allocator, "--require-entitylike-span");
-    if (opts.compiled_required) try quality_args_list.append(allocator, "--compiled-required");
+    if (opts.eval_compiled_required) try quality_args_list.append(allocator, "--compiled-required");
     if (opts.min_entity_precision) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-precision", value });
     if (opts.min_entity_recall) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-recall", value });
     if (opts.min_entity_f1) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-f1", value });
@@ -495,7 +506,7 @@ fn runSemanticEval(
         golden.text,
         opts.entity_types_csv,
         "--backend",
-        opts.backend,
+        opts.eval_backend,
         "--seq-len",
         opts.seq_len,
         "--max-span-width",
@@ -519,7 +530,7 @@ fn runSemanticEval(
     if (opts.semantic_best_span_per_label_start) try eval_args_list.append(allocator, "--best-span-per-label-start");
     if (opts.semantic_best_label_per_span_start) try eval_args_list.append(allocator, "--best-label-per-span-start");
     if (opts.semantic_require_entitylike_span) try eval_args_list.append(allocator, "--require-entitylike-span");
-    if (opts.compiled_required) try eval_args_list.append(allocator, "--compiled-required");
+    if (opts.eval_compiled_required) try eval_args_list.append(allocator, "--compiled-required");
     try runCommand(init, allocator, "eval-gliner2-autodiff-adapter", eval_gliner2_autodiff_adapter.main, eval_args_list.items);
 }
 
@@ -659,6 +670,8 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.min_device_trainable_bytes,
     });
     try writer.interface.print(
+        \\eval_backend: {s}
+        \\eval_compiled_required: {}
         \\max_metal_tensor_device_owned_peak_live_bytes: {?}
         \\max_metal_runtime_total_bytes: {?}
         \\max_metal_eager_arena_peak_bytes: {?}
@@ -671,6 +684,8 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\max_graph_command_dispatch_count: {?}
         \\max_metal_frame_gpu_ms: {?}
     , .{
+        opts.eval_backend,
+        opts.eval_compiled_required,
         opts.max_metal_tensor_device_owned_peak_live_bytes,
         opts.max_metal_runtime_total_bytes,
         opts.max_metal_eager_arena_peak_bytes,
@@ -807,8 +822,12 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.seed = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--backend")) {
             opts.backend = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--eval-backend")) {
+            opts.eval_backend = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--compiled-required")) {
             opts.compiled_required = true;
+        } else if (std.mem.eql(u8, arg, "--eval-compiled-required")) {
+            opts.eval_compiled_required = true;
         } else if (std.mem.eql(u8, arg, "--activation-checkpointing")) {
             opts.activation_checkpointing = true;
         } else if (std.mem.eql(u8, arg, "--activation-checkpoint-interval")) {
@@ -1141,8 +1160,10 @@ fn printUsage() void {
         \\  --span-negative-weight FLOAT     Negative span-label loss weight (default: 1)
         \\  --span-hard-negative-weight FLOAT Extra negative weight for spans overlapping gold entities (default: 1)
         \\  --span-negative-mask-rate FLOAT  Random negative-label masking rate (default: 0.5)
-        \\  --backend auto|metal|native  Training backend (default: auto)
-        \\  --compiled-required              Fail if requested compiled backend falls back
+        \\  --backend auto|cuda|metal|native Training backend (default: auto)
+        \\  --eval-backend auto|metal|native Saved-adapter evaluation backend (default: native)
+        \\  --compiled-required              Fail if the training backend falls back
+        \\  --eval-compiled-required         Fail if the evaluation backend falls back
         \\  --activation-checkpointing       Recompute non-checkpoint activations during backward
         \\  --activation-checkpoint-interval N
         \\                                    Save every Nth checkpoint boundary (default: 1)
@@ -1221,7 +1242,9 @@ test "entity Metal readiness defaults include shaped quality eval" {
     try std.testing.expect(opts.entity_metal_readiness);
     try std.testing.expectEqualStrings("gliner2-total-loss", opts.objective);
     try std.testing.expectEqualStrings("metal", opts.backend);
+    try std.testing.expectEqualStrings("native", opts.eval_backend);
     try std.testing.expect(opts.compiled_required);
+    try std.testing.expect(!opts.eval_compiled_required);
     try std.testing.expect(opts.activation_checkpointing);
     try std.testing.expectEqualStrings("parameters-only", opts.activation_checkpoint_strategy);
     try std.testing.expectEqualStrings("8", opts.structure_span_chunk_samples);
@@ -1231,6 +1254,29 @@ test "entity Metal readiness defaults include shaped quality eval" {
     try std.testing.expectEqualStrings("0.15", opts.min_entity_f1.?);
     try std.testing.expect(opts.semantic_require_entitylike_span);
     try std.testing.expect(opts.quality_require_entitylike_span);
+}
+
+test "production readiness requires the selected CUDA backend and optimizer" {
+    try std.testing.expectEqualStrings("CUDA", requiredAcceleratorBackend("cuda").?);
+    try std.testing.expectEqualStrings("cuda", requiredDeviceOptimizerBackend("cuda").?);
+    try std.testing.expect(requiredAcceleratorBackend("native") == null);
+    try std.testing.expect(requiredDeviceOptimizerBackend("auto") == null);
+}
+
+test "accelerator readiness evaluates saved full-task adapters on native by default" {
+    const opts = Options{
+        .model_dir = "model",
+        .train_data = "train.jsonl",
+        .eval_data = "eval.jsonl",
+        .out_dir = "out",
+        .entity_types_csv = "person,organization,location",
+        .backend = "cuda",
+        .compiled_required = true,
+    };
+    try std.testing.expectEqualStrings("cuda", opts.backend);
+    try std.testing.expect(opts.compiled_required);
+    try std.testing.expectEqualStrings("native", opts.eval_backend);
+    try std.testing.expect(!opts.eval_compiled_required);
 }
 
 fn validateDatasetSeparation(

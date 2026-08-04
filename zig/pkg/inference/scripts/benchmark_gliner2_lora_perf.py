@@ -166,6 +166,19 @@ def run_compare(argv: list[str], out_dir: Path, run_index: int, timeout: int | N
     }
 
 
+def args_with_seed(argv: list[str], seed: int) -> list[str]:
+    result = list(argv)
+    try:
+        index = result.index("--seed")
+    except ValueError:
+        result.extend(["--seed", str(seed)])
+        return result
+    if index + 1 >= len(result):
+        raise ValueError("forwarded --seed is missing its value")
+    result[index + 1] = str(seed)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Repeat compare_gliner2_lora_python_zig.py and write median/p90 performance summary.",
@@ -175,6 +188,11 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=Path("/private/tmp/termite-gliner2-lora-perf-runs"))
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument("--allow-failures", action="store_true")
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated isolated comparison seeds; count must equal --runs",
+    )
     parser.add_argument("--op-stats", action="store_true", help="Set TERMITE_METAL_PARTITION_OP_STATS=1 for each comparison run")
     parser.add_argument("--op-runs", action="store_true", help="Set TERMITE_METAL_PARTITION_OP_RUNS=1 for grouped-dot candidate summaries")
     parser.add_argument("--loop-profile", action="store_true", help="Set TERMITE_METAL_PARTITION_LOOP_PROFILE=1 for executor loop timing summaries")
@@ -219,6 +237,14 @@ def main() -> int:
 
     if args.runs <= 0:
         parser.error("--runs must be positive")
+    seeds: list[int] | None = None
+    if args.seeds is not None:
+        try:
+            seeds = [int(value.strip()) for value in args.seeds.split(",") if value.strip()]
+        except ValueError as exc:
+            parser.error(f"--seeds must contain integers: {exc}")
+        if len(seeds) != args.runs:
+            parser.error("--seeds count must equal --runs")
     for name, value in vars(args).items():
         if name.startswith(("max_", "min_", "warn_")) and value is not None and not math.isfinite(value):
             parser.error(f"--{name.replace('_', '-')} must be finite")
@@ -238,7 +264,8 @@ def main() -> int:
     if args.hazard_profile:
         run_env["TERMITE_METAL_PLANNED_ACCESS_PROFILE"] = "1"
     for idx in range(1, args.runs + 1):
-        result = run_compare(forwarded, args.out_dir, idx, args.timeout_seconds, run_env)
+        run_args = args_with_seed(forwarded, seeds[idx - 1]) if seeds is not None else forwarded
+        result = run_compare(run_args, args.out_dir, idx, args.timeout_seconds, run_env)
         runs.append(result)
         print(json.dumps({
             "event": "perf_run",
@@ -276,6 +303,23 @@ def main() -> int:
         "zig_graph_executor_parameter_materializations_avg",
         "zig_graph_executor_host_output_unattributed_avg",
         "zig_graph_executor_device_output_parameter_avg",
+        "zig_cuda_device_allocations_avg",
+        "zig_cuda_device_frees_avg",
+        "zig_cuda_h2d_bytes_avg",
+        "zig_cuda_h2d_bytes_max",
+        "zig_cuda_training_input_uploads_avg",
+        "zig_cuda_training_input_upload_bytes_avg",
+        "zig_cuda_training_input_upload_bytes_max",
+        "zig_cuda_d2h_bytes_avg",
+        "zig_cuda_d2h_bytes_max",
+        "zig_cuda_largest_d2h_transfer_bytes_max",
+        "zig_cuda_to_float32_calls_avg",
+        "zig_cuda_to_float32_calls_max",
+        "zig_cuda_stream_synchronizations_avg",
+        "zig_cuda_upload_synchronizations_avg",
+        "zig_cuda_temp_cache_hits_avg",
+        "zig_cuda_temp_cache_misses_avg",
+        "zig_cuda_kernel_launches_avg",
         "zig_graph_executor_metal_gather_input_promotions_avg",
         "zig_graph_executor_metal_gather_input_promotion_bytes_avg",
         "zig_graph_executor_metal_gather_input_promotion_ms_avg",
@@ -491,6 +535,7 @@ def main() -> int:
         "runs_requested": args.runs,
         "runs_completed": len(runs),
         "runs_successful": len(successful),
+        "seeds": seeds,
         "compare_args": forwarded,
         "metrics": metrics,
         "zig_beats_python_median_step_time": (
@@ -523,9 +568,22 @@ def main() -> int:
         },
         "run_reports": [run["report_path"] for run in runs],
     }
+    accelerator_backends = [run["summary"].get("zig_manifest_backend", "").lower() for run in successful]
+    training_precisions = [run["summary"].get("zig_training_precision") for run in successful]
+    optimizer_precisions = [run["summary"].get("zig_optimizer_state_precision") for run in successful]
+    summary["accelerator_backend"] = accelerator_backends[0] if accelerator_backends else None
+    summary["training_precision"] = training_precisions[0] if training_precisions else None
+    summary["optimizer_state_precision"] = optimizer_precisions[0] if optimizer_precisions else None
+    summary["precision_consistent"] = bool(successful) and (
+        len(set(accelerator_backends)) == 1
+        and training_precisions == ["fp32"] * len(successful)
+        and optimizer_precisions == ["fp32"] * len(successful)
+    )
     failures: list[str] = []
     if len(successful) != args.runs:
         failures.append(f"only {len(successful)}/{args.runs} runs succeeded")
+    if python_oracle_expected and successful and summary["precision_consistent"] is not True:
+        failures.append("accelerator backend or FP32 training/optimizer precision was missing or inconsistent")
     valid_oracles = [
         oracle
         for oracle in oracle_rows

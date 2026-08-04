@@ -25,8 +25,13 @@ Options:
   --eval-data FILE         Disjoint full-task eval JSONL (required and scored)
   --python-bin FILE        Python executable forwarded to the perf gate
   --upstream-source DIR    Clean upstream GLiNER2 checkout at the pinned commit (required)
+  --zig-backend metal|cuda Accelerator under test (default: metal)
+  --zig-cuda-artifacts NAME
+                           portable, sm89, or fatbin (default: fatbin)
   --convergence-summary FILE
                            Passing output from summarize_gliner2_convergence.py (required)
+  --cuda-hardware-qualification FILE
+                           Current passing L4/A100/H100 FP32 qualification matrix (required for CUDA)
   --heldout-min KEY=FLOAT  Required held-out floor; repeat for every metric listed below
   --heldout-threshold N    Upstream extraction threshold (default: 0.5)
   --heldout-batch-size N   Upstream CPU evaluation batch size (default: 8)
@@ -62,7 +67,10 @@ model_dir=""
 release_adapter_dir=""
 python_bin="/private/tmp/gliner2-parity-venv/bin/python"
 upstream_source=""
+zig_backend="metal"
+zig_cuda_artifacts="fatbin"
 convergence_summary=""
+cuda_hardware_qualification=""
 heldout_threshold="0.5"
 heldout_batch_size="8"
 heldout_max_length=""
@@ -119,8 +127,30 @@ while [[ $# -gt 0 ]]; do
       gate_args+=("$1" "${upstream_source}")
       shift 2
       ;;
+    --zig-backend)
+      zig_backend="${2:?missing value for --zig-backend}"
+      if [[ "${zig_backend}" != "metal" && "${zig_backend}" != "cuda" ]]; then
+        echo "--zig-backend must be metal or cuda" >&2
+        exit 2
+      fi
+      gate_args+=("--zig-backend" "${zig_backend}")
+      shift 2
+      ;;
+    --zig-cuda-artifacts)
+      zig_cuda_artifacts="${2:?missing value for --zig-cuda-artifacts}"
+      if [[ "${zig_cuda_artifacts}" != "portable" && "${zig_cuda_artifacts}" != "sm89" && "${zig_cuda_artifacts}" != "fatbin" ]]; then
+        echo "--zig-cuda-artifacts must be portable, sm89, or fatbin" >&2
+        exit 2
+      fi
+      gate_args+=("--zig-cuda-artifacts" "${zig_cuda_artifacts}")
+      shift 2
+      ;;
     --convergence-summary)
       convergence_summary="${2:?missing value for --convergence-summary}"
+      shift 2
+      ;;
+    --cuda-hardware-qualification)
+      cuda_hardware_qualification="${2:?missing value for --cuda-hardware-qualification}"
       shift 2
       ;;
     --heldout-min)
@@ -197,6 +227,17 @@ if (( skip_head_opt_in && require_head_opt_in )); then
   echo "--skip-head-opt-in and --require-head-opt-in are mutually exclusive" >&2
   exit 2
 fi
+if [[ "${zig_backend}" == "cuda" ]]; then
+  if (( require_head_opt_in )); then
+    echo "--require-head-opt-in is Metal-only and cannot be used with --zig-backend cuda" >&2
+    exit 2
+  fi
+  skip_head_opt_in=1
+  if [[ -z "${cuda_hardware_qualification}" || ! -f "${cuda_hardware_qualification}" ]]; then
+    echo "--cuda-hardware-qualification must name a current L4/A100/H100 matrix for CUDA readiness" >&2
+    exit 2
+  fi
+fi
 if [[ ! "${runs}" =~ ^[0-9]+$ ]] || (( runs < 5 )); then
   echo "production readiness requires at least five performance runs" >&2
   exit 2
@@ -218,6 +259,20 @@ if [[ -z "${convergence_summary}" || ! -f "${convergence_summary}" ]]; then
   echo "--convergence-summary must name a current five-seed convergence report" >&2
   exit 2
 fi
+if [[ "${zig_backend}" == "cuda" ]]; then
+  PYTHONPATH="${script_dir}" "${python_bin}" - "${cuda_hardware_qualification}" "${script_dir}/.." <<'PY'
+import json
+import sys
+from pathlib import Path
+from summarize_gliner2_cuda_hardware import verify_summary
+
+path = Path(sys.argv[1]).resolve()
+report = json.loads(path.read_text(encoding="utf-8"))
+errors = verify_summary(report, Path(sys.argv[2]).resolve())
+if errors:
+    raise SystemExit("; ".join(errors))
+PY
+fi
 if [[ -z "${model_dir}" || -z "${release_adapter_dir}" ]]; then
   echo "--model-dir and --release-adapter-dir are required for release quality validation" >&2
   exit 2
@@ -228,7 +283,8 @@ if [[ ! -d "${model_dir}" || ! -f "${release_adapter_dir}/adapter_config.json" |
 fi
 "${python_bin}" "${script_dir}/validate_gliner2_release_data.py" \
   --train "${train_data}" --eval "${eval_data}" --require-full-task \
-  --model-dir "${model_dir}" --release-adapter-dir "${release_adapter_dir}"
+  --model-dir "${model_dir}" --release-adapter-dir "${release_adapter_dir}" \
+  --backend "${zig_backend}"
 heldout_preflight=("${upstream_source}" "${heldout_threshold}" "${heldout_batch_size}" "${heldout_max_length}")
 if ((${#heldout_minima[@]})); then
   heldout_preflight+=("${heldout_minima[@]}")
@@ -249,7 +305,7 @@ try:
 except ValueError as exc:
     raise SystemExit(str(exc))
 PY
-PYTHONPATH="${script_dir}" "${python_bin}" - "${convergence_summary}" "${model_dir}" "${train_data}" "${eval_data}" "${upstream_source}" <<'PY'
+PYTHONPATH="${script_dir}" "${python_bin}" - "${convergence_summary}" "${model_dir}" "${train_data}" "${eval_data}" "${upstream_source}" "${zig_backend}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -290,6 +346,7 @@ if (
     or report.get("normalization") != CANONICAL_NORMALIZATION
     or report.get("unicode_version") != CANONICAL_UNICODE_VERSION
     or report.get("training_policy") != STOCK_STOCHASTIC_TRAINING_POLICY
+    or report.get("accelerator_backend", "metal") != sys.argv[6]
     or report.get("fingerprints") != expected_fingerprints
 ):
     raise SystemExit("convergence summary is not a passing five-seed report for the selected model/train/eval artifacts")
@@ -396,16 +453,23 @@ else
 fi
 set -e
 
-"${python_bin}" "${script_dir}/finalize_gliner2_readiness.py" \
-  --out-dir "${out_dir}" \
-  --convergence-summary "${convergence_summary}" \
-  --release-adapter-dir "${release_adapter_dir}" \
-  --default-rc "${default_rc}" \
-  --head-rc "${head_rc}" \
-  --quality-rc "${quality_rc}" \
-  --native-rc "${native_release_rc}" \
-  --skip-head-opt-in "${skip_head_opt_in}" \
+finalize_cmd=(
+  "${python_bin}" "${script_dir}/finalize_gliner2_readiness.py"
+  --out-dir "${out_dir}"
+  --convergence-summary "${convergence_summary}"
+  --release-adapter-dir "${release_adapter_dir}"
+  --backend "${zig_backend}"
+  --default-rc "${default_rc}"
+  --head-rc "${head_rc}"
+  --quality-rc "${quality_rc}"
+  --native-rc "${native_release_rc}"
+  --skip-head-opt-in "${skip_head_opt_in}"
   --require-head-opt-in "${require_head_opt_in}"
+)
+if [[ "${zig_backend}" == "cuda" ]]; then
+  finalize_cmd+=(--hardware-qualification "${cuda_hardware_qualification}")
+fi
+"${finalize_cmd[@]}"
 
 if (( default_rc != 0 )); then
   exit "${default_rc}"
@@ -431,7 +495,7 @@ if summary.get("production_ready") is not True:
     raise SystemExit(1)
 PY
 then
-  echo "GLiNER2 Zig Metal production readiness: PASS"
+  echo "GLiNER2 Zig ${zig_backend^^} production readiness: PASS"
   exit 0
 fi
 exit 3

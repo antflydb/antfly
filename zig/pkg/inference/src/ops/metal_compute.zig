@@ -3898,17 +3898,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub const TrainingAdamWOptions = metal_runtime.TrainingAdamWOptions;
-    pub const TrainingAdamWBatchOptions = metal_runtime.TrainingAdamWBatchOptions;
-
-    pub const TrainingAdamWBatchInput = struct {
-        weight: CT,
-        grad: CT,
-        m: CT,
-        v: CT,
-        elem_count: usize,
-        bias_correction1: f32,
-        bias_correction2: f32,
-    };
+    pub const TrainingAdamWBatchOptions = ops.TrainingAdamWBatchOptions;
+    pub const TrainingAdamWBatchInput = ops.TrainingAdamWBatchInput;
 
     pub fn trainingAdamWF32(
         self: *MetalCompute,
@@ -3974,7 +3965,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const ok = try metal_runtime.decoderRuntimeTrainingAdamWManyF32(
             self.provider_impl,
             batch,
-            opts,
+            .{
+                .lr = opts.lr,
+                .beta1 = opts.beta1,
+                .beta2 = opts.beta2,
+                .eps = opts.eps,
+                .weight_decay = opts.weight_decay,
+                .grad_scale = opts.grad_scale,
+            },
         );
         if (!ok) return error.MetalTrainingAdamWUnavailable;
     }
@@ -4003,10 +4001,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return if (host.len > 0) host[0] else 0.0;
     }
 
-    pub const TrainingSumSquaresInput = struct {
-        tensor: CT,
-        elem_count: usize,
-    };
+    pub const TrainingSumSquaresInput = ops.TrainingSumSquaresInput;
 
     pub fn trainingSumSquaresManyF32(
         self: *MetalCompute,
@@ -4050,6 +4045,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var total: f64 = 0.0;
         for (host) |value| total += @as(f64, value);
         return @floatCast(total);
+    }
+
+    fn trainingOverwriteF32Op(ctx: *anyopaque, tensor: CT, data: []const f32, shape: []const i32) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.trainingOverwriteF32(tensor, data, shape);
+    }
+
+    fn trainingZeroF32Op(ctx: *anyopaque, elem_count: usize, shape: []const i32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.trainingZeroF32(elem_count, shape);
+    }
+
+    fn trainingAccumulateF32Op(ctx: *anyopaque, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.trainingAccumulateF32(accum, grad, elem_count, scale, first);
+    }
+
+    fn trainingAdamWManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatchInput, opts: ops.TrainingAdamWBatchOptions) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.trainingAdamWManyF32(inputs, opts);
+    }
+
+    fn trainingSumSquaresManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingSumSquaresInput) anyerror!f32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.trainingSumSquaresManyF32(inputs);
     }
 
     fn nextPow2AtLeast(value: usize) usize {
@@ -23612,6 +23632,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.tensorShapeMatches = tensorShapeMatchesOp;
         vt.sliceLastDim = sliceLastDimOp;
         vt.evalTensor = evalTensorOp;
+        vt.trainingOverwriteF32 = trainingOverwriteF32Op;
+        vt.trainingZeroF32 = trainingZeroF32Op;
+        vt.trainingAccumulateF32 = trainingAccumulateF32Op;
+        vt.trainingAdamWManyF32 = trainingAdamWManyF32Op;
+        vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;
         vt.argmaxLastRow = argmaxLastRowOp;
         vt.linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp;
         vt.argmaxRows = argmaxRowsOp;

@@ -45,7 +45,7 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-gliner2-backend-grad-parity",
         .root_source_file = "src/finetune/test/test_gliner2_backend_grad_parity.zig",
-        .description = "Run GLiNER2 native/Metal per-parameter gradient parity gates",
+        .description = "Run GLiNER2 native/Metal/CUDA per-parameter gradient parity gates",
         .imports = &.{ .antfly_platform, .build_options, .ml, .inference_internal },
         .native_link = .default,
     },
