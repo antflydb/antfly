@@ -301,6 +301,7 @@ pub const InferenceToolChoice = types.InferenceToolChoice;
 pub const InferenceTranscribeObject = types.InferenceTranscribeObject;
 pub const InferenceTranscribeRequest = types.InferenceTranscribeRequest;
 pub const InferenceTranscribeResponse = types.InferenceTranscribeResponse;
+pub const InferenceTransientCapacityError = types.InferenceTransientCapacityError;
 pub const InferenceschemasConfig = types.InferenceschemasConfig;
 pub const InstallExtensionRequest = types.InstallExtensionRequest;
 pub const InstallManifest = types.InstallManifest;

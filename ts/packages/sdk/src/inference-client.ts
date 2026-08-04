@@ -20,8 +20,61 @@ import type {
   RerankResponse,
   RewriteResponse,
   TranscribeResponse,
+  TransientCapacityError,
 } from "./inference-types.js";
 import type { paths } from "./public-api.js";
+
+/** Structured temporary-capacity failure with an actionable backoff delay. */
+export class InferenceCapacityError extends Error {
+  readonly code: string;
+  readonly reason: TransientCapacityError["reason"];
+  readonly retryAfterMs: number;
+  readonly retryable = true;
+
+  constructor(details: TransientCapacityError) {
+    super(`${details.error}: ${details.message}`);
+    this.name = "InferenceCapacityError";
+    this.code = details.error;
+    this.reason = details.reason;
+    this.retryAfterMs = details.retry_after_ms;
+  }
+}
+
+function isTransientCapacityError(value: unknown): value is TransientCapacityError {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.error === "string" &&
+    typeof candidate.message === "string" &&
+    (candidate.reason === "inference_capacity" || candidate.reason === "request_queue") &&
+    candidate.retryable === true &&
+    typeof candidate.retry_after_ms === "number" &&
+    Number.isFinite(candidate.retry_after_ms) &&
+    candidate.retry_after_ms > 0
+  );
+}
+
+function inferenceRequestError(operation: string, value: unknown): Error {
+  if (isTransientCapacityError(value)) return new InferenceCapacityError(value);
+  if (typeof value === "object" && value !== null && "error" in value) {
+    return new Error(`${operation} failed: ${String(value.error)}`);
+  }
+  return new Error(`${operation} failed`);
+}
+
+async function inferenceFetchError(operation: string, response: Response): Promise<Error> {
+  const body = await response.text();
+  if (response.headers.get("Content-Type")?.includes("application/json")) {
+    try {
+      const parsed: unknown = JSON.parse(body);
+      const error = inferenceRequestError(operation, parsed);
+      if (error instanceof InferenceCapacityError) return error;
+    } catch {
+      // Fall through to the status-and-body diagnostic below.
+    }
+  }
+  return new Error(`${operation} failed: ${response.status} ${body}`);
+}
 
 export class InferenceClient {
   private client: Client<paths>;
@@ -85,7 +138,7 @@ export class InferenceClient {
       },
       parseAs: "json",
     });
-    if (error) throw new Error(`Embed failed: ${error.error}`);
+    if (error) throw inferenceRequestError("Embed", error);
     // The API returns both application/octet-stream and application/json.
     // We request JSON via Accept header and parseAs, so cast appropriately.
     return data as EmbedResponse;
@@ -128,8 +181,7 @@ export class InferenceClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Embed failed: ${response.status} ${errorText}`);
+      throw await inferenceFetchError("Embed", response);
     }
 
     const arrayBuffer = await response.arrayBuffer();
@@ -184,7 +236,7 @@ export class InferenceClient {
       },
       signal: options?.signal,
     });
-    if (error) throw new Error(`Chunk failed: ${error.error}`);
+    if (error) throw inferenceRequestError("Chunk", error);
     if (!data) throw new Error("Chunk failed: unexpected empty response");
     return data;
   }
@@ -220,7 +272,7 @@ export class InferenceClient {
         prompts,
       },
     });
-    if (error) throw new Error(`Rerank failed: ${error.error}`);
+    if (error) throw inferenceRequestError("Rerank", error);
     if (!data) throw new Error("Rerank failed: unexpected empty response");
     return data;
   }
@@ -274,7 +326,7 @@ export class InferenceClient {
     const { data, error } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
-    if (error) throw new Error(`Extract failed: ${error.error}`);
+    if (error) throw inferenceRequestError("Extract", error);
     if (!data) throw new Error("Extract failed: unexpected empty response");
     return data;
   }
@@ -380,7 +432,7 @@ export class InferenceClient {
         inputs,
       },
     });
-    if (error) throw new Error(`Rewrite failed: ${error.error}`);
+    if (error) throw inferenceRequestError("Rewrite", error);
     if (!data) throw new Error("Rewrite failed: unexpected empty response");
     return data;
   }
@@ -420,7 +472,7 @@ export class InferenceClient {
         language: options?.language,
       },
     });
-    if (error) throw new Error(`Transcribe failed: ${error.error}`);
+    if (error) throw inferenceRequestError("Transcribe", error);
     if (!data) throw new Error("Transcribe failed: unexpected empty response");
     return data;
   }
@@ -440,7 +492,7 @@ export class InferenceClient {
    */
   async listModels(): Promise<ModelsResponse> {
     const { data, error } = await this.client.GET("/ai/v1/models");
-    if (error) throw new Error(`List models failed: ${error.error}`);
+    if (error) throw inferenceRequestError("List models", error);
     if (!data) throw new Error("List models failed: unexpected empty response");
     return data;
   }

@@ -1204,6 +1204,101 @@ fn spinLock(m: *std.atomic.Mutex) void {
     platform.sync.lockYielding(m);
 }
 
+/// Writer-preferring process-local gate for optional embedding assets.
+/// Primary-only requests take shared access and retain full backend concurrency;
+/// requests that swap ephemeral audio sessions take exclusive access.
+const EmbeddingAssetGate = struct {
+    reader_gate: std.atomic.Mutex = .unlocked,
+    reader_mutex: std.atomic.Mutex = .unlocked,
+    resource_mutex: std.atomic.Mutex = .unlocked,
+    reader_count: usize = 0,
+
+    fn lockShared(self: *EmbeddingAssetGate) void {
+        spinLock(&self.reader_gate);
+        defer self.reader_gate.unlock();
+        spinLock(&self.reader_mutex);
+        defer self.reader_mutex.unlock();
+
+        self.reader_count += 1;
+        if (self.reader_count == 1) spinLock(&self.resource_mutex);
+    }
+
+    fn tryLockShared(self: *EmbeddingAssetGate) bool {
+        if (!self.reader_gate.tryLock()) return false;
+        defer self.reader_gate.unlock();
+        if (!self.reader_mutex.tryLock()) return false;
+        defer self.reader_mutex.unlock();
+
+        if (self.reader_count == 0 and !self.resource_mutex.tryLock()) return false;
+        self.reader_count += 1;
+        return true;
+    }
+
+    fn unlockShared(self: *EmbeddingAssetGate) void {
+        spinLock(&self.reader_mutex);
+        defer self.reader_mutex.unlock();
+
+        std.debug.assert(self.reader_count > 0);
+        self.reader_count -= 1;
+        if (self.reader_count == 0) self.resource_mutex.unlock();
+    }
+
+    fn lockExclusive(self: *EmbeddingAssetGate) void {
+        spinLock(&self.reader_gate);
+        spinLock(&self.resource_mutex);
+    }
+
+    fn tryLockExclusive(self: *EmbeddingAssetGate) bool {
+        if (!self.reader_gate.tryLock()) return false;
+        if (!self.resource_mutex.tryLock()) {
+            self.reader_gate.unlock();
+            return false;
+        }
+        return true;
+    }
+
+    fn unlockExclusive(self: *EmbeddingAssetGate) void {
+        self.resource_mutex.unlock();
+        self.reader_gate.unlock();
+    }
+
+    /// Convert an exclusive owner into the first shared reader without opening
+    /// a gap in which another writer could mutate optional-session slots.
+    fn downgradeExclusiveToShared(self: *EmbeddingAssetGate) void {
+        spinLock(&self.reader_mutex);
+        std.debug.assert(self.reader_count == 0);
+        self.reader_count = 1;
+        self.reader_mutex.unlock();
+
+        // Keep resource_mutex held on behalf of the new reader cohort. New
+        // readers may now join, while queued writers remain excluded until the
+        // final reader releases the resource.
+        self.reader_gate.unlock();
+    }
+};
+
+pub const EmbeddingAssetLease = struct {
+    gate: *EmbeddingAssetGate,
+    access: enum { shared, exclusive },
+    held: bool = true,
+
+    pub fn release(self: *EmbeddingAssetLease) void {
+        if (!self.held) return;
+        switch (self.access) {
+            .shared => self.gate.unlockShared(),
+            .exclusive => self.gate.unlockExclusive(),
+        }
+        self.held = false;
+    }
+
+    pub fn downgradeExclusiveToShared(self: *EmbeddingAssetLease) void {
+        std.debug.assert(self.held);
+        std.debug.assert(self.access == .exclusive);
+        self.gate.downgradeExclusiveToShared();
+        self.access = .shared;
+    }
+};
+
 pub fn shouldPreferSentencePieceOverride(man: manifest_mod.ModelManifest, model_dir: []const u8, allocator: std.mem.Allocator) bool {
     if (!c_file.fileExistsInDir(allocator, model_dir, "tokenizer.model")) return false;
     return manifestLooksLikeGemma(man, model_dir, allocator);
@@ -1849,8 +1944,14 @@ pub const LoadedModel = struct {
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
     native_generate_lock: std.atomic.Mutex = .unlocked,
-    // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
+    // Multimodal sessions (CLIP/CLAP/CLIPCLAP). The gate protects session
+    // lifetime during execution; the mutex protects short slot mutations.
+    embedding_asset_gate: EmbeddingAssetGate = .{},
     embedding_session_lock: std.atomic.Mutex = .unlocked,
+    /// Stateful GPU embedding sessions share mutable weight-store and command
+    /// state. Cold-load waiters are released together, so serialize their
+    /// forward passes without constraining thread-safe CPU sessions.
+    embedding_run_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
@@ -1924,9 +2025,9 @@ pub const LoadedModel = struct {
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
         path: ?[]const u8,
-    ) !void {
-        if (slot.* != null) return;
-        const session_path = path orelse return;
+    ) !bool {
+        if (slot.* != null) return false;
+        const session_path = path orelse return false;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
         const strict_backend = [_]backends.BackendType{if (shared_ctx) |shared|
             shared.backendType()
@@ -1941,12 +2042,43 @@ pub const LoadedModel = struct {
         lease_slot.* = loaded.resource_lease;
         loaded.owns_session = false;
         loaded.resource_lease = null;
+        return true;
+    }
+
+    fn releaseOptionalSession(
+        slot: *?backends.Session,
+        lease_slot: *?runtime.tier.memory.AdmissionLease,
+    ) void {
+        if (slot.*) |session| session.close();
+        slot.* = null;
+        if (lease_slot.*) |*lease| lease.release();
+        lease_slot.* = null;
+    }
+
+    /// Serialize short optional-session slot mutations. Request execution is
+    /// protected separately by embedding_asset_gate so primary-only callers
+    /// retain shared concurrency.
+    pub fn lockEmbeddingAssets(self: *LoadedModel) void {
+        spinLock(&self.embedding_session_lock);
+    }
+
+    pub fn unlockEmbeddingAssets(self: *LoadedModel) void {
+        self.embedding_session_lock.unlock();
+    }
+
+    pub fn acquireEmbeddingAssetLease(self: *LoadedModel, include_audio: bool) EmbeddingAssetLease {
+        if (include_audio) {
+            self.embedding_asset_gate.lockExclusive();
+            return .{ .gate = &self.embedding_asset_gate, .access = .exclusive };
+        }
+        self.embedding_asset_gate.lockShared();
+        return .{ .gate = &self.embedding_asset_gate, .access = .shared };
     }
 
     pub fn ensureVisionSession(self: *LoadedModel) !void {
-        spinLock(&self.embedding_session_lock);
-        defer self.embedding_session_lock.unlock();
-        try self.ensureOptionalSession(
+        self.lockEmbeddingAssets();
+        defer self.unlockEmbeddingAssets();
+        _ = try self.ensureOptionalSession(
             &self.vision_session,
             &self.vision_resource_lease,
             self.manifest.visual_model_path,
@@ -1954,43 +2086,103 @@ pub const LoadedModel = struct {
     }
 
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
-        spinLock(&self.embedding_session_lock);
-        defer self.embedding_session_lock.unlock();
+        self.lockEmbeddingAssets();
+        defer self.unlockEmbeddingAssets();
+        try self.ensureEmbeddingAssetsLocked(include_text, include_image, include_audio);
+    }
+
+    pub fn ensureEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
+        try self.ensurePrimaryEmbeddingAssetsLocked(include_text, include_image);
+        if (include_audio) try self.ensureAudioEmbeddingAssetsLocked();
+    }
+
+    const PrimaryEmbeddingAssetAcquisitions = struct {
+        text_projection: bool = false,
+        vision: bool = false,
+        visual_projection: bool = false,
+    };
+
+    fn rollbackPrimaryEmbeddingAssetsLocked(self: *LoadedModel, acquired: PrimaryEmbeddingAssetAcquisitions) void {
+        if (acquired.visual_projection) releaseOptionalSession(
+            &self.visual_projection,
+            &self.visual_projection_resource_lease,
+        );
+        if (acquired.vision) releaseOptionalSession(
+            &self.vision_session,
+            &self.vision_resource_lease,
+        );
+        if (acquired.text_projection) releaseOptionalSession(
+            &self.text_projection,
+            &self.text_projection_resource_lease,
+        );
+    }
+
+    /// Admit the reusable text/image sidecars transactionally. A failed
+    /// multi-session admission releases only sessions acquired by this call,
+    /// preserving already-warm assets for concurrent request efficiency.
+    pub fn ensurePrimaryEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool) !void {
+        var acquired = PrimaryEmbeddingAssetAcquisitions{};
+        errdefer self.rollbackPrimaryEmbeddingAssetsLocked(acquired);
 
         if (include_text) {
-            try self.ensureOptionalSession(
+            acquired.text_projection = try self.ensureOptionalSession(
                 &self.text_projection,
                 &self.text_projection_resource_lease,
                 self.manifest.text_projection_path,
             );
         }
         if (include_image) {
-            try self.ensureOptionalSession(
+            acquired.vision = try self.ensureOptionalSession(
                 &self.vision_session,
                 &self.vision_resource_lease,
                 self.manifest.visual_model_path,
             );
-            try self.ensureOptionalSession(
+            acquired.visual_projection = try self.ensureOptionalSession(
                 &self.visual_projection,
                 &self.visual_projection_resource_lease,
                 self.manifest.visual_projection_path,
             );
         }
-        if (include_audio) {
-            try self.ensureOptionalSession(
-                &self.audio_session,
-                &self.audio_resource_lease,
-                self.manifest.audio_model_path,
-            );
-            try self.ensureOptionalSession(
-                &self.audio_projection,
-                &self.audio_projection_resource_lease,
-                self.manifest.audio_projection_path,
-            );
-        }
+    }
+
+    /// Admit the ephemeral audio sidecars as one phase. Any partial admission
+    /// is rolled back immediately so a failed request cannot strand a lease
+    /// and prevent subsequent text/image work from making progress.
+    pub fn ensureAudioEmbeddingAssetsLocked(self: *LoadedModel) !void {
+        errdefer self.releaseAudioEmbeddingAssetsLocked();
+        _ = try self.ensureOptionalSession(
+            &self.audio_session,
+            &self.audio_resource_lease,
+            self.manifest.audio_model_path,
+        );
+        _ = try self.ensureOptionalSession(
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+            self.manifest.audio_projection_path,
+        );
+    }
+
+    /// Release the lazily loaded audio branch after its outputs have been
+    /// materialized. The primary CLIP session can then admit text/image work
+    /// without counting an idle CLAP session against the same host budget.
+    pub fn releaseAudioEmbeddingAssetsLocked(self: *LoadedModel) void {
+        releaseOptionalSession(
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+        );
+        releaseOptionalSession(
+            &self.audio_session,
+            &self.audio_resource_lease,
+        );
     }
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
+        self.lockEmbeddingAssets();
+        defer self.unlockEmbeddingAssets();
+        return self.embeddingPipelineLocked(allocator);
+    }
+
+    pub fn embeddingPipelineLocked(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.max_position_embeddings,
@@ -2011,10 +2203,23 @@ pub const LoadedModel = struct {
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;
             if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
-        } else if (self.vision_session) |vs| {
-            if (session_factory.getClipConfig(vs)) |cfg| {
-                pipeline.config.image_size = cfg.image_size;
-                if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
+        }
+        self.bindEmbeddingPipelineAssetsLocked(&pipeline);
+        pipeline.resident_projection_stats = &self.resident_projection_stats;
+        pipeline.execution_lock = self.embeddingExecutionLock();
+        return pipeline;
+    }
+
+    /// Refresh borrowed optional-session handles after a phased admission.
+    /// Callers hold embedding_session_lock while rebinding and retain an
+    /// embedding asset lease for the pipeline's full use.
+    pub fn bindEmbeddingPipelineAssetsLocked(self: *LoadedModel, pipeline: *EmbeddingPipeline) void {
+        if (session_factory.getClipConfig(self.session) == null) {
+            if (self.vision_session) |vs| {
+                if (session_factory.getClipConfig(vs)) |cfg| {
+                    pipeline.config.image_size = cfg.image_size;
+                    if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
+                }
             }
         }
         pipeline.vision_session = self.vision_session;
@@ -2022,8 +2227,11 @@ pub const LoadedModel = struct {
         pipeline.text_projection = self.text_projection;
         pipeline.visual_projection = self.visual_projection;
         pipeline.audio_projection = self.audio_projection;
-        pipeline.resident_projection_stats = &self.resident_projection_stats;
-        return pipeline;
+    }
+
+    pub fn embeddingExecutionLock(self: *LoadedModel) ?*std.atomic.Mutex {
+        if (!embeddingBackendNeedsRunLock(self.session.backend())) return null;
+        return &self.embedding_run_lock;
     }
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
@@ -2190,6 +2398,236 @@ pub const LoadedModel = struct {
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
         (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+}
+
+fn embeddingBackendNeedsRunLock(backend: backends.BackendType) bool {
+    return backend.usesGpuHostedSession();
+}
+
+test "embedding asset gate admits concurrent readers and excludes writers" {
+    var gate = EmbeddingAssetGate{};
+
+    gate.lockShared();
+    try std.testing.expect(gate.tryLockShared());
+    gate.unlockShared();
+    try std.testing.expect(!gate.tryLockExclusive());
+    gate.unlockShared();
+
+    try std.testing.expect(gate.tryLockExclusive());
+    try std.testing.expect(!gate.tryLockShared());
+    gate.unlockExclusive();
+
+    try std.testing.expect(gate.tryLockShared());
+    gate.unlockShared();
+
+    gate.lockShared();
+    var lease = EmbeddingAssetLease{ .gate = &gate, .access = .shared };
+    lease.release();
+    lease.release();
+    try std.testing.expect(gate.tryLockExclusive());
+    gate.unlockExclusive();
+}
+
+test "embedding asset lease downgrades exclusive access without an ownership gap" {
+    var gate = EmbeddingAssetGate{};
+    gate.lockExclusive();
+    var lease = EmbeddingAssetLease{ .gate = &gate, .access = .exclusive };
+
+    lease.downgradeExclusiveToShared();
+    try std.testing.expect(lease.held);
+    try std.testing.expect(lease.access == .shared);
+    try std.testing.expect(gate.tryLockShared());
+    gate.unlockShared();
+    try std.testing.expect(!gate.tryLockExclusive());
+
+    lease.release();
+    try std.testing.expect(gate.tryLockExclusive());
+    gate.unlockExclusive();
+}
+
+test "embedding asset gate blocks late readers behind a queued writer" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding)
+        return error.SkipZigTest;
+
+    const Writer = struct {
+        gate: *EmbeddingAssetGate,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.gate.lockExclusive();
+            self.acquired.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            self.gate.unlockExclusive();
+        }
+    };
+
+    var gate = EmbeddingAssetGate{};
+    gate.lockShared();
+    var shared_held = true;
+    defer if (shared_held) gate.unlockShared();
+
+    var writer = Writer{ .gate = &gate };
+    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        if (shared_held) {
+            gate.unlockShared();
+            shared_held = false;
+        }
+        writer.release.store(true, .release);
+        writer_thread.join();
+    };
+
+    var writer_queued = false;
+    for (0..200_000) |_| {
+        if (!gate.tryLockShared()) {
+            writer_queued = true;
+            break;
+        }
+        gate.unlockShared();
+        std.Thread.yield() catch {};
+    }
+    if (!writer_queued) return error.TestTimeout;
+
+    // Once the writer owns the reader gate, a newly arriving reader cannot
+    // join the active reader cohort and bypass it.
+    try std.testing.expect(!gate.tryLockShared());
+    gate.unlockShared();
+    shared_held = false;
+
+    var writer_acquired = false;
+    for (0..200_000) |_| {
+        if (writer.acquired.load(.acquire)) {
+            writer_acquired = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!writer_acquired) return error.TestTimeout;
+    try std.testing.expect(!gate.tryLockShared());
+
+    writer.release.store(true, .release);
+    writer_thread.join();
+    writer_joined = true;
+
+    try std.testing.expect(gate.tryLockShared());
+    gate.unlockShared();
+}
+
+test "embedding asset rollback closes only newly acquired primary sessions" {
+    const CloseProbe = struct {
+        close_count: usize = 0,
+
+        fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
+            return allocator.alloc(backends.Tensor, 0);
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.close_count += 1;
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable = backends.Session.VTable{
+            .run = run,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+
+    var text_probe = CloseProbe{};
+    var existing_vision_probe = CloseProbe{};
+    var visual_probe = CloseProbe{};
+    var model: LoadedModel = undefined;
+    model.text_projection = text_probe.session();
+    model.vision_session = existing_vision_probe.session();
+    model.visual_projection = visual_probe.session();
+    model.text_projection_resource_lease = null;
+    model.vision_resource_lease = null;
+    model.visual_projection_resource_lease = null;
+
+    model.rollbackPrimaryEmbeddingAssetsLocked(.{
+        .text_projection = true,
+        .vision = false,
+        .visual_projection = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), text_probe.close_count);
+    try std.testing.expectEqual(@as(usize, 0), existing_vision_probe.close_count);
+    try std.testing.expectEqual(@as(usize, 1), visual_probe.close_count);
+    try std.testing.expect(model.text_projection == null);
+    try std.testing.expect(model.vision_session != null);
+    try std.testing.expect(model.visual_projection == null);
+}
+
+test "audio asset rollback closes every ephemeral session" {
+    const CloseProbe = struct {
+        close_count: usize = 0,
+
+        fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
+            return allocator.alloc(backends.Tensor, 0);
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.close_count += 1;
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable = backends.Session.VTable{
+            .run = run,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+
+    var audio_probe = CloseProbe{};
+    var projection_probe = CloseProbe{};
+    var model: LoadedModel = undefined;
+    model.audio_session = audio_probe.session();
+    model.audio_projection = projection_probe.session();
+    model.audio_resource_lease = null;
+    model.audio_projection_resource_lease = null;
+
+    model.releaseAudioEmbeddingAssetsLocked();
+
+    try std.testing.expectEqual(@as(usize, 1), audio_probe.close_count);
+    try std.testing.expectEqual(@as(usize, 1), projection_probe.close_count);
+    try std.testing.expect(model.audio_session == null);
+    try std.testing.expect(model.audio_projection == null);
+}
+
+test "embedding run gate is limited to stateful GPU backends" {
+    try std.testing.expect(embeddingBackendNeedsRunLock(.metal));
+    try std.testing.expect(embeddingBackendNeedsRunLock(.cuda));
+    try std.testing.expect(!embeddingBackendNeedsRunLock(.native));
+    try std.testing.expect(!embeddingBackendNeedsRunLock(.onnx));
+    try std.testing.expect(!embeddingBackendNeedsRunLock(.wasm));
 }
 
 fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) bool {
