@@ -2443,13 +2443,13 @@ pub const Node = struct {
                 // Variant resolution within task-type dir
                 const task_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, tt });
                 defer self.allocator.free(task_dir);
-                if (registry_mod.resolveVariant(self.allocator, io, task_dir, name_without_variant)) |variant_path| {
+                if (try registry_mod.resolveVariant(self.allocator, io, task_dir, name_without_variant)) |variant_path| {
                     return variant_path;
                 }
             }
 
             // Variant resolution: look for "name-{suffix}" with shortest suffix wins
-            if (registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, name_without_variant)) |variant_path| {
+            if (try registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, name_without_variant)) |variant_path| {
                 return variant_path;
             }
 
@@ -2464,7 +2464,7 @@ pub const Node = struct {
                 }
 
                 // Variant resolution on model-only name
-                if (registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, model_only)) |variant_path| {
+                if (try registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, model_only)) |variant_path| {
                     return variant_path;
                 }
             }

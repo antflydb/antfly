@@ -24,7 +24,10 @@ const registry_mod = @import("../registry/registry.zig");
 const c_file = @import("../util/c_file.zig");
 
 const reader_selection_cache_ttl_ns: i96 = 30 * std.time.ns_per_s;
+const reader_failure_cooldown_ns: i96 = 30 * std.time.ns_per_s;
 const max_reader_selection_cache_entries: usize = 256;
+const max_failed_reader_candidates: usize = 16;
+const reader_selection_lock_stripes: usize = 64;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -35,23 +38,46 @@ pub const Context = struct {
     reader_resolver: ?*ReaderResolver = null,
 };
 
-/// Node-scoped positive cache for fallback OCR readers. Reader preference can
+/// Node-scoped cache for fallback OCR readers. Reader preference can
 /// depend on the recognizer name, so selections are keyed by recognizer rather
 /// than sharing one process-wide default. Model discovery and compatibility
-/// inspection are filesystem work, so concurrent extraction requests share a
-/// selection instead of reparsing every installed model. The short TTL makes
-/// newly installed preferred readers visible without a restart; structurally
-/// invalid artifacts are evicted immediately while transient load pressure
-/// retains the selection for a cheap retry. Canonical model-reference keys and
-/// a fixed entry cap bound memory under aliases and dynamic model churn.
+/// inspection are filesystem work, so same-key concurrent requests share a
+/// selection instead of reparsing every installed model. Striped selection
+/// locks allow unrelated recognizers to discover readers concurrently while a
+/// short state lock protects the bounded cache. The short TTL makes newly
+/// installed preferred readers visible without a restart. Structurally invalid
+/// candidates enter a bounded cooldown so the same request can immediately try
+/// the next compatible reader without permanently suppressing repaired models.
 pub const ReaderResolver = struct {
-    const CacheEntry = struct {
+    const FailedCandidate = struct {
         path: []u8,
-        cached_at: std.Io.Timestamp,
+        failed_at: std.Io.Timestamp,
+    };
+
+    const CacheEntry = struct {
+        path: ?[]u8 = null,
+        cached_at: std.Io.Timestamp = .zero,
+        last_accessed_at: std.Io.Timestamp,
+        failed_candidates: std.ArrayListUnmanaged(FailedCandidate) = .empty,
+    };
+
+    const Snapshot = struct {
+        allocator: std.mem.Allocator,
+        cached_path: ?[]u8 = null,
+        failed_paths: [][]u8 = &.{},
+
+        fn deinit(self: *Snapshot) void {
+            if (self.cached_path) |path| self.allocator.free(path);
+            for (self.failed_paths) |path| self.allocator.free(path);
+            if (self.failed_paths.len > 0) self.allocator.free(self.failed_paths);
+            self.* = undefined;
+        }
     };
 
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
+    selection_mutexes: [reader_selection_lock_stripes]std.Io.Mutex =
+        [_]std.Io.Mutex{.init} ** reader_selection_lock_stripes,
     entries: std.StringHashMapUnmanaged(CacheEntry) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ReaderResolver {
@@ -62,7 +88,7 @@ pub const ReaderResolver = struct {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.path);
+            self.deinitEntry(entry.value_ptr);
         }
         self.entries.deinit(self.allocator);
         self.* = undefined;
@@ -71,8 +97,20 @@ pub const ReaderResolver = struct {
     fn removeLocked(self: *ReaderResolver, extractor_model_name: []const u8) void {
         if (self.entries.fetchRemove(extractor_model_name)) |removed| {
             self.allocator.free(removed.key);
-            self.allocator.free(removed.value.path);
+            var value = removed.value;
+            self.deinitEntry(&value);
         }
+    }
+
+    fn deinitEntry(self: *ReaderResolver, entry: *CacheEntry) void {
+        if (entry.path) |path| self.allocator.free(path);
+        for (entry.failed_candidates.items) |failure| self.allocator.free(failure.path);
+        entry.failed_candidates.deinit(self.allocator);
+    }
+
+    fn selectionMutex(self: *ReaderResolver, extractor_model_name: []const u8) *std.Io.Mutex {
+        const hash = std.hash.Wyhash.hash(0x6f63725f72656164, extractor_model_name);
+        return &self.selection_mutexes[@intCast(hash % reader_selection_lock_stripes)];
     }
 
     fn evictOldestLocked(self: *ReaderResolver) void {
@@ -82,9 +120,9 @@ pub const ReaderResolver = struct {
         var oldest_at_ns: i96 = std.math.maxInt(i96);
         var it = self.entries.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.cached_at.nanoseconds < oldest_at_ns) {
+            if (entry.value_ptr.last_accessed_at.nanoseconds < oldest_at_ns) {
                 oldest_key = entry.key_ptr.*;
-                oldest_at_ns = entry.value_ptr.cached_at.nanoseconds;
+                oldest_at_ns = entry.value_ptr.last_accessed_at.nanoseconds;
             }
         }
         self.removeLocked(oldest_key orelse return);
@@ -96,45 +134,128 @@ pub const ReaderResolver = struct {
         path: []const u8,
         cached_at: std.Io.Timestamp,
     ) !void {
-        // Callers normally remove an expired entry first. Keeping replacement
-        // safe here prevents ownership leaks if this helper gains another
-        // caller later.
-        self.removeLocked(extractor_model_name);
-        self.evictOldestLocked();
-
-        const cache_key = try self.allocator.dupe(u8, extractor_model_name);
-        errdefer self.allocator.free(cache_key);
         const cache_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(cache_path);
+
+        if (self.entries.getPtr(extractor_model_name)) |entry| {
+            if (entry.path) |old_path| self.allocator.free(old_path);
+            entry.path = cache_path;
+            entry.cached_at = cached_at;
+            entry.last_accessed_at = cached_at;
+            return;
+        }
+
+        self.evictOldestLocked();
+        const cache_key = try self.allocator.dupe(u8, extractor_model_name);
+        errdefer self.allocator.free(cache_key);
         try self.entries.put(self.allocator, cache_key, .{
             .path = cache_path,
             .cached_at = cached_at,
+            .last_accessed_at = cached_at,
         });
     }
 
-    fn invalidate(
-        self: *ReaderResolver,
-        io: std.Io,
-        extractor_model_name: []const u8,
-        failed_path: []const u8,
-    ) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const cached = self.entries.get(extractor_model_name) orelse return;
-        if (!std.mem.eql(u8, cached.path, failed_path)) return;
-        self.removeLocked(extractor_model_name);
+    fn expireFailuresLocked(self: *ReaderResolver, entry: *CacheEntry, now: std.Io.Timestamp) void {
+        var i: usize = 0;
+        while (i < entry.failed_candidates.items.len) {
+            const failure = entry.failed_candidates.items[i];
+            const age = std.Io.Timestamp.durationTo(failure.failed_at, now).nanoseconds;
+            if (age >= 0 and age < reader_failure_cooldown_ns) {
+                i += 1;
+                continue;
+            }
+            self.allocator.free(failure.path);
+            _ = entry.failed_candidates.swapRemove(i);
+        }
     }
 
-    fn handleLoadFailure(
+    fn snapshotLocked(
+        self: *ReaderResolver,
+        extractor_model_name: []const u8,
+        now: std.Io.Timestamp,
+    ) !Snapshot {
+        var snapshot = Snapshot{ .allocator = self.allocator };
+        errdefer snapshot.deinit();
+        const entry = self.entries.getPtr(extractor_model_name) orelse return snapshot;
+        entry.last_accessed_at = now;
+        self.expireFailuresLocked(entry, now);
+
+        if (entry.path) |path| {
+            const age = std.Io.Timestamp.durationTo(entry.cached_at, now).nanoseconds;
+            if (age >= 0 and age < reader_selection_cache_ttl_ns) {
+                snapshot.cached_path = try self.allocator.dupe(u8, path);
+                return snapshot;
+            }
+            self.allocator.free(path);
+            entry.path = null;
+        }
+
+        if (entry.failed_candidates.items.len == 0) return snapshot;
+        snapshot.failed_paths = try self.allocator.alloc([]u8, entry.failed_candidates.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (snapshot.failed_paths[0..initialized]) |path| self.allocator.free(path);
+            self.allocator.free(snapshot.failed_paths);
+            snapshot.failed_paths = &.{};
+        }
+        for (entry.failed_candidates.items, 0..) |failure, i| {
+            snapshot.failed_paths[i] = try self.allocator.dupe(u8, failure.path);
+            initialized += 1;
+        }
+        return snapshot;
+    }
+
+    fn markCandidateFailure(
         self: *ReaderResolver,
         io: std.Io,
         extractor_model_name: []const u8,
         failed_path: []const u8,
-        err: anyerror,
-    ) void {
-        if (shouldInvalidateReaderSelection(err)) {
-            self.invalidate(io, canonicalModelName(extractor_model_name), failed_path);
+    ) !void {
+        const canonical_name = canonicalModelName(extractor_model_name);
+        const selection_mutex = self.selectionMutex(canonical_name);
+        selection_mutex.lockUncancelable(io);
+        defer selection_mutex.unlock(io);
+
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const now = std.Io.Timestamp.now(io, .awake);
+        var entry = self.entries.getPtr(canonical_name);
+        if (entry == null) {
+            self.evictOldestLocked();
+            const cache_key = try self.allocator.dupe(u8, canonical_name);
+            errdefer self.allocator.free(cache_key);
+            try self.entries.put(self.allocator, cache_key, .{ .last_accessed_at = now });
+            entry = self.entries.getPtr(canonical_name).?;
         }
+        entry.?.last_accessed_at = now;
+        self.expireFailuresLocked(entry.?, now);
+        if (entry.?.path) |path| {
+            if (std.mem.eql(u8, path, failed_path)) {
+                self.allocator.free(path);
+                entry.?.path = null;
+            }
+        }
+
+        for (entry.?.failed_candidates.items) |*failure| {
+            if (std.mem.eql(u8, failure.path, failed_path)) {
+                failure.failed_at = now;
+                return;
+            }
+        }
+
+        if (entry.?.failed_candidates.items.len >= max_failed_reader_candidates) {
+            var oldest_index: usize = 0;
+            for (entry.?.failed_candidates.items[1..], 1..) |failure, i| {
+                if (failure.failed_at.nanoseconds < entry.?.failed_candidates.items[oldest_index].failed_at.nanoseconds) {
+                    oldest_index = i;
+                }
+            }
+            const removed = entry.?.failed_candidates.swapRemove(oldest_index);
+            self.allocator.free(removed.path);
+        }
+        const owned_path = try self.allocator.dupe(u8, failed_path);
+        errdefer self.allocator.free(owned_path);
+        try entry.?.failed_candidates.append(self.allocator, .{ .path = owned_path, .failed_at = now });
     }
 };
 
@@ -316,18 +437,38 @@ fn readTextsForExtraction(
     image_datas: []const []const u8,
     read_options: readers_mod.ReadOptions,
 ) ![][]const u8 {
-    const model_path = try resolveReaderModelPathForExtraction(ctx, extractor_model_name);
-    defer ctx.allocator.free(model_path);
+    const fallback_enabled = platform.env.getenv("TERMITE_EXTRACT_DEFAULT_READER_MODEL") == null and ctx.reader_resolver != null;
+    var last_candidate_error: ?anyerror = null;
+    var attempts: usize = 0;
+    while (attempts <= max_failed_reader_candidates) : (attempts += 1) {
+        const model_path = resolveReaderModelPathForExtraction(ctx, extractor_model_name) catch |err| {
+            if (err == error.NoReaderModelAvailable) return last_candidate_error orelse err;
+            return err;
+        };
+        defer ctx.allocator.free(model_path);
 
+        return readTextsWithReader(ctx, model_path, image_datas, read_options) catch |err| {
+            if (!fallback_enabled or !shouldInvalidateReaderSelection(err)) return err;
+            try ctx.reader_resolver.?.markCandidateFailure(ctx.io, extractor_model_name, model_path);
+            last_candidate_error = err;
+            continue;
+        };
+    }
+    return last_candidate_error orelse error.NoReaderModelAvailable;
+}
+
+fn readTextsWithReader(
+    ctx: Context,
+    model_path: []const u8,
+    image_datas: []const []const u8,
+    read_options: readers_mod.ReadOptions,
+) ![][]const u8 {
     var reader = readers_mod.LoadedReader.loadFromDir(
         ctx.allocator,
         model_path,
         ctx.session_manager,
         ctx.model_manager,
-    ) catch |err| {
-        if (ctx.reader_resolver) |resolver| resolver.handleLoadFailure(ctx.io, extractor_model_name, model_path, err);
-        return err;
-    };
+    ) catch |err| return err;
     defer reader.deinit();
 
     const texts = try ctx.allocator.alloc([]const u8, image_datas.len);
@@ -352,31 +493,36 @@ fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []con
         return resolveSupportedNamedReaderPath(ctx, override);
     }
 
-    if (resolveSupportedNamedReaderPath(ctx, extractor_model_name)) |path| {
-        return path;
-    } else |_| {}
-
     const canonical_extractor_name = canonicalModelName(extractor_model_name);
 
     if (ctx.reader_resolver) |resolver| {
-        resolver.mutex.lockUncancelable(ctx.io);
-        defer resolver.mutex.unlock(ctx.io);
+        const selection_mutex = resolver.selectionMutex(canonical_extractor_name);
+        selection_mutex.lockUncancelable(ctx.io);
+        defer selection_mutex.unlock(ctx.io);
+
         const now = std.Io.Timestamp.now(ctx.io, .awake);
-        if (resolver.entries.get(canonical_extractor_name)) |entry| {
-            const age = std.Io.Timestamp.durationTo(entry.cached_at, now).nanoseconds;
-            if (age >= 0 and age < reader_selection_cache_ttl_ns) {
-                return ctx.allocator.dupe(u8, entry.path);
-            }
-            resolver.removeLocked(canonical_extractor_name);
+        var snapshot = blk: {
+            resolver.mutex.lockUncancelable(ctx.io);
+            defer resolver.mutex.unlock(ctx.io);
+            break :blk try resolver.snapshotLocked(canonical_extractor_name, now);
+        };
+        defer snapshot.deinit();
+        if (snapshot.cached_path) |path| {
+            snapshot.cached_path = null;
+            return path;
         }
 
-        const path = try discoverReaderModelPathForExtraction(ctx, canonical_extractor_name);
+        const path = try discoverReaderModelPathForExtraction(ctx, canonical_extractor_name, snapshot.failed_paths);
         errdefer ctx.allocator.free(path);
-        try resolver.cacheLocked(canonical_extractor_name, path, now);
+        {
+            resolver.mutex.lockUncancelable(ctx.io);
+            defer resolver.mutex.unlock(ctx.io);
+            try resolver.cacheLocked(canonical_extractor_name, path, now);
+        }
         return path;
     }
 
-    return discoverReaderModelPathForExtraction(ctx, canonical_extractor_name);
+    return discoverReaderModelPathForExtraction(ctx, canonical_extractor_name, &.{});
 }
 
 fn shouldInvalidateReaderSelection(err: anyerror) bool {
@@ -390,14 +536,28 @@ fn shouldInvalidateReaderSelection(err: anyerror) bool {
         error.InvalidMetadata,
         error.ModelAssetOutsideRoot,
         error.NoModelFileFound,
+        error.MissingWeight,
+        error.MissingRequiredWeights,
+        error.ShapeMismatch,
+        error.UnsupportedShape,
+        error.UnsupportedTensorType,
+        error.NoBackendAvailable,
+        error.IncompatibleModel,
+        error.UnknownModelCompatibility,
+        error.OnnxNotEnabled,
+        error.NativePix2StructNotYetSupported,
         => true,
         else => false,
     };
 }
 
-fn discoverReaderModelPathForExtraction(ctx: Context, extractor_model_name: []const u8) ![]const u8 {
+fn discoverReaderModelPathForExtraction(
+    ctx: Context,
+    extractor_model_name: []const u8,
+    excluded_paths: []const []const u8,
+) ![]const u8 {
     var registry = registry_mod.ModelRegistry.init(ctx.allocator, ctx.models_dir);
-    const discovered = registry.discoverShallow(ctx.io) catch return error.NoReaderModelAvailable;
+    const discovered = try registry.discoverShallow(ctx.io);
     defer {
         for (discovered) |entry| {
             ctx.allocator.free(entry.name);
@@ -410,7 +570,16 @@ fn discoverReaderModelPathForExtraction(ctx: Context, extractor_model_name: []co
     var best_path: ?[]const u8 = null;
     var best_rank: u8 = std.math.maxInt(u8);
     for (discovered) |entry| {
-        var manifest = manifest_mod.loadListingFromDir(ctx.allocator, entry.path) catch continue;
+        var excluded = false;
+        for (excluded_paths) |path| {
+            if (std.mem.eql(u8, path, entry.path)) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
+
+        var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, entry.path);
         defer manifest.deinit();
         if (manifest.model_type != .reader and entry.kind != .reader) continue;
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) continue;
@@ -448,11 +617,11 @@ fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []
 
     const task_dir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.models_dir, task_type });
     defer ctx.allocator.free(task_dir);
-    if (registry_mod.resolveVariant(ctx.allocator, ctx.io, task_dir, name_without_variant)) |variant_path| {
+    if (try registry_mod.resolveVariant(ctx.allocator, ctx.io, task_dir, name_without_variant)) |variant_path| {
         return variant_path;
     }
 
-    if (registry_mod.resolveVariant(ctx.allocator, ctx.io, ctx.models_dir, name_without_variant)) |variant_path| {
+    if (try registry_mod.resolveVariant(ctx.allocator, ctx.io, ctx.models_dir, name_without_variant)) |variant_path| {
         return variant_path;
     }
 
@@ -464,7 +633,7 @@ fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []
         }
         ctx.allocator.free(flat_path);
 
-        if (registry_mod.resolveVariant(ctx.allocator, ctx.io, ctx.models_dir, model_only)) |variant_path| {
+        if (try registry_mod.resolveVariant(ctx.allocator, ctx.io, ctx.models_dir, model_only)) |variant_path| {
             return variant_path;
         }
     }
@@ -484,7 +653,7 @@ fn resolveNamedReaderPath(ctx: Context, requested_name: []const u8) ![]const u8 
 fn resolveSupportedNamedReaderPath(ctx: Context, requested_name: []const u8) ![]const u8 {
     const path = try resolveNamedReaderPath(ctx, requested_name);
     errdefer ctx.allocator.free(path);
-    var manifest = manifest_mod.loadListingFromDir(ctx.allocator, path) catch return error.ModelNotFound;
+    var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, path);
     defer manifest.deinit();
     if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) return error.ModelNotFound;
     if (!readers_mod.isSupportedManifest(ctx.allocator, path, manifest)) return error.ModelNotFound;
@@ -669,17 +838,19 @@ test "image extraction caches a supported fallback reader selection" {
     const first = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
     defer allocator.free(first);
     const cached = resolver.entries.get("fastino/gliner2-base-v1").?;
-    try std.testing.expectEqualStrings(first, cached.path);
+    try std.testing.expectEqualStrings(first, cached.path.?);
 
     const second = try resolveReaderModelPathForExtraction(ctx, "hf:fastino/gliner2-base-v1:native");
     defer allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expectEqual(@as(usize, 1), resolver.entries.count());
 
-    resolver.handleLoadFailure(std.testing.io, "hf:fastino/gliner2-base-v1:native", first, error.ResourceTemporarilyUnavailable);
     try std.testing.expect(resolver.entries.contains("fastino/gliner2-base-v1"));
-    resolver.handleLoadFailure(std.testing.io, "fastino/gliner2-base-v1:other", first, error.InvalidModelForReading);
-    try std.testing.expect(!resolver.entries.contains("fastino/gliner2-base-v1"));
+    try resolver.markCandidateFailure(std.testing.io, "fastino/gliner2-base-v1:other", first);
+    const failed_entry = resolver.entries.get("fastino/gliner2-base-v1").?;
+    try std.testing.expectEqual(@as(?[]u8, null), failed_entry.path);
+    try std.testing.expectEqual(@as(usize, 1), failed_entry.failed_candidates.items.len);
+    try std.testing.expectEqualStrings(first, failed_entry.failed_candidates.items[0].path);
 }
 
 test "image extraction fallback cache is isolated by recognizer" {
@@ -714,8 +885,8 @@ test "image extraction fallback cache is isolated by recognizer" {
     try std.testing.expect(std.mem.endsWith(u8, first, "readers/acme/extractor-a"));
     try std.testing.expect(std.mem.endsWith(u8, second, "readers/acme/extractor-b"));
     try std.testing.expectEqual(@as(usize, 2), resolver.entries.count());
-    try std.testing.expectEqualStrings(first, resolver.entries.get("acme/extractor-a").?.path);
-    try std.testing.expectEqualStrings(second, resolver.entries.get("acme/extractor-b").?.path);
+    try std.testing.expectEqualStrings(first, resolver.entries.get("acme/extractor-a").?.path.?);
+    try std.testing.expectEqualStrings(second, resolver.entries.get("acme/extractor-b").?.path.?);
 }
 
 test "expired fallback cache discovers a newly preferred reader" {
@@ -748,7 +919,45 @@ test "expired fallback cache discovers a newly preferred reader" {
     const second = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
     defer allocator.free(second);
     try std.testing.expect(std.mem.endsWith(u8, second, "readers/Xenova/trocr-base-printed"));
-    try std.testing.expectEqualStrings(second, resolver.entries.get("fastino/gliner2-base-v1").?.path);
+    try std.testing.expectEqualStrings(second, resolver.entries.get("fastino/gliner2-base-v1").?.path.?);
+}
+
+test "structurally broken preferred reader falls back within its cooldown" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFlorenceReader(tmp.dir, "readers/Xenova/trocr-base-printed");
+    try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    var resolver = ReaderResolver.init(allocator);
+    defer resolver.deinit();
+    const ctx = Context{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+        .reader_resolver = &resolver,
+    };
+
+    const preferred = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
+    defer allocator.free(preferred);
+    try std.testing.expect(std.mem.endsWith(u8, preferred, "readers/Xenova/trocr-base-printed"));
+
+    try resolver.markCandidateFailure(std.testing.io, "hf:fastino/gliner2-base-v1:native", preferred);
+    const fallback = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
+    defer allocator.free(fallback);
+    try std.testing.expect(std.mem.endsWith(u8, fallback, "readers/antflydb/florence-2-base"));
+
+    const entry = resolver.entries.getPtr("fastino/gliner2-base-v1").?;
+    entry.cached_at = std.Io.Timestamp.zero;
+    entry.failed_candidates.items[0].failed_at = std.Io.Timestamp.zero;
+    const repaired = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
+    defer allocator.free(repaired);
+    try std.testing.expect(std.mem.endsWith(u8, repaired, "readers/Xenova/trocr-base-printed"));
 }
 
 test "reader selection invalidation distinguishes structural and transient load failures" {
@@ -756,11 +965,15 @@ test "reader selection invalidation distinguishes structural and transient load 
     try std.testing.expect(shouldInvalidateReaderSelection(error.InvalidModelForReading));
     try std.testing.expect(shouldInvalidateReaderSelection(error.IncompleteFlorence2Bundle));
     try std.testing.expect(shouldInvalidateReaderSelection(error.InvalidMetadata));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.MissingWeight));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.MissingRequiredWeights));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.NoBackendAvailable));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.UnsupportedTensorType));
 
     try std.testing.expect(!shouldInvalidateReaderSelection(error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!shouldInvalidateReaderSelection(error.OutOfMemory));
     try std.testing.expect(!shouldInvalidateReaderSelection(error.ModelArtifactsChanging));
-    try std.testing.expect(!shouldInvalidateReaderSelection(error.NoBackendAvailable));
+    try std.testing.expect(!shouldInvalidateReaderSelection(error.ResourceLimitExceeded));
 }
 
 test "reader selection cache evicts the oldest entry at its fixed capacity" {
@@ -781,6 +994,85 @@ test "reader selection cache evicts the oldest entry at its fixed capacity" {
     var newest_key_buf: [64]u8 = undefined;
     const newest_key = try std.fmt.bufPrint(&newest_key_buf, "acme/recognizer-{d}", .{max_reader_selection_cache_entries});
     try std.testing.expect(resolver.entries.contains(newest_key));
+}
+
+test "reader selection bounds structural failure history per recognizer" {
+    const allocator = std.testing.allocator;
+    var resolver = ReaderResolver.init(allocator);
+    defer resolver.deinit();
+
+    for (0..max_failed_reader_candidates + 4) |i| {
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/models/readers/broken-{d}", .{i});
+        try resolver.markCandidateFailure(std.testing.io, "hf:acme/recognizer:native", path);
+    }
+
+    const entry = resolver.entries.get("acme/recognizer").?;
+    try std.testing.expectEqual(max_failed_reader_candidates, entry.failed_candidates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), resolver.entries.count());
+}
+
+test "reader selection state cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var resolver = ReaderResolver.init(allocator);
+            defer resolver.deinit();
+
+            const now = std.Io.Timestamp.now(std.testing.io, .awake);
+            try resolver.cacheLocked("acme/recognizer", "/models/readers/preferred", now);
+            try resolver.markCandidateFailure(
+                std.testing.io,
+                "hf:acme/recognizer:native",
+                "/models/readers/preferred",
+            );
+            try resolver.markCandidateFailure(
+                std.testing.io,
+                "acme/recognizer",
+                "/models/readers/fallback",
+            );
+            var snapshot = try resolver.snapshotLocked("acme/recognizer", now);
+            defer snapshot.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "reader selection uses stable striped locks for independent recognizers" {
+    var resolver = ReaderResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+
+    const first = resolver.selectionMutex("acme/recognizer-a");
+    try std.testing.expect(first == resolver.selectionMutex("acme/recognizer-a"));
+
+    var found_independent_stripe = false;
+    for (0..reader_selection_lock_stripes * 2) |i| {
+        var key_buf: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "acme/recognizer-{d}", .{i});
+        if (resolver.selectionMutex(key) != first) {
+            found_independent_stripe = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_independent_stripe);
+}
+
+test "reader discovery preserves allocation failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, resolveReaderModelPathForExtraction(.{
+        .allocator = failing.allocator(),
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+    }, "acme/recognizer"));
 }
 
 test "canonical model names coalesce prefixes and variants" {

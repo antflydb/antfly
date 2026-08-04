@@ -14,3 +14,8 @@
 
 pub const types = @import("types.zig");
 pub const extractor = @import("extractor.zig");
+
+test {
+    _ = types;
+    _ = extractor;
+}

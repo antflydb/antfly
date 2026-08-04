@@ -110,6 +110,13 @@ pub const ModelRegistry = struct {
 
     fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
         var entries = std.ArrayListUnmanaged(ModelEntry).empty;
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.name);
+                self.allocator.free(entry.path);
+            }
+            entries.deinit(self.allocator);
+        }
         var seen = std.StringHashMapUnmanaged(void){};
         defer {
             var it = seen.keyIterator();
@@ -130,7 +137,10 @@ pub const ModelRegistry = struct {
         seen: *std.StringHashMapUnmanaged(void),
         kind_mode: DiscoverKindMode,
     ) !void {
-        var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch return;
+        var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
         defer dir.close(io);
 
         var iter = dir.iterate();
@@ -146,7 +156,10 @@ pub const ModelRegistry = struct {
                 continue;
             }
 
-            var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch continue;
+            var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => continue,
+                else => return err,
+            };
             defer owner_dir.close(io);
 
             var owner_iter = owner_dir.iterate();
@@ -186,7 +199,10 @@ pub const ModelRegistry = struct {
             const path = try std.fs.path.join(self.allocator, &.{ self.models_dir, subdir.dir });
             defer self.allocator.free(path);
 
-            var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch continue;
+            var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => continue,
+                else => return err,
+            };
             defer dir.close(io);
 
             var iter = dir.iterate();
@@ -197,8 +213,9 @@ pub const ModelRegistry = struct {
                     if (isModelDir(io, entry_path)) {
                         try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, subdir.kind);
                     } else {
-                        var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch {
-                            continue;
+                        var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch |err| switch (err) {
+                            error.FileNotFound, error.NotDir => continue,
+                            else => return err,
                         };
                         defer owner_dir.close(io);
 
@@ -272,8 +289,10 @@ pub const ModelRegistry = struct {
         if (seen.contains(model_path)) return;
 
         const seen_path = try self.allocator.dupe(u8, model_path);
-        errdefer self.allocator.free(seen_path);
-        try seen.put(self.allocator, seen_path, {});
+        seen.put(self.allocator, seen_path, {}) catch |err| {
+            self.allocator.free(seen_path);
+            return err;
+        };
 
         const kind = switch (kind_mode) {
             .manifest => blk: {
@@ -284,10 +303,14 @@ pub const ModelRegistry = struct {
             .path => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
+        const owned_name = try self.allocator.dupe(u8, display_name);
+        errdefer self.allocator.free(owned_name);
+        const owned_path = try self.allocator.dupe(u8, model_path);
+        errdefer self.allocator.free(owned_path);
         try entries.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, display_name),
+            .name = owned_name,
             .kind = kind,
-            .path = try self.allocator.dupe(u8, model_path),
+            .path = owned_path,
             .variant = "f32",
         });
     }
@@ -980,6 +1003,36 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
     try std.testing.expectEqualStrings("monkt/paddleocr-onnx", models[0].name);
 }
 
+test "shallow discovery cleans up every allocation failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "owner/model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "owner/model-a/config.json", .data = "{}" });
+    try tmp.dir.createDirPath(io, "owner/model-b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "owner/model-b/config.json", .data = "{}" });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, root: []const u8) !void {
+            var registry = ModelRegistry.init(alloc, root);
+            const models = try registry.discoverShallow(std.testing.io);
+            defer {
+                for (models) |model| {
+                    alloc.free(model.name);
+                    alloc.free(model.path);
+                }
+                if (models.len > 0) alloc.free(models);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
+}
+
 test "model discovery rejects incomplete or invalid managed downloads" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1190,36 +1243,54 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
 /// Resolve a model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for entries prefixed with
 /// "requested-" and returns the shortest match. Matches Go inference's resolveVariant.
-/// Uses Io-based dir iteration (Zig 0.16).
-pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) ?[]const u8 {
-    const prefix = std.fmt.allocPrint(allocator, "{s}-", .{requested}) catch return null;
+/// Returns null only for a missing directory or missing match; allocation and
+/// directory iteration failures remain actionable to callers.
+pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) !?[]const u8 {
+    const prefix = try std.fmt.allocPrint(allocator, "{s}-", .{requested});
     defer allocator.free(prefix);
 
-    var dir = Dir.cwd().openDir(io, models_dir, .{ .iterate = true }) catch return null;
+    var dir = Dir.cwd().openDir(io, models_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
     defer dir.close(io);
 
     var best_name: ?[]const u8 = null;
+    defer if (best_name) |name| allocator.free(name);
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, prefix)) {
             if (best_name == null or entry.name.len < best_name.?.len) {
+                const new_best = try allocator.dupe(u8, entry.name);
                 if (best_name) |old| allocator.free(old);
-                best_name = allocator.dupe(u8, entry.name) catch continue;
+                best_name = new_best;
             }
         }
     }
 
     if (best_name) |bn| {
-        const result = std.fs.path.join(allocator, &.{ models_dir, bn }) catch {
-            allocator.free(bn);
-            return null;
-        };
-        allocator.free(bn);
-        return result;
+        return try std.fs.path.join(allocator, &.{ models_dir, bn });
     }
     return null;
+}
+
+test "resolveVariant preserves allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        resolveVariant(failing.allocator(), std.testing.io, "/models", "acme/model"),
+    );
+}
+
+test "resolveVariant treats a missing model directory as no match" {
+    try std.testing.expect(try resolveVariant(
+        std.testing.allocator,
+        std.testing.io,
+        "/definitely-not-an-antfly-model-directory",
+        "acme/model",
+    ) == null);
 }
 
 test "parse hf: prefix" {
