@@ -38,6 +38,121 @@ const data_mod = @import("../data/mod.zig");
 const data_shard_state_store = @import("../data/storage/shard_state_store.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 
+const simulation_transition_table_contract: metadata_mod.TransitionTableContract = .{
+    .table_id = 1,
+    .table_name = "docs",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 1, .range_id = 1 },
+    .target_identity = .{ .shard_id = 1, .range_id = 1 },
+};
+
+fn applySimulationMetadataCommands(
+    store: *metadata_mod.RaftApplyStore,
+    metadata_group_id: u64,
+    start_index: u64,
+    commands: []const metadata_mod.TransitionCommand,
+) !u64 {
+    if (commands.len == 0) return start_index;
+
+    const alloc = std.testing.allocator;
+    const encoded_commands = try alloc.alloc([]u8, commands.len);
+    defer alloc.free(encoded_commands);
+    var encoded_count: usize = 0;
+    defer for (encoded_commands[0..encoded_count]) |encoded| alloc.free(encoded);
+
+    const entries = try alloc.alloc(raft_engine.core.Entry, commands.len);
+    defer alloc.free(entries);
+    for (commands, 0..) |command, i| {
+        encoded_commands[i] = try metadata_mod.encodeTransitionCommand(alloc, command);
+        encoded_count += 1;
+        entries[i] = .{
+            .term = 1,
+            .index = start_index + i,
+            .entry_type = .normal,
+            .data = encoded_commands[i],
+        };
+    }
+
+    const entries_bytes = try raft_state_machine.encodeCommittedEntries(alloc, entries);
+    defer alloc.free(entries_bytes);
+    var outcome = try store.applyCommittedBatch(
+        metadata_group_id,
+        start_index + commands.len - 1,
+        entries_bytes,
+    );
+    defer outcome.deinit();
+    if (outcome.failure) |failure| return failure;
+    return start_index + commands.len;
+}
+
+fn seedSimulationSplitTransition(
+    store: *metadata_mod.RaftApplyStore,
+    metadata_group_id: u64,
+    start_index: u64,
+    record: metadata_mod.SplitTransitionRecord,
+) !u64 {
+    if (record.attempt_epoch == 0 or record.split_key == null)
+        return error.InvalidSplitAdmission;
+    const source_end = record.source_range_end orelse "doc:z";
+    return try applySimulationMetadataCommands(store, metadata_group_id, start_index, &.{
+        .{ .upsert_table = .{
+            .table_id = record.table_contract.table_id,
+            .name = record.table_contract.table_name,
+            .schema_json = record.table_contract.schema_json,
+            .indexes_json = record.table_contract.indexes_json,
+        } },
+        .{ .upsert_range = .{
+            .group_id = record.source_group_id,
+            .range_id = record.table_contract.source_identity.range_id,
+            .table_id = record.table_contract.table_id,
+            .start_key = "doc:a",
+            .end_key = source_end,
+            .doc_identity_shard_id = record.table_contract.source_identity.shard_id,
+            .doc_identity_range_id = record.table_contract.source_identity.range_id,
+            .split_attempt_epoch = record.attempt_epoch - 1,
+        } },
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = record.attempt_epoch - 1,
+            .record = record,
+        } },
+    });
+}
+
+fn seedSimulationMergeTransition(
+    store: *metadata_mod.RaftApplyStore,
+    metadata_group_id: u64,
+    start_index: u64,
+    record: metadata_mod.MergeTransitionRecord,
+) !u64 {
+    return try applySimulationMetadataCommands(store, metadata_group_id, start_index, &.{
+        .{ .upsert_table = .{
+            .table_id = record.table_contract.table_id,
+            .name = record.table_contract.table_name,
+            .schema_json = record.table_contract.schema_json,
+            .indexes_json = record.table_contract.indexes_json,
+        } },
+        .{ .upsert_range = .{
+            .group_id = record.receiver_group_id,
+            .range_id = record.table_contract.target_identity.range_id,
+            .table_id = record.table_contract.table_id,
+            .start_key = "doc:a",
+            .end_key = "doc:m",
+            .doc_identity_shard_id = record.table_contract.target_identity.shard_id,
+            .doc_identity_range_id = record.table_contract.target_identity.range_id,
+        } },
+        .{ .upsert_range = .{
+            .group_id = record.donor_group_id,
+            .range_id = record.table_contract.source_identity.range_id,
+            .table_id = record.table_contract.table_id,
+            .start_key = "doc:m",
+            .end_key = "doc:z",
+            .doc_identity_shard_id = record.table_contract.source_identity.shard_id,
+            .doc_identity_range_id = record.table_contract.source_identity.range_id,
+        } },
+        .{ .upsert_merge_transition = record },
+    });
+}
+
 fn simulationHoldsTransitionAuthority(_: ?*anyopaque, _: u64) bool {
     return true;
 }
@@ -4310,6 +4425,7 @@ test "cluster simulation drives split transition actions deterministically" {
 
     const runtime = transition_runtime_mod.TransitionRuntime{ .split = split.iface() };
     var record = metadata_mod.SplitTransitionRecord{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9001,
         .attempt_epoch = 1,
         .source_group_id = 101,
@@ -4446,6 +4562,7 @@ test "http host simulation drives queued split transitions through the service l
 
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9101,
             .attempt_epoch = 1,
             .source_group_id = 101,
@@ -4620,6 +4737,7 @@ test "http host simulation rolls back and retries queued split transitions throu
 
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9151,
             .attempt_epoch = 1,
             .source_group_id = 151,
@@ -4637,6 +4755,7 @@ test "http host simulation rolls back and retries queued split transitions throu
     split.reset();
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9151,
             .attempt_epoch = 2,
             .source_group_id = 151,
@@ -4761,6 +4880,7 @@ test "http host simulation removes queued split transition mid-flight" {
 
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9152,
             .attempt_epoch = 1,
             .source_group_id = 161,
@@ -4884,6 +5004,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
 
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9153,
             .attempt_epoch = 1,
             .source_group_id = 171,
@@ -4895,6 +5016,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
 
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9153,
             .attempt_epoch = 1,
             .source_group_id = 171,
@@ -4969,6 +5091,7 @@ test "http host simulation drives queued split transitions through the service l
 
     try sim.apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9102,
             .attempt_epoch = 1,
             .source_group_id = 101,
@@ -5139,6 +5262,7 @@ test "cluster simulation drives merge transition actions deterministically" {
 
     const runtime = transition_runtime_mod.TransitionRuntime{ .merge = merge.iface() };
     var record = metadata_mod.MergeTransitionRecord{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9002,
         .donor_group_id = 201,
         .receiver_group_id = 202,
@@ -5289,6 +5413,7 @@ test "cluster simulation drives queued split transitions through service-owned m
 
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9201,
             .attempt_epoch = 1,
             .source_group_id = 401,
@@ -5386,6 +5511,7 @@ test "cluster simulation drives queued split transitions through service-owned m
 
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9201,
             .attempt_epoch = 1,
             .source_group_id = 401,
@@ -5458,24 +5584,15 @@ test "cluster simulation resumes queued split transitions after node restart wit
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9401,
-                .attempt_epoch = 1,
-                .source_group_id = 1701,
-                .destination_group_id = 1702,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9401,
+            .attempt_epoch = 1,
+            .source_group_id = 1701,
+            .destination_group_id = 1702,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
     }
 
@@ -5561,7 +5678,13 @@ test "cluster simulation resumes queued split transitions after node restart wit
         try cluster.stepAll();
     }
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
-    const resumed = (try cluster.node(0).describeSplitTransition(9401)) orelse return error.TestExpectedEqual;
+    var resumed_observation: ?metadata_mod.SplitExecutionState = null;
+    rounds = 0;
+    while (rounds < 16 and resumed_observation == null) : (rounds += 1) {
+        try cluster.stepAll();
+        resumed_observation = try cluster.node(0).describeSplitTransition(9401);
+    }
+    const resumed = resumed_observation orelse return error.TestExpectedEqual;
     try std.testing.expect(resumed.tag == .bootstrapping_destination or resumed.tag == .ready_to_finalize);
 
     rounds = 0;
@@ -5646,24 +5769,15 @@ test "cluster simulation ignores active split removal and rolls back explicitly 
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9501,
-                .attempt_epoch = 1,
-                .source_group_id = 1901,
-                .destination_group_id = 1902,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9501,
+            .attempt_epoch = 1,
+            .source_group_id = 1901,
+            .destination_group_id = 1902,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
     }
 
@@ -5734,28 +5848,31 @@ test "cluster simulation ignores active split removal and rolls back explicitly 
     const before_remove = (try cluster.node(0).describeSplitTransition(9501)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.SplitExecutionStateTag.bootstrapping_destination, before_remove.tag);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
         .{ .remove_split_transition = .{ .transition_id = 9501 } },
     });
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_split_transitions);
 
     const rollback_record = metadata_mod.SplitTransitionRecord{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9501,
         .attempt_epoch = 1,
         .source_group_id = 1901,
         .destination_group_id = 1902,
         .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort",
     };
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_split_transition = rollback_record },
     });
     var progress = SplitProgress{ .node_index = 0, .transition_id = rollback_record.transition_id };
     try cluster.assertProgress("split-rollback-before-cutover", 64, &progress, SplitProgress.rolledBack);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_split_transitions);
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 4, rollback_record);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 6, rollback_record);
 
     try cluster.restartNode(0);
 
@@ -5779,15 +5896,19 @@ test "cluster simulation ignores active split removal and rolls back explicitly 
         .dest_group_id = 1902,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
-        .{ .upsert_split_transition = .{
-            .transition_id = 9502,
-            .attempt_epoch = 2,
-            .source_group_id = 1901,
-            .destination_group_id = 1902,
-            .phase = .prepare,
-            .split_key = "doc:m",
-            .source_range_end = "doc:z",
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 7, &.{
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .table_contract = simulation_transition_table_contract,
+                .transition_id = 9502,
+                .attempt_epoch = 2,
+                .source_group_id = 1901,
+                .destination_group_id = 1902,
+                .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+            },
         } },
     });
 
@@ -5858,24 +5979,15 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9511,
-                .attempt_epoch = 1,
-                .source_group_id = 1911,
-                .destination_group_id = 1912,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9511,
+            .attempt_epoch = 1,
+            .source_group_id = 1911,
+            .destination_group_id = 1912,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
     }
 
@@ -5946,13 +6058,16 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     const before_rollback = (try cluster.node(0).describeSplitTransition(9511)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.SplitExecutionStateTag.bootstrapping_destination, before_rollback.tag);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9511,
             .attempt_epoch = 1,
             .source_group_id = 1911,
             .destination_group_id = 1912,
             .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort",
         } },
     });
@@ -5970,12 +6085,15 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_split_transitions);
     try expectSplitTransitionInactive(&cluster, 0, 9511);
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 3, .{
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 5, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9511,
         .attempt_epoch = 1,
         .source_group_id = 1911,
         .destination_group_id = 1912,
         .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort",
     });
 
@@ -6016,15 +6134,19 @@ test "cluster simulation rolls back queued split transition mid-flight across no
         .dest_group_id = 1912,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
-        .{ .upsert_split_transition = .{
-            .transition_id = 9511,
-            .attempt_epoch = 2,
-            .source_group_id = 1911,
-            .destination_group_id = 1912,
-            .phase = .prepare,
-            .split_key = "doc:m",
-            .source_range_end = "doc:z",
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .table_contract = simulation_transition_table_contract,
+                .transition_id = 9511,
+                .attempt_epoch = 2,
+                .source_group_id = 1911,
+                .destination_group_id = 1912,
+                .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+            },
         } },
     });
 
@@ -6082,24 +6204,15 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9521,
-                .attempt_epoch = 1,
-                .source_group_id = 1921,
-                .destination_group_id = 1922,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9521,
+            .attempt_epoch = 1,
+            .source_group_id = 1921,
+            .destination_group_id = 1922,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
     }
 
@@ -6170,26 +6283,32 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     const before_rollback = (try cluster.node(0).describeSplitTransition(9521)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.SplitExecutionStateTag.bootstrapping_destination, before_rollback.tag);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9521,
             .attempt_epoch = 1,
             .source_group_id = 1921,
             .destination_group_id = 1922,
             .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort 1",
         } },
     });
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9521,
             .attempt_epoch = 1,
             .source_group_id = 1921,
             .destination_group_id = 1922,
             .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort 2",
         } },
     });
@@ -6197,12 +6316,15 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_split_transitions);
     try expectSplitTransitionInactive(&cluster, 0, 9521);
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 4, .{
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 6, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9521,
         .attempt_epoch = 1,
         .source_group_id = 1921,
         .destination_group_id = 1922,
         .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort 2",
     });
 
@@ -6218,15 +6340,19 @@ test "cluster simulation survives repeated same-id split overwrites across resta
         .dest_group_id = 1922,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
-        .{ .upsert_split_transition = .{
-            .transition_id = 9521,
-            .attempt_epoch = 2,
-            .source_group_id = 1921,
-            .destination_group_id = 1922,
-            .phase = .prepare,
-            .split_key = "doc:m",
-            .source_range_end = "doc:z",
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 7, &.{
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .table_contract = simulation_transition_table_contract,
+                .transition_id = 9521,
+                .attempt_epoch = 2,
+                .source_group_id = 1921,
+                .destination_group_id = 1922,
+                .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+            },
         } },
     });
 
@@ -6396,6 +6522,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
 
     try cluster.node(0).apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9202,
             .donor_group_id = 501,
             .receiver_group_id = 502,
@@ -6498,6 +6625,7 @@ test "http host simulation drives queued merge transitions through the service l
 
     try sim.apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9302,
             .donor_group_id = 201,
             .receiver_group_id = 202,
@@ -6668,6 +6796,7 @@ test "http host simulation rolls back and retries queued merge transitions throu
 
     try sim.apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9251,
             .donor_group_id = 251,
             .receiver_group_id = 252,
@@ -6684,7 +6813,8 @@ test "http host simulation rolls back and retries queued merge transitions throu
     merge.reset();
     try sim.apply(.{
         .upsert_merge_transition = .{
-            .transition_id = 9251,
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9252,
             .donor_group_id = 251,
             .receiver_group_id = 252,
         },
@@ -6789,6 +6919,7 @@ test "http host simulation removes queued merge transition mid-flight" {
 
     try sim.apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9252,
             .donor_group_id = 261,
             .receiver_group_id = 262,
@@ -6896,6 +7027,7 @@ test "http host simulation updates merge transition to rollback mid-flight" {
 
     try sim.apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9253,
             .donor_group_id = 271,
             .receiver_group_id = 272,
@@ -6906,6 +7038,7 @@ test "http host simulation updates merge transition to rollback mid-flight" {
 
     try sim.apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9253,
             .donor_group_id = 271,
             .receiver_group_id = 272,
@@ -7004,6 +7137,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
 
     try cluster.node(0).apply(.{
         .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9303,
             .donor_group_id = 501,
             .receiver_group_id = 502,
@@ -7084,23 +7218,12 @@ test "cluster simulation resumes queued merge transitions after node restart wit
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9402,
-                .donor_group_id = 1801,
-                .receiver_group_id = 1802,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9402,
+            .donor_group_id = 1801,
+            .receiver_group_id = 1802,
+            .phase = .prepare,
         });
     }
 
@@ -7184,7 +7307,13 @@ test "cluster simulation resumes queued merge transitions after node restart wit
         try cluster.stepAll();
     }
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_merge_transitions);
-    const resumed = (try cluster.node(0).describeMergeTransition(9402)) orelse return error.TestExpectedEqual;
+    var resumed_observation: ?metadata_mod.MergeExecutionState = null;
+    rounds = 0;
+    while (rounds < 16 and resumed_observation == null) : (rounds += 1) {
+        try cluster.stepAll();
+        resumed_observation = try cluster.node(0).describeMergeTransition(9402);
+    }
+    const resumed = resumed_observation orelse return error.TestExpectedEqual;
     try std.testing.expect(resumed.tag == .bootstrapping_receiver or resumed.tag == .ready_to_finalize);
 
     rounds = 0;
@@ -7257,23 +7386,12 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9601,
-                .donor_group_id = 1951,
-                .receiver_group_id = 1952,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9601,
+            .donor_group_id = 1951,
+            .receiver_group_id = 1952,
+            .phase = .prepare,
         });
     }
 
@@ -7342,8 +7460,9 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     const before_rollback = (try cluster.node(0).describeMergeTransition(9601)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.MergeExecutionStateTag.bootstrapping_receiver, before_rollback.tag);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9601,
             .donor_group_id = 1951,
             .receiver_group_id = 1952,
@@ -7365,7 +7484,8 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9601);
-    try cluster.node(0).retireRolledBackMergeTransition(1300, 3, .{
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 6, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9601,
         .donor_group_id = 1951,
         .receiver_group_id = 1952,
@@ -7390,9 +7510,10 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
         .receiver_group_id = 1952,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 7, &.{
         .{ .upsert_merge_transition = .{
-            .transition_id = 9601,
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9602,
             .donor_group_id = 1951,
             .receiver_group_id = 1952,
             .phase = .prepare,
@@ -7402,12 +7523,12 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     rounds = 0;
     while (rounds < 16) : (rounds += 1) {
         try cluster.stepAll();
-        if (try cluster.node(0).describeMergeTransition(9601)) |state| {
+        if (try cluster.node(0).describeMergeTransition(9602)) |state| {
             try std.testing.expect(state.tag == .awaiting_receiver_acceptance or state.tag == .bootstrapping_receiver or state.tag == .ready_to_finalize);
             if (state.tag != .awaiting_receiver_acceptance) break;
         }
     }
-    const retried_merge = (try cluster.node(0).describeMergeTransition(9601)) orelse return error.TestExpectedEqual;
+    const retried_merge = (try cluster.node(0).describeMergeTransition(9602)) orelse return error.TestExpectedEqual;
     try std.testing.expect(retried_merge.tag == .bootstrapping_receiver or retried_merge.tag == .ready_to_finalize);
 }
 
@@ -7462,23 +7583,12 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9621,
-                .donor_group_id = 1971,
-                .receiver_group_id = 1972,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9621,
+            .donor_group_id = 1971,
+            .receiver_group_id = 1972,
+            .phase = .prepare,
         });
     }
 
@@ -7547,8 +7657,9 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     const before_rollback = (try cluster.node(0).describeMergeTransition(9621)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.MergeExecutionStateTag.bootstrapping_receiver, before_rollback.tag);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9621,
             .donor_group_id = 1971,
             .receiver_group_id = 1972,
@@ -7559,8 +7670,9 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     try cluster.stepAll();
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_merge_transitions);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9621,
             .donor_group_id = 1971,
             .receiver_group_id = 1972,
@@ -7572,7 +7684,8 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9621);
-    try cluster.node(0).retireRolledBackMergeTransition(1300, 4, .{
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 7, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9621,
         .donor_group_id = 1971,
         .receiver_group_id = 1972,
@@ -7590,8 +7703,9 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
         .receiver_group_id = 1972,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 8, &.{
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9621,
             .donor_group_id = 1971,
             .receiver_group_id = 1972,
@@ -7695,34 +7809,22 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
 
-        const split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9701,
-                .attempt_epoch = 1,
-                .source_group_id = 1981,
-                .destination_group_id = 1982,
-                .phase = .prepare,
-            },
+        const next_index = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9701,
+            .attempt_epoch = 1,
+            .source_group_id = 1981,
+            .destination_group_id = 1982,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
-        defer std.testing.allocator.free(split_cmd);
-        const merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9702,
-                .donor_group_id = 1983,
-                .receiver_group_id = 1984,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_cmd },
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, next_index, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9702,
+            .donor_group_id = 1983,
+            .receiver_group_id = 1984,
+            .phase = .prepare,
         });
     }
 
@@ -7808,17 +7910,21 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try std.testing.expect(split_before.tag == .bootstrapping_destination or split_before.tag == .ready_to_finalize);
     try std.testing.expect(merge_before.tag == .bootstrapping_receiver or merge_before.tag == .ready_to_finalize);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 8, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9701,
             .attempt_epoch = 1,
             .source_group_id = 1981,
             .destination_group_id = 1982,
             .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort concurrent",
         } },
         .{
             .upsert_merge_transition = .{
+                .table_contract = simulation_transition_table_contract,
                 .transition_id = 9702,
                 .donor_group_id = 1983,
                 .receiver_group_id = 1984,
@@ -7844,15 +7950,19 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9702);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 5, .{
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 10, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9701,
         .attempt_epoch = 1,
         .source_group_id = 1981,
         .destination_group_id = 1982,
         .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort concurrent",
     });
-    try cluster.node(0).retireRolledBackMergeTransition(1300, 7, .{
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 12, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9702,
         .donor_group_id = 1983,
         .receiver_group_id = 1984,
@@ -7876,8 +7986,9 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
         .receiver_group_id = 1984,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 9, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 14, &.{
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9702,
             .donor_group_id = 1983,
             .receiver_group_id = 1984,
@@ -8013,34 +8124,22 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
 
-        const split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9711,
-                .attempt_epoch = 1,
-                .source_group_id = 1991,
-                .destination_group_id = 1992,
-                .phase = .prepare,
-            },
+        const next_index = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9711,
+            .attempt_epoch = 1,
+            .source_group_id = 1991,
+            .destination_group_id = 1992,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
-        defer std.testing.allocator.free(split_cmd);
-        const merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9712,
-                .donor_group_id = 1993,
-                .receiver_group_id = 1994,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_cmd },
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 2,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, next_index, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9712,
+            .donor_group_id = 1993,
+            .receiver_group_id = 1994,
+            .phase = .prepare,
         });
     }
 
@@ -8126,18 +8225,22 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try std.testing.expect(split_before.tag == .bootstrapping_destination or split_before.tag == .ready_to_finalize);
     try std.testing.expect(merge_before.tag == .bootstrapping_receiver or merge_before.tag == .ready_to_finalize);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 8, &.{
         .{
             .upsert_split_transition = .{
+                .table_contract = simulation_transition_table_contract,
                 .transition_id = 9711,
                 .attempt_epoch = 1,
                 .source_group_id = 1991,
                 .destination_group_id = 1992,
                 .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
                 .rollback_reason = "operator abort concurrent reverse",
             },
         },
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9712,
             .donor_group_id = 1993,
             .receiver_group_id = 1994,
@@ -8162,15 +8265,19 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9712);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 5, .{
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 10, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9711,
         .attempt_epoch = 1,
         .source_group_id = 1991,
         .destination_group_id = 1992,
         .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort concurrent reverse",
     });
-    try cluster.node(0).retireRolledBackMergeTransition(1300, 7, .{
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 12, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9712,
         .donor_group_id = 1993,
         .receiver_group_id = 1994,
@@ -8196,15 +8303,19 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
         .dest_group_id = 1992,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 9, &.{
-        .{ .upsert_split_transition = .{
-            .transition_id = 9711,
-            .attempt_epoch = 2,
-            .source_group_id = 1991,
-            .destination_group_id = 1992,
-            .phase = .prepare,
-            .split_key = "doc:m",
-            .source_range_end = "doc:z",
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 14, &.{
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .table_contract = simulation_transition_table_contract,
+                .transition_id = 9711,
+                .attempt_epoch = 2,
+                .source_group_id = 1991,
+                .destination_group_id = 1992,
+                .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+            },
         } },
     });
 
@@ -8346,45 +8457,32 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const split_a_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9801,
-                .attempt_epoch = 1,
-                .source_group_id = 2001,
-                .destination_group_id = 2002,
-                .phase = .prepare,
-            },
+        var next_index = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9801,
+            .attempt_epoch = 1,
+            .source_group_id = 2001,
+            .destination_group_id = 2002,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
-        defer std.testing.allocator.free(split_a_cmd);
-        const split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9802,
-                .attempt_epoch = 1,
-                .source_group_id = 2003,
-                .destination_group_id = 2004,
-                .phase = .prepare,
-            },
+        next_index = try seedSimulationSplitTransition(&metadata_store, 1300, next_index, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9802,
+            .attempt_epoch = 1,
+            .source_group_id = 2003,
+            .destination_group_id = 2004,
+            .phase = .prepare,
+            .split_key = "doc:p",
+            .source_range_end = "doc:z",
         });
-        defer std.testing.allocator.free(split_b_cmd);
-        const merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9803,
-                .donor_group_id = 2005,
-                .receiver_group_id = 2006,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_a_cmd },
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = split_b_cmd },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, next_index, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9803,
+            .donor_group_id = 2005,
+            .receiver_group_id = 2006,
+            .phase = .prepare,
         });
     }
 
@@ -8478,22 +8576,28 @@ test "cluster simulation drives multiple concurrent real transition ids through 
         }
     }
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 11, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9801,
             .attempt_epoch = 1,
             .source_group_id = 2001,
             .destination_group_id = 2002,
             .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort multi",
         } },
         .{
             .upsert_split_transition = .{
+                .table_contract = simulation_transition_table_contract,
                 .transition_id = 9802,
                 .attempt_epoch = 1,
                 .source_group_id = 2003,
                 .destination_group_id = 2004,
                 .phase = .prepare,
+                .split_key = "doc:p",
+                .source_range_end = "doc:z",
                 .rollback_reason = "operator abort multi",
             },
         },
@@ -8508,20 +8612,26 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     }
     try expectSplitTransitionInactive(&cluster, 0, 9801);
     try expectSplitTransitionInactive(&cluster, 0, 9802);
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 6, .{
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 13, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9801,
         .attempt_epoch = 1,
         .source_group_id = 2001,
         .destination_group_id = 2002,
         .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort multi",
     });
-    try cluster.node(0).retireRolledBackSplitTransition(1300, 8, .{
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 15, .{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9802,
         .attempt_epoch = 1,
         .source_group_id = 2003,
         .destination_group_id = 2004,
         .phase = .prepare,
+        .split_key = "doc:p",
+        .source_range_end = "doc:z",
         .rollback_reason = "operator abort multi",
     });
 
@@ -8545,15 +8655,19 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     });
     try multiplex.addSplit(9802, 2, 2003, 2004, split_b.runtime());
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 10, &.{
-        .{ .upsert_split_transition = .{
-            .transition_id = 9802,
-            .attempt_epoch = 2,
-            .source_group_id = 2003,
-            .destination_group_id = 2004,
-            .phase = .prepare,
-            .split_key = "doc:p",
-            .source_range_end = "doc:z",
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 17, &.{
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .table_contract = simulation_transition_table_contract,
+                .transition_id = 9802,
+                .attempt_epoch = 2,
+                .source_group_id = 2003,
+                .destination_group_id = 2004,
+                .phase = .prepare,
+                .split_key = "doc:p",
+                .source_range_end = "doc:z",
+            },
         } },
     });
 
@@ -8694,45 +8808,32 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const split_a_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9811,
-                .attempt_epoch = 1,
-                .source_group_id = 2011,
-                .destination_group_id = 2012,
-                .phase = .prepare,
-            },
+        var next_index = try seedSimulationSplitTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9811,
+            .attempt_epoch = 1,
+            .source_group_id = 2011,
+            .destination_group_id = 2012,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         });
-        defer std.testing.allocator.free(split_a_cmd);
-        const split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 9812,
-                .attempt_epoch = 1,
-                .source_group_id = 2013,
-                .destination_group_id = 2014,
-                .phase = .prepare,
-            },
+        next_index = try seedSimulationSplitTransition(&metadata_store, 1300, next_index, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9812,
+            .attempt_epoch = 1,
+            .source_group_id = 2013,
+            .destination_group_id = 2014,
+            .phase = .prepare,
+            .split_key = "doc:p",
+            .source_range_end = "doc:z",
         });
-        defer std.testing.allocator.free(split_b_cmd);
-        const merge_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9813,
-                .donor_group_id = 2015,
-                .receiver_group_id = 2016,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(merge_cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_a_cmd },
-            .{ .term = 1, .index = 2, .entry_type = .normal, .data = split_b_cmd },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = merge_cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 3,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, next_index, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9813,
+            .donor_group_id = 2015,
+            .receiver_group_id = 2016,
+            .phase = .prepare,
         });
     }
 
@@ -8826,25 +8927,31 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
         }
     }
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 11, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9812,
             .attempt_epoch = 1,
             .source_group_id = 2013,
             .destination_group_id = 2014,
             .phase = .prepare,
+            .split_key = "doc:p",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort overlap 1",
         } },
     });
     try cluster.stepAll();
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 12, &.{
         .{ .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9812,
             .attempt_epoch = 1,
             .source_group_id = 2013,
             .destination_group_id = 2014,
             .phase = .prepare,
+            .split_key = "doc:p",
+            .source_range_end = "doc:z",
             .rollback_reason = "operator abort overlap 2",
         } },
     });
@@ -8874,15 +8981,19 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     });
     try multiplex.addSplit(9812, 2, 2013, 2014, split_b.runtime());
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
-        .{ .upsert_split_transition = .{
-            .transition_id = 9812,
-            .attempt_epoch = 2,
-            .source_group_id = 2013,
-            .destination_group_id = 2014,
-            .phase = .prepare,
-            .split_key = "doc:p",
-            .source_range_end = "doc:z",
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 13, &.{
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .table_contract = simulation_transition_table_contract,
+                .transition_id = 9812,
+                .attempt_epoch = 2,
+                .source_group_id = 2013,
+                .destination_group_id = 2014,
+                .phase = .prepare,
+                .split_key = "doc:p",
+                .source_range_end = "doc:z",
+            },
         } },
     });
     rounds = 0;
@@ -8903,6 +9014,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
 
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9812,
             .attempt_epoch = 2,
             .source_group_id = 2013,
@@ -9005,23 +9117,12 @@ test "cluster simulation ignores active merge removal and rolls back explicitly 
     {
         var metadata_store = try metadata_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = replica_root_a });
         defer metadata_store.deinit();
-        const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
-                .transition_id = 9611,
-                .donor_group_id = 1961,
-                .receiver_group_id = 1962,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-            .{ .term = 1, .index = 1, .entry_type = .normal, .data = cmd },
-        });
-        defer std.testing.allocator.free(entries);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = 1300,
-            .commit_index = 1,
-            .entries_bytes = entries,
+        _ = try seedSimulationMergeTransition(&metadata_store, 1300, 1, .{
+            .table_contract = simulation_transition_table_contract,
+            .transition_id = 9611,
+            .donor_group_id = 1961,
+            .receiver_group_id = 1962,
+            .phase = .prepare,
         });
     }
 
@@ -9090,7 +9191,7 @@ test "cluster simulation ignores active merge removal and rolls back explicitly 
     const before_remove = (try cluster.node(0).describeMergeTransition(9611)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(metadata_mod.MergeExecutionStateTag.bootstrapping_receiver, before_remove.tag);
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .remove_merge_transition = .{ .transition_id = 9611 } },
     });
     try cluster.stepAll();
@@ -9098,13 +9199,14 @@ test "cluster simulation ignores active merge removal and rolls back explicitly 
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_merge_transitions);
 
     const rollback_record = metadata_mod.MergeTransitionRecord{
+        .table_contract = simulation_transition_table_contract,
         .transition_id = 9611,
         .donor_group_id = 1961,
         .receiver_group_id = 1962,
         .phase = .prepare,
         .rollback_reason = "operator abort",
     };
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_merge_transition = rollback_record },
     });
     rounds = 0;
@@ -9113,7 +9215,7 @@ test "cluster simulation ignores active merge removal and rolls back explicitly 
     }
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_merge_transitions);
-    try cluster.node(0).retireRolledBackMergeTransition(1300, 4, rollback_record);
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 7, rollback_record);
 
     try cluster.restartNode(0);
 
@@ -9129,8 +9231,9 @@ test "cluster simulation ignores active merge removal and rolls back explicitly 
     try std.testing.expectEqualStrings("doc:m", range.end);
     try std.testing.expectEqual(@as(?[]u8, null), try receiver.get(std.testing.allocator, "doc:t"));
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 9, &.{
         .{ .upsert_merge_transition = .{
+            .table_contract = simulation_transition_table_contract,
             .transition_id = 9612,
             .donor_group_id = 1961,
             .receiver_group_id = 1962,

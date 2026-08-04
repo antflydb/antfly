@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_mod = @import("mod.zig");
+const metadata_authority = @import("authority.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
 const metadata_storage = @import("storage/mod.zig");
@@ -50,6 +51,7 @@ pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
     control_loop: metadata_mod.MetadataControlLoop,
+    transition_ops_registration: ?raft_shard_ops.OwnedShardOperationAdapter.Registration = null,
     owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null,
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
@@ -75,6 +77,8 @@ pub const MetadataServer = struct {
         errdefer if (owned_hosted_shard_ops) |ops| alloc.destroy(ops);
         var owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null;
         errdefer if (owned_hosted_shard_db) |adapter| alloc.destroy(adapter);
+        var transition_ops_registration: ?raft_shard_ops.OwnedShardOperationAdapter.Registration = null;
+        errdefer if (transition_ops_registration) |*registration| registration.deinit();
 
         if (deps.http.raft.transition_ops == null) {
             const local_ops = metadataLocalShardOperationAdapter(svc);
@@ -87,11 +91,11 @@ pub const MetadataServer = struct {
                 svc.raft.host.http_host.request_executor,
                 .{
                     .ptr = svc,
-                    .is_ready = metadataGroupTransitionReady,
+                    .readiness = metadataGroupTransitionReadiness,
                 },
                 local_ops,
             );
-            try svc.raft.replaceTransitionOps(hosted_ops.adapter());
+            transition_ops_registration = try svc.raft.replaceTransitionOps(hosted_ops.adapter());
             owned_hosted_shard_ops = hosted_ops;
         }
         {
@@ -210,6 +214,7 @@ pub const MetadataServer = struct {
             .alloc = alloc,
             .svc = svc,
             .control_loop = metadata_mod.MetadataControlLoop.initWithConfig(alloc, cfg.reconciler_config),
+            .transition_ops_registration = transition_ops_registration,
             .owned_hosted_shard_ops = owned_hosted_shard_ops,
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
@@ -221,13 +226,18 @@ pub const MetadataServer = struct {
         };
     }
 
-    fn metadataGroupTransitionReady(ptr: *anyopaque, group_id: u64) !bool {
+    fn metadataGroupTransitionReadiness(
+        ptr: *anyopaque,
+        group_id: u64,
+    ) !transition_state.StablePlacementReadiness {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return try svc.groupTransitionReady(group_id);
+        return try svc.groupTransitionReadiness(group_id);
     }
 
     pub fn deinit(self: *MetadataServer) void {
         self.stopRestoreSupervisor();
+        if (self.transition_ops_registration) |*registration| registration.deinit();
+        self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
             listener.deinit();
             self.alloc.destroy(listener);
@@ -274,7 +284,7 @@ pub const MetadataServer = struct {
             const runtime = try self.svc.ensureBackendRuntime();
             if (runtime.threaded_jobs != null and runtime.io() != null) {
                 self.restore_supervisor_stop.store(false, .release);
-                self.restore_supervisor_owner_id = runtime.allocOwnerId();
+                self.restore_supervisor_owner_id = try runtime.allocOwnerId();
                 errdefer self.restore_supervisor_owner_id = 0;
                 try runtime.durable_jobs.submit(.{
                     .owner_id = self.restore_supervisor_owner_id,
@@ -311,13 +321,14 @@ pub const MetadataServer = struct {
                     } else {
                         last_unexpected_error = null;
                     }
-                } else |err| switch (err) {
-                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => last_unexpected_error = null,
-                    else => {
+                } else |err| {
+                    if (metadata_authority.isRetryableError(err)) {
+                        last_unexpected_error = null;
+                    } else {
                         if (last_unexpected_error == null or last_unexpected_error.? != err)
                             std.log.err("metadata restore supervisor failed err={s}", .{@errorName(err)});
                         last_unexpected_error = err;
-                    },
+                    }
                 }
             }
             io.sleep(std.Io.Duration.fromMilliseconds(250), .awake) catch return;
@@ -442,11 +453,11 @@ const MetadataAdminMux = struct {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
         if (isPublicApiRequest(req.uri)) {
             if (isRestoreApiRequest(req.uri)) {
-                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| switch (err) {
-                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => {
+                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| {
+                    if (metadata_authority.isRetryableError(err)) {
                         return try public_api_http_server.metadataNotLeaderResponse(alloc);
-                    },
-                    else => return err,
+                    }
+                    return err;
                 };
                 // Mutations and collection reads stay leader-serialized. A
                 // follower can refresh one replicated job by key, but it has
@@ -454,9 +465,10 @@ const MetadataAdminMux = struct {
                 if (!local_leader and (req.method != .GET or isRestoreJobCollectionRequest(req.uri)))
                     return try public_api_http_server.metadataNotLeaderResponse(alloc);
             }
-            var response = self.public_api.handle(req) catch |err| switch (err) {
-                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => try public_api_http_server.metadataNotLeaderResponse(alloc),
-                else => return err,
+            var response = self.public_api.handle(req) catch |err| {
+                if (metadata_authority.isRetryableError(err))
+                    return try public_api_http_server.metadataNotLeaderResponse(alloc);
+                return err;
             };
             if (response.owner_allocator == null) response.owner_allocator = self.public_api.alloc;
             return response;
@@ -897,73 +909,73 @@ fn schemaIndexReady(
     return try shard_db.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
 }
 
-fn observeSplit(ptr: *anyopaque, record: transition_state.SplitTransitionRecord) !transition_state.SplitObservation {
+fn observeSplit(ptr: *anyopaque, _: u64, record: transition_state.SplitTransitionRecord) !transition_state.SplitObservation {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     return try runtime.shardOperationAdapter().observeSplit(record);
 }
 
-fn observeMerge(ptr: *anyopaque, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
+fn observeMerge(ptr: *anyopaque, _: u64, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     return try runtime.shardOperationAdapter().observeMerge(record);
 }
 
-fn prepareSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "prepare_split_source")) !void {
+fn prepareSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "prepare_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .prepare_split_source = op });
 }
 
-fn startSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "start_split_source")) !void {
+fn startSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "start_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .start_split_source = op });
 }
 
-fn bootstrapSplitDestination(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "bootstrap_split_destination")) !void {
+fn bootstrapSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "bootstrap_split_destination")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
 }
 
-fn catchUpSplitDestination(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "catch_up_split_destination")) !void {
+fn catchUpSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "catch_up_split_destination")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
 }
 
-fn finalizeSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "finalize_split_source")) !void {
+fn finalizeSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "finalize_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .finalize_split_source = op });
 }
 
-fn rollbackSplit(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "rollback_split")) !void {
+fn rollbackSplit(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "rollback_split")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .rollback_split = op });
 }
 
-fn acceptMergeReceiver(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "accept_merge_receiver")) !void {
+fn acceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "accept_merge_receiver")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
 }
 
-fn catchUpMergeReceiver(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver")) !void {
+fn catchUpMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
 }
 
-fn finalizeMerge(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "finalize_merge")) !void {
+fn finalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "finalize_merge")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
 }
 
-fn rollbackMerge(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "rollback_merge")) !void {
+fn rollbackMerge(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "rollback_merge")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });

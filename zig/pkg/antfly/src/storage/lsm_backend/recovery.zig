@@ -138,6 +138,40 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         );
     };
     recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
+    if (loaded_manifest) {
+        for (backend.runs.items) |run| {
+            const path = run.path orelse return error.RunStateUnavailable;
+            // Check the manifest bound first so old oversized manifests retain
+            // their precise FileTooBig diagnosis even when the referenced file
+            // has already been removed by an operator.
+            repository_mod.validateManifestRunSize(run.size_bytes) catch |err| {
+                // The caller receives the concrete open error. Keep the
+                // structured rejection diagnostic at warning level so an
+                // expected corruption/size-admission test does not violate the
+                // project's invariant that error logs represent unhandled
+                // failures rather than successfully rejected input.
+                std.log.warn(
+                    "lsm backend open rejected invalid manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+            const physical_size = backend.storage.?.fileSize(path) catch |err| {
+                std.log.warn(
+                    "lsm backend open rejected unavailable manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+            repository_mod.validateManifestRunPhysicalSize(run.size_bytes, physical_size) catch |err| {
+                std.log.warn(
+                    "lsm backend open rejected mismatched manifest run root={s} run_id={} path={s} manifest_bytes={} physical_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, physical_size, err },
+                );
+                return err;
+            };
+        }
+    }
     if (debug_open) {
         std.log.info(
             "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",
@@ -154,6 +188,13 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
         defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
         try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
+        // A durable file or manifest below a newly-created root cannot make
+        // the root's own parent entry survive a crash. Publish that structural
+        // boundary once, before any transaction can report full durability.
+        // Existing-manifest opens skip this path and pay no startup fsync.
+        if (backend.options.backend.durability == .full) {
+            try backend.storage.?.syncParentAbsolute(backend.root_dir.?);
+        }
         if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {
@@ -195,6 +236,15 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
     }
     cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
+    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
+        backend.noteRecoveredWriteMutationLocked();
+    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
+        backend.noteWriteMutationLocked();
+    }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }

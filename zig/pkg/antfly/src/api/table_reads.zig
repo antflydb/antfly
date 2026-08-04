@@ -117,6 +117,9 @@ fn aggregationFullResultBudget() u32 {
 }
 
 fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    if (req.cancellation) |value| {
+        if (value.load(.acquire)) return error.Cancelled;
+    }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
@@ -1763,6 +1766,38 @@ pub const TableReadSource = struct {
             table_name: []const u8,
             body: []const u8,
         ) anyerror!?query_api.QueryResponse = null,
+        join_partition_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_rows_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_unmatched_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_finalize_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
         join_job_state_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2066,6 +2101,66 @@ pub const TableReadSource = struct {
         return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
     }
 
+    pub fn joinPartitionGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_partition_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinPartitionGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinRowsGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_rows_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinRowsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinUnmatchedGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_unmatched_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinUnmatchedGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinFinalizeGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_finalize_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
+    }
+
     pub fn joinJobStateGroupLocal(
         self: TableReadSource,
         alloc: std.mem.Allocator,
@@ -2210,6 +2305,8 @@ const AlgebraicVectorWorkerCandidate = struct {
 fn algebraicVectorWorkerCandidateForSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ?AlgebraicVectorWorkerCandidate {
     if (req.aggregations_json.len != 0 or
         req.full_text != null or
+        req.filter_text != null or
+        req.exclusion_text != null or
         req.full_text_queries.len != 0 or
         req.dense_queries.len != 0 or
         req.sparse_queries.len != 0 or
@@ -2269,7 +2366,11 @@ fn annotateVectorWorkerPreflight(
 ) void {
     if (!searchRequestHasSingleVectorWorkerKnn(req)) return;
     summary.vector_worker_filter_constraint_count +|= vectorWorkerFilterConstraintCount(req);
-    if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) {
+    if (req.filter_text != null or
+        req.exclusion_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0)
+    {
         summary.vector_worker_requires_algebraic_filter_resolution = true;
     }
     if (algebraicVectorWorkerCandidateForSearchRequest(alloc, req) != null) {
@@ -2292,6 +2393,8 @@ fn searchRequestHasSingleVectorWorkerKnn(req: db_mod.types.SearchRequest) bool {
 
 fn vectorWorkerFilterConstraintCount(req: db_mod.types.SearchRequest) u32 {
     var count: u32 = 0;
+    if (req.filter_text != null) count += 1;
+    if (req.exclusion_text != null) count += 1;
     if (req.filter_query_json.len > 0) count += 1;
     if (req.exclusion_query_json.len > 0) count += 1;
     if (req.filter_ids.len > 0) count += 1;
@@ -2716,7 +2819,7 @@ pub const BoundTableReadSource = struct {
                     var result = try self.reads.searchWithConsistency(alloc, self.db, search_req, consistency);
                     defer result.deinit();
                     var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                     else
                         try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                     for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -2742,23 +2845,15 @@ pub const BoundTableReadSource = struct {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         if (req.topology_epoch != 0) return error.TopologyChanged;
-
-        var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-        errdefer {
-            for (hits.items) |*hit| hit.deinit(alloc);
-            hits.deinit(alloc);
-        }
-
-        for (req.keys) |key| {
-            var result = (try self.reads.lookupWithConsistency(alloc, self.db, key, .{}, consistency)) orelse continue;
-            defer result.deinit(alloc);
-            try hits.append(alloc, .{
-                .id = try alloc.dupe(u8, key),
-                .doc_ordinal = try self.db.lookupLiveDocOrdinalForInternalRead(alloc, key, req.identity_read_generation),
-                .stored_data = try alloc.dupe(u8, result.json),
-            });
-        }
-        return .{ .hits = try hits.toOwnedSlice(alloc) };
+        try validateGraphHydrateResolvedDocFilterForDb(req, self.db);
+        return try graphHydrateOnOpenDb(
+            alloc,
+            self.reads,
+            self.db,
+            req,
+            consistency,
+            false,
+        );
     }
 
     fn graphEdgesGroupLocal(
@@ -3067,7 +3162,7 @@ pub const ProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
 
-        if (group_ids.len > 1 and distributed_graph.supportsCrossRange(req)) {
+        if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
             var base_req = req;
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
@@ -3318,7 +3413,7 @@ pub const ProvisionedTableReadSource = struct {
                     var result = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, search_req, consistency);
                     defer result.deinit();
                     var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                     else
                         try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                     for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -3653,10 +3748,10 @@ pub const HostedProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
-                .join_partition_group_local = joinPartitionGroupLocal,
-                .join_rows_group_local = joinRowsGroupLocal,
-                .join_unmatched_group_local = joinUnmatchedGroupLocal,
-                .join_finalize_group_local = joinFinalizeGroupLocal,
+                .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
+                .join_rows_group_local_with_timeout = joinRowsGroupLocal,
+                .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocal,
+                .join_finalize_group_local_with_timeout = joinFinalizeGroupLocal,
                 .join_job_state_group_local = joinJobStateGroupLocal,
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
@@ -3922,7 +4017,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
 
-        if (group_ids.len > 1 and distributed_graph.supportsCrossRange(req)) {
+        if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
             var base_req = req;
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
@@ -4154,6 +4249,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4161,7 +4257,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinPartitionRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinPartitionRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4174,6 +4270,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4181,7 +4278,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinRowsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinRowsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4194,6 +4291,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4201,7 +4299,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinUnmatchedRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinUnmatchedRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4214,6 +4312,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4221,7 +4320,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinFinalizeRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinFinalizeRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4288,7 +4387,7 @@ pub const HostedProvisionedTableReadSource = struct {
                             var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
                             defer result.deinit();
                             var graph_result = if (result.graph_results.len > 0)
-                                try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                                try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                             else
                                 try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                             for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -5424,6 +5523,14 @@ fn graphHydrateRequestHasResolvedDocFilter(req: distributed_graph.GraphHydrateRe
     return req.resolved_doc_filter != null;
 }
 
+fn requiresDistributedGraphCoordinator(
+    group_count: usize,
+    req: db_mod.types.SearchRequest,
+) bool {
+    return distributed_graph.supportsCrossRange(req) and
+        (group_count > 1 or req.graph_table_read_authorizer != null);
+}
+
 fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
     if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
@@ -5432,24 +5539,54 @@ fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrat
     if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
 }
 
-fn graphHydrateResolvedDocFilterAllows(req: distributed_graph.GraphHydrateRequest, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    const ptr = req.resolved_doc_filter orelse return true;
-    const filter: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
-    return graphHydrateResolvedDocSetIncludes(&filter.include, key, ordinal) and
-        !graphHydrateResolvedDocSetIncludes(&filter.exclude, key, ordinal);
+fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
+    return .{
+        .query = .{ .match_all = {} },
+        .filter_query_json = req.filter_query_json,
+        .exclusion_query_json = req.exclusion_query_json,
+        .include_stored = req.include_stored,
+        .resolved_doc_filter = req.resolved_doc_filter,
+        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
+        .identity_read_generation = req.identity_read_generation,
+        .execution_deadline_ns = distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .cancellation = req.cancellation,
+    };
 }
 
-fn graphHydrateResolvedDocSetIncludes(set: *const doc_set.ResolvedDocSet, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    return switch (set.*) {
-        .all => true,
-        .none => false,
-        .doc_keys => |keys| blk: {
-            for (keys) |candidate| {
-                if (std.mem.eql(u8, candidate, key)) break :blk true;
-            }
-            break :blk false;
+fn graphHydrateOnOpenDb(
+    alloc: std.mem.Allocator,
+    reads: raft_mod.FeatureDBReads,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphHydrateRequest,
+    consistency: raft_mod.ReadConsistency,
+    fallback_to_stale_on_not_leader: bool,
+) !distributed_graph.GraphHydrateResponse {
+    const search_req = graphHydrateSearchRequest(req);
+    reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, consistency) catch |err| switch (err) {
+        error.NotLeader => {
+            if (!fallback_to_stale_on_not_leader or consistency == .stale) return err;
+            try reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, .stale);
         },
-        .ordinals, .ordinal_bitmap => if (ordinal) |value| set.containsOrdinal(value) else false,
+        else => return err,
+    };
+    const hits = if (req.include_hits)
+        try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
+    else
+        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+    errdefer {
+        for (hits) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
+    return .{
+        .hits = hits,
+        .has_incoming = if (req.incoming_index_name.len > 0)
+            try db.graphHasIncomingEdgesForInternalRead(
+                alloc,
+                req.incoming_index_name,
+                req.keys,
+            )
+        else
+            @constCast((&[_]bool{})[0..]),
     };
 }
 
@@ -5607,7 +5744,7 @@ fn executeProvisionedGraphExpand(
                 var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
                 defer result.deinit();
                 var graph_result = if (result.graph_results.len > 0)
-                    try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                    try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                 else
                     try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                 for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -5637,28 +5774,8 @@ fn executeProvisionedGraphHydrate(
     defer db.close();
     try validateGraphHydrateResolvedDocFilterForDb(req, &db);
 
-    var reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    errdefer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-
-    for (req.keys) |key| {
-        var result = (reads.lookupWithConsistency(alloc, &db, key, .{}, consistency) catch |err| switch (err) {
-            error.NotLeader => if (consistency == .stale) return err else try reads.lookupWithConsistency(alloc, &db, key, .{}, .stale),
-            else => return err,
-        }) orelse continue;
-        defer result.deinit(alloc);
-        const ordinal = try db.lookupLiveDocOrdinalForInternalRead(alloc, key, req.identity_read_generation);
-        if (!graphHydrateResolvedDocFilterAllows(req, key, ordinal)) continue;
-        try hits.append(alloc, .{
-            .id = try alloc.dupe(u8, key),
-            .doc_ordinal = ordinal,
-            .stored_data = try alloc.dupe(u8, result.json),
-        });
-    }
-    return .{ .hits = try hits.toOwnedSlice(alloc) };
+    const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+    return try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, true);
 }
 
 fn executeHostedGraphExpand(
@@ -5698,25 +5815,8 @@ fn executeHostedGraphHydrate(
             try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
             try validateGraphHydrateResolvedDocFilterForDb(req, &db);
 
-            var reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-            var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-            errdefer {
-                for (hits.items) |*hit| hit.deinit(alloc);
-                hits.deinit(alloc);
-            }
-
-            for (req.keys) |key| {
-                var result = (try reads.lookupWithConsistency(alloc, &db, key, .{}, consistency)) orelse continue;
-                defer result.deinit(alloc);
-                const ordinal = try db.lookupLiveDocOrdinalForInternalRead(alloc, key, req.identity_read_generation);
-                if (!graphHydrateResolvedDocFilterAllows(req, key, ordinal)) continue;
-                try hits.append(alloc, .{
-                    .id = try alloc.dupe(u8, key),
-                    .doc_ordinal = ordinal,
-                    .stored_data = try alloc.dupe(u8, result.json),
-                });
-            }
-            break :blk .{ .hits = try hits.toOwnedSlice(alloc) };
+            const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+            break :blk try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, false);
         },
         .remote => |remote| blk: {
             if (req.resolved_doc_filter != null) {
@@ -6278,6 +6378,7 @@ fn readPreparationKindForQuery(req: db_mod.types.SearchRequest) ReadPreparation.
 
 fn isDenseOnlyQuery(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null or req.full_text_queries.len > 0) return false;
+    if (req.filter_text != null or req.exclusion_text != null) return false;
     if (req.sparse != null or req.sparse_queries.len > 0) return false;
     if (req.graph_queries.len > 0) return false;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return false;
@@ -7074,6 +7175,8 @@ fn algebraicIndexFreshEnoughForName(
 
 fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
     return req.full_text == null and
+        req.filter_text == null and
+        req.exclusion_text == null and
         req.exclusion_query_json.len == 0 and
         req.full_text_queries.len == 0 and
         req.dense == null and
@@ -13513,9 +13616,16 @@ fn joinPartitionRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinPartition(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinPartitionWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        timeout_ms,
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13527,9 +13637,16 @@ fn joinRowsRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinRows(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinRowsWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        timeout_ms,
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13541,9 +13658,16 @@ fn joinUnmatchedRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinUnmatched(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinUnmatchedWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        timeout_ms,
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13555,9 +13679,16 @@ fn joinFinalizeRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinFinalize(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinFinalizeWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        timeout_ms,
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13587,7 +13718,18 @@ fn graphExpandRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphExpandRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupGraphExpand(base_uri, group_id, table_name, body);
+    var cancellation = if (req.cancellation) |signal|
+        http_common.RequestCancellation{ .borrowed = signal }
+    else
+        null;
+    var result = try client.fetchGroupGraphExpandWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        req.timeout_ms,
+        if (cancellation != null) &cancellation.? else null,
+    );
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphExpandResponse(alloc, result.body);
 }
@@ -13603,7 +13745,18 @@ fn graphHydrateRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphHydrateRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupGraphHydrate(base_uri, group_id, table_name, body);
+    var cancellation = if (req.cancellation) |signal|
+        http_common.RequestCancellation{ .borrowed = signal }
+    else
+        null;
+    var result = try client.fetchGroupGraphHydrateWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        req.timeout_ms,
+        if (cancellation != null) &cancellation.? else null,
+    );
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphHydrateResponse(alloc, result.body);
 }
@@ -13619,7 +13772,18 @@ fn graphEdgesRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupGraphEdges(base_uri, group_id, table_name, body);
+    var cancellation = if (req.cancellation) |signal|
+        http_common.RequestCancellation{ .borrowed = signal }
+    else
+        null;
+    var result = try client.fetchGroupGraphEdgesWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        req.timeout_ms,
+        if (cancellation != null) &cancellation.? else null,
+    );
     defer result.deinit(alloc);
     return try distributed_graph.parseGraphEdgesResponse(alloc, result.body);
 }
@@ -13715,11 +13879,20 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (native_doc_id_constraints.hasConstraints()) {
         try appendNativeDocIdConstraintsField(alloc, &out, &first, native_doc_id_constraints);
     }
+    if (req.doc_filter_bindings.len > 0) {
+        try appendDocFilterBindingsField(alloc, &out, &first, req.doc_filter_bindings);
+    }
     if (req.filter_query_json.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "_filter_query_json", req.filter_query_json);
     }
     if (req.exclusion_query_json.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "_exclusion_query_json", req.exclusion_query_json);
+    }
+    if (req.filter_text) |filter_text| {
+        try appendTextQueryField(alloc, &out, &first, "filter_query", filter_text);
+    }
+    if (req.exclusion_text) |exclusion_text| {
+        try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
     }
     if (req.graph_queries.len > 0) {
         try appendGraphQueriesField(alloc, &out, &first, req.graph_queries);
@@ -13741,6 +13914,50 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendDocFilterBindingsField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    bindings: []const db_mod.types.NamedDocFilterBinding,
+) !void {
+    if (bindings.len == 0) return;
+
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    const binding_count = std.math.cast(u32, bindings.len) orelse {
+        return error.InvalidQueryRequest;
+    };
+    try seen.ensureTotalCapacity(binding_count);
+
+    try appendJsonFieldName(alloc, out, first, "with");
+    try out.append(alloc, '{');
+    for (bindings, 0..) |binding, index| {
+        if (binding.name.len == 0 or binding.filter_query_json.len == 0) {
+            return error.InvalidQueryRequest;
+        }
+        const normalized_filter = std.mem.trim(
+            u8,
+            binding.filter_query_json,
+            &std.ascii.whitespace,
+        );
+        if (normalized_filter.len < 2 or
+            normalized_filter[0] != '{' or
+            normalized_filter[normalized_filter.len - 1] != '}' or
+            !(try std.json.validate(alloc, normalized_filter)))
+        {
+            return error.InvalidQueryRequest;
+        }
+        const entry = try seen.getOrPut(binding.name);
+        if (entry.found_existing) return error.InvalidQueryRequest;
+
+        if (index > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, binding.name);
+        try out.append(alloc, ':');
+        try out.appendSlice(alloc, normalized_filter);
+    }
+    try out.append(alloc, '}');
 }
 
 fn appendNativeDocIdConstraintsField(
@@ -14008,21 +14225,6 @@ fn appendQueryField(
 ) !void {
     try appendJsonFieldName(alloc, out, first, "full_text_search");
     switch (query) {
-        .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
-        .term => |term| {
-            try out.appendSlice(alloc, "{\"term\":");
-            try appendJsonString(alloc, out, term.term);
-            try out.appendSlice(alloc, ",\"field\":");
-            try appendJsonString(alloc, out, term.field);
-            try out.append(alloc, '}');
-        },
-        .match => |match| {
-            try out.appendSlice(alloc, "{\"match\":");
-            try appendJsonString(alloc, out, match.text);
-            try out.appendSlice(alloc, ",\"field\":");
-            try appendJsonString(alloc, out, match.field);
-            try out.append(alloc, '}');
-        },
         .dense_knn => |dense| {
             try out.appendSlice(alloc, "{\"dense_knn\":{\"vector\":[");
             for (dense.vector, 0..) |value, i| {
@@ -14048,8 +14250,138 @@ fn appendQueryField(
             try out.print(alloc, "{d}", .{if (sparse.k == 0) default_k else sparse.k});
             try out.appendSlice(alloc, "}}");
         },
-        else => return error.UnsupportedQueryRequest,
+        .graph => return error.UnsupportedQueryRequest,
+        else => try appendTextQueryValue(
+            alloc,
+            out,
+            try borrowedTextQueryFromQuery(query),
+        ),
     }
+}
+
+fn borrowedTextQueryFromQuery(
+    query: db_mod.types.Query,
+) !db_mod.types.TextQuery {
+    return switch (query) {
+        .match_none => .{ .match_none = {} },
+        .match_all => .{ .match_all = {} },
+        .phrase => |value| .{ .phrase = .{
+            .field = value.field,
+            .terms = value.terms,
+            .max_edits = value.max_edits,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .multi_phrase => |value| .{ .multi_phrase = .{
+            .field = value.field,
+            .terms = value.terms,
+            .max_edits = value.max_edits,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .term => |value| .{ .term = .{
+            .field = value.field,
+            .term = value.term,
+            .boost = value.boost,
+        } },
+        .match => |value| .{ .match = .{
+            .field = value.field,
+            .text = value.text,
+            .analyzer = value.analyzer,
+            .boost = value.boost,
+        } },
+        .match_phrase => |value| .{ .match_phrase = .{
+            .field = value.field,
+            .text = value.text,
+            .analyzer = value.analyzer,
+            .max_edits = value.max_edits,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .fuzzy => |value| .{ .fuzzy = .{
+            .field = value.field,
+            .term = value.term,
+            .max_edits = value.max_edits,
+            .prefix_len = value.prefix_len,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .numeric_range => |value| .{ .numeric_range = .{
+            .field = value.field,
+            .min = value.min,
+            .max = value.max,
+            .inclusive_min = value.inclusive_min,
+            .inclusive_max = value.inclusive_max,
+            .boost = value.boost,
+        } },
+        .date_range => |value| .{ .date_range = .{
+            .field = value.field,
+            .start_ns = value.start_ns,
+            .end_ns = value.end_ns,
+            .inclusive_start = value.inclusive_start,
+            .inclusive_end = value.inclusive_end,
+            .boost = value.boost,
+        } },
+        .doc_id => |value| .{ .doc_id = .{
+            .ids = value.ids,
+            .boost = value.boost,
+        } },
+        .bool_field => |value| .{ .bool_field = .{
+            .field = value.field,
+            .value = value.value,
+            .boost = value.boost,
+        } },
+        .geo_distance => |value| .{ .geo_distance = .{
+            .field = value.field,
+            .lon = value.lon,
+            .lat = value.lat,
+            .radius_meters = value.radius_meters,
+            .boost = value.boost,
+        } },
+        .geo_bbox => |value| .{ .geo_bbox = .{
+            .field = value.field,
+            .min_lat = value.min_lat,
+            .min_lon = value.min_lon,
+            .max_lat = value.max_lat,
+            .max_lon = value.max_lon,
+            .boost = value.boost,
+        } },
+        .prefix => |value| .{ .prefix = .{
+            .field = value.field,
+            .prefix = value.prefix,
+            .boost = value.boost,
+        } },
+        .wildcard => |value| .{ .wildcard = .{
+            .field = value.field,
+            .pattern = value.pattern,
+            .boost = value.boost,
+        } },
+        .regexp => |value| .{ .regexp = .{
+            .field = value.field,
+            .pattern = value.pattern,
+            .boost = value.boost,
+        } },
+        .term_range => |value| .{ .term_range = .{
+            .field = value.field,
+            .min = value.min,
+            .max = value.max,
+            .inclusive_min = value.inclusive_min,
+            .inclusive_max = value.inclusive_max,
+            .boost = value.boost,
+        } },
+        .ip_range => |value| .{ .ip_range = .{
+            .field = value.field,
+            .cidr = value.cidr,
+            .boost = value.boost,
+        } },
+        .geo_shape => |value| .{ .geo_shape = .{
+            .field = value.field,
+            .relation = value.relation,
+            .polygons = value.polygons,
+            .boost = value.boost,
+        } },
+        .dense_knn, .sparse_knn, .graph => error.UnsupportedQueryRequest,
+    };
 }
 
 fn appendTextQueryField(
@@ -14071,11 +14403,14 @@ fn appendTextQueryValue(
     switch (query) {
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
+        .phrase => |phrase| try appendPhraseTextQueryValue(alloc, out, phrase),
+        .multi_phrase => |phrase| try appendMultiPhraseTextQueryValue(alloc, out, phrase),
         .term => |term| {
             try out.appendSlice(alloc, "{\"term\":");
             try appendJsonString(alloc, out, term.term);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, term.field);
+            try appendTextQueryBoost(alloc, out, term.boost);
             try out.append(alloc, '}');
         },
         .match => |match| {
@@ -14087,14 +14422,21 @@ fn appendTextQueryValue(
                 try out.appendSlice(alloc, ",\"analyzer\":");
                 try appendJsonString(alloc, out, analyzer);
             }
+            try appendTextQueryBoost(alloc, out, match.boost);
             try out.append(alloc, '}');
         },
         .multi_match_bool_prefix => |multi_match| {
+            if (!std.math.isFinite(multi_match.boost)) {
+                return error.InvalidQueryRequest;
+            }
             try out.appendSlice(alloc, "{\"multi_match\":{\"query\":");
             try appendJsonString(alloc, out, multi_match.query);
             try out.appendSlice(alloc, ",\"type\":\"bool_prefix\",\"fields\":[");
             for (multi_match.fields, 0..) |field, i| {
                 if (i > 0) try out.append(alloc, ',');
+                if (!std.math.isFinite(field.boost) or field.boost <= 0) {
+                    return error.InvalidQueryRequest;
+                }
                 if (field.boost == 1.0) {
                     try appendJsonString(alloc, out, field.field);
                 } else {
@@ -14104,10 +14446,7 @@ fn appendTextQueryValue(
                 }
             }
             try out.append(alloc, ']');
-            if (multi_match.boost != 1.0) {
-                try out.appendSlice(alloc, ",\"boost\":");
-                try out.print(alloc, "{d}", .{multi_match.boost});
-            }
+            try appendTextQueryBoost(alloc, out, multi_match.boost);
             try out.appendSlice(alloc, "}}");
         },
         .match_phrase => |phrase| {
@@ -14125,6 +14464,7 @@ fn appendTextQueryValue(
                 try out.appendSlice(alloc, ",\"fuzziness\":");
                 try out.print(alloc, "{d}", .{phrase.max_edits});
             }
+            try appendTextQueryBoost(alloc, out, phrase.boost);
             try out.append(alloc, '}');
         },
         .fuzzy => |fuzzy| {
@@ -14142,6 +14482,7 @@ fn appendTextQueryValue(
                 try out.appendSlice(alloc, ",\"fuzziness\":");
                 try out.print(alloc, "{d}", .{fuzzy.max_edits});
             }
+            try appendTextQueryBoost(alloc, out, fuzzy.boost);
             try out.append(alloc, '}');
         },
         .prefix => |prefix| {
@@ -14149,6 +14490,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, prefix.prefix);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, prefix.field);
+            try appendTextQueryBoost(alloc, out, prefix.boost);
             try out.append(alloc, '}');
         },
         .wildcard => |wildcard| {
@@ -14156,6 +14498,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, wildcard.pattern);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, wildcard.field);
+            try appendTextQueryBoost(alloc, out, wildcard.boost);
             try out.append(alloc, '}');
         },
         .regexp => |regexp| {
@@ -14163,6 +14506,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, regexp.pattern);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, regexp.field);
+            try appendTextQueryBoost(alloc, out, regexp.boost);
             try out.append(alloc, '}');
         },
         .numeric_range => |range_query| {
@@ -14179,6 +14523,7 @@ fn appendTextQueryValue(
             try appendJsonFieldString(alloc, out, &first, "field", range_query.field);
             if (!range_query.inclusive_min) try appendJsonFieldBool(alloc, out, &first, "inclusive_min", false);
             if (range_query.inclusive_max) try appendJsonFieldBool(alloc, out, &first, "inclusive_max", true);
+            try appendOptionalTextQueryBoostField(alloc, out, &first, range_query.boost);
             try out.append(alloc, '}');
         },
         .date_range => |range_query| {
@@ -14197,6 +14542,7 @@ fn appendTextQueryValue(
             try appendJsonFieldString(alloc, out, &first, "field", range_query.field);
             if (!range_query.inclusive_start) try appendJsonFieldBool(alloc, out, &first, "inclusive_start", false);
             if (range_query.inclusive_end) try appendJsonFieldBool(alloc, out, &first, "inclusive_end", true);
+            try appendOptionalTextQueryBoostField(alloc, out, &first, range_query.boost);
             try out.append(alloc, '}');
         },
         .term_range => |range_query| {
@@ -14207,6 +14553,7 @@ fn appendTextQueryValue(
             try appendJsonFieldString(alloc, out, &first, "field", range_query.field);
             if (!range_query.inclusive_min) try appendJsonFieldBool(alloc, out, &first, "inclusive_min", false);
             if (range_query.inclusive_max) try appendJsonFieldBool(alloc, out, &first, "inclusive_max", true);
+            try appendOptionalTextQueryBoostField(alloc, out, &first, range_query.boost);
             try out.append(alloc, '}');
         },
         .doc_id => |doc_id| {
@@ -14215,13 +14562,16 @@ fn appendTextQueryValue(
                 if (i > 0) try out.append(alloc, ',');
                 try appendJsonString(alloc, out, id);
             }
-            try out.appendSlice(alloc, "]}");
+            try out.append(alloc, ']');
+            try appendTextQueryBoost(alloc, out, doc_id.boost);
+            try out.append(alloc, '}');
         },
         .bool_field => |bool_field| {
             try out.appendSlice(alloc, "{\"bool\":");
             try out.appendSlice(alloc, if (bool_field.value) "true" else "false");
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, bool_field.field);
+            try appendTextQueryBoost(alloc, out, bool_field.boost);
             try out.append(alloc, '}');
         },
         .bool_query => |bool_query| {
@@ -14244,7 +14594,7 @@ fn appendTextQueryValue(
                     try appendTextQueryValue(alloc, out, item);
                 }
                 try out.append(alloc, ']');
-                if (bool_query.min_should > 0) {
+                if (bool_query.min_should > 0 or bool_query.pure_should_optional) {
                     try out.appendSlice(alloc, ",\"min\":");
                     try out.print(alloc, "{d}", .{bool_query.min_should});
                 }
@@ -14259,10 +14609,199 @@ fn appendTextQueryValue(
                 }
                 try out.appendSlice(alloc, "]}");
             }
+            try appendOptionalTextQueryBoostField(alloc, out, &first, bool_query.boost);
             try out.append(alloc, '}');
         },
-        else => return error.UnsupportedQueryRequest,
+        .geo_distance => |distance| try appendGeoDistanceTextQueryValue(alloc, out, distance),
+        .geo_bbox => |bbox| try appendGeoBBoxTextQueryValue(alloc, out, bbox),
+        .ip_range => |range| try appendIpRangeTextQueryValue(alloc, out, range),
+        .geo_shape => |shape| try appendGeoShapeTextQueryValue(alloc, out, shape),
     }
+}
+
+fn appendPhraseTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    phrase: anytype,
+) !void {
+    if (phrase.field.len == 0 or phrase.terms.len == 0 or phrase.max_edits > 2) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"terms\":[");
+    for (phrase.terms, 0..) |term, index| {
+        if (term.len == 0) return error.InvalidQueryRequest;
+        if (index > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, term);
+    }
+    try out.appendSlice(alloc, "],\"field\":");
+    try appendJsonString(alloc, out, phrase.field);
+    if (phrase.auto_fuzzy) {
+        try out.appendSlice(alloc, ",\"fuzziness\":\"auto\"");
+    } else if (phrase.max_edits > 0) {
+        try out.appendSlice(alloc, ",\"fuzziness\":");
+        try out.print(alloc, "{d}", .{phrase.max_edits});
+    }
+    try appendTextQueryBoost(alloc, out, phrase.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendMultiPhraseTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    phrase: anytype,
+) !void {
+    if (phrase.field.len == 0 or phrase.terms.len == 0 or phrase.max_edits > 2) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"terms\":[");
+    for (phrase.terms, 0..) |alternatives, position| {
+        if (alternatives.len == 0) return error.InvalidQueryRequest;
+        if (position > 0) try out.append(alloc, ',');
+        try out.append(alloc, '[');
+        for (alternatives, 0..) |term, alternative| {
+            if (term.len == 0) return error.InvalidQueryRequest;
+            if (alternative > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, term);
+        }
+        try out.append(alloc, ']');
+    }
+    try out.appendSlice(alloc, "],\"field\":");
+    try appendJsonString(alloc, out, phrase.field);
+    if (phrase.auto_fuzzy) {
+        try out.appendSlice(alloc, ",\"fuzziness\":\"auto\"");
+    } else if (phrase.max_edits > 0) {
+        try out.appendSlice(alloc, ",\"fuzziness\":");
+        try out.print(alloc, "{d}", .{phrase.max_edits});
+    }
+    try appendTextQueryBoost(alloc, out, phrase.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendGeoDistanceTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    distance: anytype,
+) !void {
+    if (distance.field.len == 0 or
+        !std.math.isFinite(distance.lon) or distance.lon < -180 or distance.lon > 180 or
+        !std.math.isFinite(distance.lat) or distance.lat < -90 or distance.lat > 90 or
+        !std.math.isFinite(distance.radius_meters) or distance.radius_meters < 0)
+    {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"location\":[");
+    try out.print(alloc, "{d},{d}", .{ distance.lon, distance.lat });
+    try out.appendSlice(alloc, "],\"distance\":\"");
+    try out.print(alloc, "{d}m\",\"field\":", .{distance.radius_meters});
+    try appendJsonString(alloc, out, distance.field);
+    try appendTextQueryBoost(alloc, out, distance.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendGeoBBoxTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    bbox: anytype,
+) !void {
+    if (bbox.field.len == 0 or
+        !std.math.isFinite(bbox.min_lat) or bbox.min_lat < -90 or bbox.min_lat > 90 or
+        !std.math.isFinite(bbox.max_lat) or bbox.max_lat < -90 or bbox.max_lat > 90 or
+        bbox.min_lat > bbox.max_lat or
+        !std.math.isFinite(bbox.min_lon) or bbox.min_lon < -180 or bbox.min_lon > 180 or
+        !std.math.isFinite(bbox.max_lon) or bbox.max_lon < -180 or bbox.max_lon > 180)
+    {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"field\":");
+    try appendJsonString(alloc, out, bbox.field);
+    try out.print(
+        alloc,
+        ",\"min_lat\":{d},\"min_lon\":{d},\"max_lat\":{d},\"max_lon\":{d}",
+        .{ bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon },
+    );
+    try appendTextQueryBoost(alloc, out, bbox.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendIpRangeTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    range: anytype,
+) !void {
+    if (range.field.len == 0 or !algebraicValidIpRange(range.cidr)) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"cidr\":");
+    try appendJsonString(alloc, out, range.cidr);
+    try out.appendSlice(alloc, ",\"field\":");
+    try appendJsonString(alloc, out, range.field);
+    try appendTextQueryBoost(alloc, out, range.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendGeoShapeTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    shape: anytype,
+) !void {
+    if (shape.field.len == 0 or shape.polygons.len == 0) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(
+        alloc,
+        "{\"geometry\":{\"shape\":{\"type\":\"MultiPolygon\",\"coordinates\":[",
+    );
+    for (shape.polygons, 0..) |polygon, polygon_index| {
+        if (polygon.len < 3) return error.InvalidQueryRequest;
+        if (polygon_index > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "[[");
+        for (polygon, 0..) |point, point_index| {
+            if (!std.math.isFinite(point.lat) or point.lat < -90 or point.lat > 90 or
+                !std.math.isFinite(point.lon) or point.lon < -180 or point.lon > 180)
+            {
+                return error.InvalidQueryRequest;
+            }
+            if (point_index > 0) try out.append(alloc, ',');
+            try out.print(alloc, "[{d},{d}]", .{ point.lon, point.lat });
+        }
+        const first = polygon[0];
+        const last = polygon[polygon.len - 1];
+        if (first.lat != last.lat or first.lon != last.lon) {
+            try out.print(alloc, ",[{d},{d}]", .{ first.lon, first.lat });
+        }
+        try out.appendSlice(alloc, "]]");
+    }
+    try out.appendSlice(alloc, "]},\"relation\":");
+    try appendJsonString(alloc, out, switch (shape.relation) {
+        .intersects => "intersects",
+        .within => "within",
+        .contains => "contains",
+    });
+    try out.appendSlice(alloc, "},\"field\":");
+    try appendJsonString(alloc, out, shape.field);
+    try appendTextQueryBoost(alloc, out, shape.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendTextQueryBoost(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    boost: f32,
+) !void {
+    if (!std.math.isFinite(boost)) return error.InvalidQueryRequest;
+    if (boost == 1.0) return;
+    try out.appendSlice(alloc, ",\"boost\":");
+    try out.print(alloc, "{d}", .{boost});
+}
+
+fn appendOptionalTextQueryBoostField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    boost: f32,
+) !void {
+    if (!std.math.isFinite(boost)) return error.InvalidQueryRequest;
+    if (boost != 1.0) try appendJsonFieldF32(alloc, out, first, "boost", boost);
 }
 
 fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
@@ -16177,6 +16716,14 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     defer alloc.free(group_path);
     var db = try db_mod.DB.open(alloc, group_path, .{});
     defer db.close();
+    const indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}}";
+    const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(
+        alloc,
+        &db,
+        indexes_json,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.indexes_added);
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -16217,7 +16764,23 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     source.cache = &cache;
     var db_lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 0, "docs");
     defer db_lease.release();
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+
+    // Provisioned read sources intentionally publish status only from the
+    // shared snapshot cache; query-cache handles are not an authoritative
+    // status source. Model the production refresher by publishing the
+    // reconciled empty managed index from the writer-owned group.
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var live_status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = try db.runtimeStatusStatsConsistent(alloc),
+    };
+    defer live_status.deinit(alloc);
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", live_status);
+    source.runtime_status_cache = &snapshot_cache;
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")) orelse
+        return error.MissingRuntimeStatusSnapshot;
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
@@ -16743,6 +17306,320 @@ test "encode query request round-trips composed bleve full_text queries" {
     try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
 }
 
+test "encode query request round-trips all public phrase geo and ip queries" {
+    const alloc = std.testing.allocator;
+    const phrase_terms = [_][]const u8{ "quick", "fox" };
+    const first_position = [_][]const u8{ "quick", "fast" };
+    const second_position = [_][]const u8{"fox"};
+    const multi_phrase_terms = [_][]const []const u8{
+        first_position[0..],
+        second_position[0..],
+    };
+    const polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.70, .lon = -122.50 },
+        .{ .lat = 37.70, .lon = -122.30 },
+        .{ .lat = 37.85, .lon = -122.30 },
+        .{ .lat = 37.70, .lon = -122.50 },
+    };
+    const polygons = [_][]const db_mod.types.GeoPoint{polygon[0..]};
+    const should_queries = [_]db_mod.types.TextQuery{
+        .{ .phrase = .{
+            .field = "body",
+            .terms = phrase_terms[0..],
+            .max_edits = 1,
+            .boost = 2,
+        } },
+        .{ .multi_phrase = .{
+            .field = "body",
+            .terms = multi_phrase_terms[0..],
+            .auto_fuzzy = true,
+            .boost = 3,
+        } },
+        .{ .geo_distance = .{
+            .field = "location",
+            .lat = 37.7749,
+            .lon = -122.4194,
+            .radius_meters = 2_500,
+            .boost = 4,
+        } },
+        .{ .geo_bbox = .{
+            .field = "location",
+            .min_lat = 37.70,
+            .min_lon = 179.5,
+            .max_lat = 37.85,
+            .max_lon = -179.5,
+            .boost = 5,
+        } },
+        .{ .ip_range = .{
+            .field = "client_ip",
+            .cidr = "10.20.0.0/16",
+            .boost = 6,
+        } },
+        .{ .geo_shape = .{
+            .field = "location",
+            .relation = .within,
+            .polygons = polygons[0..],
+            .boost = 7,
+        } },
+    };
+
+    const encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .bool_query = .{
+            .should = should_queries[0..],
+            .min_should = 1,
+        } },
+    });
+    defer alloc.free(encoded);
+
+    var owned = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer owned.deinit(alloc);
+    const full_text = owned.req.full_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(full_text == .bool_query);
+    const should = full_text.bool_query.should;
+    try std.testing.expectEqual(@as(usize, should_queries.len), should.len);
+    try std.testing.expect(should[0] == .phrase);
+    try std.testing.expectEqual(@as(f32, 2), should[0].phrase.boost);
+    try std.testing.expectEqualStrings("quick", should[0].phrase.terms[0]);
+    try std.testing.expect(should[1] == .multi_phrase);
+    try std.testing.expectEqual(@as(f32, 3), should[1].multi_phrase.boost);
+    try std.testing.expectEqualStrings("fast", should[1].multi_phrase.terms[0][1]);
+    try std.testing.expect(should[2] == .geo_distance);
+    try std.testing.expectEqual(@as(f64, 2_500), should[2].geo_distance.radius_meters);
+    try std.testing.expect(should[3] == .geo_bbox);
+    try std.testing.expectEqual(@as(f64, 179.5), should[3].geo_bbox.min_lon);
+    try std.testing.expectEqual(@as(f64, -179.5), should[3].geo_bbox.max_lon);
+    try std.testing.expect(should[4] == .ip_range);
+    try std.testing.expectEqualStrings("10.20.0.0/16", should[4].ip_range.cidr);
+    try std.testing.expect(should[5] == .geo_shape);
+    try std.testing.expectEqual(db_mod.types.GeoShapeRelation.within, should[5].geo_shape.relation);
+    try std.testing.expectEqual(@as(usize, 1), should[5].geo_shape.polygons.len);
+    try std.testing.expectEqual(@as(usize, polygon.len), should[5].geo_shape.polygons[0].len);
+
+    const filtered_encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .filter_text = should_queries[0],
+        .exclusion_text = should_queries[5],
+        .filter_query_json = "{\"term\":{\"path\":\"status\",\"term\":\"active\"}}",
+        .exclusion_query_json = "{\"term\":{\"path\":\"tenant\",\"term\":\"blocked\"}}",
+    });
+    defer alloc.free(filtered_encoded);
+
+    var filtered_owned = try query_api.parseQueryRequest(alloc, null, "docs", filtered_encoded);
+    defer filtered_owned.deinit(alloc);
+    const filter_text = filtered_owned.req.filter_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(filter_text == .phrase);
+    try std.testing.expectEqualStrings("quick", filter_text.phrase.terms[0]);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"status\",\"term\":\"active\"}}",
+        filtered_owned.req.filter_query_json,
+    );
+    const exclusion_text = filtered_owned.req.exclusion_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(exclusion_text == .geo_shape);
+    try std.testing.expectEqual(db_mod.types.GeoShapeRelation.within, exclusion_text.geo_shape.relation);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"tenant\",\"term\":\"blocked\"}}",
+        filtered_owned.req.exclusion_query_json,
+    );
+}
+
+test "encode query request round-trips every scalar Query text variant" {
+    const alloc = std.testing.allocator;
+    const phrase_terms = [_][]const u8{ "quick", "fox" };
+    const first_position = [_][]const u8{ "quick", "fast" };
+    const second_position = [_][]const u8{"fox"};
+    const multi_phrase_terms = [_][]const []const u8{
+        first_position[0..],
+        second_position[0..],
+    };
+    const ids = [_][]const u8{ "doc:a", "doc:b" };
+    const polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.70, .lon = -122.50 },
+        .{ .lat = 37.70, .lon = -122.30 },
+        .{ .lat = 37.85, .lon = -122.30 },
+    };
+    const polygons = [_][]const db_mod.types.GeoPoint{polygon[0..]};
+    const cases = [_]struct {
+        query: db_mod.types.Query,
+        expected: std.meta.Tag(db_mod.types.TextQuery),
+    }{
+        .{ .query = .{ .match_none = {} }, .expected = .match_none },
+        .{ .query = .{ .match_all = {} }, .expected = .match_all },
+        .{ .query = .{ .phrase = .{
+            .field = "body",
+            .terms = phrase_terms[0..],
+        } }, .expected = .phrase },
+        .{ .query = .{ .multi_phrase = .{
+            .field = "body",
+            .terms = multi_phrase_terms[0..],
+        } }, .expected = .multi_phrase },
+        .{ .query = .{ .term = .{
+            .field = "status",
+            .term = "active",
+        } }, .expected = .term },
+        .{ .query = .{ .match = .{
+            .field = "body",
+            .text = "quick fox",
+        } }, .expected = .match },
+        .{ .query = .{ .match_phrase = .{
+            .field = "body",
+            .text = "quick fox",
+        } }, .expected = .match_phrase },
+        .{ .query = .{ .fuzzy = .{
+            .field = "body",
+            .term = "quik",
+        } }, .expected = .fuzzy },
+        .{ .query = .{ .numeric_range = .{
+            .field = "price",
+            .min = 10,
+            .max = 20,
+        } }, .expected = .numeric_range },
+        .{ .query = .{ .date_range = .{
+            .field = "created_at",
+            .start_ns = 1_772_323_200 * std.time.ns_per_s,
+        } }, .expected = .date_range },
+        .{ .query = .{ .doc_id = .{ .ids = ids[0..] } }, .expected = .doc_id },
+        .{ .query = .{ .bool_field = .{
+            .field = "published",
+            .value = true,
+        } }, .expected = .bool_field },
+        .{ .query = .{ .geo_distance = .{
+            .field = "location",
+            .lat = 37.7749,
+            .lon = -122.4194,
+            .radius_meters = 2_500,
+        } }, .expected = .geo_distance },
+        .{ .query = .{ .geo_bbox = .{
+            .field = "location",
+            .min_lat = 37.70,
+            .min_lon = -122.50,
+            .max_lat = 37.85,
+            .max_lon = -122.30,
+        } }, .expected = .geo_bbox },
+        .{ .query = .{ .prefix = .{
+            .field = "body",
+            .prefix = "qui",
+        } }, .expected = .prefix },
+        .{ .query = .{ .wildcard = .{
+            .field = "body",
+            .pattern = "qu*",
+        } }, .expected = .wildcard },
+        .{ .query = .{ .regexp = .{
+            .field = "body",
+            .pattern = "qu.*",
+        } }, .expected = .regexp },
+        .{ .query = .{ .term_range = .{
+            .field = "tier",
+            .min = "bronze",
+            .max = "gold",
+        } }, .expected = .term_range },
+        .{ .query = .{ .ip_range = .{
+            .field = "client_ip",
+            .cidr = "10.20.0.0/16",
+        } }, .expected = .ip_range },
+        .{ .query = .{ .geo_shape = .{
+            .field = "location",
+            .polygons = polygons[0..],
+        } }, .expected = .geo_shape },
+    };
+
+    for (cases) |case| {
+        const encoded = try encodeQueryRequest(alloc, .{ .query = case.query });
+        defer alloc.free(encoded);
+        var owned = try query_api.parseQueryRequest(
+            alloc,
+            null,
+            "docs",
+            encoded,
+        );
+        defer owned.deinit(alloc);
+        const full_text = owned.req.full_text orelse
+            return error.TestExpectedEqual;
+        try std.testing.expectEqual(
+            case.expected,
+            std.meta.activeTag(full_text),
+        );
+    }
+}
+
+test "encode query request round-trips schema valid multi match boosts" {
+    const alloc = std.testing.allocator;
+    inline for ([_]f32{ 0, -1 }) |boost| {
+        const encoded = try encodeQueryRequest(alloc, .{ .full_text = .{
+            .multi_match_bool_prefix = .{
+                .query = "quick fox",
+                .fields = &.{.{ .field = "body" }},
+                .boost = boost,
+            },
+        } });
+        defer alloc.free(encoded);
+        var owned = try query_contract.parsePublicQueryRequest(
+            alloc,
+            null,
+            "files",
+            encoded,
+        );
+        defer owned.deinit(alloc);
+        try std.testing.expectEqual(
+            boost,
+            owned.req.full_text.?.multi_match_bool_prefix.boost,
+        );
+    }
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        encodeQueryRequest(alloc, .{ .full_text = .{
+            .multi_match_bool_prefix = .{
+                .query = "quick fox",
+                .fields = &.{.{ .field = "body", .boost = -1 }},
+            },
+        } }),
+    );
+}
+
+test "encode query request rejects invalid public phrase geo and ip values" {
+    const alloc = std.testing.allocator;
+    const short_polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.70, .lon = -122.50 },
+        .{ .lat = 37.85, .lon = -122.30 },
+    };
+    const short_polygons = [_][]const db_mod.types.GeoPoint{
+        short_polygon[0..],
+    };
+    inline for ([_]db_mod.types.TextQuery{
+        .{ .phrase = .{ .field = "body", .terms = &.{} } },
+        .{ .multi_phrase = .{
+            .field = "body",
+            .terms = &.{&.{}},
+        } },
+        .{ .geo_distance = .{
+            .field = "location",
+            .lat = 91,
+            .lon = 0,
+            .radius_meters = 10,
+        } },
+        .{ .geo_bbox = .{
+            .field = "location",
+            .min_lat = 40,
+            .min_lon = -130,
+            .max_lat = 30,
+            .max_lon = -120,
+        } },
+        .{ .ip_range = .{
+            .field = "client_ip",
+            .cidr = "10.999.0.0/16",
+        } },
+        .{ .geo_shape = .{
+            .field = "location",
+            .polygons = short_polygons[0..],
+        } },
+    }) |query| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            encodeQueryRequest(alloc, .{ .full_text = query }),
+        );
+    }
+}
+
 test "encode query request includes named vector embeddings for routed semantic search" {
     const alloc = std.testing.allocator;
 
@@ -17032,6 +17909,112 @@ test "encode query request with distributed text stats parses through query cont
     try std.testing.expectEqual(@as(u64, 45), owned.req.distributed_text_stats[0].global_total_field_len);
     try std.testing.expectEqual(@as(usize, 2), owned.req.distributed_text_stats[0].term_doc_freqs.len);
     try std.testing.expectEqualStrings("hello", owned.req.distributed_text_stats[0].term_doc_freqs[0].term);
+}
+
+test "encode query request losslessly carries optional should and named filter bindings" {
+    const alloc = std.testing.allocator;
+    const should_queries = [_]db_mod.types.TextQuery{
+        .{ .match = .{ .field = "body", .text = "computer", .boost = 3.0 } },
+        .{ .term = .{ .field = "status", .term = "active", .boost = 4.0 } },
+        .{ .match_phrase = .{
+            .field = "body",
+            .text = "distributed storage",
+            .analyzer = "standard",
+            .boost = 5.0,
+        } },
+    };
+    const binding_defs = [_]db_mod.types.NamedDocFilterBinding{
+        .{
+            .name = "tenant",
+            .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+        },
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"tenant\"},{\"bool_field\":{\"field\":\"published\",\"value\":true}}]}}",
+        },
+    };
+
+    const encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .bool_query = .{
+            .should = should_queries[0..],
+            .pure_should_optional = true,
+            .boost = 2.0,
+        } },
+        .filter_query_json = "{\"ref\":\"visible\"}",
+        .doc_filter_bindings = binding_defs[0..],
+    });
+    defer alloc.free(encoded);
+
+    var parsed_json = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed_json.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        parsed_json.value.object.get("full_text_search").?.object
+            .get("should").?.object.get("min").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        parsed_json.value.object.get("with").?.object.count(),
+    );
+
+    var owned = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer owned.deinit(alloc);
+    const full_text = owned.req.full_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(full_text == .bool_query);
+    try std.testing.expect(full_text.bool_query.pure_should_optional);
+    try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+    try std.testing.expectEqual(@as(f32, 2.0), full_text.bool_query.boost);
+    try std.testing.expect(full_text.bool_query.should[0] == .match);
+    try std.testing.expectEqual(@as(f32, 3.0), full_text.bool_query.should[0].match.boost);
+    try std.testing.expect(full_text.bool_query.should[1] == .term);
+    try std.testing.expectEqual(@as(f32, 4.0), full_text.bool_query.should[1].term.boost);
+    try std.testing.expect(full_text.bool_query.should[2] == .match_phrase);
+    try std.testing.expectEqualStrings(
+        "standard",
+        full_text.bool_query.should[2].match_phrase.analyzer.?,
+    );
+    try std.testing.expectEqual(@as(f32, 5.0), full_text.bool_query.should[2].match_phrase.boost);
+    try std.testing.expectEqual(@as(usize, 2), owned.req.doc_filter_bindings.len);
+    try std.testing.expectEqualStrings("tenant", owned.req.doc_filter_bindings[0].name);
+    try std.testing.expectEqualStrings("visible", owned.req.doc_filter_bindings[1].name);
+    try std.testing.expectEqualStrings("{\"ref\":\"visible\"}", owned.req.filter_query_json);
+}
+
+test "encode query request rejects duplicate named filter bindings" {
+    const alloc = std.testing.allocator;
+    const duplicate_bindings = [_]db_mod.types.NamedDocFilterBinding{
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"match_all\":{}}",
+        },
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"match_none\":{}}",
+        },
+    };
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        encodeQueryRequest(alloc, .{
+            .doc_filter_bindings = duplicate_bindings[0..],
+        }),
+    );
+
+    inline for ([_][]const u8{
+        "not-json",
+        "[]",
+        "{\"term\":",
+        "{\"term\":{}} trailing",
+    }) |invalid_filter| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            encodeQueryRequest(alloc, .{
+                .doc_filter_bindings = &.{.{
+                    .name = "invalid",
+                    .filter_query_json = invalid_filter,
+                }},
+            }),
+        );
+    }
 }
 
 test "encode query request carries internal native doc id constraints through query contract" {
@@ -17412,6 +18395,96 @@ test "remote simple vector query uses vector worker route" {
     try std.testing.expectEqual(@as(u32, 0), fallback_result.total_hits);
     try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, fallback_result.total_hits_relation);
     try std.testing.expectEqual(@as(?u64, 88), fallback_result.identity_read_generation);
+}
+
+test "remote query preserves optional should and named filter bindings" {
+    const alloc = std.testing.allocator;
+    const ExecutorState = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            req: http_common.HttpRequest,
+        ) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/groups/11/tables/docs/query",
+            ));
+
+            var parsed = try query_api.parseQueryRequest(
+                alloc_inner,
+                null,
+                "docs",
+                req.body,
+            );
+            defer parsed.deinit(alloc_inner);
+            const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(full_text == .bool_query);
+            try std.testing.expect(full_text.bool_query.pure_should_optional);
+            try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+            try std.testing.expectEqual(@as(f32, 2.0), full_text.bool_query.boost);
+            try std.testing.expect(full_text.bool_query.should[0] == .match);
+            try std.testing.expectEqual(@as(f32, 3.0), full_text.bool_query.should[0].match.boost);
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[1].name);
+            try std.testing.expectEqualStrings("{\"ref\":\"visible\"}", parsed.req.filter_query_json);
+
+            return .{
+                .status = 200,
+                .body = try alloc_inner.dupe(
+                    u8,
+                    "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}",
+                ),
+            };
+        }
+    };
+
+    const should_queries = [_]db_mod.types.TextQuery{
+        .{ .match = .{ .field = "body", .text = "computer", .boost = 3.0 } },
+    };
+    const binding_defs = [_]db_mod.types.NamedDocFilterBinding{
+        .{
+            .name = "tenant",
+            .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+        },
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"tenant\"},{\"bool_field\":{\"field\":\"published\",\"value\":true}}]}}",
+        },
+    };
+    var state = ExecutorState{};
+    var result = try queryRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        .{
+            .full_text = .{ .bool_query = .{
+                .should = should_queries[0..],
+                .pure_should_optional = true,
+                .boost = 2.0,
+            } },
+            .filter_query_json = "{\"ref\":\"visible\"}",
+            .doc_filter_bindings = binding_defs[0..],
+        },
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 }
 
 test "remote query rejects resolved doc filters before vector worker encoding" {
@@ -19907,6 +20980,39 @@ test "hosted table read source preflights mixed local and remote groups" {
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
     try std.testing.expectEqual(@as(usize, 1), executor_state.call_count);
+}
+
+test "authenticated single-group graph queries require distributed coordination" {
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !db_mod.types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{},
+        },
+    }};
+    var req = db_mod.types.SearchRequest{
+        .graph_queries = &graph_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    };
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, req));
+    req.graph_table_read_authorizer = null;
+    try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
+    try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
 }
 
 test "hosted cross-range graph query expands explicit local start keys" {

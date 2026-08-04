@@ -183,7 +183,7 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_node_shutdown_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, null, null);
+        try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
     pub fn finalizeNodeShutdown(
@@ -196,7 +196,7 @@ pub const MetadataHttpClient = struct {
             node_id,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, null, null);
+        try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
     pub fn reportNodeStatus(
@@ -313,7 +313,7 @@ pub const MetadataHttpClient = struct {
             table_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null);
+        try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null, error.TableTransitionActive);
     }
 
     pub fn updateSchema(
@@ -328,7 +328,7 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_table_schema_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, null);
+        try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, error.TableTransitionActive);
     }
 
     pub fn replaceTableDefinition(
@@ -375,7 +375,7 @@ pub const MetadataHttpClient = struct {
             index_name,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, index_json, error.InvalidCreateIndexRequest, error.TableNotFound, null);
+        try self.requestWithBody(base_uri, .PUT, path, index_json, error.InvalidCreateIndexRequest, error.TableNotFound, error.TableTransitionActive);
     }
 
     pub fn dropIndex(
@@ -391,7 +391,7 @@ pub const MetadataHttpClient = struct {
             index_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.IndexNotFound, null);
+        try self.requestNoBody(base_uri, .DELETE, path, error.IndexNotFound, null, error.TableTransitionActive);
     }
 
     pub fn putArtifactEnrichment(
@@ -412,7 +412,7 @@ pub const MetadataHttpClient = struct {
             escaped_enrichment_name,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, null);
+        try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, error.TableTransitionActive);
     }
 
     pub fn deleteArtifactEnrichment(
@@ -432,7 +432,7 @@ pub const MetadataHttpClient = struct {
             escaped_enrichment_name,
         });
         defer self.alloc.free(path);
-        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment);
+        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment, error.TableTransitionActive);
     }
 
     pub fn requestTableSplit(
@@ -554,6 +554,7 @@ pub const MetadataHttpClient = struct {
         path: []const u8,
         not_found_err: ?anyerror,
         bad_request_err: ?anyerror,
+        conflict_err: ?anyerror,
     ) !void {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
@@ -564,7 +565,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
-        try mapStatus(resp.status, bad_request_err, not_found_err, null);
+        try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
     }
 
     fn executeWithRetry(self: *MetadataHttpClient, req: http_common.HttpRequest) !http_common.HttpResponse {

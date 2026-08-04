@@ -171,7 +171,7 @@ class HAStandaloneNode:
             cwd=self.root,
             env=env,
         )
-        if not wait_for_server(self.url, path="/status", timeout=30.0):
+        if not wait_for_server(self.url, path="/readyz", timeout=30.0):
             logs = self.debug_logs()
             self.stop()
             raise RuntimeError(f"HA {self.role} node failed to start at {self.url}\n{logs}")

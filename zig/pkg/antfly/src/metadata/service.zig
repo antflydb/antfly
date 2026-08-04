@@ -22,6 +22,7 @@ const metadata_api = @import("api.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
+const metadata_reallocation_request = @import("reallocation_request.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_replication_backfill = @import("replication_backfill.zig");
 const metadata_state = @import("state.zig");
@@ -116,7 +117,7 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     );
     const persist = ready.persist_ready_detail;
     std.log.warn(
-        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} wal_inner_segment_syncs={d} wal_inner_index_syncs={d} wal_post_commit_segment_syncs={d} wal_post_commit_index_syncs={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
         .{
             ready.group_id,
             persist.skipped_no_durable_state,
@@ -131,6 +132,10 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
             @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
             persist.wal_physical_commits,
+            persist.wal_inner_segment_syncs,
+            persist.wal_inner_index_syncs,
+            persist.wal_post_commit_segment_syncs,
+            persist.wal_post_commit_index_syncs,
             persist.encoded_bytes,
             persist.delta_records_since_checkpoint,
             persist.delta_bytes_since_checkpoint,
@@ -723,6 +728,7 @@ const ProjectedCoreSnapshot = struct {
                 @sizeOf(metadata_table_manager.RuntimeGroupStatusReport) * record.runtime_statuses.len;
             for (record.runtime_statuses) |status| {
                 out.estimated_bytes += status.table_name.len + status.source.len + status.freshness.len +
+                    status.enrichment.projection_checkpoint_status.len +
                     @sizeOf(metadata_table_manager.RuntimeIndexStatusReport) * status.indexes.len;
                 for (status.indexes) |index| out.estimated_bytes += index.name.len + index.kind.len;
             }
@@ -730,10 +736,15 @@ const ProjectedCoreSnapshot = struct {
         for (self.placement_intents) |intent| {
             out.estimated_bytes += @sizeOf(u64) * intent.peer_node_ids.len;
             if (intent.record.snapshot_bootstrap) |record| out.estimated_bytes += record.snapshot_id.len + record.uri.len;
-            if (intent.record.backup_restore_bootstrap) |record| out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len;
+            if (intent.record.backup_restore_bootstrap) |record| {
+                out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
+                    record.location.len + record.snapshot_path.len + record.connection.len +
+                    record.artifact_sha256.len;
+            }
         }
         for (self.restore_progresses) |record| {
-            out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len +
+            out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
+                record.location.len + record.snapshot_path.len + record.artifact_sha256.len +
                 record.phase.len + record.last_error.len;
         }
         for (self.replication_source_statuses) |record| {
@@ -776,7 +787,9 @@ const CatalogValidationSnapshot = struct {
         }
         for (self.ranges) |record| {
             out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
-                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len;
+                record.restore_backup_id.len + record.restore_artifact_backup_id.len +
+                record.restore_location.len + record.restore_snapshot_path.len +
+                record.restore_connection.len + record.restore_artifact_sha256.len;
         }
     }
 };
@@ -806,7 +819,7 @@ const ProjectedCoreSnapshotCache = struct {
 const TransitionReadinessCache = struct {
     initialized: bool = false,
     epoch: u64 = 0,
-    ready_by_group: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+    ready_by_group: std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness) = .empty,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.ready_by_group.deinit(alloc);
@@ -1072,17 +1085,10 @@ fn cloneProjectedSplitTransitionsOwned(
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .transition_id = record.transition_id,
-            .attempt_epoch = record.attempt_epoch,
-            .source_group_id = record.source_group_id,
-            .destination_group_id = record.destination_group_id,
-            .phase = record.phase,
-        };
-        errdefer metadata_table_manager.freeSplitTransitionRecord(alloc, out[i]);
-        out[i].split_key = if (record.split_key) |value| try alloc.dupe(u8, value) else null;
-        out[i].source_range_end = if (record.source_range_end) |value| try alloc.dupe(u8, value) else null;
-        out[i].rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null;
+        out[i] = try metadata_table_manager.cloneSplitTransitionRecord(
+            alloc,
+            record,
+        );
         cloned = i + 1;
     }
     return out;
@@ -1108,6 +1114,191 @@ fn cloneProjectedReplicationSourceStatusesOwned(
     return out;
 }
 
+fn replicationCutoverIntentApplied(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.table_id == expected.table_id and
+        record.source_ordinal == expected.source_ordinal and
+        record.cutover_intent_id == expected.cutover_intent_id and
+        record.cutover_authority_id == expected.cutover_authority_id and
+        std.mem.eql(
+            u8,
+            &record.cutover_config_fingerprint,
+            &expected.cutover_config_fingerprint,
+        ) and
+        std.mem.eql(
+            u8,
+            &record.cutover_provider_identity,
+            &expected.cutover_provider_identity,
+        ) and
+        std.mem.eql(u8, record.source_kind, expected.source_kind) and
+        std.mem.eql(u8, record.external_table, expected.external_table) and
+        std.mem.eql(u8, record.cutover_mode, expected.cutover_mode) and
+        std.mem.eql(u8, record.slot_name, expected.slot_name) and
+        std.mem.eql(u8, record.publication_name, expected.publication_name) and
+        std.mem.eql(u8, record.phase, expected.phase) and
+        record.retired_cutover_authority_id ==
+            expected.retired_cutover_authority_id and
+        std.mem.eql(
+            u8,
+            record.retired_slot_name,
+            expected.retired_slot_name,
+        ) and
+        std.mem.eql(
+            u8,
+            record.retired_publication_name,
+            expected.retired_publication_name,
+        );
+}
+
+fn replicationCutoverAuthorityMatches(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.table_id == expected.table_id and
+        record.source_ordinal == expected.source_ordinal and
+        record.cutover_intent_id == expected.cutover_intent_id and
+        record.cutover_authority_id == expected.cutover_authority_id and
+        std.mem.eql(
+            u8,
+            &record.cutover_config_fingerprint,
+            &expected.cutover_config_fingerprint,
+        ) and
+        std.mem.eql(
+            u8,
+            &record.cutover_provider_identity,
+            &expected.cutover_provider_identity,
+        ) and
+        std.mem.eql(u8, record.source_kind, expected.source_kind) and
+        std.mem.eql(u8, record.external_table, expected.external_table) and
+        std.mem.eql(u8, record.slot_name, expected.slot_name) and
+        std.mem.eql(u8, record.publication_name, expected.publication_name);
+}
+
+fn replicationCutoverRetirementMatches(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.retired_cutover_authority_id ==
+        expected.retired_cutover_authority_id and
+        std.mem.eql(
+            u8,
+            record.retired_slot_name,
+            expected.retired_slot_name,
+        ) and
+        std.mem.eql(
+            u8,
+            record.retired_publication_name,
+            expected.retired_publication_name,
+        );
+}
+
+fn isExpectedCdcRoundError(err: anyerror) bool {
+    return switch (err) {
+        error.UnknownReplicationSource,
+        error.UnsupportedReplicationSource,
+        error.UnsupportedReplicationStreaming,
+        error.UnsupportedReplicationTransform,
+        error.UnsupportedReplicationRoute,
+        error.ReplicationExactCutoverRequired,
+        error.InvalidReplicationSourceConfig,
+        error.InvalidReplicationSourceRow,
+        error.LibpqUnavailable,
+        error.ForeignAuthFailed,
+        error.ForeignConnectionFailed,
+        error.ForeignConnectionPoolLimitExceeded,
+        error.ForeignColumnCacheLimitExceeded,
+        error.ForeignQueryFailed,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
+        error.ReplicationCutoverAuthorityLost,
+        error.ReplicationSourceConfigChanged,
+        error.InvalidReplicationCutoverIntent,
+        error.ForeignReplicationSlotMissing,
+        error.ForeignTableNotFound,
+        error.ExactCutoverCleanupPending,
+        error.CdcWorkLeaseLost,
+        error.CdcWorkShuttingDown,
+        error.CdcWorkLeaseRenewalTimeout,
+        error.MetadataMutationApplyTimeout,
+        error.Timeout,
+        error.FileNotFound,
+        error.InvalidQueryRequest,
+        error.WriterLocked,
+        error.LmdbUnexpected,
+        error.Corrupted,
+        error.UnknownColumn,
+        => true,
+        else => false,
+    };
+}
+
+test "metadata durable cutover acknowledgement is attempt scoped" {
+    const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const expected = metadata_table_manager.ReplicationSourceStatusRecord{
+        .table_id = 41,
+        .source_ordinal = 2,
+        .source_kind = "postgres",
+        .external_table = "public.docs",
+        .cutover_mode = "exported_snapshot_pending",
+        .slot_name = "antfly_docs",
+        .publication_name = "antfly_docs_pub",
+        .phase = "cutover_preparing",
+        .cutover_intent_id = 99,
+        .cutover_authority_id = 1001,
+        .cutover_config_fingerprint = fingerprint,
+        .cutover_provider_identity = [_]u8{0x6b} ** std.crypto.hash.sha2.Sha256.digest_length,
+    };
+    try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
+
+    var stale_attempt = expected;
+    stale_attempt.cutover_intent_id = 98;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_attempt, expected));
+
+    var stale_authority = expected;
+    stale_authority.cutover_authority_id = 1000;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_authority, expected));
+
+    var stale_provider = expected;
+    stale_provider.cutover_provider_identity[0] ^= 0xff;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_provider, expected));
+
+    var stale_config = expected;
+    stale_config.cutover_config_fingerprint[0] ^= 0xff;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_config, expected));
+
+    var overwritten_phase = expected;
+    overwritten_phase.phase = "failed";
+    try std.testing.expect(!replicationCutoverIntentApplied(overwritten_phase, expected));
+
+    var stale_retirement = expected;
+    stale_retirement.retired_cutover_authority_id = 1000;
+    stale_retirement.retired_slot_name = "antfly_docs_old";
+    stale_retirement.retired_publication_name = "antfly_docs_pub_old";
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_retirement, expected));
+}
+
+test "metadata CDC round error policy isolates expected recovery failures" {
+    const expected_errors = [_]anyerror{
+        error.ExactCutoverCleanupPending,
+        error.MetadataMutationApplyTimeout,
+        error.Timeout,
+        error.ForeignConnectionPoolLimitExceeded,
+        error.ForeignColumnCacheLimitExceeded,
+        error.ForeignConnectionFailed,
+        error.ForeignQueryFailed,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
+    };
+    for (expected_errors) |err| try std.testing.expect(isExpectedCdcRoundError(err));
+
+    // Process-health and authority failures remain visible to the lifecycle
+    // owner instead of being mistaken for a source-local retry.
+    try std.testing.expect(!isExpectedCdcRoundError(error.OutOfMemory));
+    try std.testing.expect(!isExpectedCdcRoundError(error.NotLeader));
+}
+
 fn cloneProjectedMergeTransitionsOwned(
     alloc: std.mem.Allocator,
     records: []const transition_state.MergeTransitionRecord,
@@ -1119,15 +1310,10 @@ fn cloneProjectedMergeTransitionsOwned(
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .transition_id = record.transition_id,
-            .donor_group_id = record.donor_group_id,
-            .receiver_group_id = record.receiver_group_id,
-            .phase = record.phase,
-            .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
-        };
-        errdefer metadata_table_manager.freeMergeTransitionRecord(alloc, out[i]);
-        out[i].rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null;
+        out[i] = try metadata_table_manager.cloneMergeTransitionRecord(
+            alloc,
+            record,
+        );
         cloned = i + 1;
     }
     return out;
@@ -1235,6 +1421,11 @@ pub const MetadataService = struct {
     local_schema_progress_group_ids_fingerprint: ?u64,
     last_local_schema_progress_refresh_at_ms: u64,
     cdc_runtime_mutex: std.Io.Mutex = .init,
+    reconcile_lease_mutex: std.Io.Mutex = .init,
+    cdc_job_in_flight: std.atomic.Value(bool) = .init(false),
+    cdc_shutdown: std.atomic.Value(bool) = .init(false),
+    cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
+    cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1318,6 +1509,7 @@ pub const MetadataService = struct {
     }
 
     pub fn deinit(self: *MetadataService) void {
+        shutdownCdcRuntimeJobs(self);
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
@@ -1632,8 +1824,104 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn replaceTableDefinition(
+        self: *MetadataService,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        if (expected.table_id == 0 or
+            replacement.table_id != expected.table_id or
+            !std.mem.eql(u8, replacement.name, expected.name))
+            return error.InvalidTableDefinitionReplacement;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            expected.table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const current = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current);
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
+                return error.TableGenerationChanged;
+
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                expected.table_id,
+            );
+            if (fence.active() or fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        if (try store.getTable(self.alloc, self.metadata_group_id, table_id)) |current| {
+            metadata_table_manager.freeTable(self.alloc, current);
+        } else {
+            return;
+        }
+        try self.proposeTransitionCommand(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = baseline_fence.generation,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            if (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                table_id,
+            )) |current| {
+                metadata_table_manager.freeTable(self.alloc, current);
+            } else {
+                return;
+            }
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                table_id,
+            );
+            if (fence.active() or
+                fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertSchemaProgress(self: *MetadataService, record: metadata_table_manager.SchemaProgressRecord) !void {
@@ -1663,15 +1951,144 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    pub fn removeReplicationSourceStatus(self: *MetadataService, table_id: u64, source_ordinal: u32) !void {
-        try self.proposeTransitionCommand(.{ .remove_replication_source_status = .{
-            .table_id = table_id,
-            .source_ordinal = source_ordinal,
+    /// Atomically claims exact-cutover authority against both the current
+    /// source catalog and prior authority, then waits for the applied proof.
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *MetadataService,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        if (record.cutover_intent_id == 0 or
+            record.cutover_authority_id == 0 or
+            std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
+            return error.InvalidReplicationCutoverIntent;
+        try self.proposeTransitionCommand(.{ .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = expected_replication_sources_json,
+            .expected_authority_id = expected_authority_id,
+            .record = record,
         } });
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            if (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+                record.source_ordinal,
+            )) |applied_record| {
+                defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
+                if (replicationCutoverIntentApplied(applied_record, record)) return;
+                if (applied_record.cutover_authority_id != expected_authority_id)
+                    return error.ReplicationCutoverAuthorityLost;
+            }
+            const current_table = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current_table);
+            if (!std.mem.eql(
+                u8,
+                current_table.replication_sources_json,
+                expected_replication_sources_json,
+            )) return error.ReplicationSourceConfigChanged;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: *MetadataService,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+        )) orelse return error.ReplicationSourceConfigChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!std.mem.eql(
+            u8,
+            table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
+        if (!replicationCutoverAuthorityMatches(current, expected))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *MetadataService,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        if (expected.cutover_authority_id == 0 or
+            expected.retired_cutover_authority_id == 0 or
+            expected.retired_slot_name.len == 0 or
+            expected.retired_publication_name.len == 0)
+            return error.InvalidReplicationCutoverIntent;
+        try self.proposeTransitionCommand(.{
+            .complete_replication_source_retirement = expected,
+        });
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse
+                return error.MissingMetadataStore;
+            const current = (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+                expected.source_ordinal,
+            )) orelse return error.ReplicationCutoverAuthorityLost;
+            defer metadata_table_manager.freeReplicationSourceStatus(
+                self.alloc,
+                current,
+            );
+            if (!replicationCutoverAuthorityMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+            if (current.retired_cutover_authority_id == 0 and
+                current.retired_slot_name.len == 0 and
+                current.retired_publication_name.len == 0)
+                return;
+            if (!replicationCutoverRetirementMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertRange(self: *MetadataService, record: metadata_table_manager.RangeRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_range = record });
+    }
+
+    pub fn completeRestoreRange(self: *MetadataService, identity: metadata_table_manager.RestoreIntentIdentity) !void {
+        try self.proposeTransitionCommand(.{ .complete_restore_range = identity });
     }
 
     pub fn removeRange(self: *MetadataService, group_id: u64) !void {
@@ -1707,13 +2124,18 @@ pub const MetadataService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataService, requested_at_ms: u64) !void {
+        const runtime = try self.ensureBackendRuntime();
+        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
+            .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
     }
 
-    pub fn clearReallocationRequest(self: *MetadataService) !void {
-        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    pub fn clearReallocationRequest(self: *MetadataService, expected_request_id: u128) !void {
+        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
     }
 
     pub fn upsertExtensionPackage(self: *MetadataService, record: extension_domain.PackageManifest) !void {
@@ -1860,7 +2282,7 @@ pub const MetadataService = struct {
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
         for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) try self.clearReallocationRequest();
+        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
     }
 
     pub fn observeSplitTransition(self: *MetadataService, transition_id: u64) !?transition_state.SplitObservation {
@@ -2045,6 +2467,8 @@ pub const MetadataService = struct {
     }
 
     pub fn reconcileLeaseStats(self: *MetadataService) metadata_reconcile_lease.Stats {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
         return self.reconcile_lease.stats();
     }
 
@@ -2413,8 +2837,9 @@ pub const MetadataService = struct {
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgress(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
             self.alloc,
+            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
@@ -2554,6 +2979,12 @@ pub const MetadataService = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataService) !bool {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
+        return try self.ensureReconcileLeaseLocked();
+    }
+
+    fn ensureReconcileLeaseLocked(self: *MetadataService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
         const is_local_leader = self.isLocalMetadataLeader();
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
@@ -2601,65 +3032,46 @@ pub const MetadataService = struct {
     }
 
     fn runReplicationBackfillRound(self: *MetadataService) !void {
-        const replica_root_dir = self.replica_root_dir orelse return;
-        if (!self.isLocalMetadataLeader()) return;
-        self.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.cdc_runtime_mutex.unlock(std.Options.debug_io);
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        if (now_ms < self.cdc_next_round_at_ms) return;
-        self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
+        try scheduleReplicationBackfillJob(self);
+    }
 
+    fn runReplicationBackfillWorker(self: *MetadataService) !void {
+        const replica_root_dir = self.replica_root_dir orelse return;
+        try ensureCdcWorkPermit(self);
+
+        const runtime = try self.ensureBackendRuntime();
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
             api_table_catalog.CatalogSource.fromMetadataService(self),
         );
-        write_source.backend_runtime = try self.ensureBackendRuntime();
+        write_source.backend_runtime = runtime;
         _ = write_source.withSecretStore(self.secret_store);
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
+                .io = runtime.io() orelse std.Options.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
-        const summary = coordinator.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const summary = coordinator.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (summary.sources_considered > 0) {
             std.log.info(
-                "metadata cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d}",
+                "metadata cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d}",
                 .{
                     summary.tables_considered,
                     summary.sources_considered,
                     summary.sources_started,
                     summary.sources_resumed,
                     summary.sources_completed,
+                    summary.sources_yielded,
                 },
             );
         }
@@ -2670,34 +3082,13 @@ pub const MetadataService = struct {
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
-        const stream_summary = streaming.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const stream_summary = streaming.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (stream_summary.sources_considered > 0) {
             std.log.info(
@@ -2743,6 +3134,11 @@ pub const MetadataHttpService = struct {
     local_schema_progress_group_ids_fingerprint: ?u64,
     last_local_schema_progress_refresh_at_ms: u64,
     cdc_runtime_mutex: std.Io.Mutex = .init,
+    reconcile_lease_mutex: std.Io.Mutex = .init,
+    cdc_job_in_flight: std.atomic.Value(bool) = .init(false),
+    cdc_shutdown: std.atomic.Value(bool) = .init(false),
+    cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
+    cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
     placement_reconcile_mutex: std.Io.Mutex = .init,
@@ -2849,6 +3245,7 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn deinit(self: *MetadataHttpService) void {
+        shutdownCdcRuntimeJobs(self);
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
@@ -3118,8 +3515,113 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn replaceTableDefinition(
+        self: *MetadataHttpService,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        if (expected.table_id == 0 or
+            replacement.table_id != expected.table_id or
+            !std.mem.eql(u8, replacement.name, expected.name))
+            return error.InvalidTableDefinitionReplacement;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            expected.table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const current = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current);
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
+                return error.TableGenerationChanged;
+
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                expected.table_id,
+            );
+            if (fence.active() or fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        if (try store.getTable(self.alloc, self.metadata_group_id, table_id)) |current| {
+            metadata_table_manager.freeTable(self.alloc, current);
+        } else {
+            return;
+        }
+        try self.proposeTransitionCommand(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = baseline_fence.generation,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            if (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                table_id,
+            )) |current| {
+                metadata_table_manager.freeTable(self.alloc, current);
+            } else {
+                return;
+            }
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                table_id,
+            );
+            if (fence.active() or
+                fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(
+                    self.metadata_group_id,
+                )) return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertSchemaProgress(self: *MetadataHttpService, record: metadata_table_manager.SchemaProgressRecord) !void {
@@ -3149,15 +3651,153 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    pub fn removeReplicationSourceStatus(self: *MetadataHttpService, table_id: u64, source_ordinal: u32) !void {
-        try self.proposeTransitionCommand(.{ .remove_replication_source_status = .{
-            .table_id = table_id,
-            .source_ordinal = source_ordinal,
+    /// Atomically claims exact-cutover authority against both the current
+    /// source catalog and prior authority, then waits for the applied proof.
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *MetadataHttpService,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        if (record.cutover_intent_id == 0 or
+            record.cutover_authority_id == 0 or
+            std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
+            return error.InvalidReplicationCutoverIntent;
+        try self.proposeTransitionCommand(.{ .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = expected_replication_sources_json,
+            .expected_authority_id = expected_authority_id,
+            .record = record,
         } });
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            if (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+                record.source_ordinal,
+            )) |applied_record| {
+                defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
+                if (replicationCutoverIntentApplied(applied_record, record)) return;
+                if (applied_record.cutover_authority_id != expected_authority_id)
+                    return error.ReplicationCutoverAuthorityLost;
+            }
+            const current_table = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current_table);
+            if (!std.mem.eql(
+                u8,
+                current_table.replication_sources_json,
+                expected_replication_sources_json,
+            )) return error.ReplicationSourceConfigChanged;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: *MetadataHttpService,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+        )) orelse return error.ReplicationSourceConfigChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!std.mem.eql(
+            u8,
+            table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
+        if (!replicationCutoverAuthorityMatches(current, expected))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *MetadataHttpService,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        if (expected.cutover_authority_id == 0 or
+            expected.retired_cutover_authority_id == 0 or
+            expected.retired_slot_name.len == 0 or
+            expected.retired_publication_name.len == 0)
+            return error.InvalidReplicationCutoverIntent;
+        try self.proposeTransitionCommand(.{
+            .complete_replication_source_retirement = expected,
+        });
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse
+                return error.MissingMetadataStore;
+            const current = (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+                expected.source_ordinal,
+            )) orelse return error.ReplicationCutoverAuthorityLost;
+            defer metadata_table_manager.freeReplicationSourceStatus(
+                self.alloc,
+                current,
+            );
+            if (!replicationCutoverAuthorityMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+            if (current.retired_cutover_authority_id == 0 and
+                current.retired_slot_name.len == 0 and
+                current.retired_publication_name.len == 0)
+                return;
+            if (!replicationCutoverRetirementMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(
+                    self.metadata_group_id,
+                )) return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertRange(self: *MetadataHttpService, record: metadata_table_manager.RangeRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_range = record });
+    }
+
+    pub fn completeRestoreRange(self: *MetadataHttpService, identity: metadata_table_manager.RestoreIntentIdentity) !void {
+        try self.proposeTransitionCommand(.{ .complete_restore_range = identity });
     }
 
     pub fn removeRange(self: *MetadataHttpService, group_id: u64) !void {
@@ -3193,13 +3833,18 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataHttpService, requested_at_ms: u64) !void {
+        const runtime = try self.ensureBackendRuntime();
+        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
+            .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
     }
 
-    pub fn clearReallocationRequest(self: *MetadataHttpService) !void {
-        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    pub fn clearReallocationRequest(self: *MetadataHttpService, expected_request_id: u128) !void {
+        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
     }
 
     pub fn upsertExtensionPackage(self: *MetadataHttpService, record: extension_domain.PackageManifest) !void {
@@ -3486,7 +4131,7 @@ pub const MetadataHttpService = struct {
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
         for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) try self.clearReallocationRequest();
+        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {
@@ -3764,7 +4409,7 @@ pub const MetadataHttpService = struct {
         );
         const persist = ready.persist_ready_detail;
         std.log.warn(
-            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} wal_inner_segment_syncs={d} wal_inner_index_syncs={d} wal_post_commit_segment_syncs={d} wal_post_commit_index_syncs={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
             .{
                 request_id,
                 ready.group_id,
@@ -3780,6 +4425,10 @@ pub const MetadataHttpService = struct {
                 @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
                 persist.wal_physical_commits,
+                persist.wal_inner_segment_syncs,
+                persist.wal_inner_index_syncs,
+                persist.wal_post_commit_segment_syncs,
+                persist.wal_post_commit_index_syncs,
                 persist.encoded_bytes,
                 persist.delta_records_since_checkpoint,
                 persist.delta_bytes_since_checkpoint,
@@ -3879,7 +4528,10 @@ pub const MetadataHttpService = struct {
         return snapshot;
     }
 
-    pub fn groupTransitionReady(self: *MetadataHttpService, group_id: u64) !bool {
+    pub fn groupTransitionReadiness(
+        self: *MetadataHttpService,
+        group_id: u64,
+    ) !transition_state.StablePlacementReadiness {
         self.transition_readiness_mutex.lockUncancelable(std.Options.debug_io);
         defer self.transition_readiness_mutex.unlock(std.Options.debug_io);
 
@@ -3887,7 +4539,7 @@ pub const MetadataHttpService = struct {
         for (0..4) |_| {
             const epoch = self.transition_readiness_epoch.load(.acquire);
             if (cache.initialized and cache.epoch == epoch) {
-                return cache.ready_by_group.get(group_id) orelse false;
+                return cache.ready_by_group.get(group_id) orelse .status_unavailable;
             }
 
             var inputs = try self.captureTransitionReadinessInputs();
@@ -3906,7 +4558,7 @@ pub const MetadataHttpService = struct {
             cache.ready_by_group = next;
             cache.epoch = epoch;
             cache.initialized = true;
-            return cache.ready_by_group.get(group_id) orelse false;
+            return cache.ready_by_group.get(group_id) orelse .status_unavailable;
         }
         return error.MetadataProjectionAdvanced;
     }
@@ -4047,6 +4699,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn reconcileLeaseStats(self: *MetadataHttpService) metadata_reconcile_lease.Stats {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
         return self.reconcile_lease.stats();
     }
 
@@ -4565,8 +5219,9 @@ pub const MetadataHttpService = struct {
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgress(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
             self.alloc,
+            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
@@ -4715,6 +5370,12 @@ pub const MetadataHttpService = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataHttpService) !bool {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
+        return try self.ensureReconcileLeaseLocked();
+    }
+
+    fn ensureReconcileLeaseLocked(self: *MetadataHttpService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
         const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
@@ -4762,14 +5423,14 @@ pub const MetadataHttpService = struct {
     }
 
     fn runReplicationBackfillRound(self: *MetadataHttpService) !void {
-        const replica_root_dir = self.replica_root_dir orelse return;
-        if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        self.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.cdc_runtime_mutex.unlock(std.Options.debug_io);
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        if (now_ms < self.cdc_next_round_at_ms) return;
-        self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
+        try scheduleReplicationBackfillJob(self);
+    }
 
+    fn runReplicationBackfillWorker(self: *MetadataHttpService) !void {
+        const replica_root_dir = self.replica_root_dir orelse return;
+        try ensureCdcWorkPermit(self);
+
+        const runtime = try self.ensureBackendRuntime();
         const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
@@ -4783,57 +5444,38 @@ pub const MetadataHttpService = struct {
             cdc_group_router.router(),
             self.raft.host.http_host.request_executor,
         );
-        _ = hosted_write_source.withBackendRuntime(try self.ensureBackendRuntime());
+        _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
+                .io = runtime.io() orelse std.Options.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
-        const summary = coordinator.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                if (comptime builtin.is_test) {
-                    std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
-                }
-                std.log.warn("metadata http cdc snapshot round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const summary = coordinator.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            if (comptime builtin.is_test) {
+                std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
+            }
+            std.log.warn("metadata http cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (summary.sources_considered > 0) {
             std.log.info(
-                "metadata http cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d}",
+                "metadata http cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d}",
                 .{
                     summary.tables_considered,
                     summary.sources_considered,
                     summary.sources_started,
                     summary.sources_resumed,
                     summary.sources_completed,
+                    summary.sources_yielded,
                 },
             );
         }
@@ -4844,34 +5486,13 @@ pub const MetadataHttpService = struct {
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
-        const stream_summary = streaming.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const stream_summary = streaming.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (stream_summary.sources_considered > 0) {
             std.log.info(
@@ -4889,6 +5510,250 @@ pub const MetadataHttpService = struct {
         }
     }
 };
+
+fn cdcLocalMetadataLeader(service: anytype) bool {
+    const Service = @TypeOf(service.*);
+    if (Service == MetadataService) return service.isLocalMetadataLeader();
+    service.lockRuntime();
+    defer service.unlockRuntime();
+    return service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id);
+}
+
+fn shutdownCdcRuntimeJobs(service: anytype) void {
+    service.cdc_shutdown.store(true, .release);
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    const runtime = service.backend_runtime;
+    const owner_id = service.cdc_job_owner_id;
+    service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    if (runtime) |value| {
+        if (owner_id != 0) value.durable_jobs.closeOwner(owner_id);
+    }
+}
+
+fn advanceCdcLeaseRaft(service: anytype) !void {
+    const Service = @TypeOf(service.*);
+    service.lockRuntime();
+    defer service.unlockRuntime();
+    if (Service == MetadataService) {
+        if (!service.raft.host.host.isLocalLeader(service.metadata_group_id))
+            return error.CdcWorkLeaseLost;
+        try service.raft.runRaftRoundOnly();
+    } else {
+        if (!service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id))
+            return error.CdcWorkLeaseLost;
+        if (service.raft.pending_updates.items.len > 0) {
+            _ = try service.raft.syncPendingRaftOnly();
+        } else {
+            try service.raft.runRaftRoundOnly();
+        }
+    }
+}
+
+fn ensureCdcWorkPermit(service: anytype) !void {
+    if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns < service.cdc_permit_check_after_ns.load(.acquire)) return;
+
+    service.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.reconcile_lease_mutex.unlock(std.Options.debug_io);
+
+    const locked_now_ns = platform_time.monotonicNs();
+    if (locked_now_ns < service.cdc_permit_check_after_ns.load(.acquire)) return;
+    if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+    const permit_cache_ns = @min(
+        @as(u64, 250 * std.time.ns_per_ms),
+        @max(
+            @as(u64, std.time.ns_per_ms),
+            (service.reconcile_lease.config.lease_ttl_ms *|
+                std.time.ns_per_ms) / 10,
+        ),
+    );
+    if (!service.reconcile_lease.config.enabled) {
+        service.cdc_permit_check_after_ns.store(
+            locked_now_ns +| permit_cache_ns,
+            .release,
+        );
+        return;
+    }
+
+    const renew_timeout_ns = @min(
+        linearizable_metadata_read_timeout_ns,
+        service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
+    );
+    const deadline_ns = platform_time.monotonicNs() +| renew_timeout_ns;
+    var proposed_expires_at_ms: u64 = 0;
+    while (platform_time.monotonicNs() < deadline_ns) {
+        if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
+        if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+
+        const now_ms = service.reconcile_lease.nowMs();
+        const projected = try service.getProjectedReconcileLease();
+        _ = service.reconcile_lease.observe(true, projected, now_ms);
+        const minimum_remaining_ms = @max(
+            @as(u64, 1),
+            service.reconcile_lease.config.lease_ttl_ms / 2,
+        );
+        if (projected) |current| {
+            if (current.owner_node_id == service.reconcile_lease.local_node_id and
+                current.expires_at_ms > now_ms +| minimum_remaining_ms)
+            {
+                service.cdc_permit_check_after_ns.store(
+                    platform_time.monotonicNs() +| permit_cache_ns,
+                    .release,
+                );
+                return;
+            }
+            if (current.owner_node_id != service.reconcile_lease.local_node_id and
+                current.expires_at_ms > now_ms)
+                return error.CdcWorkLeaseLost;
+        }
+
+        const desired = service.reconcile_lease.desiredRecord(now_ms);
+        if (desired.expires_at_ms > proposed_expires_at_ms) {
+            service.upsertReconcileLease(desired) catch |err| {
+                service.reconcile_lease.noteAcquireFailure();
+                return err;
+            };
+            proposed_expires_at_ms = desired.expires_at_ms;
+        }
+        try advanceCdcLeaseRaft(service);
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    return error.CdcWorkLeaseRenewalTimeout;
+}
+
+fn cdcWorkDeadlineNs(service: anytype) !u64 {
+    try ensureCdcWorkPermit(service);
+    if (!service.reconcile_lease.config.enabled)
+        return platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+
+    service.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.reconcile_lease_mutex.unlock(std.Options.debug_io);
+    const now_ms = service.reconcile_lease.nowMs();
+    if (service.reconcile_lease.owner_node_id !=
+        service.reconcile_lease.local_node_id or
+        service.reconcile_lease.expires_at_ms <= now_ms)
+        return error.CdcWorkLeaseLost;
+    const remaining_ms = service.reconcile_lease.expires_at_ms - now_ms;
+    const quantum_ns = try cdcProviderQuantumNs(
+        service.reconcile_lease.config.lease_ttl_ms,
+        remaining_ms,
+    );
+    return platform_time.monotonicNs() +| quantum_ns;
+}
+
+fn cdcProviderQuantumNs(ttl_ms: u64, remaining_ms: u64) !u64 {
+    if (ttl_ms == 0 or remaining_ms <= 1) return error.CdcWorkLeaseLost;
+    const safety_ms = @max(
+        @as(u64, 1),
+        @min(ttl_ms / 10, remaining_ms / 2),
+    );
+    if (remaining_ms <= safety_ms) return error.CdcWorkLeaseLost;
+    const lease_budget_ns =
+        (remaining_ms - safety_ms) *| std.time.ns_per_ms;
+    const configured_quantum_ns = @max(
+        @as(u64, std.time.ns_per_ms),
+        (ttl_ms *| std.time.ns_per_ms) / 3,
+    );
+    return @min(
+        @as(u64, 5 * std.time.ns_per_s),
+        @min(configured_quantum_ns, lease_budget_ns),
+    );
+}
+
+test "metadata cdc provider quantum is bounded by observed lease remainder" {
+    try std.testing.expectError(
+        error.CdcWorkLeaseLost,
+        cdcProviderQuantumNs(100, 1),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 100 * std.time.ns_per_ms / 3),
+        try cdcProviderQuantumNs(100, 60),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 50 * std.time.ns_per_ms),
+        try cdcProviderQuantumNs(5_000, 100),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 5_000 * std.time.ns_per_ms / 3),
+        try cdcProviderQuantumNs(5_000, 3_000),
+    );
+}
+
+fn cdcWorkPermit(service: anytype) metadata_replication_backfill.WorkPermit {
+    const Service = @TypeOf(service.*);
+    const Callbacks = struct {
+        fn checkpoint(ptr: *anyopaque) !void {
+            const typed: *Service = @ptrCast(@alignCast(ptr));
+            try ensureCdcWorkPermit(typed);
+        }
+
+        fn deadline(ptr: *anyopaque) !u64 {
+            const typed: *Service = @ptrCast(@alignCast(ptr));
+            return try cdcWorkDeadlineNs(typed);
+        }
+    };
+    return .{
+        .ptr = service,
+        .checkpoint_fn = Callbacks.checkpoint,
+        .deadline_fn = Callbacks.deadline,
+    };
+}
+
+fn scheduleReplicationBackfillJob(service: anytype) !void {
+    const Service = @TypeOf(service.*);
+    if (service.replica_root_dir == null or !cdcLocalMetadataLeader(service)) return;
+
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    if (service.cdc_shutdown.load(.acquire)) return;
+    if (service.cdc_job_in_flight.load(.acquire)) return;
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    if (now_ms < service.cdc_next_round_at_ms) return;
+
+    const runtime = try service.ensureBackendRuntime();
+    if (service.cdc_job_owner_id == 0)
+        service.cdc_job_owner_id = try runtime.allocOwnerId();
+
+    const JobContext = struct {
+        alloc: std.mem.Allocator,
+        service: *Service,
+
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            ctx.service.runReplicationBackfillWorker() catch |err| {
+                if (isExpectedCdcRoundError(err)) {
+                    std.log.warn("metadata CDC maintenance job deferred: {s}", .{@errorName(err)});
+                } else {
+                    std.log.err("metadata CDC maintenance job failed: {s}", .{@errorName(err)});
+                }
+            };
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            ctx.service.cdc_job_in_flight.store(false, .release);
+            const alloc = ctx.alloc;
+            alloc.destroy(ctx);
+        }
+    };
+
+    const ctx = try service.alloc.create(JobContext);
+    ctx.* = .{ .alloc = service.alloc, .service = service };
+    service.cdc_job_in_flight.store(true, .release);
+    runtime.durable_jobs.submit(.{
+        .owner_id = service.cdc_job_owner_id,
+        .class = .maintenance,
+        .ptr = ctx,
+        .run = JobContext.run,
+        .deinit = JobContext.deinit,
+    }) catch |err| {
+        JobContext.deinit(ctx);
+        return err;
+    };
+    service.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
+}
 
 fn syncLocalSchemaProgress(
     service: anytype,
@@ -4938,8 +5803,10 @@ fn syncLocalRestoreProgress(
 
 fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b: metadata_table_manager.RestoreProgressRecord) bool {
     return std.mem.eql(u8, a.backup_id, b.backup_id) and
+        std.mem.eql(u8, a.artifact_backup_id, b.artifact_backup_id) and
         std.mem.eql(u8, a.location, b.location) and
         std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
+        std.mem.eql(u8, a.artifact_sha256, b.artifact_sha256) and
         a.primary_restored == b.primary_restored and
         a.runtime_repair_complete == b.runtime_repair_complete and
         std.mem.eql(u8, a.phase, b.phase) and
@@ -4994,58 +5861,23 @@ fn completeRestoreIntentsForService(
 
     for (ranges) |range| {
         const table = findProjectedTableById(tables, range.table_id) orelse continue;
-        const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        const restore_location = restoreLocationForRange(range, table) orelse continue;
-        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, restore_location, placements, progress)) continue;
-        if (range.restore_backup_id.len == 0 and range.restore_location.len == 0) continue;
+        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+        if (!rangeRestoreIntentComplete(
+            table.table_id,
+            range,
+            range.restore_backup_id,
+            range.restore_location,
+            placements,
+            progress,
+        )) continue;
 
-        var cleared = try metadata_table_manager.cloneRange(service.alloc, range);
-        errdefer metadata_table_manager.freeRange(service.alloc, cleared);
-        service.alloc.free(cleared.restore_backup_id);
-        service.alloc.free(cleared.restore_location);
-        service.alloc.free(cleared.restore_snapshot_path);
-        cleared.restore_backup_id = try service.alloc.dupe(u8, "");
-        cleared.restore_location = try service.alloc.dupe(u8, "");
-        cleared.restore_snapshot_path = try service.alloc.dupe(u8, "");
-        try service.upsertRange(cleared);
-        metadata_table_manager.freeRange(service.alloc, cleared);
+        try service.completeRestoreRange(metadata_table_manager.restoreIntentIdentity(range));
     }
-
-    for (tables) |table| {
-        if (table.restore_backup_id.len == 0) continue;
-        if (!restoreIntentComplete(table, ranges, placements, progress)) continue;
-
-        var cleared = try metadata_table_manager.cloneTable(service.alloc, table);
-        errdefer metadata_table_manager.freeTable(service.alloc, cleared);
-        service.alloc.free(cleared.restore_backup_id);
-        service.alloc.free(cleared.restore_location);
-        cleared.restore_backup_id = try service.alloc.dupe(u8, "");
-        cleared.restore_location = try service.alloc.dupe(u8, "");
-        try service.upsertTable(cleared);
-        metadata_table_manager.freeTable(service.alloc, cleared);
-    }
-}
-
-fn restoreIntentComplete(
-    table: metadata_table_manager.TableRecord,
-    ranges: []const metadata_table_manager.RangeRecord,
-    placements: []const raft_reconciler.PlacementIntent,
-    progress: []const metadata_table_manager.RestoreProgressRecord,
-) bool {
-    var found_any_range = false;
-    for (ranges) |range| {
-        if (range.table_id != table.table_id) continue;
-        const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        const restore_location = restoreLocationForRange(range, table) orelse return false;
-        found_any_range = true;
-        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, restore_location, placements, progress)) return false;
-    }
-    return found_any_range;
 }
 
 fn rangeRestoreIntentComplete(
     table_id: u64,
-    group_id: u64,
+    range: metadata_table_manager.RangeRecord,
     restore_backup_id: []const u8,
     restore_location: []const u8,
     placements: []const raft_reconciler.PlacementIntent,
@@ -5053,32 +5885,17 @@ fn rangeRestoreIntentComplete(
 ) bool {
     var found_any_placement = false;
     for (placements) |intent| {
-        if (intent.record.group_id != group_id) continue;
+        if (intent.record.group_id != range.group_id) continue;
         found_any_placement = true;
-        const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, group_id) orelse return false;
+        const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, range.group_id) orelse return false;
         if (!std.mem.eql(u8, restored.backup_id, restore_backup_id)) return false;
+        if (!std.mem.eql(u8, restored.artifact_backup_id, range.restore_artifact_backup_id)) return false;
         if (!std.mem.eql(u8, restored.location, restore_location)) return false;
+        if (!std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path)) return false;
+        if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
         if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
     }
     return found_any_placement;
-}
-
-fn restoreBackupIdForRange(
-    range: metadata_table_manager.RangeRecord,
-    table: metadata_table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_backup_id.len > 0) return range.restore_backup_id;
-    if (table.restore_backup_id.len > 0) return table.restore_backup_id;
-    return null;
-}
-
-fn restoreLocationForRange(
-    range: metadata_table_manager.RangeRecord,
-    table: metadata_table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_location.len > 0) return range.restore_location;
-    if (table.restore_location.len > 0) return table.restore_location;
-    return null;
 }
 
 fn collectProjectedSplitObservations(
@@ -5161,6 +5978,11 @@ fn syncLocalStoreStatus(
     const merge_transitions = admin_snapshot.merge_transitions;
     const split_observations = admin_snapshot.split_observations;
     const merge_observations = admin_snapshot.merge_observations;
+    const backend_runtime = try service.ensureBackendRuntime();
+    const status_io = backend_runtime.io() orelse if (builtin.is_test)
+        std.testing.io
+    else
+        return error.BackendIoUnavailable;
 
     var local_stores = std.ArrayListUnmanaged(metadata_table_manager.StoreRecord).empty;
     defer local_stores.deinit(service.alloc);
@@ -5173,6 +5995,9 @@ fn syncLocalStoreStatus(
     const group_statuses = try collectLocalGroupStatusReportsWithProvider(
         service,
         service.alloc,
+        backend_runtime,
+        status_io,
+        local_node_id,
         replica_root_dir,
         tables,
         ranges,
@@ -5204,6 +6029,7 @@ fn syncLocalStoreStatus(
     const reports = try collectExplicitLocalStoreStatusReports(
         service,
         service.alloc,
+        status_io,
         replica_root_dir,
         local_stores.items,
         ranges,
@@ -5220,6 +6046,7 @@ fn syncLocalStoreStatus(
     const shared_reports = try collectSharedRootLocalStoreStatusReports(
         service,
         service.alloc,
+        status_io,
         replica_root_dir,
         local_node_id,
         local_stores.items,
@@ -5259,15 +6086,13 @@ fn reportStoreStatusesWithProjected(
 fn collectExplicitLocalStoreStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     stores: []const metadata_table_manager.StoreRecord,
     ranges: []const metadata_table_manager.RangeRecord,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
     backfill_markers: []const StoreStatusBackfillMarker,
 ) ![]metadata_table_manager.StoreStatusReport {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
     errdefer reports.deinit(alloc);
 
@@ -5275,14 +6100,14 @@ fn collectExplicitLocalStoreStatusReports(
         const store_root = try std.fmt.allocPrint(alloc, "{s}/store-{d}", .{ replica_root_dir, store.store_id });
         defer alloc.free(store_root);
 
-        var dir = openDirPath(io_impl.io(), store_root, false) catch |err| switch (err) {
+        var dir = openDirPath(io, store_root, false) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
                 reports.deinit(alloc);
                 return try alloc.alloc(metadata_table_manager.StoreStatusReport, 0);
             },
             else => return err,
         };
-        dir.close(io_impl.io());
+        dir.close(io);
 
         try reports.append(alloc, try collectLocalStoreStatusReport(
             service,
@@ -5327,6 +6152,7 @@ fn collectLocalStoreStatusReport(
     var progress_sum: f64 = 0.0;
     for (backfill_markers) |marker| {
         if (!storeStatusBackfillMarkerMatchesStore(marker, store.store_id, true)) continue;
+        if (!backfillMarkerMatchesRuntimeGeneration(marker, store.runtime_statuses)) continue;
         try accumulateStoreStatusBackfillProgress(
             alloc,
             ranges,
@@ -5341,6 +6167,16 @@ fn collectLocalStoreStatusReport(
         const millis = std.math.clamp(avg_progress * 1000.0, 0.0, 1000.0);
         report.backfill_progress_millis = @intFromFloat(millis);
     }
+    report.runtime_statuses = try collectStoreRuntimeStatusesWithQuarantinedBackfills(
+        alloc,
+        store.runtime_statuses,
+        ranges,
+        backfill_markers,
+        store.store_id,
+        store.node_id,
+        true,
+    );
+    errdefer metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
     report.group_statuses = try metadata_table_manager.cloneGroupStatuses(alloc, group_statuses);
     return report;
 }
@@ -5348,6 +6184,7 @@ fn collectLocalStoreStatusReport(
 fn collectSharedRootLocalStoreStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     local_node_id: u64,
     stores: []const metadata_table_manager.StoreRecord,
@@ -5359,7 +6196,13 @@ fn collectSharedRootLocalStoreStatusReports(
 ) ![]metadata_table_manager.StoreStatusReport {
     _ = service;
     var reports = try alloc.alloc(metadata_table_manager.StoreStatusReport, stores.len);
-    errdefer alloc.free(reports);
+    errdefer {
+        for (reports) |report| {
+            metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
+            metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+        }
+        alloc.free(reports);
+    }
     for (stores, 0..) |store, i| {
         reports[i] = .{
             .store_id = store.store_id,
@@ -5380,12 +6223,17 @@ fn collectSharedRootLocalStoreStatusReports(
     var progress_sum = try alloc.alloc(f64, stores.len);
     defer alloc.free(progress_sum);
     @memset(progress_sum, 0.0);
+    var quarantined = try alloc.alloc(std.ArrayListUnmanaged(StoreStatusBackfillMarker), stores.len);
+    defer alloc.free(quarantined);
+    for (quarantined) |*list| list.* = .empty;
+    defer for (quarantined) |*list| list.deinit(alloc);
 
     for (backfill_markers) |marker| {
         if (marker.store_id != null) continue;
         const range = findRangeByGroupId(ranges, marker.group_id) orelse continue;
-        const store_id = try resolveSharedRootStoreAffinity(alloc, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
+        const store_id = try resolveSharedRootStoreAffinity(alloc, io, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
         const report_index = findStoreStatusReportIndex(reports, store_id) orelse continue;
+        if (!backfillMarkerMatchesRuntimeGeneration(marker, stores[report_index].runtime_statuses)) continue;
         try accumulateStoreStatusBackfillProgress(
             alloc,
             ranges,
@@ -5393,6 +6241,7 @@ fn collectSharedRootLocalStoreStatusReports(
             &reports[report_index].active_backfills,
             &progress_sum[report_index],
         );
+        if (marker.state == .corrupt) try quarantined[report_index].append(alloc, marker);
     }
 
     for (reports, 0..) |*report, i| {
@@ -5403,6 +6252,17 @@ fn collectSharedRootLocalStoreStatusReports(
     }
     for (reports) |*report| {
         report.group_statuses = try metadata_table_manager.cloneGroupStatuses(alloc, group_statuses);
+    }
+    for (reports, 0..) |*report, i| {
+        report.runtime_statuses = try collectStoreRuntimeStatusesWithQuarantinedBackfills(
+            alloc,
+            stores[i].runtime_statuses,
+            ranges,
+            quarantined[i].items,
+            report.store_id,
+            stores[i].node_id,
+            true,
+        );
     }
     return reports;
 }
@@ -5421,6 +6281,9 @@ fn shouldRefreshLocalStoreStatusForLifecycleRound(service: anytype, backfill_mar
 fn collectLocalGroupStatusReportsWithProvider(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
+    local_node_id: u64,
     replica_root_dir: []const u8,
     tables: []const metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -5451,6 +6314,9 @@ fn collectLocalGroupStatusReportsWithProvider(
     return try collectLocalGroupStatusReports(
         service,
         alloc,
+        backend_runtime,
+        io,
+        local_node_id,
         replica_root_dir,
         tables,
         ranges,
@@ -5466,6 +6332,9 @@ fn collectLocalGroupStatusReportsWithProvider(
 fn collectLocalGroupStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
+    local_node_id: u64,
     replica_root_dir: []const u8,
     tables: []const metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -5487,28 +6356,51 @@ fn collectLocalGroupStatusReports(
         const db_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ replica_root_dir, range.group_id });
         defer alloc.free(db_path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
+        const path_present = present: {
+            _ = statFilePath(io, db_path) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => break :present false,
+                else => return err,
+            };
+            break :present true;
         };
 
-        const group_status = try collectLocalGroupStatusReport(
-            service,
-            alloc,
-            db_path,
-            replica_root_dir,
-            range.group_id,
-            stores,
-            merged_group_statuses,
-            split_transitions,
-            merge_transitions,
-            split_observations,
-            merge_observations,
-        );
-        errdefer metadata_table_manager.freeGroupStatus(alloc, group_status);
-        try reports.append(alloc, group_status);
+        const group_status = if (path_present)
+            try collectLocalGroupStatusReport(
+                service,
+                alloc,
+                backend_runtime,
+                io,
+                db_path,
+                replica_root_dir,
+                range.group_id,
+                stores,
+                merged_group_statuses,
+                split_transitions,
+                merge_transitions,
+                split_observations,
+                merge_observations,
+            )
+        else
+            null;
+        if (group_status) |status| {
+            errdefer metadata_table_manager.freeGroupStatus(alloc, status);
+            try reports.append(alloc, status);
+        } else if (latestLocalGroupStatus(stores, local_node_id, range.group_id)) |previous| {
+            var preserved = previous;
+            const readiness = transition_state.readinessForGroupWithObservations(
+                range.group_id,
+                split_transitions,
+                merge_transitions,
+                split_observations,
+                merge_observations,
+            );
+            preserved.transition_pending = readiness.transition_pending;
+            preserved.replay_required = readiness.replay_required;
+            preserved.replay_caught_up = readiness.replay_caught_up;
+            preserved.cutover_ready = readiness.cutover_ready;
+            preserved.reads_ready_after_cutover = readiness.reads_ready_after_cutover;
+            try reports.append(alloc, preserved);
+        }
     }
 
     return try reports.toOwnedSlice(alloc);
@@ -5517,6 +6409,8 @@ fn collectLocalGroupStatusReports(
 fn collectLocalGroupStatusReport(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
     db_path: []const u8,
     replica_root_dir: ?[]const u8,
     group_id: u64,
@@ -5526,10 +6420,10 @@ fn collectLocalGroupStatusReport(
     merge_transitions: []const transition_state.MergeTransitionRecord,
     split_observations: []const transition_state.SplitObservationRecord,
     merge_observations: []const transition_state.MergeObservationRecord,
-) !metadata_table_manager.GroupStatusReport {
+) !?metadata_table_manager.GroupStatusReport {
     _ = stores;
     _ = merged_group_statuses;
-    var db = try db_mod.DB.open(alloc, db_path, .{
+    var db = db_mod.DB.open(alloc, db_path, .{
         // This path is only a fallback when no local data-runtime provider is
         // installed. Group status needs primary identity count and filesystem
         // size, never query execution. Catalog-only mode avoids mmap/open of
@@ -5539,7 +6433,11 @@ fn collectLocalGroupStatusReport(
         .ttl_cleanup = .{ .enabled = false },
         .transaction_recovery = .{ .enabled = false },
         .text_merge = .{ .enabled = false },
-    });
+        .backend_runtime = backend_runtime,
+    }) catch |err| switch (err) {
+        error.GenerationTransitionActive, error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
     defer db.close();
 
     const stats = try db.stats(alloc);
@@ -5550,6 +6448,7 @@ fn collectLocalGroupStatusReport(
     const readiness = if (replica_root_dir) |root_dir|
         try transition_state.readinessForLocalGroup(
             alloc,
+            io,
             root_dir,
             group_id,
             split_transitions,
@@ -5564,16 +6463,18 @@ fn collectLocalGroupStatusReport(
     return .{
         .group_id = group_id,
         .doc_count = stats.doc_count,
-        .disk_bytes = try directoryUsageBytes(alloc, db_path),
+        .disk_bytes = try directoryUsageBytes(alloc, io, db_path),
         .empty = stats.doc_count == 0,
         .created_at_millis = created_at_millis,
-        .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
-        .local_leader = serviceGroupLocalLeader(service, group_id),
+        .updated_at_millis = now_realtime_ms,
+        .local_leader = membership.local_leader,
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
         .voter_set_known = membership.voter_set_known,
         .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
+        .raft_term = membership.raft_term,
+        .raft_membership_index = membership.raft_membership_index,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,
         .replay_caught_up = readiness.replay_caught_up,
@@ -5582,11 +6483,124 @@ fn collectLocalGroupStatusReport(
     };
 }
 
-fn serviceGroupLocalLeader(service: anytype, group_id: u64) bool {
-    const Service = @TypeOf(service);
-    if (Service == *MetadataService) return service.raft.host.host.isLocalLeader(group_id);
-    if (Service == *MetadataHttpService) return service.raft.host.http_host.host.isLocalLeader(group_id);
-    return false;
+fn latestLocalGroupStatus(
+    stores: []const metadata_table_manager.StoreRecord,
+    local_node_id: u64,
+    group_id: u64,
+) ?metadata_table_manager.GroupStatusReport {
+    var latest: ?metadata_table_manager.GroupStatusReport = null;
+    for (stores) |store| {
+        if (store.node_id != local_node_id) continue;
+        for (store.group_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (latest == null or
+                status.raft_term > latest.?.raft_term or
+                (status.raft_term == latest.?.raft_term and
+                    status.raft_applied_index > latest.?.raft_applied_index) or
+                (status.raft_term == latest.?.raft_term and
+                    status.raft_applied_index == latest.?.raft_applied_index and
+                    status.updated_at_millis > latest.?.updated_at_millis))
+            {
+                latest = status;
+            }
+        }
+    }
+    return latest;
+}
+
+test "metadata service status preserves the last observation during a generation transition" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/status-generation-transition",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root});
+    defer alloc.free(db_path);
+    try fs_paths.createDirPathPortable(std.testing.io, db_path);
+
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(db_path);
+    defer transition.deinit();
+
+    const tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    };
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 77, .range_id = 77, .table_id = 7, .start_key = "" },
+    };
+    var previous_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 77,
+        .doc_count = 42,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .empty = false,
+        .updated_at_millis = 1234,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+    }};
+    var stores = [_]metadata_table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .group_statuses = &previous_statuses,
+    }};
+    const splits = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7001,
+        .attempt_epoch = 1,
+        .source_group_id = 77,
+        .destination_group_id = 78,
+        .phase = .prepare,
+    }};
+    const split_observations = [_]transition_state.SplitObservationRecord{.{
+        .transition_id = 7001,
+        .observation = .{
+            .status = .{
+                .phase = .cutover_ready,
+                .source_split_phase = .splitting,
+                .bootstrapped = true,
+                .replay_required = true,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .destination_ready_for_reads = true,
+                .source_delta_sequence = 5,
+                .dest_delta_sequence = 5,
+            },
+        },
+    }};
+    var fake_service: struct {} = .{};
+
+    const reports = try collectLocalGroupStatusReports(
+        &fake_service,
+        alloc,
+        runtime.ptr(),
+        runtime.ptr().io().?,
+        1,
+        replica_root,
+        &tables,
+        &ranges,
+        &stores,
+        &.{},
+        &splits,
+        &.{},
+        &split_observations,
+        &.{},
+    );
+    defer metadata_table_manager.freeGroupStatuses(alloc, reports);
+
+    try std.testing.expectEqual(@as(usize, 1), reports.len);
+    try std.testing.expectEqual(@as(u64, 42), reports[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 1234), reports[0].updated_at_millis);
+    try std.testing.expect(reports[0].transition_pending);
+    try std.testing.expect(reports[0].replay_required);
+    try std.testing.expect(reports[0].replay_caught_up);
+    try std.testing.expect(reports[0].cutover_ready);
+    try std.testing.expect(reports[0].reads_ready_after_cutover);
 }
 
 const ServiceGroupRaftObservation = struct {
@@ -5686,11 +6700,14 @@ fn raftRoleName(role: raft_engine.core.types.StateRole) []const u8 {
 }
 
 const ServiceGroupMembership = struct {
+    local_leader: bool = false,
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
     voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
     joint_consensus: bool = false,
+    raft_term: u64 = 0,
+    raft_membership_index: u64 = 0,
 };
 
 fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembership {
@@ -5705,11 +6722,15 @@ fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembershi
             }
         }
         return .{
+            .local_leader = raft_status.soft.role == .leader and
+                raft_status.soft.leader_id == raft_status.id,
             .local_voter = local_voter,
             .voter_count = @intCast(raft_status.conf_state.voters.len),
             .voter_set_known = true,
             .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+            .raft_term = raft_status.hard.current_term,
+            .raft_membership_index = raft_status.applied_index,
         };
     }
     if (Service == *MetadataHttpService) {
@@ -5722,31 +6743,33 @@ fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembershi
             }
         }
         return .{
+            .local_leader = raft_status.soft.role == .leader and
+                raft_status.soft.leader_id == raft_status.id,
             .local_voter = local_voter,
             .voter_count = @intCast(raft_status.conf_state.voters.len),
             .voter_set_known = true,
             .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+            .raft_term = raft_status.hard.current_term,
+            .raft_membership_index = raft_status.applied_index,
         };
     }
     return .{};
 }
 
-fn directoryUsageBytes(alloc: std.mem.Allocator, path: []const u8) !u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var dir = openDirPath(io_impl.io(), path, true) catch |err| switch (err) {
+fn directoryUsageBytes(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+    var dir = openDirPath(io, path, true) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close(io_impl.io());
+    defer dir.close(io);
 
     var total: u64 = 0;
     var walker = try dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        const stat = try dir.statFile(io, entry.path, .{});
         total += stat.size;
     }
     return total;
@@ -5773,7 +6796,22 @@ const StoreStatusBackfillMarker = struct {
     store_id: ?u64,
     group_id: u64,
     path: []const u8,
-    resume_key: ?[]const u8 = null,
+    owner_generation: ?u64 = null,
+    state: State = .absent,
+
+    const State = union(enum) {
+        absent,
+        legacy,
+        corrupt,
+        valid: []const u8,
+
+        fn deinit(self: State, alloc: std.mem.Allocator) void {
+            switch (self) {
+                .valid => |resume_key| alloc.free(resume_key),
+                else => {},
+            }
+        }
+    };
 };
 
 const StoreStatusBackfillMarkerCache = struct {
@@ -5812,9 +6850,9 @@ fn maybeRefreshStoreStatusBackfillMarkerCache(
     if (!should_rescan) return;
 
     const markers = try collectStoreStatusBackfillMarkers(alloc, replica_root_dir);
-    const markers_missing_resume_keys = storeStatusBackfillMarkersHaveMissingResumeKeys(markers);
+    const markers_missing_state = storeStatusBackfillMarkersHaveMissingState(markers);
     cache.replace(alloc, markers, now_ms);
-    cache.rescan_requested = markers_missing_resume_keys;
+    cache.rescan_requested = markers_missing_state;
     probe_ticks.* = 0;
 }
 
@@ -5825,9 +6863,9 @@ fn refreshStoreStatusBackfillMarkerCacheNow(
     cache: *StoreStatusBackfillMarkerCache,
 ) !void {
     const markers = try collectStoreStatusBackfillMarkers(alloc, replica_root_dir);
-    const markers_missing_resume_keys = storeStatusBackfillMarkersHaveMissingResumeKeys(markers);
+    const markers_missing_state = storeStatusBackfillMarkersHaveMissingState(markers);
     cache.replace(alloc, markers, monotonicMs());
-    cache.rescan_requested = markers_missing_resume_keys;
+    cache.rescan_requested = markers_missing_state;
     probe_ticks.* = 0;
 }
 
@@ -5835,34 +6873,41 @@ fn monotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
 
-fn scanStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var root_dir = std.Io.Dir.cwd().openDir(io_impl.io(), replica_root_dir, .{ .iterate = true }) catch |err| switch (err) {
+fn scanStoreStatusBackfillMarkersWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+) ![]StoreStatusBackfillMarker {
+    var root_dir = std.Io.Dir.cwd().openDir(io, replica_root_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,
     };
-    defer root_dir.close(io_impl.io());
+    defer root_dir.close(io);
 
     var markers = std.ArrayListUnmanaged(StoreStatusBackfillMarker).empty;
     errdefer {
         for (markers.items) |marker| {
             alloc.free(marker.path);
-            if (marker.resume_key) |resume_key| alloc.free(resume_key);
+            marker.state.deinit(alloc);
         }
         markers.deinit(alloc);
     }
 
     var walker = try root_dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, "/rebuild.state")) continue;
+        if (backfill_state_mod.ownerGenerationFromPath(entry.path) == null and
+            !std.mem.endsWith(u8, entry.path, "/rebuild.state"))
+        {
+            continue;
+        }
         const parsed = parseStoreStatusBackfillMarkerPath(entry.path) orelse continue;
         try markers.append(alloc, .{
             .store_id = parsed.store_id,
             .group_id = parsed.group_id,
             .path = try alloc.dupe(u8, entry.path),
+            .owner_generation = backfill_state_mod.ownerGenerationFromPath(entry.path),
         });
     }
     if (markers.items.len == 0) {
@@ -5874,51 +6919,82 @@ fn scanStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []
 
 fn loadStoreStatusBackfillMarkerResumeKeys(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     markers: []StoreStatusBackfillMarker,
 ) !void {
-    _ = try refreshStoreStatusBackfillMarkerResumeKeys(alloc, replica_root_dir, markers);
+    _ = try refreshStoreStatusBackfillMarkerResumeKeys(alloc, io, replica_root_dir, markers);
 }
 
 fn refreshStoreStatusBackfillMarkerResumeKeys(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     markers: []StoreStatusBackfillMarker,
 ) !bool {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     var any_missing = false;
 
     for (markers) |*marker| {
-        if (marker.resume_key) |resume_key| {
-            alloc.free(resume_key);
-            marker.resume_key = null;
-        }
+        marker.state.deinit(alloc);
+        marker.state = .absent;
         const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
         defer alloc.free(state_path);
-        marker.resume_key = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                any_missing = true;
-                break :blk null;
+        var loaded = try rebuildStateForPath(state_path).loadWithIo(alloc, io);
+        marker.state = switch (loaded) {
+            .absent => .absent,
+            .legacy => .legacy,
+            .corrupt => blk: {
+                std.log.warn("derived index rebuild state quarantined path={s}", .{state_path});
+                break :blk .corrupt;
             },
-            else => return err,
+            .valid => |resume_key| blk: {
+                loaded = undefined;
+                break :blk .{ .valid = resume_key };
+            },
         };
+        if (marker.state == .absent) any_missing = true;
     }
     return any_missing;
 }
 
+fn rebuildStateForPath(path: []const u8) backfill_state_mod.RebuildState {
+    const root_path = std.fs.path.dirname(path) orelse ".";
+    if (backfill_state_mod.ownerGenerationFromPath(path)) |generation| {
+        return backfill_state_mod.RebuildState.initOwned(root_path, null, generation);
+    }
+    return backfill_state_mod.RebuildState.init(root_path);
+}
+
 fn collectStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
-    const markers = try scanStoreStatusBackfillMarkers(alloc, replica_root_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const markers = try scanStoreStatusBackfillMarkersWithIo(alloc, io, replica_root_dir);
     errdefer freeStoreStatusBackfillMarkers(alloc, markers);
-    try loadStoreStatusBackfillMarkerResumeKeys(alloc, replica_root_dir, markers);
+    try loadStoreStatusBackfillMarkerResumeKeys(alloc, io, replica_root_dir, markers);
     return markers;
 }
 
-fn storeStatusBackfillMarkersHaveMissingResumeKeys(markers: []const StoreStatusBackfillMarker) bool {
+fn storeStatusBackfillMarkersHaveMissingState(markers: []const StoreStatusBackfillMarker) bool {
     for (markers) |marker| {
-        if (marker.resume_key == null) return true;
+        if (marker.state == .absent) return true;
     }
     return false;
+}
+
+fn backfillMarkerStateFileExistsWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    marker: StoreStatusBackfillMarker,
+) !bool {
+    const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
+    defer alloc.free(state_path);
+    std.Io.Dir.cwd().access(io, state_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn backfillMarkerStateFileExists(
@@ -5928,13 +7004,7 @@ fn backfillMarkerStateFileExists(
 ) !bool {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
-    defer alloc.free(state_path);
-    std.Io.Dir.cwd().access(io_impl.io(), state_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
+    return try backfillMarkerStateFileExistsWithIo(alloc, io_impl.io(), replica_root_dir, marker);
 }
 
 fn maybeRequestStoreStatusBackfillMarkerRescan(
@@ -5947,12 +7017,14 @@ fn maybeRequestStoreStatusBackfillMarkerRescan(
     if (active_backfill_markers.len == 0) return;
     if (service.store_status_backfill_marker_cache.rescan_requested) return;
 
+    var io_impl = std.Io.Threaded.init(service.alloc, .{});
+    defer io_impl.deinit();
     for (active_backfill_markers) |marker| {
-        if (marker.resume_key == null) {
+        if (marker.state == .absent) {
             service.store_status_backfill_marker_cache.rescan_requested = true;
             return;
         }
-        if (!try backfillMarkerStateFileExists(service.alloc, replica_root_dir, marker)) {
+        if (!try backfillMarkerStateFileExistsWithIo(service.alloc, io_impl.io(), replica_root_dir, marker)) {
             service.store_status_backfill_marker_cache.rescan_requested = true;
             return;
         }
@@ -5962,7 +7034,7 @@ fn maybeRequestStoreStatusBackfillMarkerRescan(
 fn freeStoreStatusBackfillMarkers(alloc: std.mem.Allocator, markers: []const StoreStatusBackfillMarker) void {
     for (markers) |marker| {
         alloc.free(marker.path);
-        if (marker.resume_key) |resume_key| alloc.free(resume_key);
+        marker.state.deinit(alloc);
     }
     if (markers.len > 0) alloc.free(markers);
 }
@@ -5991,6 +7063,241 @@ fn storeStatusBackfillMarkerMatchesStore(marker: StoreStatusBackfillMarker, stor
     return include_unassigned;
 }
 
+fn backfillMarkerMatchesRuntimeGeneration(
+    marker: StoreStatusBackfillMarker,
+    runtime_statuses: []const metadata_table_manager.RuntimeGroupStatusReport,
+) bool {
+    const marker_generation = marker.owner_generation orelse return true;
+    const index_dir = std.fs.path.dirname(marker.path) orelse return true;
+    const index_name = std.fs.path.basename(index_dir);
+    for (runtime_statuses) |status| {
+        if (status.group_id != marker.group_id) continue;
+        for (status.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, index_name)) continue;
+            // A current runtime identity is authoritative for same-name
+            // replacement. Ignore a stale worker's generation cursor instead
+            // of reporting duplicate progress or quarantining the replacement.
+            if (index.coverage_generation != 0) {
+                return index.coverage_generation == marker_generation;
+            }
+        }
+    }
+    // Missing runtime status is not evidence of staleness. Preserve marker
+    // visibility until the data runtime publishes an authoritative generation.
+    return true;
+}
+
+test "metadata service ignores stale rebuild generation markers after replacement" {
+    const marker = StoreStatusBackfillMarker{
+        .store_id = 7,
+        .group_id = 9501,
+        .path = "store-7/group-9501/table-db/indexes/search_idx/rebuild.state.g-000000000000005f",
+        .owner_generation = 95,
+    };
+    var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "search_idx",
+        .kind = "full_text",
+        .coverage_generation = 96,
+    }};
+    const statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 9501,
+        .indexes = &indexes,
+    }};
+
+    try std.testing.expect(!backfillMarkerMatchesRuntimeGeneration(marker, &statuses));
+    indexes[0].coverage_generation = 95;
+    try std.testing.expect(backfillMarkerMatchesRuntimeGeneration(marker, &statuses));
+
+    var legacy = marker;
+    legacy.owner_generation = null;
+    try std.testing.expect(backfillMarkerMatchesRuntimeGeneration(legacy, &statuses));
+}
+
+const rebuild_state_quarantine_source = "rebuild_state_quarantine";
+const rebuild_state_quarantine_error = "InvalidRebuildState";
+
+fn collectStoreRuntimeStatusesWithQuarantinedBackfills(
+    alloc: std.mem.Allocator,
+    existing: []const metadata_table_manager.RuntimeGroupStatusReport,
+    ranges: []const metadata_table_manager.RangeRecord,
+    markers: []const StoreStatusBackfillMarker,
+    store_id: u64,
+    node_id: u64,
+    include_unassigned: bool,
+) ![]metadata_table_manager.RuntimeGroupStatusReport {
+    // Keep the data runtime's authoritative observations intact. Quarantine
+    // reports are reversible overlays: retaining the underlying report lets a
+    // repaired marker disappear immediately on the next scan without waiting
+    // for another data-server heartbeat.
+    var base = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer freeOwnedRuntimeStatusList(alloc, &base);
+    for (existing) |status| {
+        if (std.mem.eql(u8, status.source, rebuild_state_quarantine_source)) continue;
+        const cloned = try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, status);
+        errdefer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, cloned);
+        try base.append(alloc, cloned);
+    }
+
+    var overlays = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer freeOwnedRuntimeStatusList(alloc, &overlays);
+    for (markers) |marker| {
+        if (marker.state != .corrupt) continue;
+        if (!storeStatusBackfillMarkerMatchesStore(marker, store_id, include_unassigned)) continue;
+        if (!backfillMarkerMatchesRuntimeGeneration(marker, base.items)) continue;
+
+        const overlay_index = findRuntimeStatusIndexByGroup(overlays.items, marker.group_id) orelse blk: {
+            var overlay = if (findRuntimeStatusIndexByGroup(base.items, marker.group_id)) |base_index|
+                try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, base.items[base_index])
+            else
+                try quarantinedBackfillRuntimeStatus(
+                    alloc,
+                    marker,
+                    findRangeByGroupId(ranges, marker.group_id),
+                    store_id,
+                    node_id,
+                );
+            errdefer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, overlay);
+            try replaceOwnedRuntimeStatusSource(alloc, &overlay, rebuild_state_quarantine_source);
+            try overlays.append(alloc, overlay);
+            break :blk overlays.items.len - 1;
+        };
+        try markRuntimeIndexQuarantined(alloc, &overlays.items[overlay_index], marker);
+    }
+
+    var statuses = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer freeOwnedRuntimeStatusList(alloc, &statuses);
+    try statuses.ensureTotalCapacity(alloc, overlays.items.len + base.items.len);
+    statuses.appendSliceAssumeCapacity(overlays.items);
+    overlays.items.len = 0;
+    statuses.appendSliceAssumeCapacity(base.items);
+    base.items.len = 0;
+    overlays.deinit(alloc);
+    overlays = .empty;
+    base.deinit(alloc);
+    base = .empty;
+    if (statuses.items.len == 0) {
+        statuses.deinit(alloc);
+        return &.{};
+    }
+    return try statuses.toOwnedSlice(alloc);
+}
+
+fn freeOwnedRuntimeStatusList(
+    alloc: std.mem.Allocator,
+    statuses: *std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport),
+) void {
+    for (statuses.items) |status| metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
+    statuses.deinit(alloc);
+}
+
+fn findRuntimeStatusIndexByGroup(
+    statuses: []const metadata_table_manager.RuntimeGroupStatusReport,
+    group_id: u64,
+) ?usize {
+    for (statuses, 0..) |status, i| {
+        if (status.group_id == group_id) return i;
+    }
+    return null;
+}
+
+fn replaceOwnedRuntimeStatusSource(
+    alloc: std.mem.Allocator,
+    status: *metadata_table_manager.RuntimeGroupStatusReport,
+    source: []const u8,
+) !void {
+    if (std.mem.eql(u8, status.source, source)) return;
+    const next = try alloc.dupe(u8, source);
+    alloc.free(status.source);
+    status.source = next;
+}
+
+fn markRuntimeIndexQuarantined(
+    alloc: std.mem.Allocator,
+    status: *metadata_table_manager.RuntimeGroupStatusReport,
+    marker: StoreStatusBackfillMarker,
+) !void {
+    const index_dir = std.fs.path.dirname(marker.path) orelse return error.InvalidBackfillMarkerPath;
+    const index_name = std.fs.path.basename(index_dir);
+    for (status.indexes) |*index| {
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        const load_error = try alloc.dupe(u8, rebuild_state_quarantine_error);
+        if (index.load_error) |previous| alloc.free(previous);
+        index.load_error = load_error;
+        index.coverage_summary_ready = false;
+        index.backfill_active = false;
+        index.backfill_progress_millis = 0;
+        index.replay_catch_up_required = false;
+        return;
+    }
+
+    const name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(name);
+    const kind = try alloc.dupe(u8, "unknown");
+    errdefer alloc.free(kind);
+    const load_error = try alloc.dupe(u8, rebuild_state_quarantine_error);
+    errdefer alloc.free(load_error);
+    const next = try alloc.alloc(metadata_table_manager.RuntimeIndexStatusReport, status.indexes.len + 1);
+    @memcpy(next[0..status.indexes.len], status.indexes);
+    next[status.indexes.len] = .{
+        .name = name,
+        .kind = kind,
+        .load_error = load_error,
+        .coverage_summary_ready = false,
+    };
+    if (status.indexes.len > 0) alloc.free(status.indexes);
+    status.indexes = next;
+    status.index_count = @intCast(next.len);
+}
+
+fn quarantinedBackfillRuntimeStatus(
+    alloc: std.mem.Allocator,
+    marker: StoreStatusBackfillMarker,
+    range: ?metadata_table_manager.RangeRecord,
+    store_id: u64,
+    node_id: u64,
+) !metadata_table_manager.RuntimeGroupStatusReport {
+    const index_dir = std.fs.path.dirname(marker.path) orelse return error.InvalidBackfillMarkerPath;
+    const index_name = std.fs.path.basename(index_dir);
+    const table_name = try alloc.dupe(u8, "");
+    errdefer alloc.free(table_name);
+    const source = try alloc.dupe(u8, rebuild_state_quarantine_source);
+    errdefer alloc.free(source);
+    const freshness = try alloc.dupe(u8, "failed");
+    errdefer alloc.free(freshness);
+    const projection_checkpoint_status = try alloc.dupe(u8, "repair_required");
+    errdefer alloc.free(projection_checkpoint_status);
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const index_kind = try alloc.dupe(u8, "unknown");
+    errdefer alloc.free(index_kind);
+    const load_error = try alloc.dupe(u8, rebuild_state_quarantine_error);
+    errdefer alloc.free(load_error);
+    const indexes = try alloc.alloc(metadata_table_manager.RuntimeIndexStatusReport, 1);
+    errdefer alloc.free(indexes);
+    indexes[0] = .{
+        .name = owned_index_name,
+        .kind = index_kind,
+        .load_error = load_error,
+        .coverage_summary_ready = false,
+        .backfill_progress_millis = 0,
+    };
+
+    var status: metadata_table_manager.RuntimeGroupStatusReport = .{
+        .table_id = if (range) |record| record.table_id else 0,
+        .table_name = table_name,
+        .group_id = marker.group_id,
+        .store_id = store_id,
+        .node_id = node_id,
+        .updated_at_ns = platform_clock.Clock.real().nowRealtimeMs() * std.time.ns_per_ms,
+        .source = source,
+        .freshness = freshness,
+        .index_count = 1,
+        .indexes = indexes,
+    };
+    status.enrichment.projection_checkpoint_status = projection_checkpoint_status;
+    return status;
+}
+
 fn accumulateStoreStatusBackfillProgress(
     alloc: std.mem.Allocator,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -6000,7 +7307,10 @@ fn accumulateStoreStatusBackfillProgress(
 ) !void {
     const range = findRangeByGroupId(ranges, marker.group_id) orelse return;
     active_backfills.* += 1;
-    const resume_key = marker.resume_key orelse return;
+    const resume_key = switch (marker.state) {
+        .valid => |key| key,
+        .absent, .legacy, .corrupt => return,
+    };
     const range_start = try internal_keys.documentRangeLowerAlloc(alloc, range.start_key);
     defer alloc.free(range_start);
     const range_end = if (range.end_key) |key| try internal_keys.documentRangeUpperAlloc(alloc, key) else null;
@@ -6024,6 +7334,7 @@ fn freeOwnedStoreStatusReports(alloc: std.mem.Allocator, reports: []const metada
 
 fn resolveSharedRootStoreAffinity(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     local_node_id: u64,
     group_id: u64,
@@ -6033,29 +7344,28 @@ fn resolveSharedRootStoreAffinity(
     range: metadata_table_manager.RangeRecord,
 ) !u64 {
     if (findPlacementIntentStoreId(placements, group_id, local_node_id, stores)) |store_id| {
-        try writeStoreAffinityFile(alloc, replica_root_dir, group_id, store_id);
+        try writeStoreAffinityFile(alloc, io, replica_root_dir, group_id, store_id);
         return store_id;
     }
-    const existing = try readStoreAffinityFile(alloc, replica_root_dir, group_id);
+    const existing = try readStoreAffinityFile(alloc, io, replica_root_dir, group_id);
     if (existing) |store_id| {
         if (findProjectedStore(stores, store_id) != null) return store_id;
     }
 
     const assigned = try assignSharedRootStoreAffinity(alloc, stores, tables, range);
-    try writeStoreAffinityFile(alloc, replica_root_dir, group_id, assigned);
+    try writeStoreAffinityFile(alloc, io, replica_root_dir, group_id, assigned);
     return assigned;
 }
 
 fn readStoreAffinityFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
 ) !?u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/store-affinity", .{ replica_root_dir, group_id });
     defer alloc.free(path);
-    const contents = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(128)) catch |err| switch (err) {
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(128)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -6067,21 +7377,20 @@ fn readStoreAffinityFile(
 
 fn writeStoreAffinityFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
     store_id: u64,
 ) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const dir_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ replica_root_dir, group_id });
     defer alloc.free(dir_path);
-    try fs_paths.createDirPathPortable(io_impl.io(), dir_path);
+    try fs_paths.createDirPathPortable(io, dir_path);
     const path = try std.fmt.allocPrint(alloc, "{s}/store-affinity", .{dir_path});
     defer alloc.free(path);
-    var file = try std.Io.Dir.cwd().createFile(io_impl.io(), path, .{ .truncate = true });
-    defer file.close(io_impl.io());
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
     var buf: [64]u8 = undefined;
-    var writer = file.writer(io_impl.io(), &buf);
+    var writer = file.writer(io, &buf);
     try writer.interface.print("{d}\n", .{store_id});
     try writer.end();
 }
@@ -6436,27 +7745,29 @@ fn findMergedGroupStatus(
     return null;
 }
 
-fn transitionStatusHasStablePlacement(
+fn transitionStatusStablePlacementReadiness(
     status: metadata_reconciler.MergedGroupStatus,
     expected_voters: u32,
     leader_placed: bool,
-) bool {
-    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16)) return false;
+) transition_state.StablePlacementReadiness {
+    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16))
+        return .invalid_expected_voter_count;
     const expected_voter_count: u16 = @intCast(expected_voters);
-    return status.leader_known and
-        status.leader_store_id != 0 and
-        leader_placed and
-        status.voter_count_known and
-        status.voter_count == expected_voter_count and
-        status.healthy_voter_reports >= status.voter_count and
-        !status.joint_consensus;
+    if (!status.leader_known) return .leader_unknown;
+    if (status.leader_store_id == 0) return .leader_store_unknown;
+    if (!leader_placed) return .leader_not_placed;
+    if (!status.voter_count_known) return .voter_count_unknown;
+    if (status.voter_count != expected_voter_count) return .voter_count_mismatch;
+    if (status.healthy_voter_reports < status.voter_count) return .insufficient_healthy_voters;
+    if (status.joint_consensus) return .joint_consensus;
+    return .ready;
 }
 
 fn buildTransitionReadinessMap(
     alloc: std.mem.Allocator,
     stores: []const metadata_table_manager.StoreRecord,
     placements: []const raft_reconciler.PlacementIntent,
-) !std.AutoHashMapUnmanaged(u64, bool) {
+) !std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness) {
     const merged = try metadata_state.mergeHealthyGroupStatuses(
         alloc,
         &.{},
@@ -6487,13 +7798,13 @@ fn buildTransitionReadinessMap(
         }, {});
     }
 
-    var ready_by_group = std.AutoHashMapUnmanaged(u64, bool).empty;
+    var ready_by_group = std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness).empty;
     errdefer ready_by_group.deinit(alloc);
     try ready_by_group.ensureTotalCapacity(alloc, @intCast(merged.len));
     for (merged) |status| {
         ready_by_group.putAssumeCapacity(
             status.group_id,
-            transitionStatusHasStablePlacement(
+            transitionStatusStablePlacementReadiness(
                 status,
                 placement_counts.get(status.group_id) orelse 0,
                 placement_stores.contains(.{
@@ -6520,18 +7831,31 @@ test "metadata service transition readiness requires stable healthy placement" {
         .voter_count = 3,
         .healthy_voter_reports = 3,
     };
-    try std.testing.expect(transitionStatusHasStablePlacement(status, placements.len, true));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.ready,
+        transitionStatusStablePlacementReadiness(status, placements.len, true),
+    );
     status.healthy_voter_reports = 2;
-    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, true));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.insufficient_healthy_voters,
+        transitionStatusStablePlacementReadiness(status, placements.len, true),
+    );
     status.healthy_voter_reports = 3;
     status.joint_consensus = true;
-    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, true));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.joint_consensus,
+        transitionStatusStablePlacementReadiness(status, placements.len, true),
+    );
     status.joint_consensus = false;
     status.leader_store_id = 99;
-    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, false));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.leader_not_placed,
+        transitionStatusStablePlacementReadiness(status, placements.len, false),
+    );
 }
 
-test "metadata service transition readiness map rejects stale placement generations" {
+test "metadata service transition readiness fences each member relocation generation independently" {
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null);
     const placements = [_]raft_reconciler.PlacementIntent{
         .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .relocation_generation = 4 },
         .{ .store_id = 2, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .relocation_generation = 4 },
@@ -6543,6 +7867,7 @@ test "metadata service transition readiness map rejects stale placement generati
             .local_leader = true,
             .local_voter = true,
             .voter_set_known = true,
+            .voter_set_fingerprint = voter_set_fingerprint,
             .voter_count = 3,
             .relocation_generation = 4,
         },
@@ -6552,6 +7877,7 @@ test "metadata service transition readiness map rejects stale placement generati
             .group_id = 77,
             .local_voter = true,
             .voter_set_known = true,
+            .voter_set_fingerprint = voter_set_fingerprint,
             .voter_count = 3,
             .relocation_generation = 4,
         },
@@ -6564,7 +7890,28 @@ test "metadata service transition readiness map rejects stale placement generati
 
     var ready = try buildTransitionReadinessMap(std.testing.allocator, &stores, &placements);
     defer ready.deinit(std.testing.allocator);
-    try std.testing.expect(ready.get(77) orelse false);
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.ready,
+        ready.get(77) orelse .status_unavailable,
+    );
+
+    var relocating_placements = placements;
+    relocating_placements[2].relocation_generation = 5;
+    relocating_placements[2].serving_state = .draining;
+    var relocating_follower_statuses = follower_statuses;
+    relocating_follower_statuses[0].relocation_generation = 5;
+    var relocating_stores = stores;
+    relocating_stores[2].group_statuses = &relocating_follower_statuses;
+    var relocating = try buildTransitionReadinessMap(
+        std.testing.allocator,
+        &relocating_stores,
+        &relocating_placements,
+    );
+    defer relocating.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.ready,
+        relocating.get(77) orelse .status_unavailable,
+    );
 
     var stale_leader_statuses = leader_statuses;
     stale_leader_statuses[0].relocation_generation = 3;
@@ -6576,7 +7923,10 @@ test "metadata service transition readiness map rejects stale placement generati
     stale_stores[2].group_statuses = &stale_follower_statuses;
     var stale = try buildTransitionReadinessMap(std.testing.allocator, &stale_stores, &placements);
     defer stale.deinit(std.testing.allocator);
-    try std.testing.expect(!(stale.get(77) orelse false));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.status_unavailable,
+        stale.get(77) orelse .status_unavailable,
+    );
 }
 
 fn groupHasExpectedHealthyPlacement(
@@ -6711,14 +8061,14 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
     defer service.freeProjectedTables(alloc, tables);
     for (tables) |table| {
         hasher.update(std.mem.asBytes(&table.table_id));
-        hasher.update(table.name);
-        hasher.update(table.schema_json);
-        hasher.update(table.read_schema_json);
-        hasher.update(table.indexes_json);
-        hasher.update(table.replication_sources_json);
-        hasher.update(table.placement_role);
-        hasher.update(table.restore_backup_id);
-        hasher.update(table.restore_location);
+        hashProjectedProvisioningBytes(&hasher, table.name);
+        hashProjectedProvisioningBytes(&hasher, table.schema_json);
+        hashProjectedProvisioningBytes(&hasher, table.read_schema_json);
+        hashProjectedProvisioningBytes(&hasher, table.indexes_json);
+        hashProjectedProvisioningBytes(&hasher, table.replication_sources_json);
+        hashProjectedProvisioningBytes(&hasher, table.placement_role);
+        hashProjectedProvisioningBytes(&hasher, table.restore_backup_id);
+        hashProjectedProvisioningBytes(&hasher, table.restore_location);
         hasher.update(std.mem.asBytes(&table.desired_replica_count));
         hasher.update(std.mem.asBytes(&table.min_ranges));
     }
@@ -6727,17 +8077,26 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
     defer service.freeProjectedRanges(alloc, ranges);
     for (ranges) |range| {
         hasher.update(std.mem.asBytes(&range.group_id));
+        hasher.update(std.mem.asBytes(&range.range_id));
         hasher.update(std.mem.asBytes(&range.table_id));
-        hasher.update(range.start_key);
+        hasher.update(std.mem.asBytes(&range.doc_identity_shard_id));
+        hasher.update(std.mem.asBytes(&range.doc_identity_range_id));
+        hasher.update(std.mem.asBytes(&range.split_attempt_epoch));
+        hashProjectedProvisioningBytes(&hasher, range.start_key);
         if (range.end_key) |end_key| {
             hasher.update(&.{1});
-            hasher.update(end_key);
+            hashProjectedProvisioningBytes(&hasher, end_key);
         } else {
             hasher.update(&.{0});
         }
-        hasher.update(range.restore_backup_id);
-        hasher.update(range.restore_location);
-        hasher.update(range.restore_snapshot_path);
+        hashProjectedProvisioningBytes(&hasher, range.restore_backup_id);
+        hashProjectedProvisioningBytes(&hasher, range.restore_artifact_backup_id);
+        hashProjectedProvisioningBytes(&hasher, range.restore_location);
+        hashProjectedProvisioningBytes(&hasher, range.restore_snapshot_path);
+        hashProjectedProvisioningBytes(&hasher, range.restore_connection);
+        hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
+        hashProjectedProvisioningBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(&range.completed_restore_fingerprint);
     }
 
     const placements = try service.listProjectedPlacementIntents(alloc);
@@ -6755,22 +8114,31 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
             hasher.update(&.{1});
             hasher.update(std.mem.asBytes(&snapshot.from_node_id));
             hasher.update(std.mem.asBytes(&snapshot.term));
-            hasher.update(snapshot.snapshot_id);
-            hasher.update(snapshot.uri);
+            hashProjectedProvisioningBytes(&hasher, snapshot.snapshot_id);
+            hashProjectedProvisioningBytes(&hasher, snapshot.uri);
         } else {
             hasher.update(&.{0});
         }
         if (intent.record.backup_restore_bootstrap) |restore| {
             hasher.update(&.{1});
-            hasher.update(restore.backup_id);
-            hasher.update(restore.location);
-            hasher.update(restore.snapshot_path);
+            hashProjectedProvisioningBytes(&hasher, restore.backup_id);
+            hashProjectedProvisioningBytes(&hasher, restore.location);
+            hashProjectedProvisioningBytes(&hasher, restore.snapshot_path);
+            hashProjectedProvisioningBytes(&hasher, restore.connection);
+            hasher.update(std.mem.asBytes(&restore.artifact_size_bytes));
+            hashProjectedProvisioningBytes(&hasher, restore.artifact_sha256);
         } else {
             hasher.update(&.{0});
         }
     }
 
     return hasher.final();
+}
+
+fn hashProjectedProvisioningBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    const len: u64 = @intCast(bytes.len);
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
 }
 
 pub fn snapshotStatus(
@@ -7261,19 +8629,32 @@ test "metadata service proposes split transitions into the metadata group" {
     try svc.upsertTable(.{ .table_id = 20, .name = "docs" });
     try svc.upsertRange(.{
         .group_id = 2001,
+        .range_id = 2001,
         .table_id = 20,
         .start_key = "",
         .end_key = "doc:z",
-        .split_attempt_epoch = 1,
+        .doc_identity_shard_id = 2001,
+        .doc_identity_range_id = 2001,
+        .split_attempt_epoch = 0,
     });
-    try svc.upsertSplitTransition(.{
-        .transition_id = 4001,
-        .attempt_epoch = 1,
-        .source_group_id = 2001,
-        .destination_group_id = 2002,
-        .phase = .prepare,
-        .split_key = "doc:m",
-        .source_range_end = "doc:z",
+    try svc.admitSplitTransition(.{
+        .expected_source_epoch = 0,
+        .record = .{
+            .transition_id = 4001,
+            .attempt_epoch = 1,
+            .source_group_id = 2001,
+            .destination_group_id = 2002,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .table_contract = .{
+                .table_id = 20,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 2001, .range_id = 2001 },
+                .target_identity = .{ .shard_id = 2001, .range_id = 2001 },
+            },
+        },
     });
 
     try runServiceRounds(&svc, 8);
@@ -7609,15 +8990,21 @@ test "metadata service can apply reconciliation plan proposals" {
     try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
     try manager.upsertRange(.{
         .group_id = 2101,
+        .range_id = 2101,
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 2101,
+        .doc_identity_range_id = 2101,
     });
     try manager.upsertRange(.{
         .group_id = 2102,
+        .range_id = 2102,
         .table_id = 10,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 2102,
+        .doc_identity_range_id = 2102,
     });
     try manager.requestSplit(.{
         .transition_id = 9101,
@@ -7632,6 +9019,20 @@ test "metadata service can apply reconciliation plan proposals" {
     defer plan.deinit(std.testing.allocator);
 
     try svc.applyReconciliationPlan(&plan);
+    try runServiceRounds(&svc, 8);
+
+    const projected_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
+    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
+
+    var admission_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = projected_tables,
+        .ranges = projected_ranges,
+    });
+    defer admission_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), admission_plan.split_admissions.len);
+    try svc.applyReconciliationPlan(&admission_plan);
     try runServiceRounds(&svc, 8);
 
     const split_records = try svc.listProjectedSplitTransitions(std.testing.allocator);
@@ -8575,11 +9976,23 @@ test "metadata service persists and clears reallocation requests" {
     try svc.runRound();
     const requested = try svc.getProjectedReallocationRequest();
     try std.testing.expect(requested != null);
+    try std.testing.expect(requested.?.request_id != 0);
     try std.testing.expectEqual(@as(u64, 77_000), requested.?.requested_at_ms);
 
-    var plan = metadata_reconciler.ReconciliationPlan.empty();
-    plan.clear_reallocation_request = true;
-    try svc.applyReconciliationPlan(&plan);
+    var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
+    stale_plan.clear_reallocation_request = requested.?.request_id;
+    try svc.requestReallocation(88_000);
+    try svc.runRound();
+    try svc.applyReconciliationPlan(&stale_plan);
+    try svc.runRound();
+    const replacement = try svc.getProjectedReallocationRequest();
+    try std.testing.expect(replacement != null);
+    try std.testing.expect(replacement.?.request_id != requested.?.request_id);
+    try std.testing.expectEqual(@as(u64, 88_000), replacement.?.requested_at_ms);
+
+    var current_plan = metadata_reconciler.ReconciliationPlan.empty();
+    current_plan.clear_reallocation_request = replacement.?.request_id;
+    try svc.applyReconciliationPlan(&current_plan);
     try svc.runRound();
     try std.testing.expect((try svc.getProjectedReallocationRequest()) == null);
 }
@@ -8687,14 +10100,7 @@ test "metadata service auto-reports local store backfill status during runRound"
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -8811,14 +10217,7 @@ test "metadata service reports automatic store status across shared multi-store 
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -8958,14 +10357,7 @@ test "metadata service reports automatic store status across explicit multi-stor
 
     const left_state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{left_db_path});
     defer std.testing.allocator.free(left_state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), left_state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:g");
-        try writer.end();
-    }
+    try rebuildStateForPath(left_state_path).update("doc:g");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -9085,14 +10477,7 @@ test "metadata service prefers placement-role-compatible store affinity in share
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.rescan_requested = true;
     try svc.runLifecycleRound();
@@ -9132,14 +10517,7 @@ test "metadata service shared-root reports survive transient rebuild marker remo
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     const markers = try collectStoreStatusBackfillMarkers(std.testing.allocator, replica_root);
     defer freeStoreStatusBackfillMarkers(std.testing.allocator, markers);
@@ -9173,6 +10551,7 @@ test "metadata service shared-root reports survive transient rebuild marker remo
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
+        std.testing.io,
         replica_root,
         1,
         stores[0..],
@@ -9319,14 +10698,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     svc.store_status_backfill_marker_cache.replace(
         std.testing.allocator,
@@ -9447,14 +10819,7 @@ test "metadata service lifecycle round discovers backfill markers immediately" {
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     try std.testing.expectEqual(@as(usize, 0), svc.store_status_backfill_marker_cache.markers.len);
     svc.store_status_backfill_marker_cache.rescan_requested = true;
@@ -9589,14 +10954,7 @@ test "metadata service cached backfill markers rescan immediately after disappea
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     var cache = StoreStatusBackfillMarkerCache{};
     defer cache.deinit(std.testing.allocator);
@@ -9640,6 +10998,135 @@ test "metadata service cached backfill markers rescan immediately after disappea
         &service.store_status_backfill_marker_cache,
     );
     try std.testing.expectEqual(@as(usize, 0), service.store_status_backfill_marker_cache.markers.len);
+}
+
+test "metadata service caches corrupt rebuild state and publishes quarantine status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-corrupt-backfill-marker-cache", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(replica_root);
+    const index_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9501/table-db/indexes/search_idx", .{replica_root});
+    defer std.testing.allocator.free(index_root);
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try fs_paths.createDirPathPortable(io_impl.io(), index_root);
+    const rebuild_state = backfill_state_mod.RebuildState.initOwned(index_root, null, 95);
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
+    const state_path = try rebuild_state.pathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(state_path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        state_path,
+        std.testing.allocator,
+        .limited(64 * 1024 + 64),
+    );
+    defer std.testing.allocator.free(encoded);
+    encoded[encoded.len - 1] ^= 0xff;
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = state_path, .data = encoded });
+
+    var cache = StoreStatusBackfillMarkerCache{};
+    defer cache.deinit(std.testing.allocator);
+    var probe_ticks: usize = 0;
+    try maybeRefreshStoreStatusBackfillMarkerCache(
+        std.testing.allocator,
+        replica_root,
+        0,
+        &probe_ticks,
+        &cache,
+    );
+    try std.testing.expectEqual(@as(usize, 1), cache.markers.len);
+    try std.testing.expect(cache.markers[0].state == .corrupt);
+    try std.testing.expect(!cache.rescan_requested);
+
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 9501, .table_id = 95, .start_key = "doc:a", .end_key = "doc:z" },
+        .{ .group_id = 9502, .table_id = 96, .start_key = "doc:a", .end_key = "doc:z" },
+    };
+    var group_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{
+        .{ .name = "search_idx", .kind = "full_text", .doc_count = 7 },
+        .{ .name = "healthy_peer_idx", .kind = "graph", .edge_count = 11 },
+    };
+    var unrelated_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{
+        .{ .name = "unrelated_idx", .kind = "sparse_vector", .doc_count = 13 },
+    };
+    var existing_runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{
+        .{
+            .table_id = 95,
+            .table_name = "docs",
+            .group_id = 9501,
+            .store_id = 95,
+            .node_id = 5,
+            .source = "live_writer_publish",
+            .freshness = "fresh",
+            .index_count = 2,
+            .indexes = &group_indexes,
+        },
+        .{
+            .table_id = 96,
+            .table_name = "other",
+            .group_id = 9502,
+            .store_id = 95,
+            .node_id = 5,
+            .source = "live_writer_publish",
+            .freshness = "fresh",
+            .index_count = 1,
+            .indexes = &unrelated_indexes,
+        },
+    };
+    const report = try collectLocalStoreStatusReport(
+        .{},
+        std.testing.allocator,
+        replica_root,
+        .{ .store_id = 95, .node_id = 5, .runtime_statuses = &existing_runtime_statuses },
+        &ranges,
+        &.{},
+        cache.markers,
+    );
+    defer freeOwnedStoreStatusReport(std.testing.allocator, report);
+    try std.testing.expectEqual(@as(u32, 1), report.active_backfills);
+    try std.testing.expectEqual(@as(u16, 0), report.backfill_progress_millis);
+    try std.testing.expectEqual(@as(usize, 3), report.runtime_statuses.len);
+    try std.testing.expectEqualStrings("rebuild_state_quarantine", report.runtime_statuses[0].source);
+    try std.testing.expectEqualStrings("fresh", report.runtime_statuses[0].freshness);
+    try std.testing.expectEqual(@as(usize, 2), report.runtime_statuses[0].indexes.len);
+    try std.testing.expectEqualStrings("search_idx", report.runtime_statuses[0].indexes[0].name);
+    try std.testing.expectEqualStrings(rebuild_state_quarantine_error, report.runtime_statuses[0].indexes[0].load_error.?);
+    try std.testing.expect(report.runtime_statuses[0].indexes[1].load_error == null);
+    try std.testing.expectEqualStrings("live_writer_publish", report.runtime_statuses[1].source);
+    try std.testing.expect(report.runtime_statuses[1].indexes[0].load_error == null);
+    try std.testing.expectEqual(@as(u64, 9502), report.runtime_statuses[2].group_id);
+    try std.testing.expectEqualStrings("unrelated_idx", report.runtime_statuses[2].indexes[0].name);
+
+    const repaired = try collectStoreRuntimeStatusesWithQuarantinedBackfills(
+        std.testing.allocator,
+        report.runtime_statuses,
+        &ranges,
+        &.{},
+        95,
+        5,
+        true,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReports(std.testing.allocator, repaired);
+    try std.testing.expectEqual(@as(usize, 2), repaired.len);
+    try std.testing.expectEqualStrings("live_writer_publish", repaired[0].source);
+    try std.testing.expect(repaired[0].indexes[0].load_error == null);
+    try std.testing.expectEqual(@as(u64, 9502), repaired[1].group_id);
+
+    cache.scanned_at_ms = monotonicMs();
+    const scanned_at_ms = cache.scanned_at_ms;
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:z");
+    try maybeRefreshStoreStatusBackfillMarkerCache(
+        std.testing.allocator,
+        replica_root,
+        0,
+        &probe_ticks,
+        &cache,
+    );
+    try std.testing.expectEqual(scanned_at_ms, cache.scanned_at_ms);
+    try std.testing.expect(cache.markers[0].state == .corrupt);
 }
 
 test "metadata service does not rescan empty backfill markers before idle interval" {
@@ -9699,14 +11186,7 @@ test "metadata service prefers planned store affinity in shared roots" {
 
     const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/indexes/search_idx/rebuild.state", .{db_path});
     defer std.testing.allocator.free(state_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io_impl.io(), state_path, .{ .truncate = true });
-        defer file.close(io_impl.io());
-        var buf: [128]u8 = undefined;
-        var writer = file.writer(io_impl.io(), &buf);
-        try writer.interface.writeAll("doc:m");
-        try writer.end();
-    }
+    try rebuildStateForPath(state_path).update("doc:m");
 
     const stores = [_]metadata_table_manager.StoreRecord{
         .{ .store_id = 91, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 880 },
@@ -9736,6 +11216,7 @@ test "metadata service prefers planned store affinity in shared roots" {
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
+        std.testing.io,
         replica_root,
         1,
         stores[0..],
@@ -9930,8 +11411,12 @@ test "metadata service status reports repair and rebalance counts" {
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "backup-8801",
+                .artifact_backup_id = "backup-8801",
                 .location = "file:///tmp/backups",
                 .snapshot_path = "backup-8801/groups/8801",
+                .connection = "backup-store",
+                .artifact_size_bytes = 4096,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         },
         .peer_node_ids = &.{1},
@@ -10290,11 +11775,11 @@ test "metadata service clears restore intent once all placement replicas report 
         placements: []const raft_reconciler.PlacementIntent,
         progress: []const metadata_table_manager.RestoreProgressRecord,
         upserted_table: ?metadata_table_manager.TableRecord = null,
-        upserted_range: ?metadata_table_manager.RangeRecord = null,
+        completed_restore: ?metadata_table_manager.RestoreIntentIdentity = null,
 
         fn deinit(self: *@This()) void {
             if (self.upserted_table) |record| metadata_table_manager.freeTable(self.alloc, record);
-            if (self.upserted_range) |record| metadata_table_manager.freeRange(self.alloc, record);
+            if (self.completed_restore) |identity| metadata_table_manager.freeRestoreIntentIdentity(self.alloc, identity);
         }
 
         fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -10352,9 +11837,9 @@ test "metadata service clears restore intent once all placement replicas report 
             self.upserted_table = try metadata_table_manager.cloneTable(self.alloc, record);
         }
 
-        fn upsertRange(self: *@This(), record: metadata_table_manager.RangeRecord) !void {
-            if (self.upserted_range) |existing| metadata_table_manager.freeRange(self.alloc, existing);
-            self.upserted_range = try metadata_table_manager.cloneRange(self.alloc, record);
+        fn completeRestoreRange(self: *@This(), identity: metadata_table_manager.RestoreIntentIdentity) !void {
+            if (self.completed_restore) |existing| metadata_table_manager.freeRestoreIntentIdentity(self.alloc, existing);
+            self.completed_restore = try metadata_table_manager.cloneRestoreIntentIdentity(self.alloc, identity);
         }
     };
 
@@ -10363,8 +11848,6 @@ test "metadata service clears restore intent once all placement replicas report 
         .table = .{
             .table_id = 7,
             .name = "docs",
-            .restore_backup_id = "snap1",
-            .restore_location = "file:///tmp/backups",
         },
         .ranges = &.{
             .{
@@ -10373,8 +11856,11 @@ test "metadata service clears restore intent once all placement replicas report 
                 .start_key = "",
                 .end_key = null,
                 .restore_backup_id = "snap1",
+                .restore_artifact_backup_id = "snap1-artifacts",
                 .restore_location = "file:///tmp/backups",
                 .restore_snapshot_path = "snap/groups/7001",
+                .restore_connection = "backups",
+                .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         },
         .placements = &.{
@@ -10382,20 +11868,19 @@ test "metadata service clears restore intent once all placement replicas report 
             .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
         },
         .progress = &.{
-            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
         },
     };
     defer service.deinit();
 
     try completeRestoreIntentsForService(&service, null, null, null, null);
-    try std.testing.expect(service.upserted_range != null);
-    try std.testing.expectEqualStrings("", service.upserted_range.?.restore_backup_id);
-    try std.testing.expectEqualStrings("", service.upserted_range.?.restore_location);
-    try std.testing.expectEqualStrings("", service.upserted_range.?.restore_snapshot_path);
-    try std.testing.expect(service.upserted_table != null);
-    try std.testing.expectEqualStrings("", service.upserted_table.?.restore_backup_id);
-    try std.testing.expectEqualStrings("", service.upserted_table.?.restore_location);
+    try std.testing.expect(service.completed_restore != null);
+    try std.testing.expectEqualStrings("snap1", service.completed_restore.?.backup_id);
+    try std.testing.expectEqualStrings("file:///tmp/backups", service.completed_restore.?.location);
+    try std.testing.expectEqualStrings("snap/groups/7001", service.completed_restore.?.snapshot_path);
+    try std.testing.expectEqualStrings("backups", service.completed_restore.?.connection);
+    try std.testing.expect(service.upserted_table == null);
 }
 
 test "metadata service keeps restore intent until runtime repair completes" {
@@ -10404,11 +11889,43 @@ test "metadata service keeps restore intent until runtime repair completes" {
         .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
     };
     const progress = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
     };
 
-    try std.testing.expect(!rangeRestoreIntentComplete(7, 7001, "snap1", "file:///tmp/backups", &placements, &progress));
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_artifact_backup_id = "snap1-artifacts",
+        .restore_snapshot_path = "snap/groups/7001",
+    }, "snap1", "file:///tmp/backups", &placements, &progress));
+
+    const stale_progress = [_]metadata_table_manager.RestoreProgressRecord{
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_artifact_backup_id = "snap1-artifacts",
+        .restore_snapshot_path = "snap/groups/7001",
+        .restore_artifact_sha256 = "new-artifact",
+    }, "snap1", "file:///tmp/backups", &placements, &stale_progress));
+
+    const stale_namespace_progress = [_]metadata_table_manager.RestoreProgressRecord{
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "old-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "new-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "old-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "new-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_artifact_backup_id = "new-artifacts",
+        .restore_snapshot_path = "snap/groups/7001",
+        .restore_artifact_sha256 = "new-artifact",
+    }, "snap1", "file:///tmp/backups", &placements, &stale_namespace_progress));
 }
 
 test "metadata http service catalog cache is independent from volatile projection traffic" {

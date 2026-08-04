@@ -92,6 +92,7 @@ pub const WalReplicaProvider = struct {
                 .ptr = self,
                 .vtable = &.{
                     .persist_ready = persistReady,
+                    .persist_ready_diagnostics = persistReadyWithDiagnostics,
                     .compact_snapshot = compactSnapshot,
                     .compact_snapshot_artifact = compactSnapshotArtifact,
                     .retire_group = retireGroup,
@@ -152,6 +153,17 @@ pub const WalReplicaProvider = struct {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
         try state.groupStorage().persistReady(group_id, ready);
+    }
+
+    fn persistReadyWithDiagnostics(
+        ptr: *anyopaque,
+        group_id: u64,
+        ready: raft_engine.core.Ready,
+        diag: *raft_engine.runtime.storage_iface.ReadyPersistenceDiagnostics,
+    ) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        try state.groupStorage().persistReadyWithDiagnostics(group_id, ready, diag);
     }
 
     fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
@@ -273,10 +285,12 @@ test "wal replica provider wires host through WAL-backed local state" {
     {
         var provider = try WalReplicaProvider.init(std.testing.allocator, .{ .root_dir = root }, base_factory.iface());
         defer provider.deinit();
+        const runtime_hooks = provider.runtimeHooks();
+        try std.testing.expect(runtime_hooks.group_storage.?.vtable.persist_ready_diagnostics != null);
 
         var local_host = host.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
             .descriptor_factory = provider.descriptorFactory(),
-            .runtime_hooks = provider.runtimeHooks(),
+            .runtime_hooks = runtime_hooks,
         });
         defer local_host.deinit();
 
@@ -289,7 +303,17 @@ test "wal replica provider wires host through WAL-backed local state" {
         try local_host.campaignGroup(501);
         _ = try local_host.runRound(1, 1);
         try local_host.propose(501, "wal-backed");
-        _ = try local_host.runRound(1, 1);
+        const persisted_round = try local_host.runRound(1, 1);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.encoded_bytes > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_append_elapsed_ns > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_commit_elapsed_ns > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_physical_commits > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_inner_segment_syncs > 0);
+        // The WAL index is synced only when its segment metadata changes.
+        // Campaign/bootstrap may initialize it in an earlier Ready; a
+        // steady-state proposal correctly persists with only a segment sync.
+        try std.testing.expectEqual(@as(u64, 0), persisted_round.slowest_ready_group.persist_ready_detail.wal_post_commit_segment_syncs);
+        try std.testing.expectEqual(@as(u64, 0), persisted_round.slowest_ready_group.persist_ready_detail.wal_post_commit_index_syncs);
 
         const state = provider.stateForGroup(501) orelse return error.MissingState;
         try std.testing.expect((try state.storage().lastIndex()) >= 1);

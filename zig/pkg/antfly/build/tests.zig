@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const build_test_filters = @import("../../../build_test_filters.zig");
 
 fn addProgressBanner(b: *std.Build, label: []const u8) *std.Build.Step.Run {
     return b.addSystemCommand(&.{
@@ -86,12 +87,9 @@ pub fn selectTestFilters(
     b: *std.Build,
     default_filters: []const []const u8,
 ) []const []const u8 {
-    const args = b.args orelse return default_filters;
-    if (args.len == 0) return default_filters;
-
-    if (std.mem.eql(u8, args[0], "--test-filter")) {
-        if (args.len <= 1) return default_filters;
-        return args[1..];
-    }
-    return args;
+    return build_test_filters.select(
+        b.allocator,
+        b.args orelse &.{},
+        default_filters,
+    );
 }

@@ -16,9 +16,12 @@ package sdk
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,8 +46,9 @@ type LocalStoreClient struct {
 	store  func() (store.StoreIface, error)
 }
 
-type storeS3InfoProvider interface {
-	S3Info() *common.S3Info
+type storeExternalIOResolver interface {
+	ResolveS3Info(connectionID, capability, location string) (common.S3Info, error)
+	ResolveFilesystemPath(connectionID, capability, location string) (string, error)
 }
 
 func NewLocalStoreClient(nodeID types.ID, s store.StoreIface) *LocalStoreClient {
@@ -123,55 +127,154 @@ func (c *LocalStoreClient) ApplyMergeChunk(
 	return err
 }
 
-func (c *LocalStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
-	format = common.NormalizeBackupFormat(format)
+func (c *LocalStoreClient) Backup(
+	ctx context.Context,
+	shardID types.ID,
+	backup common.BackupConfig,
+) (*common.BackupArtifactIntegrity, error) {
+	backup.Format = common.NormalizeBackupFormat(backup.Format)
 	s, err := c.store()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	shard, ok := s.Shard(shardID)
 	if !ok {
-		return fmt.Errorf("shard %s not found on store %s", shardID, c.nodeID)
+		return nil, fmt.Errorf("shard %s not found on store %s", shardID, c.nodeID)
 	}
-	if format == common.BackupFormatPortable {
-		if strings.HasPrefix(loc, "s3://") {
-			s3Provider, ok := s.(storeS3InfoProvider)
+	if strings.HasPrefix(backup.Location, "file://") {
+		if backup.ResolvedLocation != "" {
+			if !strings.HasPrefix(backup.ResolvedLocation, "file://") {
+				return nil, fmt.Errorf("resolved filesystem backup location must use file://")
+			}
+			backup.Location = backup.ResolvedLocation
+		} else if backup.Connection != "" {
+			resolver, ok := s.(storeExternalIOResolver)
 			if !ok {
-				return fmt.Errorf("portable S3 backup requires store S3 configuration")
+				return nil, fmt.Errorf("filesystem backup requires store connection resolution")
+			}
+			resolved, err := resolver.ResolveFilesystemPath(
+				backup.Connection,
+				"backup.write",
+				backup.Location,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("authorizing filesystem backup: %w", err)
+			}
+			backup.Location = "file://" + resolved
+		}
+	}
+	if backup.Format == common.BackupFormatPortable {
+		if strings.HasPrefix(backup.Location, "s3://") {
+			s3Provider, ok := s.(storeExternalIOResolver)
+			if !ok {
+				return nil, fmt.Errorf("portable S3 backup requires store S3 configuration")
+			}
+			s3Info, err := s3Provider.ResolveS3Info(
+				backup.Connection,
+				"backup.write",
+				backup.Location,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("authorizing portable S3 backup: %w", err)
 			}
 			tempDir, err := os.MkdirTemp("", "antfly-portable-backup-")
 			if err != nil {
-				return fmt.Errorf("creating portable backup temp dir: %w", err)
+				return nil, fmt.Errorf("creating portable backup temp dir: %w", err)
 			}
 			defer func() { _ = os.RemoveAll(tempDir) }()
 
-			filePath := filepath.Join(tempDir, common.ShardPortableBackupFileName(id, shardID))
+			filePath := filepath.Join(tempDir, common.ShardPortableBackupFileName(backup.BackupID, shardID))
 			f, err := os.Create(filePath) //nolint:gosec
 			if err != nil {
-				return fmt.Errorf("creating portable backup file: %w", err)
+				return nil, fmt.Errorf("creating portable backup file: %w", err)
 			}
-			if err := shard.ExportPortable(ctx, f); err != nil {
+			artifactHasher := sha256.New()
+			if err := shard.ExportPortable(ctx, io.MultiWriter(f, artifactHasher)); err != nil {
 				_ = f.Close()
-				return err
+				return nil, err
 			}
 			if err := f.Close(); err != nil {
-				return fmt.Errorf("closing portable backup file: %w", err)
+				return nil, fmt.Errorf("closing portable backup file: %w", err)
 			}
-			return db.WriteBackupToBlobStore(context.Background(), loc, filePath, s3Provider.S3Info())
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				return nil, fmt.Errorf("stating portable backup file: %w", err)
+			}
+			if err := db.WriteBackupToBlobStore(ctx, filePath, &s3Info); err != nil {
+				return nil, err
+			}
+			return &common.BackupArtifactIntegrity{
+				Name:      common.ShardPortableBackupFileName(backup.BackupID, shardID),
+				SizeBytes: uint64(fileInfo.Size()),
+				SHA256:    hex.EncodeToString(artifactHasher.Sum(nil)),
+			}, nil
 		}
-		fileName := common.ShardPortableBackupFileName(id, shardID)
-		destDir := strings.TrimPrefix(loc, "file://")
+		fileName := common.ShardPortableBackupFileName(backup.BackupID, shardID)
+		destDir := strings.TrimPrefix(backup.Location, "file://")
 		if err := os.MkdirAll(destDir, 0o750); err != nil {
-			return fmt.Errorf("creating portable backup dir: %w", err)
+			return nil, fmt.Errorf("creating portable backup dir: %w", err)
 		}
-		f, err := os.Create(filepath.Join(destDir, fileName)) //nolint:gosec
+		f, err := os.CreateTemp(destDir, "."+fileName+".tmp-*") //nolint:gosec
 		if err != nil {
-			return fmt.Errorf("creating portable backup file: %w", err)
+			return nil, fmt.Errorf("creating temporary portable backup file: %w", err)
 		}
-		defer func() { _ = f.Close() }()
-		return shard.ExportPortable(ctx, f)
+		tempPath := f.Name()
+		defer func() {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+		}()
+		if err := f.Chmod(0o600); err != nil {
+			return nil, fmt.Errorf("setting portable backup permissions: %w", err)
+		}
+		artifactHasher := sha256.New()
+		if err := shard.ExportPortable(ctx, io.MultiWriter(f, artifactHasher)); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := f.Sync(); err != nil {
+			return nil, fmt.Errorf("syncing portable backup: %w", err)
+		}
+		fileInfo, err := f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stating portable backup: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("closing portable backup: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := os.Link(tempPath, filepath.Join(destDir, fileName)); err != nil {
+			if os.IsExist(err) {
+				return nil, fmt.Errorf("%w: %s", common.ErrBackupAlreadyExists, fileName)
+			}
+			return nil, fmt.Errorf("publishing portable backup: %w", err)
+		}
+		dir, err := os.Open(destDir) //nolint:gosec // authorized backup directory
+		if err != nil {
+			return nil, fmt.Errorf("opening portable backup directory for sync: %w", err)
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			return nil, fmt.Errorf("syncing portable backup directory: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return nil, fmt.Errorf("closing portable backup directory: %w", err)
+		}
+		return &common.BackupArtifactIntegrity{
+			Name:      fileName,
+			SizeBytes: uint64(fileInfo.Size()),
+			SHA256:    hex.EncodeToString(artifactHasher.Sum(nil)),
+		}, nil
 	}
-	return shard.Backup(ctx, loc, id)
+	shardBackup := backup
+	shardBackup.BackupID = strings.TrimSuffix(
+		common.ShardBackupFileName(backup.BackupID, shardID),
+		".tar.zst",
+	)
+	return nil, shard.Backup(ctx, shardBackup)
 }
 
 func (c *LocalStoreClient) Lookup(ctx context.Context, shardID types.ID, keys []string) (map[string][]byte, error) {
@@ -359,6 +462,7 @@ func (c *LocalStoreClient) StartShard(ctx context.Context, shardID types.ID, req
 	return s.StartRaftGroup(shardID, req.Peers, req.Join, &store.ShardStartConfig{
 		ShardConfig: req.ShardConfig,
 		Timestamp:   req.Timestamp,
+		Context:     ctx,
 	})
 }
 

@@ -314,10 +314,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -588,7 +588,8 @@ components:
         - projection_checkpoint_status
         - projection_checkpoint_applied_sequence
         - projection_checkpoint_generation
-        - projection_checkpoint_config_hash
+        - projection_checkpoint_config_fingerprint
+        - projection_checkpoint_identity_consistent
         - checkpoint_replay_tail_sequence_count
         - processed_requests
         - error_count
@@ -612,6 +613,7 @@ components:
         - last_embed_batch_items
         - last_embed_batch_bytes
         - last_embed_batch_max_bytes
+        - last_embed_batch_completed_ms
         - last_embed_batch_ns
         - total_embed_ns
       properties:
@@ -634,9 +636,12 @@ components:
         projection_checkpoint_generation:
           type: integer
           format: uint64
-        projection_checkpoint_config_hash:
-          type: integer
-          format: uint64
+        projection_checkpoint_config_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{16}$"
+        projection_checkpoint_identity_consistent:
+          type: boolean
+          description: "Whether every shard contributing to this status reports the same checkpoint generation and configuration identity."
         checkpoint_replay_tail_sequence_count:
           type: integer
           format: uint64
@@ -704,9 +709,14 @@ components:
         last_embed_batch_max_bytes:
           type: integer
           format: uint64
+        last_embed_batch_completed_ms:
+          type: integer
+          format: uint64
+          description: "Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch."
         last_embed_batch_ns:
           type: integer
           format: uint64
+          description: "Elapsed duration in nanoseconds for the most recently completed embedding batch."
         total_embed_ns:
           type: integer
           format: uint64
@@ -881,10 +891,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -1171,10 +1181,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -1571,10 +1581,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -2004,6 +2014,8 @@ components:
         max_depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 64
           description: "Maximum traversal depth"
         min_weight:
           x-go-type-skip-optional-pointer: true
@@ -2018,6 +2030,8 @@ components:
         max_results:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 10000
           description: "Maximum number of results (traversal)"
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
@@ -2032,6 +2046,8 @@ components:
         k:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 100
           description: "Number of paths to find (k-shortest-paths)"
         node_filter:
           $ref: "#/components/schemas/NodeFilter"
@@ -2056,6 +2072,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Document key"
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Owning table for a cross-table node; omitted for nodes in the queried table"
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer

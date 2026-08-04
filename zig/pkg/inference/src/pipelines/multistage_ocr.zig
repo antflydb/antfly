@@ -20,6 +20,7 @@ const crop = @import("crop.zig");
 const ctc_decode = @import("ctc_decode.zig");
 const connected_components = @import("connected_components.zig");
 const vision_reader = @import("../readers/vision_reader.zig");
+const model_manager_mod = @import("../server/model_manager.zig");
 
 pub const TextRegion = struct {
     bbox: [4]f64,
@@ -274,18 +275,39 @@ pub const Vision2SeqRecognizer = struct {
     pub fn loadFromStagePaths(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        encoder_file: []const u8,
-        decoder_file: []const u8,
-        session_manager: *backends.SessionManager,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !Vision2SeqRecognizer {
         return .{
             .allocator = allocator,
             .reader = try vision_reader.LoadedVisionReader.loadFromStagePaths(
                 allocator,
                 model_path,
-                encoder_file,
-                decoder_file,
-                session_manager,
+                encoder_path,
+                decoder_path,
+                component_loader,
+            ),
+        };
+    }
+
+    pub fn loadFromStagePathsWithTokenizer(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+    ) !Vision2SeqRecognizer {
+        return .{
+            .allocator = allocator,
+            .reader = try vision_reader.LoadedVisionReader.loadFromStagePathsWithTokenizer(
+                allocator,
+                model_path,
+                encoder_path,
+                decoder_path,
+                component_loader,
+                managed_tokenizer,
             ),
         };
     }

@@ -13,9 +13,9 @@
 // limitations.
 
 const std = @import("std");
-const common_secrets = @import("../common/secrets.zig");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
+const metadata_authority = @import("authority.zig");
 const metadata_admin = @import("admin.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
@@ -28,7 +28,6 @@ const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
-const foreign_mod = @import("../foreign/mod.zig");
 const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
@@ -110,7 +109,15 @@ pub const AdminSource = struct {
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
-        restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
+        restore_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            artifact_backup_id: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -180,9 +187,17 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, expected, replacement);
     }
 
-    pub fn restoreTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    pub fn restoreTable(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const fn_ptr = self.vtable.restore_table orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, location_uri, backup_id);
+        return try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
     }
 
     pub fn dropTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -448,7 +463,7 @@ pub const AdminSource = struct {
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
         if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
         if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
-        try svc.upsertTable(replacement);
+        try svc.replaceTableDefinition(expected, replacement);
     }
 
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -471,9 +486,17 @@ pub const AdminSource = struct {
         try flushMetadataServiceMutation(svc);
     }
 
-    fn metadataServiceRestoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn metadataServiceRestoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, backup_id);
+        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -499,7 +522,7 @@ pub const AdminSource = struct {
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -513,7 +536,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -528,7 +551,7 @@ pub const AdminSource = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -543,7 +566,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -559,7 +582,7 @@ pub const AdminSource = struct {
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -792,9 +815,17 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
-    fn metadataHttpServiceRestoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn metadataHttpServiceRestoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, backup_id);
+        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -820,7 +851,7 @@ pub const AdminSource = struct {
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -834,7 +865,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -849,7 +880,7 @@ pub const AdminSource = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -864,7 +895,7 @@ pub const AdminSource = struct {
         updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -880,7 +911,7 @@ pub const AdminSource = struct {
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try svc.upsertTable(updated);
+        try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1160,9 +1191,11 @@ pub const MetadataHttpServer = struct {
                     }) catch return try textResponse(alloc, 400, "invalid catalog publication contract");
                     defer parsed.deinit();
                     const valid = self.source.validatePublication(parsed.value) catch |err| switch (err) {
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => return try notLeaderResponse(alloc),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
+                        else => if (metadata_authority.isRetryableError(err))
+                            return try notLeaderResponse(alloc)
+                        else
+                            return err,
                     };
                     return try textResponse(alloc, if (valid) 204 else 409, "");
                 }
@@ -1173,9 +1206,11 @@ pub const MetadataHttpServer = struct {
                     }) catch return try textResponse(alloc, 400, "invalid catalog table publication contract");
                     defer parsed.deinit();
                     const valid = self.source.validateTablePublication(parsed.value) catch |err| switch (err) {
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => return try notLeaderResponse(alloc),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
+                        else => if (metadata_authority.isRetryableError(err))
+                            return try notLeaderResponse(alloc)
+                        else
+                            return err,
                     };
                     return try textResponse(alloc, if (valid) 204 else 409, "");
                 }
@@ -1318,7 +1353,14 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
                     var restore_req = parseInternalTableRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
                     defer restore_req.deinit();
-                    self.source.restoreTable(alloc, table.table_name, restore_req.value.location, restore_req.value.backup_id) catch |err| {
+                    self.source.restoreTable(
+                        alloc,
+                        table.table_name,
+                        restore_req.value.location,
+                        restore_req.value.connection,
+                        restore_req.value.artifact_backup_id,
+                        &restore_req.value.manifest,
+                    ) catch |err| {
                         if (backups_api.backupLocationErrorMessage(err)) |msg| {
                             return try textResponse(alloc, 400, msg);
                         }
@@ -1327,6 +1369,11 @@ pub const MetadataHttpServer = struct {
                             error.InvalidBackupRequest, error.UnsupportedBackupFormat, error.UnsupportedBackupMigrationState => {
                                 return try textResponse(alloc, 400, "invalid restore request");
                             },
+                            error.BackupIntegrityMissing,
+                            error.BackupArtifactIntegrityMismatch,
+                            error.BackupArtifactMissing,
+                            error.BackupArtifactFormatMismatch,
+                            => return try textResponse(alloc, 400, backups_api.integrity_failure_message),
                             error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                             else => return err,
                         }
@@ -1369,6 +1416,8 @@ pub const MetadataHttpServer = struct {
                     var result = self.source.reseedReplicationSourceExactCutover(alloc, source_path.table_name, source_path.source_ordinal) catch |err| switch (err) {
                         error.TableNotFound, error.UnknownReplicationSource => return try textResponse(alloc, 404, "not found"),
                         error.InvalidReplicationSourceConfig, error.UnsupportedReplicationSource => return try textResponse(alloc, 400, "invalid replication source"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
@@ -1415,6 +1464,7 @@ pub const MetadataHttpServer = struct {
                     self.source.replaceTableDefinition(parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
                         error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject, error.UnsupportedOperation => return try textResponse(alloc, 405, "method not allowed"),
                         else => return err,
                     };
@@ -1423,6 +1473,8 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableSchema(req.uri)) |table| {
                     self.source.updateSchema(alloc, table.table_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(alloc, 400, "invalid schema update request"),
@@ -1433,6 +1485,8 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.createIndex(alloc, table_index.table_name, table_index.index_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return try textResponse(alloc, 400, "unsupported index configuration"),
@@ -1453,6 +1507,8 @@ pub const MetadataHttpServer = struct {
                     defer alloc.free(enrichment_name);
                     self.source.putArtifactEnrichment(alloc, table_name, enrichment_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(alloc, 400, "unsupported artifact enrichment configuration"),
@@ -1480,6 +1536,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
                     self.source.dropTable(alloc, table.table_name) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
@@ -1489,6 +1546,8 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.dropIndex(alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
                         error.TableNotFound, error.IndexNotFound => return try textResponse(alloc, 404, "index not found"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
@@ -1508,6 +1567,8 @@ pub const MetadataHttpServer = struct {
                     defer alloc.free(enrichment_name);
                     self.source.deleteArtifactEnrichment(alloc, table_name, enrichment_name) catch |err| switch (err) {
                         error.TableNotFound, error.EnrichmentNotFound => return try textResponse(alloc, 404, "artifact enrichment not found"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(alloc, 400, "unsupported artifact enrichment configuration"),
@@ -1715,9 +1776,9 @@ pub const MetadataHttpServer = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.handleWithAllocator(alloc, req) catch |err| switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(alloc),
-            else => return err,
+        return self.handleWithAllocator(alloc, req) catch |err| {
+            if (metadata_authority.isRetryableError(err)) return try notLeaderResponse(alloc);
+            return err;
         };
     }
 };
@@ -1736,18 +1797,60 @@ fn cloneValues(
 
 const InternalTableRestoreRequest = struct {
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
+    connection: []const u8,
+    manifest: backups_api.TableBackupManifest,
 };
 
-/// Metadata-to-metadata restore dispatch is an internal control-plane request.
-/// It deliberately does not carry a public named connection: the data node
-/// resolves the location using its own configured storage authority.
+/// The ingress data node validates and content-binds the manifest using the
+/// named connection. Metadata persists that authority identifier and exact
+/// artifact identity without requiring backup credentials itself.
 fn parseInternalTableRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(InternalTableRestoreRequest) {
     const parsed = try std.json.parseFromSlice(InternalTableRestoreRequest, alloc, body, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     try backups_api.validateBackupId(parsed.value.backup_id);
+    try backups_api.validateBackupId(parsed.value.artifact_backup_id);
     if (parsed.value.location.len == 0 or parsed.value.location.len > 4096) return error.InvalidBackupRequest;
+    if (parsed.value.connection.len == 0 or parsed.value.connection.len > 256) return error.InvalidBackupRequest;
+    if (!std.mem.eql(u8, parsed.value.backup_id, parsed.value.manifest.backup_id))
+        return error.InvalidBackupRequest;
+    try backups_api.validateTableManifest(alloc, &parsed.value.manifest, parsed.value.backup_id);
     return parsed;
+}
+
+fn testInternalTableRestoreRequestBodyAlloc(
+    alloc: std.mem.Allocator,
+    backup_id: []const u8,
+    table_name: []const u8,
+    location: []const u8,
+    connection: []const u8,
+) ![]u8 {
+    const manifest = backups_api.TableBackupManifest{
+        .format = .native,
+        .backup_id = backup_id,
+        .table_name = table_name,
+        .description = "test restore manifest",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &.{.{
+            .group_id = 7001,
+            .start_key = "",
+            .end_key = null,
+            .snapshot_path = "artifacts/groups/7001",
+            .artifact_size_bytes = 0,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        }},
+    };
+    return try std.json.Stringify.valueAlloc(alloc, InternalTableRestoreRequest{
+        .backup_id = backup_id,
+        .artifact_backup_id = backup_id,
+        .location = location,
+        .connection = connection,
+        .manifest = manifest,
+    }, .{});
 }
 
 fn buildNodeShutdownStatus(
@@ -1945,19 +2048,26 @@ fn loadRestoreMetadataSpec(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     location_uri: []const u8,
-    backup_id: []const u8,
-    secret_store: ?*common_secrets.FileStore,
+    connection: []const u8,
+    artifact_backup_id: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
 ) !RestoreMetadataSpec {
-    var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
-    defer location.deinit(alloc);
-    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
-    defer manifest.deinit(alloc);
-
-    const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest) catch {
+    try backups_api.validateTableManifest(alloc, manifest, manifest.backup_id);
+    if (manifest.artifact_integrity_mode != .declared)
+        return error.BackupIntegrityMissing;
+    if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+    const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch {
         return error.InvalidBackupRequest;
     };
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
+    const ranges = try backups_api.deriveRestoreRanges(
+        alloc,
+        table.table_id,
+        location_uri,
+        connection,
+        artifact_backup_id,
+        manifest,
+    );
     errdefer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
@@ -1968,17 +2078,23 @@ fn loadRestoreMetadataSpec(
     };
 }
 
-fn serviceSecretStore(service_impl: anytype) ?*common_secrets.FileStore {
-    const Ptr = @TypeOf(service_impl);
-    const Service = std.meta.Child(Ptr);
-    if (comptime @hasField(Service, "secret_store")) {
-        return service_impl.secret_store;
-    }
-    return null;
-}
-
-fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
-    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, serviceSecretStore(service_impl));
+fn persistRestoreTableIntent(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    location_uri: []const u8,
+    connection: []const u8,
+    artifact_backup_id: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
+) !void {
+    var spec = try loadRestoreMetadataSpec(
+        alloc,
+        table_name,
+        location_uri,
+        connection,
+        artifact_backup_id,
+        manifest,
+    );
     defer spec.deinit(alloc);
 
     var snapshot = try service_impl.adminSnapshot();
@@ -1997,8 +2113,11 @@ const ParsedGroupStatus = struct {
     group_id: u64,
     relocation_generation: ?u64 = null,
     raft_applied_index: ?u64 = null,
+    raft_term: ?u64 = null,
+    raft_membership_index: ?u64 = null,
     doc_count: ?u64 = null,
     disk_bytes: ?u64 = null,
+    disk_bytes_known: ?bool = null,
     empty: ?bool = null,
     created_at_millis: ?u64 = null,
     updated_at_millis: ?u64 = null,
@@ -2018,6 +2137,7 @@ const ParsedGroupStatus = struct {
 const ParsedRuntimeIndexStatus = struct {
     name: ?[]const u8 = null,
     kind: ?[]const u8 = null,
+    load_error: ?[]const u8 = null,
     doc_count: ?u64 = null,
     term_count: ?u64 = null,
     edge_count: ?u64 = null,
@@ -2054,13 +2174,7 @@ const ParsedRuntimeGroupStatus = struct {
     disk_bytes_known: ?bool = null,
     created_at_millis: ?u64 = null,
     index_count: ?u32 = null,
-    enrichment_enabled: ?bool = null,
-    enrichment_target_sequence: ?u64 = null,
-    enrichment_applied_sequence: ?u64 = null,
-    enrichment_retrying: ?bool = null,
-    enrichment_worker_failed: ?bool = null,
-    enrichment_worker_started: ?bool = null,
-    enrichment_stalled: ?bool = null,
+    enrichment: ?metadata_table_manager.RuntimeEnrichmentStatusReport = null,
     async_indexing_active: ?bool = null,
     async_startup_active: ?bool = null,
     async_dense_catch_up_active: ?bool = null,
@@ -2243,8 +2357,11 @@ fn cloneParsedGroupStatuses(
             .group_id = parsed.group_id,
             .relocation_generation = parsed.relocation_generation orelse 0,
             .raft_applied_index = parsed.raft_applied_index orelse 0,
+            .raft_term = parsed.raft_term orelse 0,
+            .raft_membership_index = parsed.raft_membership_index orelse 0,
             .doc_count = parsed.doc_count orelse 0,
             .disk_bytes = parsed.disk_bytes orelse 0,
+            .disk_bytes_known = parsed.disk_bytes_known orelse false,
             .empty = parsed.empty orelse true,
             .created_at_millis = parsed.created_at_millis orelse 0,
             .updated_at_millis = parsed.updated_at_millis orelse 0,
@@ -2294,6 +2411,9 @@ fn cloneParsedRuntimeGroupStatus(
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, parsed.freshness orelse "unknown");
     errdefer alloc.free(freshness);
+    var enrichment = parsed.enrichment orelse metadata_table_manager.RuntimeEnrichmentStatusReport{};
+    enrichment.projection_checkpoint_status = try alloc.dupe(u8, enrichment.projection_checkpoint_status);
+    errdefer alloc.free(enrichment.projection_checkpoint_status);
     return .{
         .table_id = parsed.table_id orelse 0,
         .table_name = table_name,
@@ -2311,13 +2431,7 @@ fn cloneParsedRuntimeGroupStatus(
         .disk_bytes_known = parsed.disk_bytes_known orelse false,
         .created_at_millis = parsed.created_at_millis orelse 0,
         .index_count = parsed.index_count orelse @intCast(indexes.len),
-        .enrichment_enabled = parsed.enrichment_enabled orelse false,
-        .enrichment_target_sequence = parsed.enrichment_target_sequence orelse 0,
-        .enrichment_applied_sequence = parsed.enrichment_applied_sequence orelse 0,
-        .enrichment_retrying = parsed.enrichment_retrying orelse false,
-        .enrichment_worker_failed = parsed.enrichment_worker_failed orelse false,
-        .enrichment_worker_started = parsed.enrichment_worker_started orelse false,
-        .enrichment_stalled = parsed.enrichment_stalled orelse false,
+        .enrichment = enrichment,
         .async_indexing_active = parsed.async_indexing_active orelse false,
         .async_startup_active = parsed.async_startup_active orelse (parsed.async_indexing_active orelse false),
         .async_dense_catch_up_active = parsed.async_dense_catch_up_active orelse (parsed.async_indexing_active orelse false),
@@ -2353,9 +2467,12 @@ fn cloneParsedRuntimeIndexStatus(
     errdefer alloc.free(name);
     const kind = try alloc.dupe(u8, parsed.kind orelse "");
     errdefer alloc.free(kind);
+    const load_error = if (parsed.load_error) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (load_error) |value| alloc.free(value);
     return .{
         .name = name,
         .kind = kind,
+        .load_error = load_error,
         .doc_count = parsed.doc_count orelse 0,
         .term_count = parsed.term_count orelse 0,
         .edge_count = parsed.edge_count orelse 0,
@@ -2400,18 +2517,19 @@ fn reseedReplicationSourceExactCutoverForService(
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    var existing = try parseReplicationSourceCleanupAlloc(alloc, table.name, table.replication_sources_json, source_ordinal);
-    defer existing.deinit(alloc);
     const updated = try cloneTableWithReseededExactCutoverSource(alloc, table.*, source_ordinal);
+    defer alloc.free(updated.table.replication_sources_json);
     errdefer {
-        alloc.free(updated.table.replication_sources_json);
         alloc.free(updated.slot_name);
         alloc.free(updated.publication_name);
     }
-    try cleanupReplicationSourceArtifactsForService(ServiceType, svc, alloc, existing);
-    try svc.upsertTable(updated.table);
-    alloc.free(updated.table.replication_sources_json);
-    try svc.removeReplicationSourceStatus(table.table_id, source_ordinal);
+    // Catalog publication is the fencing point. The old runtime observes the
+    // changed source config and loses authority before it can publish further
+    // work. The replacement runtime atomically claims a fresh authority and
+    // durably retires the superseded slot/publication under the provider lock.
+    // Performing provider cleanup here would race both owners and would leave
+    // no durable retry intent after a process crash.
+    try svc.replaceTableDefinition(table.*, updated.table);
     try flushFn(svc);
     return .{
         .slot_name = updated.slot_name,
@@ -2423,19 +2541,6 @@ const ReseededTable = struct {
     table: metadata_table_manager.TableRecord,
     slot_name: []u8,
     publication_name: []u8,
-};
-
-const ReplicationSourceCleanup = struct {
-    dsn: []u8,
-    slot_name: []u8,
-    publication_name: []u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.dsn);
-        alloc.free(self.slot_name);
-        alloc.free(self.publication_name);
-        self.* = undefined;
-    }
 };
 
 fn cloneTableWithReseededExactCutoverSource(
@@ -2503,68 +2608,6 @@ fn reseedReplicationSourcesExactCutoverAlloc(
         .replication_sources_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{}),
         .slot_name = slot_name,
         .publication_name = publication_name,
-    };
-}
-
-fn cleanupReplicationSourceArtifactsForService(
-    comptime ServiceType: type,
-    svc: *ServiceType,
-    alloc: std.mem.Allocator,
-    cleanup: ReplicationSourceCleanup,
-) !void {
-    if (!@hasField(ServiceType, "cdc_backfill_registry")) return error.UnsupportedOperation;
-    const config = foreign_mod.Config{
-        .kind = .postgres,
-        .dsn = try alloc.dupe(u8, cleanup.dsn),
-    };
-    var source = try svc.cdc_backfill_registry.create(alloc, config);
-    defer source.deinit(alloc);
-    var params = foreign_mod.ReplicationCleanupParams{
-        .slot_name = try alloc.dupe(u8, cleanup.slot_name),
-        .publication_name = try alloc.dupe(u8, cleanup.publication_name),
-    };
-    defer params.deinit(alloc);
-    try source.cleanupReplication(alloc, params);
-}
-
-fn parseReplicationSourceCleanupAlloc(
-    alloc: std.mem.Allocator,
-    table_name: []const u8,
-    replication_sources_json: []const u8,
-    source_ordinal: u32,
-) !ReplicationSourceCleanup {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, replication_sources_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidReplicationSourceConfig;
-    if (source_ordinal >= parsed.value.array.items.len) return error.UnknownReplicationSource;
-    const source = parsed.value.array.items[source_ordinal];
-    if (source != .object) return error.InvalidReplicationSourceConfig;
-
-    const type_value = source.object.get("type") orelse return error.InvalidReplicationSourceConfig;
-    if (type_value != .string or !std.mem.eql(u8, type_value.string, "postgres")) return error.UnsupportedReplicationSource;
-    const dsn_value = source.object.get("dsn") orelse return error.InvalidReplicationSourceConfig;
-    if (dsn_value != .string) return error.InvalidReplicationSourceConfig;
-    const postgres_table_value = source.object.get("postgres_table") orelse return error.InvalidReplicationSourceConfig;
-    if (postgres_table_value != .string) return error.InvalidReplicationSourceConfig;
-
-    return .{
-        .dsn = try alloc.dupe(u8, dsn_value.string),
-        .slot_name = if (source.object.get("slot_name")) |value|
-            switch (value) {
-                .string => try alloc.dupe(u8, value.string),
-                .null => try deriveDefaultPostgresSlotNameAlloc(alloc, table_name, postgres_table_value.string),
-                else => return error.InvalidReplicationSourceConfig,
-            }
-        else
-            try deriveDefaultPostgresSlotNameAlloc(alloc, table_name, postgres_table_value.string),
-        .publication_name = if (source.object.get("publication_name")) |value|
-            switch (value) {
-                .string => try alloc.dupe(u8, value.string),
-                .null => try deriveDefaultPostgresPublicationNameAlloc(alloc, table_name, postgres_table_value.string),
-                else => return error.InvalidReplicationSourceConfig,
-            }
-        else
-            try deriveDefaultPostgresPublicationNameAlloc(alloc, table_name, postgres_table_value.string),
     };
 }
 
@@ -4173,11 +4216,22 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             self.store_status_count += 1;
         }
 
-        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            artifact_backup_id: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
-            try std.testing.expectEqualStrings("snap1", backup_id);
+            try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("snap1", artifact_backup_id);
+            try std.testing.expectEqualStrings("snap1", manifest.backup_id);
+            try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.restore_count += 1;
         }
 
@@ -4267,10 +4321,18 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     defer store_status.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), store_status.status);
 
+    const restore_body = try testInternalTableRestoreRequestBodyAlloc(
+        std.testing.allocator,
+        "snap1",
+        "docs",
+        "file:///tmp/out",
+        "test-backups",
+    );
+    defer std.testing.allocator.free(restore_body);
     var restore = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/tables/docs/restore",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\"}",
+        .body = restore_body,
         .content_type = "application/json",
     });
     defer restore.deinit(std.testing.allocator);
@@ -4728,7 +4790,7 @@ test "metadata http server returns 400 for invalid internal restore backup locat
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn restoreTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+        fn restoreTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: *const backups_api.TableBackupManifest) !void {
             return error.MissingEndpoint;
         }
     };
@@ -4736,10 +4798,18 @@ test "metadata http server returns 400 for invalid internal restore backup locat
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
 
+    const restore_body = try testInternalTableRestoreRequestBodyAlloc(
+        std.testing.allocator,
+        "snap1",
+        "docs",
+        "s3://bucket/out",
+        "test-backups",
+    );
+    defer std.testing.allocator.free(restore_body);
     var restore = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/tables/docs/restore",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"s3://bucket/out\"}",
+        .body = restore_body,
         .content_type = "application/json",
     });
     defer restore.deinit(std.testing.allocator);
@@ -4816,4 +4886,64 @@ test "metadata http server accepts reseed exact cutover route" {
     try std.testing.expectEqual(@as(u32, 1), source.reseed_source_ordinal.?);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"slot_name\":\"fresh_slot\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"publication_name\":\"fresh_pub\"") != null);
+}
+
+test "metadata http server returns retryable authority response when reconcile lease is not held" {
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusCall;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: tables_api.CreateTableRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.create_calls += 1;
+            return error.ReconcileLeaseNotHeld;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var resp = try server.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "/internal/v1/tables/docs",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    var authority_header_found = false;
+    for (resp.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header)) continue;
+        try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, header.value);
+        authority_header_found = true;
+    }
+    try std.testing.expect(authority_header_found);
 }

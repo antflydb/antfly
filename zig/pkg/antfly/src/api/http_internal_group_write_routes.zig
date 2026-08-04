@@ -306,6 +306,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             error.ApplyStoreGroupRetired,
             error.ApplyStoreShuttingDown,
             error.BackgroundOwnerClosing,
+            error.BackgroundOwnerClosed,
             error.TransitionOperationBusy,
             => {
                 return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
@@ -748,7 +749,23 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
+    table_contract: metadata_transition_state.TransitionTableContract = .{},
 };
+
+const test_transition_table_contract: metadata_transition_state.TransitionTableContract = .{
+    .table_id = 7,
+    .table_name = "docs",
+    .schema_json = "",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 7, .range_id = 7 },
+    .target_identity = .{ .shard_id = 7, .range_id = 7 },
+};
+
+fn requiredTransitionGroupId(value: ?u64) !u64 {
+    const group_id = value orelse return error.InvalidTransitionActionRequest;
+    if (group_id == 0) return error.InvalidTransitionActionRequest;
+    return group_id;
+}
 
 fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.SplitTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
@@ -758,28 +775,61 @@ fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metad
     {
         return error.InvalidTransitionActionRequest;
     }
+    try parsed.value.table_contract.validateForSplit();
+    const split_key = if (parsed.value.split_key) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (split_key) |value| alloc.free(value);
+    const source_range_end = if (parsed.value.source_range_end) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_range_end) |value| alloc.free(value);
+    const rollback_reason = if (parsed.value.rollback_reason) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (rollback_reason) |value| alloc.free(value);
+    const table_contract = try parsed.value.table_contract.clone(alloc);
     return .{
         .transition_id = parsed.value.transition_id,
         .attempt_epoch = parsed.value.attempt_epoch,
         .source_group_id = parsed.value.source_group_id,
         .destination_group_id = parsed.value.destination_group_id,
         .phase = parsed.value.phase,
-        .split_key = if (parsed.value.split_key) |value| try alloc.dupe(u8, value) else null,
-        .source_range_end = if (parsed.value.source_range_end) |value| try alloc.dupe(u8, value) else null,
-        .rollback_reason = if (parsed.value.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .split_key = split_key,
+        .source_range_end = source_range_end,
+        .rollback_reason = rollback_reason,
+        .table_contract = table_contract,
     };
 }
 
 fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.MergeTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.MergeTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    if (parsed.value.transition_id == 0 or parsed.value.donor_group_id == 0 or
+        parsed.value.receiver_group_id == 0)
+    {
+        return error.InvalidTransitionActionRequest;
+    }
+    try parsed.value.table_contract.validateForMerge(
+        parsed.value.allow_doc_identity_reassignment,
+    );
+    const rollback_reason = if (parsed.value.rollback_reason) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (rollback_reason) |value| alloc.free(value);
+    const table_contract = try parsed.value.table_contract.clone(alloc);
     return .{
         .transition_id = parsed.value.transition_id,
         .donor_group_id = parsed.value.donor_group_id,
         .receiver_group_id = parsed.value.receiver_group_id,
         .phase = parsed.value.phase,
-        .rollback_reason = if (parsed.value.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .rollback_reason = rollback_reason,
         .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+        .table_contract = table_contract,
     };
 }
 
@@ -796,87 +846,141 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
         => if (parsed.value.attempt_epoch == 0) return error.InvalidTransitionActionRequest,
         else => {},
     }
+    if (parsed.value.transition_id == 0)
+        return error.InvalidTransitionActionRequest;
+    switch (parsed.value.kind) {
+        .prepare_split_source,
+        .start_split_source,
+        .bootstrap_split_destination,
+        .catch_up_split_destination,
+        .finalize_split_source,
+        .rollback_split,
+        => try parsed.value.table_contract.validateForSplit(),
+        .accept_merge_receiver,
+        .catch_up_merge_receiver,
+        .finalize_merge,
+        .rollback_merge,
+        => try parsed.value.table_contract.validateForMerge(
+            parsed.value.allow_doc_identity_reassignment,
+        ),
+    }
     return switch (parsed.value.kind) {
-        .prepare_split_source => .{
-            .prepare_split_source = .{
-                .transition_id = parsed.value.transition_id,
-                .attempt_epoch = parsed.value.attempt_epoch,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
-                .split_key = try alloc.dupe(u8, parsed.value.split_key orelse return error.InvalidTransitionActionRequest),
-                .source_range_end = if (parsed.value.source_range_end) |value| try alloc.dupe(u8, value) else null,
-            },
-        },
+        .prepare_split_source => try parsePrepareSplitTransitionAction(
+            alloc,
+            parsed.value,
+        ),
         .start_split_source => .{
             .start_split_source = .{
                 .transition_id = parsed.value.transition_id,
                 .attempt_epoch = parsed.value.attempt_epoch,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .bootstrap_split_destination => .{
             .bootstrap_split_destination = .{
                 .transition_id = parsed.value.transition_id,
                 .attempt_epoch = parsed.value.attempt_epoch,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .catch_up_split_destination => .{
             .catch_up_split_destination = .{
                 .transition_id = parsed.value.transition_id,
                 .attempt_epoch = parsed.value.attempt_epoch,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .finalize_split_source => .{
             .finalize_split_source = .{
                 .transition_id = parsed.value.transition_id,
                 .attempt_epoch = parsed.value.attempt_epoch,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .rollback_split => .{
             .rollback_split = .{
                 .transition_id = parsed.value.transition_id,
                 .attempt_epoch = parsed.value.attempt_epoch,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .accept_merge_receiver => .{
             .accept_merge_receiver = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
                 .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .catch_up_merge_receiver => .{
             .catch_up_merge_receiver = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
                 .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .finalize_merge => .{
             .finalize_merge = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
                 .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .rollback_merge => .{
             .rollback_merge = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
+                .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
+        },
+    };
+}
+
+fn parsePrepareSplitTransitionAction(
+    alloc: std.mem.Allocator,
+    encoded: EncodedTransitionAction,
+) !metadata_mod.TransitionAction {
+    const source_group_id = try requiredTransitionGroupId(encoded.source_group_id);
+    const destination_group_id = try requiredTransitionGroupId(
+        encoded.destination_group_id,
+    );
+    const raw_split_key = encoded.split_key orelse
+        return error.InvalidTransitionActionRequest;
+    if (raw_split_key.len == 0) return error.InvalidTransitionActionRequest;
+    const split_key = try alloc.dupe(u8, raw_split_key);
+    errdefer alloc.free(split_key);
+    const source_range_end = if (encoded.source_range_end) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_range_end) |value| alloc.free(value);
+    const table_contract = try encoded.table_contract.clone(alloc);
+    return .{
+        .prepare_split_source = .{
+            .transition_id = encoded.transition_id,
+            .attempt_epoch = encoded.attempt_epoch,
+            .source_group_id = source_group_id,
+            .destination_group_id = destination_group_id,
+            .split_key = split_key,
+            .source_range_end = source_range_end,
+            .table_contract = table_contract,
         },
     };
 }
@@ -885,11 +989,13 @@ fn freeSplitTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_tr
     if (record.split_key) |value| alloc.free(value);
     if (record.source_range_end) |value| alloc.free(value);
     if (record.rollback_reason) |value| alloc.free(value);
+    record.table_contract.deinitOwned(alloc);
     record.* = undefined;
 }
 
 fn freeMergeTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_transition_state.MergeTransitionRecord) void {
     if (record.rollback_reason) |value| alloc.free(value);
+    record.table_contract.deinitOwned(alloc);
     record.* = undefined;
 }
 
@@ -1010,6 +1116,19 @@ test "internal group artifact repair rejects callback token without cancel execu
 
 test "internal group write routes reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
+    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(
+        EncodedTransitionAction{
+            .kind = .prepare_split_source,
+            .transition_id = 1,
+            .attempt_epoch = 1,
+            .source_group_id = 8,
+            .destination_group_id = 9,
+            .split_key = "doc:m",
+            .table_contract = test_transition_table_contract,
+        },
+        .{},
+    )});
+    defer alloc.free(body);
 
     var resp = (try handle(.{
         .alloc = alloc,
@@ -1020,7 +1139,7 @@ test "internal group write routes reject mismatched shard execute requests" {
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = "{\"kind\":\"prepare_split_source\",\"transition_id\":1,\"source_group_id\":8,\"destination_group_id\":9,\"split_key\":\"doc:m\"}",
+        .body = body,
     }, "/internal/v1/groups/7/shard-ops/execute")).?;
     defer resp.deinit(alloc);
 
@@ -1034,6 +1153,7 @@ test "internal group write routes allow source-hosted split destination actions"
         .attempt_epoch = 1,
         .source_group_id = 7,
         .destination_group_id = 8,
+        .table_contract = test_transition_table_contract,
     } };
     try std.testing.expect(transitionActionMatchesRouteGroup(action, 7));
     try std.testing.expect(transitionActionMatchesRouteGroup(action, 8));
@@ -1042,13 +1162,54 @@ test "internal group write routes allow source-hosted split destination actions"
 
 test "internal group write routes parse merge doc identity reassignment action flag" {
     const alloc = std.testing.allocator;
-    var action = try parseTransitionAction(alloc,
-        \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9,"allow_doc_identity_reassignment":true}
-    );
+    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(
+        EncodedTransitionAction{
+            .kind = .catch_up_merge_receiver,
+            .transition_id = 4,
+            .donor_group_id = 10,
+            .receiver_group_id = 9,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = test_transition_table_contract,
+        },
+        .{},
+    )});
+    defer alloc.free(body);
+    var action = try parseTransitionAction(alloc, body);
     defer freeTransitionActionOwned(alloc, &action);
 
     try std.testing.expect(action == .catch_up_merge_receiver);
     try std.testing.expect(action.catch_up_merge_receiver.allow_doc_identity_reassignment);
+    try std.testing.expect(action.catch_up_merge_receiver.table_contract.eql(
+        test_transition_table_contract,
+    ));
+}
+
+test "internal group write routes reject incomplete transition contracts" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        parseTransitionAction(alloc,
+            \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionActionRequest,
+        parseTransitionAction(alloc,
+            \\{"kind":"prepare_split_source","transition_id":4,"attempt_epoch":1,"source_group_id":10,"destination_group_id":9,"split_key":"","table_contract":{"table_id":7,"table_name":"docs","schema_json":"","indexes_json":"{}","source_identity":{"shard_id":7,"range_id":7},"target_identity":{"shard_id":7,"range_id":7}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        parseTransitionAction(alloc,
+            \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9,"table_contract":{"table_id":7,"table_name":"docs","schema_json":"","indexes_json":"{}","source_identity":{"shard_id":7,"range_id":7},"target_identity":{"shard_id":8,"range_id":8}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        parseTransitionAction(alloc,
+            \\{"kind":"prepare_split_source","transition_id":4,"attempt_epoch":1,"source_group_id":10,"destination_group_id":9,"split_key":"doc:m","table_contract":{"table_id":7,"table_name":"docs","schema_json":"","indexes_json":"{}","source_identity":{"shard_id":7,"range_id":7},"target_identity":{"shard_id":8,"range_id":8}}}
+        ),
+    );
 }
 
 test "internal group write routes map shard doc identity mismatch to conflict" {
@@ -1074,51 +1235,51 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+        fn prepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
             unreachable;
         }
 
-        fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+        fn startSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
             unreachable;
         }
 
-        fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+        fn bootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
             unreachable;
         }
 
-        fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+        fn catchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
             unreachable;
         }
 
-        fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+        fn finalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
             unreachable;
         }
 
-        fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+        fn rollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
             unreachable;
         }
 
-        fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+        fn acceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
             unreachable;
         }
 
-        fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+        fn catchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
             unreachable;
         }
 
-        fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+        fn finalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+        fn rollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
             unreachable;
         }
     };
@@ -1134,7 +1295,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var split_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-split",
-        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\"}",
+        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\",\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/observe-split")).?;
     defer split_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), split_resp.status);
@@ -1143,7 +1304,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var merge_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-merge",
-        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7}",
+        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/observe-merge")).?;
     defer merge_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), merge_resp.status);
@@ -1152,7 +1313,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var execute_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true}",
+        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/execute")).?;
     defer execute_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), execute_resp.status);
@@ -1281,62 +1442,70 @@ const TestShardOps = struct {
         };
     }
 
-    fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+    fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
         unreachable;
     }
 
-    fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+    fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
         unreachable;
     }
 
-    fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+    fn prepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
         unreachable;
     }
 
-    fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+    fn startSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
         unreachable;
     }
 
-    fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+    fn bootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
         unreachable;
     }
 
-    fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+    fn catchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
         unreachable;
     }
 
-    fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+    fn finalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
         unreachable;
     }
 
-    fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+    fn rollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
         unreachable;
     }
 
-    fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+    fn acceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
         unreachable;
     }
 
-    fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+    fn catchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
         unreachable;
     }
 
-    fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+    fn finalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
         unreachable;
     }
 
-    fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+    fn rollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
         unreachable;
     }
 };
 
 fn freeTransitionActionOwned(alloc: std.mem.Allocator, action: *metadata_mod.TransitionAction) void {
+    const table_contract: ?metadata_transition_state.TransitionTableContract = switch (action.*) {
+        .none => null,
+        inline else => |op| op.table_contract,
+    };
     switch (action.*) {
         .prepare_split_source => |op| {
             alloc.free(op.split_key);
             if (op.source_range_end) |value| alloc.free(value);
         },
         else => {},
+    }
+    if (table_contract) |contract| {
+        var owned = contract;
+        owned.deinitOwned(alloc);
     }
     action.* = undefined;
 }

@@ -268,7 +268,14 @@ const SegmentFileStore = struct {
         errdefer allocator.free(owned_root);
 
         if (storage) |provided| {
-            if (create_if_missing) try provided.createDirPath(owned_root);
+            if (create_if_missing) {
+                try provided.createDirPath(owned_root);
+                // Segment publication fsyncs each immutable file and its
+                // containing directory. Publish the directory entry itself
+                // first so those acknowledged files remain reachable after a
+                // crash that follows initial index creation.
+                try provided.syncParentAbsolute(owned_root);
+            }
             return .{
                 .allocator = allocator,
                 .root_dir = owned_root,
@@ -280,7 +287,10 @@ const SegmentFileStore = struct {
         errdefer allocator.destroy(owner);
         owner.* = try storage_io.NativeStorage.init(allocator, io_runtime);
         errdefer owner.deinit();
-        if (create_if_missing) try owner.storage().createDirPath(owned_root);
+        if (create_if_missing) {
+            try owner.storage().createDirPath(owned_root);
+            try owner.storage().syncParentAbsolute(owned_root);
+        }
 
         return .{
             .allocator = allocator,
@@ -469,6 +479,12 @@ const AtomicSegmentSink = struct {
         try self.flush();
         return try self.writer.crc32Prefix(len_prefix);
     }
+
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.flush();
+        return try self.writer.crc32Range(offset, range_len);
+    }
 };
 
 const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
@@ -478,6 +494,7 @@ const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
     .append_ntimes = AtomicSegmentSink.appendNTimes,
     .write_at = AtomicSegmentSink.writeAt,
     .crc32_prefix = AtomicSegmentSink.crc32Prefix,
+    .crc32_range = AtomicSegmentSink.crc32Range,
 };
 
 fn walCommitBackendForOptions(backend: lmdb.CommitBackend) wal_mod.CommitBackend {
@@ -561,6 +578,7 @@ const meta_next_seg_id = "next_seg_id";
 const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
 const meta_segment_range_prefix = "segment_range:";
+pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
 const meta_db_name = "meta";
 const deletions_db_name = "deletions";
@@ -612,6 +630,21 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.close(),
+        }
+        self.* = undefined;
+    }
+
+    fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
+        switch (self.*) {
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .mem => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
         }
         self.* = undefined;
     }
@@ -830,6 +863,64 @@ pub const PersistentIndex = struct {
 
     pub fn backendStore(self: *PersistentIndex) BackendStore {
         return BackendStore.init(self);
+    }
+
+    /// Read generation-owned metadata from the same durable namespace as the
+    /// active segment catalog. The returned bytes are owned by `alloc`.
+    pub fn readGenerationMetadataAlloc(
+        self: *PersistentIndex,
+        alloc: Allocator,
+        key: []const u8,
+    ) !?[]u8 {
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const value = txn.get(.meta, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try alloc.dupe(u8, value);
+    }
+
+    /// Persist generation-owned metadata before any segment whose semantics
+    /// depend on it is admitted to the generation.
+    pub fn writeGenerationMetadata(
+        self: *PersistentIndex,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, key, value);
+        try txn.commit();
+    }
+
+    pub fn deleteGenerationMetadata(self: *PersistentIndex, key: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        txn.delete(.meta, key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try txn.commit();
+    }
+
+    /// Physical segments, including fully-deleted segments, are projection
+    /// history. They prevent changing a generation's analyzer semantics.
+    pub fn hasPhysicalSegments(self: *PersistentIndex) bool {
+        const snap = self.writer.acquireSnapshot();
+        defer snap.release();
+        return snap.segments.len != 0;
     }
 
     fn openMainStore(alloc: Allocator, index_path_z: [*:0]const u8, index_path: []const u8, opts: PersistentIndexOptions) !OpenedMainStore {
@@ -1128,6 +1219,20 @@ pub const PersistentIndex = struct {
         self.* = undefined;
     }
 
+    /// Tears down a pre-crash owner without allowing it to flush, compact, or
+    /// reclaim files after storage has been rolled back to a durable snapshot.
+    pub fn abandonAfterCrash(self: *PersistentIndex) void {
+        self.lockStorage();
+        self.writer.deinit();
+        self.wal.abandonAfterCrash();
+        self.main_store.deinit();
+        self.main_store_owner.abandonAfterCrash(self.alloc);
+        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
+        if (self.segment_files) |*store| store.close();
+        self.unlockStorage();
+        self.* = undefined;
+    }
+
     pub fn resetAllForRebuild(self: *PersistentIndex) !void {
         if (self.read_only) return error.ReadOnly;
 
@@ -1206,7 +1311,7 @@ pub const PersistentIndex = struct {
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
         return switch (self.main_store_owner) {
             .lmdb, .mem => null,
-            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 
@@ -1744,7 +1849,7 @@ pub const PersistentIndex = struct {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
                 defer reader.deinit();
                 for (0..reader.doc_count) |doc_idx| {
-                    const stored = reader.storedDoc(@intCast(doc_idx)) orelse continue;
+                    const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
                 }
             }
@@ -1909,11 +2014,23 @@ pub const PersistentIndex = struct {
 
         var inputs = try work_alloc.alloc(segment_mod.MergeInput, segment_indices.len);
         defer work_alloc.free(inputs);
+        const owned_deleted_docs = try work_alloc.alloc(
+            ?roaring.RoaringBitmap,
+            if (deleted_docs == null) segment_indices.len else 0,
+        );
+        defer {
+            for (owned_deleted_docs) |*maybe_deleted| {
+                if (maybe_deleted.*) |*deleted| deleted.deinit();
+            }
+            work_alloc.free(owned_deleted_docs);
+        }
+        if (owned_deleted_docs.len > 0) @memset(owned_deleted_docs, null);
         for (segment_indices, 0..) |seg_idx, i| {
             const seg = &snap.segments[seg_idx];
+            if (deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(work_alloc);
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = if (deleted_docs) |frozen| frozen[i] else seg.shared.deleted,
+                .deleted = if (deleted_docs) |frozen| frozen[i] else owned_deleted_docs[i],
             };
         }
         const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);
@@ -2560,7 +2677,7 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
 
     if (reader.doc_count == 0) return error.EmptySegment;
 
-    if (reader.storedFieldsOmitted()) {
+    if (try reader.storedFieldsOmitted()) {
         const range = (try reader.docKeyRange()) orelse return error.InvalidSegment;
         const min_doc_key = try alloc.dupe(u8, range.min_key);
         errdefer alloc.free(min_doc_key);
@@ -2578,7 +2695,7 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
     errdefer if (max_key) |key| alloc.free(key);
 
     for (0..reader.doc_count) |doc_idx| {
-        const stored = reader.storedDoc(@intCast(doc_idx)) orelse continue;
+        const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
         if (min_key == null or std.mem.order(u8, stored.id, min_key.?) == .lt) {
             if (min_key) |key| alloc.free(key);
             min_key = try alloc.dupe(u8, stored.id);
@@ -2725,6 +2842,47 @@ fn buildMultiDocSegment(alloc: Allocator, docs: []const struct { doc_id: []const
     return seg_writer.build();
 }
 
+fn buildHighFrequencyKeywordSegmentRange(alloc: Allocator, start: usize, count: usize) ![]u8 {
+    const published_count = 4_237;
+    var body_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
+    defer body_builder.deinit();
+    var state_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
+    defer state_builder.deinit();
+
+    for (0..count) |local_doc| {
+        const doc_num: u32 = @intCast(local_doc);
+        const i = start + local_doc;
+        try body_builder.addDocument(doc_num, &.{.{ .term = "document", .freq = 1, .norm = 10 }});
+        try state_builder.addDocument(doc_num, &.{.{
+            .term = if (i < published_count) "published" else "draft",
+            .freq = 1,
+            .norm = 10,
+        }});
+    }
+    const body_data = try body_builder.build();
+    defer alloc.free(body_data);
+    const state_data = try state_builder.build();
+    defer alloc.free(state_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const body_field = try seg_writer.addField("body");
+    try seg_writer.addSection(body_field, .inverted_text, body_data);
+    const state_field = try seg_writer.addField("state");
+    try seg_writer.addSection(state_field, .inverted_text, state_data);
+    var doc_id_buf: [32]u8 = undefined;
+    for (0..count) |local_doc| {
+        const i = start + local_doc;
+        const doc_id = try std.fmt.bufPrint(&doc_id_buf, "doc:{d}", .{i});
+        try seg_writer.addStoredDoc(doc_id, "{}");
+    }
+    return seg_writer.build();
+}
+
+fn buildHighFrequencyKeywordSegment(alloc: Allocator) ![]u8 {
+    return buildHighFrequencyKeywordSegmentRange(alloc, 0, 5_000);
+}
+
 var persist_tmp_nonce: u64 = 0;
 
 fn persistTmpPath(buf: []u8) [*:0]const u8 {
@@ -2756,7 +2914,7 @@ test "persistent index write and read" {
         try pi.indexSegment(seg);
 
         const snap = pi.snapshot();
-        try std.testing.expectEqual(@as(u32, 1), snap.global_doc_count);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
     }
 }
 
@@ -2779,7 +2937,7 @@ test "persistent index reopen recovery" {
         defer alloc.free(seg2);
         try pi.indexSegment(seg2);
 
-        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().global_doc_count);
+        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().liveDocCount());
     }
 
     // Reopen and verify data survived
@@ -2787,7 +2945,7 @@ test "persistent index reopen recovery" {
         var pi = try PersistentIndex.open(alloc, .{ .path = path });
         defer pi.close();
 
-        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().global_doc_count);
+        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().liveDocCount());
 
         // Verify search works
         const snap = pi.snapshot();
@@ -2795,6 +2953,80 @@ test "persistent index reopen recovery" {
         defer alloc.free(results.hits);
         try std.testing.expect(results.hits.len >= 1);
     }
+}
+
+test "persistent index keeps high-frequency keyword postings across two read-only restarts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    const segment = try buildHighFrequencyKeywordSegment(alloc);
+    defer alloc.free(segment);
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path, .main_backend = .lsm });
+        defer index.close();
+        try index.indexSegment(segment);
+        try index.syncMain(true);
+        const snapshot = index.snapshot();
+        const published = try snapshot.search(alloc, "state", &.{"published"}, 5_000);
+        defer alloc.free(published.hits);
+        try std.testing.expectEqual(@as(u32, 4_237), published.total_count);
+    }
+
+    // Neither recovery opens writes nor re-indexes the documents. Each cycle
+    // must rebuild the reader directly from the durable posting representation.
+    for (0..2) |_| {
+        var reopened = try PersistentIndex.open(alloc, .{
+            .path = path,
+            .main_backend = .lsm,
+            .read_only = true,
+        });
+        defer reopened.close();
+        const snapshot = reopened.snapshot();
+        const published = try snapshot.search(alloc, "state", &.{"published"}, 5_000);
+        defer alloc.free(published.hits);
+        try std.testing.expectEqual(@as(u32, 4_237), published.total_count);
+        const draft = try snapshot.search(alloc, "state", &.{"draft"}, 5_000);
+        defer alloc.free(draft.hits);
+        try std.testing.expectEqual(@as(u32, 763), draft.total_count);
+        const unfiltered = try snapshot.search(alloc, "body", &.{"document"}, 5_000);
+        defer alloc.free(unfiltered.hits);
+        try std.testing.expectEqual(@as(u32, 5_000), unfiltered.total_count);
+        try std.testing.expectEqual(@as(u32, 5_000), snapshot.liveDocCount());
+    }
+}
+
+test "persistent index keeps high-frequency keyword postings across many segments on restart" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path, .main_backend = .lsm });
+        defer index.close();
+        for (0..10) |batch| {
+            const segment = try buildHighFrequencyKeywordSegmentRange(alloc, batch * 500, 500);
+            defer alloc.free(segment);
+            try index.indexSegment(segment);
+        }
+        try index.syncMain(true);
+    }
+
+    var reopened = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .lsm,
+        .read_only = true,
+    });
+    defer reopened.close();
+    const snapshot = reopened.snapshot();
+    const published = try snapshot.search(alloc, "state", &.{"published"}, 5_000);
+    defer alloc.free(published.hits);
+    try std.testing.expectEqual(@as(u32, 4_237), published.total_count);
+    const draft = try snapshot.search(alloc, "state", &.{"draft"}, 5_000);
+    defer alloc.free(draft.hits);
+    try std.testing.expectEqual(@as(u32, 763), draft.total_count);
 }
 
 test "persistent index exposes wal and lmdb commit stats" {
@@ -3154,7 +3386,7 @@ test "persistent index hands off right-only segments to child index" {
     try std.testing.expectEqualStrings("doc:z", ranges[0].max_doc_key);
 
     const snap = dest.snapshot();
-    try std.testing.expectEqual(@as(u32, 1), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 
     const middle_results = try snap.search(alloc, "body", &.{"middle"}, 10);
     defer alloc.free(middle_results.hits);
@@ -3302,7 +3534,7 @@ test "persistent index reopens with durable lsm main backend" {
         defer idx.close();
 
         const snap = idx.snapshot();
-        try std.testing.expectEqual(@as(u32, 1), snap.global_doc_count);
+        try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
         const results = try snap.search(alloc, "body", &.{"alpha"}, 10);
         defer alloc.free(results.hits);
         try std.testing.expectEqual(@as(u32, 1), results.total_count);
@@ -3356,7 +3588,7 @@ test "persistent index snapshots use mapped segment files when native storage is
     const snap = idx.snapshot();
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(snap.segments[0].data.isFileBacked());
-    try std.testing.expectEqualStrings("doc:a", snap.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:a", (try snap.storedDoc(0)).?.id);
 }
 
 test "persistent index deletes replaced segment files only after retained snapshot release" {
@@ -3490,7 +3722,7 @@ fn persistentSimSummaryFromIndex(alloc: Allocator, pi: *PersistentIndex) !Persis
 
     const snap = pi.snapshot();
     return .{
-        .doc_count = snap.global_doc_count,
+        .doc_count = snap.liveDocCount(),
         .segment_count = ranges.len,
         .alpha_hits = try persistentSearchHitCount(alloc, snap, "alpha"),
         .beta_hits = try persistentSearchHitCount(alloc, snap, "beta"),
@@ -4334,7 +4566,7 @@ fn expectPersistentTextCompactionView(
     }
 
     const snap = pi.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), snap.liveDocCount());
     try std.testing.expectEqual(expected_segments, ranges.len);
     try std.testing.expectEqual(stale_hits, try persistentSearchHitCount(alloc, snap, "stale"));
     try std.testing.expectEqual(fresh_hits, try persistentSearchHitCount(alloc, snap, "fresh"));

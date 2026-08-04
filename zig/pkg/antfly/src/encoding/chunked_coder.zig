@@ -36,17 +36,20 @@ pub const ChunkFormat = enum(u8) {
 // Uvarint helpers (protobuf-style, matching Go's binary.Uvarint)
 // ============================================================================
 
-fn readUvarint(data: []const u8, pos: *usize) u64 {
+fn readUvarint(data: []const u8, pos: *usize) !u64 {
+    if (pos.* > data.len) return error.TruncatedInput;
+
     var result: u64 = 0;
-    var shift: u6 = 0;
+    var shift: u7 = 0;
     while (pos.* < data.len) {
         const b = data[pos.*];
         pos.* += 1;
-        result |= @as(u64, b & 0x7F) << shift;
-        if (b & 0x80 == 0) break;
-        shift +|= 7;
+        if (shift == 63 and b > 1) return error.InvalidVarint;
+        result |= @as(u64, b & 0x7F) << @intCast(shift);
+        if (b & 0x80 == 0) return result;
+        shift += 7;
     }
-    return result;
+    return error.TruncatedInput;
 }
 
 fn uvarintSize(value: u64) usize {
@@ -368,13 +371,17 @@ pub const ChunkedIntDecoder = struct {
             .alloc = alloc,
         };
 
+        if (offset > data.len) return error.TruncatedInput;
         var read_pos = @as(usize, @intCast(offset));
-        const num_chunks = readUvarint(data, &read_pos);
+        const num_chunks = try readUvarint(data, &read_pos);
 
         if (num_chunks > 0) {
+            // Every declared chunk requires at least one offset byte.
+            if (num_chunks > @as(u64, @intCast(data.len - read_pos))) return error.TruncatedInput;
             self.chunk_offsets = try alloc.alloc(u64, @intCast(num_chunks));
+            errdefer alloc.free(self.chunk_offsets);
             for (0..@as(usize, @intCast(num_chunks))) |i| {
-                self.chunk_offsets[i] = readUvarint(data, &read_pos);
+                self.chunk_offsets[i] = try readUvarint(data, &read_pos);
             }
         }
 
@@ -393,8 +400,9 @@ pub const ChunkedIntDecoder = struct {
         if (chunk >= self.chunk_offsets.len) return error.InvalidChunk;
 
         // Calculate chunk byte range
-        const start_off = self.data_start_offset + if (chunk > 0) self.chunk_offsets[chunk - 1] else 0;
-        const end_off = self.data_start_offset + self.chunk_offsets[chunk];
+        const start_off = std.math.add(u64, self.data_start_offset, if (chunk > 0) self.chunk_offsets[chunk - 1] else 0) catch return error.InvalidChunk;
+        const end_off = std.math.add(u64, self.data_start_offset, self.chunk_offsets[chunk]) catch return error.InvalidChunk;
+        if (start_off > end_off or end_off > self.data.len) return error.TruncatedInput;
         const chunk_bytes = self.data[@intCast(start_off)..@intCast(end_off)];
 
         if (chunk_bytes.len == 0) {
@@ -403,7 +411,7 @@ pub const ChunkedIntDecoder = struct {
             return;
         }
 
-        self.format = @enumFromInt(chunk_bytes[0]);
+        self.format = std.enums.fromInt(ChunkFormat, chunk_bytes[0]) orelse return error.InvalidChunk;
 
         switch (self.format) {
             .columnar => try self.loadChunkColumnar(chunk_bytes),
@@ -415,18 +423,24 @@ pub const ChunkedIntDecoder = struct {
     fn loadChunkStreamVByte(self: *ChunkedIntDecoder, chunk_bytes: []const u8) !void {
         var offset: usize = 1;
 
-        const num_values = readUvarint(chunk_bytes, &offset);
-        const control_len = readUvarint(chunk_bytes, &offset);
+        const num_values = try readUvarint(chunk_bytes, &offset);
+        const control_len = try readUvarint(chunk_bytes, &offset);
+        if (control_len != svb.encodedControlLen(@intCast(num_values))) return error.InvalidChunk;
+        if (control_len > chunk_bytes.len -| offset) return error.TruncatedInput;
 
         const control = chunk_bytes[offset..][0..@intCast(control_len)];
         const data_bytes = chunk_bytes[offset + @as(usize, @intCast(control_len)) ..];
+        // Partial final groups may omit bytes for unused values, while the
+        // canonical encoder includes zero padding for them.
+        if (data_bytes.len > svb.dataLength(control)) return error.TruncatedInput;
 
         // Ensure capacity
         self.values.clearRetainingCapacity();
         try self.values.ensureTotalCapacity(self.alloc, @intCast(num_values));
         self.values.items.len = @intCast(num_values);
 
-        _ = svb.decodeInto(control, data_bytes, self.values.items);
+        const decoded = svb.decodeInto(control, data_bytes, self.values.items);
+        if (decoded.decoded != self.values.items.len) return error.TruncatedInput;
 
         // Delta decode if needed
         if (self.format == .stream_vbyte_delta) {
@@ -439,85 +453,101 @@ pub const ChunkedIntDecoder = struct {
     fn loadChunkColumnar(self: *ChunkedIntDecoder, chunk_bytes: []const u8) !void {
         var offset: usize = 1;
 
-        const num_docs = readUvarint(chunk_bytes, &offset);
-        const num_locs = readUvarint(chunk_bytes, &offset);
-        const num_array_pos = readUvarint(chunk_bytes, &offset);
+        const num_docs = try readUvarint(chunk_bytes, &offset);
+        const num_locs = try readUvarint(chunk_bytes, &offset);
+        const num_array_pos = try readUvarint(chunk_bytes, &offset);
+        const num_docs_usize = std.math.cast(usize, num_docs) orelse return error.InvalidChunk;
+        const num_locs_usize = std.math.cast(usize, num_locs) orelse return error.InvalidChunk;
+        const num_array_pos_usize = std.math.cast(usize, num_array_pos) orelse return error.InvalidChunk;
 
         // Read columns
-        const col_counts = try self.readColumn(chunk_bytes, &offset, @intCast(num_docs));
+        const col_counts = try self.readColumn(chunk_bytes, &offset, num_docs_usize);
         defer self.alloc.free(col_counts);
-        const col_field_ids = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const col_field_ids = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(col_field_ids);
-        const col_positions = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const col_positions = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(col_positions);
-        const start_deltas = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const start_deltas = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(start_deltas);
-        const end_deltas = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const end_deltas = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(end_deltas);
-        const col_num_aps = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const col_num_aps = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(col_num_aps);
 
         var col_array_pos: []u32 = &.{};
         defer if (col_array_pos.len > 0) self.alloc.free(col_array_pos);
         if (num_array_pos > 0) {
-            col_array_pos = try self.readColumn(chunk_bytes, &offset, @intCast(num_array_pos));
+            col_array_pos = try self.readColumn(chunk_bytes, &offset, num_array_pos_usize);
         }
+        if (offset != chunk_bytes.len) return error.InvalidChunk;
 
         // Delta decode starts and ends
         svb.deltaDecode(start_deltas);
         svb.deltaDecode(end_deltas);
 
         // Reconstruct interleaved format
-        const total_values = @as(usize, @intCast(num_docs)) + @as(usize, @intCast(num_locs)) * 5 + @as(usize, @intCast(num_array_pos));
+        const location_values = std.math.mul(usize, num_locs_usize, 5) catch return error.InvalidChunk;
+        const base_values = std.math.add(usize, num_docs_usize, location_values) catch return error.InvalidChunk;
+        const total_values = std.math.add(usize, base_values, num_array_pos_usize) catch return error.InvalidChunk;
         self.values.clearRetainingCapacity();
         try self.values.ensureTotalCapacity(self.alloc, total_values);
 
         var loc_idx: usize = 0;
         var ap_idx: usize = 0;
-        for (0..@as(usize, @intCast(num_docs))) |doc_idx| {
+        for (0..num_docs_usize) |doc_idx| {
             const count = col_counts[doc_idx];
             self.values.appendAssumeCapacity(count);
 
             var rem: i64 = @intCast(count);
-            while (rem > 0 and loc_idx < @as(usize, @intCast(num_locs))) {
+            while (rem > 0) {
+                if (loc_idx >= num_locs_usize) return error.InvalidChunk;
+                const num_ap: usize = col_num_aps[loc_idx];
+                const location_len = 5 + num_ap;
+                if (location_len > rem) return error.InvalidChunk;
+                if (num_ap > num_array_pos_usize - ap_idx) return error.InvalidChunk;
+
                 self.values.appendAssumeCapacity(col_field_ids[loc_idx]);
                 self.values.appendAssumeCapacity(col_positions[loc_idx]);
                 self.values.appendAssumeCapacity(start_deltas[loc_idx]);
                 self.values.appendAssumeCapacity(end_deltas[loc_idx]);
                 self.values.appendAssumeCapacity(col_num_aps[loc_idx]);
 
-                const num_ap = col_num_aps[loc_idx];
                 for (0..num_ap) |_| {
-                    if (ap_idx < @as(usize, @intCast(num_array_pos))) {
-                        self.values.appendAssumeCapacity(col_array_pos[ap_idx]);
-                        ap_idx += 1;
-                    }
+                    self.values.appendAssumeCapacity(col_array_pos[ap_idx]);
+                    ap_idx += 1;
                 }
 
-                rem -= @as(i64, 5 + @as(i64, @intCast(num_ap)));
+                rem -= @intCast(location_len);
                 loc_idx += 1;
             }
         }
+        if (loc_idx != num_locs_usize or ap_idx != num_array_pos_usize) return error.InvalidChunk;
 
         self.pos = 0;
     }
 
     fn readColumn(self: *ChunkedIntDecoder, chunk_bytes: []const u8, offset: *usize, num_values: usize) ![]u32 {
-        const ctrl_len = readUvarint(chunk_bytes, offset);
+        const ctrl_len = try readUvarint(chunk_bytes, offset);
         if (ctrl_len == 0) {
+            if (num_values != 0) return error.InvalidChunk;
             return try self.alloc.alloc(u32, 0);
         }
+        if (ctrl_len != svb.encodedControlLen(num_values)) return error.InvalidChunk;
+        if (ctrl_len > chunk_bytes.len -| offset.*) return error.TruncatedInput;
 
         const control = chunk_bytes[offset.*..][0..@intCast(ctrl_len)];
         offset.* += @intCast(ctrl_len);
 
         // Calculate data length from control bytes
         const data_len = svb.dataLength(control);
+        if (data_len > chunk_bytes.len -| offset.*) return error.TruncatedInput;
         const data_bytes = chunk_bytes[offset.*..][0..data_len];
         offset.* += data_len;
 
         const result = try self.alloc.alloc(u32, num_values);
-        _ = svb.decodeInto(control, data_bytes, result);
+        errdefer self.alloc.free(result);
+        const decoded = svb.decodeInto(control, data_bytes, result);
+        if (decoded.decoded != num_values) return error.TruncatedInput;
         return result;
     }
 
@@ -526,7 +556,7 @@ pub const ChunkedIntDecoder = struct {
         self.values.clearRetainingCapacity();
         var offset: usize = 0;
         while (offset < chunk_bytes.len) {
-            const val = readUvarint(chunk_bytes, &offset);
+            const val = try readUvarint(chunk_bytes, &offset);
             try self.values.append(self.alloc, @intCast(val));
         }
         self.pos = 0;
@@ -569,12 +599,12 @@ pub const ChunkedIntDecoder = struct {
 /// Useful when document IDs move by an exact multiple of chunk_size.
 pub fn prependEmptyChunks(alloc: Allocator, data: []const u8, chunk_delta: usize, total_chunks: usize) ![]u8 {
     var pos: usize = 0;
-    const old_num_chunks = readUvarint(data, &pos);
+    const old_num_chunks = try readUvarint(data, &pos);
     if (total_chunks < chunk_delta + old_num_chunks) return error.InvalidChunk;
 
     var old_total_len: u64 = 0;
     for (0..@as(usize, @intCast(old_num_chunks))) |_| {
-        old_total_len = readUvarint(data, &pos);
+        old_total_len = try readUvarint(data, &pos);
     }
 
     const chunk_data = data[pos..];
@@ -586,7 +616,7 @@ pub fn prependEmptyChunks(alloc: Allocator, data: []const u8, chunk_delta: usize
         const offset: u64 = if (chunk_idx < chunk_delta)
             0
         else if (exact_shifted_idx < old_num_chunks) blk: {
-            const val = readUvarint(data, &size_pos);
+            const val = try readUvarint(data, &size_pos);
             exact_shifted_idx += 1;
             break :blk val;
         } else old_total_len;
@@ -605,7 +635,7 @@ pub fn prependEmptyChunks(alloc: Allocator, data: []const u8, chunk_delta: usize
         const offset: u64 = if (chunk_idx < chunk_delta)
             0
         else if (shifted_idx < old_num_chunks) blk: {
-            next_offset = readUvarint(data, &src_pos);
+            next_offset = try readUvarint(data, &src_pos);
             shifted_idx += 1;
             break :blk next_offset;
         } else old_total_len;
@@ -690,6 +720,32 @@ test "ChunkedIntEncoder/Decoder with array positions" {
     try std.testing.expectEqual(@as(?u32, 1), dec.readValue()); // arrayPos[1]
 }
 
+test "ChunkedIntDecoder rejects inconsistent columnar cardinalities" {
+    const alloc = std.testing.allocator;
+
+    var enc = try ChunkedIntEncoder.init(alloc, 1024, 1);
+    defer enc.deinit();
+    try enc.add(0, &[_]u32{ 7, 2, 5, 50, 60, 2, 0, 1 });
+    try enc.close();
+
+    const bytes = try enc.toBytes();
+    defer alloc.free(bytes);
+
+    var header_pos: usize = 0;
+    _ = try readUvarint(bytes, &header_pos); // numChunks
+    _ = try readUvarint(bytes, &header_pos); // chunk offset
+    try std.testing.expectEqual(@as(u8, @intFromEnum(ChunkFormat.columnar)), bytes[header_pos]);
+    header_pos += 1;
+    _ = try readUvarint(bytes, &header_pos); // numDocs
+    _ = try readUvarint(bytes, &header_pos); // numLocs
+    try std.testing.expectEqual(@as(u8, 2), bytes[header_pos]); // numArrayPos
+    bytes[header_pos] = 1;
+
+    var dec = try ChunkedIntDecoder.init(alloc, bytes, 0);
+    defer dec.deinit();
+    try std.testing.expectError(error.InvalidChunk, dec.loadChunk(0));
+}
+
 test "ChunkedIntEncoder/Decoder multi-chunk" {
     const alloc = std.testing.allocator;
 
@@ -756,6 +812,83 @@ test "ChunkedIntDecoder readValues batch" {
     try std.testing.expectEqual(@as(u32, 100), batch.?[2]); // start
     try std.testing.expectEqual(@as(u32, 110), batch.?[3]); // end
     try std.testing.expectEqual(@as(u32, 0), batch.?[4]); // numAP
+}
+
+test "ChunkedIntDecoder rejects a truncated StreamVByte value" {
+    const alloc = std.testing.allocator;
+    var enc = try ChunkedIntEncoder.initWithMode(alloc, 1024, 1, .stream_vbyte);
+    defer enc.deinit();
+    try enc.add(0, &[_]u32{ 0x1234, 0x5678, 0x9abc, 0xdef0 });
+    try enc.close();
+
+    const bytes = try enc.toBytes();
+    defer alloc.free(bytes);
+    var dec = try ChunkedIntDecoder.init(alloc, bytes[0 .. bytes.len - 1], 0);
+    defer dec.deinit();
+    try std.testing.expectError(error.TruncatedInput, dec.loadChunk(0));
+}
+
+test "ChunkedIntDecoder rejects truncated chunk metadata" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.TruncatedInput, ChunkedIntDecoder.init(alloc, &.{}, 0));
+    try std.testing.expectError(error.TruncatedInput, ChunkedIntDecoder.init(alloc, &.{0x01}, 0));
+
+    const truncated_chunks = [_][]const u8{
+        &.{ 0x01, 0x01, 0x01 },
+        &.{ 0x01, 0x01, 0x02 },
+        &.{ 0x01, 0x01, 0x03 },
+        &.{ 0x01, 0x02, 0x01, 0x80 },
+    };
+    for (truncated_chunks) |bytes| {
+        var dec = try ChunkedIntDecoder.init(alloc, bytes, 0);
+        defer dec.deinit();
+        try std.testing.expectError(error.TruncatedInput, dec.loadChunk(0));
+    }
+
+    const invalid_format = [_]u8{ 0x01, 0x01, 0xff };
+    var invalid_dec = try ChunkedIntDecoder.init(alloc, &invalid_format, 0);
+    defer invalid_dec.deinit();
+    try std.testing.expectError(error.InvalidChunk, invalid_dec.loadChunk(0));
+
+    const empty_chunk = [_]u8{ 0x01, 0x00 };
+    var empty_dec = try ChunkedIntDecoder.init(alloc, &empty_chunk, 0);
+    defer empty_dec.deinit();
+    try empty_dec.loadChunk(0);
+    try std.testing.expectEqual(@as(usize, 0), empty_dec.remaining());
+
+    const maximal_value_count = [_]u8{
+        0x01, 0x0c, 0x01,
+        0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff,
+        0x01, 0x00,
+    };
+    var maximal_dec = try ChunkedIntDecoder.init(alloc, &maximal_value_count, 0);
+    defer maximal_dec.deinit();
+    try std.testing.expectError(error.InvalidChunk, maximal_dec.loadChunk(0));
+}
+
+test "ChunkedIntDecoder accepts omitted unused partial-group padding" {
+    const alloc = std.testing.allocator;
+
+    const unpadded = [_]u8{ 0x01, 0x06, 0x01, 0x01, 0x01, 0x01, 0x34, 0x12 };
+    var unpadded_dec = try ChunkedIntDecoder.init(alloc, &unpadded, 0);
+    defer unpadded_dec.deinit();
+    try unpadded_dec.loadChunk(0);
+    try std.testing.expectEqual(@as(?u32, 0x1234), unpadded_dec.readValue());
+    try std.testing.expectEqual(@as(?u32, null), unpadded_dec.readValue());
+
+    const padded = [_]u8{ 0x01, 0x09, 0x01, 0x01, 0x01, 0x01, 0x34, 0x12, 0x00, 0x00, 0x00 };
+    var padded_dec = try ChunkedIntDecoder.init(alloc, &padded, 0);
+    defer padded_dec.deinit();
+    try padded_dec.loadChunk(0);
+    try std.testing.expectEqual(@as(?u32, 0x1234), padded_dec.readValue());
+
+    const truncated = [_]u8{ 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x34 };
+    var truncated_dec = try ChunkedIntDecoder.init(alloc, &truncated, 0);
+    defer truncated_dec.deinit();
+    try std.testing.expectError(error.TruncatedInput, truncated_dec.loadChunk(0));
 }
 
 test "prependEmptyChunks shifts chunk table without reencoding payload" {

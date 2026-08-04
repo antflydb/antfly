@@ -460,7 +460,7 @@ pub const AlgebraicIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -891,7 +891,7 @@ pub const BatchRequest = struct {
     inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
@@ -2629,7 +2629,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -2720,7 +2720,9 @@ pub const EnrichmentRuntimeStatus = struct {
     projection_checkpoint_status: []const u8,
     projection_checkpoint_applied_sequence: i64,
     projection_checkpoint_generation: i64,
-    projection_checkpoint_config_hash: i64,
+    projection_checkpoint_config_fingerprint: []const u8,
+    /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
+    projection_checkpoint_identity_consistent: bool,
     checkpoint_replay_tail_sequence_count: i64,
     processed_requests: i64,
     error_count: i64,
@@ -2746,6 +2748,9 @@ pub const EnrichmentRuntimeStatus = struct {
     last_embed_batch_items: i64,
     last_embed_batch_bytes: i64,
     last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
     last_embed_batch_ns: i64,
     total_embed_ns: i64,
 };
@@ -3450,7 +3455,7 @@ pub const FullTextIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -3759,7 +3764,7 @@ pub const GraphIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -3900,6 +3905,8 @@ pub const GraphQueryType = enum {
 pub const GraphResultNode = struct {
     /// Document key
     key: []const u8,
+    /// Owning table for a cross-table node; omitted for nodes in the queried table
+    table: ?[]const u8 = null,
     /// Distance from start node
     depth: ?i64 = null,
     /// Weighted distance
@@ -4394,9 +4401,9 @@ pub const InferenceConfig = struct {
     content_security: ?InferenceContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
@@ -4414,7 +4421,7 @@ pub const InferenceConfig = struct {
     preload: ?[]const InferenceModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
@@ -4524,6 +4531,8 @@ pub const InferenceEmbeddingItemError = struct {
     retryable: bool,
     /// HTTP-style status classification for this item
     status: i64,
+    /// Minimum retry delay in milliseconds for a retryable transient failure
+    retry_after_ms: ?i64 = null,
 };
 
 /// A single embedding result
@@ -4545,8 +4554,16 @@ pub const InferenceEmbeddingUsage = struct {
 };
 
 pub const InferenceError = struct {
-    /// Error message
+    /// Stable machine-readable error code
     @"error": []const u8,
+    /// Human-readable error description
+    message: ?[]const u8 = null,
+    /// Machine-readable capacity source when the failure is retryable
+    reason: ?[]const u8 = null,
+    /// Whether retrying the same request may succeed
+    retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: ?i64 = null,
 };
 
 /// Reason why generation stopped
@@ -4599,7 +4616,9 @@ pub const InferenceFunctionDefinition = struct {
 pub const InferenceGenerateBatchError = struct {
     code: []const u8,
     message: []const u8,
-    retryable: ?bool = null,
+    retryable: bool,
+    /// Minimum retry delay in milliseconds for a retryable capacity failure.
+    retry_after_ms: ?i64 = null,
 };
 
 /// Batch execution mode. Only synchronous batches are implemented.
@@ -5392,6 +5411,20 @@ pub const InferenceTranscribeResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
+/// Actionable retry contract for temporary inference-capacity failures.
+pub const InferenceTransientCapacityError = struct {
+    /// Stable machine-readable error code
+    @"error": []const u8,
+    /// Human-readable error description
+    message: []const u8,
+    /// Machine-readable capacity source
+    reason: []const u8,
+    /// Always true for a transient-capacity response
+    retryable: bool,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: i64,
+};
+
 /// Logging configuration for inference services
 pub const InferenceschemasConfig = struct {
     level: ?InferenceLevel = null,
@@ -5720,6 +5753,22 @@ pub const LsmStorageStatus = struct {
     read_snapshot_mutable_rotation_count: ?i64 = null,
     read_snapshot_mutable_rotation_bytes: ?i64 = null,
     wal_retained_bytes: ?i64 = null,
+    /// Whether WAL checkpoint maintenance is pending.
+    wal_checkpoint_pending: ?bool = null,
+    /// Whether WAL hard-limit admission is currently blocked.
+    wal_pressure_blocked: ?bool = null,
+    /// Representative reason for the earliest pending WAL checkpoint retry.
+    wal_checkpoint_retry_reason: ?[]const u8 = null,
+    /// Consecutive failures for the representative WAL checkpoint retry.
+    wal_checkpoint_retry_attempts: ?i64 = null,
+    /// Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+    wal_checkpoint_retry_delay_ns: ?i64 = null,
+    /// Logical bytes in immutable memtables awaiting run publication.
+    active_immutable_logical_bytes: ?i64 = null,
+    /// Logical bytes in runs awaiting durable manifest publication.
+    unpublished_wal_logical_bytes: ?i64 = null,
+    /// Largest logical batch awaiting durable manifest publication.
+    unpublished_wal_max_batch_logical_bytes: ?i64 = null,
     compaction_backlog_bytes: ?i64 = null,
     active_readers: ?i64 = null,
     active_readers_bound_read_txn: ?i64 = null,
@@ -5795,9 +5844,6 @@ pub const MatchQuery = struct {
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
 };
 
 /// Inline binary media content (audio, image, etc.).
@@ -6265,7 +6311,6 @@ pub const Pruner = struct {
 
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
-    match_query: *MatchQuery,
     boolean_query: *BooleanQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     numeric_range_query: *NumericRangeQuery,
@@ -6274,6 +6319,7 @@ pub const Query = union(enum) {
     match_phrase_query: *MatchPhraseQuery,
     disjunction_query: *DisjunctionQuery,
     geo_distance_query: *GeoDistanceQuery,
+    match_query: *MatchQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
@@ -6318,15 +6364,6 @@ pub const Query = union(enum) {
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "match",
-            "analyzer",
-            "prefix_length",
-            "fuzziness",
-            "operator",
-        })) {
-            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "must",
@@ -6385,6 +6422,12 @@ pub const Query = union(enum) {
             "distance",
         })) {
             if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "analyzer",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "terms",
@@ -6474,7 +6517,6 @@ pub const Query = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
-            .match_query => |v| try jw.write(v.*),
             .boolean_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
@@ -6483,6 +6525,7 @@ pub const Query = union(enum) {
             .match_phrase_query => |v| try jw.write(v.*),
             .disjunction_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
@@ -6617,7 +6660,7 @@ pub const QueryProfile = struct {
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -6880,7 +6923,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -7023,19 +7066,19 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
-    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
+    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
-    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
+    /// Mandatory filters from prior interactions. These are converted to structured Antfly predicates and applied to every table and every search tool invocation, including generated follow-ups, graph/tree traversal, aggregations, and root scans.
     accumulated_filters: ?[]const FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    /// Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
     decisions: ?[]const AgentDecision = null,
@@ -7155,7 +7198,7 @@ pub const RetrievalAgentUsage = struct {
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -7437,7 +7480,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
@@ -8262,7 +8305,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+    /// Value for operation (not required for $unset). Type depends on the supported operator.
     value: ?std.json.Value = null,
 };
 
@@ -8273,14 +8316,8 @@ pub const TransformOpType = enum {
     @"$unset",
     @"$inc",
     @"$push",
-    @"$pull",
     @"$add_to_set",
-    @"$pop",
-    @"$mul",
-    @"$min",
     @"$max",
-    @"$current_date",
-    @"$rename",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -8289,14 +8326,8 @@ pub const TransformOpType = enum {
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
             .@"$push" => "$push",
-            .@"$pull" => "$pull",
             .@"$add_to_set" => "$addToSet",
-            .@"$pop" => "$pop",
-            .@"$mul" => "$mul",
-            .@"$min" => "$min",
             .@"$max" => "$max",
-            .@"$current_date" => "$currentDate",
-            .@"$rename" => "$rename",
         };
         try jw.write(s);
     }
@@ -8312,14 +8343,8 @@ pub const TransformOpType = enum {
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
             .{ "$push", .@"$push" },
-            .{ "$pull", .@"$pull" },
             .{ "$addToSet", .@"$add_to_set" },
-            .{ "$pop", .@"$pop" },
-            .{ "$mul", .@"$mul" },
-            .{ "$min", .@"$min" },
             .{ "$max", .@"$max" },
-            .{ "$currentDate", .@"$current_date" },
-            .{ "$rename", .@"$rename" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

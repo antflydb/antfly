@@ -710,6 +710,150 @@ pub fn createSession(allocator: std.mem.Allocator, onnx_path: []const u8, reques
     return createSessionWithOptions(allocator, onnx_path, requested_backend, .{});
 }
 
+/// Parse and normalize an ONNX graph without constructing backend buffers.
+///
+/// Discovery uses this as a cached compatibility preflight when no external ONNX
+/// Runtime backend is compiled in. It stops before optimization and backend allocation:
+/// malformed external-data references, unsupported operators, and invalid graph topology
+/// fail early without constant-folding a potentially large model during listing.
+pub fn inspectGraphCompatibility(allocator: std.mem.Allocator, onnx_path: []const u8) !void {
+    var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
+    defer mapped.deinit();
+    if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
+    mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
+
+    const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
+    defer model.deinit();
+
+    var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
+    defer clipclap_dim_overrides.deinit(allocator);
+    var use_clipclap_dim_overrides = false;
+    if (shouldSpecializeClipclapAudioInputTime(onnx_path)) {
+        try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
+        use_clipclap_dim_overrides = true;
+    }
+    if (shouldSpecializeClipclapTextInputShape(onnx_path)) {
+        try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
+        try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
+        use_clipclap_dim_overrides = true;
+    }
+    const dim_overrides: ?*const onnx_graph.DimOverrides = if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
+
+    var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
+    defer converted.deinit(allocator);
+    try validateImportedGraph(&converted.graph, "convert");
+}
+
+/// Files that participate in one ONNX model load. ONNX stores large tensors in
+/// external files, so treating only the protobuf as the model artifact can
+/// under-account residency by gigabytes and leaves dependency changes invisible
+/// to compatibility caches.
+pub const OnnxArtifactSet = struct {
+    allocator: std.mem.Allocator,
+    external_paths: [][]u8,
+    encoded_bytes: usize,
+
+    pub fn deinit(self: *OnnxArtifactSet) void {
+        for (self.external_paths) |path| self.allocator.free(path);
+        self.allocator.free(self.external_paths);
+        self.* = undefined;
+    }
+};
+
+/// Parse only initializer metadata and return the complete, validated artifact
+/// set. External files are deduplicated and conservatively charged at their
+/// full file size: runtimes may mmap or cache the complete backing file even
+/// when individual tensors reference disjoint ranges.
+pub fn inspectArtifactSet(
+    allocator: std.mem.Allocator,
+    onnx_path: []const u8,
+) !OnnxArtifactSet {
+    var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
+    defer mapped.deinit();
+    if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
+    mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
+
+    const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
+    defer model.deinit();
+
+    var paths = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    var encoded_bytes = mapped.data.len;
+
+    var initializer_it = model.initializer_map.iterator();
+    while (initializer_it.next()) |entry| {
+        const tensor = try model.initializerAt(entry.value_ptr.*);
+        if (!tensor.isExternal()) continue;
+        const external = tensor.externalDataInfo();
+        if (external.location.len == 0) return error.InvalidExternalPath;
+        if (std.fs.path.isAbsolute(external.location)) return error.InvalidExternalPath;
+        if (std.mem.indexOfScalar(u8, external.location, 0) != null) return error.InvalidExternalPath;
+        if (std.mem.indexOfScalar(u8, external.location, '\\') != null) return error.InvalidExternalPath;
+        var component_it = std.mem.splitScalar(u8, external.location, std.fs.path.sep);
+        while (component_it.next()) |component| {
+            if (std.mem.eql(u8, component, "..")) return error.InvalidExternalPath;
+        }
+        if (external.offset < 0) return error.InvalidExternalOffset;
+
+        const full_path = try std.fs.path.join(allocator, &.{ model_dir, external.location });
+        var duplicate = false;
+        for (paths.items) |existing| {
+            if (std.mem.eql(u8, existing, full_path)) {
+                duplicate = true;
+                break;
+            }
+        }
+
+        const file_size = c_file.fileSize(allocator, full_path) catch |err| {
+            allocator.free(full_path);
+            return err;
+        };
+        const offset: u64 = @intCast(external.offset);
+        if (offset > file_size) {
+            allocator.free(full_path);
+            return error.ExternalRegionOutOfBounds;
+        }
+        if (external.length >= 0) {
+            const end = std.math.add(u64, offset, @as(u64, @intCast(external.length))) catch {
+                allocator.free(full_path);
+                return error.ExternalRegionOutOfBounds;
+            };
+            if (end > file_size) {
+                allocator.free(full_path);
+                return error.ExternalRegionOutOfBounds;
+            }
+        }
+
+        if (duplicate) {
+            allocator.free(full_path);
+            continue;
+        }
+        const size = std.math.cast(usize, file_size) orelse {
+            allocator.free(full_path);
+            return error.ResourceLimitExceeded;
+        };
+        encoded_bytes = std.math.add(usize, encoded_bytes, size) catch {
+            allocator.free(full_path);
+            return error.ResourceLimitExceeded;
+        };
+        paths.append(allocator, full_path) catch |err| {
+            allocator.free(full_path);
+            return err;
+        };
+    }
+
+    return .{
+        .allocator = allocator,
+        .external_paths = try paths.toOwnedSlice(allocator),
+        .encoded_bytes = encoded_bytes,
+    };
+}
+
 pub const ImportedOnnxSessionOptions = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     shared_backend_ctx: ?*SharedBackendContext = null,
@@ -1776,6 +1920,56 @@ test "imported onnx session runs simple add model" {
     for (expected, actual) |want, got| {
         try std.testing.expectApproxEqAbs(want, got, 1e-5);
     }
+}
+
+test "ONNX artifact inspection includes and validates external tensor files" {
+    const allocator = std.testing.allocator;
+
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("weight", Shape.init(.f32, &.{4}));
+    try graph.markOutput(weight);
+    const values = [_]f32{ 1, 2, 3, 4 };
+    const initializer = onnx_graph.ParameterInitializer{
+        .name = "weight",
+        .shape = Shape.init(.f32, &.{4}),
+        .data = .{ .raw_bytes = std.mem.asBytes(&values) },
+    };
+    var exported = try onnx_graph.exportGraphWithExternalData(
+        allocator,
+        &graph,
+        .{ .parameter_initializers = &.{initializer} },
+        "model.data",
+    );
+    defer exported.deinit(allocator);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.onnx",
+        .data = exported.model_bytes,
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.data",
+        .data = exported.external_data.?.bytes,
+    });
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" },
+    );
+    defer allocator.free(path);
+
+    var artifacts = try inspectArtifactSet(allocator, path);
+    defer artifacts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifacts.external_paths.len);
+    try std.testing.expectEqual(
+        exported.model_bytes.len + exported.external_data.?.bytes.len,
+        artifacts.encoded_bytes,
+    );
+
+    try dir.dir.deleteFile(std.testing.io, "model.data");
+    try std.testing.expectError(error.FileNotFound, inspectArtifactSet(allocator, path));
 }
 
 test "imported onnx l2 normalize tail plans to metal without device" {

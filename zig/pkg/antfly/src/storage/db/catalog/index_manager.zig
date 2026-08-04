@@ -48,6 +48,7 @@ const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
+const dense_exact = @import("../dense_exact.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
@@ -594,6 +595,20 @@ const TextMergeScheduler = struct {
         }
     }
 
+    fn removeIndex(self: *TextMergeScheduler, alloc: Allocator, index_name: []const u8) void {
+        self.supersedeInFlightForIndex(alloc, index_name);
+        var i: usize = 0;
+        while (i < self.quarantined.items.len) {
+            const merge = &self.quarantined.items[i];
+            if (!std.mem.eql(u8, merge.index_name, index_name)) {
+                i += 1;
+                continue;
+            }
+            merge.deinit(alloc);
+            _ = self.quarantined.orderedRemove(i);
+        }
+    }
+
     fn pruneExpiredQuarantines(self: *TextMergeScheduler, alloc: Allocator, now_ns: u64) void {
         var i: usize = 0;
         while (i < self.quarantined.items.len) {
@@ -953,6 +968,7 @@ pub const IndexManager = struct {
 
     pub const TextIndex = struct {
         apply_mutex: *std.atomic.Mutex,
+        analysis_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
         config: types.IndexConfig,
         chunk_name: ?[]u8,
         text_analysis: introducer_mod.TextAnalysisConfig,
@@ -961,6 +977,14 @@ pub const IndexManager = struct {
         rebuild_root_path: []u8,
         persistent: persistent_mod.PersistentIndex,
         compaction_pending: bool = false,
+
+        pub fn lockAnalysisShared(self: *TextIndex) void {
+            self.analysis_mutex.lockShared();
+        }
+
+        pub fn unlockAnalysisShared(self: *TextIndex) void {
+            self.analysis_mutex.unlockShared();
+        }
     };
 
     pub const OwnedFieldAnalyzer = struct {
@@ -1734,7 +1758,21 @@ pub const IndexManager = struct {
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
-        entry.persistent.close();
+        self.deinitTextIndexEntry(entry, false);
+    }
+
+    fn abandonTextIndexEntryAfterCrash(self: *IndexManager, entry: *TextIndex) void {
+        self.deinitTextIndexEntry(entry, true);
+    }
+
+    fn deinitTextIndexEntry(self: *IndexManager, entry: *TextIndex, abandon_after_crash: bool) void {
+        entry.analysis_mutex.lockExclusive();
+        defer entry.analysis_mutex.unlockExclusive();
+        if (abandon_after_crash) {
+            entry.persistent.abandonAfterCrash();
+        } else {
+            entry.persistent.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         introducer_mod.freeTextAnalysisConfig(self.alloc, entry.text_analysis);
@@ -1756,7 +1794,19 @@ pub const IndexManager = struct {
     }
 
     fn freeDenseIndexEntry(self: *IndexManager, entry: *DenseIndex) void {
-        entry.index.close();
+        self.deinitDenseIndexEntry(entry, false);
+    }
+
+    fn abandonDenseIndexEntryAfterCrash(self: *IndexManager, entry: *DenseIndex) void {
+        self.deinitDenseIndexEntry(entry, true);
+    }
+
+    fn deinitDenseIndexEntry(self: *IndexManager, entry: *DenseIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.index.abandonAfterCrash();
+        } else {
+            entry.index.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.vector_loader_context) |ctx| ctx.deinit(self.alloc);
         entry.ordinal_vector_ids.deinit(self.alloc);
@@ -1902,21 +1952,23 @@ pub const IndexManager = struct {
             .reverse_lsm_root_generation = self.lsm_root_generation,
             .edge_type_configs = entry.edge_type_configs,
             .rebuild_root_path = path,
+            .rebuild_owner_generation = coverageGenerationForConfig(entry.config),
             .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
         });
     }
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
         try entry.persistent.resetAllForRebuild();
-        try rebuild_state.update("");
+        try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
         var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             entry.config.name,
@@ -1925,13 +1977,14 @@ pub const IndexManager = struct {
         checkpoint.config_hash = types.indexConfigHash(entry.config);
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             entry.config.name,
             checkpoint,
         );
 
-        const rebuilt = entry.persistent.snapshot().global_doc_count;
+        const rebuilt = entry.persistent.snapshot().liveDocCount();
         entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
         if (entry.compaction_pending) {
             TextMergeScheduler.schedule(entry);
@@ -1950,16 +2003,16 @@ pub const IndexManager = struct {
         capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
         try checkRepairCancelled(cancel_check);
         try entry.persistent.resetAllForRebuild();
-        try rebuild_state.update("");
+        try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check, capacity_check);
         try checkRepairCancelled(cancel_check);
         try entry.persistent.sync(true);
 
-        return entry.persistent.snapshot().global_doc_count;
+        return entry.persistent.snapshot().liveDocCount();
     }
 
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
@@ -1967,7 +2020,19 @@ pub const IndexManager = struct {
     }
 
     fn freeSparseIndexEntry(self: *IndexManager, entry: *SparseIndex) void {
-        entry.index.close();
+        self.deinitSparseIndexEntry(entry, false);
+    }
+
+    fn abandonSparseIndexEntryAfterCrash(self: *IndexManager, entry: *SparseIndex) void {
+        self.deinitSparseIndexEntry(entry, true);
+    }
+
+    fn deinitSparseIndexEntry(self: *IndexManager, entry: *SparseIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.index.abandonAfterCrash();
+        } else {
+            entry.index.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         self.alloc.free(entry.field_name);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
@@ -1977,7 +2042,19 @@ pub const IndexManager = struct {
     }
 
     fn freeGraphIndexEntry(self: *IndexManager, entry: *GraphIndex) void {
-        entry.index.close();
+        self.deinitGraphIndexEntry(entry, false);
+    }
+
+    fn abandonGraphIndexEntryAfterCrash(self: *IndexManager, entry: *GraphIndex) void {
+        self.deinitGraphIndexEntry(entry, true);
+    }
+
+    fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.index.abandonAfterCrash();
+        } else {
+            entry.index.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         for (entry.edge_type_configs) |cfg| {
             self.alloc.free(cfg.name);
@@ -1990,19 +2067,30 @@ pub const IndexManager = struct {
     }
 
     pub fn deinit(self: *IndexManager) void {
+        self.deinitWithBackendDisposition(false);
+    }
+
+    /// Releases a pre-crash generation without executing backend finalizers.
+    /// This is for storage simulators and fault injection after the modeled
+    /// device has already rolled back volatile state.
+    pub fn abandonAfterCrash(self: *IndexManager) void {
+        self.deinitWithBackendDisposition(true);
+    }
+
+    fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
         for (self.text_indexes.items) |*entry| {
-            self.freeTextIndexEntry(entry);
+            if (abandon_after_crash) self.abandonTextIndexEntryAfterCrash(entry) else self.freeTextIndexEntry(entry);
         }
         for (self.dense_indexes.items) |*entry| {
-            self.freeDenseIndexEntry(entry);
+            if (abandon_after_crash) self.abandonDenseIndexEntryAfterCrash(entry) else self.freeDenseIndexEntry(entry);
         }
         for (self.sparse_indexes.items) |*entry| {
-            self.freeSparseIndexEntry(entry);
+            if (abandon_after_crash) self.abandonSparseIndexEntryAfterCrash(entry) else self.freeSparseIndexEntry(entry);
         }
         for (self.graph_indexes.items) |*entry| {
-            self.freeGraphIndexEntry(entry);
+            if (abandon_after_crash) self.abandonGraphIndexEntryAfterCrash(entry) else self.freeGraphIndexEntry(entry);
         }
         for (self.algebraic_indexes.items) |*entry| {
             self.freeAlgebraicIndexEntry(entry);
@@ -2071,6 +2159,59 @@ pub const IndexManager = struct {
 
     pub fn hasLoadFailures(self: *const IndexManager) bool {
         return self.failed_index_loads.count() > 0;
+    }
+
+    /// Refresh schema-derived mapping state for text indexes that have not
+    /// published any documents yet. Table creation can provision the default
+    /// full-text index before its schema metadata is committed locally; without
+    /// this refresh, early writes are projected with dynamic mappings and become
+    /// unreachable through the declared field after a clean restart.
+    ///
+    /// Non-empty generations are deliberately immutable here. Schema migration
+    /// serves those through their versioned runtime until a new generation is
+    /// built and promoted.
+    pub fn refreshEmptyTextIndexSchemas(self: *IndexManager, store: anytype) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+
+        for (self.text_indexes.items) |*entry| {
+            lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            entry.analysis_mutex.lockExclusive();
+            defer entry.analysis_mutex.unlockExclusive();
+
+            if (entry.persistent.hasPhysicalSegments()) continue;
+
+            const runtime_schema = try loadRuntimeSchemaForTextIndex(self.alloc, store, entry.config.name);
+            var runtime_schema_owned = runtime_schema;
+            errdefer if (runtime_schema_owned) |schema| schema_mod.freeSchema(self.alloc, schema);
+
+            var text_analysis = try parseTextAnalysisForIndexConfig(self.alloc, entry.config.config_json, runtime_schema_owned);
+            var text_analysis_owned = true;
+            errdefer if (text_analysis_owned) introducer_mod.freeTextAnalysisConfig(self.alloc, text_analysis);
+            try appendObservedFieldAnalyzers(self.alloc, &text_analysis, entry.observed_field_analyzers);
+            const provenance = try TextProjectionProvenance.fromRuntimeSchema(
+                self.alloc,
+                entry.config,
+                runtime_schema_owned,
+            );
+
+            // Registry claims may be safely ahead of an empty generation, but
+            // the generation witness must never be ahead of its live runtime.
+            // Persist claims first, then the witness, then swap infallibly.
+            try publishFullTextDictionaryRegistry(store, self.alloc, entry.config.name, text_analysis);
+            try saveTextProjectionProvenance(&entry.persistent, self.alloc, provenance);
+
+            const previous_schema = entry.runtime_schema;
+            const previous_analysis = entry.text_analysis;
+            entry.runtime_schema = runtime_schema_owned;
+            entry.text_analysis = text_analysis;
+            runtime_schema_owned = null;
+            text_analysis_owned = false;
+
+            if (previous_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+            introducer_mod.freeTextAnalysisConfig(self.alloc, previous_analysis);
+        }
     }
 
     pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
@@ -2252,6 +2393,24 @@ pub const IndexManager = struct {
         remaining: usize = 0,
     };
 
+    /// DB-owned service fence for publishing a newly opened quarantined
+    /// index. Opening and backfill happen outside this fence; only the final
+    /// catalog commit excludes readers that borrow pointers into inline index
+    /// arrays.
+    pub const CatalogPublicationFence = struct {
+        ptr: *anyopaque,
+        lock_fn: *const fn (*anyopaque) void,
+        unlock_fn: *const fn (*anyopaque) void,
+
+        fn lock(self: @This()) void {
+            self.lock_fn(self.ptr);
+        }
+
+        fn unlock(self: @This()) void {
+            self.unlock_fn(self.ptr);
+        }
+    };
+
     /// Re-attempts opening quarantined indexes whose backoff deadline has
     /// passed (all of them when `force` is set). A successful open registers
     /// the runtime index, removes the quarantined config from the
@@ -2260,7 +2419,13 @@ pub const IndexManager = struct {
     /// recorded error and pushes the next attempt out exponentially
     /// (30s..10min). `remaining` is the quarantine count after this pass,
     /// read under the catalog lock so callers can stop polling at zero.
-    pub fn retryFailedIndexLoads(self: *IndexManager, store: anytype, now_ns: u64, force: bool) !QuarantineRetryResult {
+    pub fn retryFailedIndexLoads(
+        self: *IndexManager,
+        store: anytype,
+        now_ns: u64,
+        force: bool,
+        publication_fence: CatalogPublicationFence,
+    ) !QuarantineRetryResult {
         const RetryTask = struct {
             name: []u8,
             cfg: types.IndexConfig,
@@ -2340,64 +2505,73 @@ pub const IndexManager = struct {
                 continue;
             };
 
-            self.catalog_mutex.lockExclusive();
-            if (self.failed_index_loads.get(task.name) == null) {
-                self.completeIndexLoadNoLock(task.name);
-                self.catalog_mutex.unlockExclusive();
-                opened.deinit(self);
-                continue;
-            }
-            var remove_idx: ?usize = null;
-            for (self.status_only_index_configs, 0..) |old_cfg, i| {
-                if (std.mem.eql(u8, old_cfg.name, task.name)) {
-                    remove_idx = i;
-                    break;
+            {
+                // Lock order is structural/service fence -> catalog. The DB
+                // fence drains maintenance and takes apply exclusive, matching
+                // every other live index publication. Keep slow open/backfill
+                // work above this scope so recovery does not stall queries.
+                publication_fence.lock();
+                defer publication_fence.unlock();
+
+                self.catalog_mutex.lockExclusive();
+                if (self.failed_index_loads.get(task.name) == null) {
+                    self.completeIndexLoadNoLock(task.name);
+                    self.catalog_mutex.unlockExclusive();
+                    opened.deinit(self);
+                    continue;
                 }
-            }
-            if (remove_idx == null) {
-                self.completeIndexLoadNoLock(task.name);
-                self.dropFailedIndexLoad(task.name);
-                self.catalog_mutex.unlockExclusive();
-                opened.deinit(self);
-                continue;
-            }
-            // Pre-allocate the shrunken status-only list so registration and
-            // de-quarantine commit together once the open has succeeded.
-            const old = self.status_only_index_configs;
-            const replacement: []types.IndexConfig = if (old.len <= 1)
-                &.{}
-            else
-                self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                var remove_idx: ?usize = null;
+                for (self.status_only_index_configs, 0..) |old_cfg, i| {
+                    if (std.mem.eql(u8, old_cfg.name, task.name)) {
+                        remove_idx = i;
+                        break;
+                    }
+                }
+                if (remove_idx == null) {
+                    self.completeIndexLoadNoLock(task.name);
+                    self.dropFailedIndexLoad(task.name);
+                    self.catalog_mutex.unlockExclusive();
+                    opened.deinit(self);
+                    continue;
+                }
+                // Pre-allocate the shrunken status-only list so registration
+                // and de-quarantine commit together once the open succeeded.
+                const old = self.status_only_index_configs;
+                const replacement: []types.IndexConfig = if (old.len <= 1)
+                    &.{}
+                else
+                    self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                        self.completeIndexLoadNoLock(task.name);
+                        self.catalog_mutex.unlockExclusive();
+                        opened.deinit(self);
+                        return err;
+                    };
+                self.appendOpenedIndex(opened) catch |err| {
+                    if (replacement.len > 0) self.alloc.free(replacement);
                     self.completeIndexLoadNoLock(task.name);
                     self.catalog_mutex.unlockExclusive();
                     opened.deinit(self);
                     return err;
                 };
-            self.appendOpenedIndex(opened) catch |err| {
-                if (replacement.len > 0) self.alloc.free(replacement);
                 self.completeIndexLoadNoLock(task.name);
-                self.catalog_mutex.unlockExclusive();
-                opened.deinit(self);
-                return err;
-            };
-            self.completeIndexLoadNoLock(task.name);
-            var wi: usize = 0;
-            for (old, 0..) |old_cfg, i| {
-                if (i == remove_idx.?) {
-                    var removed = old_cfg;
-                    removed.deinit(self.alloc);
-                    continue;
+                var wi: usize = 0;
+                for (old, 0..) |old_cfg, i| {
+                    if (i == remove_idx.?) {
+                        var removed = old_cfg;
+                        removed.deinit(self.alloc);
+                        continue;
+                    }
+                    replacement[wi] = old_cfg;
+                    wi += 1;
                 }
-                replacement[wi] = old_cfg;
-                wi += 1;
+                if (old.len > 0) self.alloc.free(old);
+                self.status_only_index_configs = replacement;
+                // Log before dropFailedIndexLoad frees the `name` key buffer.
+                std.log.info("quarantined index recovered name={s} kind={s}", .{ task.name, @tagName(task.cfg.kind) });
+                self.dropFailedIndexLoad(task.name);
+                self.catalog_mutex.unlockExclusive();
+                recovered += 1;
             }
-            if (old.len > 0) self.alloc.free(old);
-            self.status_only_index_configs = replacement;
-            // Log before dropFailedIndexLoad frees the `name` key buffer.
-            std.log.info("quarantined index recovered name={s} kind={s}", .{ task.name, @tagName(task.cfg.kind) });
-            self.dropFailedIndexLoad(task.name);
-            self.catalog_mutex.unlockExclusive();
-            recovered += 1;
         }
 
         self.catalog_mutex.lockExclusive();
@@ -3486,6 +3660,33 @@ pub const IndexManager = struct {
         self.io = io;
     }
 
+    pub fn checkpointIo(self: *const IndexManager) std.Io {
+        return self.io orelse std.Io.Threaded.global_single_threaded.io();
+    }
+
+    /// Binds rebuild cursors to the same storage backend as their index kind.
+    /// Callers must use this instead of assuming the logical root is a host
+    /// filesystem path; Lite and other external roots may be single files.
+    pub fn rebuildState(
+        self: *const IndexManager,
+        kind: types.IndexKind,
+        root_path: []const u8,
+        cfg: types.IndexConfig,
+    ) backfill_state_mod.RebuildState {
+        const storage = switch (kind) {
+            .full_text => self.text_lsm_storage,
+            .dense_vector => self.dense_lsm_storage,
+            .sparse_vector => self.sparse_lsm_storage,
+            .graph => self.graph_lsm_storage,
+            .algebraic => null,
+        };
+        return backfill_state_mod.RebuildState.initOwned(
+            root_path,
+            storage,
+            coverageGenerationForConfig(cfg),
+        );
+    }
+
     const GeneratedArtifactCleanupPlan = struct {
         alloc: Allocator,
         key: ?[]u8 = null,
@@ -3543,6 +3744,7 @@ pub const IndexManager = struct {
         // crash-surviving artifact cleanup before the new config can bind the
         // same public artifact names, then discard name-scoped index state.
         try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
+        try self.provisionConfiguredIndexDirDurable(stored_cfg);
 
         const enrichment_checkpoint = self.enrichments.items.len;
         var enrichment_catalog_committed = false;
@@ -3614,6 +3816,7 @@ pub const IndexManager = struct {
             false;
 
         for (stored_configs) |cfg| {
+            try self.provisionConfiguredIndexDirDurable(cfg);
             try self.openConfiguredIndex(store, cfg, false, false);
             try opened.append(self.alloc, cfg.name);
         }
@@ -3879,7 +4082,7 @@ pub const IndexManager = struct {
                 return;
             }
         }
-        apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name) catch |err| {
+        apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
             std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -4294,6 +4497,7 @@ pub const IndexManager = struct {
         // the catalog lock used by unrelated indexes.
         try apply_state.clearAppliedSequenceWithCheckpoint(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             name,
@@ -4332,6 +4536,7 @@ pub const IndexManager = struct {
                     name,
                     try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
                 );
+                self.text_merge_scheduler.removeIndex(self.alloc, name);
                 self.freeTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
@@ -5400,12 +5605,6 @@ pub const IndexManager = struct {
         return null;
     }
 
-    pub fn textAnalyzerForField(self: *IndexManager, name: ?[]const u8, field: []const u8) ?*const analysis_mod.Analyzer {
-        const entry = self.textIndexEntry(name) orelse return null;
-        const analyzer_name = textFieldAnalyzerName(entry, field) orelse return null;
-        return introducer_mod.resolveAnalyzerName(analyzer_name, entry.text_analysis);
-    }
-
     pub fn acquireTextQueryLease(
         self: *IndexManager,
         alloc: Allocator,
@@ -5416,6 +5615,8 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockShared();
 
         const entry = self.textIndexEntry(name) orelse return null;
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
         const snapshot = entry.persistent.acquireSnapshot();
         errdefer snapshot.release();
 
@@ -5445,6 +5646,17 @@ pub const IndexManager = struct {
         name: ?[]const u8,
     ) ![]schema_mod.FieldCapability {
         const entry = self.textIndexEntry(name) orelse return &.{};
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
+        return try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry);
+    }
+
+    fn observedDynamicFieldCapabilitiesLockedAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        entry: *IndexManager.TextIndex,
+    ) ![]schema_mod.FieldCapability {
+        _ = self;
         const declared_capability_count = declaredRuntimeNativeDocValueFieldCapabilityCount(entry);
         const capability_count = entry.observed_field_analyzers.len + declared_capability_count;
         if (capability_count == 0) return &.{};
@@ -5507,17 +5719,17 @@ pub const IndexManager = struct {
 
     fn observedDynamicFieldTypedDocValueCoverageStatus(
         alloc: Allocator,
-        entry: *TextIndex,
+        entry: *IndexManager.TextIndex,
         field: []const u8,
         mapping: schema_mod.FieldMapping,
     ) !typed_dv_coverage.Status {
         if (!schema_mod.mappingHasNativeDocValues(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
-        if (snapshot.global_doc_count == 0) return .covered;
+        if (snapshot.liveDocCount() == 0) return .covered;
 
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
-            const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+            const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
             const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch return .malformed_doc_values_section;
             if (!typedDocValueReaderMatchesMapping(reader.value_type, mapping)) return .doc_values_kind_mismatch;
             const coverage = try typed_dv_coverage.readerCoversLiveDocsAlloc(alloc, segment, &reader);
@@ -5544,6 +5756,14 @@ pub const IndexManager = struct {
         self: *IndexManager,
         alloc: Allocator,
     ) ![]ObservedDynamicFieldCapabilitySet {
+        for (self.text_indexes.items) |*entry| entry.analysis_mutex.lockShared();
+        defer {
+            var i = self.text_indexes.items.len;
+            while (i > 0) {
+                i -= 1;
+                self.text_indexes.items[i].analysis_mutex.unlockShared();
+            }
+        }
         var set_count: usize = 0;
         for (self.text_indexes.items) |*entry| {
             if (entry.observed_field_analyzers.len > 0 or declaredRuntimeNativeDocValueFieldCapabilityCount(entry) > 0) set_count += 1;
@@ -5562,7 +5782,7 @@ pub const IndexManager = struct {
             sets[initialized] = blk: {
                 const index_name = try alloc.dupe(u8, entry.config.name);
                 errdefer alloc.free(index_name);
-                const field_capabilities = try self.observedDynamicFieldCapabilitiesAlloc(alloc, entry.config.name);
+                const field_capabilities = try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry);
                 break :blk .{
                     .index_name = index_name,
                     .field_capabilities = field_capabilities,
@@ -5575,15 +5795,11 @@ pub const IndexManager = struct {
 
     pub fn fullTextLexicalAccessPath(self: *IndexManager, name: ?[]const u8, field: []const u8, analyzer: []const u8) ?algebraic_mod.ir.PhysicalAccessPath {
         const entry = self.textIndexEntry(name) orelse return null;
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
         if (!textFieldAnalyzerMatches(entry, field, analyzer)) return null;
         const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText(entry.config.name, field, analyzer);
         return algebraic_mod.ir.lexicalAccessPath(entry.config.name, .full_text_postings, identity, true);
-    }
-
-    pub fn fullTextLexicalAccessPathForField(self: *IndexManager, name: ?[]const u8, field: []const u8) ?algebraic_mod.ir.PhysicalAccessPath {
-        const entry = self.textIndexEntry(name) orelse return null;
-        const analyzer = textFieldAnalyzerName(entry, field) orelse return null;
-        return self.fullTextLexicalAccessPath(entry.config.name, field, analyzer);
     }
 
     pub fn planFullTextLexicalAccessPathAlloc(
@@ -5595,6 +5811,8 @@ pub const IndexManager = struct {
         fragment: algebraic_mod.ir.TensorFragment,
     ) !?algebraic_mod.ir.AccessPathPlan {
         const entry = self.textIndexEntry(name) orelse return null;
+        entry.analysis_mutex.lockShared();
+        defer entry.analysis_mutex.unlockShared();
         const resolved_analyzer = if (analyzer) |explicit| blk: {
             if (!textFieldAnalyzerMatches(entry, field, explicit)) return null;
             break :blk explicit;
@@ -6547,7 +6765,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
-    ) !hbc_mod.SearchResults {
+    ) !dense_exact.SearchOutcome {
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -6565,15 +6783,9 @@ pub const IndexManager = struct {
             active_dense_vector_load_session = &vector_load_session.?;
         }
 
-        var candidate_ids = std.ArrayListUnmanaged(u64).empty;
-        defer candidate_ids.deinit(self.alloc);
-        try candidate_ids.ensureTotalCapacity(self.alloc, req.filter_ids.len);
-        for (req.filter_ids) |vector_id| {
-            if (std.mem.indexOfScalar(u64, req.exclude_ids, vector_id) != null) continue;
-            candidate_ids.appendAssumeCapacity(vector_id);
-        }
-        std.mem.sort(u64, candidate_ids.items, {}, std.sort.asc(u64));
-        const unique_candidate_ids = candidate_ids.items[0..uniqueSortedU64(candidate_ids.items)];
+        var candidates = try dense_exact.CandidateDifference.init(self.alloc, req.filter_ids, req.exclude_ids);
+        defer candidates.deinit();
+        const unique_candidate_ids = candidates.values;
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -6586,23 +6798,90 @@ pub const IndexManager = struct {
         var txn = try entry.index.beginReadTxn();
         defer txn.abort();
 
+        // Candidate IDs are sorted, so resolve metadata and vectors with the
+        // backend's ordered batch/cursor APIs. The old loop performed one
+        // metadata probe and could open one primary-store transaction per
+        // candidate, which dominated highly selective filtered searches.
+        const candidate_metadata = try self.alloc.alloc(?[]const u8, unique_candidate_ids.len);
+        defer self.alloc.free(candidate_metadata);
+        @memset(candidate_metadata, null);
+        try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+
+        const fallback_doc_keys = try self.alloc.alloc(?[]u8, unique_candidate_ids.len);
+        defer {
+            for (fallback_doc_keys) |maybe_doc_key| {
+                if (maybe_doc_key) |doc_key| self.alloc.free(doc_key);
+            }
+            self.alloc.free(fallback_doc_keys);
+        }
+        @memset(fallback_doc_keys, null);
+
+        var needs_primary_metadata = false;
+        for (candidate_metadata) |maybe_metadata| {
+            if (maybe_metadata == null) {
+                needs_primary_metadata = true;
+                break;
+            }
+        }
+        if (needs_primary_metadata) {
+            if (self.primary_store) |store| {
+                var legacy_vector_ordinals = std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal).empty;
+                defer legacy_vector_ordinals.deinit(self.alloc);
+                var needs_legacy_reverse = false;
+                for (unique_candidate_ids, candidate_metadata) |vector_id, maybe_metadata| {
+                    if (maybe_metadata == null and !entry.vector_ordinals.contains(vector_id)) {
+                        needs_legacy_reverse = true;
+                        break;
+                    }
+                }
+                if (needs_legacy_reverse) {
+                    try legacy_vector_ordinals.ensureTotalCapacity(self.alloc, entry.ordinal_vector_ids.count());
+                    var reverse_it = entry.ordinal_vector_ids.iterator();
+                    while (reverse_it.next()) |item| {
+                        legacy_vector_ordinals.putAssumeCapacity(item.value_ptr.*, item.key_ptr.*);
+                    }
+                }
+
+                var identity_txn = try store.beginProbeTxn();
+                defer identity_txn.abort();
+                for (unique_candidate_ids, candidate_metadata, 0..) |vector_id, maybe_metadata, i| {
+                    if (maybe_metadata != null) continue;
+                    const ordinal = entry.vector_ordinals.get(vector_id) orelse legacy_vector_ordinals.get(vector_id) orelse continue;
+                    fallback_doc_keys[i] = try doc_identity.lookupDocIdTxn(self.alloc, &identity_txn, ordinal);
+                }
+            }
+        }
+
+        var vector_cursor = entry.index.openNamespacedCursor(self.alloc, &txn, .vecs) catch |err| switch (err) {
+            error.Unsupported => null,
+            else => return err,
+        };
+        defer if (vector_cursor) |*cursor| cursor.close();
+
         const query_measure = vector_mod.norm(req.query);
         const vector_scratch = try self.alloc.alloc(f32, entry.dims);
         defer self.alloc.free(vector_scratch);
-        for (unique_candidate_ids) |vector_id| {
-            var owned_metadata = try self.resolveExactDenseDocKeyAlloc(entry, &txn, vector_id);
-            defer if (owned_metadata) |metadata| self.alloc.free(metadata);
-
-            const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+        var vectors_scored: u64 = 0;
+        for (unique_candidate_ids, candidate_metadata, fallback_doc_keys) |vector_id, maybe_metadata, fallback_doc_key| {
+            const doc_key = maybe_metadata orelse fallback_doc_key;
+            if (req.filter_prefix.len > 0) {
+                const resolved_doc_key = doc_key orelse continue;
+                if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
+            }
+            const vector = (if (vector_cursor) |*cursor|
+                entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
+            else
+                entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
                 error.NotFound => blk: {
                     const loader_ctx = entry.vector_loader_context orelse continue;
-                    const doc_key = owned_metadata orelse continue;
-                    break :blk try loadDenseVectorForHbcIntoScratch(loader_ctx, vector_id, doc_key, vector_scratch);
+                    const resolved_doc_key = doc_key orelse continue;
+                    break :blk try loadDenseVectorForHbcIntoScratch(loader_ctx, vector_id, resolved_doc_key, vector_scratch);
                 },
                 else => return err,
             };
             if (vector.len != req.query.len) return error.DimensionMismatch;
 
+            vectors_scored += 1;
             const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
             if (!std.math.isFinite(distance)) continue;
             if (req.distance_over) |threshold| {
@@ -6611,12 +6890,11 @@ pub const IndexManager = struct {
             if (req.distance_under) |threshold| {
                 if (distance >= threshold) continue;
             }
-            if (req.filter_prefix.len > 0) {
-                const doc_key = owned_metadata orelse continue;
-                if (!std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
-            }
+            const owned_metadata = if (doc_key) |resolved_doc_key|
+                try self.alloc.dupe(u8, resolved_doc_key)
+            else
+                null;
             results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
-            owned_metadata = null;
         }
         results.sort();
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
@@ -6626,31 +6904,10 @@ pub const IndexManager = struct {
                 results.getHits().len,
             });
         }
-        return results;
-    }
-
-    fn resolveExactDenseDocKeyAlloc(
-        self: *IndexManager,
-        entry: *DenseIndex,
-        hbc_txn: anytype,
-        vector_id: u64,
-    ) !?[]u8 {
-        if (try entry.index.getMetadataInTxn(hbc_txn, vector_id)) |metadata| {
-            return try self.alloc.dupe(u8, metadata);
-        }
-        const store = self.primary_store orelse return null;
-        const ordinal = entry.vector_ordinals.get(vector_id) orelse ordinal: {
-            var it = entry.ordinal_vector_ids.iterator();
-            while (it.next()) |item| {
-                if (item.value_ptr.* == vector_id) break :ordinal item.key_ptr.*;
-            }
-            return null;
+        return .{
+            .results = results,
+            .vectors_scored = vectors_scored,
         };
-        var runtime_store = try initRuntimeStore(self.alloc, store);
-        defer runtime_store.deinit();
-        var txn = try runtime_store.store.beginRead();
-        defer txn.abort();
-        return try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal);
     }
 
     pub fn textIndexesForChunk(
@@ -7881,7 +8138,7 @@ pub const IndexManager = struct {
         if (builtin.is_test) test_text_backfill_invocations += 1;
         self.beginTextBackfill();
         defer self.endTextBackfill();
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -7922,7 +8179,7 @@ pub const IndexManager = struct {
                     .compact_text = false,
                     .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
                 }, stats);
-                try rebuild.update(last_doc_key);
+                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -8064,7 +8321,7 @@ pub const IndexManager = struct {
         }
 
         if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
-        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
 
@@ -8079,7 +8336,7 @@ pub const IndexManager = struct {
     ) !void {
         self.beginTextBackfill();
         defer self.endTextBackfill();
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -8130,7 +8387,7 @@ pub const IndexManager = struct {
                     .compact_text = false,
                     .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
                 }, stats);
-                try rebuild.update(last_doc_key);
+                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -8279,12 +8536,42 @@ pub const IndexManager = struct {
         }
 
         if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
-        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ self.base_path, name });
+    }
+
+    fn provisionConfiguredIndexDirDurable(self: *IndexManager, cfg: types.IndexConfig) !void {
+        const storage = switch (cfg.kind) {
+            .full_text => self.text_lsm_storage,
+            .dense_vector => self.dense_lsm_storage,
+            .sparse_vector => self.sparse_lsm_storage,
+            .graph => self.graph_lsm_storage,
+            .algebraic => return,
+        };
+        const path = try self.indexPath(cfg.name);
+        defer self.alloc.free(path);
+
+        if (storage) |lsm_storage| {
+            const parent_path = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{self.base_path});
+            defer self.alloc.free(parent_path);
+
+            // A catalog row must not become durable before the namespace that
+            // will hold its generation. Descendant file syncs cannot make an
+            // unsynced ancestor durable, so publish each structural boundary.
+            try lsm_storage.createDirPath(self.base_path);
+            try lsm_storage.syncParentAbsolute(self.base_path);
+            try lsm_storage.createDirPath(parent_path);
+            try lsm_storage.syncParentAbsolute(parent_path);
+            try lsm_storage.createDirPath(path);
+            try lsm_storage.syncParentAbsolute(path);
+            return;
+        }
+
+        try ensureIndexDirDurable(self.alloc, self.io, self.base_path, path);
     }
 
     fn prepareStorageForFreshCatalogEntry(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
@@ -8305,7 +8592,7 @@ pub const IndexManager = struct {
         self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
-        try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, cfg.name);
+        try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
     }
 
     fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
@@ -8581,6 +8868,7 @@ pub const IndexManager = struct {
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             .{
@@ -8763,6 +9051,18 @@ pub const IndexManager = struct {
                 errdefer if (!runtime_schema_moved) {
                     if (runtime_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
                 };
+                const projection_provenance = try TextProjectionProvenance.fromRuntimeSchema(
+                    self.alloc,
+                    cfg,
+                    runtime_schema,
+                );
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, read_only) catch |err| {
+                    std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
+                        cfg.name,
+                        @errorName(err),
+                    });
+                    return err;
+                };
                 var text_analysis = parseTextAnalysisForIndexConfig(self.alloc, cfg.config_json, runtime_schema) catch |err| {
                     std.log.warn("full_text open failed step=text_analysis name={s} err={s}", .{
                         cfg.name,
@@ -8818,8 +9118,8 @@ pub const IndexManager = struct {
                     self.alloc.free(persisted_ranges);
                 }
 
-                const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                var resume_from = rebuild_state.check(self.alloc) catch |err| {
+                const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
+                var resume_from = rebuild_state.checkWithIo(self.alloc, self.checkpointIo()) catch |err| {
                     std.log.warn("full_text open failed step=rebuild_state_check name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -8836,9 +9136,9 @@ pub const IndexManager = struct {
                     rebuild_from_scratch_after_interruption = true;
                 }
 
-                if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
+                if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().liveDocCount() == 0 and persisted_ranges.len == 0))) {
                     const backfill_started_ns = nowNs();
-                    try rebuild_state.update(if (resume_from) |buf| buf else "");
+                    try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
                     try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
@@ -9045,13 +9345,13 @@ pub const IndexManager = struct {
                 index_moved = true;
                 errdefer self.freeSparseIndexEntry(&entry);
 
-                const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                const resume_from = try rebuild_state.check(self.alloc);
+                const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
+                const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
                 if (allow_backfill and (resume_from != null or entry.index.next_doc_num == 0)) {
                     const backfill_started_ns = nowNs();
-                    try rebuild_state.update(if (resume_from) |buf| buf else "");
+                    try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     try self.backfillSparseIndex(store, &entry, resume_from);
                     try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
@@ -9121,6 +9421,7 @@ pub const IndexManager = struct {
                     .reverse_lsm_root_generation = self.lsm_root_generation,
                     .edge_type_configs = graph_cfg.edge_type_configs,
                     .rebuild_root_path = path,
+                    .rebuild_owner_generation = coverageGenerationForConfig(cfg),
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
                 });
                 var index_moved = false;
@@ -9143,13 +9444,14 @@ pub const IndexManager = struct {
                 graph_cfg_moved = true;
                 errdefer self.freeGraphIndexEntry(&entry);
 
-                const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                const resume_from = try rebuild_state.check(self.alloc);
+                const rebuild_state = self.rebuildState(.graph, entry.rebuild_root_path, entry.config);
+                const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
                 const reverse_edges = (try entry.index.stats(self.alloc)).edge_count;
 
                 const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
                     self.alloc,
+                    self.checkpointIo(),
                     store,
                     self.applied_sequence_checkpoint_path,
                     cfg.name,
@@ -9159,8 +9461,14 @@ pub const IndexManager = struct {
                 const has_replay_history = latest_replay_sequence != 0;
                 if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
                     const backfill_started_ns = nowNs();
-                    try rebuild_state.update(if (resume_from) |buf| buf else "");
-                    _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResume(self.alloc, self.byte_range.start, self.byte_range.end, resume_from);
+                    try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
+                    _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(
+                        self.alloc,
+                        self.checkpointIo(),
+                        self.byte_range.start,
+                        self.byte_range.end,
+                        resume_from,
+                    );
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
@@ -9842,12 +10150,13 @@ pub const IndexManager = struct {
         for (snap.segments, 0..) |seg, i| {
             if (self.text_merge_scheduler.segmentInFlight(entry.config.name, seg.id)) continue;
             if (self.text_merge_scheduler.segmentQuarantined(entry.config.name, seg.id, now_ns)) continue;
+            const deletion_summary = seg.deletionSummary();
             try infos.append(self.alloc, .{
                 .index = i,
                 .size = seg.data.bytes().len,
                 .doc_count = seg.reader.doc_count,
-                .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-                .has_deletions = seg.shared.deleted != null,
+                .deleted_count = deletion_summary.count,
+                .has_deletions = deletion_summary.has_deletions,
             });
         }
         if (infos.items.len < 2) return null;
@@ -9902,7 +10211,7 @@ pub const IndexManager = struct {
             const source_seg = &snap.segments[seg_idx];
             source[i] = .{
                 .id = source_seg.id,
-                .deleted = if (source_seg.shared.deleted) |*deleted| try deleted.clone(self.alloc) else null,
+                .deleted = try source_seg.cloneDeleted(self.alloc),
             };
             source_initialized += 1;
             merge_indices[i] = seg_idx;
@@ -10003,11 +10312,15 @@ pub const IndexManager = struct {
         defer snap.release();
         for (task.source) |source| {
             const seg = findSegmentById(snap, source.id) orelse return false;
-            if (source.deleted) |expected| {
-                const current_deleted = seg.shared.deleted orelse return false;
-                if (!current_deleted.eql(&expected)) return false;
-            } else if (seg.shared.deleted != null) {
-                return false;
+            {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                if (source.deleted) |expected| {
+                    const current_deleted = seg.shared.deleted orelse return false;
+                    if (!current_deleted.eql(&expected)) return false;
+                } else if (seg.shared.deleted != null) {
+                    return false;
+                }
             }
         }
         return true;
@@ -10276,7 +10589,7 @@ pub const IndexManager = struct {
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -10319,7 +10632,7 @@ pub const IndexManager = struct {
                 try sparse_entry.index.batchWithOptions(writes_buf.items, &.{}, .{
                     .defer_term_range_updates = true,
                 });
-                doc_count.* += writes_buf.items.len;
+                doc_count.* = sparse_entry.index.doc_count;
                 try sparse_entry.index.persistBackfillDocCount(doc_count.*);
                 for (writes_buf.items) |item| {
                     manager.alloc.free(@constCast(item.doc_id));
@@ -10327,7 +10640,7 @@ pub const IndexManager = struct {
                     manager.alloc.free(@constCast(item.vec.values));
                 }
                 writes_buf.clearRetainingCapacity();
-                try rebuild.update(last_doc_key);
+                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 flush_count.* += 1;
                 if (@import("builtin").is_test) {
                     if (test_abort_sparse_backfill_after_batches) |limit| {
@@ -10370,7 +10683,7 @@ pub const IndexManager = struct {
             try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
-        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.index.checkpointLsmWalAfterDurableBoundary();
     }
 
@@ -14714,7 +15027,7 @@ fn buildSplitSegment(
             }
         }
 
-        const stored = reader.storedDoc(doc_idx) orelse return error.InvalidSegment;
+        const stored = (try reader.storedDoc(doc_idx)) orelse return error.InvalidSegment;
         const keep = switch (side) {
             .left => std.mem.order(u8, stored.id, split_key) == .lt,
             .right => std.mem.order(u8, stored.id, split_key) != .lt,
@@ -14747,6 +15060,29 @@ fn buildSplitSegment(
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),
     };
+}
+
+test "dense rebuild state uses configured durable storage" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const storage = memory.storage();
+
+    var manager = try IndexManager.initWithOptions(alloc, "__test/db", .{
+        .dense_lsm_storage = storage,
+    });
+    defer manager.deinit();
+
+    const state = manager.rebuildState(.dense_vector, "__test/db/indexes/dense", .{
+        .name = "dense",
+        .kind = .dense_vector,
+        .config_json = "{}",
+        .coverage_generation = 11,
+    });
+    try state.updateWithIo(std.testing.io, "doc:m");
+    const loaded = (try state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+    defer alloc.free(loaded);
+    try std.testing.expectEqualStrings("doc:m", loaded);
 }
 
 test "split preserves postings when text segments omit source bodies" {
@@ -15773,6 +16109,9 @@ fn mergeObservedTextFieldAnalyzers(
 ) !void {
     if (observed.len == 0) return;
 
+    entry.analysis_mutex.lockExclusive();
+    defer entry.analysis_mutex.unlockExclusive();
+
     var additions = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
     defer {
         for (additions.items) |item| {
@@ -15784,9 +16123,14 @@ fn mergeObservedTextFieldAnalyzers(
 
     for (observed) |item| {
         if (containsObservedFieldAnalyzer(entry.observed_field_analyzers, item)) continue;
+        if (containsObservedFieldAnalyzer(additions.items, item)) continue;
+        const field_name = try self.alloc.dupe(u8, item.field_name);
+        errdefer self.alloc.free(field_name);
+        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
+        errdefer self.alloc.free(analyzer_name);
         try additions.append(self.alloc, .{
-            .field_name = try self.alloc.dupe(u8, item.field_name),
-            .analyzer_name = try self.alloc.dupe(u8, item.analyzer_name),
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
             .field_type = item.field_type,
             .do_index = item.do_index,
             .store = item.store,
@@ -15798,12 +16142,29 @@ fn mergeObservedTextFieldAnalyzers(
     }
     if (additions.items.len == 0) return;
 
-    const original_len = entry.observed_field_analyzers.len;
-    const expanded = try self.alloc.realloc(entry.observed_field_analyzers, original_len + additions.items.len);
+    const original_observed_len = entry.observed_field_analyzers.len;
+    const expanded_observed = try self.alloc.alloc(
+        mapper.ObservedFieldAnalyzer,
+        original_observed_len + additions.items.len,
+    );
+    var observed_initialized = original_observed_len;
+    var observed_published = false;
+    defer if (!observed_published) {
+        for (expanded_observed[original_observed_len..observed_initialized]) |item| {
+            self.alloc.free(item.field_name);
+            self.alloc.free(item.analyzer_name);
+        }
+        self.alloc.free(expanded_observed);
+    };
+    for (entry.observed_field_analyzers, 0..) |item, i| expanded_observed[i] = item;
     for (additions.items, 0..) |item, i| {
-        expanded[original_len + i] = .{
-            .field_name = try self.alloc.dupe(u8, item.field_name),
-            .analyzer_name = try self.alloc.dupe(u8, item.analyzer_name),
+        const field_name = try self.alloc.dupe(u8, item.field_name);
+        errdefer self.alloc.free(field_name);
+        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
+        errdefer self.alloc.free(analyzer_name);
+        expanded_observed[original_observed_len + i] = .{
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
             .field_type = item.field_type,
             .do_index = item.do_index,
             .store = item.store,
@@ -15812,12 +16173,52 @@ fn mergeObservedTextFieldAnalyzers(
             .missing_null_policy = item.missing_null_policy,
             .include_in_all = item.include_in_all,
         };
+        observed_initialized += 1;
     }
-    entry.observed_field_analyzers = expanded;
 
-    try appendObservedFieldAnalyzers(self.alloc, &entry.text_analysis, additions.items);
-    try saveObservedTextFieldAnalyzers(store, self.alloc, entry.config.name, entry.observed_field_analyzers);
-    try publishFullTextDictionaryRegistry(store, self.alloc, entry.config.name, entry.text_analysis);
+    const FieldAnalyzer = std.meta.Child(@TypeOf(entry.text_analysis.field_analyzers));
+    const original_analysis_len = entry.text_analysis.field_analyzers.len;
+    const expanded_analysis = try self.alloc.alloc(FieldAnalyzer, original_analysis_len + additions.items.len);
+    var analysis_initialized = original_analysis_len;
+    var analysis_published = false;
+    defer if (!analysis_published) {
+        for (expanded_analysis[original_analysis_len..analysis_initialized]) |item| {
+            self.alloc.free(item.field_name);
+            self.alloc.free(item.analyzer_name);
+        }
+        self.alloc.free(expanded_analysis);
+    };
+    for (entry.text_analysis.field_analyzers, 0..) |item, i| expanded_analysis[i] = item;
+    for (additions.items, 0..) |item, i| {
+        const field_name = try self.alloc.dupe(u8, item.field_name);
+        errdefer self.alloc.free(field_name);
+        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
+        errdefer self.alloc.free(analyzer_name);
+        expanded_analysis[original_analysis_len + i] = .{
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
+        };
+        analysis_initialized += 1;
+    }
+
+    var candidate_analysis = entry.text_analysis;
+    candidate_analysis.field_analyzers = expanded_analysis;
+    try publishFullTextMetadata(
+        store,
+        self.alloc,
+        entry.config.name,
+        candidate_analysis,
+        expanded_observed,
+    );
+
+    const previous_observed = entry.observed_field_analyzers;
+    const previous_analysis = entry.text_analysis.field_analyzers;
+    entry.observed_field_analyzers = expanded_observed;
+    entry.text_analysis.field_analyzers = expanded_analysis;
+    observed_published = true;
+    analysis_published = true;
+    if (previous_observed.len > 0) self.alloc.free(previous_observed);
+    if (previous_analysis.len > 0) self.alloc.free(previous_analysis);
 }
 
 fn containsObservedFieldAnalyzer(
@@ -16619,6 +17020,39 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     }
 }
 
+fn ensureIndexDirDurable(
+    alloc: Allocator,
+    shared_io: ?std.Io,
+    base_path: []const u8,
+    path: []const u8,
+) !void {
+    if (builtin.os.tag == .freestanding) return;
+
+    if (shared_io) |io| {
+        return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
+    }
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    try ensureIndexDirDurableWithIo(alloc, io_impl.io(), base_path, path);
+}
+
+fn ensureIndexDirDurableWithIo(
+    alloc: Allocator,
+    io: std.Io,
+    base_path: []const u8,
+    path: []const u8,
+) !void {
+    const parent_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{base_path});
+    defer alloc.free(parent_path);
+
+    try fs_paths.createDirPathPortable(io, base_path);
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(base_path) orelse ".");
+    try fs_paths.createDirPathPortable(io, parent_path);
+    try fs_paths.syncDirPortable(io, base_path);
+    try fs_paths.createDirPathPortable(io, path);
+    try fs_paths.syncDirPortable(io, parent_path);
+}
+
 fn deleteIndexDirIfPresent(path: []const u8) void {
     if (builtin.os.tag == .freestanding) return;
 
@@ -16959,31 +17393,144 @@ fn containsU32(items: []const u32, id: u32) bool {
     return false;
 }
 
+/// Durable witness for the projection semantics used to build a full-text
+/// generation. It lives in the persistent generation's own metadata backend,
+/// so shadows and replacement roots cannot overwrite the active witness.
+const TextProjectionProvenance = struct {
+    coverage_generation: u64,
+    index_config_hash: u64,
+    schema_version: ?u32,
+    schema_fingerprint: u64,
+
+    fn fromRuntimeSchema(
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        schema: ?schema_mod.TableSchema,
+    ) !TextProjectionProvenance {
+        const schema_fingerprint = if (schema) |value| blk: {
+            const encoded = try schema_mod.serializeSchema(alloc, value);
+            defer alloc.free(encoded);
+            break :blk std.hash.Wyhash.hash(0x41545052534d0001, encoded);
+        } else std.hash.Wyhash.hash(0x41545052534d0001, "schema-less");
+        return .{
+            .coverage_generation = coverageGenerationForConfig(cfg),
+            .index_config_hash = types.indexConfigHash(cfg),
+            .schema_version = if (schema) |value| value.version else null,
+            .schema_fingerprint = schema_fingerprint,
+        };
+    }
+
+    fn eql(left: TextProjectionProvenance, right: TextProjectionProvenance) bool {
+        return left.coverage_generation == right.coverage_generation and
+            left.index_config_hash == right.index_config_hash and
+            left.schema_version == right.schema_version and
+            left.schema_fingerprint == right.schema_fingerprint;
+    }
+
+    fn encodeAlloc(self: TextProjectionProvenance, alloc: Allocator) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "ATPP");
+        try appendU32(&out, alloc, 2);
+        try appendU64(&out, alloc, self.coverage_generation);
+        try appendU64(&out, alloc, self.index_config_hash);
+        try out.append(alloc, if (self.schema_version != null) 1 else 0);
+        try appendU32(&out, alloc, self.schema_version orelse 0);
+        try appendU64(&out, alloc, self.schema_fingerprint);
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn decode(data: []const u8) !TextProjectionProvenance {
+        if (data.len != 37 or !std.mem.eql(u8, data[0..4], "ATPP")) return error.InvalidTextProjectionProvenance;
+        var pos: usize = 4;
+        if (try readU32(data, &pos) != 2) return error.UnsupportedTextProjectionProvenanceVersion;
+        const coverage_generation = try readU64(data, &pos);
+        const index_config_hash = try readU64(data, &pos);
+        const has_schema = switch (data[pos]) {
+            0 => false,
+            1 => true,
+            else => return error.InvalidTextProjectionProvenance,
+        };
+        pos += 1;
+        const schema_version = try readU32(data, &pos);
+        const schema_fingerprint = try readU64(data, &pos);
+        return .{
+            .coverage_generation = coverage_generation,
+            .index_config_hash = index_config_hash,
+            .schema_version = if (has_schema) schema_version else null,
+            .schema_fingerprint = schema_fingerprint,
+        };
+    }
+};
+
+fn saveTextProjectionProvenance(
+    persistent: *persistent_mod.PersistentIndex,
+    alloc: Allocator,
+    provenance: TextProjectionProvenance,
+) !void {
+    const data = try provenance.encodeAlloc(alloc);
+    defer alloc.free(data);
+    try persistent.writeGenerationMetadata(persistent_mod.text_projection_provenance_meta_key, data);
+}
+
+fn ensureTextProjectionProvenance(
+    alloc: Allocator,
+    persistent: *persistent_mod.PersistentIndex,
+    expected: TextProjectionProvenance,
+    read_only: bool,
+) !void {
+    const encoded = try persistent.readGenerationMetadataAlloc(
+        alloc,
+        persistent_mod.text_projection_provenance_meta_key,
+    );
+    defer if (encoded) |bytes| alloc.free(bytes);
+    const persisted = if (encoded) |bytes| try TextProjectionProvenance.decode(bytes) else null;
+    if (persisted != null and persisted.?.eql(expected)) return;
+
+    if (persistent.hasPhysicalSegments()) {
+        // There is no trustworthy upgrade witness for legacy postings. Keep
+        // the configured index visible through load status, but do not attach
+        // analyzers that may interpret its postings under different semantics.
+        if (persisted == null) return error.MissingTextProjectionProvenance;
+        return error.TextProjectionProvenanceMismatch;
+    }
+    // A physically empty writable generation has no postings to reinterpret.
+    // This covers fresh creation, portable restore before explicit backfill,
+    // and schema installation before the first write.
+    if (read_only) {
+        if (persisted == null) return error.MissingTextProjectionProvenance;
+        return error.TextProjectionProvenanceMismatch;
+    }
+    try saveTextProjectionProvenance(persistent, alloc, expected);
+}
+
 fn textFieldAnalyzersKey(alloc: Allocator, index_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ text_field_analyzers_prefix, index_name });
 }
 
-fn saveObservedTextFieldAnalyzers(store: anytype, alloc: Allocator, index_name: []const u8, observed: []const mapper.ObservedFieldAnalyzer) !void {
-    const key = try textFieldAnalyzersKey(alloc, index_name);
-    defer alloc.free(key);
-    const data = try serializeObservedTextFieldAnalyzers(alloc, observed);
-    defer alloc.free(data);
-
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    try txn.put(key, data);
-    try txn.commit();
+fn publishFullTextDictionaryRegistry(store: anytype, alloc: Allocator, index_name: []const u8, text_analysis: introducer_mod.TextAnalysisConfig) !void {
+    try publishFullTextMetadata(store, alloc, index_name, text_analysis, null);
 }
 
-fn publishFullTextDictionaryRegistry(store: anytype, alloc: Allocator, index_name: []const u8, text_analysis: introducer_mod.TextAnalysisConfig) !void {
-    if (text_analysis.field_analyzers.len == 0) return;
+fn publishFullTextMetadata(
+    store: anytype,
+    alloc: Allocator,
+    index_name: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    observed: ?[]const mapper.ObservedFieldAnalyzer,
+) !void {
+    if (text_analysis.field_analyzers.len == 0 and observed == null) return;
 
+    const observed_key = if (observed != null) try textFieldAnalyzersKey(alloc, index_name) else null;
+    defer if (observed_key) |key| alloc.free(key);
+    const observed_data = if (observed) |items| try serializeObservedTextFieldAnalyzers(alloc, items) else null;
+    defer if (observed_data) |data| alloc.free(data);
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+
+    if (observed_key) |key| try txn.put(key, observed_data.?);
 
     for (text_analysis.field_analyzers) |item| {
         if (item.field_name.len == 0 or item.analyzer_name.len == 0) continue;
@@ -17283,8 +17830,19 @@ const IndexManagerSimRuntime = struct {
         runtime.dest_manager_open = true;
         errdefer if (runtime.dest_manager_open) runtime.dest_manager.deinit();
 
-        try runtime.source_manager.addAllNoBackfill(&runtime.source_store, &.{indexManagerSimTextConfig()});
-        try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
+        // This initializer is also used to reopen crash-surviving modeled
+        // stores. Preserve the catalog's generated coverage identity instead
+        // of recreating the same public index name from a bare config. A new
+        // identity over existing postings is deliberately rejected by text
+        // projection provenance validation.
+        try runtime.source_manager.load(&runtime.source_store);
+        if (!runtime.source_manager.has(index_manager_sim_index_name)) {
+            try runtime.source_manager.addAllNoBackfill(&runtime.source_store, &.{indexManagerSimTextConfig()});
+        }
+        try runtime.dest_manager.load(&runtime.dest_store);
+        if (!runtime.dest_manager.has(index_manager_sim_index_name)) {
+            try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
+        }
         runtime.updateRanges();
         return runtime;
     }
@@ -17310,12 +17868,20 @@ const IndexManagerSimRuntime = struct {
     }
 
     fn reopen(self: *IndexManagerSimRuntime) !void {
+        try self.reopenWithBackendDisposition(false);
+    }
+
+    fn reopenAfterModeledCrash(self: *IndexManagerSimRuntime) !void {
+        try self.reopenWithBackendDisposition(true);
+    }
+
+    fn reopenWithBackendDisposition(self: *IndexManagerSimRuntime, abandon_after_crash: bool) !void {
         if (self.source_manager_open) {
-            self.source_manager.deinit();
+            if (abandon_after_crash) self.source_manager.abandonAfterCrash() else self.source_manager.deinit();
             self.source_manager_open = false;
         }
         if (self.dest_manager_open) {
-            self.dest_manager.deinit();
+            if (abandon_after_crash) self.dest_manager.abandonAfterCrash() else self.dest_manager.deinit();
             self.dest_manager_open = false;
         }
         if (self.source_store_open) {
@@ -17505,15 +18071,17 @@ const IndexManagerSimRuntime = struct {
     }
 
     fn summary(self: *IndexManagerSimRuntime, alloc: Allocator) !IndexManagerSimSummary {
+        const source = self.source_manager.textIndex(index_manager_sim_index_name) orelse return error.IndexNotFound;
+        const dest = self.dest_manager.textIndex(index_manager_sim_index_name) orelse return error.IndexNotFound;
         return .{
-            .source_doc_count = self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().global_doc_count,
-            .dest_doc_count = self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().global_doc_count,
-            .source_alpha_hits = try self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "alpha"),
-            .source_beta_hits = try self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "beta"),
-            .source_gamma_hits = try self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "gamma"),
-            .dest_alpha_hits = try self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "alpha"),
-            .dest_beta_hits = try self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "beta"),
-            .dest_gamma_hits = try self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "gamma"),
+            .source_doc_count = source.snapshot().liveDocCount(),
+            .dest_doc_count = dest.snapshot().liveDocCount(),
+            .source_alpha_hits = try source.snapshot().termDocFreq(alloc, "title", "alpha"),
+            .source_beta_hits = try source.snapshot().termDocFreq(alloc, "title", "beta"),
+            .source_gamma_hits = try source.snapshot().termDocFreq(alloc, "title", "gamma"),
+            .dest_alpha_hits = try dest.snapshot().termDocFreq(alloc, "title", "alpha"),
+            .dest_beta_hits = try dest.snapshot().termDocFreq(alloc, "title", "beta"),
+            .dest_gamma_hits = try dest.snapshot().termDocFreq(alloc, "title", "gamma"),
         };
     }
 };
@@ -18214,7 +18782,7 @@ fn replayModeledIndexManagerCrashFixture(
     }
     try runtime.applyReplayAction(crash_action, prelude_actions.len);
     try modeled_device.device().crash();
-    try runtime.reopen();
+    try runtime.reopenAfterModeledCrash();
 
     const full_actions = try alloc.alloc(IndexManagerSimAction, prelude_actions.len + 1);
     defer alloc.free(full_actions);
@@ -18355,7 +18923,7 @@ test "index manager split handoff preserves interleaved write and query summarie
     }
 
     try modeled_device.device().crash();
-    try runtime.reopen();
+    try runtime.reopenAfterModeledCrash();
     try expectIndexManagerSummaryEqual("deterministic-split-reopen", try expectedIndexManagerSummary(&actions), try runtime.summary(alloc));
 }
 
@@ -19367,6 +19935,129 @@ test "observed full text analyzers publish shared dictionary ownership" {
     );
 }
 
+test "observed analyzer publication leaves runtime and metadata unchanged on registry conflict" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+
+    const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText("ft_v1", "meta.body", "french");
+    {
+        var runtime = try initRuntimeStore(alloc, &store);
+        defer runtime.deinit();
+        var txn = try runtime.store.beginWrite();
+        errdefer txn.abort();
+        try std.testing.expectEqual(
+            algebraic_mod.lexical.RegistryClaim.claimed,
+            try algebraic_mod.lexical.claimRegistryOwnerTxn(
+                alloc,
+                &txn,
+                identity,
+                "algebraic:path-promotion",
+                .lexicon_postings_rows,
+                "ready",
+            ),
+        );
+        try txn.commit();
+    }
+
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = @constCast("meta.body"),
+        .analyzer_name = @constCast("french"),
+    }};
+    try std.testing.expectError(
+        error.InvalidIndexConfig,
+        mergeObservedTextFieldAnalyzers(&manager, &store, entry, &observed),
+    );
+    try std.testing.expectEqual(@as(usize, 0), entry.observed_field_analyzers.len);
+    try std.testing.expectEqual(@as(usize, 0), entry.text_analysis.field_analyzers.len);
+
+    const persisted = try loadObservedTextFieldAnalyzers(alloc, &store, "ft_v1");
+    defer freeObservedTextFieldAnalyzers(alloc, persisted);
+    try std.testing.expectEqual(@as(usize, 0), persisted.len);
+}
+
+test "observed analyzer publication waits for active analysis readers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const observed = [_]mapper.ObservedFieldAnalyzer{.{
+        .field_name = @constCast("meta.body"),
+        .analyzer_name = @constCast("french"),
+    }};
+    const Worker = struct {
+        manager: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *IndexManager.TextIndex,
+        observed: []const mapper.ObservedFieldAnalyzer,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            mergeObservedTextFieldAnalyzers(self.manager, self.store, self.entry, self.observed) catch |err| {
+                self.err = err;
+            };
+            self.finished.store(true, .release);
+        }
+    };
+    var worker = Worker{
+        .manager = &manager,
+        .store = &store,
+        .entry = entry,
+        .observed = &observed,
+    };
+
+    entry.lockAnalysisShared();
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..128) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!worker.finished.load(.acquire));
+    entry.unlockAnalysisShared();
+    thread.join();
+
+    if (worker.err) |err| return err;
+    try std.testing.expect(worker.finished.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), entry.observed_field_analyzers.len);
+    try std.testing.expectEqualStrings("meta.body", entry.text_analysis.field_analyzers[0].field_name);
+}
+
 test "text query lease retains snapshot and analyzer across catalog removal" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -19671,6 +20362,364 @@ test "declared runtime sortable field capability is queryable for empty index" {
     try std.testing.expect(capabilities[0].sortable);
     try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
     try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
+}
+
+test "empty text index refreshes schema committed after index provisioning" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+    try std.testing.expect(manager.textIndexEntry("full_text_index_v0").?.runtime_schema == null);
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    const schema = schema_mod.TableSchema{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    };
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, schema));
+    try manager.refreshEmptyTextIndexSchemas(&store);
+
+    const entry = manager.textIndexEntry("full_text_index_v0").?;
+    const runtime_schema = entry.runtime_schema.?;
+    try std.testing.expectEqual(@as(usize, 1), runtime_schema.full_text_documents.len);
+    try std.testing.expectEqualStrings("state", runtime_schema.full_text_documents[0].fields[0].emitted_name);
+    try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
+}
+
+test "fresh text generation persists provenance before its first segment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        const entry = manager.textIndexEntry("ft_v1").?;
+        try std.testing.expect(!entry.persistent.hasPhysicalSegments());
+        const encoded = (try entry.persistent.readGenerationMetadataAlloc(
+            alloc,
+            persistent_mod.text_projection_provenance_meta_key,
+        )) orelse return error.TestExpectedEqual;
+        defer alloc.free(encoded);
+        _ = try TextProjectionProvenance.decode(encoded);
+        try entry.persistent.sync(true);
+    }
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const entry = reopened.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!entry.persistent.hasPhysicalSegments());
+    try reopened.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }});
+    try std.testing.expect(entry.persistent.hasPhysicalSegments());
+}
+
+test "empty generation adopts schema provenance after schema-only crash boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+    }
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    }));
+
+    // Model a crash after schema metadata commits but before the live manager
+    // refreshes its empty full-text generation.
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const entry = reopened.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 0), entry.runtime_schema.?.version);
+    try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
+}
+
+test "non-empty schema-less text generation fails closed when a schema appears" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{
+            .{ .key = "doc:a", .value = "{\"state\":\"published\"}" },
+            .{ .key = "doc:b", .value = "{\"state\":\"draft\"}" },
+        });
+    }
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    }));
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("full_text_index_v0") == null);
+    try std.testing.expectEqualStrings(
+        "TextProjectionProvenanceMismatch",
+        reopened.loadFailure("full_text_index_v0") orelse return error.TestExpectedEqual,
+    );
+}
+
+test "non-empty text generation without provenance fails closed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"published\"}" }});
+        const entry = manager.textIndexEntry("ft_v1").?;
+        try entry.persistent.deleteGenerationMetadata(persistent_mod.text_projection_provenance_meta_key);
+    }
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqualStrings(
+        "MissingTextProjectionProvenance",
+        reopened.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
+    );
+}
+
+test "deleted-only text generation cannot adopt different schema provenance" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"published\"}" }});
+        try manager.deleteTextBatchByName("ft_v1", &.{"doc:a"});
+
+        const entry = manager.textIndexEntry("ft_v1").?;
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(u32, 0), snapshot.liveDocCount());
+        try std.testing.expect(snapshot.segments.len != 0);
+    }
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    }));
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqualStrings(
+        "TextProjectionProvenanceMismatch",
+        reopened.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
+    );
+}
+
+test "shadow text generation owns provenance without mutating active generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    const shadow_path = try std.fmt.allocPrint(alloc, "{s}/shadow", .{path});
+    defer alloc.free(shadow_path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var source = try IndexManager.init(alloc, path);
+        defer source.deinit();
+        source.updateRange(.{ .start = "", .end = "" });
+        try source.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try source.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"published\"}" }});
+
+        const fields = [_]schema_mod.FullTextField{.{
+            .path = "state",
+            .emitted_name = "state",
+            .analyzer = "keyword",
+        }};
+        const documents = [_]schema_mod.FullTextDocument{.{
+            .name = "product",
+            .fields = &fields,
+        }};
+        try std.testing.expect(try schema_mod.saveSchema(&store, alloc, .{
+            .version = 0,
+            .default_type = "product",
+            .full_text_documents = &documents,
+        }));
+
+        var shadow = try IndexManager.init(alloc, shadow_path);
+        defer shadow.deinit();
+        shadow.updateRange(.{ .start = "doc:m", .end = "" });
+        try shadow.registerShadowIndex(&store, source.textIndexEntry("ft_v1").?.config);
+
+        const shadow_entry = shadow.textIndexEntry("ft_v1").?;
+        const encoded = (try shadow_entry.persistent.readGenerationMetadataAlloc(
+            alloc,
+            persistent_mod.text_projection_provenance_meta_key,
+        )) orelse return error.TestExpectedEqual;
+        defer alloc.free(encoded);
+        const persisted = try TextProjectionProvenance.decode(encoded);
+        const expected = try TextProjectionProvenance.fromRuntimeSchema(
+            alloc,
+            shadow_entry.config,
+            shadow_entry.runtime_schema,
+        );
+        try std.testing.expect(persisted.eql(expected));
+    }
+
+    // The source generation still owns its schema-less witness. A shadow
+    // created after schema installation must not rewrite it by public name.
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry("ft_v1") == null);
+    try std.testing.expectEqualStrings(
+        "TextProjectionProvenanceMismatch",
+        reopened.loadFailure("ft_v1") orelse return error.TestExpectedEqual,
+    );
 }
 
 test "observed dynamic sortable field capability stays declared for sparse doc values" {
@@ -22106,7 +23155,7 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expect(in_flight_stats.in_flight_segments >= 2);
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
-    const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    const stale_doc = (try stale_segment.reader.storedDoc(0)) orelse return error.TestUnexpectedResult;
     var frozen_live_docs: u32 = 0;
     for (task.source, task.merge_indices) |source, seg_idx| {
         const deleted_count: u32 = if (source.deleted) |deleted| @intCast(deleted.cardinality()) else 0;
@@ -22268,7 +23317,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
     try std.testing.expectEqual(@as(u64, 1), in_flight_stats.in_flight_merges);
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
-    const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    const stale_doc = (try stale_segment.reader.storedDoc(0)) orelse return error.TestUnexpectedResult;
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
@@ -22287,7 +23336,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     const snapshot = entry.persistent.snapshot();
     try std.testing.expect(snapshot.segments.len <= default_text_merge_max_segments_per_tier);
-    try std.testing.expectEqual(@as(u64, 11), snapshot.global_doc_count);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.liveDocCount());
 }
 
 test "text merge task records input and output bytes" {
@@ -22394,10 +23443,19 @@ test "text delete clears handed-off stale docs outside current range" {
     try manager.deleteTextBatchByName("ft_v1", &.{ "doc:m", "doc:z" });
 
     const snapshot = manager.textIndex("ft_v1").?.snapshot();
-    try std.testing.expectEqual(@as(u64, 1), snapshot.global_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "title", "alpha"));
+    // Lucene/Tantivy-style collection statistics remain segment-immutable
+    // until merge. The in-range segment was merged, while the handed-off
+    // segment retains its statistic; both tombstones are masked from hits now.
     try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "title", "middle"));
-    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "title", "zeta"));
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "title", "zeta"));
+    const middle = try snapshot.search(alloc, "title", &.{"middle"}, 10);
+    defer alloc.free(middle.hits);
+    try std.testing.expectEqual(@as(usize, 0), middle.hits.len);
+    const zeta = try snapshot.search(alloc, "title", &.{"zeta"}, 10);
+    defer alloc.free(zeta.hits);
+    try std.testing.expectEqual(@as(usize, 0), zeta.hits.len);
 }
 
 test "text merge failure quarantines source segments" {
@@ -22942,6 +24000,11 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     var modeled_device = storage_sim.ModeledDevice.init(alloc);
     defer modeled_device.deinit();
+    const modeled_storage = modeled_device.storage();
+    // The backing store's mount root predates the index lifecycle. Model that
+    // external durability boundary so this test isolates index-owned paths.
+    try modeled_storage.createDirPath(".zig-cache/tmp");
+    try modeled_storage.syncParentAbsolute(".zig-cache/tmp");
 
     var pressured_budgets = resource_manager_mod.Options.defaultBudgets();
     pressured_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
@@ -22963,7 +24026,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     const backend_options = db_config.IndexBackendOptions{
         .text_main_backend = .lsm,
-        .text_lsm_storage = modeled_device.storage(),
+        .text_lsm_storage = modeled_storage,
         .resource_manager = &pressured_manager,
     };
 
@@ -23020,7 +24083,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
     var relaxed_manager = resource_manager_mod.ResourceManager.init(.{});
     const reopen_backend_options = db_config.IndexBackendOptions{
         .text_main_backend = .lsm,
-        .text_lsm_storage = modeled_device.storage(),
+        .text_lsm_storage = modeled_storage,
         .resource_manager = &relaxed_manager,
     };
 

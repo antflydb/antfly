@@ -25,6 +25,7 @@ pub const RuntimeStatusSource = enum {
     background_refresh,
     startup_catch_up,
     remote_store,
+    rebuild_state_quarantine,
 };
 
 pub const RuntimeStatusFreshness = enum {
@@ -102,7 +103,7 @@ pub const LsmStorageStats = struct {
 
 pub fn statusHasRuntimeFacts(status: LocalTableRuntimeStatus) bool {
     return switch (status.metadata.source) {
-        .live_writer_publish, .background_refresh, .startup_catch_up, .remote_store => true,
+        .live_writer_publish, .background_refresh, .startup_catch_up, .remote_store, .rebuild_state_quarantine => true,
         .cached_snapshot, .unknown, .synthetic_config => statusStatsHaveRuntimeFacts(status.stats),
     };
 }
@@ -801,7 +802,13 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
     if (preserved_visibility and incoming.stats.doc_count < previous.stats.doc_count) {
         incoming.stats.doc_count = previous.stats.doc_count;
     }
-    if (preserved_visibility and incoming.stats.source_doc_count < previous.stats.source_doc_count) {
+    // A live writer's source cardinality is authoritative and can legitimately
+    // fall after deletes (including TTL cleanup). Only background projections
+    // need the anti-regression guard for source visibility.
+    if (preserved_visibility and
+        incoming.metadata.source != .live_writer_publish and
+        incoming.stats.source_doc_count < previous.stats.source_doc_count)
+    {
         incoming.stats.source_doc_count = previous.stats.source_doc_count;
     }
 }
@@ -921,6 +928,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     var merged = try placeholder.clone(alloc);
     errdefer merged.deinit(alloc);
 
+    merged.stats.storage_change_token = previous.stats.storage_change_token;
     merged.stats.source_doc_count = previous.stats.source_doc_count;
     merged.stats.doc_count = previous.stats.doc_count;
     merged.stats.enrichment = previous.stats.enrichment;
@@ -1442,6 +1450,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     return .{
+        .storage_change_token = stats.storage_change_token,
         .source_doc_count = stats.source_doc_count,
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
@@ -2477,6 +2486,52 @@ test "table runtime snapshot cache live publication does not starve structural r
     defer docs.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(live_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "live writer artifact regression keeps authoritative source deletions" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .coverage_config_hash = 77,
+        .projection_checkpoint_applied_sequence = 2,
+        .projection_checkpoint_config_hash = 77,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 2,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{
+            .source_doc_count = 1,
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = previous_indexes[0..],
+        },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .projection_checkpoint_applied_sequence = 0,
+        .projection_checkpoint_config_hash = 77,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 2,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 0,
+            .doc_count = 0,
+            .index_count = 1,
+            .indexes = incoming_indexes[0..],
+        },
+    };
+
+    preserveArtifactVisibilityOnReplayRegression(previous, &incoming);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), incoming.stats.doc_count);
 }
 
 test "table runtime snapshot cache preserves live completion over regressing persisted projection" {

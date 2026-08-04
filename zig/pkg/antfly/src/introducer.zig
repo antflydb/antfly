@@ -2580,14 +2580,14 @@ test "introducer builds and indexes a batch" {
     } });
 
     const snap = writer.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), snap.liveDocCount());
 
     const results = try snap.search(alloc, "title", &.{"hello"}, 10);
     defer alloc.free(results.hits);
     try std.testing.expectEqual(@as(usize, 2), results.hits.len);
 
     // Verify stored docs accessible
-    const stored = snap.segments[0].reader.storedDoc(0).?;
+    const stored = (try snap.segments[0].reader.storedDoc(0)).?;
     try std.testing.expectEqualStrings("doc1", stored.id);
 }
 
@@ -2617,7 +2617,7 @@ test "multiple batches create multiple segments" {
     } });
 
     try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
-    try std.testing.expectEqual(@as(u32, 2), writer.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
 }
 
 test "buildSegmentFromText analyzes and indexes text" {
@@ -2648,7 +2648,7 @@ test "buildSegmentFromText analyzes and indexes text" {
     try writer.addSegment(seg_bytes);
 
     const snap = writer.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), snap.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), snap.liveDocCount());
 
     // Check what terms the default analyzer produces for "Running"
     const check_tokens = try analysis_mod.default_analyzer.analyze(alloc, "Running");
@@ -2809,7 +2809,7 @@ test "buildSegmentFromText omits empty inverted sections" {
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    try std.testing.expect(reader.getSection("title", .inverted_text) == null);
+    try std.testing.expect((try reader.getSection("title", .inverted_text)) == null);
     try std.testing.expect(try reader.invertedIndex("title") == null);
     try std.testing.expect((try reader.invertedIndex("body")) != null);
 }
@@ -2829,24 +2829,24 @@ test "buildSegmentFromText emits typed doc values from stored JSON" {
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
     try std.testing.expectEqual(@as(?f64, 10.5), try price_reader.getF64(0));
 
-    const ts_section = reader.getSection("published_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("published_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expect((try ts_reader.getU64(0)) != null);
 
-    const geo_section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const geo_section = (try reader.getSection("location", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var geo_reader = try typed_dv.TypedDocValuesReader.init(alloc, geo_section);
     try std.testing.expectEqual(typed_dv.ValueType.geo_point, geo_reader.value_type);
     const point = (try geo_reader.getGeoPoint(0)).?;
     try std.testing.expectApproxEqAbs(@as(f64, 37.7749), point.lat, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f64, -122.4194), point.lon, 0.00001);
 
-    const bool_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const bool_section = (try reader.getSection("active", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var bool_reader = try typed_dv.TypedDocValuesReader.init(alloc, bool_section);
     try std.testing.expectEqual(typed_dv.ValueType.bool_val, bool_reader.value_type);
     try std.testing.expectEqual(@as(?bool, true), try bool_reader.getBool(0));
@@ -2874,13 +2874,13 @@ test "buildSegmentFromText omits multi-valued typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
     try std.testing.expectEqual(@as(?f64, 10.0), try price_reader.getF64(0));
     try std.testing.expectEqual(@as(?f64, 20.0), try price_reader.getF64(1));
 
-    try std.testing.expect(reader.getSection("scores", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("scores", .typed_doc_values)) == null);
 }
 
 test "buildSegmentFromText rejects multi-valued projected index sort field" {
@@ -2955,7 +2955,7 @@ test "buildSegmentFromText uses configured custom datetime parsers for typed doc
     var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
 
-    const ts_section = reader.getSection("published_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("published_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expect((try ts_reader.getU64(0)) != null);

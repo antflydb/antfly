@@ -561,6 +561,17 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
+fn publicApiTestListenerConfig() std_http_listener.StdHttpListenerConfig {
+    // Public API handlers synchronously fan out to other data nodes. Exercise
+    // them with the same concurrent-listener contract used by production so a
+    // forwarded request can re-enter an ingress node without serial-listener
+    // deadlock. Keep the test bound lower than production's 64 threads.
+    return .{
+        .serve_in_connection_threads = true,
+        .max_connection_threads = 16,
+    };
+}
+
 fn startPublicApiServers(
     comptime N: usize,
     cluster: *metadata_sim.MetadataHttpClusterSimulation,
@@ -673,6 +684,14 @@ fn startPublicApiServersWithSharedSessionStorePath(
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
     api_base_uris: *[N][]const u8,
 ) !void {
+    var initialized_servers: usize = 0;
+    var initialized_listeners: usize = 0;
+    var initialized_base_uris: usize = 0;
+    errdefer {
+        for (api_base_uris[0..initialized_base_uris]) |uri| std.testing.allocator.free(uri);
+        for (listeners[0..initialized_listeners]) |*listener| listener.deinit();
+        for (servers[0..initialized_servers]) |*server| server.deinit();
+    }
     for (0..N) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -703,16 +722,26 @@ fn startPublicApiServersWithSharedSessionStorePath(
                 .session_router = routers[i].iface(),
                 .session_executor = forward_executor.executor(),
                 .session_store_path = session_store_path,
+                .session_store_scope = .cluster_shared,
                 .session_owner_lease_ttl_ns = std.time.ns_per_ms,
             },
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, servers[i].executor());
+        initialized_servers += 1;
+        listeners[i] = std_http_listener.StdHttpListener.init(
+            std.testing.allocator,
+            publicApiTestListenerConfig(),
+            servers[i].executor(),
+        );
+        initialized_listeners += 1;
         try listeners[i].start();
     }
-    for (0..N) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
+    for (0..N) |i| {
+        api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
+        initialized_base_uris += 1;
+    }
 }
 
 fn startPublicApiServersWithOptionalSessions(
@@ -731,6 +760,14 @@ fn startPublicApiServersWithOptionalSessions(
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
     api_base_uris: *[N][]const u8,
 ) !void {
+    var initialized_servers: usize = 0;
+    var initialized_listeners: usize = 0;
+    var initialized_base_uris: usize = 0;
+    errdefer {
+        for (api_base_uris[0..initialized_base_uris]) |uri| std.testing.allocator.free(uri);
+        for (listeners[0..initialized_listeners]) |*listener| listener.deinit();
+        for (servers[0..initialized_servers]) |*server| server.deinit();
+    }
     for (0..N) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -763,10 +800,19 @@ fn startPublicApiServersWithOptionalSessions(
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, servers[i].executor());
+        initialized_servers += 1;
+        listeners[i] = std_http_listener.StdHttpListener.init(
+            std.testing.allocator,
+            publicApiTestListenerConfig(),
+            servers[i].executor(),
+        );
+        initialized_listeners += 1;
         try listeners[i].start();
     }
-    for (0..N) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
+    for (0..N) |i| {
+        api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
+        initialized_base_uris += 1;
+    }
 }
 
 const GraphChurnMode = enum {
@@ -1411,6 +1457,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
         &write_sources,
         &api_base_uris,
     );
+    defer for (&servers) |*server| server.deinit();
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
@@ -1656,6 +1703,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
         &write_sources,
         &api_base_uris,
     );
+    defer for (&servers) |*server| server.deinit();
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
@@ -2103,6 +2151,7 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
         &write_sources,
         &api_base_uris,
     );
+    defer for (&servers) |*server| server.deinit();
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
@@ -2172,7 +2221,7 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     try std.testing.expectEqual(@as(u16, 200), read_stage.status);
     var parsed_read_stage = try parsePageJson(transactions_api.StageReadResponse, read_stage.body);
     defer parsed_read_stage.deinit();
-    try std.testing.expectEqualStrings("7", parsed_read_stage.value.snapshot.version);
+    try std.testing.expectEqualStrings(lookup.version.?, parsed_read_stage.value.snapshot.version);
     try std.testing.expectEqualStrings("alpha", parsed_read_stage.value.snapshot.document.object.get("title").?.string);
 
     const external_update_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
@@ -2187,7 +2236,7 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     try std.testing.expectEqual(@as(u16, 200), repeated_read_stage.status);
     var parsed_repeated_read_stage = try parsePageJson(transactions_api.StageReadResponse, repeated_read_stage.body);
     defer parsed_repeated_read_stage.deinit();
-    try std.testing.expectEqualStrings("7", parsed_repeated_read_stage.value.snapshot.version);
+    try std.testing.expectEqualStrings(lookup.version.?, parsed_repeated_read_stage.value.snapshot.version);
     try std.testing.expectEqualStrings("alpha", parsed_repeated_read_stage.value.snapshot.document.object.get("title").?.string);
 
     const write_stage_body = try test_contract_helpers.encodeTransactionStageWriteRequest(
@@ -2209,8 +2258,8 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     try std.testing.expectEqual(@as(u64, @intCast(begin_index + 1)), parsed_session_info.value.owner_node_id);
     try std.testing.expectEqual(@as(usize, 1), parsed_session_info.value.staged_write_count);
     try std.testing.expectEqual(@as(usize, 1), parsed_session_info.value.read_snapshot_count);
-    try std.testing.expect(parsed_session_info.value.lease_expires_at > 0);
-    try std.testing.expectEqualStrings("held", parsed_session_info.value.lease_state);
+    try std.testing.expectEqual(@as(u64, 0), parsed_session_info.value.lease_expires_at);
+    try std.testing.expectEqualStrings("none", parsed_session_info.value.lease_state);
     try std.testing.expectEqual(@as(usize, 1), parsed_session_info.value.tables.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_session_info.value.read_snapshots.len);
     try std.testing.expectEqualStrings("docs", parsed_session_info.value.read_snapshots[0].table);
@@ -2224,11 +2273,11 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     var parsed_owner_session_list = try parsePageJson(transactions_api.SessionListResponse, owner_session_list.body);
     defer parsed_owner_session_list.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_owner_session_list.value.session_count);
-    try std.testing.expectEqual(@as(usize, 1), parsed_owner_session_list.value.lease_held_count);
+    try std.testing.expectEqual(@as(usize, 0), parsed_owner_session_list.value.lease_held_count);
     try std.testing.expectEqual(@as(usize, 0), parsed_owner_session_list.value.lease_expired_count);
     try std.testing.expectEqual(@as(usize, 1), parsed_owner_session_list.value.sessions.len);
-    try std.testing.expect(parsed_owner_session_list.value.sessions[0].lease_expires_at > 0);
-    try std.testing.expectEqualStrings("held", parsed_owner_session_list.value.sessions[0].lease_state);
+    try std.testing.expectEqual(@as(u64, 0), parsed_owner_session_list.value.sessions[0].lease_expires_at);
+    try std.testing.expectEqualStrings("none", parsed_owner_session_list.value.sessions[0].lease_state);
 
     var savepoint = try client.fetchTransactionSessionSavepoint(followup_base, txn_id_hex);
     defer savepoint.deinit(std.heap.page_allocator);
@@ -2261,13 +2310,17 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
 
     var committed = try client.fetchTransactionSessionCommit(followup_base, txn_id_hex, "");
     defer committed.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 200), committed.status);
+    try std.testing.expectEqual(@as(u16, 409), committed.status);
+    var parsed_commit = try parsePageJson(transactions_api.SessionCommitResponse, committed.body);
+    defer parsed_commit.deinit();
+    try std.testing.expectEqualStrings("aborted", parsed_commit.value.status);
+    try std.testing.expectEqualStrings("version_conflict", parsed_commit.value.conflict.?.kind);
 
     var updated = try client.fetchLookup(followup_base, "docs", "doc:a", null);
     defer updated.deinit(std.heap.page_allocator);
-    var parsed_updated = try parseJsonBody(LookupTitle, updated.body);
+    var parsed_updated = try parseJsonBodyIgnoreUnknown(LookupTitle, updated.body);
     defer parsed_updated.deinit();
-    try std.testing.expectEqualStrings("alpha session committed", parsed_updated.value.title);
+    try std.testing.expectEqualStrings("alpha external", parsed_updated.value.title);
 
     var latest_lookup = try client.fetchLookup(followup_base, "docs", "doc:a", null);
     defer latest_lookup.deinit(std.heap.page_allocator);
@@ -2315,9 +2368,9 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     try std.testing.expectEqualStrings("aborted", parsed_stale_commit.value.status);
     const stale_conflict = parsed_stale_commit.value.conflict.?;
     try std.testing.expectEqualStrings("version_conflict", stale_conflict.kind);
-    const stale_participant = stale_conflict.participant.?;
-    try std.testing.expectEqualStrings("prepare", stale_participant.phase.?);
-    try std.testing.expectEqual(@as(u64, group_id), stale_participant.group_id.?);
+    // The coordinator catches this stale read before participant prepare, so
+    // participant diagnostics are intentionally absent.
+    try std.testing.expect(stale_conflict.participant == null);
     try std.testing.expectEqual(try std.fmt.parseInt(u64, latest_lookup.version.?, 10), stale_conflict.expected_version.?);
     try std.testing.expect(stale_conflict.current_version.? > stale_conflict.expected_version.?);
 
@@ -2432,6 +2485,7 @@ test "public api multi-node e2e supports cross-table transaction sessions" {
         &write_sources,
         &api_base_uris,
     );
+    defer for (&servers) |*server| server.deinit();
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
@@ -2575,7 +2629,7 @@ test "public api multi-node e2e supports cross-table transaction sessions" {
 
     var updated_user = try client.fetchLookup(followup_base, "users", "user:1", null);
     defer updated_user.deinit(std.heap.page_allocator);
-    var parsed_updated_user = try parseJsonBody(UserName, updated_user.body);
+    var parsed_updated_user = try parseJsonBodyIgnoreUnknown(UserName, updated_user.body);
     defer parsed_updated_user.deinit();
     try std.testing.expectEqualStrings("Alice Session", parsed_updated_user.value.name);
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(followup_base, "orders", "order:old", null));
@@ -2691,6 +2745,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
         &write_sources,
         &api_base_uris,
     );
+    defer for (&servers) |*server| server.deinit();
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
@@ -2812,6 +2867,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
 
     listeners[begin_index].deinit();
     std.testing.allocator.free(api_base_uris[begin_index]);
+    servers[begin_index].deinit();
     servers[begin_index] = api_http_server.ApiHttpServer.init(
         std.testing.allocator,
         .{
@@ -2825,7 +2881,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
     );
     listeners[begin_index] = std_http_listener.StdHttpListener.init(
         std.testing.allocator,
-        .{},
+        publicApiTestListenerConfig(),
         servers[begin_index].executor(),
     );
     try listeners[begin_index].start();
@@ -2847,7 +2903,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
 
     var updated_user = try client.fetchLookup(followup_base, "users", "user:1", null);
     defer updated_user.deinit(std.heap.page_allocator);
-    var parsed_updated_user = try parseJsonBody(UserName, updated_user.body);
+    var parsed_updated_user = try parseJsonBodyIgnoreUnknown(UserName, updated_user.body);
     defer parsed_updated_user.deinit();
     try std.testing.expectEqualStrings("Alice Durable Session", parsed_updated_user.value.name);
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(followup_base, "orders", "order:old", null));
@@ -3064,8 +3120,33 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
     try std.testing.expectEqual(@as(u16, 200), delete_order.status);
 
     listeners[begin_index].deinit();
+    // Leave a valid stopped value for the common deferred cleanup.
+    listeners[begin_index] = std_http_listener.StdHttpListener.init(
+        std.testing.allocator,
+        publicApiTestListenerConfig(),
+        servers[begin_index].executor(),
+    );
     std.testing.allocator.free(api_base_uris[begin_index]);
     api_base_uris[begin_index] = try std.testing.allocator.dupe(u8, "http://127.0.0.1:1");
+    // Advance the lease clock explicitly instead of racing a deliberate 1 ms
+    // lease against wall-clock scheduling on loaded CI hosts.
+    const pre_adoption_status = (try servers[followup_index].txn_sessions.getStatus(
+        std.testing.allocator,
+        try distributed_txn.parseTxnIdHex(txn_id_hex),
+    )) orelse return error.TestExpectedEqual;
+    try std.testing.expect(try servers[followup_index].txn_sessions.adoptIfLeaseExpired(
+        std.testing.allocator,
+        try distributed_txn.parseTxnIdHex(txn_id_hex),
+        @intCast(followup_index + 1),
+        pre_adoption_status.lease_expires_at +| 1,
+    ));
+    try std.testing.expectEqual(
+        @as(?u64, @intCast(followup_index + 1)),
+        try servers[followup_index].txn_sessions.getOwnerNodeId(
+            std.testing.allocator,
+            try distributed_txn.parseTxnIdHex(txn_id_hex),
+        ),
+    );
 
     var adopted_info = try client.fetchTransactionSessionInfo(followup_base, txn_id_hex);
     defer adopted_info.deinit(std.heap.page_allocator);
@@ -3077,7 +3158,12 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
     try std.testing.expectEqual(@as(usize, 1), parsed_adopted_info.value.staged_write_count);
     try std.testing.expectEqual(@as(usize, 1), parsed_adopted_info.value.staged_delete_count);
     try std.testing.expect(parsed_adopted_info.value.lease_expires_at > 0);
-    try std.testing.expectEqualStrings("held", parsed_adopted_info.value.lease_state);
+    // This fixture deliberately uses a 1 ms lease to trigger adoption without
+    // sleeping. It may expire again before the status response is encoded.
+    try std.testing.expect(
+        std.mem.eql(u8, parsed_adopted_info.value.lease_state, "held") or
+            std.mem.eql(u8, parsed_adopted_info.value.lease_state, "expired"),
+    );
 
     var committed = try client.fetchTransactionSessionCommit(followup_base, txn_id_hex, "");
     defer committed.deinit(std.heap.page_allocator);
@@ -3089,7 +3175,7 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
 
     var updated_user = try client.fetchLookup(followup_base, "users", "user:1", null);
     defer updated_user.deinit(std.heap.page_allocator);
-    var parsed_updated_user = try parseJsonBody(UserName, updated_user.body);
+    var parsed_updated_user = try parseJsonBodyIgnoreUnknown(UserName, updated_user.body);
     defer parsed_updated_user.deinit();
     try std.testing.expectEqualStrings("Alice Adopted Session", parsed_updated_user.value.name);
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(followup_base, "orders", "order:old", null));
@@ -3205,6 +3291,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
         &write_sources,
         &api_base_uris,
     );
+    defer for (&servers) |*server| server.deinit();
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
@@ -3287,6 +3374,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
 
     listeners[begin_index].deinit();
     std.testing.allocator.free(api_base_uris[begin_index]);
+    servers[begin_index].deinit();
     servers[begin_index] = api_http_server.ApiHttpServer.init(
         std.testing.allocator,
         .{
@@ -3300,7 +3388,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
     );
     listeners[begin_index] = std_http_listener.StdHttpListener.init(
         std.testing.allocator,
-        .{},
+        publicApiTestListenerConfig(),
         servers[begin_index].executor(),
     );
     try listeners[begin_index].start();
@@ -3320,7 +3408,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
 
     var updated = try client.fetchLookup(followup_base, "docs", "doc:a", null);
     defer updated.deinit(std.heap.page_allocator);
-    var parsed_updated = try parseJsonBody(LookupTitle, updated.body);
+    var parsed_updated = try parseJsonBodyIgnoreUnknown(LookupTitle, updated.body);
     defer parsed_updated.deinit();
     try std.testing.expectEqualStrings("alpha durable session committed", parsed_updated.value.title);
 }
@@ -3507,7 +3595,10 @@ test "public api multi-node e2e adopts durable transaction sessions after coordi
     defer parsed_adopted_info.deinit();
     try std.testing.expectEqual(@as(u64, @intCast(followup_index + 1)), parsed_adopted_info.value.owner_node_id);
     try std.testing.expect(parsed_adopted_info.value.lease_expires_at > 0);
-    try std.testing.expectEqualStrings("held", parsed_adopted_info.value.lease_state);
+    try std.testing.expect(
+        std.mem.eql(u8, parsed_adopted_info.value.lease_state, "held") or
+            std.mem.eql(u8, parsed_adopted_info.value.lease_state, "expired"),
+    );
 
     var committed = try client.fetchTransactionSessionCommit(followup_base, txn_id_hex, "");
     defer committed.deinit(std.heap.page_allocator);

@@ -29,16 +29,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func webSearchConnection(
+	t *testing.T,
+	provider string,
+	config common.WebSearchConnectionConfig,
+) common.ConnectionConfig {
+	t.Helper()
+	var connection common.ConnectionConfig
+	require.NoError(t, connection.FromWebSearchConnectionVariant(common.WebSearchConnectionVariant{
+		Capabilities: []string{"web.search", "agents.use"},
+		Provider:     provider,
+		WebSearch:    config,
+	}))
+	return connection
+}
+
 func TestWebSearchConfigFromConnection(t *testing.T) {
 	safeSearch := false
-	config, err := webSearchConfigFromConnection("agent-web", common.ConnectionConfig{
-		Kind:     common.ConnectionKindWebSearch,
-		Provider: "exa",
-		Capabilities: []string{
-			"web.search",
-			"agents.use",
-		},
-		WebSearch: common.WebSearchConnectionConfig{
+	config, err := webSearchConfigFromConnection(
+		"agent-web",
+		webSearchConnection(t, "exa", common.WebSearchConnectionConfig{
 			ApiKey:            "${secret:exa.api_key}",
 			CredentialsPath:   "${secret:vertex.service_account_path}",
 			DataStore:         "docs-store",
@@ -53,8 +63,8 @@ func TestWebSearchConfigFromConnection(t *testing.T) {
 			SafeSearch:        &safeSearch,
 			IncludeContent:    true,
 			IncludeHighlights: true,
-		},
-	})
+		}),
+	)
 
 	assert.NoError(t, err)
 	assert.Equal(t, "exa", string(config.Provider))
@@ -77,25 +87,28 @@ func TestWebSearchConfigFromConnection(t *testing.T) {
 }
 
 func TestWebSearchConfigFromConnectionRejectsWrongKind(t *testing.T) {
-	_, err := webSearchConfigFromConnection("model", common.ConnectionConfig{
-		Kind:     common.ConnectionKindInference,
+	var connection common.ConnectionConfig
+	require.NoError(t, connection.FromInferenceConnectionVariant(common.InferenceConnectionVariant{
 		Provider: "exa",
-	})
+		Inference: common.InferenceConnectionConfig{
+			Provider: "exa",
+		},
+	}))
+	_, err := webSearchConfigFromConnection("model", connection)
 	assert.ErrorContains(t, err, "expected web_search")
 }
 
 func TestWebSearchConfigFromConnectionAllowsVertex(t *testing.T) {
-	config, err := webSearchConfigFromConnection("agent-search", common.ConnectionConfig{
-		Kind:     common.ConnectionKindWebSearch,
-		Provider: "vertex",
-		WebSearch: common.WebSearchConnectionConfig{
+	config, err := webSearchConfigFromConnection(
+		"agent-search",
+		webSearchConnection(t, "vertex", common.WebSearchConnectionConfig{
 			CredentialsPath: "${secret:vertex.service_account_path}",
 			DataStore:       "docs-store",
 			Location:        "global",
 			ProjectId:       "test-project",
 			ServingConfig:   "default_config",
-		},
-	})
+		}),
+	)
 
 	require.NoError(t, err)
 	assert.Equal(t, websearch.WebSearchProviderVertex, config.Provider)

@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const wildcard_mod = @import("wildcard.zig");
 const roaring = @import("../encoding/roaring.zig");
 const inverted = @import("../section/inverted.zig");
 const segment_mod = @import("../segment.zig");
@@ -49,6 +50,7 @@ pub const FilterError = error{
     InvalidChunk,
     CorruptInput,
     InvalidSegment,
+    CrcMismatch,
 };
 
 const geo_filter_earth_radius_meters: f64 = 6371008.8;
@@ -153,7 +155,7 @@ pub const TermFilter = struct {
         }
 
         // Synonym expansion: check if field has a synonym section
-        if (seg.reader.getSection(self.field, .synonym)) |syn_data| {
+        if (try seg.reader.getSection(self.field, .synonym)) |syn_data| {
             var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch return result;
             defer syn_reader.deinit();
 
@@ -302,26 +304,79 @@ fn executeShouldClauses(
 pub const PrefixFilter = struct {
     field: []const u8,
     prefix: []const u8,
+    indexed_field: ?[]const u8 = null,
     boost: f32 = 1.0,
 
+    pub const ExecutionStats = struct {
+        dictionary_terms_decoded: u64 = 0,
+        matching_terms: u64 = 0,
+    };
+
     pub fn execute(self: PrefixFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null);
+    }
+
+    pub fn executeWithStats(
+        self: PrefixFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        stats: *ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        stats.* = .{};
+        return self.executeInternal(alloc, seg, true, stats);
+    }
+
+    fn executeInternal(
+        self: PrefixFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        comptime collect_stats: bool,
+        stats: ?*ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        if (self.indexed_field) |indexed_field| {
+            if (try seg.reader.invertedIndex(indexed_field)) |indexed_reader| {
+                var exact = roaring.RoaringBitmap.init(alloc);
+                errdefer exact.deinit();
+                if (indexed_reader.lookup(self.prefix)) |lookup| {
+                    if (comptime collect_stats) stats.?.matching_terms = 1;
+                    switch (lookup) {
+                        .postings => |postings| {
+                            var matches = try postings.docBitmap(alloc);
+                            defer matches.deinit();
+                            try exact.orWith(&matches);
+                        },
+                        .one_hit => |hit| try exact.add(hit.doc_num),
+                    }
+                }
+                return exact;
+            }
+        }
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Use the term iterator to find all terms with the given prefix
-        var term_iter = try inv_reader.termIterator();
+        // Seek to the first dictionary block that can contain the prefix.
+        // Starting from termIterator() makes every prefix query decode all
+        // lexicographically earlier terms, which turns type-ahead queries into
+        // a full term-dictionary scan as the corpus vocabulary grows.
+        var term_iter = try inv_reader.rangeTermIterator(self.prefix, null);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        while (try term_iter.next()) |entry| {
+        while (true) {
+            const next_entry = if (comptime collect_stats)
+                try term_iter.nextWithDecodedCount(&stats.?.dictionary_terms_decoded)
+            else
+                try term_iter.next();
+            const entry = next_entry orelse break;
             if (entry.term.len < self.prefix.len) continue;
             if (!std.mem.startsWith(u8, entry.term, self.prefix)) {
                 // FST terms are sorted; if we've passed the prefix range, stop
                 if (std.mem.order(u8, entry.term[0..self.prefix.len], self.prefix) == .gt) break;
                 continue;
             }
+            if (comptime collect_stats) stats.?.matching_terms += 1;
             // Term matches prefix — union its postings
             switch (entry.result) {
                 .postings => |p| {
@@ -618,17 +673,16 @@ pub const TermRangeFilter = struct {
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Compute FST bounds: iterator uses [start, end) half-open interval
+        // Compute FST bounds: iterator uses [start, end) half-open interval.
+        // `max ++ "\x00"` is the first byte string after `max` itself and
+        // before every longer string with `max` as a prefix.
         const start = self.min;
-        // For inclusive_max, we need to include max itself. FST iterator uses [start, end),
-        // so append \xff to make end exclusive past max.
-        var end_buf: [1024]u8 = undefined;
+        var owned_end: ?[]u8 = null;
+        defer if (owned_end) |end| alloc.free(end);
         const end: ?[]const u8 = if (self.max) |m| blk: {
             if (self.inclusive_max) {
-                if (m.len + 1 > end_buf.len) break :blk null; // too long, unbounded
-                @memcpy(end_buf[0..m.len], m);
-                end_buf[m.len] = 0xff;
-                break :blk end_buf[0 .. m.len + 1];
+                owned_end = try inclusiveTermUpperBoundAlloc(alloc, m);
+                break :blk owned_end.?;
             } else {
                 break :blk m;
             }
@@ -660,6 +714,14 @@ pub const TermRangeFilter = struct {
         return result;
     }
 };
+
+fn inclusiveTermUpperBoundAlloc(alloc: Allocator, max: []const u8) FilterError![]u8 {
+    if (max.len == std.math.maxInt(usize)) return error.OutOfMemory;
+    const end = try alloc.alloc(u8, max.len + 1);
+    @memcpy(end[0..max.len], max);
+    end[max.len] = 0;
+    return end;
+}
 
 /// CIDR-based IP range filter. Matches docs with IP address terms in the given subnet.
 /// IPs must be indexed as dotted-quad strings (e.g. "192.168.1.1").
@@ -753,12 +815,24 @@ pub const IPRangeFilter = struct {
 };
 
 /// GeoShape filter: point-in-polygon test on geo_point typed doc values.
+pub const GeoShapeRelation = enum {
+    intersects,
+    within,
+    contains,
+};
+
 pub const GeoShapeFilter = struct {
     field: []const u8,
+    relation: GeoShapeRelation = .intersects,
     polygons: []const []const geo.GeoPoint,
 
     pub fn execute(self: GeoShapeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        // Indexed geo values are points. A point cannot contain a non-empty
+        // polygon, so this relation has a known empty result and must not scan
+        // the segment or decode its typed doc values.
+        if (self.relation == .contains) return roaring.RoaringBitmap.init(alloc);
+
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
         var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
         if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
@@ -791,7 +865,7 @@ pub const RangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -834,7 +908,7 @@ pub const GeoDistanceFilter = struct {
     radius_meters: f64,
 
     pub fn execute(self: GeoDistanceFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -899,7 +973,7 @@ pub const GeoBBoxFilter = struct {
     max_lon: f64,
 
     pub fn execute(self: GeoBBoxFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -1413,7 +1487,7 @@ pub const DateRangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -1482,31 +1556,7 @@ pub const WildcardFilter = struct {
 /// Match a glob pattern against a string.
 /// `*` matches zero or more characters, `?` matches exactly one character.
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-    var pi: usize = 0;
-    var ti: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
-
-    while (ti < text.len) {
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    // Consume trailing *'s
-    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
-    return pi == pattern.len;
+    return wildcard_mod.match(pattern, text);
 }
 
 /// Document ID filter: matches documents by their stored document ID.
@@ -1519,7 +1569,7 @@ pub const DocIdFilter = struct {
 
         // Scan stored docs and match IDs
         for (0..seg.reader.doc_count) |doc_num| {
-            const stored = seg.reader.storedDoc(@intCast(doc_num)) orelse continue;
+            const stored = (try seg.reader.storedDoc(@intCast(doc_num))) orelse continue;
             for (self.doc_ids) |wanted| {
                 if (std.mem.eql(u8, stored.id, wanted)) {
                     try result.add(@intCast(doc_num));
@@ -1556,7 +1606,7 @@ pub const BoolFieldFilter = struct {
     value: bool,
 
     pub fn execute(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -1597,8 +1647,12 @@ pub fn executeFilter(
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
-        // Remove deleted docs
-        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        // Remove deleted docs while pinning the shared bitmap containers.
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        }
 
         // Collect with offset
         var iter = bm.iterator();
@@ -1627,7 +1681,11 @@ pub fn executeFilterBitmap(
     for (snap.segments) |*seg| {
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
-        if (seg.shared.deleted) |d| local.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| local.andNotWith(&d);
+        }
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1659,7 +1717,11 @@ pub fn countFilterIntersection(
     for (snap.segments) |*seg| {
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
-        if (seg.shared.deleted) |d| local.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| local.andNotWith(&d);
+        }
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1689,7 +1751,11 @@ pub fn countFilter(
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
-        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        }
         total = std.math.add(usize, total, bm.cardinality()) catch return error.CountOverflow;
         doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1703,7 +1769,13 @@ pub fn countFilter(
 
 const testing = std.testing;
 
-fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const struct { terms: []const inverted.InvertedIndexBuilder.TermHit }) ![]u8 {
+const TestTermDocument = struct { terms: []const inverted.InvertedIndexBuilder.TermHit };
+const NamedTestTermField = struct {
+    name: []const u8,
+    docs: []const TestTermDocument,
+};
+
+fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const TestTermDocument) ![]u8 {
     var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
     defer inv_builder.deinit();
 
@@ -1724,6 +1796,33 @@ fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const struct { terms: []c
         try seg_writer.addStoredDoc(id_str, "{}");
     }
 
+    return seg_writer.build();
+}
+
+fn buildTestSegmentWithNamedTermFields(
+    alloc: Allocator,
+    fields: []const NamedTestTermField,
+) ![]u8 {
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+
+    var doc_count: usize = 0;
+    for (fields) |field| {
+        if (doc_count == 0) doc_count = field.docs.len else if (field.docs.len != doc_count) return error.InvalidData;
+        var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+        defer inv_builder.deinit();
+        for (field.docs, 0..) |doc, i| try inv_builder.addDocument(@intCast(i), doc.terms);
+        const inv_data = try inv_builder.build();
+        defer alloc.free(inv_data);
+        const field_idx = try seg_writer.addField(field.name);
+        try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+    }
+
+    for (0..doc_count) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{i}) catch unreachable;
+        try seg_writer.addStoredDoc(id_str, "{}");
+    }
     return seg_writer.build();
 }
 
@@ -2012,6 +2111,90 @@ test "prefix filter" {
     try testing.expect(bm.contains(0));
     try testing.expect(bm.contains(1));
     try testing.expect(!bm.contains(2));
+}
+
+test "prefix filter seeks late range in large term dictionary" {
+    const alloc = testing.allocator;
+
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    defer hits.deinit(alloc);
+    var owned_terms = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_terms.items) |term| alloc.free(term);
+        owned_terms.deinit(alloc);
+    }
+    for (0..4_096) |i| {
+        const term = try std.fmt.allocPrint(alloc, "catalog-{d:0>5}", .{i});
+        owned_terms.append(alloc, term) catch |err| {
+            alloc.free(term);
+            return err;
+        };
+        try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
+    }
+    try hits.append(alloc, .{ .term = "zz-target", .freq = 1, .norm = 10 });
+
+    const seg_bytes = try buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const seg = &writer.snapshot().segments[0];
+    const filter = Filter{ .prefix = .{ .field = "body", .prefix = "zz-" } };
+    var stats: PrefixFilter.ExecutionStats = .{};
+    var bm = try filter.prefix.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(bm.contains(0));
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    // The late seek may decode the tail of one dictionary block, but it must
+    // not revisit the thousands of lexicographically earlier entries.
+    try testing.expect(stats.dictionary_terms_decoded < 128);
+}
+
+test "prefix filter uses a materialized companion with old-segment fallback" {
+    const alloc = testing.allocator;
+    const source_docs = &[_]TestTermDocument{
+        .{ .terms = &.{.{ .term = "apple", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "application", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "banana", .freq = 1, .norm = 10 }} },
+    };
+    const companion_docs = &[_]TestTermDocument{
+        .{ .terms = &.{.{ .term = "app", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "app", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{} },
+    };
+    const new_segment = try buildTestSegmentWithNamedTermFields(alloc, &.{
+        .{ .name = "body", .docs = source_docs },
+        .{ .name = "body._root_prefix", .docs = companion_docs },
+    });
+    defer alloc.free(new_segment);
+    const old_segment = try buildTestSegmentWithTerms(alloc, source_docs);
+    defer alloc.free(old_segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(new_segment);
+    try writer.addSegment(old_segment);
+    const filter = PrefixFilter{
+        .field = "body",
+        .prefix = "app",
+        .indexed_field = "body._root_prefix",
+    };
+
+    var new_stats: PrefixFilter.ExecutionStats = .{};
+    var new_matches = try filter.executeWithStats(alloc, &writer.snapshot().segments[0], &new_stats);
+    defer new_matches.deinit();
+    try testing.expectEqual(@as(usize, 2), new_matches.cardinality());
+    try testing.expectEqual(@as(u64, 0), new_stats.dictionary_terms_decoded);
+
+    var old_stats: PrefixFilter.ExecutionStats = .{};
+    var old_matches = try filter.executeWithStats(alloc, &writer.snapshot().segments[1], &old_stats);
+    defer old_matches.deinit();
+    try testing.expectEqual(@as(usize, 2), old_matches.cardinality());
+    try testing.expect(old_stats.dictionary_terms_decoded > 0);
+    try testing.expectEqual(@as(u64, 2), old_stats.matching_terms);
 }
 
 test "multi-segment filter execution" {
@@ -2933,6 +3116,7 @@ test "term range filter inclusive max [b, d]" {
     try inv_builder.addDocument(0, &.{.{ .term = "banana", .freq = 1, .norm = 10 }});
     try inv_builder.addDocument(1, &.{.{ .term = "cherry", .freq = 1, .norm = 10 }});
     try inv_builder.addDocument(2, &.{.{ .term = "date", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(3, &.{.{ .term = "date\x00suffix", .freq = 1, .norm = 10 }});
     const inv_data = try inv_builder.build();
     defer alloc.free(inv_data);
 
@@ -2940,7 +3124,7 @@ test "term range filter inclusive max [b, d]" {
     defer seg_writer.deinit();
     const field_idx = try seg_writer.addField("fruit");
     try seg_writer.addSection(field_idx, .inverted_text, inv_data);
-    for (0..3) |_| try seg_writer.addStoredDoc("d", "{}");
+    for (0..4) |_| try seg_writer.addStoredDoc("d", "{}");
     const seg_bytes = try seg_writer.build();
     defer alloc.free(seg_bytes);
 
@@ -2965,6 +3149,20 @@ test "term range filter inclusive max [b, d]" {
     try testing.expect(bm.contains(0)); // banana
     try testing.expect(bm.contains(1)); // cherry
     try testing.expect(bm.contains(2)); // date (inclusive)
+    try testing.expect(!bm.contains(3)); // lexicographically greater prefixed term
+}
+
+test "term range inclusive upper bound is exact and unbounded in length" {
+    const alloc = testing.allocator;
+    const max = try alloc.alloc(u8, 4096);
+    defer alloc.free(max);
+    @memset(max, 'x');
+
+    const end = try inclusiveTermUpperBoundAlloc(alloc, max);
+    defer alloc.free(end);
+    try testing.expectEqual(max.len + 1, end.len);
+    try testing.expectEqualSlices(u8, max, end[0..max.len]);
+    try testing.expectEqual(@as(u8, 0), end[max.len]);
 }
 
 test "term range filter unbounded lower" {
@@ -3143,6 +3341,15 @@ test "geo shape filter point in polygon" {
     try testing.expect(bm.contains(0)); // (5,5) inside
     try testing.expect(!bm.contains(1)); // (15,5) outside
     try testing.expect(bm.contains(2)); // (3,3) inside
+
+    const contains_filter = Filter{ .geo_shape = .{
+        .field = "location",
+        .relation = .contains,
+        .polygons = filter.geo_shape.polygons,
+    } };
+    var contains = try contains_filter.execute(alloc, seg);
+    defer contains.deinit();
+    try testing.expect(contains.isEmpty());
 }
 
 test "term filter with synonym expansion" {

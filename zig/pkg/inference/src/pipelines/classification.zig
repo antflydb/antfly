@@ -108,6 +108,15 @@ pub const ClassificationPipeline = struct {
         const max_len = self.config.max_length;
         const total_pairs = std.math.mul(usize, texts.len, labels.len) catch return error.ClassificationBatchTooLarge;
         const input_len = std.math.mul(usize, total_pairs, max_len) catch return error.ClassificationBatchTooLarge;
+        var run_permit = try self.session.admit(.{
+            .batch = total_pairs,
+            .sequence = max_len,
+            .input_bytes = std.math.mul(usize, input_len, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, input_len, 40) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
         var hypotheses = try alloc.alloc([]const u8, labels.len);
         defer {
@@ -185,7 +194,7 @@ pub const ClassificationPipeline = struct {
             break :blk &[_]Tensor{ input_ids_tensor, attention_mask_tensor, token_type_tensor.? };
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
-        var outputs = try self.session.run(inputs, alloc);
+        var outputs = try run_permit.run(inputs, alloc);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

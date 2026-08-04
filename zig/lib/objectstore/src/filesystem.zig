@@ -227,6 +227,9 @@ pub const FilesystemClient = struct {
             .{ .start = range.start, .end = range.end }
         else
             .{ .start = 0, .end = total_len };
+        if (opts.max_response_bytes) |limit| {
+            if (requested.end - requested.start > limit) return error.ResponseTooLarge;
+        }
         const body = try readObjectRangeAlloc(self.io, alloc, object_path, requested.start, requested.end, meta.etag.?);
 
         meta.content_length = @intCast(body.len);

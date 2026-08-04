@@ -211,10 +211,10 @@ class EmbeddedInferenceStandaloneServer:
             logs = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(f"Standalone API server failed to start at {self.url}\n{logs}")
-        if not _wait_for_server(self.inference_api_url, timeout_s=120.0, path="/models"):
+        if not _wait_for_server(self.public_url, path="/readyz"):
             logs = _read_log_tail(self.log_path)
             self.stop()
-            raise RuntimeError(f"Embedded inference server failed to start at {self.inference_api_url}\n{logs}")
+            raise RuntimeError(f"Standalone runtime failed readiness at {self.public_url}\n{logs}")
 
     def debug_logs(self) -> str:
         self.log_file.flush()

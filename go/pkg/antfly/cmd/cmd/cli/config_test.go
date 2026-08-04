@@ -18,6 +18,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,6 +27,36 @@ import (
 
 	"github.com/spf13/cobra"
 )
+
+func TestClusterBackupReturnsErrorForPartialResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"backup_id":"daily",
+			"status":"partial",
+			"tables":[
+				{"name":"documents","status":"completed"},
+				{"name":"missing","status":"failed","error":"not found"}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClient(server.URL, "", server.Client())
+	if err != nil {
+		t.Fatalf("NewAntflyClient: %v", err)
+	}
+	err = client.ClusterBackup(
+		context.Background(),
+		"daily",
+		"file:///backups",
+		"local-backups",
+		[]string{"documents", "missing"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "did not complete: status partial") {
+		t.Fatalf("ClusterBackup error = %v", err)
+	}
+}
 
 func TestResolveURLUsesEnvWhenFlagUnset(t *testing.T) {
 	t.Setenv("ANTFLY_URL", "https://platform.antfly.io/cloud/v1/instance")
@@ -96,7 +127,7 @@ func TestBackupListJSONWritesStdout(t *testing.T) {
 
 	cmd := newBackupCmd()
 	cmd.PreRunE = nil
-	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "-o", "json"})
+	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "--connection", "archive", "-o", "json"})
 
 	oldStdout := os.Stdout
 	readPipe, writePipe, err := os.Pipe()
@@ -125,7 +156,7 @@ func TestBackupListJSONWritesStdout(t *testing.T) {
 func TestBackupListRejectsJSONL(t *testing.T) {
 	cmd := newBackupCmd()
 	cmd.PreRunE = nil
-	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "-o", "jsonl"})
+	cmd.SetArgs([]string{"--list", "--location", "s3://bucket/backups", "--connection", "archive", "-o", "jsonl"})
 
 	err := cmd.Execute()
 	if err == nil {

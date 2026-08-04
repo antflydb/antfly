@@ -16,6 +16,8 @@ const std = @import("std");
 const raft_engine = @import("raft_engine");
 const runtime_loop = @import("raft/runtime_loop.zig");
 const hosted_shard_ops = @import("raft/hosted_shard_ops.zig");
+const service = @import("raft/service.zig");
+const shard_ops = @import("raft/shard_ops.zig");
 const transition_service = @import("raft/transition_service.zig");
 
 test "raft scheduler ready priority cannot starve consensus ticks" {
@@ -124,5 +126,7 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
 test {
     _ = runtime_loop;
     _ = hosted_shard_ops;
+    _ = service;
+    _ = shard_ops;
     std.testing.refAllDecls(transition_service);
 }

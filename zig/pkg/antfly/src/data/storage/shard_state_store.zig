@@ -254,11 +254,12 @@ fn replaceGroupSnapshotWithMetadataAndDeletes(
     for (existing) |key| try txn.delete(key);
     for (metadata_deletes) |key| try txn.delete(key);
 
-    var range_buf: [1024]u8 = undefined;
+    const encoded_range = try range_state.encodeRangeAlloc(alloc, byte_range);
+    defer alloc.free(encoded_range);
     {
         const range_key = try groupRangeKeyAlloc(alloc, group_id);
         defer alloc.free(range_key);
-        try txn.put(range_key, try range_state.encodeRange(byte_range, &range_buf));
+        try txn.put(range_key, encoded_range);
     }
     for (entries) |entry| {
         const document_key = try groupDocumentStoreKeyAlloc(alloc, group_id, entry.key);
@@ -522,8 +523,8 @@ pub fn applyHandoff(store: *docstore.DocStore, alloc: std.mem.Allocator, group_i
     }
 
     const range_key = try groupRangeKeyAlloc(alloc, group_id);
-    var range_buf: [1024]u8 = undefined;
-    const encoded_range = try range_state.encodeRange(handoff.byte_range, &range_buf);
+    const encoded_range = try range_state.encodeRangeAlloc(alloc, handoff.byte_range);
+    defer alloc.free(encoded_range);
     try writes.append(alloc, .{ .key = range_key, .value = encoded_range });
 
     for (handoff.entries) |entry| {
@@ -883,8 +884,8 @@ pub fn installSnapshotStreamIntoEmptyStore(
 
     const range_key = try groupRangeKeyAlloc(alloc, group_id);
     defer alloc.free(range_key);
-    var range_buf: [1024]u8 = undefined;
-    const range_value = try range_state.encodeRange(snapshot.byte_range, &range_buf);
+    const range_value = try range_state.encodeRangeAlloc(alloc, snapshot.byte_range);
+    defer alloc.free(range_value);
     if (external_metadata_writes.len > max_chunk_entries - 1) return error.SnapshotMetadataTooLarge;
     writes[0] = .{ .key = range_key, .value = range_value };
     @memcpy(writes[1..][0..external_metadata_writes.len], external_metadata_writes);
@@ -1760,10 +1761,11 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
     defer range_state.freeRange(alloc, replacement_range);
     const range_key = try groupRangeKeyAlloc(alloc, group_id);
     defer alloc.free(range_key);
-    var range_buf: [1024]u8 = undefined;
+    const encoded_range = try range_state.encodeRangeAlloc(alloc, replacement_range);
+    defer alloc.free(encoded_range);
     var final_txn = try projected.beginWriteTxn();
     errdefer final_txn.abort();
-    try final_txn.put(range_key, try range_state.encodeRange(replacement_range, &range_buf));
+    try final_txn.put(range_key, encoded_range);
     for (final_metadata_writes) |write| try final_txn.put(write.key, write.value);
     try final_txn.commit();
 }
@@ -2115,9 +2117,7 @@ fn appendSplitStateWrite(
 ) !void {
     const key = try groupSplitStateKeyAlloc(alloc, group_id);
     errdefer alloc.free(key);
-    var split_buf: [1024]u8 = undefined;
-    const encoded = try encodeSplitState(state, &split_buf);
-    const value = try alloc.dupe(u8, encoded);
+    const value = try encodeSplitStateAlloc(alloc, state);
     errdefer alloc.free(value);
     removeOwnedWriteByKey(alloc, writes, key);
     removeDeleteByKey(alloc, deletes, key);
@@ -2287,9 +2287,7 @@ pub fn appendOperationEffects(
             errdefer alloc.free(range_key);
             removeOwnedWriteByKey(alloc, writes, range_key);
             removeDeleteByKey(alloc, deletes, range_key);
-            var range_buf: [1024]u8 = undefined;
-            const encoded_range = try range_state.encodeRange(byte_range, &range_buf);
-            const range_value = try alloc.dupe(u8, encoded_range);
+            const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
             errdefer alloc.free(range_value);
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
         },
@@ -2390,9 +2388,7 @@ pub fn appendOperationEffects(
             errdefer alloc.free(range_key);
             removeOwnedWriteByKey(alloc, writes, range_key);
             removeDeleteByKey(alloc, deletes, range_key);
-            var range_buf: [1024]u8 = undefined;
-            const encoded_range = try range_state.encodeRange(byte_range, &range_buf);
-            const range_value = try alloc.dupe(u8, encoded_range);
+            const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
             errdefer alloc.free(range_value);
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
 
@@ -2511,9 +2507,7 @@ pub fn appendOperationEffects(
             errdefer alloc.free(range_key);
             removeOwnedWriteByKey(alloc, writes, range_key);
             removeDeleteByKey(alloc, deletes, range_key);
-            var range_buf: [1024]u8 = undefined;
-            const encoded_range = try range_state.encodeRange(byte_range, &range_buf);
-            const range_value = try alloc.dupe(u8, encoded_range);
+            const range_value = try range_state.encodeRangeAlloc(alloc, byte_range);
             errdefer alloc.free(range_value);
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
 
@@ -2817,9 +2811,15 @@ fn appendSnapshotU32(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8),
     try out.appendSlice(alloc, &encoded);
 }
 
-fn encodeSplitState(state: AppliedSplitState, buf: []u8) ![]const u8 {
-    const total_len = 1 + 8 + 8 + 8 + 4 + state.split_key.len + 4 + state.original_range_end.len;
-    if (total_len > buf.len) return error.SplitStateTooLarge;
+fn encodeSplitStateAlloc(alloc: std.mem.Allocator, state: AppliedSplitState) ![]u8 {
+    if (state.split_key.len > std.math.maxInt(u32) or state.original_range_end.len > std.math.maxInt(u32))
+        return error.SplitStateTooLarge;
+    const keys_len = std.math.add(usize, state.split_key.len, state.original_range_end.len) catch
+        return error.SplitStateTooLarge;
+    const total_len = std.math.add(usize, 1 + 8 + 8 + 8 + 4 + 4, keys_len) catch
+        return error.SplitStateTooLarge;
+    const buf = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(buf);
     var pos: usize = 0;
     buf[pos] = @intFromEnum(state.phase);
     pos += 1;
@@ -2851,15 +2851,16 @@ fn decodeSplitStateAlloc(alloc: std.mem.Allocator, encoded: []const u8) !Applied
     pos += 8;
     const new_shard_id = std.mem.readInt(u64, encoded[pos..][0..8], .little);
     pos += 8;
-    const split_key_len = std.mem.readInt(u32, encoded[pos..][0..4], .little);
+    const split_key_len: usize = std.mem.readInt(u32, encoded[pos..][0..4], .little);
     pos += 4;
-    if (pos + split_key_len + 4 > encoded.len) return error.InvalidSplitState;
+    if (split_key_len > encoded.len - pos or encoded.len - pos - split_key_len < 4)
+        return error.InvalidSplitState;
     const split_key = try alloc.dupe(u8, encoded[pos .. pos + split_key_len]);
     pos += split_key_len;
     errdefer alloc.free(split_key);
-    const original_range_end_len = std.mem.readInt(u32, encoded[pos..][0..4], .little);
+    const original_range_end_len: usize = std.mem.readInt(u32, encoded[pos..][0..4], .little);
     pos += 4;
-    if (pos + original_range_end_len != encoded.len) return error.InvalidSplitState;
+    if (original_range_end_len != encoded.len - pos) return error.InvalidSplitState;
     const original_range_end = try alloc.dupe(u8, encoded[pos .. pos + original_range_end_len]);
     return .{
         .phase = phase,
@@ -2875,7 +2876,10 @@ const split_terminal_format_version: u8 = 2;
 
 fn encodeSplitTerminalAlloc(alloc: std.mem.Allocator, terminal: AppliedSplitTerminal) ![]u8 {
     const header_len = 1 + 1 + 8 + 8 + 8 + 4;
-    const encoded = try alloc.alloc(u8, header_len + terminal.split_key.len);
+    if (terminal.split_key.len > std.math.maxInt(u32)) return error.SplitTerminalTooLarge;
+    const encoded_len = std.math.add(usize, header_len, terminal.split_key.len) catch
+        return error.SplitTerminalTooLarge;
+    const encoded = try alloc.alloc(u8, encoded_len);
     encoded[0] = split_terminal_format_version;
     encoded[1] = @intFromEnum(terminal.outcome);
     std.mem.writeInt(u64, encoded[2..10], terminal.transition_id, .little);
@@ -2889,8 +2893,8 @@ fn encodeSplitTerminalAlloc(alloc: std.mem.Allocator, terminal: AppliedSplitTerm
 fn decodeSplitTerminalAlloc(alloc: std.mem.Allocator, encoded: []const u8) !AppliedSplitTerminal {
     if (encoded.len < 30 or encoded[0] != split_terminal_format_version) return error.InvalidSplitTerminal;
     const outcome = std.enums.fromInt(SplitTerminalOutcome, encoded[1]) orelse return error.InvalidSplitTerminal;
-    const split_key_len = std.mem.readInt(u32, encoded[26..30], .little);
-    if (encoded.len != 30 + split_key_len) return error.InvalidSplitTerminal;
+    const split_key_len: usize = std.mem.readInt(u32, encoded[26..30], .little);
+    if (split_key_len != encoded.len - 30) return error.InvalidSplitTerminal;
     return .{
         .transition_id = std.mem.readInt(u64, encoded[2..10], .little),
         .attempt_epoch = std.mem.readInt(u64, encoded[10..18], .little),
@@ -2898,6 +2902,41 @@ fn decodeSplitTerminalAlloc(alloc: std.mem.Allocator, encoded: []const u8) !Appl
         .split_key = try alloc.dupe(u8, encoded[30..]),
         .outcome = outcome,
     };
+}
+
+test "split state codecs preserve multi-kibibyte boundaries" {
+    const split_key = try std.testing.allocator.alloc(u8, 8 * 1024);
+    defer std.testing.allocator.free(split_key);
+    @memset(split_key, 'm');
+    const range_end = try std.testing.allocator.alloc(u8, 12 * 1024);
+    defer std.testing.allocator.free(range_end);
+    @memset(range_end, 'z');
+
+    const encoded = try encodeSplitStateAlloc(std.testing.allocator, .{
+        .phase = .splitting,
+        .transition_id = 17,
+        .attempt_epoch = 3,
+        .split_key = split_key,
+        .new_shard_id = 19,
+        .original_range_end = range_end,
+    });
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decodeSplitStateAlloc(std.testing.allocator, encoded);
+    defer freeSplitState(std.testing.allocator, decoded);
+    try std.testing.expectEqualSlices(u8, split_key, decoded.split_key);
+    try std.testing.expectEqualSlices(u8, range_end, decoded.original_range_end);
+
+    const terminal_encoded = try encodeSplitTerminalAlloc(std.testing.allocator, .{
+        .transition_id = 17,
+        .attempt_epoch = 3,
+        .destination_group_id = 19,
+        .split_key = split_key,
+        .outcome = .finalized,
+    });
+    defer std.testing.allocator.free(terminal_encoded);
+    const terminal = try decodeSplitTerminalAlloc(std.testing.allocator, terminal_encoded);
+    defer freeSplitTerminal(std.testing.allocator, terminal);
+    try std.testing.expectEqualSlices(u8, split_key, terminal.split_key);
 }
 
 fn appendFinalizeSplitDeletes(

@@ -958,7 +958,58 @@ class MultiNodeScalingCluster:
                     parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
         return "\n".join(parts)
 
+    def preserve_failure_diagnostics(self) -> None:
+        diagnostics: dict[str, Any] = {
+            "metadata_snapshots": [],
+            "metadata_statuses": self.metadata_statuses(),
+            "node_shutdown_statuses": [],
+            "processes": {
+                "metadata": [
+                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.metadata_procs
+                ],
+                "data": [
+                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.data_procs
+                ],
+            },
+        }
+        for index, url in enumerate(self.metadata_urls):
+            try:
+                diagnostics["metadata_snapshots"].append(
+                    {"index": index, "url": url, "snapshot": self.metadata_snapshot(index)}
+                )
+            except Exception as exc:
+                diagnostics["metadata_snapshots"].append(
+                    {"index": index, "url": url, "error": repr(exc)}
+                )
+        for node in self.data_nodes:
+            node_id = int(node["id"])
+            try:
+                response = requests.get(
+                    f"{self.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown",
+                    timeout=5,
+                )
+                diagnostics["node_shutdown_statuses"].append(
+                    {
+                        "node_id": node_id,
+                        "status_code": response.status_code,
+                        "body": response.json() if response.ok else response.text,
+                    }
+                )
+            except Exception as exc:
+                diagnostics["node_shutdown_statuses"].append(
+                    {"node_id": node_id, "error": repr(exc)}
+                )
+        try:
+            (self.root / "failure-diagnostics.json").write_text(
+                json.dumps(diagnostics, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"failed to preserve scaling diagnostics: {exc!r}")
+
     def stop(self, *, timeout_s: float = 10.0, test_failed: bool = False) -> None:
+        if test_failed:
+            self.preserve_failure_diagnostics()
         procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
         for proc in procs:
             proc.send_signal(signal.SIGTERM)
@@ -1039,6 +1090,40 @@ def _table_group_ids(cluster: MultiNodeScalingCluster, table_name: str) -> set[i
         if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
     }
     return group_ids if group_ids else None
+
+
+def _oversized_table_group_ids(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    max_shard_size_bytes: int,
+) -> set[int] | None:
+    snapshot = cluster.metadata_snapshot()
+    table_id = next(
+        (
+            int(table["table_id"])
+            for table in snapshot.get("tables", [])
+            if isinstance(table, dict) and table.get("name") == table_name
+        ),
+        None,
+    )
+    if table_id is None:
+        return None
+
+    table_group_ids = {
+        int(record["group_id"])
+        for record in snapshot.get("ranges", [])
+        if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
+    }
+    oversized_group_ids = {
+        int(status["group_id"])
+        for status in snapshot.get("merged_group_statuses", [])
+        if isinstance(status, dict)
+        and int(status.get("group_id", 0)) in table_group_ids
+        and status.get("leader_known") is True
+        and status.get("disk_bytes_known") is True
+        and int(status.get("disk_bytes", 0)) > max_shard_size_bytes
+    }
+    return oversized_group_ids if oversized_group_ids else None
 
 
 def _placed_nodes_for_groups(cluster: MultiNodeScalingCluster, group_ids: set[int]) -> set[int]:
@@ -1405,7 +1490,10 @@ def _wait_node_drained_for_groups(
                     continue
                 if int(record.get("local_node_id", 0)) != node_id:
                     continue
-                if intent.get("serving_state") == "draining":
+                # Both states are excluded from request routing. `retiring`
+                # is the later, safer phase: the survivor set is latched and
+                # the local replica is completing leader transfer/removal.
+                if intent.get("serving_state") in {"draining", "retiring"}:
                     continue
                 return None
         return snapshots[0]
@@ -1646,19 +1734,29 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     _insert_docs(cluster, table_name, docs, min_group_count=1)
     timings.record("insert_docs", phase_started)
 
-    last_reallocate_at = 0.0
+    phase_started = time.monotonic()
+    oversized_groups = wait_until(
+        lambda: _oversized_table_group_ids(
+            cluster,
+            table_name,
+            cluster.max_shard_size_bytes,
+        ),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    timings.record("oversized_status_observed", phase_started)
+    assert oversized_groups is not None, (
+        "metadata did not observe the source shard above the configured size threshold\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+        f"{cluster.debug_logs()}"
+    )
 
-    def maybe_trigger_reallocate() -> None:
-        nonlocal last_reallocate_at
-        now = time.monotonic()
-        if now - last_reallocate_at < 5.0:
-            return
-        cluster.trigger_reallocate()
-        last_reallocate_at = now
+    phase_started = time.monotonic()
+    cluster.trigger_reallocate()
+    timings.record("reallocate_requested", phase_started)
 
     def split_completed() -> set[int] | None:
         try:
-            maybe_trigger_reallocate()
             group_ids = _table_group_ids(cluster, table_name)
         except (AssertionError, requests.RequestException):
             return None

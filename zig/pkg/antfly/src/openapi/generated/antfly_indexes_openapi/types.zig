@@ -105,7 +105,7 @@ pub const AlgebraicIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -540,7 +540,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -631,7 +631,9 @@ pub const EnrichmentRuntimeStatus = struct {
     projection_checkpoint_status: []const u8,
     projection_checkpoint_applied_sequence: i64,
     projection_checkpoint_generation: i64,
-    projection_checkpoint_config_hash: i64,
+    projection_checkpoint_config_fingerprint: []const u8,
+    /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
+    projection_checkpoint_identity_consistent: bool,
     checkpoint_replay_tail_sequence_count: i64,
     processed_requests: i64,
     error_count: i64,
@@ -657,6 +659,9 @@ pub const EnrichmentRuntimeStatus = struct {
     last_embed_batch_items: i64,
     last_embed_batch_bytes: i64,
     last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
     last_embed_batch_ns: i64,
     total_embed_ns: i64,
 };
@@ -746,7 +751,7 @@ pub const FullTextIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -854,7 +859,7 @@ pub const GraphIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -995,6 +1000,8 @@ pub const GraphQueryType = enum {
 pub const GraphResultNode = struct {
     /// Document key
     key: []const u8,
+    /// Owning table for a cross-table node; omitted for nodes in the queried table
+    table: ?[]const u8 = null,
     /// Distance from start node
     depth: ?i64 = null,
     /// Weighted distance

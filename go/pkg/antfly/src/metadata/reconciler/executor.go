@@ -743,7 +743,11 @@ func (r *Reconciler) seedMergeReceiverFromArchive(
 	}
 
 	backupID := fmt.Sprintf("merge-seed-%s-%d", donorShardID, r.timeProvider.Now().UnixNano())
-	if err := donorClient.Backup(ctx, donorShardID, "file://"+backupDir, backupID, common.BackupFormatNative); err != nil {
+	if _, err := donorClient.Backup(ctx, donorShardID, common.BackupConfig{
+		BackupID: backupID,
+		Location: "file://" + backupDir,
+		Format:   common.BackupFormatNative,
+	}); err != nil {
 		return fmt.Errorf("creating donor merge seed archive: %w", err)
 	}
 

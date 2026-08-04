@@ -1658,6 +1658,7 @@ pub fn searchProfiledRequest(
 ) !search_types.ProfiledSearchResults {
     var profile = search_types.SearchProfile{};
     const total_start = now_fn_u64();
+    try search_types.checkCancelled(req);
     hbc_runtime.beginSearchEpoch(self);
     defer hbc_runtime.endSearchEpoch(self);
     const Index = comptime childType(@TypeOf(self));
@@ -1740,7 +1741,8 @@ pub fn searchProfiledRequest(
         );
 
         var flat_leaves_scored: usize = 0;
-        for (probes[0..probe_count]) |probe| {
+        for (probes[0..probe_count], 0..) |probe, i| {
+            if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
             var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
             var leaf_handle_active = true;
@@ -1845,6 +1847,7 @@ pub fn searchProfiledRequest(
 
     var beam_state = search_mod.BeamSearchState{};
     while (true) {
+        try search_types.checkCancelled(req);
         const candidate = candidates.pop() orelse break;
         if (search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
         profile.nodes_visited += 1;
@@ -2089,9 +2092,13 @@ fn scoreLeafMemberIds(
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
             if (!has_extra_filters) {
-                for (member_ids, 0..) |member_id, i| results.addApproxResult(member_id, distances[i], error_bounds[i]);
+                for (member_ids, 0..) |member_id, i| {
+                    if (i % 256 == 0) try search_types.checkCancelled(req);
+                    results.addApproxResult(member_id, distances[i], error_bounds[i]);
+                }
             } else {
                 for (member_ids, 0..) |member_id, i| {
+                    if (i % 256 == 0) try search_types.checkCancelled(req);
                     if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], req, filter_state, true)) continue;
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
@@ -2111,7 +2118,8 @@ fn scoreLeafMemberIds(
 
     const fetch_member_ids = scratch.member_ids[0..member_ids.len];
     var fetch_count: usize = 0;
-    for (member_ids) |member_id| {
+    for (member_ids, 0..) |member_id, i| {
+        if (i % 256 == 0) try search_types.checkCancelled(req);
         if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
             var handle = cached_handle;
             defer handle.deinit();
@@ -2181,14 +2189,18 @@ fn scoreLeafMemberIds(
         scored_count += 1;
     }
     if (scored_count == 0) return;
-    search_runtime.exactDistancesToStoredVectors(
+    try search_types.checkCancelled(req);
+    try search_runtime.exactDistancesToStoredVectorsCancellable(
         self.config,
         exact_query,
         exact_query_measure,
         vector_views[0..scored_count],
         exact_distances[0..scored_count],
+        req.cancellation,
     );
+    try search_types.checkCancelled(req);
     for (scored_positions[0..scored_count], 0..) |member_index, dist_index| {
+        if (dist_index % 256 == 0) try search_types.checkCancelled(req);
         const member_id = fetch_member_ids[member_index];
         const dist = exact_distances[dist_index];
         if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
@@ -2311,13 +2323,16 @@ pub fn rerankResults(
                 loaded_count += 1;
             }
             const dist_start = now_fn_u64();
-            search_runtime.exactDistancesToStoredVectors(self.config, query, query_measure, vector_views[0..loaded_count], exact_distances[0..loaded_count]);
+            try search_types.checkCancelled(req);
+            try search_runtime.exactDistancesToStoredVectorsCancellable(self.config, query, query_measure, vector_views[0..loaded_count], exact_distances[0..loaded_count], req.cancellation);
+            try search_types.checkCancelled(req);
             profile.rerank_distance_ns += elapsed_fn_u64(dist_start);
         }
 
         const apply_start = now_fn_u64();
         var exact_idx: usize = 0;
         for (rerank_positions, 0..) |index, slot| {
+            if (slot % 256 == 0) try search_types.checkCancelled(req);
             const item = &ranked_items[index];
             if (!std.math.isFinite(item.distance)) continue;
             const dist = if (external_scored) exact_distances[slot] else blk: {
@@ -4011,7 +4026,6 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
             try recomputeInternalCentroid(self, txn, &node);
             try self.saveNode(txn, &node);
         }
-
     }
     return report;
 }

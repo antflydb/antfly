@@ -25,6 +25,8 @@ const multistage_metadata = @import("multistage_metadata.zig");
 const multistage_reader_mod = @import("multistage_reader.zig");
 const pix2struct_mod = @import("pix2struct.zig");
 const vision_reader_mod = @import("vision_reader.zig");
+const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
 
 pub const Field = reader_types.Field;
@@ -229,7 +231,12 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
-            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(allocator, model_path, session_manager) };
+            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(
+                allocator,
+                model_path,
+                session_manager,
+                model_manager,
+            ) };
         }
 
         const parser_kind = try detectParserKind(allocator, model_path);
@@ -336,6 +343,28 @@ pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8)
     }
 
     return vision_reader_mod.isSupportedModelDir(allocator, model_path);
+}
+
+/// Same check, reusing a manifest the caller already loaded.
+///
+/// The directory-based form ends in a full `manifest.loadFromDir`, which parses GGUF
+/// tokenizer metadata. Running that once per model made `/ai/v1/models` take about a
+/// second per GGUF model even though the listing never needed those fields.
+pub fn isSupportedManifest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    man: manifest_mod.ModelManifest,
+) bool {
+    if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return true;
+
+    const parser_kind = detectParserKind(allocator, model_path) catch return false;
+    if (parser_kind == .moondream) {
+        return onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path);
+    }
+
+    if (enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man)) return true;
+
+    return vision_reader_mod.isSupportedManifest(man);
 }
 
 fn detectParserKind(allocator: std.mem.Allocator, model_path: []const u8) !ParserKind {

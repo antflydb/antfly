@@ -42,6 +42,10 @@ pub fn PriorityQueue(comptime T: type) type {
             return self.items.items.len - 1;
         }
 
+        pub fn clearRetainingCapacity(self: *Self) void {
+            self.items.items.len = 1;
+        }
+
         pub fn insert(self: *Self, elem: T) !void {
             try self.items.append(self.allocator, elem);
             self.siftUp(self.items.items.len - 1);

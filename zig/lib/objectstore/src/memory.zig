@@ -131,12 +131,16 @@ pub const MemoryClient = struct {
             if (part_number != 1) return error.InvalidPartNumber;
         }
 
-        const body = if (opts.range) |range| blk: {
+        const selected = if (opts.range) |range| blk: {
             const start: usize = @intCast(range.offset);
             if (start > object.body.len) return error.InvalidRange;
             const end = if (range.length) |len| @min(object.body.len, start + @as(usize, @intCast(len))) else object.body.len;
-            break :blk try alloc.dupe(u8, object.body[start..end]);
-        } else try alloc.dupe(u8, object.body);
+            break :blk object.body[start..end];
+        } else object.body;
+        if (opts.max_response_bytes) |limit| {
+            if (selected.len > limit) return error.ResponseTooLarge;
+        }
+        const body = try alloc.dupe(u8, selected);
 
         return .{
             .body = body,
@@ -369,6 +373,16 @@ test "memory client supports put get stat list and delete" {
     var got = try client.getObject("bucket", "a/one", .{});
     defer got.deinit(alloc);
     try std.testing.expectEqualStrings("alpha", got.body);
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        client.getObject("bucket", "a/one", .{ .max_response_bytes = 4 }),
+    );
+    var bounded = try client.getObject("bucket", "a/one", .{
+        .range = .{ .offset = 0, .length = 4 },
+        .max_response_bytes = 4,
+    });
+    defer bounded.deinit(alloc);
+    try std.testing.expectEqualStrings("alph", bounded.body);
 
     var meta = try client.statObject("bucket", "a/one");
     defer meta.deinit(alloc);

@@ -1234,6 +1234,7 @@ const AggregatedIndexStatus = struct {
     hbc_posting: db_mod.types.HbcPostingStats = .{},
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
+    enrichment_observation_count: u64 = 0,
     resolution: db_mod.types.ReplayStageStats = .{},
     promotion: db_mod.types.ReplayStageStats = .{},
     resolver_replay: db_mod.types.ResolverReplayDiagnostics = .{},
@@ -1348,6 +1349,10 @@ fn aggregateIndexStatusIndexed(
         if (!runtime_present) continue;
         aggregate.reported_group_count += 1;
         aggregate.runtime_present = true;
+        // Integrity failures are current index-scoped facts even when the
+        // surrounding runtime snapshot is stale or failed. Capture them before
+        // gating materialization counters on freshness.
+        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
             aggregate.fresh_group_count += 1;
             aggregate.runtime_fresh = true;
@@ -1386,7 +1391,6 @@ fn aggregateIndexStatusIndexed(
             continue;
         }
         materialization_count += 1;
-        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
         if (publicIndexRepairState(item)) |state| {
             if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
                 aggregate.repair_state = state;
@@ -1445,7 +1449,12 @@ fn aggregateIndexStatusIndexed(
             }
         }
         db_mod.types.accumulateAsyncIndexingStats(&aggregate.async_indexing, runtime.stats.async_indexing);
-        aggregateEnrichmentStats(&aggregate.enrichment, runtime.stats.enrichment);
+        aggregateEnrichmentStats(
+            &aggregate.enrichment,
+            runtime.stats.enrichment,
+            aggregate.enrichment_observation_count == 0,
+        );
+        aggregate.enrichment_observation_count +|= 1;
         aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
         aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
         aggregateResolverReplayDiagnostics(&aggregate.resolver_replay, runtime.stats.resolver_replay);
@@ -1466,6 +1475,11 @@ fn aggregateIndexStatusIndexed(
         aggregate.coverage_identity_ready = coverage_generation != 0;
     }
     aggregate.missing_group_count = aggregate.expected_group_count -| aggregate.reported_group_count;
+    if (aggregate.expected_group_count != aggregate.fresh_group_count) {
+        aggregate.enrichment.projection_checkpoint_identity_consistent = false;
+        aggregate.enrichment.projection_checkpoint_generation = 0;
+        aggregate.enrichment.projection_checkpoint_config_hash = 0;
+    }
     if (aggregate.missing_group_count > 0 or aggregate.stale_group_count > 0 or aggregate.remote_unknown_group_count > 0) {
         aggregate.backfill_active = true;
         aggregate.replay_catch_up_required = true;
@@ -1573,46 +1587,97 @@ fn aggregateReplayStageStats(dst: *db_mod.types.ReplayStageStats, src: db_mod.ty
     dst.error_count += src.error_count;
 }
 
-fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.types.EnrichmentStats) void {
+fn aggregateEnrichmentStats(
+    dst: *db_mod.types.EnrichmentStats,
+    src: db_mod.types.EnrichmentStats,
+    first_observation: bool,
+) void {
     dst.enabled = dst.enabled or src.enabled;
     dst.lease_owned = dst.lease_owned and src.lease_owned;
     dst.has_lease = dst.has_lease or src.has_lease;
-    dst.acquisition_count += src.acquisition_count;
-    dst.lease_acquire_failures += src.lease_acquire_failures;
-    dst.lost_leases += src.lost_leases;
+    dst.acquisition_count +|= src.acquisition_count;
+    dst.lease_acquire_failures +|= src.lease_acquire_failures;
+    dst.lost_leases +|= src.lost_leases;
     dst.last_acquired_ms = @max(dst.last_acquired_ms, src.last_acquired_ms);
-    dst.target_sequence += src.target_sequence;
-    dst.applied_sequence += src.applied_sequence;
-    dst.processed_requests += src.processed_requests;
-    dst.error_count += src.error_count;
-    dst.retryable_error_count += src.retryable_error_count;
-    dst.fatal_error_count += src.fatal_error_count;
+    dst.target_sequence +|= src.target_sequence;
+    dst.applied_sequence +|= src.applied_sequence;
+    if (first_observation) {
+        dst.projection_checkpoint_status = src.projection_checkpoint_status;
+        dst.projection_checkpoint_generation = src.projection_checkpoint_generation;
+        dst.projection_checkpoint_config_hash = src.projection_checkpoint_config_hash;
+        dst.projection_checkpoint_identity_consistent = src.projection_checkpoint_identity_consistent;
+        if (!dst.projection_checkpoint_identity_consistent) {
+            dst.projection_checkpoint_generation = 0;
+            dst.projection_checkpoint_config_hash = 0;
+        }
+    } else {
+        if (projectionCheckpointStatusRank(src.projection_checkpoint_status) >
+            projectionCheckpointStatusRank(dst.projection_checkpoint_status))
+        {
+            dst.projection_checkpoint_status = src.projection_checkpoint_status;
+        }
+        if (dst.projection_checkpoint_generation != src.projection_checkpoint_generation or
+            dst.projection_checkpoint_config_hash != src.projection_checkpoint_config_hash or
+            !src.projection_checkpoint_identity_consistent)
+        {
+            dst.projection_checkpoint_identity_consistent = false;
+            dst.projection_checkpoint_generation = 0;
+            dst.projection_checkpoint_config_hash = 0;
+        }
+    }
+    dst.projection_checkpoint_applied_sequence +|= src.projection_checkpoint_applied_sequence;
+    dst.checkpoint_replay_tail_sequence_count +|= src.checkpoint_replay_tail_sequence_count;
+    dst.processed_requests +|= src.processed_requests;
+    dst.error_count +|= src.error_count;
+    dst.retryable_error_count +|= src.retryable_error_count;
+    dst.fatal_error_count +|= src.fatal_error_count;
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.worker_started = dst.worker_started or src.worker_started;
     dst.stalled = dst.stalled or src.stalled;
-    dst.skip_by_hash_count += src.skip_by_hash_count;
-    dst.skipped_source_count += src.skipped_source_count;
-    dst.codec_decode_failures += src.codec_decode_failures;
-    dst.embed_batches_started += src.embed_batches_started;
-    dst.embed_batches_completed += src.embed_batches_completed;
-    dst.embed_items_started += src.embed_items_started;
-    dst.embed_items_completed += src.embed_items_completed;
-    dst.active_embed_batch_items += src.active_embed_batch_items;
-    dst.active_embed_batch_bytes += src.active_embed_batch_bytes;
+    dst.skip_by_hash_count +|= src.skip_by_hash_count;
+    dst.skipped_source_count +|= src.skipped_source_count;
+    dst.codec_decode_failures +|= src.codec_decode_failures;
+    dst.embed_batches_started +|= src.embed_batches_started;
+    dst.embed_batches_completed +|= src.embed_batches_completed;
+    dst.embed_items_started +|= src.embed_items_started;
+    dst.embed_items_completed +|= src.embed_items_completed;
+    dst.active_embed_batch_items +|= src.active_embed_batch_items;
+    dst.active_embed_batch_bytes +|= src.active_embed_batch_bytes;
     dst.active_embed_batch_max_bytes = @max(dst.active_embed_batch_max_bytes, src.active_embed_batch_max_bytes);
-    dst.active_embed_batch_started_ms = @max(dst.active_embed_batch_started_ms, src.active_embed_batch_started_ms);
-    if (src.last_embed_batch_ns >= dst.last_embed_batch_ns) {
+    if (src.active_embed_batch_started_ms != 0 and
+        (dst.active_embed_batch_started_ms == 0 or src.active_embed_batch_started_ms < dst.active_embed_batch_started_ms))
+    {
+        dst.active_embed_batch_started_ms = src.active_embed_batch_started_ms;
+    }
+    if (src.last_embed_batch_completed_ms > dst.last_embed_batch_completed_ms or
+        (src.last_embed_batch_completed_ms == dst.last_embed_batch_completed_ms and
+            (src.last_embed_batch_ns > dst.last_embed_batch_ns or
+                (src.last_embed_batch_ns == dst.last_embed_batch_ns and
+                    (src.last_embed_batch_bytes > dst.last_embed_batch_bytes or
+                        (src.last_embed_batch_bytes == dst.last_embed_batch_bytes and
+                            src.last_embed_batch_items > dst.last_embed_batch_items))))))
+    {
         dst.last_embed_batch_items = src.last_embed_batch_items;
         dst.last_embed_batch_bytes = src.last_embed_batch_bytes;
         dst.last_embed_batch_max_bytes = src.last_embed_batch_max_bytes;
+        dst.last_embed_batch_completed_ms = src.last_embed_batch_completed_ms;
         dst.last_embed_batch_ns = src.last_embed_batch_ns;
     }
-    dst.total_embed_ns += src.total_embed_ns;
-    dst.dense_artifact_bytes_written += src.dense_artifact_bytes_written;
-    dst.sparse_artifact_bytes_written += src.sparse_artifact_bytes_written;
-    dst.chunk_artifact_bytes_written += src.chunk_artifact_bytes_written;
-    dst.artifact_bytes_written += src.artifact_bytes_written;
+    dst.total_embed_ns +|= src.total_embed_ns;
+    dst.dense_artifact_bytes_written +|= src.dense_artifact_bytes_written;
+    dst.sparse_artifact_bytes_written +|= src.sparse_artifact_bytes_written;
+    dst.chunk_artifact_bytes_written +|= src.chunk_artifact_bytes_written;
+    dst.artifact_bytes_written +|= src.artifact_bytes_written;
+}
+
+fn projectionCheckpointStatusRank(status: []const u8) u8 {
+    if (std.mem.eql(u8, status, "repair_required") or std.mem.eql(u8, status, "failed")) return 50;
+    if (std.mem.eql(u8, status, "degraded")) return 40;
+    if (std.mem.eql(u8, status, "retrying")) return 30;
+    if (std.mem.eql(u8, status, "rebuilding")) return 20;
+    if (std.mem.eql(u8, status, "clean")) return 0;
+    return 10;
 }
 
 fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.TextMergeStats) void {
@@ -1851,6 +1916,47 @@ test "derived coverage aggregation rejects mixed config observations" {
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
 }
 
+test "rebuild quarantine remains an explicit failed public index status" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "search_idx",
+        .kind = .full_text,
+        .load_error = "InvalidRebuildState",
+    };
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .rebuild_state_quarantine, .freshness = .failed },
+        .stats = .{ .index_count = 1, .indexes = @constCast((&[_]db_mod.types.DBIndexStats{item})[0..]) },
+    }};
+    const aggregate = aggregateIndexStatus(&runtimes, "search_idx", &.{1}, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("InvalidRebuildState", aggregate.load_error.?);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .full_text,
+        item,
+        0,
+        .strict,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        runtimes[0].metadata,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"backfill_state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: InvalidRebuildState\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"runtime_source\":\"rebuild_state_quarantine\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"runtime_freshness\":\"failed\"") != null);
+}
+
 test "index status exposes compact repair state without internal diagnostics" {
     const item = db_mod.types.DBIndexStats{
         .name = "visual",
@@ -2000,7 +2106,7 @@ test "derived coverage aggregation rejects stale index incarnations" {
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_status\":\"rebuilding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_applied_sequence\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_generation\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_config_hash\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_config_fingerprint\":\"0000000000000000\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"checkpoint_replay_tail_sequence_count\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_degraded\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_issue_count\":0") != null);
@@ -2324,8 +2430,10 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.projection_checkpoint_applied_sequence);
     try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
     try appendIntValue(alloc, out, stats.projection_checkpoint_generation);
-    try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
-    try appendIntValue(alloc, out, stats.projection_checkpoint_config_hash);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_config_fingerprint\":");
+    try appendCoverageFingerprint(alloc, out, stats.projection_checkpoint_config_hash);
+    try out.appendSlice(alloc, ",\"projection_checkpoint_identity_consistent\":");
+    try out.appendSlice(alloc, if (stats.projection_checkpoint_identity_consistent) "true" else "false");
     try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
     try appendIntValue(alloc, out, stats.checkpoint_replay_tail_sequence_count);
     try out.appendSlice(alloc, ",\"processed_requests\":");
@@ -2372,6 +2480,8 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.last_embed_batch_bytes);
     try out.appendSlice(alloc, ",\"last_embed_batch_max_bytes\":");
     try appendIntValue(alloc, out, stats.last_embed_batch_max_bytes);
+    try out.appendSlice(alloc, ",\"last_embed_batch_completed_ms\":");
+    try appendIntValue(alloc, out, stats.last_embed_batch_completed_ms);
     try out.appendSlice(alloc, ",\"last_embed_batch_ns\":");
     try appendIntValue(alloc, out, stats.last_embed_batch_ns);
     try out.appendSlice(alloc, ",\"total_embed_ns\":");
@@ -2397,6 +2507,66 @@ test "enrichment index status encodes worker lifecycle diagnostics" {
     defer parsed.deinit();
     try std.testing.expectEqual(false, parsed.value.worker_started);
     try std.testing.expectEqual(true, parsed.value.stalled);
+}
+
+test "enrichment aggregation preserves telemetry and fences mixed checkpoint identity" {
+    var aggregate: db_mod.types.EnrichmentStats = .{};
+    aggregateEnrichmentStats(&aggregate, .{
+        .enabled = true,
+        .target_sequence = 11,
+        .applied_sequence = 7,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 41,
+        .projection_checkpoint_config_hash = std.math.maxInt(u64) - 7,
+        .processed_requests = std.math.maxInt(u64) - 1,
+        .active_embed_batch_items = 3,
+        .active_embed_batch_started_ms = 200,
+        .last_embed_batch_items = 4,
+        .last_embed_batch_bytes = 100,
+        .last_embed_batch_completed_ms = 2000,
+        .last_embed_batch_ns = 900,
+    }, true);
+    aggregateEnrichmentStats(&aggregate, .{
+        .enabled = true,
+        .target_sequence = 13,
+        .applied_sequence = 9,
+        .projection_checkpoint_status = "repair_required",
+        .projection_checkpoint_applied_sequence = 9,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
+        .processed_requests = 10,
+        .active_embed_batch_items = 5,
+        .active_embed_batch_started_ms = 100,
+        .last_embed_batch_items = 8,
+        .last_embed_batch_bytes = 200,
+        .last_embed_batch_completed_ms = 1000,
+        .last_embed_batch_ns = 9010,
+    }, false);
+
+    try std.testing.expectEqual(std.math.maxInt(u64), aggregate.processed_requests);
+    try std.testing.expectEqual(@as(u64, 24), aggregate.target_sequence);
+    try std.testing.expectEqual(@as(u64, 16), aggregate.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 16), aggregate.projection_checkpoint_applied_sequence);
+    try std.testing.expectEqualStrings("repair_required", aggregate.projection_checkpoint_status);
+    try std.testing.expect(!aggregate.projection_checkpoint_identity_consistent);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.projection_checkpoint_generation);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.projection_checkpoint_config_hash);
+    try std.testing.expectEqual(@as(u64, 8), aggregate.active_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 100), aggregate.active_embed_batch_started_ms);
+    try std.testing.expectEqual(@as(u64, 4), aggregate.last_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 2000), aggregate.last_embed_batch_completed_ms);
+    try std.testing.expectEqual(@as(u64, 900), aggregate.last_embed_batch_ns);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendEnrichmentRuntimeStatus(std.testing.allocator, &encoded, .{
+        .projection_checkpoint_config_hash = std.math.maxInt(u64) - 7,
+    });
+    var parsed = try std.json.parseFromSlice(indexes_openapi.EnrichmentRuntimeStatus, std.testing.allocator, encoded.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("fffffffffffffff8", parsed.value.projection_checkpoint_config_fingerprint);
+    try std.testing.expect(parsed.value.projection_checkpoint_identity_consistent);
 }
 
 fn appendSingleIndexRuntimeStatus(
@@ -2500,7 +2670,7 @@ fn appendSingleIndexRuntimeStatus(
     // operator-visible error. Once a repair intent exists, the compact repair
     // state is authoritative; exposing the quarantined root's raw load error
     // at the same time would incorrectly tell clients to drop/recreate.
-    const raw_load_error: ?[]const u8 = if (embeddings_materialization_current and @hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
     const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
     if (load_error != null) {
         backfill_active = false;
@@ -2697,8 +2867,8 @@ fn appendSingleIndexRuntimeStatus(
         try appendIntValue(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_applied_sequence else 0);
         try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
         try appendIntValue(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_generation else 0);
-        try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
-        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_config_hash else 0);
+        try out.appendSlice(alloc, ",\"projection_checkpoint_config_fingerprint\":");
+        try appendCoverageFingerprint(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_config_hash else 0);
         try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
         try appendIntValue(alloc, out, if (embeddings_materialization_current) item.checkpoint_replay_tail_sequence_count else 0);
     }

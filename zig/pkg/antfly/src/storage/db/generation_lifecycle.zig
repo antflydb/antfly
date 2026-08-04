@@ -140,6 +140,7 @@ pub const PublicationOutcome = enum {
 
 const CleanupScheduler = struct {
     alloc: Allocator,
+    io: std.Io,
     lane: background_runtime.DurableJobLane,
     owner_id: u64,
 
@@ -150,8 +151,9 @@ const CleanupScheduler = struct {
         if (active.threaded_jobs == null) return null;
         return .{
             .alloc = active.alloc,
+            .io = active.io() orelse return null,
             .lane = active.durable_jobs,
-            .owner_id = active.allocOwnerId(),
+            .owner_id = active.retired_generation_cleanup_owner_id,
         };
     }
 };
@@ -635,8 +637,7 @@ pub const PreparationTransition = struct {
         self.publication_lock = null;
         const publication_lock = openPublicationLock(self.alloc, path_key, .exclusive) catch |promotion_err| {
             self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
-                std.log.err("generation preparation failed to restore publication read lock path={s} promotion_err={s} reacquire_err={s}", .{
-                    self.path,
+                std.log.err("generation preparation lock recovery failed phase=promote promotion_class={s} reacquire_class={s}", .{
                     @errorName(promotion_err),
                     @errorName(reacquire_err),
                 });
@@ -647,8 +648,7 @@ pub const PreparationTransition = struct {
         self.manager.promotePreparation(self.path, self.id) catch |promotion_err| {
             closePublicationLock(publication_lock);
             self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
-                std.log.err("generation preparation failed to restore publication read lock path={s} promotion_err={s} reacquire_err={s}", .{
-                    self.path,
+                std.log.err("generation preparation lock recovery failed phase=state_promotion promotion_class={s} reacquire_class={s}", .{
                     @errorName(promotion_err),
                     @errorName(reacquire_err),
                 });
@@ -1026,6 +1026,7 @@ fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {
 
 const RetiredGenerationCleanupBatch = struct {
     alloc: Allocator,
+    io: std.Io,
     paths: [][]u8,
     parent: []u8,
 
@@ -1035,10 +1036,7 @@ const RetiredGenerationCleanupBatch = struct {
             test_retired_cleanup_started.store(true, .release);
             while (test_block_retired_cleanup.load(.acquire)) platform.time.yieldBriefly();
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        try deleteRetiredGenerationPaths(self.alloc, io, self.paths, self.parent);
+        try deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -1105,6 +1103,7 @@ fn scheduleRetiredGenerationCleanupBatch(scheduler: ?CleanupScheduler, paths: []
     }
     work.* = .{
         .alloc = active.alloc,
+        .io = active.io,
         .paths = owned_paths,
         .parent = try active.alloc.dupe(u8, parent),
     };
@@ -1307,21 +1306,33 @@ pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const
     defer reconciliation.deinit();
     var publication_lock = try openPublicationLock(process_manager_allocator, reconciliation.path_key, .exclusive);
     errdefer closePublicationLock(publication_lock);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
+    var fallback_io_impl: std.Io.Threaded = undefined;
+    var fallback_io_owned = false;
+    defer if (fallback_io_owned) fallback_io_impl.deinit();
+    const io = if (runtime) |active|
+        active.io() orelse fallback: {
+            fallback_io_impl = std.Io.Threaded.init(alloc, .{});
+            fallback_io_owned = true;
+            break :fallback fallback_io_impl.io();
+        }
+    else fallback: {
+        fallback_io_impl = std.Io.Threaded.init(alloc, .{});
+        fallback_io_owned = true;
+        break :fallback fallback_io_impl.io();
+    };
     var deferred_cleanup = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (deferred_cleanup.items) |stale_path| alloc.free(stale_path);
         deferred_cleanup.deinit(alloc);
     }
     const cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
-    const reconciled = try reconcilePublishedGeneration(alloc, io_impl.io(), path, cleanup_scheduler, &deferred_cleanup);
-    try publication_lock.downgradeLock(io_impl.io());
+    const reconciled = try reconcilePublishedGeneration(alloc, io, path, cleanup_scheduler, &deferred_cleanup);
+    try publication_lock.downgradeLock(io);
     var read_lease = try reconciliation.promoteToRead(publication_lock, reconciled);
     errdefer read_lease.deinit();
     if (deferred_cleanup.items.len > 0) {
         const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
-        deleteRetiredGenerationPaths(alloc, io_impl.io(), deferred_cleanup.items, parent) catch |err| {
+        deleteRetiredGenerationPaths(alloc, io, deferred_cleanup.items, parent) catch |err| {
             std.log.warn("stale generation cleanup remains retryable after read admission path={s} count={} err={s}", .{ path, deferred_cleanup.items.len, @errorName(err) });
         };
     }

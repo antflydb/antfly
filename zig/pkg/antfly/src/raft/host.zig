@@ -352,15 +352,9 @@ pub const Host = struct {
     ) !PreparedReplica {
         const should_prepare_bootstrap = prepare_bootstrap and record.backup_restore_bootstrap != null;
         if (should_prepare_bootstrap) {
+            try record.backup_restore_bootstrap.?.validate();
             if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
                 try bootstrapper.prepareBackupRestore(record);
-            } else if (self.cfg.replica_root_dir) |replica_root_dir| {
-                try backup_restore.applyBackupRestoreFromRecord(
-                    self.alloc,
-                    replica_root_dir,
-                    record.group_id,
-                    record.backup_restore_bootstrap.?,
-                );
             } else {
                 return error.MissingBackupRestoreBootstrapHandler;
             }
@@ -1610,8 +1604,12 @@ test "host invokes backup restore bootstrapper exactly once before creating a re
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-91",
+            .artifact_backup_id = "snap-91",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-91/groups/91",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
 
@@ -1646,8 +1644,12 @@ test "host invokes backup restore bootstrapper exactly once before creating a re
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-91",
+            .artifact_backup_id = "snap-91",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-91/groups/91",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
     try std.testing.expectEqual(@as(usize, 1), bootstrapper.count);
@@ -1711,8 +1713,12 @@ test "host records backup restore bootstrap failure when no handler is available
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-92",
+            .artifact_backup_id = "snap-92",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-92/groups/92",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     }));
 
@@ -1743,8 +1749,12 @@ test "host records committed bootstrap durability as pending instead of failed" 
     defer host.deinit();
     const restore: catalog.BackupRestoreBootstrapRecord = .{
         .backup_id = "snap-pending",
+        .artifact_backup_id = "snap-pending",
         .location = "file:///tmp/backups",
         .snapshot_path = "snap-pending/groups/94",
+        .connection = "backup-store",
+        .artifact_size_bytes = 4096,
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     };
 
     host.noteBootstrapPreparing(94, .backup_db_snapshot_restore, restore);
@@ -1761,7 +1771,7 @@ test "host records committed bootstrap durability as pending instead of failed" 
     try std.testing.expectEqual(@as(usize, 0), metrics.backup_bootstrap_successes);
 }
 
-test "host records backup restore bootstrap failure details" {
+test "host does not perform path restore without a bootstrap authority owner" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -1820,15 +1830,19 @@ test "host records backup restore bootstrap failure details" {
     });
     defer host.deinit();
 
-    try std.testing.expectError(error.InvalidBackupLocation, host.ensureReplica(.{
+    try std.testing.expectError(error.MissingBackupRestoreBootstrapHandler, host.ensureReplica(.{
         .group_id = 93,
         .replica_id = 1,
         .local_node_id = 1,
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-93",
-            .location = "file://relative/path",
+            .artifact_backup_id = "snap-93",
+            .location = "file:///tmp/backups",
             .snapshot_path = "snap-93/groups/93",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     }));
 
@@ -1838,7 +1852,7 @@ test "host records backup restore bootstrap failure details" {
     try std.testing.expectEqual(.failed, bootstrap_status.phase);
     try std.testing.expectEqual(@as(u64, 1), bootstrap_status.attempts);
     try std.testing.expect(bootstrap_status.last_updated_at_millis > 0);
-    try std.testing.expectEqualStrings("InvalidBackupLocation", bootstrap_status.last_error orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings("MissingBackupRestoreBootstrapHandler", bootstrap_status.last_error orelse return error.TestExpectedEqual);
     try std.testing.expectEqualStrings("snap-93", bootstrap_status.backup_id orelse return error.TestExpectedEqual);
     try std.testing.expectEqualStrings("snap-93/groups/93", bootstrap_status.snapshot_path orelse return error.TestExpectedEqual);
     const host_metrics = host.metricsSnapshot();
@@ -1847,7 +1861,45 @@ test "host records backup restore bootstrap failure details" {
     try std.testing.expectEqual(@as(usize, 1), host_metrics.backup_bootstrap_failures);
 }
 
-test "host falls back to replica root backup restore when no bootstrapper is installed" {
+const TestBackupRestoreBootstrapper = struct {
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    open_options: @import("../api/backups.zig").OpenOptions,
+
+    fn iface(self: *@This()) BackupRestoreBootstrapper {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .prepare_backup_restore = prepareBackupRestore },
+        };
+    }
+
+    fn prepareBackupRestore(ptr: *anyopaque, record: catalog.ReplicaRecord) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try backup_restore.applyBackupRestoreFromRecordWithOptions(
+            self.alloc,
+            self.replica_root_dir,
+            record.group_id,
+            record.backup_restore_bootstrap orelse return error.MissingBootstrapRecord,
+            self.open_options,
+        );
+    }
+};
+
+fn testBackupRestoreNodeConfig(alloc: std.mem.Allocator) !@import("../common/config.zig").Config {
+    return @import("../common/config.zig").Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
+test "host restores through an explicitly authorized bootstrap owner" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -1933,10 +1985,20 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testBackupRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -1949,6 +2011,8 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/91",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -1960,11 +2024,20 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var bootstrapper = TestBackupRestoreBootstrapper{
+        .alloc = std.testing.allocator,
+        .replica_root_dir = replica_root,
+        .open_options = .{
+            .node_config = &node_config,
+            .io = io_impl.io(),
+        },
+    };
     var host = Host.init(std.testing.allocator, .{
         .local_node_id = 1,
         .replica_root_dir = replica_root,
     }, .{
         .descriptor_factory = factory.iface(),
+        .backup_restore_bootstrapper = bootstrapper.iface(),
     });
     defer host.deinit();
 
@@ -1975,8 +2048,12 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap1",
+            .artifact_backup_id = "snap1",
             .location = restore_location,
             .snapshot_path = "snap1/groups/91",
+            .connection = "test-backups",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         },
     });
 
@@ -2080,10 +2157,28 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testBackupRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    var bootstrapper = TestBackupRestoreBootstrapper{
+        .alloc = std.testing.allocator,
+        .replica_root_dir = replica_root,
+        .open_options = .{
+            .node_config = &node_config,
+            .io = io_impl.io(),
+        },
+    };
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -2096,6 +2191,8 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/92",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -2116,6 +2213,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         }, .{
             .descriptor_factory = factory.iface(),
             .replica_catalog = file_catalog.catalog(),
+            .backup_restore_bootstrapper = bootstrapper.iface(),
         });
         defer host.deinit();
 
@@ -2126,8 +2224,12 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "snap1",
+                .artifact_backup_id = "snap1",
                 .location = restore_location,
                 .snapshot_path = "snap1/groups/92",
+                .connection = "test-backups",
+                .artifact_size_bytes = artifact_integrity.size_bytes,
+                .artifact_sha256 = artifact_integrity.sha256,
             },
         });
     }
@@ -2146,6 +2248,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         }, .{
             .descriptor_factory = restarted_factory.iface(),
             .replica_catalog = reopened_catalog.catalog(),
+            .backup_restore_bootstrapper = bootstrapper.iface(),
         });
         defer restarted_host.deinit();
 

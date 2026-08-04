@@ -133,14 +133,42 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
 
-    try model.ensureEmbeddingAssets(
-        opts.texts.items.len > 0,
-        opts.image_paths.items.len > 0,
-        opts.audio_paths.items.len > 0,
-    );
-    const ensured_assets_at = std.Io.Timestamp.now(io, .awake);
-    var pipeline = model.embeddingPipeline(allocator);
+    const has_primary_inputs = opts.texts.items.len > 0 or opts.image_paths.items.len > 0;
+    var asset_lease = model.acquireEmbeddingAssetLease(opts.audio_paths.items.len > 0);
+    defer asset_lease.release();
+    var pipeline = initial_pipeline: {
+        model.lockEmbeddingAssets();
+        defer model.unlockEmbeddingAssets();
+        if (opts.audio_paths.items.len > 0)
+            try model.ensureAudioEmbeddingAssetsLocked()
+        else
+            try model.ensurePrimaryEmbeddingAssetsLocked(opts.texts.items.len > 0, opts.image_paths.items.len > 0);
+        break :initial_pipeline model.embeddingPipelineLocked(allocator);
+    };
+    errdefer if (opts.audio_paths.items.len > 0) releaseAudioEmbeddingAssets(model);
+    const ensured_initial_assets_at = std.Io.Timestamp.now(io, .awake);
     pipeline.print_timing = opts.print_timing;
+
+    const audio_bytes = try loadFiles(allocator, opts.audio_paths.items);
+    const loaded_audio_at = std.Io.Timestamp.now(io, .awake);
+    defer freeOwnedBytes(allocator, audio_bytes);
+    const audio_embeddings = if (audio_bytes.len > 0) audio: {
+        defer releaseAudioEmbeddingAssets(model);
+        break :audio try pipeline.embedAudio(audio_bytes);
+    } else try allocator.alloc([]f32, 0);
+    const embedded_audio_at = std.Io.Timestamp.now(io, .awake);
+    defer freeEmbeddings(allocator, audio_embeddings);
+
+    if (opts.audio_paths.items.len > 0 and has_primary_inputs) {
+        asset_lease.downgradeExclusiveToShared();
+        model.lockEmbeddingAssets();
+        defer model.unlockEmbeddingAssets();
+        try model.ensurePrimaryEmbeddingAssetsLocked(opts.texts.items.len > 0, opts.image_paths.items.len > 0);
+        model.bindEmbeddingPipelineAssetsLocked(&pipeline);
+    } else if (opts.audio_paths.items.len > 0) {
+        asset_lease.release();
+    }
+    const ensured_primary_assets_at = std.Io.Timestamp.now(io, .awake);
 
     const text_embeddings = if (opts.texts.items.len > 0)
         try pipeline.embed(opts.texts.items)
@@ -158,16 +186,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         try allocator.alloc([]f32, 0);
     const embedded_images_at = std.Io.Timestamp.now(io, .awake);
     defer freeEmbeddings(allocator, image_embeddings);
-
-    const audio_bytes = try loadFiles(allocator, opts.audio_paths.items);
-    const loaded_audio_at = std.Io.Timestamp.now(io, .awake);
-    defer freeOwnedBytes(allocator, audio_bytes);
-    const audio_embeddings = if (audio_bytes.len > 0)
-        try pipeline.embedAudio(audio_bytes)
-    else
-        try allocator.alloc([]f32, 0);
-    const embedded_audio_at = std.Io.Timestamp.now(io, .awake);
-    defer freeEmbeddings(allocator, audio_embeddings);
+    asset_lease.release();
 
     try writeResultJson(
         allocator,
@@ -180,20 +199,27 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const finished_at = std.Io.Timestamp.now(io, .awake);
     if (opts.print_timing) {
         print(
-            "timing_ms: load_model={d} ensure_assets={d} text={d} image_load={d} image={d} audio_load={d} audio={d} write_json={d} total={d}\n",
+            "timing_ms: load_model={d} ensure_initial_assets={d} audio_load={d} audio={d} ensure_primary_assets={d} text={d} image_load={d} image={d} write_json={d} total={d}\n",
             .{
                 durationMillis(started_at, loaded_model_at),
-                durationMillis(loaded_model_at, ensured_assets_at),
-                durationMillis(ensured_assets_at, embedded_text_at),
+                durationMillis(loaded_model_at, ensured_initial_assets_at),
+                durationMillis(ensured_initial_assets_at, loaded_audio_at),
+                durationMillis(loaded_audio_at, embedded_audio_at),
+                durationMillis(embedded_audio_at, ensured_primary_assets_at),
+                durationMillis(ensured_primary_assets_at, embedded_text_at),
                 durationMillis(embedded_text_at, loaded_images_at),
                 durationMillis(loaded_images_at, embedded_images_at),
-                durationMillis(embedded_images_at, loaded_audio_at),
-                durationMillis(loaded_audio_at, embedded_audio_at),
-                durationMillis(embedded_audio_at, finished_at),
+                durationMillis(embedded_images_at, finished_at),
                 durationMillis(started_at, finished_at),
             },
         );
     }
+}
+
+fn releaseAudioEmbeddingAssets(model: *model_manager_mod.LoadedModel) void {
+    model.lockEmbeddingAssets();
+    defer model.unlockEmbeddingAssets();
+    model.releaseAudioEmbeddingAssetsLocked();
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {

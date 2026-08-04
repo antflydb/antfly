@@ -25,8 +25,8 @@ type mockHandler struct {
 	listIndexesFn func(ctx context.Context, tableName string) ([]IndexInfo, error)
 	queryFn       func(ctx context.Context, req QueryRequest) (*QueryResult, error)
 	batchFn       func(ctx context.Context, tableName string, inserts map[string]any, deletes []string) (*BatchResult, error)
-	backupFn      func(ctx context.Context, tableName, backupID, location string) error
-	restoreFn     func(ctx context.Context, tableName, backupID, location string) error
+	backupFn      func(ctx context.Context, tableName, backupID, connection, location string) error
+	restoreFn     func(ctx context.Context, tableName, backupID, connection, location string) error
 }
 
 func (m *mockHandler) CreateTable(ctx context.Context, name string, numShards int, schemaJSON string) error {
@@ -85,16 +85,16 @@ func (m *mockHandler) Batch(ctx context.Context, tableName string, inserts map[s
 	return &BatchResult{}, nil
 }
 
-func (m *mockHandler) Backup(ctx context.Context, tableName, backupID, location string) error {
+func (m *mockHandler) Backup(ctx context.Context, tableName, backupID, connection, location string) error {
 	if m.backupFn != nil {
-		return m.backupFn(ctx, tableName, backupID, location)
+		return m.backupFn(ctx, tableName, backupID, connection, location)
 	}
 	return nil
 }
 
-func (m *mockHandler) Restore(ctx context.Context, tableName, backupID, location string) error {
+func (m *mockHandler) Restore(ctx context.Context, tableName, backupID, connection, location string) error {
 	if m.restoreFn != nil {
-		return m.restoreFn(ctx, tableName, backupID, location)
+		return m.restoreFn(ctx, tableName, backupID, connection, location)
 	}
 	return nil
 }

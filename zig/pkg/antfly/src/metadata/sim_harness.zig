@@ -28,6 +28,7 @@ const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
+const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -51,9 +52,11 @@ const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
+const storage_sim = @import("../storage/sim_runtime.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
@@ -1563,7 +1566,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
 
     const verification_index = transition_observer_index orelse (currentMetadataLeaderIndex(&cluster) orelse query_index);
     const retirement = try retireFinalizedSplitTransition(cluster.node(verification_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     try verifySplitPublicTraffic(&cluster, &client, public_api.api_base_uris[0..], public_api.catalog_sources[verification_index].iface(), client_base, "docs", roots[0..], cfg.verify);
 }
@@ -1716,8 +1719,8 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
 
     const verification_index = transition_observer_index orelse (currentMetadataLeaderIndex(&cluster) orelse query_index);
     const retirement = try retireFinalizedMergeTransition(cluster.node(verification_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     try verifyMergePublicTraffic(&cluster, &client, public_api.api_base_uris[0..], public_api.catalog_sources[verification_index].iface(), client_base, "docs", roots[0..], left_group_id, right_group_id, cfg.verify);
 }
@@ -1843,10 +1846,26 @@ fn buildHealthyStoreStatusReports(
     for (group_statuses) |base_status| {
         var voter_count: u16 = 0;
         var leader_store_id: ?u64 = null;
+        var voter_set_known = false;
+        var voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint =
+            [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len;
         for (projected_intents) |intent| {
             if (intent.record.group_id != base_status.group_id) continue;
             if (intent.store_id == 0) continue;
-            voter_count += 1;
+            if (!voter_set_known) {
+                const normalized_voter_count = metadata_table_manager.normalizedVoterCount(
+                    intent.peer_node_ids,
+                    intent.record.local_node_id,
+                );
+                if (normalized_voter_count <= std.math.maxInt(u16)) {
+                    voter_count = @intCast(normalized_voter_count);
+                    voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(
+                        intent.peer_node_ids,
+                        intent.record.local_node_id,
+                    );
+                    voter_set_known = true;
+                }
+            }
             if (leader_store_id == null or intent.store_id < leader_store_id.?) leader_store_id = intent.store_id;
         }
 
@@ -1869,6 +1888,9 @@ fn buildHealthyStoreStatusReports(
             status.empty = false;
             status.local_voter = true;
             status.voter_count = voter_count;
+            status.voter_set_known = voter_set_known;
+            status.voter_set_fingerprint = voter_set_fingerprint;
+            status.raft_membership_index = @intFromBool(voter_set_known);
             status.local_leader = store_id == leader_store_id.?;
 
             const existing = reports[report_index].group_statuses;
@@ -1969,6 +1991,8 @@ fn publishSimulatedRaftGroupStatus(
             }
             report.relocation_generation = local_intent.?.relocation_generation;
             report.raft_applied_index = status.applied_index;
+            report.raft_term = status.hard.current_term;
+            report.raft_membership_index = status.applied_index;
             report.updated_at_millis = cluster.manual_clock.clock().nowRealtimeMs();
             report.local_leader = status.soft.role == .leader;
             report.local_voter = local_voter;
@@ -2764,7 +2788,17 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn removeTable(self: MetadataHttpNodeSimulation, table_id: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const fence = try store.getTableTransitionFence(
+            self.cluster.metadata_group_id,
+            table_id,
+        );
+        if (fence.active()) return error.TableTransitionActive;
+        try self.proposeTransitionCommand(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = fence.generation,
+        } });
     }
 
     pub fn upsertRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.RangeRecord) !void {
@@ -2800,13 +2834,18 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn requestReallocation(self: MetadataHttpNodeSimulation, requested_at_ms: u64) !void {
+        const request_id = self.cluster.next_reallocation_request_id;
+        self.cluster.next_reallocation_request_id +|= 1;
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
+            .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
     }
 
-    pub fn clearReallocationRequest(self: MetadataHttpNodeSimulation) !void {
-        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    pub fn clearReallocationRequest(self: MetadataHttpNodeSimulation, expected_request_id: u128) !void {
+        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
     }
 
     pub fn applyReconciliationPlan(self: MetadataHttpNodeSimulation, plan: *const metadata_reconciler.ReconciliationPlan) !void {
@@ -2836,11 +2875,25 @@ pub const MetadataHttpNodeSimulation = struct {
                 .local_node_id = record.local_node_id,
             } });
         }
-        for (plan.table_removals) |table_id| try commands.append(self.cluster.alloc, .{ .remove_table = .{ .table_id = table_id } });
+        for (plan.table_removals) |table_id| {
+            const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+                return error.MissingMetadataStore;
+            const fence = try store.getTableTransitionFence(
+                self.cluster.metadata_group_id,
+                table_id,
+            );
+            if (fence.active()) return error.TableTransitionActive;
+            try commands.append(self.cluster.alloc, .{ .remove_table = .{
+                .table_id = table_id,
+                .expected_transition_generation = fence.generation,
+            } });
+        }
         for (plan.range_removals) |group_id| try commands.append(self.cluster.alloc, .{ .remove_range = .{ .group_id = group_id } });
         for (plan.split_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_split_transition = .{ .transition_id = transition_id } });
         for (plan.merge_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_merge_transition = .{ .transition_id = transition_id } });
-        if (plan.clear_reallocation_request) try commands.append(self.cluster.alloc, .{ .remove_reallocation_request = .{} });
+        if (plan.clear_reallocation_request) |expected| try commands.append(self.cluster.alloc, .{
+            .remove_reallocation_request = .{ .expected_request_id = expected },
+        });
 
         try self.proposeTransitionCommands(commands.items);
     }
@@ -3039,6 +3092,7 @@ pub const MetadataHttpClusterSimulation = struct {
     manual_clock: *platform_clock.ManualClock,
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
+    next_reallocation_request_id: u128 = 1,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
     const min_pending_reconcile_lease_retry_ms: u64 = 250;
@@ -3231,6 +3285,27 @@ pub const MetadataHttpClusterSimulation = struct {
         }
         _ = try self.virtual_network.advanceTicks(1);
         for (0..self.cluster.nodes.len) |i| {
+            try self.refreshOwnedMetadataRuntimes(i);
+        }
+    }
+
+    pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
+        std.debug.assert(stalled_index < self.cluster.nodes.len);
+        self.manual_clock.advanceMs(100);
+        _ = try self.virtual_network.drainDue(null);
+        for (0..self.cluster.nodes.len) |i| {
+            if (i == stalled_index) continue;
+            try self.refreshOwnedMetadataRuntimes(i);
+        }
+        for (0..self.cluster.nodes.len) |i| {
+            if (i == stalled_index) continue;
+            _ = try self.cluster.node(i).stepOnce();
+            _ = try self.virtual_network.drainDue(null);
+            try self.refreshOwnedMetadataRuntimes(i);
+        }
+        _ = try self.virtual_network.advanceTicks(1);
+        for (0..self.cluster.nodes.len) |i| {
+            if (i == stalled_index) continue;
             try self.refreshOwnedMetadataRuntimes(i);
         }
     }
@@ -3772,7 +3847,24 @@ fn waitForSplitTransitionFinalized(
         .observer_index = observer_index,
         .fallback_index = fallback_index,
     };
-    return try cluster.runUntil(max_rounds, &ctx, metadataSplitTransitionFinalizedProgressPredicate);
+    const completed = try cluster.runUntil(max_rounds, &ctx, metadataSplitTransitionFinalizedProgressPredicate);
+    if (!completed) {
+        for (0..cluster.cluster.nodes.len) |index| {
+            const metrics = cluster.node(index).serviceMetrics();
+            const local = try cluster.node(index).sim().observeSplitTransition(transition_id);
+            std.debug.print(
+                "split timeout node={d} queued={d} stepped={d} completed={d} local_phase={s}\n",
+                .{
+                    index,
+                    metrics.queued_split_transitions,
+                    metrics.stepped_split_transitions,
+                    metrics.completed_split_transitions,
+                    if (local) |observation| @tagName(observation.status.phase) else "none",
+                },
+            );
+        }
+    }
+    return completed;
 }
 
 fn waitForMergeTransitionFinalized(
@@ -3787,7 +3879,24 @@ fn waitForMergeTransitionFinalized(
         .observer_index = observer_index,
         .fallback_index = fallback_index,
     };
-    return try cluster.runUntil(max_rounds, &ctx, metadataMergeTransitionFinalizedProgressPredicate);
+    const completed = try cluster.runUntil(max_rounds, &ctx, metadataMergeTransitionFinalizedProgressPredicate);
+    if (!completed) {
+        for (0..cluster.cluster.nodes.len) |index| {
+            const metrics = cluster.node(index).serviceMetrics();
+            const local = try cluster.node(index).sim().observeMergeTransition(transition_id);
+            std.debug.print(
+                "merge timeout node={d} queued={d} stepped={d} completed={d} local_phase={s}\n",
+                .{
+                    index,
+                    metrics.queued_merge_transitions,
+                    metrics.stepped_merge_transitions,
+                    metrics.completed_merge_transitions,
+                    if (local) |observation| @tagName(observation.receiver.phase) else "none",
+                },
+            );
+        }
+    }
+    return completed;
 }
 
 fn findProjectedStore(records: []const metadata_table_manager.StoreRecord, store_id: u64) ?metadata_table_manager.StoreRecord {
@@ -4180,6 +4289,10 @@ fn retireFinalizedSplitTransition(
     const terminal = try requireLeasedReconcile(node, loop);
     try std.testing.expectEqual(@as(usize, 1), terminal.split_upserts);
     try std.testing.expectEqual(@as(usize, 0), terminal.split_removals);
+    // The terminal transition is the write-ahead publication boundary.
+    // Topology must remain fenced until that marker is durably projected.
+    try std.testing.expectEqual(@as(usize, 0), terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 0), terminal.range_removals);
     try node.cluster.stepAll();
 
     const removal = try requireLeasedReconcile(node, loop);
@@ -4200,6 +4313,8 @@ fn retireFinalizedMergeTransition(
     const terminal = try requireLeasedReconcile(node, loop);
     try std.testing.expectEqual(@as(usize, 1), terminal.merge_upserts);
     try std.testing.expectEqual(@as(usize, 0), terminal.merge_removals);
+    try std.testing.expectEqual(@as(usize, 0), terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 0), terminal.range_removals);
     try node.cluster.stepAll();
 
     const removal = try requireLeasedReconcile(node, loop);
@@ -4217,7 +4332,7 @@ fn bootstrapDesiredLoop(
 }
 
 fn currentGroupStatusTimestampMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    return platform_clock.Clock.real().nowRealtimeMs();
 }
 
 fn metadataBlackholeEndpoints() []const peer_resolver.PeerEndpoint {
@@ -4410,6 +4525,68 @@ fn applyDropIndexMutation(
     try target.runRound();
 }
 
+const PublicApiLinearizableReadDriver = struct {
+    cluster: ?*MetadataHttpClusterSimulation = null,
+    node_index: usize,
+    completed: std.atomic.Value(bool) = .init(false),
+    max_rounds: usize = 48,
+    request_sequence: u64 = 0,
+    active_group_id: u64 = 0,
+    active_request_context: [96]u8 = undefined,
+    active_request_context_len: usize = 0,
+
+    fn activeRequestContext(self: *const @This()) []const u8 {
+        return self.active_request_context[0..self.active_request_context_len];
+    }
+
+    fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .on_read_states = onReadStates },
+        };
+    }
+
+    fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (group_id != self.active_group_id) return;
+        const request_context = self.activeRequestContext();
+        for (read_states) |read_state| {
+            if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
+                self.completed.store(true, .release);
+                return;
+            }
+        }
+    }
+
+    fn ensure(self: *@This()) !void {
+        const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
+        self.completed.store(false, .release);
+        self.request_sequence +%= 1;
+        if (self.request_sequence == 0) self.request_sequence = 1;
+        self.active_group_id = cluster.metadata_group_id;
+        const context = try std.fmt.bufPrint(
+            &self.active_request_context,
+            "public-api-linearizable-read/{d}/{d}",
+            .{ self.node_index, self.request_sequence },
+        );
+        self.active_request_context_len = context.len;
+        cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
+            cluster.metadata_group_id,
+            self.activeRequestContext(),
+        ) catch |err| switch (err) {
+            error.NotLeader => return error.NotLeader,
+            else => return err,
+        };
+
+        var rounds: usize = 0;
+        while (rounds < self.max_rounds) : (rounds += 1) {
+            try cluster.stepAll();
+            if (self.completed.load(.acquire)) return;
+        }
+        return error.MetadataLinearizableReadTimeout;
+    }
+};
+
 const PublicApiStatusSource = struct {
     const MetadataSnapshotMode = enum {
         local,
@@ -4418,6 +4595,7 @@ const PublicApiStatusSource = struct {
 
     node: MetadataHttpNodeSimulation,
     metadata_snapshot_mode: MetadataSnapshotMode = .local,
+    linearizable_read_driver: ?*PublicApiLinearizableReadDriver = null,
 
     fn metadataNode(self: @This()) MetadataHttpNodeSimulation {
         return switch (self.metadata_snapshot_mode) {
@@ -4433,6 +4611,7 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
+                .ensure_linearizable_read = ensureLinearizableRead,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
@@ -4455,6 +4634,19 @@ const PublicApiStatusSource = struct {
 
     fn cachedAdminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
         return try adminSnapshot(ptr);
+    }
+
+    fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.linearizable_read_driver) |driver| return try driver.ensure();
+        const target = self.metadataNode();
+        const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (target.index != leader_index) return error.NotLeader;
+
+        const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (raft_status.soft.role != .leader) return error.NotLeader;
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -5454,6 +5646,7 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .table_id = merge_table_id,
         .donor_group_id = merge_right_group,
         .receiver_group_id = merge_left_group,
+        .allow_doc_identity_reassignment = true,
     });
     try std.testing.expectEqual(@as(usize, 1), merge_summary.merge_upserts);
     try metadataVoprHealAll(cluster, state);
@@ -6140,8 +6333,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     defer workflow.deinit();
     const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-    _ = try requireLeasedReconcile(cluster.node(reconcile_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
 
     const split_route = try waitForPublicSplitRoute(&cluster, catalog_sources[0..], "docs", leader_index, 48);
     const left_group = split_route.left_group;
@@ -6337,8 +6529,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer workflow.deinit();
     const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-    _ = try requireLeasedReconcile(cluster.node(reconcile_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
 
     const split_route = try waitForPublicSplitRoute(&cluster, catalog_sources[0..], "docs", leader_index, 48);
     const left_group = split_route.left_group;
@@ -6377,8 +6568,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer merge_workflow.deinit();
     const merge_reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     try merge_workflow.bootstrapDesiredFromCommitted(&cluster.node(merge_reconcile_index));
-    _ = try requireLeasedReconcile(cluster.node(merge_reconcile_index), merge_workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedMergeTransition(cluster.node(merge_reconcile_index), merge_workflow.controlLoop());
     try std.testing.expect(try cluster.waitForGroupStatusCount(left_group, .active, 3, 48));
     try std.testing.expect(try cluster.waitForGroupStatus(right_group, .absent, 48));
 
@@ -6651,24 +6841,32 @@ test "metadata http cluster simulation converges placement after candidate churn
 
     try workflow.setPlacementCandidates(&.{ 2, 3 });
     const churn_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), churn_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), churn_summary.placement_removals);
+    // Relocation updates all three affected records atomically: the new
+    // learner, the draining source, and the retained voter whose peer set
+    // changes. Omitting the retained voter leaves a stale membership view.
+    try std.testing.expectEqual(@as(usize, 3), churn_summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 0), churn_summary.placement_removals);
 
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4401, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4401, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4401, .active, 40));
 
     const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
-    try std.testing.expectEqual(@as(usize, 2), intents.len);
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    var saw_one = false;
     var saw_two = false;
     var saw_three = false;
     for (intents) |intent| {
         if (intent.record.group_id != 4401) continue;
+        if (intent.record.local_node_id == 1) {
+            saw_one = true;
+            try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, intent.serving_state);
+        }
         if (intent.record.local_node_id == 2) saw_two = true;
         if (intent.record.local_node_id == 3) saw_three = true;
-        try std.testing.expect(intent.record.local_node_id != 1);
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, intent.peer_node_ids);
     }
+    try std.testing.expect(saw_one);
     try std.testing.expect(saw_two);
     try std.testing.expect(saw_three);
 }
@@ -6839,6 +7037,7 @@ test "metadata http cluster simulation drives merge intent through the control l
         .table_id = 46,
         .donor_group_id = 4602,
         .receiver_group_id = 4601,
+        .allow_doc_identity_reassignment = true,
     });
     try std.testing.expectEqual(@as(usize, 1), merge_summary.merge_upserts);
 
@@ -6945,7 +7144,7 @@ test "metadata http cluster simulation drives automatic split through the contro
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7275,7 +7474,7 @@ test "metadata http cluster simulation completes automatic split after metadata 
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7375,7 +7574,7 @@ test "metadata http cluster simulation completes automatic split after metadata 
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 64));
 
     const retirement = try retireFinalizedSplitTransition(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7480,7 +7679,7 @@ test "metadata http cluster simulation completes automatic split under delayed r
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7588,7 +7787,7 @@ test "metadata http cluster simulation completes automatic split after leader re
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7690,7 +7889,7 @@ test "metadata http cluster simulation completes automatic split after source gr
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7810,7 +8009,7 @@ test "metadata http cluster simulation completes automatic split after destinati
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     if (destination_progress.group_index == null) {
         const post_finalize_destination = (try waitForGroupLeaderIndex(&cluster, destination_group_id, 96)) orelse return error.TestExpectedEqual;
@@ -7918,7 +8117,7 @@ test "metadata http cluster simulation completes automatic split after leader pa
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 160));
 
     const retirement = try retireFinalizedSplitTransition(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8131,8 +8330,8 @@ test "metadata http cluster simulation drives automatic merge through the contro
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8241,8 +8440,8 @@ test "metadata http cluster simulation completes automatic merge after metadata 
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8348,8 +8547,8 @@ test "metadata http cluster simulation completes automatic merge after donor gro
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8455,8 +8654,8 @@ test "metadata http cluster simulation completes automatic merge after receiver 
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8560,8 +8759,8 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 64));
 
     const retirement = try retireFinalizedMergeTransition(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8670,8 +8869,8 @@ test "metadata http cluster simulation completes automatic merge under delayed r
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8783,8 +8982,8 @@ test "metadata http cluster simulation completes automatic merge after leader re
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8895,8 +9094,8 @@ test "metadata http cluster simulation completes automatic merge after leader pa
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 160));
 
     const retirement = try retireFinalizedMergeTransition(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -9177,7 +9376,7 @@ test "metadata http cluster simulation publishes split topology after finalize" 
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     const ranges = try cluster.node(query_index).listProjectedRanges(std.testing.allocator);
     defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, ranges);
@@ -9267,14 +9466,15 @@ test "metadata http cluster simulation publishes merge topology after finalize" 
         .table_id = 48,
         .donor_group_id = 4802,
         .receiver_group_id = 4801,
+        .allow_doc_identity_reassignment = true,
     });
 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, 48001, null, leader_index, 32));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     const ranges = try cluster.node(query_index).listProjectedRanges(std.testing.allocator);
     defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, ranges);
@@ -9364,7 +9564,7 @@ test "metadata http cluster simulation provisions split destination replicas acr
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedSplitTransition(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
     try std.testing.expect(try cluster.waitForGroupStatus(4811, .active, 40));
     try std.testing.expect(try cluster.waitForGroupStatus(4812, .active, 40));
@@ -9451,14 +9651,15 @@ test "metadata http cluster simulation retires merge donor replicas across nodes
         .table_id = 482,
         .donor_group_id = 4822,
         .receiver_group_id = 4821,
+        .allow_doc_identity_reassignment = true,
     });
 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, 48201, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const retirement = try retireFinalizedMergeTransition(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.removal.range_removals);
 
     try std.testing.expect(try cluster.waitForGroupStatus(4821, .active, 40));
     try std.testing.expect(try cluster.waitForGroupStatus(4822, .absent, 40));
@@ -9909,8 +10110,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, 48401, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    _ = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedSplitTransition(cluster.node(query_index), workflow.controlLoop());
 
     var left_host: ?usize = null;
     var right_host: ?usize = null;
@@ -10192,13 +10392,13 @@ test "metadata http cluster simulation forwards public table io after merge fina
         .table_id = 485,
         .donor_group_id = 4852,
         .receiver_group_id = 4851,
+        .allow_doc_identity_reassignment = true,
     });
 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, 48501, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    _ = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try cluster.stepAll();
+    _ = try retireFinalizedMergeTransition(cluster.node(query_index), workflow.controlLoop());
 
     var receiver_host: ?usize = null;
     for (0..3) |i| {
@@ -10362,7 +10562,7 @@ test "metadata http cluster simulation reconverges placement from committed node
     try cluster.stepAll();
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), reconcile_summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4701, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4701, .active, 1));
@@ -10457,7 +10657,7 @@ test "metadata http cluster simulation reconverges placement from committed live
     try cluster.stepAll();
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), reconcile_summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4801, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4801, .active, 1));
@@ -10549,7 +10749,7 @@ test "metadata http cluster simulation drains node through shutdown API" {
     try cluster.assertProgress("metadata-sim-node-shutdown-drain-requested", 32, &drain_ctx, voprStoreDrainProgressPredicate);
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), reconcile_summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4821, .absent, 64));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4821, .active, 1));
@@ -10765,7 +10965,7 @@ test "metadata http cluster simulation rebalances after store capacity churn" {
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5001, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5001, .active, 1));
@@ -10862,7 +11062,7 @@ test "metadata http cluster simulation survives leader restart after reported st
     try cluster.restartNode(leader_index);
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
     const summary = try requireLeasedReconcile(cluster.node(new_leader), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5201, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5201, .active, 1));
@@ -10940,6 +11140,428 @@ test "metadata http cluster simulation transfers reconcile lease on leader resta
     const restarted_status = try cluster.node(leader_index).metadataStatus();
     try std.testing.expect(!restarted_status.reconcile_lease_held_by_local);
     try std.testing.expectEqual(new_leader_status.reconcile_lease_owner_node_id, restarted_status.reconcile_lease_owner_node_id);
+}
+
+test "metadata http cluster simulation recovers from a ready persistence stall without term churn" {
+    const PersistenceStall = struct {
+        cluster: ?*MetadataHttpClusterSimulation = null,
+        node_index: usize,
+        armed: bool = false,
+        fired: bool = false,
+        peer_rounds: usize = 12,
+        last_leader_node_id: u64 = 0,
+        leadership_changes: usize = 0,
+
+        fn scheduler(self: *@This()) storage_sim.CompletionScheduler {
+            return .{
+                .ctx = self,
+                .wait_ns_fn = waitNs,
+            };
+        }
+
+        fn waitNs(ptr: ?*anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!self.armed) return;
+            self.armed = false;
+            self.fired = true;
+
+            const cluster = self.cluster orelse return error.PersistenceStallClusterUnavailable;
+            const node_id = cluster.cluster.configs[self.node_index].host.http.host.local_node_id;
+            try cluster.virtual_network.partitionNode(node_id);
+            defer cluster.virtual_network.healNode(node_id);
+
+            // The callback runs synchronously inside WalReplicaState.persist().
+            // Advance only the peers while that exact durability completion is
+            // blocked, matching a slow fsync without pausing unrelated work.
+            var round: usize = 0;
+            while (round < self.peer_rounds) : (round += 1) {
+                try cluster.stepAllExcept(self.node_index);
+                try self.observePeerLeadership(cluster);
+            }
+        }
+
+        fn observePeerLeadership(
+            self: *@This(),
+            cluster: *MetadataHttpClusterSimulation,
+        ) !void {
+            var observed_leader_node_id: u64 = 0;
+            for (0..cluster.cluster.nodes.len) |index| {
+                if (index == self.node_index) continue;
+                const status = cluster.cluster.node(index).raftStatus(4972) orelse continue;
+                if (status.soft.role != .leader) continue;
+                const node_id = cluster.cluster.configs[index].host.http.host.local_node_id;
+                if (observed_leader_node_id != 0 and observed_leader_node_id != node_id) {
+                    return error.MultiplePersistenceStallPeerLeaders;
+                }
+                observed_leader_node_id = node_id;
+            }
+            if (observed_leader_node_id == 0 or observed_leader_node_id == self.last_leader_node_id) return;
+            self.last_leader_node_id = observed_leader_node_id;
+            self.leadership_changes += 1;
+        }
+    };
+
+    const ReadBarrierRecorder = struct {
+        const contexts = [_][]const u8{
+            "issue-398-linearizable-read-0",
+            "issue-398-linearizable-read-1",
+            "issue-398-linearizable-read-2",
+            "issue-398-linearizable-read-3",
+        };
+
+        completed_mask: u8 = 0,
+
+        fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .on_read_states = onReadStates },
+            };
+        }
+
+        fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id != 4972) return;
+            for (read_states) |read_state| {
+                for (contexts, 0..) |context, index| {
+                    if (!std.mem.eql(u8, read_state.request_ctx, context)) continue;
+                    self.completed_mask |= @as(u8, 1) << @intCast(index);
+                }
+            }
+        }
+
+        fn completed(self: *const @This(), index: usize) bool {
+            return self.completed_mask & (@as(u8, 1) << @intCast(index)) != 0;
+        }
+
+        fn allCompleted(self: *const @This()) bool {
+            const expected_mask = (@as(u8, 1) << contexts.len) - 1;
+            return self.completed_mask == expected_mask;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-a", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-b", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-c", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_c);
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-a.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-b.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-c.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_c);
+
+    var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4972, root_a, cat_a),
+        makeHostSimConfig(2, 4972, root_b, cat_b),
+        makeHostSimConfig(3, 4972, root_c, cat_c),
+    };
+    var persistence_stalls = [_]PersistenceStall{
+        .{ .node_index = 0 },
+        .{ .node_index = 1 },
+        .{ .node_index = 2 },
+    };
+    for (&configs, 0..) |*config, index| {
+        config.host.http.host.replica_state_backend = .wal;
+        config.host.wal_replica_state.wal.artificial_sync_delay_ns = 1;
+        config.host.wal_replica_state.wal.commit_scheduler = persistence_stalls[index].scheduler();
+    }
+
+    var read_barriers = [_]ReadBarrierRecorder{ .{}, .{}, .{} };
+    var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+    for (&deps, 0..) |*dep, index| dep.host.read_state_observer = read_barriers[index].observer();
+
+    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4972, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    for (&persistence_stalls) |*stall| stall.cluster = &cluster;
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const stalled_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    persistence_stalls[stalled_leader].last_leader_node_id =
+        cluster.cluster.configs[stalled_leader].host.http.host.local_node_id;
+
+    persistence_stalls[stalled_leader].armed = true;
+    try cluster.node(stalled_leader).upsertStore(.{
+        .store_id = 398,
+        .node_id = cluster.cluster.configs[stalled_leader].host.http.host.local_node_id,
+        .role = "persistence-stall-probe",
+        .live = true,
+    });
+
+    var rounds: usize = 0;
+    while (rounds < 12 and !persistence_stalls[stalled_leader].fired) : (rounds += 1) try cluster.stepAll();
+    try std.testing.expect(persistence_stalls[stalled_leader].fired);
+
+    const recovered_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(recovered_leader != stalled_leader);
+
+    rounds = 0;
+    while (rounds < 24) : (rounds += 1) try cluster.stepAll();
+    const stable_status = cluster.cluster.node(recovered_leader).raftStatus(4972) orelse return error.MissingRaftStatus;
+    try std.testing.expect(stable_status.soft.role == .leader);
+    const stable_term = stable_status.hard.current_term;
+    try persistence_stalls[stalled_leader].observePeerLeadership(&cluster);
+    try std.testing.expectEqual(@as(usize, 1), persistence_stalls[stalled_leader].leadership_changes);
+    try std.testing.expectEqual(
+        cluster.cluster.configs[recovered_leader].host.http.host.local_node_id,
+        persistence_stalls[stalled_leader].last_leader_node_id,
+    );
+
+    const lease_status = try cluster.node(recovered_leader).metadataStatus();
+    try std.testing.expect(lease_status.reconcile_lease_held_by_local);
+    try std.testing.expectEqual(
+        cluster.cluster.configs[recovered_leader].host.http.host.local_node_id,
+        lease_status.reconcile_lease_owner_node_id,
+    );
+    const initial_lease_expiry_ms = lease_status.reconcile_lease_expires_at_ms;
+
+    // Exercise more than a full 2s lease TTL. Reads are issued throughout the
+    // window, every renewal is observed without a lease gap, and the leader
+    // and term are checked on every control round.
+    var observed_lease_renewal = false;
+    rounds = 0;
+    while (rounds < 32) : (rounds += 1) {
+        if (rounds % 8 == 0) {
+            const read_index = rounds / 8;
+            if (read_index > 0) try std.testing.expect(read_barriers[recovered_leader].completed(read_index - 1));
+            try cluster.cluster.node(recovered_leader).runtime.svc.requestReadableLease(
+                4972,
+                ReadBarrierRecorder.contexts[read_index],
+            );
+        }
+        try cluster.stepAll();
+        const round_status = cluster.cluster.node(recovered_leader).raftStatus(4972) orelse return error.MissingRaftStatus;
+        try std.testing.expectEqual(stable_term, round_status.hard.current_term);
+        try std.testing.expect(round_status.soft.role == .leader);
+
+        const round_lease_status = try cluster.node(recovered_leader).metadataStatus();
+        try std.testing.expect(round_lease_status.reconcile_lease_held_by_local);
+        try std.testing.expectEqual(
+            cluster.cluster.configs[recovered_leader].host.http.host.local_node_id,
+            round_lease_status.reconcile_lease_owner_node_id,
+        );
+        observed_lease_renewal = observed_lease_renewal or
+            round_lease_status.reconcile_lease_expires_at_ms > initial_lease_expiry_ms;
+    }
+    try std.testing.expect(observed_lease_renewal);
+    try std.testing.expect(read_barriers[recovered_leader].allCompleted());
+
+    for (0..3) |index| {
+        const quiet_status = cluster.cluster.node(index).raftStatus(4972) orelse return error.MissingRaftStatus;
+        try std.testing.expectEqual(stable_term, quiet_status.hard.current_term);
+        try std.testing.expectEqual(index == recovered_leader, quiet_status.soft.role == .leader);
+    }
+}
+
+test "metadata http cluster simulation load balanced backup retries a real election" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-a", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-b", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-c", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_c);
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-a.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-b.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-c.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4973, root_a, cat_a),
+        makeHostSimConfig(2, 4973, root_b, cat_b),
+        makeHostSimConfig(3, 4973, root_c, cat_c),
+    };
+    var read_drivers = [_]PublicApiLinearizableReadDriver{
+        .{ .node_index = 0 },
+        .{ .node_index = 1 },
+        .{ .node_index = 2 },
+    };
+    var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+    for (&deps, 0..) |*dep, index| dep.host.read_state_observer = read_drivers[index].observer();
+
+    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4973, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    for (&read_drivers) |*driver| driver.cluster = &cluster;
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const initial_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try cluster.publishClusterNodes(initial_leader);
+    try cluster.publishClusterStores(initial_leader);
+
+    try cluster.node(initial_leader).upsertTable(.{
+        .table_id = 398,
+        .name = "docs",
+        .description = "backup election integration",
+        .indexes_json = api_tables.default_indexes_json,
+        .placement_role = "data",
+    });
+    try cluster.node(initial_leader).upsertRange(.{
+        .group_id = 4974,
+        .table_id = 398,
+        .start_key = "",
+        .end_key = null,
+    });
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) try cluster.stepAll();
+
+    var node_config = try common_config.Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer node_config.deinit();
+
+    var db_paths: [3][]u8 = undefined;
+    var dbs: [3]db_mod.DB = undefined;
+    var db_count: usize = 0;
+    defer {
+        for (dbs[0..db_count]) |*db| db.close();
+        for (db_paths[0..db_count]) |path| std.testing.allocator.free(path);
+    }
+    var writes: [3]api_table_writes.BoundTableWriteSource = undefined;
+    for (0..3) |index| {
+        db_paths[index] = try std.fmt.allocPrint(
+            std.testing.allocator,
+            ".zig-cache/tmp/{s}/backup-election-db-{d}",
+            .{ tmp.sub_path, index },
+        );
+        dbs[index] = try db_mod.DB.open(std.testing.allocator, db_paths[index], .{});
+        db_count += 1;
+        try dbs[index].batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .timestamp_ns = 1,
+        });
+        writes[index] = api_table_writes.BoundTableWriteSource.init("docs", &dbs[index]);
+    }
+
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    defer http_io.deinit();
+    var status_sources: [3]PublicApiStatusSource = undefined;
+    var servers: [3]api_http_server.ApiHttpServer = undefined;
+    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var started: usize = 0;
+    defer {
+        for (listeners[0..started]) |*listener| listener.deinit();
+        for (servers[0..started]) |*server| server.deinit();
+    }
+    for (0..3) |index| {
+        status_sources[index] = .{
+            .node = cluster.node(index),
+            .linearizable_read_driver = &read_drivers[index],
+        };
+        servers[index] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
+            std.testing.allocator,
+            leanSimHttpAllocator(),
+            .{ .node_config = &node_config },
+            status_sources[index].iface(),
+            null,
+            writes[index].source(),
+        );
+        listeners[index] = std_http_listener.StdHttpListener.initShared(
+            leanSimHttpAllocator(),
+            lean_sim_http_listener_cfg,
+            servers[index].executor(),
+            &http_io,
+        );
+        try listeners[index].start();
+        started += 1;
+    }
+    var api_base_uris: [3][]u8 = undefined;
+    var uri_count: usize = 0;
+    defer for (api_base_uris[0..uri_count]) |uri| std.testing.allocator.free(uri);
+    for (0..3) |index| {
+        api_base_uris[index] = try listeners[index].baseUri(std.testing.allocator);
+        uri_count += 1;
+    }
+    var client_executor: std_http_executor.StdHttpExecutor = undefined;
+    client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
+    defer client_executor.deinit();
+    var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+
+    const initial_leader_node_id = cluster.cluster.configs[initial_leader].host.http.host.local_node_id;
+    try cluster.virtual_network.partitionNode(initial_leader_node_id);
+    defer cluster.virtual_network.healNode(initial_leader_node_id);
+
+    var ordered_endpoints: [3][]const u8 = undefined;
+    ordered_endpoints[0] = api_base_uris[initial_leader];
+    var next_endpoint: usize = 1;
+    for (0..3) |index| {
+        if (index == initial_leader) continue;
+        ordered_endpoints[next_endpoint] = api_base_uris[index];
+        next_endpoint += 1;
+    }
+
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-output", .{tmp.sub_path});
+    defer std.testing.allocator.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
+    defer std.testing.allocator.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
+    defer std.testing.allocator.free(location_uri);
+    const backup_body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"backup_id\":\"election-snap\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}}",
+        .{location_uri},
+    );
+    defer std.testing.allocator.free(backup_body);
+
+    var backup_response = try client.fetchClusterBackupFromEndpoints(&ordered_endpoints, backup_body);
+    defer backup_response.deinit(std.heap.page_allocator);
+    try std.testing.expect(backup_response.attempts > 1);
+    const elected_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(elected_leader != initial_leader);
+
+    var manifest = try backups_api.readClusterManifest(std.testing.allocator, backup_root_abs, "election-snap");
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
+    try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
 }
 
 test "metadata http cluster simulation skips reconcile work without lease ownership" {
@@ -11120,7 +11742,7 @@ test "metadata http cluster simulation rebalances away from high lease pressure"
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
     try std.testing.expectEqual(@as(usize, 0), summary.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 1), summary.rebalance_placement_groups);
@@ -11210,7 +11832,7 @@ test "metadata http cluster simulation repairs replica count after store recover
     try cluster.stepAll();
 
     const repair_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 3), repair_summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 2), repair_summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 0), repair_summary.placement_removals);
     try std.testing.expectEqual(@as(usize, 1), repair_summary.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 0), repair_summary.rebalance_placement_groups);
@@ -11620,7 +12242,7 @@ test "metadata http cluster simulation rebalances one table while preserving ano
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
 
     const intents_after = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
@@ -11741,7 +12363,7 @@ test "metadata http cluster simulation prefers healthy stores before degraded on
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5801, .active, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5801, .absent, 1));
@@ -11927,7 +12549,7 @@ test "metadata http cluster simulation mixes health domain and minimal-movement 
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
 
     const intents_after = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
@@ -12085,7 +12707,7 @@ test "metadata http cluster simulation respects table placement roles under chur
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
     {
         const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
@@ -12295,7 +12917,7 @@ test "metadata http cluster simulation rebalances after store class promotion an
     try cluster.stepAll();
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.placement_upserts);
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 6501, .active, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 6501, .active, 1));

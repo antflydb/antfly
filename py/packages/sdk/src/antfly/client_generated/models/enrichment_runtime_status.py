@@ -20,7 +20,9 @@ class EnrichmentRuntimeStatus:
         projection_checkpoint_status (str):
         projection_checkpoint_applied_sequence (int):
         projection_checkpoint_generation (int):
-        projection_checkpoint_config_hash (int):
+        projection_checkpoint_config_fingerprint (str):
+        projection_checkpoint_identity_consistent (bool): Whether every shard contributing to this status reports the
+            same checkpoint generation and configuration identity.
         checkpoint_replay_tail_sequence_count (int):
         processed_requests (int):
         error_count (int):
@@ -45,7 +47,9 @@ class EnrichmentRuntimeStatus:
         last_embed_batch_items (int):
         last_embed_batch_bytes (int):
         last_embed_batch_max_bytes (int):
-        last_embed_batch_ns (int):
+        last_embed_batch_completed_ms (int): Wall-clock completion time in Unix milliseconds for the most recently
+            completed embedding batch.
+        last_embed_batch_ns (int): Elapsed duration in nanoseconds for the most recently completed embedding batch.
         total_embed_ns (int):
     """
 
@@ -56,7 +60,8 @@ class EnrichmentRuntimeStatus:
     projection_checkpoint_status: str
     projection_checkpoint_applied_sequence: int
     projection_checkpoint_generation: int
-    projection_checkpoint_config_hash: int
+    projection_checkpoint_config_fingerprint: str
+    projection_checkpoint_identity_consistent: bool
     checkpoint_replay_tail_sequence_count: int
     processed_requests: int
     error_count: int
@@ -80,6 +85,7 @@ class EnrichmentRuntimeStatus:
     last_embed_batch_items: int
     last_embed_batch_bytes: int
     last_embed_batch_max_bytes: int
+    last_embed_batch_completed_ms: int
     last_embed_batch_ns: int
     total_embed_ns: int
 
@@ -98,7 +104,9 @@ class EnrichmentRuntimeStatus:
 
         projection_checkpoint_generation = self.projection_checkpoint_generation
 
-        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+        projection_checkpoint_config_fingerprint = self.projection_checkpoint_config_fingerprint
+
+        projection_checkpoint_identity_consistent = self.projection_checkpoint_identity_consistent
 
         checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
 
@@ -146,6 +154,8 @@ class EnrichmentRuntimeStatus:
 
         last_embed_batch_max_bytes = self.last_embed_batch_max_bytes
 
+        last_embed_batch_completed_ms = self.last_embed_batch_completed_ms
+
         last_embed_batch_ns = self.last_embed_batch_ns
 
         total_embed_ns = self.total_embed_ns
@@ -161,7 +171,8 @@ class EnrichmentRuntimeStatus:
                 "projection_checkpoint_status": projection_checkpoint_status,
                 "projection_checkpoint_applied_sequence": projection_checkpoint_applied_sequence,
                 "projection_checkpoint_generation": projection_checkpoint_generation,
-                "projection_checkpoint_config_hash": projection_checkpoint_config_hash,
+                "projection_checkpoint_config_fingerprint": projection_checkpoint_config_fingerprint,
+                "projection_checkpoint_identity_consistent": projection_checkpoint_identity_consistent,
                 "checkpoint_replay_tail_sequence_count": checkpoint_replay_tail_sequence_count,
                 "processed_requests": processed_requests,
                 "error_count": error_count,
@@ -185,6 +196,7 @@ class EnrichmentRuntimeStatus:
                 "last_embed_batch_items": last_embed_batch_items,
                 "last_embed_batch_bytes": last_embed_batch_bytes,
                 "last_embed_batch_max_bytes": last_embed_batch_max_bytes,
+                "last_embed_batch_completed_ms": last_embed_batch_completed_ms,
                 "last_embed_batch_ns": last_embed_batch_ns,
                 "total_embed_ns": total_embed_ns,
             }
@@ -209,7 +221,9 @@ class EnrichmentRuntimeStatus:
 
         projection_checkpoint_generation = d.pop("projection_checkpoint_generation")
 
-        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash")
+        projection_checkpoint_config_fingerprint = d.pop("projection_checkpoint_config_fingerprint")
+
+        projection_checkpoint_identity_consistent = d.pop("projection_checkpoint_identity_consistent")
 
         checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count")
 
@@ -257,6 +271,8 @@ class EnrichmentRuntimeStatus:
 
         last_embed_batch_max_bytes = d.pop("last_embed_batch_max_bytes")
 
+        last_embed_batch_completed_ms = d.pop("last_embed_batch_completed_ms")
+
         last_embed_batch_ns = d.pop("last_embed_batch_ns")
 
         total_embed_ns = d.pop("total_embed_ns")
@@ -269,7 +285,8 @@ class EnrichmentRuntimeStatus:
             projection_checkpoint_status=projection_checkpoint_status,
             projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
             projection_checkpoint_generation=projection_checkpoint_generation,
-            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            projection_checkpoint_config_fingerprint=projection_checkpoint_config_fingerprint,
+            projection_checkpoint_identity_consistent=projection_checkpoint_identity_consistent,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             processed_requests=processed_requests,
             error_count=error_count,
@@ -293,6 +310,7 @@ class EnrichmentRuntimeStatus:
             last_embed_batch_items=last_embed_batch_items,
             last_embed_batch_bytes=last_embed_batch_bytes,
             last_embed_batch_max_bytes=last_embed_batch_max_bytes,
+            last_embed_batch_completed_ms=last_embed_batch_completed_ms,
             last_embed_batch_ns=last_embed_batch_ns,
             total_embed_ns=total_embed_ns,
         )

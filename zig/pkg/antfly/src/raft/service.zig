@@ -124,6 +124,14 @@ const TestSingleNodeFactory = struct {
     }
 };
 
+const test_transition_table_contract: metadata.TransitionTableContract = .{
+    .table_id = 1,
+    .table_name = "docs",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 1, .range_id = 1 },
+    .target_identity = .{ .shard_id = 1, .range_id = 1 },
+};
+
 fn establishManagedHostTransitionAuthorityForTest(svc: *ManagedHostService, group_id: u64) !void {
     try svc.host.host.campaignGroup(group_id);
     for (0..16) |_| {
@@ -135,6 +143,19 @@ fn establishManagedHostTransitionAuthorityForTest(svc: *ManagedHostService, grou
         );
     }
     return error.SimulationProgressTimeout;
+}
+
+fn proposeManagedHostTransitionCommandsForTest(
+    svc: *ManagedHostService,
+    metadata_group_id: u64,
+    commands: []const metadata.TransitionCommand,
+) !void {
+    for (commands) |command| {
+        const encoded = try metadata.encodeTransitionCommand(std.testing.allocator, command);
+        defer std.testing.allocator.free(encoded);
+        try svc.host.host.propose(metadata_group_id, encoded);
+        _ = try svc.host.host.runRound(1, 1);
+    }
 }
 
 pub const ManagedHostService = struct {
@@ -163,9 +184,9 @@ pub const ManagedHostService = struct {
             .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
             else if (deps.transition_runtime) |runtime|
-                transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
             else
                 null,
         };
@@ -229,16 +250,27 @@ pub const ManagedHostService = struct {
         return null;
     }
 
-    pub fn replaceTransitionOps(self: *ManagedHostService, ops: shard_ops.ShardOperationAdapter) !void {
-        if (self.transition_svc) |*transition_svc| transition_svc.deinit();
-        self.transition_svc = null;
-        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
-        errdefer {
-            if (self.transition_svc) |*transition_svc| transition_svc.deinit();
-            self.transition_svc = null;
-        }
-        try self.seedTransitionsFromMetadataStore(self.host.host.cfg.metadata_group_id);
+    pub fn replaceTransitionOps(
+        self: *ManagedHostService,
+        ops: shard_ops.ShardOperationAdapter,
+    ) !shard_ops.OwnedShardOperationAdapter.Registration {
+        var replacement = try transition_service.TransitionService.initWithRetryClock(
+            self.alloc,
+            ops,
+            self.transition_retry_clock,
+        );
+        errdefer replacement.deinit();
+        try self.seedTransitionServiceFromMetadataStore(
+            &replacement,
+            self.host.host.cfg.metadata_group_id,
+        );
+        const registration = replacement.operationRegistration() orelse unreachable;
+
+        var previous = self.transition_svc;
+        self.transition_svc = replacement;
+        if (previous) |*transition_svc| transition_svc.deinit();
         self.syncTransitionMetrics();
+        return registration;
     }
 
     pub fn prepareEnrichmentRead(
@@ -350,8 +382,11 @@ pub const ManagedHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
-        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
+            if (!self.holdsTransitionAuthority()) {
+                try transition_svc.refreshPendingObservations();
+                return .{};
+            }
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
@@ -367,7 +402,7 @@ pub const ManagedHostService = struct {
 
     pub fn observeSplitTransition(self: *ManagedHostService, transition_id: u64) !?metadata.SplitObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeSplit(transition_id)) orelse return null;
+            var observation = transition_svc.observeSplit(transition_id) orelse return null;
             if (transition_svc.splitRecord(transition_id)) |record| {
                 observation.source_local_leader = observation.source_local_leader or self.host.host.isLocalLeader(record.source_group_id);
                 observation.destination_local_leader = observation.destination_local_leader or self.host.host.isLocalLeader(record.destination_group_id);
@@ -379,14 +414,14 @@ pub const ManagedHostService = struct {
 
     pub fn describeSplitTransition(self: *ManagedHostService, transition_id: u64) !?metadata.SplitExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeSplit(transition_id);
+            return transition_svc.describeSplit(transition_id);
         }
         return null;
     }
 
     pub fn observeMergeTransition(self: *ManagedHostService, transition_id: u64) !?metadata.MergeObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeMerge(transition_id)) orelse return null;
+            var observation = transition_svc.observeMerge(transition_id) orelse return null;
             if (transition_svc.mergeRecord(transition_id)) |record| {
                 observation.donor_local_leader = observation.donor_local_leader or self.host.host.isLocalLeader(record.donor_group_id);
                 observation.receiver_local_leader = observation.receiver_local_leader or self.host.host.isLocalLeader(record.receiver_group_id);
@@ -398,7 +433,7 @@ pub const ManagedHostService = struct {
 
     pub fn describeMergeTransition(self: *ManagedHostService, transition_id: u64) !?metadata.MergeExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeMerge(transition_id);
+            return transition_svc.describeMerge(transition_id);
         }
         return null;
     }
@@ -458,17 +493,27 @@ pub const ManagedHostService = struct {
     }
 
     fn seedTransitionsFromMetadataStore(self: *ManagedHostService, metadata_group_id: ?u64) !void {
-        if (self.transition_svc == null) return;
+        if (self.transition_svc) |*transition_svc| {
+            try self.seedTransitionServiceFromMetadataStore(transition_svc, metadata_group_id);
+            self.syncTransitionMetrics();
+        }
+    }
+
+    fn seedTransitionServiceFromMetadataStore(
+        self: *ManagedHostService,
+        transition_svc: *transition_service.TransitionService,
+        metadata_group_id: ?u64,
+    ) !void {
         const group_id = metadata_group_id orelse return;
         const store = self.host.owned_metadata_store orelse return;
 
         const split_records = try store.listSplitTransitions(self.alloc, group_id);
         defer store.freeSplitTransitions(self.alloc, split_records);
-        for (split_records) |record| try self.submitSplitTransition(record);
+        for (split_records) |record| try transition_svc.submitSplit(record);
 
         const merge_records = try store.listMergeTransitions(self.alloc, group_id);
         defer store.freeMergeTransitions(self.alloc, merge_records);
-        for (merge_records) |record| try self.submitMergeTransition(record);
+        for (merge_records) |record| try transition_svc.submitMerge(record);
     }
 };
 
@@ -499,9 +544,9 @@ pub const ManagedHttpHostService = struct {
             .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
             else if (deps.transition_runtime) |runtime|
-                transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
             else
                 null,
         };
@@ -545,16 +590,27 @@ pub const ManagedHttpHostService = struct {
         return try self.host.beginDataApplyGroupTransition(group_ids);
     }
 
-    pub fn replaceTransitionOps(self: *ManagedHttpHostService, ops: shard_ops.ShardOperationAdapter) !void {
-        if (self.transition_svc) |*transition_svc| transition_svc.deinit();
-        self.transition_svc = null;
-        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
-        errdefer {
-            if (self.transition_svc) |*transition_svc| transition_svc.deinit();
-            self.transition_svc = null;
-        }
-        try self.seedTransitionsFromMetadataStore(self.host.http_host.host.cfg.metadata_group_id);
+    pub fn replaceTransitionOps(
+        self: *ManagedHttpHostService,
+        ops: shard_ops.ShardOperationAdapter,
+    ) !shard_ops.OwnedShardOperationAdapter.Registration {
+        var replacement = try transition_service.TransitionService.initWithRetryClock(
+            self.alloc,
+            ops,
+            self.transition_retry_clock,
+        );
+        errdefer replacement.deinit();
+        try self.seedTransitionServiceFromMetadataStore(
+            &replacement,
+            self.host.http_host.host.cfg.metadata_group_id,
+        );
+        const registration = replacement.operationRegistration() orelse unreachable;
+
+        var previous = self.transition_svc;
+        self.transition_svc = replacement;
+        if (previous) |*transition_svc| transition_svc.deinit();
         self.syncTransitionMetrics();
+        return registration;
     }
 
     pub fn submit(self: *ManagedHttpHostService, update: metadata_view.MetadataUpdate) !void {
@@ -727,8 +783,11 @@ pub const ManagedHttpHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHttpHostService) !transition_service.TransitionStepResult {
-        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
+            if (!self.holdsTransitionAuthority()) {
+                try transition_svc.refreshPendingObservations();
+                return .{};
+            }
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
@@ -744,7 +803,7 @@ pub const ManagedHttpHostService = struct {
 
     pub fn observeSplitTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.SplitObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeSplit(transition_id)) orelse return null;
+            var observation = transition_svc.observeSplit(transition_id) orelse return null;
             if (transition_svc.splitRecord(transition_id)) |record| {
                 observation.source_local_leader = observation.source_local_leader or self.host.http_host.host.isLocalLeader(record.source_group_id);
                 observation.destination_local_leader = observation.destination_local_leader or self.host.http_host.host.isLocalLeader(record.destination_group_id);
@@ -756,14 +815,14 @@ pub const ManagedHttpHostService = struct {
 
     pub fn describeSplitTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.SplitExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeSplit(transition_id);
+            return transition_svc.describeSplit(transition_id);
         }
         return null;
     }
 
     pub fn observeMergeTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.MergeObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeMerge(transition_id)) orelse return null;
+            var observation = transition_svc.observeMerge(transition_id) orelse return null;
             if (transition_svc.mergeRecord(transition_id)) |record| {
                 observation.donor_local_leader = observation.donor_local_leader or self.host.http_host.host.isLocalLeader(record.donor_group_id);
                 observation.receiver_local_leader = observation.receiver_local_leader or self.host.http_host.host.isLocalLeader(record.receiver_group_id);
@@ -775,7 +834,7 @@ pub const ManagedHttpHostService = struct {
 
     pub fn describeMergeTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.MergeExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeMerge(transition_id);
+            return transition_svc.describeMerge(transition_id);
         }
         return null;
     }
@@ -847,17 +906,27 @@ pub const ManagedHttpHostService = struct {
     }
 
     fn seedTransitionsFromMetadataStore(self: *ManagedHttpHostService, metadata_group_id: ?u64) !void {
-        if (self.transition_svc == null) return;
+        if (self.transition_svc) |*transition_svc| {
+            try self.seedTransitionServiceFromMetadataStore(transition_svc, metadata_group_id);
+            self.syncTransitionMetrics();
+        }
+    }
+
+    fn seedTransitionServiceFromMetadataStore(
+        self: *ManagedHttpHostService,
+        transition_svc: *transition_service.TransitionService,
+        metadata_group_id: ?u64,
+    ) !void {
         const group_id = metadata_group_id orelse return;
         const store = self.host.owned_metadata_store orelse return;
 
         const split_records = try store.listSplitTransitions(self.alloc, group_id);
         defer store.freeSplitTransitions(self.alloc, split_records);
-        for (split_records) |record| try self.submitSplitTransition(record);
+        for (split_records) |record| try transition_svc.submitSplit(record);
 
         const merge_records = try store.listMergeTransitions(self.alloc, group_id);
         defer store.freeMergeTransitions(self.alloc, merge_records);
-        for (merge_records) |record| try self.submitMergeTransition(record);
+        for (merge_records) |record| try transition_svc.submitMerge(record);
     }
 };
 
@@ -1412,19 +1481,44 @@ test "managed host service seeds queued transitions from projected metadata stor
         try svc.host.host.campaignGroup(1300);
         _ = try svc.host.host.runRound(1, 1);
 
-        const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 901,
-                .attempt_epoch = 1,
-                .source_group_id = 1300,
-                .destination_group_id = 1301,
-                .phase = .prepare,
+        const transition_record: metadata.SplitTransitionRecord = .{
+            .transition_id = 901,
+            .attempt_epoch = 1,
+            .source_group_id = 1300,
+            .destination_group_id = 1301,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .table_contract = .{
+                .table_id = 13,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 1300, .range_id = 1300 },
+                .target_identity = .{ .shard_id = 1300, .range_id = 1300 },
             },
-        });
-        defer std.testing.allocator.free(cmd);
-
-        try svc.host.host.propose(1300, cmd);
-        _ = try svc.host.host.runRound(1, 1);
+        };
+        const seed_commands = [_]metadata.TransitionCommand{
+            .{ .upsert_table = .{
+                .table_id = 13,
+                .name = "docs",
+                .indexes_json = "{}",
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1300,
+                .range_id = 1300,
+                .table_id = 13,
+                .start_key = "doc:a",
+                .end_key = "doc:z",
+                .doc_identity_shard_id = 1300,
+                .doc_identity_range_id = 1300,
+                .split_attempt_epoch = 0,
+            } },
+            .{ .admit_split_transition = .{
+                .expected_source_epoch = 0,
+                .record = transition_record,
+            } },
+        };
+        try proposeManagedHostTransitionCommandsForTest(&svc, 1300, &seed_commands);
 
         const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         const projected = try metadata_store.listSplitTransitions(std.testing.allocator, 1300);
@@ -1449,6 +1543,39 @@ test "managed host service seeds queued transitions from projected metadata stor
     defer restarted.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_split_transitions);
+
+    // Fail after the replacement adapter has been allocated, while persisted
+    // transitions are being read for seeding. The old executor, queue, metrics,
+    // and adapter must remain live, and the partial replacement must be freed.
+    const previous_adapter = restarted.shardOperationAdapter() orelse return error.TestExpectedEqual;
+    var replacement_runtime = transition_runtime.TransitionRuntime{
+        .split = fake_split.iface(),
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+    });
+    {
+        const service_alloc = restarted.alloc;
+        restarted.alloc = failing.allocator();
+        defer restarted.alloc = service_alloc;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            restarted.replaceTransitionOps(replacement_runtime.shardOperationAdapter()),
+        );
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), failing.allocations);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_split_transitions);
+    try std.testing.expect(restarted.transition_svc.?.splitRecord(901) != null);
+    _ = try previous_adapter.observeSplit(.{
+        .transition_id = 901,
+        .attempt_epoch = 1,
+        .source_group_id = 1300,
+        .destination_group_id = 1301,
+    });
+
     try establishManagedHostTransitionAuthorityForTest(&restarted, 1300);
 
     try restarted.runRound();
@@ -1518,18 +1645,44 @@ test "managed host service resumes real split transition after restart" {
         try svc.host.host.campaignGroup(1300);
         _ = try svc.host.host.runRound(1, 1);
 
-        const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 1001,
-                .attempt_epoch = 1,
-                .source_group_id = 1701,
-                .destination_group_id = 1702,
-                .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        try svc.host.host.propose(1300, cmd);
-        _ = try svc.host.host.runRound(1, 1);
+        const seed_commands = [_]metadata.TransitionCommand{
+            .{ .upsert_table = .{
+                .table_id = test_transition_table_contract.table_id,
+                .name = test_transition_table_contract.table_name,
+                .schema_json = test_transition_table_contract.schema_json,
+                .indexes_json = test_transition_table_contract.indexes_json,
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1701,
+                .range_id = test_transition_table_contract.source_identity.range_id,
+                .table_id = test_transition_table_contract.table_id,
+                .start_key = "doc:a",
+                .end_key = "doc:z",
+                .doc_identity_shard_id = test_transition_table_contract.source_identity.shard_id,
+                .doc_identity_range_id = test_transition_table_contract.source_identity.range_id,
+                .split_attempt_epoch = 0,
+            } },
+            .{ .admit_split_transition = .{
+                .expected_source_epoch = 0,
+                .record = .{
+                    .transition_id = 1001,
+                    .attempt_epoch = 1,
+                    .source_group_id = 1701,
+                    .destination_group_id = 1702,
+                    .phase = .prepare,
+                    .split_key = "doc:m",
+                    .source_range_end = "doc:z",
+                    .table_contract = test_transition_table_contract,
+                },
+            } },
+        };
+        try proposeManagedHostTransitionCommandsForTest(&svc, 1300, &seed_commands);
+
+        const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        const projected = try metadata_store.listSplitTransitions(std.testing.allocator, 1300);
+        defer metadata_store.freeSplitTransitions(std.testing.allocator, projected);
+        try std.testing.expectEqual(@as(usize, 1), projected.len);
+        try std.testing.expectEqual(@as(u64, 1001), projected[0].transition_id);
     }
 
     {
@@ -1676,17 +1829,46 @@ test "managed host service resumes real merge transition after restart" {
         try svc.host.host.campaignGroup(1300);
         _ = try svc.host.host.runRound(1, 1);
 
-        const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
+        const seed_commands = [_]metadata.TransitionCommand{
+            .{ .upsert_table = .{
+                .table_id = test_transition_table_contract.table_id,
+                .name = test_transition_table_contract.table_name,
+                .schema_json = test_transition_table_contract.schema_json,
+                .indexes_json = test_transition_table_contract.indexes_json,
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1802,
+                .range_id = test_transition_table_contract.target_identity.range_id,
+                .table_id = test_transition_table_contract.table_id,
+                .start_key = "doc:a",
+                .end_key = "doc:m",
+                .doc_identity_shard_id = test_transition_table_contract.target_identity.shard_id,
+                .doc_identity_range_id = test_transition_table_contract.target_identity.range_id,
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1801,
+                .range_id = test_transition_table_contract.source_identity.range_id,
+                .table_id = test_transition_table_contract.table_id,
+                .start_key = "doc:m",
+                .end_key = "doc:z",
+                .doc_identity_shard_id = test_transition_table_contract.source_identity.shard_id,
+                .doc_identity_range_id = test_transition_table_contract.source_identity.range_id,
+            } },
+            .{ .upsert_merge_transition = .{
                 .transition_id = 1002,
                 .donor_group_id = 1801,
                 .receiver_group_id = 1802,
                 .phase = .prepare,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        try svc.host.host.propose(1300, cmd);
-        _ = try svc.host.host.runRound(1, 1);
+                .table_contract = test_transition_table_contract,
+            } },
+        };
+        try proposeManagedHostTransitionCommandsForTest(&svc, 1300, &seed_commands);
+
+        const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        const projected = try metadata_store.listMergeTransitions(std.testing.allocator, 1300);
+        defer metadata_store.freeMergeTransitions(std.testing.allocator, projected);
+        try std.testing.expectEqual(@as(usize, 1), projected.len);
+        try std.testing.expectEqual(@as(u64, 1002), projected[0].transition_id);
     }
 
     {
@@ -1865,6 +2047,7 @@ test "managed host service reports local leader roles in split observations" {
         .destination_group_id = 1702,
         .phase = .bootstrap_peer,
     });
+    _ = try svc.stepTransitions();
 
     const observation = (try svc.observeSplitTransition(2001)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(data.RangeTransitionPhase, .bootstrap_peer), observation.status.phase);
@@ -1963,6 +2146,7 @@ test "managed host service reports local leader roles in merge observations" {
         .receiver_group_id = 1802,
         .phase = .bootstrap_peer,
     });
+    _ = try svc.stepTransitions();
 
     const observation = (try svc.observeMergeTransition(2002)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(data.RangeTransitionPhase, .bootstrap_peer), observation.receiver.phase);
@@ -1992,7 +2176,7 @@ test "managed host service preserves leader-routed observation roles from transi
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata.SplitTransitionRecord) !metadata.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata.SplitTransitionRecord) !metadata.SplitObservation {
             return .{
                 .status = .{
                     .phase = .cutover_ready,
@@ -2010,7 +2194,7 @@ test "managed host service preserves leader-routed observation roles from transi
             };
         }
 
-        fn observeMerge(_: *anyopaque, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
             const status = data.MergeTransitionStatus{
                 .phase = .replay_deltas,
                 .donor_group_id = record.donor_group_id,
@@ -2032,16 +2216,16 @@ test "managed host service preserves leader-routed observation roles from transi
             };
         }
 
-        fn noopPrepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .prepare_split_source).type) !void {}
-        fn noopStartSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .start_split_source).type) !void {}
-        fn noopBootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .bootstrap_split_destination).type) !void {}
-        fn noopCatchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .catch_up_split_destination).type) !void {}
-        fn noopFinalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .finalize_split_source).type) !void {}
-        fn noopRollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .rollback_split).type) !void {}
-        fn noopAcceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .accept_merge_receiver).type) !void {}
-        fn noopCatchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .catch_up_merge_receiver).type) !void {}
-        fn noopFinalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .finalize_merge).type) !void {}
-        fn noopRollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata.TransitionAction, .rollback_merge).type) !void {}
+        fn noopPrepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .prepare_split_source).type) !void {}
+        fn noopStartSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .start_split_source).type) !void {}
+        fn noopBootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .bootstrap_split_destination).type) !void {}
+        fn noopCatchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .catch_up_split_destination).type) !void {}
+        fn noopFinalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .finalize_split_source).type) !void {}
+        fn noopRollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .rollback_split).type) !void {}
+        fn noopAcceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .accept_merge_receiver).type) !void {}
+        fn noopCatchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .catch_up_merge_receiver).type) !void {}
+        fn noopFinalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .finalize_merge).type) !void {}
+        fn noopRollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata.TransitionAction, .rollback_merge).type) !void {}
     };
 
     var tmp = std.testing.tmpDir(.{});
@@ -2083,6 +2267,7 @@ test "managed host service preserves leader-routed observation roles from transi
         .receiver_group_id = 2902,
         .phase = .bootstrap_peer,
     });
+    _ = try svc.stepTransitions();
 
     const split = (try svc.observeSplitTransition(3001)) orelse return error.TestExpectedEqual;
     try std.testing.expect(split.source_local_leader);
@@ -2091,6 +2276,29 @@ test "managed host service preserves leader-routed observation roles from transi
     const merge = (try svc.observeMergeTransition(3002)) orelse return error.TestExpectedEqual;
     try std.testing.expect(!merge.donor_local_leader);
     try std.testing.expect(merge.receiver_local_leader);
+
+    // Replacement construction errors leave the live transition executor and
+    // its callback admission intact.
+    const previous_adapter = svc.shardOperationAdapter() orelse return error.TestExpectedEqual;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    {
+        const service_alloc = svc.alloc;
+        svc.alloc = failing.allocator();
+        defer svc.alloc = service_alloc;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            svc.replaceTransitionOps(FakeShardOps.adapter()),
+        );
+    }
+    const after_failed_replace = try previous_adapter.observeSplit(.{
+        .transition_id = 3003,
+        .attempt_epoch = 1,
+        .source_group_id = 1901,
+        .destination_group_id = 1902,
+    });
+    try std.testing.expect(after_failed_replace.source_local_leader);
 }
 
 test "managed service module compiles" {

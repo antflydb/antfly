@@ -185,6 +185,8 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
+        keep_alive: ?[]u8 = null,
+        max_loaded_models: ?i64 = null,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -195,6 +197,7 @@ pub const Config = struct {
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
             for (self.preload) |*model| model.deinit(alloc);
             if (self.preload.len > 0) alloc.free(self.preload);
+            if (self.keep_alive) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -601,6 +604,8 @@ pub const Config = struct {
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
+                .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
+                .max_loaded_models = inference.max_loaded_models,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -2039,6 +2044,8 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "keep_alive": "1m30s",
+        \\    "max_loaded_models": 4,
         \\    "preload": [
         \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\    ],
@@ -2064,6 +2071,8 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqualStrings("1m30s", cfg.inference.keep_alive.?);
+    try std.testing.expectEqual(@as(?i64, 4), cfg.inference.max_loaded_models);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);

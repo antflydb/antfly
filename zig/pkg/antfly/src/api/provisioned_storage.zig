@@ -199,6 +199,7 @@ pub const ProvisionedGroupStorage = struct {
     hbc_cache: hbc_mod.Cache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
     read_cache: table_reads.ProvisionedTableReadCache,
+    write_cache_state_mutex: std.atomic.Mutex = .unlocked,
     write_cache: table_writes.ProvisionedTableWriteCache,
     startup_write_cache: table_writes.ProvisionedTableWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
@@ -295,7 +296,11 @@ pub const ProvisionedGroupStorage = struct {
         _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
         read_source.resident_db = write_source.residentDbSource();
         write_source.read_cache = &self.read_cache;
-        write_source.bindWriteCaches(&self.write_cache, &self.startup_write_cache);
+        write_source.bindWriteCachesWithStateMutex(
+            &self.write_cache,
+            &self.startup_write_cache,
+            &self.write_cache_state_mutex,
+        );
         write_source.runtime_status_cache = &self.runtime_status_cache;
         _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
     }

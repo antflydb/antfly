@@ -94,6 +94,20 @@ pub fn getRequestBodyType(
     return null;
 }
 
+/// Return whether an operation's request body is required by the OpenAPI
+/// contract. Resolution failures preserve the historical required behavior so
+/// generated clients never silently omit an unresolved body.
+pub fn isRequestBodyRequired(
+    resolver: *Resolver,
+    rb_or: types.RequestBodyOrRef,
+) bool {
+    const rb = switch (rb_or) {
+        .request_body => |r| r,
+        .ref => |ref| resolver.resolveRequestBody(.{ .ref = ref }) catch return true,
+    };
+    return rb.required;
+}
+
 /// Return true when an operation accepts a raw application/octet-stream body.
 /// These bodies are passed through as `[]const u8` by the generated client and
 /// are intentionally not parsed by the generated server router.

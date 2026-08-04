@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const backups_api = @import("../api/backups.zig");
+const common_config = @import("../common/config.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const metadata_api = @import("api.zig");
 const table_manager = @import("table_manager.zig");
@@ -73,6 +74,7 @@ pub const ProvisionSummary = struct {
 pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
+    restore_open_options: backups_api.OpenOptions = .{},
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -95,8 +97,12 @@ const TableProgressStatus = struct {
 
 const RestoreIntentSource = struct {
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8 = "",
+    connection: []const u8 = "",
+    artifact_size_bytes: u64 = 0,
+    artifact_sha256: []const u8 = "",
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -109,7 +115,23 @@ pub fn applyBackupRestoreBootstrap(
     group_id: u64,
     restore: raft_catalog.BackupRestoreBootstrapRecord,
 ) !void {
-    try backup_restore.applyBackupRestoreFromRecord(alloc, replica_root_dir, group_id, restore);
+    return try applyBackupRestoreBootstrapWithOptions(alloc, replica_root_dir, group_id, restore, .{});
+}
+
+pub fn applyBackupRestoreBootstrapWithOptions(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+    restore: raft_catalog.BackupRestoreBootstrapRecord,
+    open_options: backups_api.OpenOptions,
+) !void {
+    try backup_restore.applyBackupRestoreFromRecordWithOptions(
+        alloc,
+        replica_root_dir,
+        group_id,
+        restore,
+        open_options,
+    );
 }
 
 pub fn provisioningFingerprint(
@@ -127,7 +149,11 @@ pub fn provisioningFingerprint(
         const range = findRange(ranges, group_id) orelse continue;
         const table = findTable(tables, range.table_id) orelse continue;
         hasher.update(std.mem.asBytes(&range.group_id));
+        hasher.update(std.mem.asBytes(&range.range_id));
         hasher.update(std.mem.asBytes(&range.table_id));
+        hasher.update(std.mem.asBytes(&range.doc_identity_shard_id));
+        hasher.update(std.mem.asBytes(&range.doc_identity_range_id));
+        hasher.update(std.mem.asBytes(&range.split_attempt_epoch));
         hashBytes(&hasher, range.start_key);
         if (range.end_key) |end_key| {
             hasher.update(&[_]u8{1});
@@ -136,8 +162,13 @@ pub fn provisioningFingerprint(
             hasher.update(&[_]u8{0});
         }
         hashBytes(&hasher, range.restore_backup_id);
+        hashBytes(&hasher, range.restore_artifact_backup_id);
         hashBytes(&hasher, range.restore_location);
         hashBytes(&hasher, range.restore_snapshot_path);
+        hashBytes(&hasher, range.restore_connection);
+        hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
+        hashBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
         hashBytes(&hasher, table.schema_json);
@@ -188,7 +219,14 @@ pub fn reconcileReplicaRootWithOptions(
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), path);
-        try applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
+        try applyRestoreIntentIfNeededWithOptions(
+            alloc,
+            path,
+            group_id,
+            table,
+            range,
+            options.restore_open_options,
+        );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
         defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
@@ -314,7 +352,25 @@ pub fn collectLocalSchemaProgressWithOptions(
 
         const version = try schemaVersion(alloc, table.schema_json);
         const read_version = try schemaVersion(alloc, table.read_schema_json);
-        const ready = try localRangeHasSchemaVersionIndex(alloc, replica_root_dir, table.name, group_id, version, read_version, options);
+        const ready = localRangeHasSchemaVersionIndex(
+            alloc,
+            replica_root_dir,
+            table.name,
+            group_id,
+            version,
+            read_version,
+            options,
+        ) catch |err| switch (err) {
+            // Schema progress is observational. A generation publication can
+            // acquire the DB between the durable-marker check and DB.open;
+            // report that shard as not ready and observe it next round.
+            error.GenerationTransitionActive,
+            error.InvalidRebuildState,
+            error.FileNotFound,
+            error.NotDir,
+            => false,
+            else => return err,
+        };
 
         const gop = try progress_by_table.getOrPut(alloc, table.table_id);
         if (!gop.found_existing) {
@@ -542,6 +598,64 @@ pub fn collectLocalRestoreProgress(
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
 ) ![]table_manager.RestoreProgressRecord {
+    return try collectLocalRestoreProgressUsingIo(
+        alloc,
+        null,
+        replica_root_dir,
+        metadata_group_id,
+        local_node_id,
+        hosted_group_ids,
+        tables,
+        ranges,
+    );
+}
+
+pub fn collectLocalRestoreProgressUsingIo(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    replica_root_dir: []const u8,
+    metadata_group_id: u64,
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+) ![]table_manager.RestoreProgressRecord {
+    if (shared_io) |io| {
+        return try collectLocalRestoreProgressWithIo(
+            alloc,
+            io,
+            replica_root_dir,
+            metadata_group_id,
+            local_node_id,
+            hosted_group_ids,
+            tables,
+            ranges,
+        );
+    }
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try collectLocalRestoreProgressWithIo(
+        alloc,
+        io_impl.io(),
+        replica_root_dir,
+        metadata_group_id,
+        local_node_id,
+        hosted_group_ids,
+        tables,
+        ranges,
+    );
+}
+
+fn collectLocalRestoreProgressWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    metadata_group_id: u64,
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+) ![]table_manager.RestoreProgressRecord {
     var out = std.ArrayListUnmanaged(table_manager.RestoreProgressRecord).empty;
     errdefer {
         for (out.items) |record| table_manager.freeRestoreProgress(alloc, record);
@@ -556,16 +670,19 @@ pub fn collectLocalRestoreProgress(
 
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
-        var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse continue;
+        var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) orelse continue;
         defer state.deinit(alloc);
         if (!std.mem.eql(u8, state.backup_id, restore.backup_id)) continue;
         if (!std.mem.eql(u8, state.location, restore.location)) continue;
+        if (!std.mem.eql(u8, state.artifact_sha256, restore.artifact_sha256)) continue;
         if (restore.snapshot_path.len > 0 and !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path)) continue;
         if (state.group_id != group_id) continue;
 
         var record: table_manager.RestoreProgressRecord = blk: {
             const progress_backup_id = try alloc.dupe(u8, restore.backup_id);
             errdefer alloc.free(progress_backup_id);
+            const progress_artifact_backup_id = try alloc.dupe(u8, restore.artifact_backup_id);
+            errdefer alloc.free(progress_artifact_backup_id);
             const progress_location = try alloc.dupe(u8, restore.location);
             errdefer alloc.free(progress_location);
             break :blk .{
@@ -573,8 +690,10 @@ pub fn collectLocalRestoreProgress(
                 .node_id = local_node_id,
                 .group_id = group_id,
                 .backup_id = progress_backup_id,
+                .artifact_backup_id = progress_artifact_backup_id,
                 .location = progress_location,
                 .snapshot_path = &.{},
+                .artifact_sha256 = &.{},
                 .primary_restored = state.primary_restored,
                 .runtime_repair_complete = state.runtime_repair_complete,
                 .phase = &.{},
@@ -585,6 +704,7 @@ pub fn collectLocalRestoreProgress(
         var appended = false;
         errdefer if (!appended) table_manager.freeRestoreProgress(alloc, record);
         record.snapshot_path = try alloc.dupe(u8, state.snapshot_path);
+        record.artifact_sha256 = try alloc.dupe(u8, state.artifact_sha256);
         record.phase = try alloc.dupe(u8, state.phase);
         record.last_error = try alloc.dupe(u8, state.last_error);
         try out.append(alloc, record);
@@ -608,11 +728,27 @@ pub fn applyRestoreIntentIfNeeded(
     table: table_manager.TableRecord,
     range: table_manager.RangeRecord,
 ) !void {
+    return try applyRestoreIntentIfNeededWithOptions(alloc, path, group_id, table, range, .{});
+}
+
+pub fn applyRestoreIntentIfNeededWithOptions(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    table: table_manager.TableRecord,
+    range: table_manager.RangeRecord,
+    open_options: backups_api.OpenOptions,
+) !void {
     const restore = resolveRestoreIntent(range, table) orelse return;
     try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
+        .artifact_backup_id = restore.artifact_backup_id,
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
+        .authority = .{ .external = restore.connection },
+        .expected_artifact_size_bytes = restore.artifact_size_bytes,
+        .expected_artifact_sha256 = restore.artifact_sha256,
+        .open_options = open_options,
     }, .{
         .expected_table_name = table.name,
         .expected_identity_namespace = doc_identity.Namespace{
@@ -636,16 +772,15 @@ fn resolveRestoreIntent(
     if (range.restore_backup_id.len > 0 and range.restore_location.len > 0) {
         return .{
             .backup_id = range.restore_backup_id,
+            .artifact_backup_id = range.restore_artifact_backup_id,
             .location = range.restore_location,
             .snapshot_path = range.restore_snapshot_path,
+            .connection = range.restore_connection,
+            .artifact_size_bytes = range.restore_artifact_size_bytes,
+            .artifact_sha256 = range.restore_artifact_sha256,
         };
     }
-    if (table.restore_backup_id.len > 0 and table.restore_location.len > 0) {
-        return .{
-            .backup_id = table.restore_backup_id,
-            .location = table.restore_location,
-        };
-    }
+    _ = table;
     return null;
 }
 
@@ -1146,12 +1281,10 @@ fn localRangeHasSchemaVersionIndex(
     else
         try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
 
-    // A rebuild marker is the durable, authoritative statement that this
-    // schema index is not ready. Check it before opening the DB: schema
-    // progress is polled by the metadata lifecycle while the resident writer
-    // can spend minutes backfilling a large corpus. Reopening the same DB in
-    // query mode on every poll maps the complete retained read index and scans
-    // primary LSM metadata even though the answer is already on disk here.
+    // Preserve the cheap pre-generation marker fast path during rolling
+    // upgrades. Generation-owned markers are resolved by the status-only open
+    // below: its catalog identity distinguishes the current cursor from a
+    // stale same-name worker without mapping retained index state.
     const rebuild_state_root = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ path, target_name });
     defer alloc.free(rebuild_state_root);
     const rebuild_state = db_mod.backfill_state.RebuildState.init(rebuild_state_root);
@@ -1279,6 +1412,7 @@ fn findReadyRuntimeFullTextIndex(
     for (indexes) |index| {
         if (!std.mem.eql(u8, index.name, index_name)) continue;
         if (!std.mem.eql(u8, index.kind, "full_text")) return null;
+        if (index.load_error != null) return null;
         if (index.backfill_active) return null;
         if (index.replay_catch_up_required) return null;
         if (index.replay_applied_sequence < index.replay_target_sequence) return null;
@@ -1966,6 +2100,64 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 0), removed_resolvers.len);
 }
 
+test "table provisioner can admit resolver backfill without draining corpus work" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-async-resolver";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const graph_only =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}}
+        \\}
+    ;
+    _ = try reconcileDbIndexesWithOptions(alloc, &db, graph_only, .{});
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const with_resolver =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\  "resolvers":[
+        \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\  ]
+        \\}
+    ;
+    const summary = try reconcileDbIndexesWithOptions(alloc, &db, with_resolver, .{
+        .drain_resolver_backfill = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), summary.resolvers_added);
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("kg", resolvers[0].name);
+}
+
 test "table provisioner registers explicit document enrichments from index config" {
     const alloc = std.heap.c_allocator;
     const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
@@ -2490,6 +2682,20 @@ test "table provisioner updates full text artifact mapping and cleans removed en
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
 }
 
+fn testRestoreNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+    return common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
 test "table provisioner restores local shard data from metadata restore intent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2539,10 +2745,20 @@ test "table provisioner restores local shard data from metadata restore intent" 
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -2555,6 +2771,8 @@ test "table provisioner restores local shard data from metadata restore intent" 
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -2563,7 +2781,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
     }
     try backups_api.writeManifest(std.testing.allocator, backup_root, &manifest);
 
-    const summary = try reconcileReplicaRoot(
+    const summary = try reconcileReplicaRootWithOptions(
         std.testing.allocator,
         replica_root,
         100,
@@ -2580,7 +2798,20 @@ test "table provisioner restores local shard data from metadata restore intent" 
             .table_id = 7,
             .start_key = "doc:a",
             .end_key = null,
+            .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1",
+            .restore_location = restore_location,
+            .restore_snapshot_path = "snap1/groups/2001",
+            .restore_connection = "test-backups",
+            .restore_artifact_size_bytes = artifact_integrity.size_bytes,
+            .restore_artifact_sha256 = artifact_integrity.sha256,
         }},
+        .{
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
+        },
     );
     try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
 
@@ -2699,10 +2930,20 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -2715,6 +2956,8 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -2723,7 +2966,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
     }
     try backups_api.writeManifest(std.testing.allocator, backup_root, &manifest);
 
-    try std.testing.expectError(error.IdentityNamespaceMismatch, reconcileReplicaRoot(
+    try std.testing.expectError(error.IdentityNamespaceMismatch, reconcileReplicaRootWithOptions(
         std.testing.allocator,
         replica_root,
         100,
@@ -2742,7 +2985,20 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .start_key = "doc:a",
             .end_key = null,
             .range_id = 2001,
+            .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1",
+            .restore_location = restore_location,
+            .restore_snapshot_path = "snap1/groups/2001",
+            .restore_connection = "test-backups",
+            .restore_artifact_size_bytes = artifact_integrity.size_bytes,
+            .restore_artifact_sha256 = artifact_integrity.sha256,
         }},
+        .{
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
+        },
     ));
 }
 
@@ -2985,6 +3241,60 @@ test "table provisioner reports local schema progress once all local shards have
     try std.testing.expectEqual(@as(u32, 1), progress[0].schema_version);
 }
 
+test "table provisioner treats an active generation transition as schema progress not ready" {
+    const GenerationTransitionAdapter = struct {
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+
+        fn schemaIndexReady(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) !bool {
+            return error.GenerationTransitionActive;
+        }
+
+        fn adapter() shard_db_adapter_mod.ShardDbAdapter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .fetch_median_key = fetchMedianKey,
+                    .schema_index_ready = schemaIndexReady,
+                },
+            };
+        }
+    };
+
+    const progress = try collectLocalSchemaProgressWithOptions(
+        std.testing.allocator,
+        "/tmp/unused-antfly-schema-progress-transition",
+        100,
+        7,
+        &.{ 100, 2003 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .schema_json = "{\"version\":1}",
+            .read_schema_json = "{\"version\":0}",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        }},
+        &.{.{
+            .group_id = 2003,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+        .{ .shard_db_adapter = GenerationTransitionAdapter.adapter() },
+    );
+    defer std.testing.allocator.free(progress);
+
+    try std.testing.expectEqual(@as(usize, 0), progress.len);
+}
+
 test "table provisioner schema progress probes do not take a writer lease" {
     const path = "/tmp/antfly-metadata-table-provisioner-progress-live-writer";
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -3030,7 +3340,7 @@ test "table provisioner schema progress probes do not take a writer lease" {
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
 }
 
-test "table provisioner schema progress returns not ready from rebuild marker without opening DB" {
+test "table provisioner schema progress reads generation-owned rebuild state from status-only catalog" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-table-provisioner-progress-rebuild-marker";
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -3042,12 +3352,30 @@ test "table provisioner schema progress returns not ready from rebuild marker wi
     defer alloc.free(db_path);
     const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
     defer alloc.free(index_root);
-    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
-    try rebuild_state.update("doc:m");
+    var coverage_generation: u64 = 0;
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        try db.addIndex(.{
+            .name = "full_text_index_v2",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        const configs = try db.listIndexes(alloc);
+        defer db_mod.types.freeIndexConfigs(alloc, configs);
+        for (configs) |config| {
+            if (!std.mem.eql(u8, config.name, "full_text_index_v2")) continue;
+            coverage_generation = config.coverage_generation;
+            break;
+        }
+    }
+    try std.testing.expect(coverage_generation != 0);
+    const rebuild_state = db_mod.backfill_state.RebuildState.initOwned(index_root, null, coverage_generation);
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
 
-    // There is deliberately no DB at db_path. If the progress probe attempts
-    // DB.open instead of trusting the durable marker, this call fails rather
-    // than returning the expected in-progress result.
+    // The lightweight status-only open reads the authoritative catalog
+    // generation without mapping retained full-text state. That lets it ignore
+    // stale same-name workers while still observing the current marker.
     try std.testing.expect(!try localRangeHasSchemaVersionIndex(
         alloc,
         path,
@@ -3057,6 +3385,61 @@ test "table provisioner schema progress returns not ready from rebuild marker wi
         1,
         .{},
     ));
+}
+
+test "table provisioner schema progress quarantines a corrupt rebuild marker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/metadata-table-provisioner-progress-corrupt-rebuild-marker",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2008);
+    defer alloc.free(db_path);
+    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
+    defer alloc.free(index_root);
+    try fs_paths.createDirPathPortable(io_impl.io(), index_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
+
+    const state_path = try rebuild_state.pathAlloc(alloc);
+    defer alloc.free(state_path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(1024));
+    defer alloc.free(encoded);
+    encoded[encoded.len - 1] ^= 0xff;
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = state_path, .data = encoded });
+
+    const progress = try collectLocalSchemaProgress(
+        alloc,
+        path,
+        100,
+        7,
+        &.{ 100, 2008 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .schema_json = "{\"version\":2}",
+            .read_schema_json = "{\"version\":1}",
+            .indexes_json = "{}",
+        }},
+        &.{.{
+            .group_id = 2008,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    defer alloc.free(progress);
+
+    // A corrupt marker keeps the shard quarantined without aborting the
+    // metadata lifecycle that collects schema progress.
+    try std.testing.expectEqual(@as(usize, 0), progress.len);
 }
 
 test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {

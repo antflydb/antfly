@@ -93,6 +93,114 @@ pub const RequestOptions = struct {
     json: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
+    /// Per-request response ceiling. This may lower, but never raise, the
+    /// client-wide maximum.
+    max_response_size: ?usize = null,
+    /// Borrowed cancellation signal. It must remain valid until the request
+    /// method returns.
+    cancellation: ?*const std.atomic.Value(bool) = null,
+};
+
+const cancellation_poll_interval_ms: u64 = 25;
+
+/// Stack-owned state used to interrupt a single HTTP/1 request.  HTTP/2 is
+/// deliberately excluded: its socket is shared by many streams.
+const RequestInterrupt = struct {
+    mutex: Io.Mutex = Io.Mutex.init,
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    socket: ?*Socket = null,
+    h2_entry: ?*H2PoolEntry = null,
+    h2_stream_id: ?u31 = null,
+
+    fn publish(self: *RequestInterrupt, socket: *Socket, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.cancelled.load(.acquire)) {
+            socket.shutdown();
+            return;
+        }
+        self.socket = socket;
+    }
+
+    fn clear(self: *RequestInterrupt, socket: *Socket, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.socket == socket) self.socket = null;
+    }
+
+    fn publishH2(self: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.h2_entry = entry;
+        self.h2_stream_id = stream_id;
+        if (self.cancelled.load(.acquire)) {
+            self.h2_entry = null;
+            self.h2_stream_id = null;
+            self.cancelH2Locked(entry, stream_id, io);
+        }
+    }
+
+    fn clearH2(self: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.h2_entry == entry and self.h2_stream_id == stream_id) {
+            self.h2_entry = null;
+            self.h2_stream_id = null;
+        }
+        // Inline H2 fallback uses a short socket timeout solely to wake a
+        // silent read after cancellation; restore normal blocking I/O before
+        // this shared connection can serve another request.
+        if (!entry.recv_running) entry.socket.setRecvTimeout(0) catch {};
+    }
+
+    fn cancelH2Locked(_: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
+        const h2 = &entry.h2;
+        h2.write_mutex.lockUncancelable(io);
+        const stream = h2.stream_manager.getStream(stream_id) orelse {
+            h2.write_mutex.unlock(io);
+            return;
+        };
+        // A finished or removed stream is no longer ours to reset. In
+        // particular, never append RST_STREAM after a completed response.
+        if (stream.completed) {
+            h2.write_mutex.unlock(io);
+            return;
+        }
+        stream.stream_error = error.Cancelled;
+        stream.completed = true;
+        stream.reset();
+        if (entry.is_tls) {
+            if (entry.session.getWriter()) |writer|
+                h2.sendRstStream(writer, stream_id, .cancel) catch {}
+            else |_| {}
+        } else {
+            h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
+        }
+        // Posting while still holding write_mutex is paired with waiter
+        // teardown below: a woken owner must acquire this mutex to unregister
+        // its pointer before destroying it, so no producer can retain a raw
+        // waiter pointer across destruction.
+        if (stream.completion_sem) |sem| sem.post(io);
+        if (stream.data_event) |event| event.set(io);
+        h2.write_mutex.unlock(io);
+
+        // A body blocked on flow control can now observe stream_error.
+        h2.send_window_event.set(io);
+        if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
+    }
+
+    fn cancel(self: *RequestInterrupt, io: Io) void {
+        self.cancelled.store(true, .release);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.socket) |socket| socket.shutdown();
+        if (self.h2_entry) |entry| {
+            const stream_id = self.h2_stream_id.?;
+            self.h2_entry = null;
+            self.h2_stream_id = null;
+            self.cancelH2Locked(entry, stream_id, io);
+        }
+    }
 };
 
 pub const WriterProgress = struct {
@@ -136,6 +244,12 @@ const H2PoolEntry = struct {
     h2: H2Connection,
     is_tls: bool,
     broken: bool = false,
+    /// Once removed from h2_conns, no new request may acquire this entry.
+    /// Existing request leases keep it alive until they release.
+    retired: bool = false,
+    active_requests: u32 = 0,
+    /// Owned map key retained after retirement so the final lease can free it.
+    retired_key: ?[]const u8 = null,
     /// Tracks the background receive-loop fiber (if spawned).
     recv_group: Io.Group = Io.Group.init,
     /// True when a receive-loop fiber is actively pumping frames.
@@ -254,6 +368,20 @@ pub const Client = struct {
 
     const Self = @This();
 
+    /// An H2 pool entry remains valid for the lifetime of this lease. Leases
+    /// are acquired under h2_mutex, closing the handoff race with replacement.
+    const H2Lease = struct {
+        client: *Self,
+        entry: *H2PoolEntry,
+        active: bool = true,
+
+        fn release(self: *H2Lease) void {
+            if (!self.active) return;
+            self.active = false;
+            self.client.releaseH2Lease(self.entry);
+        }
+    };
+
     /// Creates a new HTTP client with default configuration.
     pub fn init(allocator: Allocator, io: Io) Self {
         return initWithConfig(allocator, io, .{});
@@ -352,6 +480,7 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        req.max_response_size = reqOpts.max_response_size;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -392,7 +521,7 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts.timeout_ms);
+        var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
         errdefer response.deinit();
 
         try self.storeCookies(&response);
@@ -446,6 +575,7 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        req.max_response_size = reqOpts.max_response_size;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -485,7 +615,7 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx);
+        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
         errdefer response.deinit();
 
         try self.storeCookies(&response);
@@ -521,10 +651,12 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
+    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?*const std.atomic.Value(bool)) !Response {
+        if (cancellation) |signal| return self.executeRequestCancellable(req, timeout_override_ms, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
-        if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms);
+        var interrupt: RequestInterrupt = .{};
+        if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms, &interrupt);
 
         const RequestResult = anyerror!Response;
         const TimeoutResult = anyerror!void;
@@ -533,8 +665,8 @@ pub const Client = struct {
             timeout: TimeoutResult,
         };
         const Task = struct {
-            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64) RequestResult {
-                return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms);
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, request_interrupt: *RequestInterrupt) RequestResult {
+                return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
             fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
@@ -556,7 +688,7 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms });
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
         select.async(.timeout, Task.timeoutTask, .{
             self.io,
             Io.Timeout{ .duration = .{
@@ -573,25 +705,141 @@ pub const Client = struct {
             },
             .timeout => |timeout_result| {
                 try timeout_result;
+                interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
                 return error.Timeout;
             },
         }
     }
 
-    fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
+    fn executeRequestCancellable(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        cancellation: *const std.atomic.Value(bool),
+    ) !Response {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
+        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        var interrupt: RequestInterrupt = .{};
+        const RequestResult = anyerror!Response;
+        const CancelResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            cancellation: CancelResult,
+            timeout: anyerror!void,
+        };
+        const Task = struct {
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, request_interrupt: *RequestInterrupt) RequestResult {
+                return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
+            }
+
+            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
+                while (!signal.load(.acquire)) {
+                    try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
+                }
+                return error.Cancelled;
+            }
+
+            fn timeoutTask(io: Io, timeout: Io.Timeout) anyerror!void {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .request => |request_result| if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {},
+                    .cancellation, .timeout => {},
+                }
+            }
+        };
+
+        if (timeout_ms == 0) {
+            var select_buffer: [2]SelectResult = undefined;
+            var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+            try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
+            select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+            const first = try select.await();
+            switch (first) {
+                .request => |request_result| {
+                    select.cancelDiscard();
+                    if (cancellation.load(.acquire)) {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit();
+                        } else |_| {}
+                        return error.Cancelled;
+                    }
+                    return try request_result;
+                },
+                .cancellation => |cancel_result| {
+                    interrupt.cancel(self.io);
+                    while (select.cancel()) |late| Task.drainLateResult(late);
+                    cancel_result catch |err| return err;
+                    return error.Cancelled;
+                },
+                .timeout => unreachable,
+            }
+        }
+
+        var select_buffer: [3]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
+        select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+        select.async(.timeout, Task.timeoutTask, .{ self.io, Io.Timeout{ .duration = .{
+            .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+            .clock = .awake,
+        } } });
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                if (cancellation.load(.acquire)) {
+                    if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {}
+                    return error.Cancelled;
+                }
+                return try request_result;
+            },
+            .cancellation => |cancel_result| {
+                interrupt.cancel(self.io);
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                cancel_result catch |err| return err;
+                return error.Cancelled;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                interrupt.cancel(self.io);
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                if (cancellation.load(.acquire)) return error.Cancelled;
+                return error.Timeout;
+            },
+        }
+    }
+
+    fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
         while (true) {
-            var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms) catch |err| {
+            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+            var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
+                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 // RFC 7540 §6.8: Streams refused via GOAWAY were never
                 // processed and are always safe to retry on a new connection.
                 const is_goaway_refused = (err == error.GoawayRefused);
                 const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
+                if ((is_goaway_refused or
+                    is_max_streams or
+                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
+                    attempt < policy.max_retries)
+                {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
@@ -623,10 +871,13 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !Response {
+        if (cancellation) |signal| return self.executeRequestToWriterCancellable(req, timeout_override_ms, writer, progress_cb, progress_ctx, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
-        if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx);
+        var interrupt: RequestInterrupt = .{};
+        if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt);
 
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
@@ -644,8 +895,9 @@ pub const Client = struct {
                 output: Writer,
                 callback: ?WriterProgressCallback,
                 callback_context: ?*anyopaque,
+                request_interrupt: *RequestInterrupt,
             ) RequestResult {
-                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context);
+                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
             fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
@@ -667,7 +919,7 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx });
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
         select.async(.timeout, Task.timeoutTask, .{
             self.io,
             Io.Timeout{ .duration = .{
@@ -684,7 +936,121 @@ pub const Client = struct {
             },
             .timeout => |timeout_result| {
                 try timeout_result;
+                interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
+                return error.Timeout;
+            },
+        }
+    }
+
+    fn executeRequestToWriterCancellable(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        cancellation: *const std.atomic.Value(bool),
+    ) !Response {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
+        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        var interrupt: RequestInterrupt = .{};
+        const Writer = @TypeOf(writer);
+        const RequestResult = anyerror!Response;
+        const CancelResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            cancellation: CancelResult,
+            timeout: anyerror!void,
+        };
+        const Task = struct {
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, output: Writer, callback: ?WriterProgressCallback, callback_context: ?*anyopaque, request_interrupt: *RequestInterrupt) RequestResult {
+                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
+            }
+
+            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
+                while (!signal.load(.acquire)) {
+                    try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
+                }
+                return error.Cancelled;
+            }
+
+            fn timeoutTask(io: Io, timeout: Io.Timeout) anyerror!void {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .request => |request_result| if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {},
+                    .cancellation, .timeout => {},
+                }
+            }
+        };
+
+        if (timeout_ms == 0) {
+            var select_buffer: [2]SelectResult = undefined;
+            var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+            try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
+            select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+            const first = try select.await();
+            switch (first) {
+                .request => |request_result| {
+                    select.cancelDiscard();
+                    if (cancellation.load(.acquire)) {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit();
+                        } else |_| {}
+                        return error.Cancelled;
+                    }
+                    return try request_result;
+                },
+                .cancellation => |cancel_result| {
+                    interrupt.cancel(self.io);
+                    while (select.cancel()) |late| Task.drainLateResult(late);
+                    cancel_result catch |err| return err;
+                    return error.Cancelled;
+                },
+                .timeout => unreachable,
+            }
+        }
+
+        var select_buffer: [3]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
+        select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
+        select.async(.timeout, Task.timeoutTask, .{ self.io, Io.Timeout{ .duration = .{
+            .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+            .clock = .awake,
+        } } });
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                if (cancellation.load(.acquire)) {
+                    if (request_result) |response_value| {
+                        var response = response_value;
+                        response.deinit();
+                    } else |_| {}
+                    return error.Cancelled;
+                }
+                return try request_result;
+            },
+            .cancellation => |cancel_result| {
+                interrupt.cancel(self.io);
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                cancel_result catch |err| return err;
+                return error.Cancelled;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                interrupt.cancel(self.io);
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                if (cancellation.load(.acquire)) return error.Cancelled;
                 return error.Timeout;
             },
         }
@@ -698,17 +1064,24 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
+        interrupt: *RequestInterrupt,
     ) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
         while (true) {
-            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx) catch |err| {
+            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, interrupt) catch |err| {
+                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 const is_goaway_refused = (err == error.GoawayRefused);
                 const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
+                if ((is_goaway_refused or
+                    is_max_streams or
+                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
+                    attempt < policy.max_retries)
+                {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
@@ -741,7 +1114,44 @@ pub const Client = struct {
         socket.setRequestDeadline(deadline_ms);
     }
 
-    fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
+    fn responseSizeLimit(self: *const Self, req: *const Request) usize {
+        return @min(req.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
+    }
+
+    fn checkedResponseSize(current: usize, incoming: usize, limit: usize) !usize {
+        if (current > limit or incoming > limit - current)
+            return error.ResponseTooLarge;
+        return current + incoming;
+    }
+
+    fn normalizeH2ResponseError(err: anyerror) anyerror {
+        return if (err == error.StreamDataOverflow) error.ResponseTooLarge else err;
+    }
+
+    fn configureH2ResponseStream(self: *const Self, stream: *Stream, req: *const Request) void {
+        stream.max_data_size = self.responseSizeLimit(req);
+    }
+
+    /// Allocates and publishes a locally initiated stream while holding the
+    /// same mutex used by the receive loop and stream teardown. A pooled H2
+    /// connection is intentionally shared by concurrent callers, so both the
+    /// next-stream-id counter and the unmanaged stream map require this lock.
+    fn createH2ResponseStream(self: *const Self, h2: *H2Connection, req: *const Request) !*Stream {
+        h2.write_mutex.lockUncancelable(self.io);
+        defer h2.write_mutex.unlock(self.io);
+        if (h2.goaway_received) return error.ConnectionClosed;
+        const stream = try h2.stream_manager.createStream();
+        self.configureH2ResponseStream(stream, req);
+        return stream;
+    }
+
+    fn mayRetryConnectionError(err: anyerror) bool {
+        // Local response-policy failures are deterministic. Retrying them
+        // wastes bandwidth and, for writer requests, could duplicate output.
+        return err != error.ResponseTooLarge;
+    }
+
+    fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
@@ -760,20 +1170,25 @@ pub const Client = struct {
         // Reuses a pooled connection per host when available.
         if (self.config.http2_enabled or self.config.force_http2) {
             const is_tls = req.uri.isTls();
-            const entry = try self.getOrCreateH2Conn(host, port, is_tls);
-            const result = self.executeH2OnPooled(entry, req) catch |err| {
+            var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+            defer lease.release();
+            const entry = lease.entry;
+            const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
                 // Only mark the connection broken for transport/framing errors.
                 // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
                 // StreamDataOverflow) don't indicate a bad connection — other streams
                 // may still be healthy.
                 switch (err) {
+                    // A caller cancellation only reset its own stream. The
+                    // shared H2 connection remains usable by other requests.
+                    error.Cancelled,
                     error.MaxConcurrentStreamsExceeded,
                     error.ContentLengthMismatch,
                     error.StreamDataOverflow,
                     => {},
                     else => entry.broken = true,
                 }
-                return err;
+                return normalizeH2ResponseError(err);
             };
             // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
             if (entry.h2.goaway_received) entry.broken = true;
@@ -789,6 +1204,8 @@ pub const Client = struct {
                 }
 
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
+                interrupt.publish(&tls_conn.socket, self.io);
+                defer interrupt.clear(&tls_conn.socket, self.io);
                 return self.executeOnTls(&tls_conn.session, req, &ok);
             }
 
@@ -797,6 +1214,8 @@ pub const Client = struct {
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
+            interrupt.publish(&socket, self.io);
+            defer interrupt.clear(&socket, self.io);
             return self.executeOnNewTls(&socket, host, req);
         }
 
@@ -808,6 +1227,8 @@ pub const Client = struct {
             }
 
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
+            interrupt.publish(&conn.socket, self.io);
+            defer interrupt.clear(&conn.socket, self.io);
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
@@ -815,6 +1236,8 @@ pub const Client = struct {
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
+        interrupt.publish(&socket, self.io);
+        defer interrupt.clear(&socket, self.io);
         return self.executeOnSocket(&socket, req, null);
     }
 
@@ -826,6 +1249,7 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
+        interrupt: *RequestInterrupt,
     ) !Response {
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
@@ -839,7 +1263,7 @@ pub const Client = struct {
         };
 
         if (self.config.http2_enabled or self.config.force_http2) {
-            var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms);
+            var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt);
             errdefer res.deinit();
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
             return res;
@@ -854,6 +1278,8 @@ pub const Client = struct {
                 }
 
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
+                interrupt.publish(&tls_conn.socket, self.io);
+                defer interrupt.clear(&tls_conn.socket, self.io);
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
@@ -861,6 +1287,8 @@ pub const Client = struct {
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
+            interrupt.publish(&socket, self.io);
+            defer interrupt.clear(&socket, self.io);
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
 
@@ -872,6 +1300,8 @@ pub const Client = struct {
             }
 
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
+            interrupt.publish(&conn.socket, self.io);
+            defer interrupt.clear(&conn.socket, self.io);
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
@@ -879,6 +1309,8 @@ pub const Client = struct {
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
+        interrupt.publish(&socket, self.io);
+        defer interrupt.clear(&socket, self.io);
         return self.executeOnSocketToWriter(&socket, req, writer, progress_cb, progress_ctx, null);
     }
 
@@ -888,7 +1320,7 @@ pub const Client = struct {
         const bytes = try serializeToSlice(self.allocator, req);
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
-        var res = try self.readResponse(socket, req.method);
+        var res = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -907,7 +1339,14 @@ pub const Client = struct {
         const bytes = try serializeToSlice(self.allocator, req);
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
-        var res = try self.readResponseToWriter(socket, req.method, writer, progress_cb, progress_ctx);
+        var res = try self.readResponseToWriter(
+            socket,
+            req.method,
+            self.responseSizeLimit(req),
+            writer,
+            progress_cb,
+            progress_ctx,
+        );
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -922,7 +1361,7 @@ pub const Client = struct {
         const w = try session.getWriter();
         try w.writeAll(bytes);
         try session.flush();
-        var res = try self.readResponse(session, req.method);
+        var res = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -943,7 +1382,14 @@ pub const Client = struct {
         const w = try session.getWriter();
         try w.writeAll(bytes);
         try session.flush();
-        var res = try self.readResponseToWriter(session, req.method, writer, progress_cb, progress_ctx);
+        var res = try self.readResponseToWriter(
+            session,
+            req.method,
+            self.responseSizeLimit(req),
+            writer,
+            progress_cb,
+            progress_ctx,
+        );
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -985,7 +1431,7 @@ pub const Client = struct {
     /// blocking I/O (DNS, TCP connect, TLS handshake, SETTINGS exchange).
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
-    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !*H2PoolEntry {
+    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !H2Lease {
         var key_buf: [280]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
 
@@ -995,7 +1441,10 @@ pub const Client = struct {
             defer self.h2_mutex.unlock(self.io);
 
             if (self.h2_conns.get(key)) |entry| {
-                if (!entry.broken and !entry.h2.goaway_received) return entry;
+                if (!entry.retired and !entry.broken and !entry.h2.goaway_received) {
+                    entry.active_requests += 1;
+                    return .{ .client = self, .entry = entry };
+                }
                 if (entry.h2.goaway_received) entry.broken = true;
             }
         }
@@ -1068,9 +1517,8 @@ pub const Client = struct {
         // Collect entries to tear down outside the lock (await yields the
         // fiber, so we must not hold h2_mutex during teardown).
         var race_winner: ?*H2PoolEntry = null;
-        var stale_removed: ?std.StringHashMapUnmanaged(*H2PoolEntry).KV = null;
-        // Use defer so stale entry is cleaned up even if allocPrint/put fail.
-        defer if (stale_removed) |removed| self.destroyH2EntryKeyed(removed);
+        var stale_to_destroy: ?*H2PoolEntry = null;
+        errdefer if (stale_to_destroy) |stale| self.destroyRetiredH2Entry(stale);
 
         {
             self.h2_mutex.lockUncancelable(self.io);
@@ -1078,28 +1526,40 @@ pub const Client = struct {
 
             // Another fiber may have raced us and inserted a connection.
             if (self.h2_conns.get(key)) |existing| {
-                if (!existing.broken and !existing.h2.goaway_received) {
+                if (!existing.retired and !existing.broken and !existing.h2.goaway_received) {
+                    existing.active_requests += 1;
                     race_winner = existing;
                 }
             }
 
             if (race_winner == null) {
                 // Remove stale/broken entry if present.
-                stale_removed = self.h2_conns.fetchRemove(key);
+                if (self.h2_conns.fetchRemove(key)) |removed| {
+                    const stale = removed.value;
+                    stale.retired = true;
+                    stale.retired_key = removed.key;
+                    if (stale.active_requests == 0) stale_to_destroy = stale;
+                }
 
                 const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
                 errdefer self.allocator.free(owned_key);
                 try self.h2_conns.put(self.allocator, owned_key, entry);
+                entry.active_requests = 1;
             }
+        }
+
+        if (stale_to_destroy) |stale| {
+            self.destroyRetiredH2Entry(stale);
+            stale_to_destroy = null;
         }
 
         if (race_winner) |existing| {
             // Loser: tear down our connection, use the winner's.
             self.destroyH2Entry(entry);
-            return existing;
+            return .{ .client = self, .entry = existing };
         }
 
-        return entry;
+        return .{ .client = self, .entry = entry };
     }
 
     /// Tears down an H2PoolEntry that was never inserted into h2_conns.
@@ -1116,16 +1576,21 @@ pub const Client = struct {
         self.allocator.destroy(entry);
     }
 
-    /// Tears down an H2PoolEntry that was removed from h2_conns via fetchRemove.
-    fn destroyH2EntryKeyed(self: *Self, removed: std.StringHashMapUnmanaged(*H2PoolEntry).KV) void {
-        const e = removed.value;
-        e.socket.close();
-        e.recv_group.await(self.io) catch {};
-        e.ping_group.await(self.io) catch {};
-        e.h2.deinit();
-        e.session.deinit();
-        self.allocator.destroy(e);
-        self.allocator.free(removed.key);
+    fn destroyRetiredH2Entry(self: *Self, entry: *H2PoolEntry) void {
+        const key = entry.retired_key orelse unreachable;
+        self.destroyH2Entry(entry);
+        self.allocator.free(key);
+    }
+
+    fn releaseH2Lease(self: *Self, entry: *H2PoolEntry) void {
+        var destroy: ?*H2PoolEntry = null;
+        self.h2_mutex.lockUncancelable(self.io);
+        std.debug.assert(entry.active_requests > 0);
+        entry.active_requests -= 1;
+        if (entry.retired and entry.active_requests == 0) destroy = entry;
+        self.h2_mutex.unlock(self.io);
+        // Teardown may await fibers, and must never run while h2_mutex is held.
+        if (destroy) |retired| self.destroyRetiredH2Entry(retired);
     }
 
     /// Reads frames until the server's initial SETTINGS has been received and ACKed.
@@ -1250,15 +1715,19 @@ pub const Client = struct {
     /// In multiplexed mode (recv_running=true), the background receive fiber
     /// pumps frames while this fiber waits on a per-stream event.
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
-    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt) !Response {
         const h2 = &entry.h2;
-        if (h2.goaway_received) {
-            entry.broken = true;
-            return error.ConnectionClosed;
-        }
-        const stream = try h2.stream_manager.createStream();
+        const stream = self.createH2ResponseStream(h2, req) catch |err| {
+            if (err == error.ConnectionClosed) entry.broken = true;
+            return err;
+        };
         const stream_id = stream.id;
-        errdefer h2.stream_manager.removeStream(stream_id);
+        defer interrupt.clearH2(entry, stream_id, self.io);
+        errdefer {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            h2.stream_manager.removeStream(stream_id);
+        }
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -1307,13 +1776,14 @@ pub const Client = struct {
             // allocated semaphore would be use-after-free.
             const sem = try self.allocator.create(Io.Semaphore);
             sem.* = .{ .permits = 0 };
-            stream.completion_sem = sem;
             // Re-fetch the stream pointer for cleanup since the backing
             // map may have rehashed while we were blocked on I/O.
             defer {
+                h2.write_mutex.lockUncancelable(self.io);
                 if (h2.stream_manager.getStream(stream_id)) |s| {
                     s.completion_sem = null;
                 }
+                h2.write_mutex.unlock(self.io);
                 self.allocator.destroy(sem);
             }
 
@@ -1321,13 +1791,39 @@ pub const Client = struct {
             {
                 h2.write_mutex.lockUncancelable(self.io);
                 defer h2.write_mutex.unlock(self.io);
+                // Cancellation before request HEADERS have reached the wire is
+                // local-only: emitting RST_STREAM for an idle stream violates
+                // RFC 7540 and can kill the shared connection.
+                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                const published = h2.stream_manager.getStream(stream_id) orelse
+                    return error.ConnectionClosed;
+                if (published.stream_error) |err| return normalizeH2ResponseError(err);
+                if (published.completed) return error.ConnectionClosed;
+                // Publish the waiter under the same lock used by the receive
+                // loop. This makes pointer publication and the pre-send error
+                // check atomic with connection teardown.
+                published.completion_sem = sem;
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                    if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
                 } else {
                     try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                    if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
+                }
+            }
+
+            // The completion semaphore is installed before publication. Do
+            // this immediately after HEADERS, before potentially blocking on
+            // request-body flow control, so cancellation owns a live stream.
+            interrupt.publishH2(entry, stream_id, self.io);
+
+            if (req.body) |body| {
+                h2.write_mutex.lockUncancelable(self.io);
+                defer h2.write_mutex.unlock(self.io);
+                if (entry.is_tls) {
+                    const w = try entry.session.getWriter();
+                    try h2.writeDataBlocking(w, stream_id, body, true);
+                } else {
+                    try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
                 }
             }
 
@@ -1335,37 +1831,71 @@ pub const Client = struct {
             sem.waitUncancelable(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
+            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
             if (entry.is_tls) {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
-                try h2.awaitStreamComplete(r, w, stream_id);
+                interrupt.publishH2(entry, stream_id, self.io);
+                if (req.body) |body| {
+                    h2.write_mutex.lockUncancelable(self.io);
+                    defer h2.write_mutex.unlock(self.io);
+                    try h2.writeData(w, stream_id, body, true);
+                }
+                h2.awaitStreamComplete(r, w, stream_id) catch |err| {
+                    if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                    return err;
+                };
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
-                try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
+                interrupt.publishH2(entry, stream_id, self.io);
+                if (req.body) |body| {
+                    h2.write_mutex.lockUncancelable(self.io);
+                    defer h2.write_mutex.unlock(self.io);
+                    try h2.writeData(&entry.socket, stream_id, body, true);
+                }
+                h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id) catch |err| {
+                    if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                    return err;
+                };
             }
         }
 
-        // Extract response from mailbox.
-        const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
-        defer h2.stream_manager.removeStream(stream_id);
-        if (s.stream_error) |err| return err;
-
-        // Headers were decoded in deliverToMailbox (receive loop) to avoid
-        // concurrent HPACK decode races on the shared hpack_ctx.
-        const decoded_headers = s.request_headers orelse return error.InvalidResponse;
+        // Extract an owned response snapshot while holding the mailbox lock.
+        // Cancellation may race the request task after the completion wake,
+        // and trailing frames can otherwise invalidate header/body slices.
+        defer {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            h2.stream_manager.removeStream(stream_id);
+        }
 
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
+        var response_body: ?[]u8 = null;
+        errdefer if (response_body) |body| self.allocator.free(body);
 
-        for (decoded_headers) |h| {
-            if (mem.eql(u8, h.name, ":status")) {
-                status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
-            } else if (h.name.len > 0 and h.name[0] != ':') {
-                try response_headers.append(h.name, h.value);
+        {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
+            if (s.stream_error) |err| return err;
+
+            // Headers were decoded in deliverToMailbox (receive loop) to
+            // avoid concurrent HPACK decode races on the shared hpack_ctx.
+            const decoded_headers = s.request_headers orelse return error.InvalidResponse;
+            for (decoded_headers) |h| {
+                if (mem.eql(u8, h.name, ":status")) {
+                    status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
+                } else if (h.name.len > 0 and h.name[0] != ':') {
+                    try response_headers.append(h.name, h.value);
+                }
+            }
+
+            if (s.data_buf.items.len > 0) {
+                if (s.data_buf.items.len > self.responseSizeLimit(req)) return error.ResponseTooLarge;
+                response_body = try self.allocator.dupe(u8, s.data_buf.items);
             }
         }
 
@@ -1375,10 +1905,10 @@ pub const Client = struct {
         res.headers.deinit();
         res.headers = response_headers;
 
-        if (s.data_buf.items.len > 0) {
-            if (s.data_buf.items.len > self.config.max_response_size) return error.ResponseTooLarge;
-            res.body = try self.allocator.dupe(u8, s.data_buf.items);
+        if (response_body) |body| {
+            res.body = body;
             res.body_owned = true;
+            response_body = null;
         }
 
         return res;
@@ -1393,6 +1923,7 @@ pub const Client = struct {
         entry: *H2PoolEntry,
         data_event: *Io.Event,
         allocator: Allocator,
+        lease: ?H2Lease = null,
         read_timeout: Io.Timeout = .none,
 
         /// Reads up to `buf.len` bytes. Blocks until data is available.
@@ -1400,6 +1931,7 @@ pub const Client = struct {
         /// within the configured read_timeout.
         pub fn read(self: *H2StreamReader, buf: []u8) !usize {
             while (true) {
+                self.h2.write_mutex.lockUncancelable(self.io);
                 const avail = self.stream.data_buf.items.len - self.stream.read_offset;
                 if (avail > 0) {
                     const n = @min(avail, buf.len);
@@ -1409,18 +1941,35 @@ pub const Client = struct {
                     if (self.stream.read_offset >= Stream.compact_threshold) {
                         self.stream.compactDataBuf();
                     }
+                    self.h2.write_mutex.unlock(self.io);
                     return n;
                 }
-                if (self.stream.stream_error) |err| return err;
-                if (self.stream.completed) return 0;
+                if (self.stream.stream_error) |err| {
+                    self.h2.write_mutex.unlock(self.io);
+                    return normalizeH2ResponseError(err);
+                }
+                if (self.stream.completed) {
+                    self.h2.write_mutex.unlock(self.io);
+                    return 0;
+                }
 
                 // Reset event, re-check buffer (handles race with receive loop),
-                // then wait with timeout.
+                // then release the mailbox lock before waiting.
                 self.data_event.reset();
                 const avail2 = self.stream.data_buf.items.len - self.stream.read_offset;
-                if (avail2 > 0) continue;
-                if (self.stream.stream_error) |err| return err;
-                if (self.stream.completed) return 0;
+                if (avail2 > 0) {
+                    self.h2.write_mutex.unlock(self.io);
+                    continue;
+                }
+                if (self.stream.stream_error) |err| {
+                    self.h2.write_mutex.unlock(self.io);
+                    return normalizeH2ResponseError(err);
+                }
+                if (self.stream.completed) {
+                    self.h2.write_mutex.unlock(self.io);
+                    return 0;
+                }
+                self.h2.write_mutex.unlock(self.io);
 
                 self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
                     error.Timeout => return error.Timeout,
@@ -1432,27 +1981,75 @@ pub const Client = struct {
         /// Releases the stream. Sends RST_STREAM(CANCEL) if the stream
         /// hasn't completed, telling the server to stop sending DATA frames.
         pub fn close(self: *H2StreamReader) void {
-            const stream_id = self.stream.id;
-            const completed = self.stream.completed;
-            self.stream.data_event = null;
-            self.stream.completion_sem = null;
-
-            if (!completed) {
-                self.h2.write_mutex.lockUncancelable(self.io);
-                defer self.h2.write_mutex.unlock(self.io);
-                if (self.entry.is_tls) {
-                    if (self.entry.session.getWriter()) |w|
-                        self.h2.sendRstStream(w, stream_id, .cancel) catch {}
-                    else |_| {}
-                } else {
-                    self.h2.sendRstStream(&self.entry.socket, stream_id, .cancel) catch {};
-                }
-            }
-
-            self.h2.stream_manager.removeStream(stream_id);
-            self.allocator.destroy(self.data_event);
+            Client.cleanupH2Stream(
+                self.entry,
+                self.stream.id,
+                self.data_event,
+                true,
+                self.io,
+                self.allocator,
+            );
+            if (self.lease) |*lease| lease.release();
         }
     };
+
+    /// Detaches a streaming response's receive-loop pointers while holding the
+    /// same mutex that protects mailbox delivery.  Once the event is detached
+    /// and the stream removed, no producer can retain either allocation; only
+    /// then is it safe to destroy the event.  `headers_sent` distinguishes a
+    /// locally allocated idle stream from one the peer can still be sending on.
+    fn cleanupH2Stream(
+        entry: *H2PoolEntry,
+        stream_id: u31,
+        data_event: ?*Io.Event,
+        headers_sent: bool,
+        io: Io,
+        allocator: Allocator,
+    ) void {
+        const h2 = &entry.h2;
+        h2.write_mutex.lockUncancelable(io);
+        const cancel_peer = prepareH2StreamCleanupLocked(h2, stream_id, data_event, headers_sent);
+        if (cancel_peer) {
+            if (entry.is_tls) {
+                if (entry.session.getWriter()) |writer|
+                    h2.sendRstStream(writer, stream_id, .cancel) catch {}
+                else |_| {}
+            } else {
+                h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
+            }
+        }
+        h2.stream_manager.removeStream(stream_id);
+        h2.write_mutex.unlock(io);
+
+        if (data_event) |event| allocator.destroy(event);
+    }
+
+    /// Prepares a stream for teardown while `h2.write_mutex` is held.
+    /// Returns whether the peer must be told about cancellation before the
+    /// caller removes the stream.
+    fn prepareH2StreamCleanupLocked(
+        h2: *H2Connection,
+        stream_id: u31,
+        data_event: ?*Io.Event,
+        headers_sent: bool,
+    ) bool {
+        const stream = h2.stream_manager.getStream(stream_id) orelse return false;
+        if (data_event) |event| {
+            if (stream.data_event == event) stream.data_event = null;
+        }
+        // This request-stream path does not install a completion waiter, but
+        // clearing it here keeps removal safe if that changes.
+        stream.completion_sem = null;
+
+        // Never RST an idle stream: before HEADERS reaches the peer it is only
+        // a local allocation. Once HEADERS is live, reset it before removal so
+        // the peer does not retain a half-open stream.
+        if (!headers_sent or stream.completed) return false;
+        stream.stream_error = error.Cancelled;
+        stream.completed = true;
+        stream.reset();
+        return true;
+    }
 
     /// Response from a streaming H2 request. Contains response headers
     /// and an incremental reader for the response body.
@@ -1474,26 +2071,25 @@ pub const Client = struct {
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
-        const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+        var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+        var lease_transferred = false;
+        defer if (!lease_transferred) lease.release();
+        const entry = lease.entry;
         if (!entry.recv_running) return error.MultiplexingRequired;
 
         const h2 = &entry.h2;
-        if (h2.goaway_received) {
-            entry.broken = true;
-            return error.ConnectionClosed;
-        }
-        const stream = try h2.stream_manager.createStream();
+        const stream = self.createH2ResponseStream(h2, req) catch |err| {
+            if (err == error.ConnectionClosed) entry.broken = true;
+            return err;
+        };
         const stream_id = stream.id;
-        errdefer h2.stream_manager.removeStream(stream_id);
+        var data_event: ?*Io.Event = null;
+        var headers_sent = false;
+        errdefer cleanupH2Stream(entry, stream_id, data_event, headers_sent, self.io, self.allocator);
 
         // Heap-allocate event for pointer stability and timed waits.
-        const data_event = try self.allocator.create(Io.Event);
-        data_event.* = .unset;
-        stream.data_event = data_event;
-        errdefer {
-            stream.data_event = null;
-            self.allocator.destroy(data_event);
-        }
+        data_event = try self.allocator.create(Io.Event);
+        data_event.?.* = .unset;
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -1538,12 +2134,21 @@ pub const Client = struct {
         {
             h2.write_mutex.lockUncancelable(self.io);
             defer h2.write_mutex.unlock(self.io);
+            const published = h2.stream_manager.getStream(stream_id) orelse
+                return error.ConnectionClosed;
+            if (published.stream_error) |err| return normalizeH2ResponseError(err);
+            if (published.completed) return error.ConnectionClosed;
+            // The receive loop reads and signals this pointer while holding
+            // write_mutex; publish it under that same lock before HEADERS.
+            published.data_event = data_event;
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                headers_sent = true;
                 if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                headers_sent = true;
                 if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
             }
         }
@@ -1556,45 +2161,68 @@ pub const Client = struct {
             } }
         else
             .none;
-        while (!stream.got_headers and !stream.completed) {
-            data_event.reset();
-            if (stream.got_headers or stream.completed) break;
-            data_event.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
+        while (true) {
+            h2.write_mutex.lockUncancelable(self.io);
+            if (stream.got_headers or stream.completed) {
+                h2.write_mutex.unlock(self.io);
+                break;
+            }
+            data_event.?.reset();
+            if (stream.got_headers or stream.completed) {
+                h2.write_mutex.unlock(self.io);
+                break;
+            }
+            h2.write_mutex.unlock(self.io);
+            data_event.?.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 error.Canceled => return error.Canceled,
             };
         }
-        if (stream.stream_error) |err| return err;
-
-        // Headers were decoded in deliverToMailbox (receive loop) to avoid
-        // concurrent HPACK decode races on the shared hpack_ctx.
-        const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
-
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (decoded_headers) |h| {
-            if (mem.eql(u8, h.name, ":status")) {
-                status_code = std.fmt.parseInt(u16, h.value, 10) catch
-                    return error.InvalidResponse;
-            } else if (h.name.len > 0 and h.name[0] != ':') {
-                try response_headers.append(h.name, h.value);
+        {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            if (stream.stream_error) |err| return normalizeH2ResponseError(err);
+
+            // Copy decoded headers while the receive loop cannot replace or
+            // extend the stream mailbox with trailing header blocks.
+            const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
+            for (decoded_headers) |h| {
+                if (mem.eql(u8, h.name, ":status")) {
+                    status_code = std.fmt.parseInt(u16, h.value, 10) catch
+                        return error.InvalidResponse;
+                } else if (h.name.len > 0 and h.name[0] != ':') {
+                    try response_headers.append(h.name, h.value);
+                }
             }
         }
 
+        const code = try transferStreamLeaseAfterStatus(&lease_transferred, status_code);
         return .{
-            .status_code = status_code orelse return error.InvalidResponse,
+            .status_code = code,
             .headers = response_headers,
             .reader = .{
                 .stream = stream,
                 .io = self.io,
                 .h2 = h2,
                 .entry = entry,
-                .data_event = data_event,
+                .data_event = data_event.?,
                 .allocator = self.allocator,
+                .lease = lease,
             },
         };
+    }
+
+    /// Validates the required H2 status before the returned stream reader owns
+    /// its pool-entry lease. This keeps requestStream's error defer in charge
+    /// of releasing leases for malformed response headers.
+    fn transferStreamLeaseAfterStatus(lease_transferred: *bool, status_code: ?u16) !u16 {
+        const code = status_code orelse return error.InvalidResponse;
+        lease_transferred.* = true;
+        return code;
     }
 
     /// Unified response reader parameterized on the read source.
@@ -1603,10 +2231,10 @@ pub const Client = struct {
     /// Streaming pipeline: parse headers only → build Io.Reader chain
     /// (leftover → socket/TLS → content-length/chunked → decompress) → read into output.
     /// Only one copy of the body is ever in memory at a time.
-    fn readResponse(self: *Self, source: anytype, req_method: types.Method) !Response {
+    fn readResponse(self: *Self, source: anytype, req_method: types.Method, max_response_size: usize) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
-        parser.max_body_size = self.config.max_response_size;
+        parser.max_body_size = max_response_size;
         parser.max_headers = self.config.max_response_headers;
         parser.headers_only = true;
 
@@ -1635,6 +2263,9 @@ pub const Client = struct {
                 };
                 if (n == 0) break;
                 total_read += n;
+                // This phase parses response headers into a fixed stack buffer.
+                // The caller-specific body ceiling is enforced by the streaming
+                // body pipeline after framing and decompression.
                 if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
                 const total = leftover + n;
                 const consumed = try parser.feed(buf[0..total]);
@@ -1660,20 +2291,21 @@ pub const Client = struct {
             break;
         }
 
-        return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method);
+        return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method, max_response_size);
     }
 
     fn readResponseToWriter(
         self: *Self,
         source: anytype,
         req_method: types.Method,
+        max_response_size: usize,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
-        parser.max_body_size = self.config.max_response_size;
+        parser.max_body_size = max_response_size;
         parser.max_headers = self.config.max_response_headers;
         parser.headers_only = true;
 
@@ -1727,7 +2359,16 @@ pub const Client = struct {
             break;
         }
 
-        return self.writeStreamingResponse(&parser, source, buf[0..leftover], req_method, writer, progress_cb, progress_ctx);
+        return self.writeStreamingResponse(
+            &parser,
+            source,
+            buf[0..leftover],
+            req_method,
+            max_response_size,
+            writer,
+            progress_cb,
+            progress_ctx,
+        );
     }
 
     /// Read bytes from either a Socket or a TlsSession into `buf`.
@@ -1771,7 +2412,14 @@ pub const Client = struct {
 
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
-    fn buildStreamingResponse(self: *Self, parser: *Parser, source: anytype, leftover: []const u8, req_method: types.Method) !Response {
+    fn buildStreamingResponse(
+        self: *Self,
+        parser: *Parser,
+        source: anytype,
+        leftover: []const u8,
+        req_method: types.Method,
+        max_response_size: usize,
+    ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
@@ -1833,17 +2481,18 @@ pub const Client = struct {
         // --- Read from the chain into a single output buffer ---
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(self.allocator);
+        const max_size = max_response_size;
 
         // Pre-allocate hint: use content_length if known (and not compressed).
         if (container == null) {
             if (parser.content_length) |len| {
+                if (len > max_size) return error.ResponseTooLarge;
                 if (len <= std.math.maxInt(usize)) {
                     try result.ensureTotalCapacity(self.allocator, @intCast(len));
                 }
             }
         }
 
-        const max_size = self.config.max_response_size;
         var read_buf: [16 * 1024]u8 = undefined;
 
         if (container) |ctr| {
@@ -1857,7 +2506,7 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                if (compressed.items.len + n > max_size) return error.ResponseTooLarge;
+                _ = try checkedResponseSize(compressed.items.len, n, max_size);
                 try compressed.appendSlice(self.allocator, read_buf[0..n]);
             }
 
@@ -1871,7 +2520,7 @@ pub const Client = struct {
                     return error.DecompressionFailed;
                 };
                 if (n == 0) break;
-                if (result.items.len + n > max_size) return error.ResponseTooLarge;
+                _ = try checkedResponseSize(result.items.len, n, max_size);
                 try result.appendSlice(self.allocator, read_buf[0..n]);
             }
         } else {
@@ -1882,7 +2531,7 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                if (result.items.len + n > max_size) return error.ResponseTooLarge;
+                _ = try checkedResponseSize(result.items.len, n, max_size);
                 try result.appendSlice(self.allocator, read_buf[0..n]);
             }
         }
@@ -1902,11 +2551,12 @@ pub const Client = struct {
     }
 
     fn writeStreamingResponse(
-        self: *Self,
+        _: *Self,
         parser: *Parser,
         source: anytype,
         leftover: []const u8,
         req_method: types.Method,
+        max_response_size: usize,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
@@ -1952,6 +2602,7 @@ pub const Client = struct {
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
             if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
+            if (container == null and len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -1961,7 +2612,7 @@ pub const Client = struct {
         const close_delimited_body = !parser.chunked and parser.content_length == null;
         const is_redirect = code >= 300 and code < 400;
         const progress_total = if (container == null and !parser.chunked) parser.content_length else null;
-        var written_total: u64 = 0;
+        var written_total: usize = 0;
 
         var read_buf: [16 * 1024]u8 = undefined;
 
@@ -1973,8 +2624,11 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                written_total += n;
-                if (written_total > self.config.max_response_size) return error.ResponseTooLarge;
+                written_total = try checkedResponseSize(
+                    written_total,
+                    n,
+                    max_response_size,
+                );
             }
         } else if (container) |ctr| {
             var decompress_window: [flate.max_window_len]u8 = undefined;
@@ -1987,10 +2641,17 @@ pub const Client = struct {
                     return error.DecompressionFailed;
                 };
                 if (n == 0) break;
-                if (written_total + n > self.config.max_response_size) return error.ResponseTooLarge;
+                const next_total = try checkedResponseSize(
+                    written_total,
+                    n,
+                    max_response_size,
+                );
                 try writer.writeAll(read_buf[0..n]);
-                written_total += n;
-                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = null }, progress_ctx);
+                written_total = next_total;
+                if (progress_cb) |cb| cb(.{
+                    .bytes_written = @intCast(written_total),
+                    .total_bytes = null,
+                }, progress_ctx);
             }
         } else {
             while (true) {
@@ -2000,9 +2661,17 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
+                const next_total = try checkedResponseSize(
+                    written_total,
+                    n,
+                    max_response_size,
+                );
                 try writer.writeAll(read_buf[0..n]);
-                written_total += n;
-                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = progress_total }, progress_ctx);
+                written_total = next_total;
+                if (progress_cb) |cb| cb(.{
+                    .bytes_written = @intCast(written_total),
+                    .total_bytes = progress_total,
+                }, progress_ctx);
             }
         }
 
@@ -2321,6 +2990,16 @@ test "Client initialization" {
     try std.testing.expectEqualStrings(meta.default_user_agent, client.config.user_agent);
 }
 
+test "Client rejects an already cancelled request" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    var cancellation = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{ .cancellation = &cancellation }),
+    );
+}
+
 test "Client with config" {
     const allocator = std.testing.allocator;
     var client = Client.initWithConfig(allocator, std.testing.io, .{
@@ -2493,6 +3172,41 @@ test "Client config limits are customizable" {
     try std.testing.expectEqual(@as(usize, 32), client.config.max_response_headers);
 }
 
+test "Client per-request response limit only lowers the configured ceiling" {
+    const allocator = std.testing.allocator;
+    var client = Client.initWithConfig(allocator, std.testing.io, .{
+        .max_response_size = 1024,
+    });
+    defer client.deinit();
+    var request = try Request.init(allocator, .GET, "http://example.com/");
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimit(&request));
+    request.max_response_size = 64;
+    try std.testing.expectEqual(@as(usize, 64), client.responseSizeLimit(&request));
+    request.max_response_size = 2048;
+    try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimit(&request));
+    request.max_response_size = 0;
+    try std.testing.expectEqual(@as(usize, 0), client.responseSizeLimit(&request));
+    var stream = Stream.init(1);
+    client.configureH2ResponseStream(&stream, &request);
+    try std.testing.expectEqual(@as(?usize, 0), stream.max_data_size);
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        try Client.checkedResponseSize(8, 8, 16),
+    );
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        Client.checkedResponseSize(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
+    );
+    try std.testing.expectEqual(
+        error.ResponseTooLarge,
+        Client.normalizeH2ResponseError(error.StreamDataOverflow),
+    );
+    try std.testing.expect(!Client.mayRetryConnectionError(error.ResponseTooLarge));
+    try std.testing.expect(Client.mayRetryConnectionError(error.ConnectionClosed));
+}
+
 test "SliceIoReader reads slice data" {
     const data = "hello, world!";
     var buf: [64]u8 = undefined;
@@ -2572,8 +3286,14 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     const allocator = std.testing.allocator;
 
     // Set up an H2Connection with a stream that has pre-buffered data.
-    var h2 = H2Connection.initClient(allocator, std.testing.io);
-    defer h2.deinit();
+    var entry = H2PoolEntry{
+        .socket = undefined,
+        .session = undefined,
+        .h2 = H2Connection.initClient(allocator, std.testing.io),
+        .is_tls = false,
+    };
+    defer entry.h2.deinit();
+    const h2 = &entry.h2;
 
     const stream = try h2.stream_manager.createStream();
     const stream_id = stream.id;
@@ -2590,8 +3310,8 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     var reader = Client.H2StreamReader{
         .stream = stream,
         .io = std.testing.io,
-        .h2 = &h2,
-        .entry = undefined, // Not dereferenced: stream.completed=true so close() skips RST_STREAM.
+        .h2 = h2,
+        .entry = &entry, // completed=true means close() skips socket/TLS access.
         .data_event = data_event,
         .allocator = allocator,
     };
@@ -2617,6 +3337,135 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 
     // Verify stream was removed.
     try std.testing.expect(h2.stream_manager.getStream(stream_id) == null);
+}
+
+test "H2 entry lease defers retired teardown while another request is in flight" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+
+    var entry = H2PoolEntry{
+        .socket = undefined,
+        .session = undefined,
+        .h2 = H2Connection.initClient(std.testing.allocator, std.testing.io),
+        .is_tls = false,
+        .retired = true,
+        .active_requests = 2,
+    };
+    defer entry.h2.deinit();
+
+    var old_request = Client.H2Lease{ .client = &client, .entry = &entry };
+    old_request.release();
+
+    // Replacing the broken map entry must not tear down its socket/H2 state
+    // until the final old request releases its lease.
+    try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+    try std.testing.expect(entry.retired);
+}
+
+test "pooled H2 stream creation serializes ids and map publication" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = Client.init(alloc, io);
+    defer client.deinit();
+    var h2 = H2Connection.initClient(alloc, io);
+    defer h2.deinit();
+    var request = try Request.init(alloc, .GET, "http://example.com/");
+    defer request.deinit();
+
+    const stream_count = 64;
+    var ids: [stream_count]u31 = undefined;
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(c: *Client, conn: *H2Connection, req: *Request, out: *u31, did_fail: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            const stream = c.createH2ResponseStream(conn, req) catch {
+                did_fail.store(true, .release);
+                return;
+            };
+            out.* = stream.id;
+        }
+    };
+
+    var group = std.Io.Group.init;
+    for (&ids) |*id| try group.concurrent(io, Worker.run, .{ &client, &h2, &request, id, &failed });
+    try group.await(io);
+    try std.testing.expect(!failed.load(.acquire));
+
+    std.mem.sort(u31, &ids, {}, std.sort.asc(u31));
+    for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u31, @intCast(i * 2 + 1)), id);
+    h2.write_mutex.lockUncancelable(io);
+    defer h2.write_mutex.unlock(io);
+    try std.testing.expectEqual(@as(u32, stream_count), h2.stream_manager.activeStreamCount());
+}
+
+test "H2 stream response without status releases its retired lease" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+
+    var entry = H2PoolEntry{
+        .socket = undefined,
+        .session = undefined,
+        .h2 = H2Connection.initClient(std.testing.allocator, std.testing.io),
+        .is_tls = false,
+        .retired = true,
+        // Keep one synthetic in-flight request so release avoids socket
+        // teardown; that lets this regression assert the lease accounting.
+        .active_requests = 2,
+    };
+    defer entry.h2.deinit();
+
+    {
+        var lease = Client.H2Lease{ .client = &client, .entry = &entry };
+        var lease_transferred = false;
+        defer if (!lease_transferred) lease.release();
+
+        try std.testing.expectError(
+            error.InvalidResponse,
+            Client.transferStreamLeaseAfterStatus(&lease_transferred, null),
+        );
+        try std.testing.expect(!lease_transferred);
+    }
+    try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+}
+
+test "H2 stream cleanup detaches receiver before resetting a published stream" {
+    const allocator = std.testing.allocator;
+    var h2 = H2Connection.initClient(allocator, std.testing.io);
+    defer h2.deinit();
+
+    const published = try h2.stream_manager.createStream();
+    const published_event = try allocator.create(Io.Event);
+    published_event.* = .unset;
+    published.data_event = published_event;
+
+    h2.write_mutex.lockUncancelable(std.testing.io);
+    try std.testing.expect(Client.prepareH2StreamCleanupLocked(&h2, published.id, published_event, true));
+    // The receive loop takes this mutex before delivering an event, so after
+    // this detach it cannot retain the event pointer across destruction.
+    try std.testing.expect(published.data_event == null);
+    try std.testing.expectEqual(error.Cancelled, published.stream_error.?);
+    try std.testing.expect(published.completed);
+    try std.testing.expectEqual(.closed, published.state);
+    h2.stream_manager.removeStream(published.id);
+    h2.write_mutex.unlock(std.testing.io);
+    allocator.destroy(published_event);
+
+    // A stream that never sent HEADERS is local-only and must not be reset.
+    const idle = try h2.stream_manager.createStream();
+    const idle_event = try allocator.create(Io.Event);
+    idle_event.* = .unset;
+    idle.data_event = idle_event;
+
+    h2.write_mutex.lockUncancelable(std.testing.io);
+    try std.testing.expect(!Client.prepareH2StreamCleanupLocked(&h2, idle.id, idle_event, false));
+    try std.testing.expect(idle.data_event == null);
+    try std.testing.expect(!idle.completed);
+    try std.testing.expectEqual(.open, idle.state);
+    h2.stream_manager.removeStream(idle.id);
+    h2.write_mutex.unlock(std.testing.io);
+    allocator.destroy(idle_event);
 }
 
 const test_tls_cert_pem =
@@ -2894,6 +3743,28 @@ const python_slow_drip_server_script =
     "        pass\n" ++
     "listener.close()\n";
 
+const python_bounded_response_server_script =
+    "import socket\n" ++
+    "import sys\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(2)\n" ++
+    "for _ in range(2):\n" ++
+    "    conn, _ = listener.accept()\n" ++
+    "    with conn:\n" ++
+    "        data = b''\n" ++
+    "        while b'\\r\\n\\r\\n' not in data:\n" ++
+    "            chunk = conn.recv(4096)\n" ++
+    "            if not chunk:\n" ++
+    "                break\n" ++
+    "            data += chunk\n" ++
+    "        body = b'x' * 32\n" ++
+    "        conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 32\\r\\nConnection: close\\r\\n\\r\\n' + body)\n" ++
+    "listener.close()\n";
+
 fn reserveEphemeralPort(io: Io) !u16 {
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try socket_mod.TcpListener.init(listen_addr, io);
@@ -2917,7 +3788,7 @@ fn requestWithRetry(client: *Client, io: Io, method: types.Method, url: []const 
     unreachable;
 }
 
-test "request timeout is absolute across a slow-drip response" {
+test "buffered H1 timeout evicts an interrupted pooled connection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const port = try reserveEphemeralPort(io);
@@ -2925,6 +3796,42 @@ test "request timeout is absolute across a slow-drip response" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = true,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 120, .read_ms = 1_000, .write_ms = 1_000 },
+    });
+    defer client.deinit();
+
+    try std.testing.expectError(error.Timeout, getWithRetry(&client, io, url, 20));
+    try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
+}
+
+test "per-request response limit rejects the body before allocation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
     var port_buf: [16]u8 = undefined;
     const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
     var child = std.process.spawn(io, .{
@@ -2945,14 +3852,30 @@ test "request timeout is absolute across a slow-drip response" {
     var client = Client.initWithConfig(allocator, io, .{
         .keep_alive = false,
         .retry_policy = .{ .max_retries = 0 },
-        .timeouts = .{ .request_ms = 120, .read_ms = 1_000, .write_ms = 1_000 },
     });
     defer client.deinit();
 
-    try std.testing.expectError(error.Timeout, getWithRetry(&client, io, url, 20));
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        client.request(.GET, url, .{ .max_response_size = 16 }),
+    );
+
+    var streamed = std.ArrayListUnmanaged(u8).empty;
+    defer streamed.deinit(allocator);
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        client.getToWriter(
+            url,
+            .{ .max_response_size = 16 },
+            arrayListWriter(&streamed, allocator),
+            null,
+            null,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), streamed.items.len);
 }
 
-test "request timeout is absolute when streaming a slow-drip response" {
+test "writer H1 timeout evicts an interrupted pooled connection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const port = try reserveEphemeralPort(io);
@@ -2978,7 +3901,7 @@ test "request timeout is absolute when streaming a slow-drip response" {
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
     var client = Client.initWithConfig(allocator, io, .{
-        .keep_alive = false,
+        .keep_alive = true,
         .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 120, .read_ms = 1_000, .write_ms = 1_000 },
     });
@@ -2990,6 +3913,7 @@ test "request timeout is absolute when streaming a slow-drip response" {
     try std.testing.expectError(error.Timeout, client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null));
     const elapsed_ms = common.milliTimestamp(io) - started_ms;
     try std.testing.expect(elapsed_ms < 750);
+    try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
 }
 
 test "HTTPS client round trip via local TLS server" {

@@ -34,6 +34,7 @@ test "data storage module tests are reachable" {
     std.testing.refAllDecls(raft_storage.snapshot_payload_store);
     std.testing.refAllDecls(raft_storage.replica_state);
     std.testing.refAllDecls(raft_storage.wal_replica_state);
+    std.testing.refAllDecls(raft_storage.wal_provider);
 }
 
 test "raft snapshot durability tests are reachable" {
