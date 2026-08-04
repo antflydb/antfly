@@ -24,6 +24,7 @@ const registry_mod = @import("../registry/registry.zig");
 const c_file = @import("../util/c_file.zig");
 
 const reader_selection_cache_ttl_ns: i96 = 30 * std.time.ns_per_s;
+const max_reader_selection_cache_entries: usize = 256;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -41,7 +42,8 @@ pub const Context = struct {
 /// selection instead of reparsing every installed model. The short TTL makes
 /// newly installed preferred readers visible without a restart; structurally
 /// invalid artifacts are evicted immediately while transient load pressure
-/// retains the selection for a cheap retry.
+/// retains the selection for a cheap retry. Canonical model-reference keys and
+/// a fixed entry cap bound memory under aliases and dynamic model churn.
 pub const ReaderResolver = struct {
     const CacheEntry = struct {
         path: []u8,
@@ -73,6 +75,43 @@ pub const ReaderResolver = struct {
         }
     }
 
+    fn evictOldestLocked(self: *ReaderResolver) void {
+        if (self.entries.count() < max_reader_selection_cache_entries) return;
+
+        var oldest_key: ?[]const u8 = null;
+        var oldest_at_ns: i96 = std.math.maxInt(i96);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.cached_at.nanoseconds < oldest_at_ns) {
+                oldest_key = entry.key_ptr.*;
+                oldest_at_ns = entry.value_ptr.cached_at.nanoseconds;
+            }
+        }
+        self.removeLocked(oldest_key orelse return);
+    }
+
+    fn cacheLocked(
+        self: *ReaderResolver,
+        extractor_model_name: []const u8,
+        path: []const u8,
+        cached_at: std.Io.Timestamp,
+    ) !void {
+        // Callers normally remove an expired entry first. Keeping replacement
+        // safe here prevents ownership leaks if this helper gains another
+        // caller later.
+        self.removeLocked(extractor_model_name);
+        self.evictOldestLocked();
+
+        const cache_key = try self.allocator.dupe(u8, extractor_model_name);
+        errdefer self.allocator.free(cache_key);
+        const cache_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(cache_path);
+        try self.entries.put(self.allocator, cache_key, .{
+            .path = cache_path,
+            .cached_at = cached_at,
+        });
+    }
+
     fn invalidate(
         self: *ReaderResolver,
         io: std.Io,
@@ -94,7 +133,7 @@ pub const ReaderResolver = struct {
         err: anyerror,
     ) void {
         if (shouldInvalidateReaderSelection(err)) {
-            self.invalidate(io, extractor_model_name, failed_path);
+            self.invalidate(io, canonicalModelName(extractor_model_name), failed_path);
         }
     }
 };
@@ -317,32 +356,27 @@ fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []con
         return path;
     } else |_| {}
 
+    const canonical_extractor_name = canonicalModelName(extractor_model_name);
+
     if (ctx.reader_resolver) |resolver| {
         resolver.mutex.lockUncancelable(ctx.io);
         defer resolver.mutex.unlock(ctx.io);
         const now = std.Io.Timestamp.now(ctx.io, .awake);
-        if (resolver.entries.get(extractor_model_name)) |entry| {
+        if (resolver.entries.get(canonical_extractor_name)) |entry| {
             const age = std.Io.Timestamp.durationTo(entry.cached_at, now).nanoseconds;
             if (age >= 0 and age < reader_selection_cache_ttl_ns) {
                 return ctx.allocator.dupe(u8, entry.path);
             }
-            resolver.removeLocked(extractor_model_name);
+            resolver.removeLocked(canonical_extractor_name);
         }
 
-        const path = try discoverReaderModelPathForExtraction(ctx, extractor_model_name);
+        const path = try discoverReaderModelPathForExtraction(ctx, canonical_extractor_name);
         errdefer ctx.allocator.free(path);
-        const cache_key = try resolver.allocator.dupe(u8, extractor_model_name);
-        errdefer resolver.allocator.free(cache_key);
-        const cache_path = try resolver.allocator.dupe(u8, path);
-        errdefer resolver.allocator.free(cache_path);
-        try resolver.entries.put(resolver.allocator, cache_key, .{
-            .path = cache_path,
-            .cached_at = now,
-        });
+        try resolver.cacheLocked(canonical_extractor_name, path, now);
         return path;
     }
 
-    return discoverReaderModelPathForExtraction(ctx, extractor_model_name);
+    return discoverReaderModelPathForExtraction(ctx, canonical_extractor_name);
 }
 
 fn shouldInvalidateReaderSelection(err: anyerror) bool {
@@ -394,8 +428,7 @@ fn discoverReaderModelPathForExtraction(ctx: Context, extractor_model_name: []co
 }
 
 fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
-    const normalized = if (std.mem.startsWith(u8, requested_name, "hf:")) requested_name[3..] else requested_name;
-    const name_without_variant = if (std.mem.indexOfScalar(u8, normalized, ':')) |colon| normalized[0..colon] else normalized;
+    const name_without_variant = canonicalModelName(requested_name);
 
     if (std.mem.startsWith(u8, name_without_variant, "/")) {
         return try ctx.allocator.dupe(u8, name_without_variant);
@@ -437,6 +470,11 @@ fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []
     }
 
     return error.ModelNotFound;
+}
+
+fn canonicalModelName(requested_name: []const u8) []const u8 {
+    const normalized = if (std.mem.startsWith(u8, requested_name, "hf:")) requested_name[3..] else requested_name;
+    return if (std.mem.indexOfScalar(u8, normalized, ':')) |colon| normalized[0..colon] else normalized;
 }
 
 fn resolveNamedReaderPath(ctx: Context, requested_name: []const u8) ![]const u8 {
@@ -633,13 +671,14 @@ test "image extraction caches a supported fallback reader selection" {
     const cached = resolver.entries.get("fastino/gliner2-base-v1").?;
     try std.testing.expectEqualStrings(first, cached.path);
 
-    const second = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
+    const second = try resolveReaderModelPathForExtraction(ctx, "hf:fastino/gliner2-base-v1:native");
     defer allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+    try std.testing.expectEqual(@as(usize, 1), resolver.entries.count());
 
-    resolver.handleLoadFailure(std.testing.io, "fastino/gliner2-base-v1", first, error.ResourceTemporarilyUnavailable);
+    resolver.handleLoadFailure(std.testing.io, "hf:fastino/gliner2-base-v1:native", first, error.ResourceTemporarilyUnavailable);
     try std.testing.expect(resolver.entries.contains("fastino/gliner2-base-v1"));
-    resolver.handleLoadFailure(std.testing.io, "fastino/gliner2-base-v1", first, error.InvalidModelForReading);
+    resolver.handleLoadFailure(std.testing.io, "fastino/gliner2-base-v1:other", first, error.InvalidModelForReading);
     try std.testing.expect(!resolver.entries.contains("fastino/gliner2-base-v1"));
 }
 
@@ -722,6 +761,32 @@ test "reader selection invalidation distinguishes structural and transient load 
     try std.testing.expect(!shouldInvalidateReaderSelection(error.OutOfMemory));
     try std.testing.expect(!shouldInvalidateReaderSelection(error.ModelArtifactsChanging));
     try std.testing.expect(!shouldInvalidateReaderSelection(error.NoBackendAvailable));
+}
+
+test "reader selection cache evicts the oldest entry at its fixed capacity" {
+    const allocator = std.testing.allocator;
+    var resolver = ReaderResolver.init(allocator);
+    defer resolver.deinit();
+
+    for (0..max_reader_selection_cache_entries + 1) |i| {
+        var key_buf: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "acme/recognizer-{d}", .{i});
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/models/readers/reader-{d}", .{i});
+        try resolver.cacheLocked(key, path, std.Io.Timestamp.fromNanoseconds(@intCast(i)));
+    }
+
+    try std.testing.expectEqual(max_reader_selection_cache_entries, resolver.entries.count());
+    try std.testing.expect(!resolver.entries.contains("acme/recognizer-0"));
+    var newest_key_buf: [64]u8 = undefined;
+    const newest_key = try std.fmt.bufPrint(&newest_key_buf, "acme/recognizer-{d}", .{max_reader_selection_cache_entries});
+    try std.testing.expect(resolver.entries.contains(newest_key));
+}
+
+test "canonical model names coalesce prefixes and variants" {
+    try std.testing.expectEqualStrings("acme/model", canonicalModelName("acme/model"));
+    try std.testing.expectEqualStrings("acme/model", canonicalModelName("hf:acme/model"));
+    try std.testing.expectEqualStrings("acme/model", canonicalModelName("hf:acme/model:gguf:Q4_K"));
 }
 
 test "resolve prefers recognizer for text extraction when both exist" {
