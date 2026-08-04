@@ -424,13 +424,31 @@ const ForceTextCompactOptions = struct {
 };
 
 const TextMergeScheduler = struct {
+    const DeletionDelta = struct {
+        bitmap: roaring.RoaringBitmap,
+        count: usize = 0,
+
+        fn init(alloc: Allocator) DeletionDelta {
+            return .{ .bitmap = roaring.RoaringBitmap.init(alloc) };
+        }
+
+        fn deinit(self: *DeletionDelta) void {
+            self.bitmap.deinit();
+            self.* = undefined;
+        }
+    };
+
     const InFlightMerge = struct {
         index_name: []u8,
         segment_ids: []u64,
+        deletion_deltas: []DeletionDelta,
+        valid: bool = true,
 
         fn deinit(self: *InFlightMerge, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.free(self.segment_ids);
+            for (self.deletion_deltas) |*delta| delta.deinit();
+            alloc.free(self.deletion_deltas);
             self.* = undefined;
         }
     };
@@ -542,9 +560,13 @@ const TextMergeScheduler = struct {
         errdefer alloc.free(owned_name);
         const owned_ids = try alloc.dupe(u64, segment_ids);
         errdefer alloc.free(owned_ids);
+        const deletion_deltas = try alloc.alloc(DeletionDelta, segment_ids.len);
+        errdefer alloc.free(deletion_deltas);
+        for (deletion_deltas) |*delta| delta.* = DeletionDelta.init(alloc);
         try self.in_flight.append(alloc, .{
             .index_name = owned_name,
             .segment_ids = owned_ids,
+            .deletion_deltas = deletion_deltas,
         });
     }
 
@@ -582,9 +604,48 @@ const TextMergeScheduler = struct {
     fn sourceInFlight(self: *const TextMergeScheduler, index_name: []const u8, source: []const IndexManager.TextMergeSourceSegment) bool {
         for (self.in_flight.items) |merge| {
             if (!std.mem.eql(u8, merge.index_name, index_name) or merge.segment_ids.len != source.len) continue;
-            if (sourceMatchesSegmentIds(source, merge.segment_ids)) return true;
+            if (sourceMatchesSegmentIds(source, merge.segment_ids)) return merge.valid;
         }
         return false;
+    }
+
+    fn sourceState(self: *const TextMergeScheduler, index_name: []const u8, source: []const IndexManager.TextMergeSourceSegment) ?*const InFlightMerge {
+        for (self.in_flight.items) |*merge| {
+            if (!merge.valid or !std.mem.eql(u8, merge.index_name, index_name) or merge.segment_ids.len != source.len) continue;
+            if (sourceMatchesSegmentIds(source, merge.segment_ids)) return merge;
+        }
+        return null;
+    }
+
+    /// Record only deletions which have durably committed after a merge took
+    /// its source snapshot. A recording allocation failure cannot be returned
+    /// to the writer after commit, so invalidate the affected merge in place.
+    /// It remains registered until completion to prevent overlapping work on
+    /// the same segments; publication then rejects it without scanning bitmap
+    /// history and the scheduler retries from a fresh snapshot.
+    fn recordCommittedDeletes(
+        self: *TextMergeScheduler,
+        index_name: []const u8,
+        delete_infos: []const index_mod.IndexWriter.DeleteInfo,
+    ) void {
+        for (self.in_flight.items) |*merge| {
+            if (!merge.valid or !std.mem.eql(u8, merge.index_name, index_name)) continue;
+            record_merge: {
+                for (delete_infos) |delete_info| {
+                    for (merge.segment_ids, 0..) |segment_id, segment_idx| {
+                        if (segment_id != delete_info.seg_id) continue;
+                        std.debug.assert(delete_info.applied_count <= delete_info.local_ids.len);
+                        const committed_ids = delete_info.local_ids[0..delete_info.applied_count];
+                        merge.deletion_deltas[segment_idx].bitmap.addSortedAscending(committed_ids) catch {
+                            merge.valid = false;
+                            break :record_merge;
+                        };
+                        merge.deletion_deltas[segment_idx].count += committed_ids.len;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn supersedeInFlightForIndex(self: *TextMergeScheduler, alloc: Allocator, index_name: []const u8) void {
@@ -1071,6 +1132,7 @@ pub const IndexManager = struct {
     pub const TextMergeSourceSegment = struct {
         id: u64,
         deleted: ?roaring.RoaringBitmap = null,
+        deleted_count: u32 = 0,
 
         fn deinit(self: *TextMergeSourceSegment, alloc: Allocator) void {
             _ = alloc;
@@ -10352,7 +10414,14 @@ pub const IndexManager = struct {
         lockAtomicWithBackoff(entry.apply_mutex);
         var index_apply_locked = true;
         defer if (index_apply_locked) entry.apply_mutex.unlock();
-        var publication_deletes = try self.textMergePublicationDeletes(entry, task, result);
+        const source_state = self.text_merge_scheduler.sourceState(task.index_name, task.source) orelse {
+            entry.apply_mutex.unlock();
+            index_apply_locked = false;
+            self.text_merge_scheduler.skipped_stale_merges += 1;
+            TextMergeScheduler.schedule(entry);
+            return false;
+        };
+        var publication_deletes = try self.textMergePublicationDeletes(entry, task, result, source_state.deletion_deltas);
         defer publication_deletes.deinit(self.alloc);
         if (!publication_deletes.source_current) {
             entry.apply_mutex.unlock();
@@ -10511,9 +10580,11 @@ pub const IndexManager = struct {
 
         for (planned, 0..) |seg_idx, i| {
             const source_seg = &snap.segments[seg_idx];
+            const deleted_state = try source_seg.cloneDeletedState(self.alloc);
             source[i] = .{
                 .id = source_seg.id,
-                .deleted = try source_seg.cloneDeleted(self.alloc),
+                .deleted = deleted_state.bitmap,
+                .deleted_count = deleted_state.count,
             };
             source_initialized += 1;
             merge_indices[i] = seg_idx;
@@ -10620,7 +10691,9 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         task: *const TextMergeTask,
         result: *const TextMergeResult,
+        deletion_deltas: []const TextMergeScheduler.DeletionDelta,
     ) !TextMergePublicationDeletes {
+        if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
         const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else result.segments.len;
         const output_deleted = try self.alloc.alloc(?roaring.RoaringBitmap, output_count);
         @memset(output_deleted, null);
@@ -10633,56 +10706,33 @@ pub const IndexManager = struct {
 
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
-        for (task.source, task.merge_indices) |source, source_idx| {
+        for (task.source, task.merge_indices, deletion_deltas) |source, source_idx, delta| {
             const seg = findSegmentById(snap, source.id) orelse return .{
                 .source_current = false,
                 .bitmaps = output_deleted,
             };
             const frozen_seg = &task.snapshot.segments[source_idx];
-            {
-                seg.shared.lockDeletionShared();
-                defer seg.shared.unlockDeletionShared();
+            const expected_count = @as(u64, source.deleted_count) + @as(u64, @intCast(delta.count));
+            if (@as(u64, seg.shared.deleted_count.load(.acquire)) != expected_count) return .{
+                .source_current = false,
+                .bitmaps = output_deleted,
+            };
 
-                const current_deleted = if (seg.shared.deleted) |*current|
-                    current
-                else {
-                    if (source.deleted != null) return .{
-                        .source_current = false,
-                        .bitmaps = output_deleted,
-                    };
-                    continue;
-                };
+            var delta_iter = delta.bitmap.iterator();
+            while (delta_iter.next()) |doc_id| {
+                if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
 
-                // Segment tombstones are monotonic. Compare unchanged Roaring
-                // containers without allocation and materialize only containers
-                // with additions, so publication stays proportional to deletes
-                // which arrived during this merge rather than deletion history.
-                var added_storage: ?roaring.RoaringBitmap = null;
-                defer if (added_storage) |*added| added.deinit();
-                const added = if (source.deleted) |*expected| blk: {
-                    added_storage = (try current_deleted.differenceIfSupersetAlloc(expected, self.alloc)) orelse return .{
-                        .source_current = false,
-                        .bitmaps = output_deleted,
-                    };
-                    break :blk &added_storage.?;
-                } else current_deleted;
-
-                var added_iter = added.iterator();
-                while (added_iter.next()) |doc_id| {
-                    if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
-
-                    const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
-                        result.outputForOrdinal(ordinal)
-                    else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
-                        result.outputForId(stored.id)
-                    else
-                        null;
-                    const output = location orelse return error.MissingMergeDocumentIdentity;
-                    if (output.segment >= output_deleted.len) return error.InvalidSegment;
-                    const output_idx: usize = @intCast(output.segment);
-                    if (output_deleted[output_idx] == null) output_deleted[output_idx] = roaring.RoaringBitmap.init(self.alloc);
-                    try output_deleted[output_idx].?.add(output.doc);
-                }
+                const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
+                    result.outputForOrdinal(ordinal)
+                else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
+                    result.outputForId(stored.id)
+                else
+                    null;
+                const output = location orelse return error.MissingMergeDocumentIdentity;
+                if (output.segment >= output_deleted.len) return error.InvalidSegment;
+                const output_idx: usize = @intCast(output.segment);
+                if (output_deleted[output_idx] == null) output_deleted[output_idx] = roaring.RoaringBitmap.init(self.alloc);
+                try output_deleted[output_idx].?.add(output.doc);
             }
         }
 
@@ -12099,8 +12149,11 @@ pub const IndexManager = struct {
         return index.snapshot().segments.len >= threshold;
     }
 
-    fn deleteTextBatchEntry(_: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
-        return .{ .deleted_any = try entry.persistent.deleteByIds(keys) };
+    fn deleteTextBatchEntry(self: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
+        const delete_infos = try entry.persistent.deleteByIdsTracked(keys);
+        defer entry.persistent.freeDeleteInfos(delete_infos);
+        self.text_merge_scheduler.recordCommittedDeletes(entry.config.name, delete_infos);
+        return .{ .deleted_any = delete_infos.len != 0 };
     }
 
     fn finalizeTextBatchMutations(
@@ -23571,6 +23624,10 @@ test "text merge task carries concurrent deletes into publication" {
         frozen_live_docs += task.snapshot.segments[seg_idx].reader.doc_count - deleted_count;
     }
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
+    const source_state = manager.text_merge_scheduler.sourceState(task.index_name, task.source) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), source_state.deletion_deltas[0].count);
+    try std.testing.expect(source_state.deletion_deltas[0].bitmap.contains(1));
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
@@ -23600,6 +23657,37 @@ test "text merge task carries concurrent deletes into publication" {
     const published = text_entry.persistent.snapshot();
     try std.testing.expect(published.segments.len < 12);
     try std.testing.expectEqual(@as(u64, 11), published.liveDocCount());
+}
+
+test "text merge deletion delta allocation failure invalidates without untracking" {
+    const alloc = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const failing_alloc = failing.allocator();
+    var scheduler = TextMergeScheduler{};
+    defer scheduler.deinit(failing_alloc);
+
+    const source = [_]IndexManager.TextMergeSourceSegment{.{ .id = 7 }};
+    try scheduler.registerSource(failing_alloc, "ft_v1", &source);
+    failing.fail_index = failing.alloc_index;
+
+    var local_ids = [_]u32{3};
+    const delete_infos = [_]index_mod.IndexWriter.DeleteInfo{.{
+        .seg_id = 7,
+        .bitmap_bytes = &.{},
+        .local_ids = &local_ids,
+        .applied_count = 1,
+        .created_bitmap = false,
+        .deleted_count_incremented = true,
+    }};
+    scheduler.recordCommittedDeletes("ft_v1", &delete_infos);
+    try std.testing.expect(failing.has_induced_failure);
+
+    try std.testing.expect(!scheduler.sourceInFlight("ft_v1", &source));
+    try std.testing.expect(scheduler.sourceState("ft_v1", &source) == null);
+    try std.testing.expect(scheduler.segmentInFlight("ft_v1", 7));
+
+    scheduler.completeSource(failing_alloc, "ft_v1", &source);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.in_flight.items.len);
 }
 
 test "text merge task retires all-deleted file-backed inputs" {

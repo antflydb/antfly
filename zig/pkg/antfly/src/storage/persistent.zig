@@ -2401,13 +2401,27 @@ pub const PersistentIndex = struct {
     /// storage transaction. This preserves all-or-nothing bitmap persistence
     /// without multiplying the scan cost by the number of IDs.
     pub fn deleteByIds(self: *PersistentIndex, doc_ids: []const []const u8) !bool {
-        if (doc_ids.len == 0) return false;
+        const delete_infos = try self.deleteByIdsTracked(doc_ids);
+        defer self.freeDeleteInfos(delete_infos);
+        return delete_infos.len != 0;
+    }
+
+    pub fn freeDeleteInfos(self: *PersistentIndex, delete_infos: []index_mod.IndexWriter.DeleteInfo) void {
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+    }
+
+    /// Tombstone a batch and return the exact newly-deleted local document IDs
+    /// after their bitmap transaction commits. Merge publication uses this
+    /// committed delta directly, avoiding a scan of historical tombstones.
+    /// The caller owns the returned delete infos and must release them with
+    /// `freeDeleteInfos` on this index.
+    pub fn deleteByIdsTracked(self: *PersistentIndex, doc_ids: []const []const u8) ![]index_mod.IndexWriter.DeleteInfo {
         self.lockStorage();
         defer self.unlockStorage();
 
         const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
-        defer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
-        if (delete_infos.len == 0) return false;
+        errdefer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+        if (delete_infos.len == 0) return delete_infos;
         var persisted = false;
         defer if (!persisted) self.writer.rollbackDeleteInfos(delete_infos);
 
@@ -2420,7 +2434,7 @@ pub const PersistentIndex = struct {
         }
         try txn.commit();
         persisted = true;
-        return true;
+        return delete_infos;
     }
 
     /// Atomically replace old segments with a newly merged segment.

@@ -52,18 +52,6 @@ const Container = union(enum) {
         };
     }
 
-    fn isEmpty(self: *const Container) bool {
-        return switch (self.*) {
-            .array => |*a| a.items.len == 0,
-            .bitmap => |bitmap| blk: {
-                for (bitmap) |word| {
-                    if (word != 0) break :blk false;
-                }
-                break :blk true;
-            },
-        };
-    }
-
     fn contains(self: *const Container, val: u16) bool {
         return switch (self.*) {
             .array => |*a| arrayContains(a.items, val),
@@ -515,19 +503,6 @@ fn cloneContainer(alloc: Allocator, src: *const Container) !Container {
     };
 }
 
-fn containersEql(lhs: *const Container, rhs: *const Container) bool {
-    return switch (lhs.*) {
-        .array => |*lhs_array| switch (rhs.*) {
-            .array => |*rhs_array| std.mem.eql(u16, lhs_array.items, rhs_array.items),
-            .bitmap => false,
-        },
-        .bitmap => |lhs_bitmap| switch (rhs.*) {
-            .bitmap => |rhs_bitmap| std.mem.eql(u64, lhs_bitmap, rhs_bitmap),
-            .array => false,
-        },
-    };
-}
-
 // ============================================================================
 // Roaring Bitmap
 // ============================================================================
@@ -760,95 +735,25 @@ pub const RoaringBitmap = struct {
         return copied;
     }
 
-    /// Returns `self - subset` when every member of `subset` is present in
-    /// `self`, or null when the monotonic-superset invariant does not hold.
-    ///
-    /// Unchanged containers are compared and skipped without allocation. Only
-    /// changed containers are cloned for the bulk AND-NOT, keeping the common
-    /// append-only snapshot reconciliation path proportional to changed
-    /// containers plus the returned delta rather than bitmap cardinality.
-    pub fn differenceIfSupersetAlloc(
-        self: *const RoaringBitmap,
-        subset: *const RoaringBitmap,
-        alloc: Allocator,
-    ) !?RoaringBitmap {
-        var difference = RoaringBitmap.init(alloc);
-        errdefer difference.deinit();
-
-        var self_idx: usize = 0;
-        var subset_idx: usize = 0;
-        while (true) {
-            while (self_idx < self.keys.items.len and self.containers.items[self_idx].isEmpty()) self_idx += 1;
-            while (subset_idx < subset.keys.items.len and subset.containers.items[subset_idx].isEmpty()) subset_idx += 1;
-            if (self_idx == self.keys.items.len or subset_idx == subset.keys.items.len) break;
-
-            const self_key = self.keys.items[self_idx];
-            const subset_key = subset.keys.items[subset_idx];
-            if (self_key < subset_key) {
-                try difference.keys.ensureUnusedCapacity(alloc, 1);
-                try difference.containers.ensureUnusedCapacity(alloc, 1);
-                const copied = try cloneContainer(alloc, &self.containers.items[self_idx]);
-                difference.keys.appendAssumeCapacity(self_key);
-                difference.containers.appendAssumeCapacity(copied);
-                self_idx += 1;
-                continue;
-            }
-            if (self_key > subset_key) {
-                difference.deinit();
-                return null;
-            }
-
-            const self_container = &self.containers.items[self_idx];
-            const subset_container = &subset.containers.items[subset_idx];
-            if (!containersEql(self_container, subset_container)) {
-                var delta = try cloneContainer(alloc, self_container);
-                var delta_active = true;
-                defer if (delta_active) delta.deinit(alloc);
-                andNotContainers(alloc, &delta, subset_container);
-
-                const self_cardinality = self_container.cardinality();
-                const subset_cardinality = subset_container.cardinality();
-                const delta_cardinality = delta.cardinality();
-                if (subset_cardinality > self_cardinality or
-                    delta_cardinality != self_cardinality - subset_cardinality)
-                {
-                    difference.deinit();
-                    return null;
-                }
-                if (delta_cardinality != 0) {
-                    try difference.keys.ensureUnusedCapacity(alloc, 1);
-                    try difference.containers.ensureUnusedCapacity(alloc, 1);
-                    difference.keys.appendAssumeCapacity(self_key);
-                    difference.containers.appendAssumeCapacity(delta);
-                    delta_active = false;
-                }
-            }
-            self_idx += 1;
-            subset_idx += 1;
-        }
-
-        while (subset_idx < subset.keys.items.len and subset.containers.items[subset_idx].isEmpty()) subset_idx += 1;
-        if (subset_idx != subset.keys.items.len) {
-            difference.deinit();
-            return null;
-        }
-        while (self_idx < self.keys.items.len) : (self_idx += 1) {
-            if (self.containers.items[self_idx].isEmpty()) continue;
-            try difference.keys.ensureUnusedCapacity(alloc, 1);
-            try difference.containers.ensureUnusedCapacity(alloc, 1);
-            const copied = try cloneContainer(alloc, &self.containers.items[self_idx]);
-            difference.keys.appendAssumeCapacity(self.keys.items[self_idx]);
-            difference.containers.appendAssumeCapacity(copied);
-        }
-        return difference;
-    }
-
     pub fn eql(self: *const RoaringBitmap, other: *const RoaringBitmap) bool {
         if (!std.mem.eql(u16, self.keys.items, other.keys.items)) return false;
         if (self.containers.items.len != other.containers.items.len) return false;
 
         for (self.containers.items, other.containers.items) |lhs, rhs| {
-            if (!containersEql(&lhs, &rhs)) return false;
+            switch (lhs) {
+                .array => |lhs_array| switch (rhs) {
+                    .array => |rhs_array| {
+                        if (!std.mem.eql(u16, lhs_array.items, rhs_array.items)) return false;
+                    },
+                    .bitmap => return false,
+                },
+                .bitmap => |lhs_bitmap| switch (rhs) {
+                    .bitmap => |rhs_bitmap| {
+                        if (!std.mem.eql(u64, lhs_bitmap, rhs_bitmap)) return false;
+                    },
+                    .array => return false,
+                },
+            }
         }
 
         return true;
@@ -1601,49 +1506,6 @@ test "AND NOT operation" {
     try std.testing.expect(a.contains(5));
     try std.testing.expect(!a.contains(2));
     try std.testing.expect(!a.contains(4));
-}
-
-test "differenceIfSupersetAlloc returns only monotonic additions" {
-    const alloc = std.testing.allocator;
-    var frozen = RoaringBitmap.init(alloc);
-    defer frozen.deinit();
-    for ([_]u32{ 1, 2, 0x1_0001, 0x2_0002 }) |value| try frozen.add(value);
-
-    var current = try frozen.clone(alloc);
-    defer current.deinit();
-    try current.add(3);
-    try current.add(0x1_0002);
-    try current.add(0x3_0003);
-
-    var difference = (try current.differenceIfSupersetAlloc(&frozen, alloc)) orelse
-        return error.TestUnexpectedResult;
-    defer difference.deinit();
-    try std.testing.expectEqual(@as(usize, 3), difference.cardinality());
-    try std.testing.expect(difference.contains(3));
-    try std.testing.expect(difference.contains(0x1_0002));
-    try std.testing.expect(difference.contains(0x3_0003));
-    try std.testing.expect(!difference.contains(1));
-
-    var regressed = try frozen.clone(alloc);
-    defer regressed.deinit();
-    try regressed.remove(2);
-    try regressed.add(4);
-    try std.testing.expect((try regressed.differenceIfSupersetAlloc(&frozen, alloc)) == null);
-}
-
-test "differenceIfSupersetAlloc skips unchanged dense containers" {
-    const alloc = std.testing.allocator;
-    var frozen = RoaringBitmap.init(alloc);
-    defer frozen.deinit();
-    for (0..5000) |value| try frozen.add(@intCast(value));
-
-    var current = try frozen.clone(alloc);
-    defer current.deinit();
-    var difference = (try current.differenceIfSupersetAlloc(&frozen, alloc)) orelse
-        return error.TestUnexpectedResult;
-    defer difference.deinit();
-    try std.testing.expect(difference.isEmpty());
-    try std.testing.expectEqual(@as(usize, 0), difference.containers.items.len);
 }
 
 test "SIMD bitmap AND" {

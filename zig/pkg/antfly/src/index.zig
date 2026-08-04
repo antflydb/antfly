@@ -261,9 +261,25 @@ pub const SegmentEntry = struct {
     }
 
     pub fn cloneDeleted(self: *const SegmentEntry, alloc: Allocator) !?roaring.RoaringBitmap {
+        return (try self.cloneDeletedState(alloc)).bitmap;
+    }
+
+    pub const DeletedState = struct {
+        bitmap: ?roaring.RoaringBitmap,
+        count: u32,
+    };
+
+    /// Clone the tombstone bitmap and sample its independently-published count
+    /// under one deletion read lease. Merge callers additionally serialize
+    /// mutations with the index apply lock, making this a coherent source pair
+    /// that can later be validated with an O(1) count comparison.
+    pub fn cloneDeletedState(self: *const SegmentEntry, alloc: Allocator) !DeletedState {
         self.shared.lockDeletionShared();
         defer self.shared.unlockDeletionShared();
-        return if (self.shared.deleted) |*deleted| try deleted.clone(alloc) else null;
+        return .{
+            .bitmap = if (self.shared.deleted) |*deleted| try deleted.clone(alloc) else null,
+            .count = self.shared.deleted_count.load(.acquire),
+        };
     }
 
     pub fn layoutStats(self: *const SegmentEntry, detailed_inverted: bool) segment_mod.SegmentLayoutStats {
