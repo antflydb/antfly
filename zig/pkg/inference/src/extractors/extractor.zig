@@ -34,35 +34,68 @@ pub const Context = struct {
     reader_resolver: ?*ReaderResolver = null,
 };
 
-/// Node-scoped positive cache for the default OCR reader. Model discovery and
-/// compatibility inspection are filesystem work, so concurrent extraction
-/// requests share one selection instead of reparsing every installed model.
-/// The short TTL makes newly installed preferred readers visible without a
-/// restart; failed construction invalidates immediately so replaced or removed
-/// artifacts are rediscovered on the next request.
+/// Node-scoped positive cache for fallback OCR readers. Reader preference can
+/// depend on the recognizer name, so selections are keyed by recognizer rather
+/// than sharing one process-wide default. Model discovery and compatibility
+/// inspection are filesystem work, so concurrent extraction requests share a
+/// selection instead of reparsing every installed model. The short TTL makes
+/// newly installed preferred readers visible without a restart; structurally
+/// invalid artifacts are evicted immediately while transient load pressure
+/// retains the selection for a cheap retry.
 pub const ReaderResolver = struct {
+    const CacheEntry = struct {
+        path: []u8,
+        cached_at: std.Io.Timestamp,
+    };
+
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
-    cached_default_path: ?[]u8 = null,
-    cached_at: ?std.Io.Timestamp = null,
+    entries: std.StringHashMapUnmanaged(CacheEntry) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ReaderResolver {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *ReaderResolver) void {
-        if (self.cached_default_path) |path| self.allocator.free(path);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.path);
+        }
+        self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
-    fn invalidate(self: *ReaderResolver, io: std.Io, failed_path: []const u8) void {
+    fn removeLocked(self: *ReaderResolver, extractor_model_name: []const u8) void {
+        if (self.entries.fetchRemove(extractor_model_name)) |removed| {
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value.path);
+        }
+    }
+
+    fn invalidate(
+        self: *ReaderResolver,
+        io: std.Io,
+        extractor_model_name: []const u8,
+        failed_path: []const u8,
+    ) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const cached = self.cached_default_path orelse return;
-        if (!std.mem.eql(u8, cached, failed_path)) return;
-        self.allocator.free(cached);
-        self.cached_default_path = null;
-        self.cached_at = null;
+        const cached = self.entries.get(extractor_model_name) orelse return;
+        if (!std.mem.eql(u8, cached.path, failed_path)) return;
+        self.removeLocked(extractor_model_name);
+    }
+
+    fn handleLoadFailure(
+        self: *ReaderResolver,
+        io: std.Io,
+        extractor_model_name: []const u8,
+        failed_path: []const u8,
+        err: anyerror,
+    ) void {
+        if (shouldInvalidateReaderSelection(err)) {
+            self.invalidate(io, extractor_model_name, failed_path);
+        }
     }
 };
 
@@ -218,6 +251,7 @@ fn tryResolveRecognizer(ctx: Context, model_name: []const u8) !?Extractor {
     var manifest = manifest_mod.loadListingFromDir(ctx.allocator, path) catch return null;
     defer manifest.deinit();
     if (!model_caps.modelSupportsCapability("recognizer", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
+    if (!model_caps.modelAcceptsInput(&manifest, "text")) return null;
 
     return try Extractor.initRecognizer(ctx.allocator, path, model_name);
 }
@@ -252,7 +286,7 @@ fn readTextsForExtraction(
         ctx.session_manager,
         ctx.model_manager,
     ) catch |err| {
-        if (ctx.reader_resolver) |resolver| resolver.invalidate(ctx.io, model_path);
+        if (ctx.reader_resolver) |resolver| resolver.handleLoadFailure(ctx.io, extractor_model_name, model_path, err);
         return err;
     };
     defer reader.deinit();
@@ -287,26 +321,44 @@ fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []con
         resolver.mutex.lockUncancelable(ctx.io);
         defer resolver.mutex.unlock(ctx.io);
         const now = std.Io.Timestamp.now(ctx.io, .awake);
-        if (resolver.cached_default_path) |path| {
-            if (resolver.cached_at) |cached_at| {
-                const age = std.Io.Timestamp.durationTo(cached_at, now).nanoseconds;
-                if (age >= 0 and age < reader_selection_cache_ttl_ns) {
-                    return ctx.allocator.dupe(u8, path);
-                }
+        if (resolver.entries.get(extractor_model_name)) |entry| {
+            const age = std.Io.Timestamp.durationTo(entry.cached_at, now).nanoseconds;
+            if (age >= 0 and age < reader_selection_cache_ttl_ns) {
+                return ctx.allocator.dupe(u8, entry.path);
             }
-            resolver.allocator.free(path);
-            resolver.cached_default_path = null;
-            resolver.cached_at = null;
+            resolver.removeLocked(extractor_model_name);
         }
 
         const path = try discoverReaderModelPathForExtraction(ctx, extractor_model_name);
         errdefer ctx.allocator.free(path);
-        resolver.cached_default_path = try resolver.allocator.dupe(u8, path);
-        resolver.cached_at = now;
+        const cache_key = try resolver.allocator.dupe(u8, extractor_model_name);
+        errdefer resolver.allocator.free(cache_key);
+        const cache_path = try resolver.allocator.dupe(u8, path);
+        errdefer resolver.allocator.free(cache_path);
+        try resolver.entries.put(resolver.allocator, cache_key, .{
+            .path = cache_path,
+            .cached_at = now,
+        });
         return path;
     }
 
     return discoverReaderModelPathForExtraction(ctx, extractor_model_name);
+}
+
+fn shouldInvalidateReaderSelection(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.InvalidModelForReading,
+        error.IncompleteFlorence2Bundle,
+        error.IncompleteModelBundle,
+        error.InvalidPreprocessorConfig,
+        error.InvalidMetadata,
+        error.ModelAssetOutsideRoot,
+        error.NoModelFileFound,
+        => true,
+        else => false,
+    };
 }
 
 fn discoverReaderModelPathForExtraction(ctx: Context, extractor_model_name: []const u8) ![]const u8 {
@@ -321,6 +373,7 @@ fn discoverReaderModelPathForExtraction(ctx: Context, extractor_model_name: []co
     }
 
     var best_name: ?[]const u8 = null;
+    var best_path: ?[]const u8 = null;
     var best_rank: u8 = std.math.maxInt(u8);
     for (discovered) |entry| {
         var manifest = manifest_mod.loadListingFromDir(ctx.allocator, entry.path) catch continue;
@@ -332,12 +385,12 @@ fn discoverReaderModelPathForExtraction(ctx: Context, extractor_model_name: []co
         const rank = extractionReaderPreference(entry.name, extractor_model_name);
         if (best_name == null or rank < best_rank or (rank == best_rank and std.mem.lessThan(u8, entry.name, best_name.?))) {
             best_name = entry.name;
+            best_path = entry.path;
             best_rank = rank;
         }
     }
 
-    const reader_name = best_name orelse return error.NoReaderModelAvailable;
-    return resolveSupportedNamedReaderPath(ctx, reader_name);
+    return ctx.allocator.dupe(u8, best_path orelse return error.NoReaderModelAvailable);
 }
 
 fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
@@ -464,6 +517,29 @@ test "resolve prefers reader for image extraction when both exist" {
     try std.testing.expect(extractor == .reader);
 }
 
+test "resolve rejects extraction recognizer without text input before inference" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestManifest(
+        tmp.dir,
+        "recognizers/acme/audio-only-extract",
+        "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"audio\"]}",
+    );
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    try std.testing.expectError(error.ModelNotFound, resolve(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+    }, "acme/audio-only-extract", true));
+}
+
 test "resolveNamedReaderPath supports flat default model layout" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -554,12 +630,98 @@ test "image extraction caches a supported fallback reader selection" {
 
     const first = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
     defer allocator.free(first);
-    try std.testing.expect(resolver.cached_default_path != null);
-    try std.testing.expectEqualStrings(first, resolver.cached_default_path.?);
+    const cached = resolver.entries.get("fastino/gliner2-base-v1").?;
+    try std.testing.expectEqualStrings(first, cached.path);
 
     const second = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
     defer allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+
+    resolver.handleLoadFailure(std.testing.io, "fastino/gliner2-base-v1", first, error.ResourceTemporarilyUnavailable);
+    try std.testing.expect(resolver.entries.contains("fastino/gliner2-base-v1"));
+    resolver.handleLoadFailure(std.testing.io, "fastino/gliner2-base-v1", first, error.InvalidModelForReading);
+    try std.testing.expect(!resolver.entries.contains("fastino/gliner2-base-v1"));
+}
+
+test "image extraction fallback cache is isolated by recognizer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestManifest(tmp.dir, "acme/extractor-a", "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "acme/extractor-b", "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
+    try writeTestFlorenceReader(tmp.dir, "readers/acme/extractor-a");
+    try writeTestFlorenceReader(tmp.dir, "readers/acme/extractor-b");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    var resolver = ReaderResolver.init(allocator);
+    defer resolver.deinit();
+    const ctx = Context{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+        .reader_resolver = &resolver,
+    };
+
+    const first = try resolveReaderModelPathForExtraction(ctx, "acme/extractor-a");
+    defer allocator.free(first);
+    const second = try resolveReaderModelPathForExtraction(ctx, "acme/extractor-b");
+    defer allocator.free(second);
+
+    try std.testing.expect(std.mem.endsWith(u8, first, "readers/acme/extractor-a"));
+    try std.testing.expect(std.mem.endsWith(u8, second, "readers/acme/extractor-b"));
+    try std.testing.expectEqual(@as(usize, 2), resolver.entries.count());
+    try std.testing.expectEqualStrings(first, resolver.entries.get("acme/extractor-a").?.path);
+    try std.testing.expectEqualStrings(second, resolver.entries.get("acme/extractor-b").?.path);
+}
+
+test "expired fallback cache discovers a newly preferred reader" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    var resolver = ReaderResolver.init(allocator);
+    defer resolver.deinit();
+    const ctx = Context{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+        .reader_resolver = &resolver,
+    };
+
+    const first = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.endsWith(u8, first, "readers/antflydb/florence-2-base"));
+
+    try writeTestFlorenceReader(tmp.dir, "readers/Xenova/trocr-base-printed");
+    resolver.entries.getPtr("fastino/gliner2-base-v1").?.cached_at = std.Io.Timestamp.zero;
+
+    const second = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.endsWith(u8, second, "readers/Xenova/trocr-base-printed"));
+    try std.testing.expectEqualStrings(second, resolver.entries.get("fastino/gliner2-base-v1").?.path);
+}
+
+test "reader selection invalidation distinguishes structural and transient load failures" {
+    try std.testing.expect(shouldInvalidateReaderSelection(error.FileNotFound));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.InvalidModelForReading));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.IncompleteFlorence2Bundle));
+    try std.testing.expect(shouldInvalidateReaderSelection(error.InvalidMetadata));
+
+    try std.testing.expect(!shouldInvalidateReaderSelection(error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(!shouldInvalidateReaderSelection(error.OutOfMemory));
+    try std.testing.expect(!shouldInvalidateReaderSelection(error.ModelArtifactsChanging));
+    try std.testing.expect(!shouldInvalidateReaderSelection(error.NoBackendAvailable));
 }
 
 test "resolve prefers recognizer for text extraction when both exist" {
