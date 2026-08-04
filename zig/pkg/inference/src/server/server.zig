@@ -1717,6 +1717,7 @@ pub const Node = struct {
             .session = model.session,
             .tok = model.getTokenizer(),
             .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+            .execution_lock = model.embeddingExecutionLock(),
         };
         return try pipeline.embed(texts);
     }
@@ -2054,6 +2055,7 @@ pub const Node = struct {
                 .session = model.session,
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                .execution_lock = model.embeddingExecutionLock(),
             };
             const sparse = try pipeline.embed(&texts);
             defer {
@@ -2739,6 +2741,7 @@ pub const Node = struct {
                 .session = model.session,
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                .execution_lock = model.embeddingExecutionLock(),
             };
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -4271,7 +4274,7 @@ pub const Node = struct {
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
         if (body.draft_model != null) return .{ .code = "UNSUPPORTED_DRAFT_MODEL", .message = "batch generation does not support draft_model yet", .retryable = false };
         if (body.mode) |mode| {
-            if (!std.mem.eql(u8, mode, "eager")) return .{ .code = "UNSUPPORTED_MODE", .message = "batch generation requires eager native mode", .retryable = false };
+            if (mode != .eager) return .{ .code = "UNSUPPORTED_MODE", .message = "batch generation requires eager native mode", .retryable = false };
         }
         if (body.compiled_target != null) return .{ .code = "UNSUPPORTED_COMPILED_TARGET", .message = "batch generation does not support compiled_target yet", .retryable = false };
         if (body.backend) |backend| switch (backend) {
@@ -4324,18 +4327,18 @@ pub const Node = struct {
             .speculative_k = 4,
             .speculation_requested = false,
             .prefill_chunk_size = 256,
-            .cache_dtype = body.cache_dtype,
+            .cache_dtype = generateRequestCacheDtypeName(body.cache_dtype),
             .cache_compaction_ratio = body.cache_compaction_ratio,
         };
         if (body.response_format) |rf| {
-            if (std.mem.eql(u8, rf.type, "json_object")) {
-                config.grammar = "json";
-            } else if (std.mem.eql(u8, rf.type, "json_schema")) {
-                const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
-                const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-                config.grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, schema);
-            } else if (!std.mem.eql(u8, rf.type, "text")) {
-                return error.UnsupportedResponseFormat;
+            switch (rf.type) {
+                .text => {},
+                .json_object => config.grammar = "json",
+                .json_schema => {
+                    const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
+                    const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
+                    config.grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, schema);
+                },
             }
         }
         if (body.grammar) |grammar| {
@@ -4368,7 +4371,7 @@ pub const Node = struct {
         };
         return .{
             .id = completion_id,
-            .object = "chat.completion",
+            .object = .chat_completion,
             .created = created,
             .model = model_name,
             .choices = choices,
@@ -4620,9 +4623,9 @@ pub const Node = struct {
                 const candidate = body.requests[idx].body;
                 if (!std.mem.eql(u8, candidate.model, first_body.model)) continue;
                 if (candidate.backend != first_body.backend) continue;
-                if (!std.mem.eql(u8, candidate.mode orelse "", first_body.mode orelse "")) continue;
-                if (!std.mem.eql(u8, candidate.compiled_target orelse "", first_body.compiled_target orelse "")) continue;
-                if (!std.mem.eql(u8, candidate.cache_dtype orelse "", first_body.cache_dtype orelse "")) continue;
+                if (candidate.mode != first_body.mode) continue;
+                if (candidate.compiled_target != first_body.compiled_target) continue;
+                if (candidate.cache_dtype != first_body.cache_dtype) continue;
                 try group_indices.append(ctx.allocator, idx);
             }
 
@@ -4716,7 +4719,7 @@ pub const Node = struct {
                 }
                 if (valid_count == 0) continue;
 
-                const kv_dtype = if (first_body.cache_dtype) |name|
+                const kv_dtype = if (generateRequestCacheDtypeName(first_body.cache_dtype)) |name|
                     runtime.kv.pool.parseKvDType(name) orelse {
                         for (group_indices.items) |idx| {
                             results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "invalid cache_dtype value", .retryable = false };
@@ -5081,7 +5084,7 @@ pub const Node = struct {
         }
         const total: i64 = @intCast(results.len);
         return ctx.json(api.GenerateBatchResponse{
-            .object = "generate.batch",
+            .object = .generate_batch,
             .data = results,
             .summary = .{ .total = total, .succeeded = succeeded, .failed = total - succeeded },
         });
@@ -5937,7 +5940,7 @@ pub const Node = struct {
             } else null;
 
             data[ti] = .{
-                .object = "recognition",
+                .object = .recognition,
                 .index = @intCast(ti),
                 .entities = entity_objects,
                 .relations = relations_inner,
@@ -6113,7 +6116,7 @@ pub const Node = struct {
         }
 
         const data = [_]api.DocumentClassificationObject{.{
-            .object = "document.classification",
+            .object = .document_classification,
             .index = 0,
             .checkpoint_path = checkpoint_path,
             .prefix = prefix,
@@ -6269,7 +6272,7 @@ pub const Node = struct {
         }
 
         const data = [_]api.DocumentTokenClassificationObject{.{
-            .object = "document.token_classification",
+            .object = .document_token_classification,
             .index = 0,
             .checkpoint_path = checkpoint_path,
             .prefix = prefix,
@@ -7329,7 +7332,7 @@ fn buildClassificationResponse(
         const inner = try alloc.alloc(api.ClassifyResult, results.len);
         for (results, 0..) |r, ri| inner[ri] = .{ .label = r.label, .score = r.score };
         data[ti] = .{
-            .object = "classification",
+            .object = .classification,
             .index = @intCast(ti),
             .classifications = inner,
         };
@@ -8338,6 +8341,23 @@ test "generate batch preflight rejects image content without parsing media" {
 
     const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("UNSUPPORTED_MULTIMODAL", reason.code);
+}
+
+test "generate batch preflight accepts eager and rejects compiled enum modes" {
+    const eager_json =
+        \\{"model":"m","messages":[{"role":"user","content":"hello"}],"mode":"eager"}
+    ;
+    var eager = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, eager_json, .{});
+    defer eager.deinit();
+    try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(eager.value) == null);
+
+    const compiled_json =
+        \\{"model":"m","messages":[{"role":"user","content":"hello"}],"mode":"compiled"}
+    ;
+    var compiled = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, compiled_json, .{});
+    defer compiled.deinit();
+    const reason = Node.generateBatchUnsupportedReasonPreflight(compiled.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("UNSUPPORTED_MODE", reason.code);
 }
 
 test "generate batch isolates native execution and serializes stateful GPU backends" {
@@ -9744,7 +9764,7 @@ fn buildEmbedDenseResponse(
         };
     }
     return .{
-        .object = .list,
+        .object = "list",
         .data = data,
         .model = model_name,
         .usage = .{
@@ -9772,7 +9792,7 @@ fn buildEmbedDensePartialResponse(
         try arr.ensureTotalCapacity(dimensions);
         for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = val });
         data[out_index] = .{
-            .object = "embedding",
+            .object = .embedding,
             .index = @intCast(input_index),
             .embedding = .{ .array = arr },
         };
@@ -9824,7 +9844,7 @@ fn buildEmbedSparseResponse(
         };
     }
     return .{
-        .object = .list,
+        .object = "list",
         .data = data,
         .model = model_name,
         .usage = .{
@@ -10585,7 +10605,7 @@ test "structured output validation fails closed instead of fabricating JSON" {
         error.InvalidStructuredOutput,
         coerceGenerateResponseFormat(
             allocator,
-            .{ .type = "json_object" },
+            .{ .type = .json_object },
             "not json",
         ),
     );
@@ -10593,7 +10613,7 @@ test "structured output validation fails closed instead of fabricating JSON" {
         error.InvalidStructuredOutput,
         coerceGenerateResponseFormat(
             allocator,
-            .{ .type = "json_object" },
+            .{ .type = .json_object },
             "[]",
         ),
     );
@@ -10610,7 +10630,7 @@ test "structured output validation fails closed instead of fabricating JSON" {
         coerceGenerateResponseFormat(
             allocator,
             .{
-                .type = "json_schema",
+                .type = .json_schema,
                 .json_schema = .{ .schema = parsed_schema.value },
             },
             "{}",
@@ -10621,7 +10641,7 @@ test "structured output validation fails closed instead of fabricating JSON" {
         try coerceGenerateResponseFormat(
             allocator,
             .{
-                .type = "json_schema",
+                .type = .json_schema,
                 .json_schema = .{ .schema = parsed_schema.value },
             },
             "{\"answer\":\"ok\"}",

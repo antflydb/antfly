@@ -367,8 +367,8 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
         null;
 
     return .{
-        .source_doc_count = source_snapshot.global_doc_count,
-        .dest_doc_count = if (dest_snapshot) |snapshot| snapshot.global_doc_count else 0,
+        .source_doc_count = source_snapshot.liveDocCount(),
+        .dest_doc_count = if (dest_snapshot) |snapshot| snapshot.liveDocCount() else 0,
         .source_alpha_hits = try source_snapshot.termDocFreq(alloc, "title", "alpha"),
         .source_beta_hits = try source_snapshot.termDocFreq(alloc, "title", "beta"),
         .source_gamma_hits = try source_snapshot.termDocFreq(alloc, "title", "gamma"),

@@ -306,26 +306,79 @@ fn executeShouldClauses(
 pub const PrefixFilter = struct {
     field: []const u8,
     prefix: []const u8,
+    indexed_field: ?[]const u8 = null,
     boost: f32 = 1.0,
 
+    pub const ExecutionStats = struct {
+        dictionary_terms_decoded: u64 = 0,
+        matching_terms: u64 = 0,
+    };
+
     pub fn execute(self: PrefixFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null);
+    }
+
+    pub fn executeWithStats(
+        self: PrefixFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        stats: *ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        stats.* = .{};
+        return self.executeInternal(alloc, seg, true, stats);
+    }
+
+    fn executeInternal(
+        self: PrefixFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        comptime collect_stats: bool,
+        stats: ?*ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        if (self.indexed_field) |indexed_field| {
+            if (try seg.reader.invertedIndex(indexed_field)) |indexed_reader| {
+                var exact = roaring.RoaringBitmap.init(alloc);
+                errdefer exact.deinit();
+                if (indexed_reader.lookup(self.prefix)) |lookup| {
+                    if (comptime collect_stats) stats.?.matching_terms = 1;
+                    switch (lookup) {
+                        .postings => |postings| {
+                            var matches = try postings.docBitmap(alloc);
+                            defer matches.deinit();
+                            try exact.orWith(&matches);
+                        },
+                        .one_hit => |hit| try exact.add(hit.doc_num),
+                    }
+                }
+                return exact;
+            }
+        }
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Use the term iterator to find all terms with the given prefix
-        var term_iter = try inv_reader.termIterator();
+        // Seek to the first dictionary block that can contain the prefix.
+        // Starting from termIterator() makes every prefix query decode all
+        // lexicographically earlier terms, which turns type-ahead queries into
+        // a full term-dictionary scan as the corpus vocabulary grows.
+        var term_iter = try inv_reader.rangeTermIterator(self.prefix, null);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        while (try term_iter.next()) |entry| {
+        while (true) {
+            const next_entry = if (comptime collect_stats)
+                try term_iter.nextWithDecodedCount(&stats.?.dictionary_terms_decoded)
+            else
+                try term_iter.next();
+            const entry = next_entry orelse break;
             if (entry.term.len < self.prefix.len) continue;
             if (!std.mem.startsWith(u8, entry.term, self.prefix)) {
                 // FST terms are sorted; if we've passed the prefix range, stop
                 if (std.mem.order(u8, entry.term[0..self.prefix.len], self.prefix) == .gt) break;
                 continue;
             }
+            if (comptime collect_stats) stats.?.matching_terms += 1;
             // Term matches prefix — union its postings
             switch (entry.result) {
                 .postings => |p| {
@@ -1630,8 +1683,12 @@ pub fn executeFilter(
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
-        // Remove deleted docs
-        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        // Remove deleted docs while pinning the shared bitmap containers.
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        }
 
         // Collect with offset
         var iter = bm.iterator();
@@ -1660,7 +1717,11 @@ pub fn executeFilterBitmap(
     for (snap.segments) |*seg| {
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
-        if (seg.shared.deleted) |d| local.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| local.andNotWith(&d);
+        }
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1692,7 +1753,11 @@ pub fn countFilterIntersection(
     for (snap.segments) |*seg| {
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
-        if (seg.shared.deleted) |d| local.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| local.andNotWith(&d);
+        }
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1722,7 +1787,11 @@ pub fn countFilter(
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
-        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        }
         total = std.math.add(usize, total, bm.cardinality()) catch return error.CountOverflow;
         doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
@@ -1736,7 +1805,13 @@ pub fn countFilter(
 
 const testing = std.testing;
 
-fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const struct { terms: []const inverted.InvertedIndexBuilder.TermHit }) ![]u8 {
+const TestTermDocument = struct { terms: []const inverted.InvertedIndexBuilder.TermHit };
+const NamedTestTermField = struct {
+    name: []const u8,
+    docs: []const TestTermDocument,
+};
+
+fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const TestTermDocument) ![]u8 {
     var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
     defer inv_builder.deinit();
 
@@ -1757,6 +1832,33 @@ fn buildTestSegmentWithTerms(alloc: Allocator, docs: []const struct { terms: []c
         try seg_writer.addStoredDoc(id_str, "{}");
     }
 
+    return seg_writer.build();
+}
+
+fn buildTestSegmentWithNamedTermFields(
+    alloc: Allocator,
+    fields: []const NamedTestTermField,
+) ![]u8 {
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+
+    var doc_count: usize = 0;
+    for (fields) |field| {
+        if (doc_count == 0) doc_count = field.docs.len else if (field.docs.len != doc_count) return error.InvalidData;
+        var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+        defer inv_builder.deinit();
+        for (field.docs, 0..) |doc, i| try inv_builder.addDocument(@intCast(i), doc.terms);
+        const inv_data = try inv_builder.build();
+        defer alloc.free(inv_data);
+        const field_idx = try seg_writer.addField(field.name);
+        try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+    }
+
+    for (0..doc_count) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{i}) catch unreachable;
+        try seg_writer.addStoredDoc(id_str, "{}");
+    }
     return seg_writer.build();
 }
 
@@ -2045,6 +2147,90 @@ test "prefix filter" {
     try testing.expect(bm.contains(0));
     try testing.expect(bm.contains(1));
     try testing.expect(!bm.contains(2));
+}
+
+test "prefix filter seeks late range in large term dictionary" {
+    const alloc = testing.allocator;
+
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    defer hits.deinit(alloc);
+    var owned_terms = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_terms.items) |term| alloc.free(term);
+        owned_terms.deinit(alloc);
+    }
+    for (0..4_096) |i| {
+        const term = try std.fmt.allocPrint(alloc, "catalog-{d:0>5}", .{i});
+        owned_terms.append(alloc, term) catch |err| {
+            alloc.free(term);
+            return err;
+        };
+        try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
+    }
+    try hits.append(alloc, .{ .term = "zz-target", .freq = 1, .norm = 10 });
+
+    const seg_bytes = try buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const seg = &writer.snapshot().segments[0];
+    const filter = Filter{ .prefix = .{ .field = "body", .prefix = "zz-" } };
+    var stats: PrefixFilter.ExecutionStats = .{};
+    var bm = try filter.prefix.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(bm.contains(0));
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    // The late seek may decode the tail of one dictionary block, but it must
+    // not revisit the thousands of lexicographically earlier entries.
+    try testing.expect(stats.dictionary_terms_decoded < 128);
+}
+
+test "prefix filter uses a materialized companion with old-segment fallback" {
+    const alloc = testing.allocator;
+    const source_docs = &[_]TestTermDocument{
+        .{ .terms = &.{.{ .term = "apple", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "application", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "banana", .freq = 1, .norm = 10 }} },
+    };
+    const companion_docs = &[_]TestTermDocument{
+        .{ .terms = &.{.{ .term = "app", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{.{ .term = "app", .freq = 1, .norm = 10 }} },
+        .{ .terms = &.{} },
+    };
+    const new_segment = try buildTestSegmentWithNamedTermFields(alloc, &.{
+        .{ .name = "body", .docs = source_docs },
+        .{ .name = "body._root_prefix", .docs = companion_docs },
+    });
+    defer alloc.free(new_segment);
+    const old_segment = try buildTestSegmentWithTerms(alloc, source_docs);
+    defer alloc.free(old_segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(new_segment);
+    try writer.addSegment(old_segment);
+    const filter = PrefixFilter{
+        .field = "body",
+        .prefix = "app",
+        .indexed_field = "body._root_prefix",
+    };
+
+    var new_stats: PrefixFilter.ExecutionStats = .{};
+    var new_matches = try filter.executeWithStats(alloc, &writer.snapshot().segments[0], &new_stats);
+    defer new_matches.deinit();
+    try testing.expectEqual(@as(usize, 2), new_matches.cardinality());
+    try testing.expectEqual(@as(u64, 0), new_stats.dictionary_terms_decoded);
+
+    var old_stats: PrefixFilter.ExecutionStats = .{};
+    var old_matches = try filter.executeWithStats(alloc, &writer.snapshot().segments[1], &old_stats);
+    defer old_matches.deinit();
+    try testing.expectEqual(@as(usize, 2), old_matches.cardinality());
+    try testing.expect(old_stats.dictionary_terms_decoded > 0);
+    try testing.expectEqual(@as(u64, 2), old_stats.matching_terms);
 }
 
 test "multi-segment filter execution" {

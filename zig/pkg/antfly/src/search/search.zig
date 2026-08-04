@@ -360,6 +360,10 @@ pub const PhraseQuery = struct {
 pub const PrefixQuery = struct {
     field: []const u8,
     prefix: []const u8,
+    /// Optional materialized prefix field. Execution uses an exact lookup when
+    /// the field exists in a segment and transparently falls back to the source
+    /// dictionary for older segments.
+    indexed_field: ?[]const u8 = null,
     boost: f32 = 1.0,
 };
 
@@ -478,11 +482,11 @@ pub const ScoredHit = struct {
 fn effectiveK(request: SearchRequest, snap: *const index_mod.IndexSnapshot) u32 {
     if (request.search_after != null) {
         // Retrieve all matching results so cursor filtering works correctly
-        return snap.global_doc_count;
+        return snap.liveDocCount();
     }
     if (request.k == 0) return 0;
     const requested_end = request.k +| request.offset;
-    return @min(snap.global_doc_count, requested_end +| 1);
+    return @min(snap.liveDocCount(), requested_end +| 1);
 }
 
 /// Execute a search request against an index snapshot.
@@ -868,11 +872,12 @@ fn executeScoredPhraseFilter(
         return executeFilterQuery(alloc, snap, .{ .phrase = phrase_filter }, request, boost);
     }
 
+    const scoring_doc_count = snap.scoringDocCount();
     var phrase_idf_sum: f32 = 0;
     for (phrase_filter.terms) |term| {
         const df = try snap.termDocFreq(alloc, phrase_filter.field, term);
         if (df == 0) return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
-        phrase_idf_sum += inverted.bm25Idf(snap.global_doc_count, df);
+        phrase_idf_sum += inverted.bm25Idf(scoring_doc_count, df);
     }
 
     var collector = FastTopK{
@@ -892,6 +897,8 @@ fn executeScoredPhraseFilter(
         doc_offset += segment.reader.doc_count;
 
         const inv_reader = (try segment.reader.invertedIndex(phrase_filter.field)) orelse continue;
+        segment.shared.lockDeletionShared();
+        defer segment.shared.unlockDeletionShared();
         const PhraseScoreState = struct {
             iter: inverted.PostingsIterator,
             current: ?inverted.PostingsIterator.Hit = null,
@@ -1091,6 +1098,7 @@ fn executePrefix(
     return executeFilterQuery(alloc, snap, .{ .prefix = .{
         .field = pq.field,
         .prefix = pq.prefix,
+        .indexed_field = pq.indexed_field,
     } }, request, pq.boost);
 }
 
@@ -1345,7 +1353,7 @@ fn executeQueryAllScored(
 ) ![]scorer_mod.ScoredHit {
     var sub_request = request;
     sub_request.query = query;
-    sub_request.k = snap.global_doc_count;
+    sub_request.k = snap.liveDocCount();
     sub_request.offset = 0;
     sub_request.include_stored = false;
     sub_request.aggregations = &.{};
@@ -1701,6 +1709,7 @@ fn initFastTermStates(
         for (states.items) |*state| state.deinit();
         states.deinit(alloc);
     };
+    const scoring_doc_count = snap.scoringDocCount();
 
     for (terms) |term| {
         const lookup_result = inv_reader.lookup(term.term) orelse {
@@ -1720,7 +1729,7 @@ fn initFastTermStates(
         var state = FastTermState{
             .iter = iter,
             .doc_freq = df,
-            .idf = inverted.bm25Idf(snap.global_doc_count, df),
+            .idf = inverted.bm25Idf(scoring_doc_count, df),
             .boost = term.boost,
             .block_max = switch (lookup_result) {
                 .postings => |postings| postings.block_max,
@@ -1766,6 +1775,8 @@ fn scoreFastTerm(
 }
 
 fn isSegmentDocDeleted(seg: *const index_mod.SegmentEntry, doc_id: u32) bool {
+    // The segment-scoring callers hold the shared deletion lock for the whole
+    // postings walk, avoiding a lock/unlock for every candidate document.
     if (seg.shared.deleted) |deleted| return deleted.contains(doc_id);
     return false;
 }
@@ -2162,7 +2173,9 @@ fn executeSimpleTextBool(
     if (should_terms.items.len > 0) field = simpleTermsField(should_terms.items, field) orelse return null;
     if (must_not_terms.items.len > 0) field = simpleTermsField(must_not_terms.items, field) orelse return null;
     const text_field = field orelse return null;
-    if (snap.global_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+    const live_doc_count = snap.liveDocCount();
+    if (live_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+    const scoring_doc_count = snap.scoringDocCount();
 
     const effective_min_should: u32 = if (should_terms.items.len > 0 and
         bq.min_should == 0 and
@@ -2256,10 +2269,12 @@ fn executeSimpleTextBool(
                 diag.postings_iterators_opened +|= @intCast(must_states.len + should_states.len + must_not_states.len);
             }
 
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
             if (must_terms.items.len > 0) {
-                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
+                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
             } else if (should_states.len > 0) {
-                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost);
+                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost);
             }
         }
     }
@@ -2519,7 +2534,7 @@ pub fn searchQueryToFilterArenaRelational(
         },
         .phrase => |pq| (try buildPhraseFilter(alloc, pq.field, pq.text, pq.analyzer orelse &analysis_mod.default_analyzer, pq.max_edits, pq.auto_fuzzy)) orelse
             .{ .bool_filter = .{ .must = &.{}, .should = &.{}, .must_not = &.{} } },
-        .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix } },
+        .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
         .wildcard => |wq| .{ .wildcard = .{ .field = wq.field, .pattern = wq.pattern } },
         .regexp => |rq| .{ .regexp = .{ .field = rq.field, .pattern = rq.pattern } },
         .bool_query => |bq| blk: {
@@ -2731,7 +2746,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             };
         },
         .prefix => |pq| .{
-            .filter = .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix } },
+            .filter = .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -3638,6 +3653,56 @@ test "bool fallback applies native doc number constraints" {
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
 }
 
+test "exact inclusive term range preserves prefix constant scores" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "app", .freq = 1, .norm = 10 },
+            .{ .term = "apple", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "app", .freq = 1, .norm = 10 },
+            .{ .term = "application", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{}", .terms = &.{
+            .{ .term = "banana", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+
+    var prefix = try execute(alloc, snap, .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "app", .boost = 2.5 } },
+        .k = 10,
+    });
+    defer prefix.deinit();
+    var exact = try execute(alloc, snap, .{
+        .query = .{ .term_range = .{
+            .field = "title",
+            .min = "app",
+            .max = "app",
+            .inclusive_min = true,
+            .inclusive_max = true,
+            .boost = 2.5,
+        } },
+        .k = 10,
+    });
+    defer exact.deinit();
+
+    try std.testing.expectEqual(prefix.total_hits, exact.total_hits);
+    try std.testing.expectEqual(prefix.hits.len, exact.hits.len);
+    for (prefix.hits, exact.hits) |prefix_hit, exact_hit| {
+        try std.testing.expectEqual(prefix_hit.doc_id, exact_hit.doc_id);
+        try std.testing.expectApproxEqAbs(prefix_hit.score, exact_hit.score, 0.00001);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.5), exact_hit.score, 0.00001);
+    }
+}
+
 test "optional pure should preserves zero baseline and text scores" {
     const alloc = std.testing.allocator;
     const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
@@ -3768,7 +3833,7 @@ test "search match query can use distributed text stats for shard-consistent bm2
 
     const distributed_stats = [_]distributed_stats_mod.TextFieldStats{.{
         .field = "title",
-        .global_doc_count = combined_snap.global_doc_count,
+        .global_doc_count = combined_snap.liveDocCount(),
         .global_total_field_len = combined_snap.global_total_field_len.get("title") orelse 0,
         .term_doc_freqs = &.{
             .{ .term = "alpha", .doc_freq = try combined_snap.termDocFreq(alloc, "title", "alpha") },
@@ -3970,7 +4035,7 @@ test "streaming boolean scorer matches all-hit reference on randomized corpus" {
         };
         const request = SearchRequest{
             .query = .{ .bool_query = bool_query },
-            .k = snap.global_doc_count,
+            .k = snap.liveDocCount(),
             .include_stored = false,
         };
         var streaming = (try executeSimpleTextBool(alloc, snap, bool_query, request)) orelse return error.TestExpectedEqual;

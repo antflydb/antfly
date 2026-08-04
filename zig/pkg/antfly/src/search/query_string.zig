@@ -576,7 +576,7 @@ const Parser = struct {
 fn applyBoost(filter: Filter, boost: f32) ParseError!Filter {
     return switch (filter) {
         .term => |term| .{ .term = .{ .field = term.field, .term = term.term, .boost = term.boost * boost } },
-        .prefix => |prefix| .{ .prefix = .{ .field = prefix.field, .prefix = prefix.prefix, .boost = prefix.boost * boost } },
+        .prefix => |prefix| .{ .prefix = .{ .field = prefix.field, .prefix = prefix.prefix, .indexed_field = prefix.indexed_field, .boost = prefix.boost * boost } },
         .phrase => |phrase| .{ .phrase = .{
             .field = phrase.field,
             .terms = phrase.terms,

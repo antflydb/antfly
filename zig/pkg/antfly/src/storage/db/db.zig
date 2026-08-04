@@ -207,11 +207,13 @@ pub const DB = struct {
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: search_runtime.VisibilityRuntimeStats = .{},
     foreign_key_stats: ForeignKeyRuntimeStats = .{},
-    index_repair_barriers: std.atomic.Value(u32) = .init(0),
+    /// High bit closes lock-free dense admission; lower bits count readers
+    /// holding an inline catalog generation alive.
+    published_dense_admission: std.atomic.Value(u32) = .init(0),
     managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
-    published_dense_searches: std.atomic.Value(u32) = .init(0),
+    index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
@@ -229,6 +231,9 @@ pub const DB = struct {
             phase: index_repair_state.Phase,
         ) anyerror!void = null,
     };
+
+    pub const published_dense_catalog_closed: u32 = @as(u32, 1) << 31;
+    pub const published_dense_reader_mask: u32 = published_dense_catalog_closed - 1;
 
     const split_restore_impl = split_restore.Impl(@This());
     const internal_impl = db_internal.Impl(@This());
@@ -341,6 +346,8 @@ pub const DB = struct {
         pub const ensure_automatic_dense_generation_repair_intent = artifact_repair_impl.ensureAutomaticDenseGenerationRepairIntent;
         pub const ensure_dense_artifact_target_counter_for_repair = artifact_repair_impl.ensureDenseArtifactTargetCounterForRepair;
         pub const rebuild_index_with_shadow_replacement = artifact_repair_impl.rebuildIndexWithShadowReplacement;
+        pub const retry_quarantined_index_loads = artifact_repair_impl.retryQuarantinedIndexLoads;
+        pub const test_quarantine_publication_fence_entered = &artifact_repair.test_quarantine_publication_fence_entered;
         pub const encode_managed_index_admission_marker = artifact_repair_impl.encodeManagedIndexAdmissionMarker;
         pub const decode_managed_index_admission_marker = artifact_repair_impl.decodeManagedIndexAdmissionMarker;
         pub const test_block_generated_artifact_finalization = &artifact_repair_impl.test_block_generated_artifact_finalization;
@@ -626,6 +633,10 @@ pub const DB = struct {
 
     pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
         return lifecycle_impl.snapshotLsmWriteStats(self);
+    }
+
+    pub fn storageChangeTokenLocked(self: *DB) u64 {
+        return lifecycle_impl.storageChangeTokenLocked(self);
     }
 
     pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
@@ -1060,12 +1071,60 @@ pub const DB = struct {
         search_runtime_impl.endPublishedDenseSearch(self);
     }
 
-    pub fn beginIndexRepairBarrier(self: *DB) void {
-        artifact_repair_impl.beginIndexRepairBarrier(self);
+    pub fn beginIndexCatalogBarrierUntil(self: *DB, deadline_ns: u64) bool {
+        return search_runtime_impl.beginIndexCatalogBarrierUntil(self, deadline_ns);
     }
 
-    pub fn endIndexRepairBarrier(self: *DB) void {
-        artifact_repair_impl.endIndexRepairBarrier(self);
+    pub fn endIndexCatalogBarrier(self: *DB) void {
+        search_runtime_impl.endIndexCatalogBarrier(self);
+    }
+
+    pub fn publishedDenseSearchCount(self: *const DB) u32 {
+        return search_runtime_impl.publishedDenseSearchCount(self);
+    }
+
+    pub fn indexCatalogBarrierActive(self: *const DB) bool {
+        return search_runtime_impl.indexCatalogBarrierActive(self);
+    }
+
+    pub fn lockApplyUntil(self: *DB, deadline_ns: u64) bool {
+        return search_runtime_impl.lockApplyUntil(self, deadline_ns);
+    }
+
+    pub fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
+        return search_runtime_impl.snapshotVisibilityStats(self);
+    }
+
+    pub fn beginIndexStructuralMutation(
+        self: *DB,
+        operation: []const u8,
+        index_name: []const u8,
+    ) artifact_repair_impl.IndexStructuralMutationGuard {
+        return artifact_repair_impl.beginIndexStructuralMutation(self, operation, index_name);
+    }
+
+    pub fn beginDrainedIndexStructuralMutation(
+        self: *DB,
+        operation: []const u8,
+        index_name: []const u8,
+    ) artifact_repair_impl.IndexStructuralMutationGuard {
+        return artifact_repair_impl.beginDrainedIndexStructuralMutation(self, operation, index_name);
+    }
+
+    pub fn quiesceTextMergeForStructuralMutation(self: *DB) bool {
+        return artifact_repair_impl.quiesceTextMergeForStructuralMutation(self);
+    }
+
+    pub fn quiesceSparseCompactionForStructuralMutation(self: *DB) bool {
+        return artifact_repair_impl.quiesceSparseCompactionForStructuralMutation(self);
+    }
+
+    pub fn restartTextMergeAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
+        artifact_repair_impl.restartTextMergeAfterStructuralMutation(self, operation, index_name);
+    }
+
+    pub fn restartSparseCompactionAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
+        artifact_repair_impl.restartSparseCompactionAfterStructuralMutation(self, operation, index_name);
     }
 
     pub fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {

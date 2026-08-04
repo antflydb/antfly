@@ -602,6 +602,7 @@ fn transformOpTypeFromString(op: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op, "$setOnInsert")) return .set_on_insert;
     if (std.mem.eql(u8, op, "$unset")) return .unset;
     if (std.mem.eql(u8, op, "$inc")) return .inc;
+    if (std.mem.eql(u8, op, "$push")) return .push;
     if (std.mem.eql(u8, op, "$addToSet")) return .add_to_set;
     if (std.mem.eql(u8, op, "$max")) return .max;
     return error.InvalidBatchRequest;
@@ -882,9 +883,16 @@ test "batch parser accepts supported Go transform op spelling" {
     try std.testing.expectEqual(db_mod.types.TransformOpType.set_on_insert, owned.transforms[0].operations[1].op);
 }
 
+test "batch parser accepts push for graph edge arrays" {
+    var owned = try parseBatchRequest(std.testing.allocator,
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$push","path":"edges","value":{"to":"doc:b"}}]}]}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.push, owned.transforms[0].operations[0].op);
+}
+
 test "batch parser rejects every recognized but unsupported transform operator" {
     const unsupported = [_][]const u8{
-        "$push",
         "$pull",
         "$pop",
         "$mul",
@@ -908,7 +916,7 @@ test "batch parser rejects every recognized but unsupported transform operator" 
 
 test "batch parser safely rejects unsupported transform after initialized operations" {
     const body =
-        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$push","path":"items","value":1}]}]}
+        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$pull","path":"items","value":1}]}]}
     ;
     for (0..32) |_| {
         try std.testing.expectError(

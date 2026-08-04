@@ -118,7 +118,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
             else => {
                 fail_count += 1;
-                std.debug.print("FAIL ({t})\n", .{err});
+                // Logs emitted by a test can split the leading test name from
+                // its result. Repeat it on failure so CI attribution survives
+                // interleaved diagnostics and truncated log windows.
+                std.debug.print("FAIL ({t}) {s}\n", .{ err, test_fn.name });
                 if (@errorReturnTrace()) |trace| {
                     std.debug.dumpErrorReturnTrace(trace);
                 }

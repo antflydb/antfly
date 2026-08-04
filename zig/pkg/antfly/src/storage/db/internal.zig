@@ -407,11 +407,12 @@ pub fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
 
 pub fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
     if (index_manager.textIndex(index_name)) |entry| {
-        const text_snapshot = entry.snapshot();
+        const text_snapshot = entry.acquireSnapshot();
+        defer text_snapshot.release();
         const term_count = textIndexTermCount(entry);
         return .{
             .kind = .full_text,
-            .doc_count = text_snapshot.global_doc_count,
+            .doc_count = text_snapshot.liveDocCount(),
             .term_count = term_count,
             .updated_at_ns = platform.time.monotonicNs(),
         };
@@ -971,7 +972,9 @@ pub fn AsyncContext(comptime DB: type) type {
         dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
         target_advance_repair_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
         text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
+        text_merge_restart_state: std.atomic.Value(u8) = .init(0),
         sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+        sparse_compaction_restart_state: std.atomic.Value(u8) = .init(0),
         relational_base_rows: bool = false,
         resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
         promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,

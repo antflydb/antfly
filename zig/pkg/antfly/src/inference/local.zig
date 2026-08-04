@@ -38,6 +38,7 @@ pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     base_url: []const u8,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
@@ -75,6 +76,10 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
         }
         self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+    }
+
+    pub fn setRequestCancellation(self: *Provider, cancellation: ?*const std.atomic.Value(bool)) void {
+        self.cancellation = cancellation;
     }
 
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
@@ -138,7 +143,7 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .cancellation = self.cancellation });
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -266,7 +271,7 @@ pub const Provider = struct {
             .input = input,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .cancellation = self.cancellation });
         defer resp.deinit();
 
         if (!resp.ok()) {

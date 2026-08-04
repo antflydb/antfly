@@ -40,6 +40,8 @@ const tables_api = @import("../metadata/catalog/table_ddl.zig");
 pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -78,7 +80,14 @@ pub const Worker = struct {
         req: GraphExpandRequest,
         consistency: raft_mod.ReadConsistency,
     ) !GraphExpandResponse {
-        return try self.vtable.execute_graph_expand(self.ptr, alloc, group_id, table_name, req, consistency);
+        try self.ensureActive();
+        var controlled = req;
+        controlled.timeout_ms = try self.remainingTimeoutMs();
+        controlled.cancellation = self.cancellation;
+        var response = try self.vtable.execute_graph_expand(self.ptr, alloc, group_id, table_name, controlled, consistency);
+        errdefer response.deinit(alloc);
+        try self.ensureActive();
+        return response;
     }
 
     pub fn executeGraphHydrate(
@@ -89,7 +98,14 @@ pub const Worker = struct {
         req: GraphHydrateRequest,
         consistency: raft_mod.ReadConsistency,
     ) !GraphHydrateResponse {
-        return try self.vtable.execute_graph_hydrate(self.ptr, alloc, group_id, table_name, req, consistency);
+        try self.ensureActive();
+        var controlled = req;
+        controlled.timeout_ms = try self.remainingTimeoutMs();
+        controlled.cancellation = self.cancellation;
+        var response = try self.vtable.execute_graph_hydrate(self.ptr, alloc, group_id, table_name, controlled, consistency);
+        errdefer response.deinit(alloc);
+        try self.ensureActive();
+        return response;
     }
 
     pub fn executeGraphGetEdges(
@@ -100,8 +116,15 @@ pub const Worker = struct {
         req: GraphEdgesRequest,
         consistency: raft_mod.ReadConsistency,
     ) !GraphEdgesResponse {
+        try self.ensureActive();
         const func = self.vtable.execute_graph_get_edges orelse return error.UnsupportedQueryRequest;
-        return try func(self.ptr, alloc, group_id, table_name, req, consistency);
+        var controlled = req;
+        controlled.timeout_ms = try self.remainingTimeoutMs();
+        controlled.cancellation = self.cancellation;
+        var response = try func(self.ptr, alloc, group_id, table_name, controlled, consistency);
+        errdefer response.deinit(alloc);
+        try self.ensureActive();
+        return response;
     }
 
     pub fn fanoutIo(self: Worker) ?std.Io {
@@ -113,7 +136,34 @@ pub const Worker = struct {
         const func = self.vtable.fanout_width_cap orelse return null;
         return func(self.ptr);
     }
+
+    fn ensureActive(self: Worker) !void {
+        if (self.cancellation) |value| {
+            if (value.load(.acquire)) return error.Cancelled;
+        }
+        if (self.execution_deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        }
+    }
+
+    fn remainingTimeoutMs(self: Worker) !?u32 {
+        const deadline_ns = self.execution_deadline_ns orelse return null;
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= deadline_ns) return error.Timeout;
+        const remaining_ns = deadline_ns - now_ns;
+        const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
+        return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+    }
 };
+
+/// Reconstitutes a node-local absolute deadline from the coordinator's
+/// remaining transport budget. Saturating addition keeps maliciously large
+/// values from wrapping into an already-expired deadline.
+pub fn executionDeadlineFromTimeoutMs(timeout_ms: ?u32) ?u64 {
+    const value = timeout_ms orelse return null;
+    const duration_ns = std.math.mul(u64, value, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    return std.math.add(u64, platform_time.monotonicNs(), duration_ns) catch std.math.maxInt(u64);
+}
 
 const GraphFanoutPlan = struct {
     parallel: bool,
@@ -266,6 +316,11 @@ pub const GraphExpandRequest = struct {
     resolved_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
+    /// Local request controls. They are deliberately excluded from the graph
+    /// JSON contract; remote workers receive the deadline as their transport
+    /// timeout and cancellation by connection interruption.
+    timeout_ms: ?u32 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn deinit(self: *GraphExpandRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -369,6 +424,8 @@ pub const GraphHydrateRequest = struct {
     resolved_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
+    timeout_ms: ?u32 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
         for (self.keys) |key| alloc.free(key);
@@ -409,6 +466,8 @@ pub const GraphEdgesRequest = struct {
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
+    timeout_ms: ?u32 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub fn deinit(self: *GraphEdgesRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);
@@ -724,9 +783,15 @@ pub fn executeCrossRange(
     try requireStampedCrossRangeRequest(req);
     try rejectUnstampedResultRefs(req);
 
+    var request_worker = worker;
+    request_worker.execution_deadline_ns = req.execution_deadline_ns;
+    request_worker.cancellation = req.cancellation;
+    try request_worker.ensureActive();
+
     var attempts: u32 = 0;
     while (true) : (attempts += 1) {
-        return executeCrossRangeOnce(alloc, catalog, worker, table_name, req, base_result, consistency) catch |err| switch (err) {
+        try request_worker.ensureActive();
+        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, consistency) catch |err| switch (err) {
             error.TopologyChanged, error.UnknownGroup => {
                 if (attempts == 0) continue;
                 return err;
@@ -4547,6 +4612,8 @@ pub fn frontierItemToSearchRequest(
         .identity_read_generation = req.identity_read_generation,
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
+        .execution_deadline_ns = executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .cancellation = req.cancellation,
     };
 }
 
@@ -8862,6 +8929,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         ) !GraphExpandResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(req.timeout_ms != null);
+            try std.testing.expect(req.cancellation != null);
             _ = state.expand_calls.fetchAdd(1, .monotonic);
             const active = state.expand_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.expand_active.fetchSub(1, .monotonic);
@@ -8906,6 +8975,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         ) !GraphHydrateResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(req.timeout_ms != null);
+            try std.testing.expect(req.cancellation != null);
             _ = state.hydrate_calls.fetchAdd(1, .monotonic);
             const active = state.hydrate_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.hydrate_active.fetchSub(1, .monotonic);
@@ -8937,6 +9008,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var state = TestState{ .io_impl = &io_impl };
+    var cancellation = std.atomic.Value(bool).init(false);
 
     const req = db_mod.types.SearchRequest{
         .graph_queries = &[_]db_mod.types.NamedGraphQuery{
@@ -8951,6 +9023,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             },
         },
         .identity_read_generation = 77,
+        .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+        .cancellation = &cancellation,
     };
     const base_result = db_mod.types.SearchResult{
         .alloc = std.testing.allocator,
@@ -8983,6 +9057,18 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
     for (results[0].hits) |hit| {
         try std.testing.expect(hit.doc_ordinal == null);
     }
+
+    cancellation.store(true, .release);
+    try std.testing.expectError(error.Cancelled, executeCrossRange(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        req,
+        base_result,
+        .read_index,
+    ));
+    try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
 }
 
 test "distributed graph metric status merge validates metadata compatibility" {

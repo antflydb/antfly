@@ -47,6 +47,7 @@ const ha_types = @import("ha_types.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const internal_keys = @import("../internal_keys.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
+const artifact_repair_mod = @import("artifact_repair.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
@@ -73,6 +74,7 @@ const Allocator = std.mem.Allocator;
 const ManagedSyncTargets = db_internal.ManagedSyncTargets;
 
 const run_until_idle_max_replay_rounds: usize = 16;
+const test_quarantine_publication_fence_entered = &artifact_repair_mod.test_quarantine_publication_fence_entered;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
@@ -648,6 +650,7 @@ pub fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
+        const test_quarantine_publication_fence_entered = DB.ArtifactRepairCallbacks.test_quarantine_publication_fence_entered;
 
         const engine_vtable = db_core.Engine.VTable{
             .batch = engineBatch,
@@ -3384,7 +3387,7 @@ pub fn Impl(comptime DB: type) type {
                         if (self.core.textIndex(cfg.name)) |entry| {
                             const text_snapshot = entry.acquireSnapshot();
                             defer text_snapshot.release();
-                            item.doc_count = text_snapshot.global_doc_count;
+                            item.doc_count = text_snapshot.liveDocCount();
                             item.term_count = textIndexTermCount(entry);
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
                             term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
@@ -3455,6 +3458,7 @@ pub fn Impl(comptime DB: type) type {
             }
 
             return .{
+                .storage_change_token = self.storageChangeTokenLocked(),
                 .source_doc_count = identity_stats.live_ordinals,
                 .doc_count = visible_doc_count,
                 .index_count = @intCast(self.core.indexCount()),
@@ -3504,7 +3508,7 @@ pub fn Impl(comptime DB: type) type {
             for (configs) |cfg| {
                 if (cfg.kind != .full_text) continue;
                 if (self.core.textIndex(cfg.name)) |entry| {
-                    indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().global_doc_count);
+                    indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().liveDocCount());
                 }
             }
             const visible_doc_count = indexed_doc_count orelse try Self.scanPrimaryDocCount(self, byte_range);
@@ -3569,7 +3573,7 @@ pub fn Impl(comptime DB: type) type {
                 switch (cfg.kind) {
                     .full_text => {
                         if (self.core.textIndex(cfg.name)) |entry| {
-                            item.doc_count = entry.snapshot().global_doc_count;
+                            item.doc_count = entry.snapshot().liveDocCount();
                             indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
                         }
                         item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
@@ -4196,7 +4200,7 @@ pub fn Impl(comptime DB: type) type {
                         if (self.core.textIndex(item.name)) |entry| {
                             const text_snapshot = entry.acquireSnapshot();
                             defer text_snapshot.release();
-                            item.doc_count = text_snapshot.global_doc_count;
+                            item.doc_count = text_snapshot.liveDocCount();
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
                         item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
@@ -4326,6 +4330,18 @@ pub fn Impl(comptime DB: type) type {
             }
             lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, self.core.index_manager.snapshotLsmWriteStats());
             return write_stats;
+        }
+
+        pub fn storageChangeTokenLocked(self: *DB) u64 {
+            const write_stats = Self.snapshotLsmWriteStatsLocked(self);
+            var hasher = std.hash.Wyhash.init(0x6c736d5f73746f72);
+            const wal_growth_bucket = write_stats.wal_append_bytes / (1024 * 1024);
+            hasher.update(std.mem.asBytes(&wal_growth_bucket));
+            hasher.update(std.mem.asBytes(&write_stats.wal_resets));
+            hasher.update(std.mem.asBytes(&write_stats.table_file_bytes));
+            hasher.update(std.mem.asBytes(&write_stats.manifest_writes));
+            hasher.update(std.mem.asBytes(&write_stats.manifest_bytes));
+            return hasher.final();
         }
 
         pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
@@ -4494,9 +4510,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
-            self.core.lockApply();
-            defer self.core.unlockApply();
-            return try self.core.index_manager.retryFailedIndexLoads(self.core.store, platform_time.monotonicNs(), force);
+            return try DB.ArtifactRepairCallbacks.retry_quarantined_index_loads(self, force);
         }
 
         const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
@@ -6453,8 +6467,51 @@ test "db lifecycle quarantine self-heals via retryQuarantinedIndexLoads" {
     }
 
     // Forced retry recovers the index in-process — no reopen, no
-    // drop+recreate — resuming the persisted rebuild state.
-    const result = try db.retryQuarantinedIndexLoads(true);
+    // drop+recreate — resuming the persisted rebuild state. Hold a simulated
+    // query lease across the final publication and prove recovery waits for
+    // it rather than reallocating the inline catalog beneath a reader.
+    const RetryState = struct {
+        db: *DB,
+        result: ?index_manager_mod.IndexManager.QuarantineRetryResult = null,
+        err: ?anyerror = null,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(state: *@This()) void {
+            state.result = state.db.retryQuarantinedIndexLoads(true) catch |err| {
+                state.err = err;
+                state.completed.store(true, .release);
+                return;
+            };
+            state.completed.store(true, .release);
+        }
+    };
+    test_quarantine_publication_fence_entered.store(false, .release);
+    defer test_quarantine_publication_fence_entered.store(false, .release);
+    db.core.lockApplyShared();
+    var apply_shared_held = true;
+    var retry_state = RetryState{ .db = &db };
+    var retry_thread = try std.Thread.spawn(.{}, RetryState.run, .{&retry_state});
+    var retry_thread_joined = false;
+    defer {
+        if (apply_shared_held) db.core.unlockApplyShared();
+        if (!retry_thread_joined) retry_thread.join();
+    }
+
+    const publication_deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
+    while (!test_quarantine_publication_fence_entered.load(.acquire) and monotonicTimeNs() < publication_deadline) {
+        db_internal.sleepNs(100 * std.time.ns_per_us);
+    }
+    const publication_fence_entered = test_quarantine_publication_fence_entered.load(.acquire);
+    const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
+    db.core.unlockApplyShared();
+    apply_shared_held = false;
+    retry_thread.join();
+    retry_thread_joined = true;
+
+    try std.testing.expect(publication_fence_entered);
+    try std.testing.expect(publication_waited_for_reader);
+    if (retry_state.err) |err| return err;
+    const result = retry_state.result orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), result.recovered);
     try std.testing.expectEqual(@as(usize, 0), result.remaining);
     try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);

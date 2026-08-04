@@ -114,10 +114,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     }
 
     if (opts.table_name) |tbl| {
-        const selected_format = opts.format orelse "portable";
-        if (!std.mem.eql(u8, selected_format, "native") and !std.mem.eql(u8, selected_format, "portable")) {
-            cli.fatal("unsupported backup format: {s}", .{selected_format});
-        }
+        const selected_format = parseBackupFormat(antfly_client.types.BackupRequestFormat, opts.format) catch unreachable;
         const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
         try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
         std.debug.print("Backup command successful.\n", .{});
@@ -138,7 +135,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         .backup_id = bid,
         .location = opts.location,
         .connection = connection,
-        .format = opts.format orelse "portable",
+        .format = parseBackupFormat(antfly_client.types.ClusterBackupRequestFormat, opts.format) catch unreachable,
         .table_names = table_names,
     });
     defer resp.deinit();
@@ -151,21 +148,18 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     std.debug.print("Backup command successful.\n", .{});
 }
 
-fn validateClusterBackupResult(status: []const u8, tables: []const antfly_client.types.TableBackupStatus) !void {
+fn validateClusterBackupResult(status: antfly_client.types.ClusterBackupResponseStatus, tables: []const antfly_client.types.TableBackupStatus) !void {
     var completed: usize = 0;
     var incomplete: usize = 0;
     for (tables) |table| {
-        if (std.mem.eql(u8, table.status, "completed")) {
-            completed += 1;
-        } else if (std.mem.eql(u8, table.status, "failed") or std.mem.eql(u8, table.status, "skipped")) {
-            incomplete += 1;
-        } else {
-            return error.InvalidBackupResponse;
+        switch (table.status) {
+            .completed => completed += 1,
+            .failed, .skipped => incomplete += 1,
         }
     }
-    const expected = if (completed == 0) "failed" else if (incomplete > 0) "partial" else "completed";
-    if (!std.mem.eql(u8, status, expected)) return error.InvalidBackupResponse;
-    if (!std.mem.eql(u8, expected, "completed")) return error.ClusterBackupIncomplete;
+    const expected: antfly_client.types.ClusterBackupResponseStatus = if (completed == 0) .failed else if (incomplete > 0) .partial else .completed;
+    if (status != expected) return error.InvalidBackupResponse;
+    if (expected != .completed) return error.ClusterBackupIncomplete;
 }
 
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -219,7 +213,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         .location = opts.location,
         .connection = connection,
         .table_names = table_names,
-        .restore_mode = opts.restore_mode,
+        .restore_mode = parseClusterRestoreMode(opts.restore_mode) catch unreachable,
     }, .{ .idempotency_key = opts.idempotency_key });
     defer resp.deinit();
     try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
@@ -284,13 +278,19 @@ fn classifyRestorePollResponse(status_code: u16, has_data: bool) RestorePollDisp
     return if (status_code == 503) .retry else .invalid;
 }
 
-pub fn isTerminalRestorePhase(phase: []const u8) bool {
-    return std.mem.eql(u8, phase, "succeeded") or std.mem.eql(u8, phase, "failed") or std.mem.eql(u8, phase, "cancelled");
+pub fn isTerminalRestorePhase(phase: antfly_client.types.RestoreJobPhase) bool {
+    return switch (phase) {
+        .queued, .running => false,
+        .succeeded, .failed, .cancelled => true,
+    };
 }
 
-pub fn restorePhaseResult(phase: []const u8) !void {
-    if (std.mem.eql(u8, phase, "failed")) return error.RestoreJobFailed;
-    if (std.mem.eql(u8, phase, "cancelled")) return error.RestoreJobCancelled;
+pub fn restorePhaseResult(phase: antfly_client.types.RestoreJobPhase) !void {
+    return switch (phase) {
+        .failed => error.RestoreJobFailed,
+        .cancelled => error.RestoreJobCancelled,
+        .queued, .running, .succeeded => {},
+    };
 }
 
 fn prepareInputRestorePlan(
@@ -410,6 +410,13 @@ fn validateBackupArgs(opts: BackupArgs) !void {
     }
 }
 
+fn parseBackupFormat(comptime Format: type, value: ?[]const u8) !Format {
+    const format = value orelse "portable";
+    if (std.mem.eql(u8, format, "native")) return .native;
+    if (std.mem.eql(u8, format, "portable")) return .portable;
+    return error.UnsupportedBackupFormat;
+}
+
 fn validateBackupCursor(cursor: []const u8) !void {
     if (cursor.len == 0 or cursor.len > 128 or std.mem.eql(u8, cursor, ".") or std.mem.eql(u8, cursor, "..")) return error.InvalidBackupCursor;
     for (cursor) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.InvalidBackupCursor;
@@ -422,7 +429,16 @@ fn validateRestoreArgs(opts: RestoreArgs) !void {
         if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
         if (!isPortableRestoreInputPath(input)) return error.InvalidRestoreInputPath;
     }
+    _ = try parseClusterRestoreMode(opts.restore_mode);
     if (!opts.location_explicit) return error.RestoreLocationRequired;
+}
+
+fn parseClusterRestoreMode(value: ?[]const u8) !?antfly_client.types.ClusterRestoreRequestRestoreMode {
+    const mode = value orelse return null;
+    if (std.mem.eql(u8, mode, "fail_if_exists")) return .fail_if_exists;
+    if (std.mem.eql(u8, mode, "skip_if_exists")) return .skip_if_exists;
+    if (std.mem.eql(u8, mode, "overwrite")) return .overwrite;
+    return error.UnsupportedRestoreMode;
 }
 
 fn isPortableRestoreInputPath(path: []const u8) bool {
@@ -476,7 +492,7 @@ fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
         \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode fail_if_exists|skip_if_exists|overwrite] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
         \\notes:
@@ -500,18 +516,20 @@ test "backup cli parser accepts help flag" {
 }
 
 test "cluster backup CLI fails closed on incomplete and unknown results" {
-    const completed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "completed" }};
-    const failed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "failed" }};
+    const completed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = .completed }};
+    const failed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = .failed }};
     const partial = [_]antfly_client.types.TableBackupStatus{
-        .{ .name = "docs", .status = "completed" },
-        .{ .name = "events", .status = "failed" },
+        .{ .name = "docs", .status = .completed },
+        .{ .name = "events", .status = .failed },
     };
-    const unknown = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "queued" }};
-    try validateClusterBackupResult("completed", &completed);
-    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult("partial", &partial));
-    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult("failed", &failed));
-    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult("completed", &failed));
-    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult("queued", &unknown));
+    try validateClusterBackupResult(.completed, &completed);
+    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult(.partial, &partial));
+    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult(.failed, &failed));
+    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult(.completed, &failed));
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        std.json.parseFromSlice(antfly_client.types.ClusterBackupResponseStatus, std.testing.allocator, "\"queued\"", .{}),
+    );
 }
 
 test "backup cli parser rejects unknown arguments" {
@@ -766,6 +784,24 @@ test "restore cli validation rejects unsupported input extension" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.InvalidRestoreInputPath, validateRestoreArgs(opts));
+}
+
+test "network restore rejects unsupported mode" {
+    var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-reader", "--location", "s3://archive/backups", "--mode", "replace" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.UnsupportedRestoreMode, validateRestoreArgs(opts));
+}
+
+test "restore phase helpers classify generated states" {
+    try std.testing.expect(!isTerminalRestorePhase(.queued));
+    try std.testing.expect(!isTerminalRestorePhase(.running));
+    try std.testing.expect(isTerminalRestorePhase(.succeeded));
+    try std.testing.expect(isTerminalRestorePhase(.failed));
+    try std.testing.expect(isTerminalRestorePhase(.cancelled));
+    try restorePhaseResult(.succeeded);
+    try std.testing.expectError(error.RestoreJobFailed, restorePhaseResult(.failed));
+    try std.testing.expectError(error.RestoreJobCancelled, restorePhaseResult(.cancelled));
 }
 
 test "restore polling response classification retries only service unavailable" {

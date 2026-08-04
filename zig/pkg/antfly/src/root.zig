@@ -290,6 +290,7 @@ test {
     _ = jsonschema;
     _ = common;
     _ = foreign;
+    _ = @import("foreign/postgres_libpq.zig");
     _ = embeddings;
     _ = generating;
     _ = generating_runtime;

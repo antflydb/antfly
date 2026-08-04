@@ -328,7 +328,7 @@ test "db shadow index manager backfills split-off range and ignores parent-range
     try db.createShadowIndexManager("doc:m", "");
     try std.testing.expect(db.shadow != null);
     try std.testing.expect(db.getShadowIndexDir().len > 0);
-    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.core.shard_manager.prepareSplit("doc:m");
     try db.core.shard_manager.split(0, "doc:m");
@@ -339,7 +339,7 @@ test "db shadow index manager backfills split-off range and ignores parent-range
         .sync_level = .full_index,
     });
 
-    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.closeShadowIndexManager();
     try std.testing.expectEqualStrings("", db.getShadowIndexDir());
@@ -668,6 +668,10 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    const copied_admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, "ft_v1");
+    defer alloc.free(copied_admission_key);
+    try std.testing.expectError(error.NotFound, split_db.core.store.get(alloc, copied_admission_key));
+    try std.testing.expect(!split_db.core.index_manager.repairUnavailable("ft_v1"));
     {
         const split_stats = try split_db.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, split_stats);

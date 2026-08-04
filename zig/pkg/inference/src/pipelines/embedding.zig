@@ -164,6 +164,10 @@ pub const EmbeddingPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: EmbeddingConfig,
+    /// Optional owner-provided gate for stateful backend sessions. Metal and
+    /// CUDA sessions share mutable backend state across request pipelines and
+    /// must not execute overlapping forward passes.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional vision encoder session for CLIP/SigLIP multimodal embedding.
     vision_session: ?backends.Session = null,
     /// Optional audio encoder session for CLAP multimodal embedding.
@@ -214,16 +218,33 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         const text_session = self.textEncodingSession();
-        if (textSessionRequiresSerialBatch(text_session, texts.len)) {
-            return try self.embedSerial(texts);
+        if (textSessionBatchPlan(text_session, texts.len)) |plan| {
+            return try self.embedWithBatchPlan(texts, plan);
         }
 
+        return self.embedDirect(texts, texts.len);
+    }
+
+    /// Execute one backend batch. `texts` contains only caller-provided rows;
+    /// any required static-batch padding is added after tokenization by copying
+    /// the final encoded row. This keeps fixed-batch compatibility from
+    /// multiplying tokenizer and prefix-allocation work on short tail batches.
+    fn embedDirect(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        execution_batch: usize,
+    ) ![][]f32 {
+        if (texts.len == 0 or execution_batch < texts.len) return error.InvalidInputShape;
+
+        const text_session = self.textEncodingSession();
         const alloc = self.allocator;
         const input_info = text_session.inputInfo();
         const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
         const fixed_len = hasFixedTextSequenceLength(input_info);
-        const batch = texts.len;
+        const batch = execution_batch;
         const admitted_tokens = std.math.mul(usize, batch, max_len) catch
             return error.ResourceLimitExceeded;
         var run_permit = try text_session.admit(.{
@@ -236,7 +257,7 @@ pub const EmbeddingPipeline = struct {
         });
         defer run_permit.deinit();
 
-        const encoded = try alloc.alloc(EncodeResult, batch);
+        const encoded = try alloc.alloc(EncodeResult, texts.len);
         defer alloc.free(encoded);
         var encoded_count: usize = 0;
         defer {
@@ -263,9 +284,13 @@ pub const EmbeddingPipeline = struct {
         const all_mask = try alloc.alloc(i32, batch * effective_len);
         defer alloc.free(all_mask);
 
-        for (encoded[0..batch], 0..) |result, i| {
+        for (encoded, 0..) |result, i| {
             @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], result.ids[0..effective_len]);
             @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], result.attention_mask[0..effective_len]);
+        }
+        for (texts.len..batch) |i| {
+            @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], all_ids[(texts.len - 1) * effective_len .. texts.len * effective_len]);
+            @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], all_mask[(texts.len - 1) * effective_len .. texts.len * effective_len]);
         }
 
         // Convert i32 token IDs to i64 for ONNX Runtime (expects int64 tensors)
@@ -361,7 +386,12 @@ pub const EmbeddingPipeline = struct {
         return self.session;
     }
 
-    fn embedSerial(self: *EmbeddingPipeline, texts: []const []const u8) anyerror![][]f32 {
+    fn embedWithBatchPlan(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        plan: TextSessionBatchPlan,
+    ) anyerror![][]f32 {
+        if (plan.batch_size == 0) return error.InvalidInputShape;
         const embeddings = try self.allocator.alloc([]f32, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -369,15 +399,26 @@ pub const EmbeddingPipeline = struct {
             self.allocator.free(embeddings);
         }
 
-        for (texts, 0..) |_, idx| {
-            const single = try self.embed(texts[idx .. idx + 1]);
-            if (single.len != 1) {
-                freeEmbeddingSlices(self.allocator, single);
+        var offset: usize = 0;
+        while (offset < texts.len) {
+            const real_count = @min(plan.batch_size, texts.len - offset);
+            if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
+            const batch_embeddings = try self.embedDirect(
+                texts[offset .. offset + real_count],
+                plan.batch_size,
+            );
+            if (batch_embeddings.len != plan.batch_size) {
+                freeEmbeddingSlices(self.allocator, batch_embeddings);
                 return error.UnexpectedOutputShape;
             }
-            embeddings[idx] = single[0];
-            self.allocator.free(single);
-            initialized += 1;
+
+            for (batch_embeddings[0..real_count], 0..) |embedding, index| {
+                embeddings[offset + index] = embedding;
+            }
+            for (batch_embeddings[real_count..]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(batch_embeddings);
+            initialized += real_count;
+            offset += real_count;
         }
 
         return embeddings;
@@ -508,6 +549,8 @@ pub const EmbeddingPipeline = struct {
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         return self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
                 return self.embedImagesIndividually(images);
@@ -659,7 +702,10 @@ pub const EmbeddingPipeline = struct {
             alloc.free(embeddings);
         }
         for (images, 0..) |img, i| {
-            const single = try self.embedImages(&.{img});
+            // The public entry point already owns execution_lock while it
+            // evaluates the batch fallback. Call the unlocked implementation
+            // directly so the non-reentrant mutex is not acquired twice.
+            const single = try self.embedImagesBatch(&.{img});
             defer alloc.free(single);
             embeddings[i] = single[0];
             initialized += 1;
@@ -751,12 +797,24 @@ pub const EmbeddingPipeline = struct {
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         return self.embedAudioPcmBatch(audio_clips) catch |err| {
             if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
                 return self.embedAudioPcmIndividually(audio_clips);
             }
             return err;
         };
+    }
+
+    fn lockExecution(self: *EmbeddingPipeline) void {
+        const mutex = self.execution_lock orelse return;
+        platform.sync.lockYielding(mutex);
+    }
+
+    fn unlockExecution(self: *EmbeddingPipeline) void {
+        const mutex = self.execution_lock orelse return;
+        mutex.unlock();
     }
 
     fn embedAudioPcmBatch(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
@@ -937,7 +995,9 @@ pub const EmbeddingPipeline = struct {
         }
 
         for (audio_clips, 0..) |_, i| {
-            const one = try self.embedAudioPcm(audio_clips[i .. i + 1]);
+            // embedAudioPcm holds execution_lock across the complete fallback,
+            // so individual attempts must use the unlocked batch primitive.
+            const one = try self.embedAudioPcmBatch(audio_clips[i .. i + 1]);
             defer alloc.free(one);
             if (one.len != 1) return error.UnexpectedOutputShape;
             embeddings[i] = one[0];
@@ -1743,16 +1803,33 @@ test "embedding text length follows fixed input_ids sequence dimension" {
     try std.testing.expectEqual(@as(usize, 77), textSequenceLengthForInputs(&input_info, 512));
 }
 
-test "embedding text serializes batches that exceed declared input_ids batch" {
+test "embedding text plans backend and fixed-shape batches" {
     const dynamic = fakeTextSession(.native, &.{ -1, 77 });
-    try std.testing.expect(!textSessionRequiresSerialBatch(dynamic, 2));
+    try std.testing.expect(textSessionBatchPlan(dynamic, 2) == null);
 
     const fixed_one = fakeTextSession(.native, &.{ 1, 77 });
-    try std.testing.expect(!textSessionRequiresSerialBatch(fixed_one, 1));
-    try std.testing.expect(textSessionRequiresSerialBatch(fixed_one, 2));
+    try std.testing.expect(textSessionBatchPlan(fixed_one, 1) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_one, 2).?,
+    );
+
+    const fixed_two = fakeTextSession(.native, &.{ 2, 77 });
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 2, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_two, 1).?,
+    );
+    try std.testing.expect(textSessionBatchPlan(fixed_two, 2) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 2, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_two, 3).?,
+    );
 
     const external_onnx = fakeTextSession(.onnx, &.{ -1, 77 });
-    try std.testing.expect(textSessionRequiresSerialBatch(external_onnx, 2));
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
+        textSessionBatchPlan(external_onnx, 2).?,
+    );
 }
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
@@ -1762,17 +1839,35 @@ fn sessionHasInput(session: backends.Session, name: []const u8) bool {
     return false;
 }
 
-fn textSessionRequiresSerialBatch(session: backends.Session, requested_batch: usize) bool {
-    if (requested_batch <= 1) return false;
-    if (session.backend() == .onnx) return true;
-    if (backends.imported_onnx_session.sharedBackendContext(session) != null) return true;
+pub const TextSessionBatchPlan = struct {
+    batch_size: usize,
+    pad_final_batch: bool,
+};
+
+/// Return an execution plan only when the requested batch cannot be sent to
+/// the session directly. Fixed-shape models are processed at their declared
+/// batch size, padding only the final partial chunk. External ONNX sessions
+/// with dynamic shapes retain the conservative single-row execution path.
+pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?TextSessionBatchPlan {
+    if (requested_batch == 0) return null;
     for (session.inputInfo()) |info| {
         if (!std.mem.eql(u8, info.name, "input_ids")) continue;
-        if (info.shape.len == 0) return false;
+        if (info.shape.len == 0) break;
         const declared_batch = info.shape[0];
-        return declared_batch > 0 and @as(usize, @intCast(declared_batch)) < requested_batch;
+        if (declared_batch > 0) {
+            const batch_size: usize = @intCast(declared_batch);
+            if (batch_size == requested_batch) return null;
+            return .{ .batch_size = batch_size, .pad_final_batch = true };
+        }
+        break;
     }
-    return false;
+    if (requested_batch <= 1) return null;
+    if (session.backend() == .onnx or
+        backends.imported_onnx_session.sharedBackendContext(session) != null)
+    {
+        return .{ .batch_size = 1, .pad_final_batch = false };
+    }
+    return null;
 }
 
 fn shouldFallbackBatchedImageError(err: anyerror) bool {
@@ -1990,6 +2085,24 @@ fn selectProjectedOutput(outputs: []Tensor, expected_dim: usize, expected_batch:
         }
     }
     return null;
+}
+
+test "embedding execution gate owns the supplied mutex" {
+    var gate: std.atomic.Mutex = .unlocked;
+    var pipeline = EmbeddingPipeline{
+        .allocator = undefined,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+        .execution_lock = &gate,
+    };
+
+    pipeline.lockExecution();
+    try std.testing.expect(!gate.tryLock());
+    pipeline.unlockExecution();
+
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 }
 
 test "projectEmbeddings runs projection as a single batch" {
@@ -2383,11 +2496,13 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     const allocator = std.testing.allocator;
 
     var fake = FakeCollapsingVisionSession{};
+    var execution_gate: std.atomic.Mutex = .unlocked;
     var pipeline = EmbeddingPipeline{
         .allocator = allocator,
         .session = fake.session(),
         .tok = undefined,
         .config = .{ .normalize = false, .image_size = 2 },
+        .execution_lock = &execution_gate,
         .vision_session = fake.session(),
     };
 
@@ -2400,6 +2515,39 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     try std.testing.expectEqual(@as(usize, 2), embeddings.len);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[0]);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
+    try std.testing.expect(execution_gate.tryLock());
+    execution_gate.unlock();
+}
+
+test "embedAudioPcm falls back under the execution gate without re-entry" {
+    const allocator = std.testing.allocator;
+
+    var fake = FakeCollapsingAudioSession{};
+    var execution_gate: std.atomic.Mutex = .unlocked;
+    var pipeline = EmbeddingPipeline{
+        .allocator = allocator,
+        .session = fake.session(),
+        .tok = undefined,
+        .config = .{ .normalize = false },
+        .execution_lock = &execution_gate,
+        .audio_session = fake.session(),
+    };
+
+    const samples = [_]f32{0.0} ** 1024;
+    const clips = [_]audio.PcmAudio{
+        .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
+        .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
+    };
+    const embeddings = try pipeline.embedAudioPcm(&clips);
+    defer freeEmbeddingSlices(allocator, embeddings);
+
+    try std.testing.expectEqual(@as(usize, 3), fake.run_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.collapsed_batch_attempts);
+    try std.testing.expectEqual(@as(usize, 2), embeddings.len);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
+    try std.testing.expect(execution_gate.tryLock());
+    execution_gate.unlock();
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {
@@ -2484,6 +2632,52 @@ const FakeCollapsingVisionSession = struct {
         out[0] = try Tensor.initFloat32(allocator, "image_embeds", &.{ @intCast(actual_batch), 2 }, data[0 .. actual_batch * 2]);
         return out;
     }
+};
+
+const FakeCollapsingAudioSession = struct {
+    run_count: usize = 0,
+    collapsed_batch_attempts: usize = 0,
+
+    fn session(self: *FakeCollapsingAudioSession) backends.Session {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .run = run,
+                .inputInfo = inputInfo,
+                .outputInfo = outputInfo,
+                .backend = backend,
+                .close = close,
+            },
+        };
+    }
+
+    fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
+        const self: *FakeCollapsingAudioSession = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqual(@as(usize, 1), inputs.len);
+        const requested_batch: usize = @intCast(inputs[0].shape[0]);
+        self.run_count += 1;
+        if (requested_batch > 1) self.collapsed_batch_attempts = requested_batch;
+
+        const actual_batch: usize = if (requested_batch > 1) 1 else requested_batch;
+        const data = [_]f32{ 1.0, 2.0 };
+        const out = try allocator.alloc(Tensor, 1);
+        out[0] = try Tensor.initFloat32(allocator, "audio_embeds", &.{ @intCast(actual_batch), 2 }, data[0 .. actual_batch * 2]);
+        return out;
+    }
+
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "input_features", .dtype = .f32, .shape = &.{ -1, 1, 1001, 64 } }};
+    }
+
+    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "audio_embeds", .dtype = .f32, .shape = &.{ -1, 2 } }};
+    }
+
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+
+    fn close(_: *anyopaque) void {}
 };
 
 fn fakeVisionSession(ptr: anytype, comptime runFn: anytype) backends.Session {

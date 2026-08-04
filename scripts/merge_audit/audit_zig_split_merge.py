@@ -46,6 +46,8 @@ SAME_PATH_CONST_FALSE_POSITIVES = {
     },
 }
 
+SAME_PATH_FUNCTION_FALSE_POSITIVES: dict[str, set[str]] = {}
+
 SAME_PATH_CONST_ALIASES = {
     "zig/pkg/antfly/src/openapi/generated/antfly_client_openapi/root.zig": {
         "InferenceTextChunkOptions": {"TextChunkOptions"},
@@ -186,6 +188,7 @@ def load_manifest_policy(path: pathlib.Path) -> None:
     if isinstance(data.get("moved_paths"), dict):
         MOVED_CURRENT_PATHS.update({key: list(value) for key, value in data["moved_paths"].items() if isinstance(value, list)})
     merge_set_map(SAME_PATH_CONST_FALSE_POSITIVES, data.get("same_path_const_false_positives", {}))
+    merge_set_map(SAME_PATH_FUNCTION_FALSE_POSITIVES, data.get("same_path_function_false_positives", {}))
     merge_nested_set_map(SAME_PATH_CONST_ALIASES, data.get("same_path_const_aliases", {}))
     merge_set_map(TEST_NAME_ALIASES, data.get("test_name_aliases", {}))
     merge_set_map(CHANGED_HELPER_CURRENT_ALIASES, data.get("changed_helper_aliases", {}))
@@ -408,7 +411,11 @@ def text_file_has_conflict_markers(path: str) -> bool:
         data = full.read_text(errors="replace")
     except OSError:
         return False
-    return re.search(r"^(<<<<<<<|=======|>>>>>>>)", data, re.MULTILINE) is not None
+    return re.search(
+        r"^(?:<<<<<<< .+|\|\|\|\|\|\|\| .+|=======|>>>>>>> .+)$",
+        data,
+        re.MULTILINE,
+    ) is not None
 
 
 def pub_fns(text: str) -> set[str]:
@@ -1099,11 +1106,17 @@ def check_surface_symbols(origin: str) -> list[CheckResult]:
             ])),
         ))
     if file_exists_at_origin(origin, "zig/pkg/antfly/src/storage/db/db.zig"):
+        db_ignored = (
+            DB_PUB_FN_FALSE_POSITIVES
+            | SAME_PATH_FUNCTION_FALSE_POSITIVES.get(
+                "zig/pkg/antfly/src/storage/db/db.zig", set()
+            )
+        )
         checks.append(compare_named_sets(
             "db public functions",
             pub_fns(origin_text(origin, "zig/pkg/antfly/src/storage/db/db.zig")),
             pub_fns(current_text(["zig/pkg/antfly/src/storage/db"])),
-            DB_PUB_FN_FALSE_POSITIVES,
+            db_ignored,
         ))
     return checks
 
@@ -1187,11 +1200,20 @@ def check_exact_sort_gap(origin: str) -> list[CheckResult]:
         "zig/pkg/antfly/src/api/query_contract.zig",
     ])
     index_manager = current_text(["zig/pkg/antfly/src/storage/db/catalog/index_manager.zig"])
+    dense_exact = current_text(["zig/pkg/antfly/src/storage/db/dense_exact.zig"])
     missing_exec = sorted(CRITICAL_SORT_EXEC_SYMBOLS & (all_fns(old_search_exec) - all_fns(new_search_exec)))
     missing_contract = sorted(CRITICAL_QUERY_CONTRACT_SORT_SYMBOLS & (all_fns(old_contract) - all_fns(new_contract)))
     exact_bridge_ok = (
         "pub fn exactScoreDenseEntryWithRequest" in index_manager
-        and "resolveExactDenseDocKeyAlloc" in index_manager
+        and (
+            "resolveExactDenseDocKeyAlloc" in index_manager
+            or (
+                "CandidateDifference.init" in index_manager
+                and "getMetadataManySortedInTxn" in index_manager
+                and "lookupDocIdTxn" in index_manager
+                and "pub const CandidateDifference" in dense_exact
+            )
+        )
         and "exactScoreRequest" not in index_manager
     )
     return [
@@ -2946,7 +2968,11 @@ def check_same_path_public_surface(origin: str, files: list[ChangedFile]) -> lis
         except (RuntimeError, OSError, UnicodeDecodeError):
             continue
         allow_missing = DB_PUB_FN_FALSE_POSITIVES if path == "zig/pkg/antfly/src/storage/db/db.zig" else set()
-        fn_missing = sorted((pub_fns(old) - pub_fns(new)) - allow_missing)
+        fn_missing = sorted(
+            (pub_fns(old) - pub_fns(new))
+            - allow_missing
+            - SAME_PATH_FUNCTION_FALSE_POSITIVES.get(path, set())
+        )
         new_members = pub_members(new)
         const_missing_items: list[str] = []
         for name in sorted(pub_consts(old) - SAME_PATH_CONST_FALSE_POSITIVES.get(path, set())):

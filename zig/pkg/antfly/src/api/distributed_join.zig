@@ -41,6 +41,7 @@ pub const JoinContext = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 
     pub const VTable = struct {
         admin_snapshot: *const fn (*anyopaque) anyerror!?metadata_api.AdminSnapshot,
@@ -53,15 +54,21 @@ pub const JoinContext = struct {
         get_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (*anyopaque, metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!void = null,
-        execute_plain_query: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64) anyerror!query_api.QueryResponse,
-        execute_query_dispatch: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64) anyerror![]u8,
-        build_owned_search_request: *const fn (*anyopaque, std.mem.Allocator, []const u8, std.json.Value, ?u64) anyerror!query_api.OwnedQueryRequest,
+        execute_plain_query: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64, ?*const std.atomic.Value(bool)) anyerror!query_api.QueryResponse,
+        execute_query_dispatch: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64, ?*const std.atomic.Value(bool)) anyerror![]u8,
+        build_owned_search_request: *const fn (*anyopaque, std.mem.Allocator, []const u8, std.json.Value, ?u64, ?*const std.atomic.Value(bool)) anyerror!query_api.OwnedQueryRequest,
         ensure_foreign_registry: *const fn (*anyopaque) anyerror!*const foreign_mod.Registry,
     };
 
     pub fn withExecutionDeadline(self: JoinContext, deadline_ns: ?u64) JoinContext {
         var out = self;
         out.execution_deadline_ns = deadline_ns;
+        return out;
+    }
+
+    pub fn withCancellation(self: JoinContext, cancellation: ?*const std.atomic.Value(bool)) JoinContext {
+        var out = self;
+        out.cancellation = cancellation;
         return out;
     }
 
@@ -91,6 +98,9 @@ pub const JoinContext = struct {
     }
 
     pub fn ensureExecutionDeadline(self: JoinContext) !void {
+        if (self.cancellation) |value| {
+            if (value.load(.acquire)) return error.Cancelled;
+        }
         const deadline_ns = self.execution_deadline_ns orelse return;
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
     }
@@ -138,6 +148,7 @@ pub const JoinContext = struct {
             body,
             row_filter_json,
             self.execution_deadline_ns,
+            self.cancellation,
         );
     }
 
@@ -150,6 +161,7 @@ pub const JoinContext = struct {
             body,
             row_filter_json,
             self.execution_deadline_ns,
+            self.cancellation,
         );
     }
 
@@ -160,6 +172,7 @@ pub const JoinContext = struct {
             table_name,
             query_value,
             self.execution_deadline_ns,
+            self.cancellation,
         );
     }
 
@@ -1450,7 +1463,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     row_filter_json: ?[]const u8,
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
-) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout })![]u8 {
+) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout, Cancelled })![]u8 {
     try ctx.ensureExecutionDeadline();
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
     var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
@@ -1476,6 +1489,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.TableNotFound => return error.NotFound,
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
+        error.Cancelled => return error.Cancelled,
         else => return error.InternalFailure,
     };
     defer primary_result.deinit(alloc);
@@ -1494,6 +1508,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
+        error.Cancelled => return error.Cancelled,
         else => return error.InternalFailure,
     };
 
@@ -1503,6 +1518,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.Timeout => return error.Timeout,
+            error.Cancelled => return error.Cancelled,
             else => {
                 std.log.err("distributed shuffle join failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -1526,6 +1542,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.TableNotFound => return error.NotFound,
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
+        error.Cancelled => return error.Cancelled,
         else => return error.InternalFailure,
     };
     defer right_result.deinit(alloc);
@@ -1540,6 +1557,8 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         appended_left_field,
     ) catch |err| switch (err) {
         error.InvalidQueryRequest => return error.InvalidQueryRequest,
+        error.Cancelled => return error.Cancelled,
+        error.Timeout => return error.Timeout,
         else => return error.InternalFailure,
     };
     try maybeAttachJoinProfile(alloc, &owned_response, stats, plan, right_result.strategy_used, right_result.distributed_execution, right_result.groups_queried);
@@ -2318,6 +2337,7 @@ const StatefulDistributedShuffleEngine = struct {
                     .succeeded = false,
                 });
                 if (err == error.Timeout) return error.Timeout;
+                if (err == error.Cancelled) return error.Cancelled;
                 continue;
             };
             try state.worker_attempts.append(self.alloc, .{
@@ -2589,6 +2609,7 @@ pub fn executeForeignRightJoinQuery(
     });
     defer params.deinit(alloc);
     params.execution_deadline_ns = ctx.execution_deadline_ns;
+    params.cancellation = ctx.cancellation;
 
     const source_config = try foreign_source.toSourceConfig(alloc);
     var foreign_query_source = try registry.create(alloc, source_config);
@@ -2604,11 +2625,11 @@ pub fn executeForeignRightJoinQuery(
     }
 
     var left_equality_index: ?EqualityJoinIndex = if (join.join_type != .right and join.operator == .eq and left_hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.execution_deadline_ns)
+        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.execution_deadline_ns, ctx.cancellation)
     else
         null;
     defer if (left_equality_index) |*index| index.deinit(alloc);
-    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns };
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns, .cancellation = ctx.cancellation };
     for (result.rows) |row| {
         try deadline_poller.poll();
         if (row != .object) return error.UnsupportedQueryRequest;
@@ -4046,11 +4067,11 @@ fn applyNestedJoinToRightHits(
     defer nested_result.deinit(alloc);
 
     var equality_index: ?EqualityJoinIndex = if (nested_join.operator == .eq and nested_result.hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.execution_deadline_ns)
+        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.execution_deadline_ns, ctx.cancellation)
     else
         null;
     defer if (equality_index) |*index| index.deinit(alloc);
-    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns };
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns, .cancellation = ctx.cancellation };
     for (right_hits) |*hit| {
         try deadline_poller.poll();
         const left_value = extractJoinValueFromHit(hit.*, nested_join.left_field) orelse continue;
@@ -4058,9 +4079,9 @@ fn applyNestedJoinToRightHits(
             if (EqualityJoinIndex.supports(left_value))
                 if (index.lookupIndex(left_value)) |match_index| nested_result.hits[match_index] else null
             else
-                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns)
+                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns, ctx.cancellation)
         else
-            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns);
+            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns, ctx.cancellation);
         const effective_matched_right = matched_right orelse continue;
         const source_value = hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
         if (source_value.* != .object) return error.InvalidQueryRequest;
@@ -4701,12 +4722,16 @@ pub fn extractJsonPathValue(value: std.json.Value, path: []const u8) ?std.json.V
 
 const JoinDeadlinePoller = struct {
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool) = null,
     work_until_check: u8 = 1,
 
     fn poll(self: *@This()) !void {
         self.work_until_check -|= 1;
         if (self.work_until_check != 0) return;
         self.work_until_check = 64;
+        if (self.cancellation) |value| {
+            if (value.load(.acquire)) return error.Cancelled;
+        }
         const deadline_ns = self.deadline_ns orelse return;
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
     }
@@ -4727,10 +4752,11 @@ const EqualityJoinIndex = struct {
         hits: []const std.json.Value,
         field_name: []const u8,
         deadline_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
     ) !EqualityJoinIndex {
         var out: EqualityJoinIndex = .{};
         errdefer out.deinit(alloc);
-        var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+        var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
         for (hits, 0..) |hit, index| {
             try poller.poll();
             const value = extractJoinValueFromHit(hit, field_name) orelse continue;
@@ -4808,6 +4834,7 @@ pub fn applyJoinedRightHitsToResponse(
 ) !JoinedQueryStats {
     return try applyJoinedRightHitsToResponseWithDeadline(
         null,
+        null,
         alloc,
         root,
         left_hits,
@@ -4830,6 +4857,7 @@ pub fn applyJoinedRightHitsToResponseWithContext(
 ) !JoinedQueryStats {
     return try applyJoinedRightHitsToResponseWithDeadline(
         ctx.execution_deadline_ns,
+        ctx.cancellation,
         alloc,
         root,
         left_hits,
@@ -4842,6 +4870,7 @@ pub fn applyJoinedRightHitsToResponseWithContext(
 
 fn applyJoinedRightHitsToResponseWithDeadline(
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     alloc: std.mem.Allocator,
     root: *std.json.Value,
     left_hits: []const std.json.Value,
@@ -4852,6 +4881,7 @@ fn applyJoinedRightHitsToResponseWithDeadline(
 ) !JoinedQueryStats {
     var merged = try mergeJoinedRightHitsAllocWithDeadline(
         deadline_ns,
+        cancellation,
         alloc,
         left_hits,
         join,
@@ -4874,6 +4904,7 @@ pub fn mergeJoinedRightHitsAlloc(
 ) !JoinedRightMergeResult {
     return try mergeJoinedRightHitsAllocWithDeadline(
         null,
+        null,
         alloc,
         left_hits,
         join,
@@ -4894,6 +4925,7 @@ fn mergeJoinedRightHitsAllocWithContext(
 ) !JoinedRightMergeResult {
     return try mergeJoinedRightHitsAllocWithDeadline(
         ctx.execution_deadline_ns,
+        ctx.cancellation,
         alloc,
         left_hits,
         join,
@@ -4905,6 +4937,7 @@ fn mergeJoinedRightHitsAllocWithContext(
 
 fn mergeJoinedRightHitsAllocWithDeadline(
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
     alloc: std.mem.Allocator,
     left_hits: []const std.json.Value,
     join: SupportedJoinRequest,
@@ -4926,11 +4959,11 @@ fn mergeJoinedRightHitsAllocWithDeadline(
     }
 
     var equality_index: ?EqualityJoinIndex = if (join.operator == .eq and right_hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns)
+        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns, cancellation)
     else
         null;
     defer if (equality_index) |*index| index.deinit(alloc);
-    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
 
     for (left_hits) |hit_value| {
         try poller.poll();
@@ -4953,9 +4986,9 @@ fn mergeJoinedRightHitsAllocWithDeadline(
             if (EqualityJoinIndex.supports(left_value))
                 if (index.lookupIndex(left_value)) |match_index| right_hits[match_index] else null
             else
-                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns)
+                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, cancellation)
         else
-            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns);
+            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns, cancellation);
         const effective_matched_right = matched_right orelse {
             stats.rows_unmatched_left += 1;
             if (join.join_type == .left) {
@@ -5606,8 +5639,9 @@ fn findFirstMatchingRightHitWithDeadline(
     left_value: std.json.Value,
     right_hits: []const std.json.Value,
     deadline_ns: ?u64,
+    cancellation: ?*const std.atomic.Value(bool),
 ) !?std.json.Value {
-    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     for (right_hits) |hit_value| {
         try poller.poll();
         const right_value = extractJoinValueFromHit(hit_value, join.right_field) orelse continue;
@@ -5700,6 +5734,7 @@ test "distributed join context forwards one absolute deadline to every query cal
             _: []const u8,
             _: ?[]const u8,
             deadline_ns: ?u64,
+            _: ?*const std.atomic.Value(bool),
         ) !query_api.QueryResponse {
             try std.testing.expectEqual(@as(?u64, expected_deadline_ns), deadline_ns);
             return error.TestDeadlineForwarded;
@@ -5713,6 +5748,7 @@ test "distributed join context forwards one absolute deadline to every query cal
             _: []const u8,
             _: ?[]const u8,
             deadline_ns: ?u64,
+            _: ?*const std.atomic.Value(bool),
         ) ![]u8 {
             try std.testing.expectEqual(@as(?u64, expected_deadline_ns), deadline_ns);
             return error.TestDeadlineForwarded;
@@ -5724,6 +5760,7 @@ test "distributed join context forwards one absolute deadline to every query cal
             _: []const u8,
             _: std.json.Value,
             deadline_ns: ?u64,
+            _: ?*const std.atomic.Value(bool),
         ) !query_api.OwnedQueryRequest {
             try std.testing.expectEqual(@as(?u64, expected_deadline_ns), deadline_ns);
             return error.TestDeadlineForwarded;
@@ -6498,10 +6535,56 @@ test "distributed join merge rejects an expired deadline before scanning" {
         error.Timeout,
         mergeJoinedRightHitsAllocWithDeadline(
             platform_time.monotonicNs(),
+            null,
             alloc,
             &.{left_hit},
             join,
             &.{},
+            &.{},
+            false,
+        ),
+    );
+}
+
+test "distributed join apply context cancels a linear non-equality merge" {
+    const alloc = std.testing.allocator;
+
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .join_type = .inner,
+        .operator = .neq,
+        .left_field = try alloc.dupe(u8, "id"),
+        .right_field = try alloc.dupe(u8, "id"),
+    };
+    defer join.deinit(alloc);
+    var left_hit = try testJoinHitAlloc(alloc, "left", 1, "shared");
+    defer deinitJsonValue(alloc, &left_hit);
+    var right_hit = try testJoinHitAlloc(alloc, "right", 1, "shared");
+    defer deinitJsonValue(alloc, &right_hit);
+    var response = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"responses\":[{\"hits\":{\"hits\":[]}}]}",
+        .{},
+    );
+    defer response.deinit();
+    var cancellation = std.atomic.Value(bool).init(true);
+    var state: u8 = 0;
+    const ctx = JoinContext{
+        .ptr = &state,
+        .vtable = undefined,
+        .cancellation = &cancellation,
+    };
+
+    try std.testing.expectError(
+        error.Cancelled,
+        applyJoinedRightHitsToResponseWithContext(
+            ctx,
+            alloc,
+            &response.value,
+            &.{left_hit},
+            join,
+            &.{right_hit},
             &.{},
             false,
         ),
@@ -6743,13 +6826,13 @@ test "distributed join unmatched worker returns only unmatched synthetic hits" {
         }
         fn upsertJoinShuffleLease(_: *anyopaque, _: metadata_table_manager.ShuffleJoinLeaseRecord) !void {}
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             const body = try stringifyJsonValueAlloc(alloc, query_value);
             defer alloc.free(body);
             return try query_api.parseQueryRequest(alloc, null, table_name, body);
@@ -6852,13 +6935,13 @@ test "distributed join unmatched worker pages group-local right hits" {
         }
         fn upsertJoinShuffleLease(_: *anyopaque, _: metadata_table_manager.ShuffleJoinLeaseRecord) !void {}
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             const body = try json_helpers.stringifyJsonValueAlloc(alloc, query_value);
             defer alloc.free(body);
             return try query_api.parseQueryRequest(alloc, null, table_name, body);
@@ -7152,13 +7235,13 @@ test "distributed join unmatched worker prefers local search results over query 
         }
         fn upsertJoinShuffleLease(_: *anyopaque, _: metadata_table_manager.ShuffleJoinLeaseRecord) !void {}
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             const body = try json_helpers.stringifyJsonValueAlloc(alloc, query_value);
             defer alloc.free(body);
             var owned = try query_api.parseQueryRequest(alloc, null, table_name, body);
@@ -7318,13 +7401,13 @@ test "distributed join rejects doc identity rebuild before right-table fanout" {
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
@@ -7450,13 +7533,13 @@ test "distributed join stateful shuffle rejects doc identity rebuild before work
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
@@ -8075,13 +8158,13 @@ test "distributed join shared finalizer start index prefers live lease owner and
         }
 
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
@@ -8155,13 +8238,13 @@ test "distributed join durable finalizer state init reuses prior owner lease" {
 
         fn upsertJoinShuffleLease(_: *anyopaque, _: metadata_table_manager.ShuffleJoinLeaseRecord) !void {}
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
@@ -8234,13 +8317,13 @@ test "distributed join durable threshold checks require shuffle shared leases an
         }
         fn upsertJoinShuffleLease(_: *anyopaque, _: metadata_table_manager.ShuffleJoinLeaseRecord) !void {}
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
@@ -8315,13 +8398,13 @@ test "distributed join finalizer start index falls back without usable shared le
         }
 
         fn removeJoinShuffleLease(_: *anyopaque, _: u64) !void {}
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64, _: ?*const std.atomic.Value(bool)) ![]u8 {
             return error.UnsupportedOperation;
         }
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64, _: ?*const std.atomic.Value(bool)) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {

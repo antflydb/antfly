@@ -162,7 +162,7 @@ pub const PrimaryStoreOwner = union(enum) {
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PrimaryStoreOwner) ?u64 {
         return switch (self.*) {
             .none, .mem => null,
-            .lsm => |owner| owner.handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lsm => |owner| owner.handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 
@@ -1009,8 +1009,17 @@ pub const DBCore = struct {
     }
 
     pub fn setSchemaWithMetadata(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_puts: []const schema_mod.SchemaMetadataPut) !void {
-        if (!try schema_mod.saveSchemaWithMetadata(self.store, self.alloc, table_schema, metadata_puts)) return;
+        const changed = try schema_mod.saveSchemaWithMetadata(self.store, self.alloc, table_schema, metadata_puts);
+        // Refresh even when the durable value is unchanged. An index may have
+        // been provisioned between the original schema commit and this
+        // idempotent retry, and empty generations still need the mapping.
+        if (!changed) {
+            try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
+            return;
+        }
         const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
+        errdefer if (next_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+        try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
         self.index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(self.schema));

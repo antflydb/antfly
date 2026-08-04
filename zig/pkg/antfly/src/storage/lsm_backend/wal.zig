@@ -103,6 +103,7 @@ pub const RetentionStats = struct {
     bytes: u64 = 0,
     oldest_retained_segment: u64 = 0,
     current_segment: u64 = 0,
+    current_segment_bytes: u64 = 0,
     checkpoint_covered_through_segment: u64 = 0,
 };
 
@@ -453,6 +454,7 @@ pub fn snapshotRetention(
         };
         allocator.free(segment_path);
         if (size == 0) continue;
+        if (segment == current_segment) stats.current_segment_bytes = size;
         stats.segments += 1;
         stats.bytes += size;
     }
@@ -482,6 +484,7 @@ pub fn snapshotReplayRetention(
         };
         allocator.free(segment_path);
         if (size == 0) continue;
+        if (segment == index.current_segment) stats.current_segment_bytes = size;
         if (stats.oldest_retained_segment == 0) stats.oldest_retained_segment = segment;
         stats.segments += 1;
         stats.bytes += size;
@@ -2154,6 +2157,8 @@ test "lsm wal retention snapshot counts replayed segment debt and reset clears i
     try std.testing.expectEqual(@as(u64, 2), retained.current_segment);
     try std.testing.expectEqual(@as(u64, 2), retained.segments);
     try std.testing.expect(retained.bytes > 0);
+    try std.testing.expect(retained.current_segment_bytes > 0);
+    try std.testing.expect(retained.current_segment_bytes <= retained.bytes);
 
     try reset(storage.storage(), std.testing.allocator, root_dir);
 
@@ -2162,6 +2167,7 @@ test "lsm wal retention snapshot counts replayed segment debt and reset clears i
     try std.testing.expectEqual(@as(u64, 1), after_reset.current_segment);
     try std.testing.expectEqual(@as(u64, 0), after_reset.segments);
     try std.testing.expectEqual(@as(u64, 0), after_reset.bytes);
+    try std.testing.expectEqual(@as(u64, 0), after_reset.current_segment_bytes);
 }
 
 test "lsm wal checkpoint retires covered segments and replay starts at retained floor" {

@@ -31,6 +31,7 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     const b = ctx.b;
     const target = ctx.target;
     const optimize = ctx.optimize;
+    const strip = ctx.strip;
     const lib_mod = ctx.lib_mod;
     const structlog_mod = ctx.structlog_mod;
 
@@ -41,6 +42,7 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     });
     capi_mod.addImport("antfly-zig", lib_mod);
     capi_mod.addImport("structlog", structlog_mod);
+    capi_mod.strip = strip;
 
     const capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -56,6 +58,7 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     });
     lite_capi_mod.addImport("antfly-zig", lib_mod);
     lite_capi_mod.addImport("structlog", structlog_mod);
+    lite_capi_mod.strip = strip;
 
     const lite_capi_lib = b.addLibrary(.{
         .linkage = .dynamic,

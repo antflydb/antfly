@@ -54,5 +54,5 @@ def test_models_exposes_gliner2_as_extractor(api):
 def test_models_exposes_reader_inputs(api):
     resp = api.models()
     readers = resp.get("readers", {})
-    if "Xenova/trocr-base-printed" in readers:
-        assert "image" in readers["Xenova/trocr-base-printed"].get("inputs", [])
+    if "antflydb/florence-2-base" in readers:
+        assert "image" in readers["antflydb/florence-2-base"].get("inputs", [])

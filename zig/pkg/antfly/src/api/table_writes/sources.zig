@@ -36,6 +36,8 @@ const platform_time = @import("antfly_platform").time;
 const backend_types = @import("../../storage/backend_types.zig");
 const change_journal_mod = @import("../../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
+const graph_mod = @import("../../graph/graph.zig");
+
 const range_state_mod = @import("../../storage/db/range_state.zig");
 const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const index_manager_mod = @import("../../storage/db/catalog/index_manager.zig");
@@ -4540,42 +4542,93 @@ pub const ProvisionedTableWriteSource = struct {
         result.retry_at_ms = entry.value_ptr.retry_at_ms;
     }
 
+    pub const LsmMaintenanceRoundResult = struct {
+        progressed: bool = false,
+        group_id: ?u64 = null,
+    };
+
     pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
+        return (try self.runLsmMaintenanceRoundDetailed()).progressed;
+    }
+
+    pub fn runLsmMaintenanceRoundDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        var primary_only = false;
         var leased = blk: {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
-            if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
-            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return false;
+            const cache = self.write_cache orelse return .{};
+            if (cache.leaseLsmMaintenanceDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmMaintenanceDueLocked()) |lease| {
+                primary_only = true;
+                break :blk lease;
+            }
+            if (cache.maxLsmMaintenanceScoreLocked() == 0) return .{};
+            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
-        return try leased.db.runLsmMaintenanceStep();
+        const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
+        const progressed = if (primary_only)
+            try leased.db.runPrimaryLsmMaintenanceStep()
+        else
+            try leased.db.runLsmMaintenanceStep();
+        if (maintenance_table_name) |table_name| {
+            const should_invalidate_read_cache = progressed or blk: {
+                const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
+                break :blk stats.obsolete_paths_pinned_by_versions != 0;
+            };
+            if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
+        }
+        return .{
+            .progressed = progressed,
+            .group_id = if (leased.entry) |entry| entry.group_id else null,
+        };
     }
 
     pub fn runLsmMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !bool {
-        if (!self.local_db_mutex.tryLock()) return false;
+        return (try self.runLsmMaintenanceRoundBestEffortDetailed()).progressed;
+    }
+
+    pub fn runLsmMaintenanceRoundBestEffortDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        if (!self.local_db_mutex.tryLock()) return .{};
         var primary_only = false;
         var leased = blk: {
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
+            const cache = self.write_cache orelse return .{};
+            if (cache.leaseLsmMaintenanceDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmMaintenanceDueLocked()) |lease| {
+                primary_only = true;
+                break :blk lease;
+            }
             if (cache.maxLsmMaintenanceScoreLocked() != 0) {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
             }
-            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
+            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return .{};
             primary_only = true;
-            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;
+            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
-        return if (primary_only)
+        const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
+        const progressed = if (primary_only)
             try leased.db.runPrimaryLsmMaintenanceStepBestEffort()
         else
             try leased.db.runLsmMaintenanceStepBestEffort();
+        if (maintenance_table_name) |table_name| {
+            const should_invalidate_read_cache = progressed or blk: {
+                const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
+                break :blk stats.obsolete_paths_pinned_by_versions != 0;
+            };
+            if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
+        }
+        return .{
+            .progressed = progressed,
+            .group_id = if (leased.entry) |entry| entry.group_id else null,
+        };
     }
 
     pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
@@ -20915,12 +20968,23 @@ pub const BoundTableWriteSource = struct {
             .deletes = table.deletes,
             .transforms = table.transforms,
             .predicates = table.predicates,
-        }) catch |err| switch (err) {
-            error.VersionConflict, error.IntentConflict => {
-                db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
-                return .{ .conflict = boundConflict(table, err) };
-            },
-            else => return normalizeRelationalConstraintError(err),
+        }) catch |err| {
+            db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch |abort_err| {
+                std.log.err("failed to abort rejected bound transaction write_err={s} abort_err={s}", .{
+                    @errorName(err),
+                    @errorName(abort_err),
+                });
+                return normalizeRelationalConstraintError(abort_err);
+            };
+            switch (err) {
+                error.VersionConflict, error.IntentConflict => return .{ .conflict = boundConflict(table, err) },
+                error.InvalidBatchRequest,
+                error.InvalidArgument,
+                error.InvalidGraphEdges,
+                error.UnsupportedTransformOperation,
+                => return error.InvalidBatchRequest,
+                else => return normalizeRelationalConstraintError(err),
+            }
         };
         db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
             return normalizeRelationalConstraintError(err);
@@ -22667,6 +22731,8 @@ test "provisioned managed replay tails converge and publish without later traffi
     var write_cache_live = true;
     defer if (write_cache_live) write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    var source_live = true;
+    defer if (source_live) source.deinit();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
@@ -22753,6 +22819,8 @@ test "provisioned managed replay tails converge and publish without later traffi
     }
 
     write_cache.entries.items[0].db.setQueryVisibilityHook(null);
+    source.deinit();
+    source_live = false;
     write_cache.deinit();
     write_cache_live = false;
     snapshot_cache.deinit();
@@ -22761,9 +22829,10 @@ test "provisioned managed replay tails converge and publish without later traffi
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
 
-    // Leave one real dense replay record beyond the persisted applied
+    // Leave one real dense replay effect beyond the persisted applied
     // watermark while all workers are stopped. This models a process exiting
-    // after the commit became durable but before derived replay completed.
+    // after the primary commit and generated effect became durable but before
+    // derived replay completed.
     var restart_tail_sequence: u64 = 0;
     {
         var seeded = try db_mod.DB.open(alloc, group_path, .{
@@ -22778,12 +22847,17 @@ test "provisioned managed replay tails converge and publish without later traffi
         });
         defer seeded.close();
 
-        const stored_key = try db_mod.internal_keys.documentKeyAlloc(alloc, "restart-tail");
-        defer alloc.free(stored_key);
-        try seeded.core.store.putBatch(&.{.{
-            .key = stored_key,
-            .value = "{\"content\":\"restart payload\",\"semantic_content\":\"restart semantic payload\"}",
-        }}, &.{});
+        // Commit through the real batch machinery while all optional runtimes
+        // and index workers are stopped. This leaves an ordinary durable
+        // document/enrichment replay tail without fabricating only one half of
+        // the journal contract.
+        try seeded.batch(.{
+            .writes = &.{.{
+                .key = "restart-tail",
+                .value = "{\"content\":\"restart payload\",\"semantic_content\":\"restart semantic payload\"}",
+            }},
+            .sync_level = .write,
+        });
 
         const artifact_key = try db_mod.internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "restart-tail", "semantic_idx");
         defer alloc.free(artifact_key);
@@ -22823,6 +22897,7 @@ test "provisioned managed replay tails converge and publish without later traffi
     var restarted_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer restarted_write_cache.deinit();
     var restarted_source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    defer restarted_source.deinit();
     restarted_source.write_cache = &restarted_write_cache;
     restarted_source.runtime_status_cache = &restarted_snapshot_cache;
 
@@ -34053,6 +34128,12 @@ test "bound table write source backs up and restores a local table" {
         std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     }
 
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
         .timestamp_ns = 1,
@@ -34094,6 +34175,13 @@ test "bound table write source backs up and restores a local table" {
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
 }
 
 test "bound table write source backs up and restores a portable local table" {
@@ -34114,6 +34202,12 @@ test "bound table write source backs up and restores a portable local table" {
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
         std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     }
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -34162,6 +34256,13 @@ test "bound table write source backs up and restores a portable local table" {
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
 }
 
 test "bound table write source enforces root conditionals not and unique items" {
@@ -35296,6 +35397,44 @@ test "bound table write source rejects invalid commit transforms against persist
             },
         }},
     }}, .write));
+}
+
+test "bound table write source aborts graph transform transaction on validation failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-graph-transform-txn", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\"}]}}}" }},
+        .sync_level = .full_index,
+    });
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    const txn_id = try distributed_txn.parseTxnIdHex("102132435465768798a9bacbdcedfe0f");
+    try std.testing.expectError(error.InvalidBatchRequest, source.source().commitTransactionWithId(
+        alloc,
+        txn_id,
+        20_000,
+        &.{.{
+            .table_name = "docs",
+            .transforms = &.{.{
+                .key = "a",
+                .operations = &.{.{ .op = .set, .path = "$._edges.graph.FRIEND", .value_json = "[]" }},
+            }},
+        }},
+        .full_index,
+    ));
+    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(txn_id));
+
+    const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("b", edges[0].target);
 }
 
 test "bound table write source rejects invalid txn prepare writes against persisted schema" {
@@ -36774,6 +36913,7 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
         .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, "snap1", 7001),
     };
     defer freeBackupShards(alloc, shards);
+    try backups_api.populateShardArtifactIntegrity(alloc, null, .native, dest_root, &shards[0]);
 
     var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,

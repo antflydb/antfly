@@ -674,6 +674,22 @@ pub const capi_default_filters = [_][]const u8{
     "capi aggregate hits rejects stale identity generation before aggregation materialization",
 };
 
+pub const release_scale_test_filters = [_][]const u8{
+    "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "db one real delete keeps filtered full text on complement path across restart",
+    "db production ingest preserves high-frequency keyword recall across clean restarts",
+};
+
+pub const release_blocker_regression_filters = [_][]const u8{
+    "non-visible doc set complements visibility per generation",
+    "built-in exact dense scorer filters metadata before vector reads",
+    "sorted unique vector id subtraction handles sparse and dense exclusions",
+};
+
+pub const release_blocker_compile_anchors = [_][]const u8{
+    "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+};
+
 pub const DBTestFilters = struct {
     // Keep DB buckets at module/category granularity. build.zig wires coarse
     // steps and aggregates only, so a DB regression should normally join an
@@ -935,6 +951,10 @@ pub const APITestFilters = struct {
         "api http server serves document lookup through mcp tool",
         "api http server storage status does not block on a direct lsm probe",
         "api http transient read retry honors expired request deadline before source query",
+        "httpx query admission rejects saturated queries without blocking control routes",
+        "httpx query admission releases a cancelled query slot",
+        "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
+        "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "api http unsupported count ordered page response exposes stable sort reason",
         "api http unsupported sorted query response exposes stable sort reason",
         "api http unsupported sorted query response surfaces exact sort diagnostics",
@@ -1577,6 +1597,7 @@ pub const APITestFilters = struct {
         "enrichment worker chunk cache keys preserve embedded separators",
         "search request text stats keys preserve embedded separators",
         "merge distributed background text stats keys preserve embedded separators",
+        "significant_terms local background stats use postings without stored index source",
         "dense metadata keys preserve embedded index separators",
         "dense metadata lookups read legacy textual rows",
         "distributed txn participant ids preserve embedded group markers",
@@ -2371,6 +2392,13 @@ pub const RootTestFilters = struct {
     pub const fast = [_][]const u8{
         ".test_0",
         "module compiles",
+        "postgres libpq async reader observes cancellation after bounded wait before consuming input",
+        "postgres libpq async reader returns cancelled before waiting or consuming input",
+        "postgres libpq result decoding observes cancellation at periodic checkpoints",
+        "postgres libpq global permit wait observes cancellation without a deadline",
+        "postgres libpq pool wait observes cancellation without a deadline",
+        "postgres libpq cancellation during connect polling closes the fresh connection",
+        "managed embedder cancels an in-flight remote embedding request",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
@@ -2460,6 +2488,7 @@ pub const RaftTestFilters = struct {
         "managed host service preserves leader-routed observation roles from transition ops",
         "managed host service seeds queued transitions from projected metadata store",
         "raft runtime cadence validates independent intervals",
+        "hosted shard db adapter rediscovers median key after stale leader route",
         "shard operation adapter metadata runtime dispatches actions",
         "transition destination requires a stable healthy voter set",
         "transition retry jitter is bounded and desynchronizes services",
@@ -2561,6 +2590,10 @@ pub const HATestFilters = struct {
 const ha_storage_default_skip_filters = HATestFilters.chaos ++ HATestFilters.compat;
 
 pub const PackageTestFilters = struct {
+    pub const httpx_transport_regression = [_][]const u8{
+        "H2 response serialization strips connection-specific headers",
+    };
+
     pub const image_conformance = [_][]const u8{
         "conformance corpus",
     };
@@ -2642,6 +2675,7 @@ pub const DataTestFilters = struct {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "runtime status disk scan retries only when maintenance invalidates its group",
         "cached repair telemetry is runtime facts",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
@@ -3534,6 +3568,7 @@ const storage_backend_test_steps = .{
     .sparse = StorageBackendTestStep{
         .name = "sparse-test",
         .description = "Run sparse index unit tests",
+        .simple_runner = true,
     },
     .derived_log = StorageBackendTestStep{
         .name = "derived-log-test",
@@ -4118,13 +4153,15 @@ pub fn addStorageTestSteps(
     root_module: *std.Build.Module,
     progress_skip_filters: []const []const u8,
 ) StorageTestSteps {
-    return .{
-        .root = addStorageTestRun(b, root_module, "lib-storage-test", "Run root-module storage tests only", &StorageTestFilters.root, true, &.{}),
+    const steps = StorageTestSteps{
+        .root = addStorageTestRun(b, root_module, "lib-storage-test", "Run root-module storage tests only", &StorageTestFilters.root, true, &release_scale_test_filters),
         .ha = addStorageTestRun(b, root_module, null, "Run hot-standby HA storage tests", &StorageTestFilters.ha, false, &ha_storage_default_skip_filters),
         .progress = addStorageTestRun(b, root_module, null, "Run root-module storage tests with progress skips", &StorageTestFilters.root, true, progress_skip_filters),
         .lsm_backend = addStorageTestRun(b, root_module, "lsm-backend-test", "Run LSM backend unit tests only", &StorageTestFilters.lsm_backend, false, &.{}),
         .resource_budget = addStorageTestRun(b, root_module, "resource-budget-test", "Run storage resource-manager accounting tests", &StorageTestFilters.resource_budget, false, &.{}),
     };
+    addRuntimeSkipTestFilters(steps.progress.run, &release_scale_test_filters);
+    return steps;
 }
 
 pub fn addRootTestStep(
@@ -4144,6 +4181,7 @@ pub fn addRootTestStep(
     for (RootTestFilters.skip) |filter| {
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
+    addRuntimeSkipTestFilters(run, &release_scale_test_filters);
     const step = b.step("root-test", "Run fast root-module compile smoke tests");
     step.dependOn(&run.step);
     return .{
@@ -4403,6 +4441,7 @@ pub fn addDBRootTestStep(
     const tests = addTestArtifact(b, root_module, &DBTestFilters.root, true);
     const run = b.addRunArtifact(tests);
     addSelectedRunTestFilter(b, run);
+    addRuntimeSkipTestFilters(run, &release_scale_test_filters);
     const step = b.step(db_root_step_name, "Run root-module DB tests only");
     step.dependOn(&run.step);
     return .{
@@ -4442,6 +4481,7 @@ fn addDBStorageTestStep(
     tests.stack_size = 64 * 1024 * 1024;
     const run = b.addRunArtifact(tests);
     addSelectedRunTestFilter(b, run);
+    addRuntimeSkipTestFilters(run, &release_scale_test_filters);
     const step = b.step(db_storage_step_name, "Run storage/db unit tests");
     step.dependOn(&run.step);
     return run;
@@ -4514,6 +4554,12 @@ pub fn addRuntimeTestFilters(
         run.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run, b.args orelse &.{});
+}
+
+pub fn addRuntimeSkipTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) void {
+    for (filters) |filter| {
+        run.addArgs(&.{ "--skip-test-filter", filter });
+    }
 }
 
 pub fn compileFiltersWithAnchors(
@@ -4955,6 +5001,15 @@ pub fn addMainCaptureTestSteps(ctx: anytype) MainCaptureTestRuns {
             "streaming phrase scorer matches randomized positional reference",
             "phrase filter exact adjacency",
             "phrase filter with slop",
+            "prefix filter seeks late range in large term dictionary",
+            "prefix filter uses a materialized companion with old-segment fallback",
+            "exact inclusive term range preserves prefix constant scores",
+            "multi_match bool_prefix preserves root semantics and bounds shingle prefixes",
+            "segment term statistics stay immutable while tombstones mask hits",
+            "retained snapshots share tombstones and immutable BM25 statistics",
+            "concurrent searches safely observe in-place deletion publication",
+            "resolved ordinal filters subtract non-visible complement without live probes",
+            "db one real delete keeps filtered full text on complement path across restart",
             "PostingsIterator positional seek decodes only selected records",
             "PostingsIterator deferred positional seek decodes only accepted candidates",
             "PostingsIterator streams deferred grouped positions without scratch arrays",
@@ -4994,7 +5049,6 @@ pub fn addMainCaptureTestSteps(ctx: anytype) MainCaptureTestRuns {
             "bool fallback applies native doc number constraints",
             "db text kernel search matches projected search without stored bodies",
             "split preserves postings when text segments omit source bodies",
-            "background text stats use postings when segment source is omitted",
             "text score query exposes score top k sort profile",
         },
         "search-performance-test",

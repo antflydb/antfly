@@ -3742,6 +3742,9 @@ pub const SearchRequest = struct {
     graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
+    /// Borrowed listener lifecycle signal. It is request-local and must never
+    /// be retained by asynchronous work after query execution returns.
+    cancellation: ?*const std.atomic.Value(bool) = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
 };
@@ -4825,6 +4828,9 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Process-local fingerprint of physical LSM/WAL publications. Runtime
+    /// status uses it only to invalidate cached directory-byte observations.
+    storage_change_token: u64 = 0,
     /// Canonical live primary-document cardinality from durable identity metadata.
     /// Unlike doc_count, this is independent of derived index fan-out.
     source_doc_count: u64 = 0,

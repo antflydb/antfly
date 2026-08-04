@@ -325,6 +325,8 @@ pub fn Impl(comptime DB: type) type {
 
         fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
             if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            var structural_guard = self.beginIndexStructuralMutation("index creation", cfg.name);
+            defer structural_guard.deinit();
             // Generated artifact namespaces can be shared across differently named
             // indexes. Cleanup is durable and owner-driven; never turn index
             // admission into an unbounded corpus scan. Metadata reconciliation can
@@ -1019,6 +1021,8 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn deleteIndex(self: *DB, name: []const u8) !bool {
             if (db_config.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
+            defer structural_guard.deinit();
             const restart_enrichment = DB.SchemaRuntimeCallbacks.quiesce_enrichment_for_structural_mutation(self);
             const removed = Self.deleteIndexWhileEnrichmentQuiesced(self, name) catch |delete_err| {
                 if (restart_enrichment) Self.restartEnrichmentAfterStructuralMutation(self, "failed index deletion", name) catch |restart_err| {

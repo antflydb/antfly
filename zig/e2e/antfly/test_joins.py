@@ -218,6 +218,9 @@ def test_distributed_right_join_returns_unmatched_right_rows(stateful_api):
 
 
 def test_distributed_join_still_works_after_standalone_restart(stateful_api):
+    if not stateful_api.supports_restart:
+        pytest.skip("restart is only available for locally managed stateful servers")
+
     docs_table, customers_table = _seed_join_tables(stateful_api, "distributed_join_restart")
 
     before_restart = wait_until(
@@ -234,10 +237,7 @@ def test_distributed_join_still_works_after_standalone_restart(stateful_api):
     assert before_restart is not None
     assert _join_profile(before_restart)["strategy_used"] == "shuffle"
 
-    try:
-        stateful_api.restart_server()
-    except AssertionError as exc:
-        pytest.skip(str(exc))
+    stateful_api.restart_server()
 
     def query_after_restart() -> dict[str, Any] | None:
         result = _joined_query_result(

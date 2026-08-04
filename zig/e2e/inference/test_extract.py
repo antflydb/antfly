@@ -27,7 +27,7 @@ def _has_reader_model(api) -> bool:
     if not readers:
         return False
 
-    model = next(iter(readers))
+    model = "antflydb/florence-2-base" if "antflydb/florence-2-base" in readers else next(iter(readers))
     resp = api.post(
         "/read",
         json={"model": model, "images": [{"url": TINY_PNG_URI}]},
@@ -54,7 +54,7 @@ def test_extract_basic(api):
     results = resp["data"]
     assert len(results) == 1
 
-    result = results[0]["structures"]
+    result = results[0]["results"]
     assert "person" in result
     assert isinstance(result["person"], list)
     if result["person"]:
@@ -95,7 +95,7 @@ def test_extract_include_confidence_and_spans(api):
         include_confidence=True,
         include_spans=True,
     )
-    person_instances = resp["data"][0]["structures"]["person"]
+    person_instances = resp["data"][0]["results"]["person"]
     if person_instances:
         for value in person_instances[0].values():
             values = value if isinstance(value, list) else [value]
@@ -128,8 +128,8 @@ def test_extract_from_images_via_reader(api):
     )
     results = resp["data"]
     assert len(results) == 1
-    assert "person" in results[0]["structures"]
-    assert isinstance(results[0]["structures"]["person"], list)
+    assert "person" in results[0]["results"]
+    assert isinstance(results[0]["results"]["person"], list)
 
 
 def test_extract_rejects_missing_texts_and_images(api):
@@ -138,14 +138,14 @@ def test_extract_rejects_missing_texts_and_images(api):
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "inputs": [],
-            "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
+            "texts": [],
+            "schema": {"person": ["name::str"]},
         },
     )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "inputs are required" in body["message"]
+    assert "exactly one of texts or images" in body["message"]
 
 
 def test_extract_rejects_both_texts_and_images(api):
@@ -155,14 +155,12 @@ def test_extract_rejects_both_texts_and_images(api):
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "inputs": [
-                {"content": "John Smith works at Google."},
-                {"content": {"type": "image_url", "image_url": {"url": test_image}}},
-            ],
-            "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
+            "texts": ["John Smith works at Google."],
+            "images": [{"url": test_image}],
+            "schema": {"person": ["name::str"]},
         },
     )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "inputs must be all text or all image content" in body["message"]
+    assert "exactly one of texts or images" in body["message"]

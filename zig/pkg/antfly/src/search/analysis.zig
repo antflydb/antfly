@@ -1424,10 +1424,22 @@ pub const search_as_you_type_3gram_analyzer = Analyzer{
     .filters = &.{ .lowercase, .{ .shingle = .{ .min = 3, .max = 3 } } },
 };
 
+pub const search_as_you_type_max_shingle_size: u8 = 3;
+pub const search_as_you_type_min_prefix_length: u8 = 2;
+pub const search_as_you_type_max_prefix_length: u8 = 20;
+
 /// Search-as-you-type prefix subfield: unicode_words → lowercase → shingle(1..3) → edge_ngram(min=2, max=20)
 pub const search_as_you_type_index_prefix_analyzer = Analyzer{
     .tokenizer = .unicode_words,
-    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 1, .max = 3 } }, .{ .edge_ngram = .{ .min = 2, .max = 20 } } },
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 1, .max = search_as_you_type_max_shingle_size } }, .{ .edge_ngram = .{ .min = search_as_you_type_min_prefix_length, .max = search_as_you_type_max_prefix_length } } },
+};
+
+/// Materialized prefixes of terms produced by the default root analyzer.
+/// Unlike `_index_prefix`, this companion retains stop-word and stemming
+/// semantics and can therefore replace a root dictionary prefix expansion.
+pub const search_as_you_type_root_prefix_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{ .lowercase, .stop_words, .stemmer, .{ .edge_ngram = .{ .min = search_as_you_type_min_prefix_length, .max = search_as_you_type_max_prefix_length } } },
 };
 
 pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
@@ -1464,6 +1476,7 @@ pub fn builtinAnalyzerByName(name: []const u8) ?*const Analyzer {
     if (std.mem.eql(u8, name, "search_as_you_type_2gram")) return &search_as_you_type_2gram_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type_3gram")) return &search_as_you_type_3gram_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type_index_prefix")) return &search_as_you_type_index_prefix_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_root_prefix")) return &search_as_you_type_root_prefix_analyzer;
     if (std.mem.eql(u8, name, "german")) return &german_analyzer;
     if (std.mem.eql(u8, name, "french")) return &french_analyzer;
     if (std.mem.eql(u8, name, "spanish")) return &spanish_analyzer;
@@ -1957,6 +1970,20 @@ test "search_as_you_type analyzers" {
     defer Analyzer.freeTokens(alloc, phrase_prefixes);
     try expectTokenTerm(phrase_prefixes, "brown f");
     try expectTokenTerm(phrase_prefixes, "quick brown f");
+
+    const root_prefixes = try search_as_you_type_root_prefix_analyzer.analyze(alloc, "the happy catalogs");
+    defer Analyzer.freeTokens(alloc, root_prefixes);
+    try std.testing.expect(!hasTokenTerm(root_prefixes, "th"));
+    try expectTokenTerm(root_prefixes, "happi");
+    try expectTokenTerm(root_prefixes, "catalog");
+    try std.testing.expect(!hasTokenTerm(root_prefixes, "happy"));
+}
+
+fn hasTokenTerm(tokens: []const Token, expected: []const u8) bool {
+    for (tokens) |token| {
+        if (std.mem.eql(u8, token.term, expected)) return true;
+    }
+    return false;
 }
 
 test "german analyzer end-to-end" {

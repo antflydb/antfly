@@ -2935,7 +2935,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var split_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-split",
-        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\"}",
+        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\",\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/observe-split")).?;
     defer split_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), split_resp.status);
@@ -2944,7 +2944,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var merge_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-merge",
-        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7}",
+        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/observe-merge")).?;
     defer merge_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), merge_resp.status);
@@ -2953,7 +2953,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var execute_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true}",
+        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/execute")).?;
     defer execute_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), execute_resp.status);

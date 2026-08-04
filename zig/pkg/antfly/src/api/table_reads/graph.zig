@@ -109,6 +109,8 @@ pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
+        .execution_deadline_ns = distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .cancellation = req.cancellation,
     };
 }
 

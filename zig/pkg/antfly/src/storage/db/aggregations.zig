@@ -7143,7 +7143,7 @@ fn computeSignificantTermsAggregation(
     var background_doc_count: i64 = if (distributed_stats) |stats|
         @intCast(stats.global_doc_count)
     else if (snapshot) |snap|
-        @intCast(snap.global_doc_count)
+        @intCast(snap.liveDocCount())
     else
         0;
 

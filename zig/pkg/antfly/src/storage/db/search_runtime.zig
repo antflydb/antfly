@@ -56,8 +56,12 @@ const db_query_metrics = @import("query_metrics.zig");
 const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
+const dense_exact = @import("dense_exact.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
+const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
+const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
+const hbc_mod = @import("../hbc_adapter.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const vectorindex_mod = @import("antfly_vectorindex");
@@ -71,6 +75,16 @@ const applyGraphIntersection = db_query_graph.applyGraphIntersection;
 const AlgebraicIndex = @import("algebraic/index.zig").Index;
 const GraphNodeRef = @import("../../graph/node_admission.zig").NodeRef;
 const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
+
+var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+var test_match_all_ordinal_lookup_entered: std.atomic.Value(bool) = .init(false);
+var test_release_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+const PublishedDenseCatalogLookupTestHook = struct {
+    io: std.Io,
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+};
+var test_published_dense_catalog_lookup_hook: ?*PublishedDenseCatalogLookupTestHook = null;
 
 pub const Edge = graph_mod.Edge;
 pub const EdgeDirection = graph_mod.EdgeDirection;
@@ -134,6 +148,18 @@ pub const VisibilityRuntimeStats = struct {
 pub const ProfiledDenseSearchResult = db_query_search.ProfiledDenseSearchResult;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+
+fn tempPath(buf: []u8) [*:0]const u8 {
+    return TestHelpers.tempPath(buf);
+}
+
+fn cleanupTempDir(path: [*:0]const u8) void {
+    TestHelpers.cleanupTempDir(path);
+}
+
+fn monotonicTimeNs() u64 {
+    return platform_time.monotonicNs();
+}
 
 test "db search runtime query repair gate revalidates stale debt" {
     const alloc = std.testing.allocator;
@@ -2419,6 +2445,8 @@ pub fn Impl(comptime DB: type) type {
             defer self.core.unlockApplyShared();
 
             const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
             const text_snapshot = entry.persistent.acquireSnapshot();
             defer text_snapshot.release();
 
@@ -2484,6 +2512,8 @@ pub fn Impl(comptime DB: type) type {
             defer self.core.unlockApplyShared();
 
             const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
             const text_snapshot = entry.persistent.acquireSnapshot();
             defer text_snapshot.release();
 
@@ -2516,6 +2546,8 @@ pub fn Impl(comptime DB: type) type {
 
             const entry = self.core.textIndexEntry(index_name) orelse
                 return error.IndexNotFound;
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
             const text_snapshot = entry.persistent.acquireSnapshot();
             defer text_snapshot.release();
             return try text_snapshot.textTermStats(
@@ -2555,7 +2587,7 @@ pub fn Impl(comptime DB: type) type {
                 };
             }
             return .{
-                .global_doc_count = text_snapshot.global_doc_count,
+                .global_doc_count = text_snapshot.liveDocCount(),
                 .total_bytes = total_bytes,
                 .segments = segments,
                 .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
@@ -2583,25 +2615,10 @@ pub fn Impl(comptime DB: type) type {
             var generation_ns: u64 = 0;
             var lock_wait_ns: u64 = 0;
             var locked_search_ns: u64 = 0;
-            if (self.searchRuntimeCanUsePublishedDenseSearch(req)) {
-                const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-                const snapshot_req = try Self.searchRequestAtCurrentIdentityGeneration(self, req);
-                if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
-                const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-                const result = try Self.searchLockedWithExecutionContext(self, alloc, snapshot_req, exec_ctx);
-                if (bench_profile) {
-                    locked_search_ns = platform_time.monotonicNs() - search_start_ns;
-                    std.log.info(
-                        "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                        .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
-                    );
-                }
-                return result;
-            }
             const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            self.core.lockApplyShared();
+            const search_access = Self.beginDenseSearchAccess(self, req);
             if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
-            defer self.core.unlockApplyShared();
+            defer Self.endDenseSearchAccess(self, search_access);
             const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const snapshot_req = try Self.searchRequestAtCurrentIdentityGeneration(self, req);
             if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
@@ -2611,7 +2628,7 @@ pub fn Impl(comptime DB: type) type {
                 locked_search_ns = platform_time.monotonicNs() - search_start_ns;
                 std.log.info(
                     "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, search_access == .published },
                 );
             }
             return result;
@@ -4570,14 +4587,41 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
-            if (Self.canUsePublishedDenseSearch(self, req) and Self.beginPublishedDenseSearch(self)) {
-                defer Self.endPublishedDenseSearch(self);
-                return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
-            }
-            {
+            const search_access = Self.beginDenseSearchAccess(self, req);
+            defer Self.endDenseSearchAccess(self, search_access);
+            return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
+        }
+
+        const DenseSearchAccess = enum { published, apply_shared };
+
+        fn beginDenseSearchAccess(self: *DB, req: types.SearchRequest) DenseSearchAccess {
+            if (!Self.publishedDenseSearchRequestEligible(req) or !Self.beginPublishedDenseSearch(self)) {
                 self.core.lockApplyShared();
-                defer self.core.unlockApplyShared();
-                return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
+                return .apply_shared;
+            }
+            if (builtin.is_test) {
+                if (test_published_dense_catalog_lookup_hook) |hook| {
+                    hook.entered.set(hook.io);
+                    hook.release.waitUncancelable(hook.io);
+                }
+            }
+            const entry = Self.denseIndex(self, req.index_name) orelse {
+                self.core.lockApplyShared();
+                Self.endPublishedDenseSearch(self);
+                return .apply_shared;
+            };
+            if (entry.index.hasExternalVectorLoader()) {
+                self.core.lockApplyShared();
+                Self.endPublishedDenseSearch(self);
+                return .apply_shared;
+            }
+            return .published;
+        }
+
+        fn endDenseSearchAccess(self: *DB, access: DenseSearchAccess) void {
+            switch (access) {
+                .published => Self.endPublishedDenseSearch(self),
+                .apply_shared => self.core.unlockApplyShared(),
             }
         }
 
@@ -4603,17 +4647,67 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn beginPublishedDenseSearch(self: *DB) bool {
-            if (self.index_repair_barriers.load(.acquire) != 0) return false;
-            _ = self.published_dense_searches.fetchAdd(1, .acq_rel);
-            if (self.index_repair_barriers.load(.acquire) != 0) {
-                _ = self.published_dense_searches.fetchSub(1, .acq_rel);
-                return false;
+            var observed = self.published_dense_admission.load(.monotonic);
+            while (true) {
+                if (observed & DB.published_dense_catalog_closed != 0) return false;
+                if (observed & DB.published_dense_reader_mask == DB.published_dense_reader_mask) return false;
+                if (self.published_dense_admission.cmpxchgWeak(observed, observed + 1, .acquire, .monotonic)) |actual| {
+                    observed = actual;
+                    continue;
+                }
+                return true;
+            }
+        }
+
+        pub fn endPublishedDenseSearch(self: *DB) void {
+            const previous = self.published_dense_admission.fetchSub(1, .release);
+            std.debug.assert(previous & DB.published_dense_reader_mask != 0);
+        }
+
+        pub fn beginIndexCatalogBarrierUntil(self: *DB, deadline_ns: u64) bool {
+            const previous = self.published_dense_admission.fetchOr(DB.published_dense_catalog_closed, .acq_rel);
+            if (previous & DB.published_dense_catalog_closed != 0) return false;
+            var spins: usize = 0;
+            while (self.published_dense_admission.load(.acquire) & DB.published_dense_reader_mask != 0) : (spins += 1) {
+                if (platform_time.monotonicNs() >= deadline_ns) {
+                    const timed_out = self.published_dense_admission.fetchAnd(DB.published_dense_reader_mask, .release);
+                    std.debug.assert(timed_out & DB.published_dense_catalog_closed != 0);
+                    return false;
+                }
+                if (spins < 64) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
             }
             return true;
         }
 
-        pub fn endPublishedDenseSearch(self: *DB) void {
-            _ = self.published_dense_searches.fetchSub(1, .acq_rel);
+        pub fn endIndexCatalogBarrier(self: *DB) void {
+            const previous = self.published_dense_admission.fetchAnd(DB.published_dense_reader_mask, .release);
+            std.debug.assert(previous & DB.published_dense_catalog_closed != 0);
+            std.debug.assert(previous & DB.published_dense_reader_mask == 0);
+        }
+
+        pub fn publishedDenseSearchCount(self: *const DB) u32 {
+            return self.published_dense_admission.load(.acquire) & DB.published_dense_reader_mask;
+        }
+
+        pub fn indexCatalogBarrierActive(self: *const DB) bool {
+            return self.published_dense_admission.load(.acquire) & DB.published_dense_catalog_closed != 0;
+        }
+
+        pub fn lockApplyUntil(self: *DB, deadline_ns: u64) bool {
+            var spins: usize = 0;
+            while (!self.core.tryLockApplyExclusive()) : (spins += 1) {
+                if (monotonicTimeNs() >= deadline_ns) return false;
+                if (spins < 64) {
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch {};
+                }
+            }
+            return true;
+        }
+
+        pub fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
+            return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
         }
 
         pub fn relationalFilterGenerationCanUseCurrentRows(self: *DB, generation: ?u64) bool {
@@ -6581,7 +6675,7 @@ pub fn Impl(comptime DB: type) type {
             self: *DB,
             entry: *index_manager_mod.IndexManager.DenseIndex,
             req: vectorindex_mod.SearchRequest,
-        ) !vectorindex_mod.SearchResults {
+        ) !dense_exact.SearchOutcome {
             return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, req);
         }
 
@@ -7221,6 +7315,10 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!?doc_set.DocOrdinal {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (builtin.is_test and test_block_match_all_ordinal_lookup.load(.acquire)) {
+                test_match_all_ordinal_lookup_entered.store(true, .release);
+                while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.Thread.yield() catch {};
+            }
             return try self.searchRuntimeLookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
         }
 
@@ -7391,7 +7489,7 @@ pub fn Impl(comptime DB: type) type {
             ctx: ?*anyopaque,
             entry: *index_manager_mod.IndexManager.DenseIndex,
             req: vectorindex_mod.SearchRequest,
-        ) anyerror!vectorindex_mod.SearchResults {
+        ) anyerror!dense_exact.SearchOutcome {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             return try Self.exactDenseSearch(self, entry, req);
         }
@@ -7409,7 +7507,7 @@ pub fn Impl(comptime DB: type) type {
                 .scan_store_range = Self.scanStoreRangeCallback,
                 .scan_store_range_with_context = Self.scanStoreRangeWithContextCallback,
                 .is_expired_key = Self.isExpiredDocumentKeyCallback,
-                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
             }, options);
         }
 
@@ -7428,7 +7526,7 @@ pub fn Impl(comptime DB: type) type {
                 .scan_store_range = Self.scanStoreRangeCallback,
                 .scan_store_range_with_context = Self.scanStoreRangeWithContextCallback,
                 .is_expired_key = Self.isExpiredDocumentKeyCallback,
-                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
             }, options, consumer_ctx, consumer);
         }
 
@@ -7516,16 +7614,6 @@ pub fn Impl(comptime DB: type) type {
         ) anyerror!bool {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             return try Self.isExpiredDocumentKey(self, alloc, key);
-        }
-
-        fn lookupLiveDocOrdinalCallback(
-            ctx: ?*anyopaque,
-            alloc: Allocator,
-            doc_id: []const u8,
-            generation: ?u64,
-        ) anyerror!?doc_set.DocOrdinal {
-            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLookupLiveDocOrdinal(alloc, doc_id, generation);
         }
 
         fn loadStoredSearchDocumentCallback(
@@ -8104,6 +8192,283 @@ test "db search runtime reopen delete index persists across reopen" {
             .limit = 10,
         }));
     }
+}
+
+test "db delete full text index drains active merge before closing generation" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+    for (0..12) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .full_text,
+        });
+    }
+
+    text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
+    text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
+    text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
+    text_merge_runtime_mod.test_stop_entered.store(false, .release);
+    defer {
+        text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+        text_merge_runtime_mod.test_stop_entered.store(false, .release);
+    }
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+
+    var merge_started = false;
+    for (0..200_000) |_| {
+        if (text_merge_runtime_mod.test_task_begin_entered.load(.acquire)) {
+            merge_started = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!merge_started) return error.TestTimeout;
+
+    const Delete = struct {
+        db: *DB,
+        completed: std.atomic.Value(bool) = .init(false),
+        removed: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.removed = self.db.deleteIndex("ft_v1") catch |err| {
+                self.err = err;
+                self.completed.store(true, .release);
+                return;
+            };
+            self.completed.store(true, .release);
+        }
+    };
+    var deletion = Delete{ .db = &db };
+    var delete_thread = try std.Thread.spawn(.{}, Delete.run, .{&deletion});
+    var joined = false;
+    defer if (!joined) {
+        text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        delete_thread.join();
+    };
+
+    var stop_entered = false;
+    for (0..200_000) |_| {
+        if (text_merge_runtime_mod.test_stop_entered.load(.acquire)) {
+            stop_entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!stop_entered) return error.TestTimeout;
+
+    // The delete thread is now inside the maintenance stopper. It must wait
+    // for the task that borrowed the index generation rather than acknowledge
+    // removal and close storage underneath that task.
+    try std.testing.expect(!deletion.completed.load(.acquire));
+
+    text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+    delete_thread.join();
+    joined = true;
+    try std.testing.expect(deletion.err == null);
+    try std.testing.expect(deletion.removed);
+
+    const source_doc = (try db.get(alloc, "doc:0")) orelse return error.TestExpectedEqual;
+    defer alloc.free(source_doc);
+    try std.testing.expect(std.mem.indexOf(u8, source_doc, "common token") != null);
+    try std.testing.expectError(error.IndexNotFound, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "common" } },
+    }));
+}
+
+test "db structural mutation autonomously retries transient maintenance restart failures" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{ .enabled = true, .idle_interval_ms = 10_000, .error_interval_ms = 10_000 },
+        .sparse_compaction = .{ .enabled = true, .idle_interval_ms = 10_000, .error_interval_ms = 10_000 },
+    });
+    defer db.close();
+    const text_runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    const sparse_runtime = db.sparse_compaction_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(text_runtime.isStarted());
+    try std.testing.expect(sparse_runtime.isStarted());
+
+    // Inject only the first post-drain spawn in each runtime. The structural
+    // mutation remains successful, and the durable supervisor must restore
+    // both workers without another foreground mutation.
+    text_merge_runtime_mod.test_start_failures_remaining.store(1, .release);
+    sparse_compaction_runtime_mod.test_start_failures_remaining.store(1, .release);
+    defer {
+        text_merge_runtime_mod.test_start_failures_remaining.store(0, .release);
+        sparse_compaction_runtime_mod.test_start_failures_remaining.store(0, .release);
+    }
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+
+    var recovered = false;
+    for (0..500) |_| {
+        if (text_runtime.isStarted() and
+            sparse_runtime.isStarted() and
+            db.async_context.text_merge_restart_state.load(.acquire) == 0 and
+            db.async_context.sparse_compaction_restart_state.load(.acquire) == 0)
+        {
+            recovered = true;
+            break;
+        }
+        try db.async_context.io.?.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(recovered);
+    try std.testing.expectEqual(@as(u32, 0), text_merge_runtime_mod.test_start_failures_remaining.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), sparse_compaction_runtime_mod.test_start_failures_remaining.load(.acquire));
+}
+
+test "db post-delete filter reader does not deadlock behind queued cleanup writer" {
+    const DB = @import("mod.zig").DB;
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const doc_count: u32 = 40;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var initial = try DB.open(alloc, std.mem.span(path), .{});
+        defer initial.close();
+        try initial.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |write| alloc.free(@constCast(write.key));
+            writes.deinit(alloc);
+        }
+        for (0..doc_count) |i| try writes.append(alloc, .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .value = "{\"state\":\"published\",\"title\":\"catalog item\"}",
+        });
+        try initial.batch(.{ .writes = writes.items, .sync_level = .full_index });
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    {
+        var warm = try db.search(alloc, .{
+            .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+            .limit = doc_count,
+        });
+        defer warm.deinit();
+        try std.testing.expectEqual(doc_count, warm.total_hits);
+    }
+    try std.testing.expect(try db.deleteIndex("ft_v1"));
+
+    test_block_match_all_ordinal_lookup.store(true, .release);
+    test_match_all_ordinal_lookup_entered.store(false, .release);
+    test_release_match_all_ordinal_lookup.store(false, .release);
+    defer {
+        test_release_match_all_ordinal_lookup.store(true, .release);
+        test_block_match_all_ordinal_lookup.store(false, .release);
+        test_match_all_ordinal_lookup_entered.store(false, .release);
+    }
+
+    const Reader = struct {
+        db: *DB,
+        total_hits: u32 = 0,
+        completed: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(reader: *@This()) void {
+            var result = reader.db.search(std.heap.smp_allocator, .{
+                .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+                .limit = doc_count,
+            }) catch |err| {
+                reader.err = err;
+                reader.completed.store(true, .release);
+                return;
+            };
+            defer result.deinit();
+            reader.total_hits = result.total_hits;
+            reader.completed.store(true, .release);
+        }
+    };
+    var reader = Reader{ .db = &db };
+    var reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        test_release_match_all_ordinal_lookup.store(true, .release);
+        reader_thread.join();
+    };
+    var lookup_entered = false;
+    for (0..200_000) |_| {
+        if (test_match_all_ordinal_lookup_entered.load(.acquire)) {
+            lookup_entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!lookup_entered) return error.TestTimeout;
+
+    const Writer = struct {
+        db: *DB,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(writer: *@This()) void {
+            writer.db.core.lockApply();
+            writer.db.core.unlockApply();
+            writer.completed.store(true, .release);
+        }
+    };
+    var writer = Writer{ .db = &db };
+    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_joined = false;
+    defer if (!writer_joined) {
+        test_release_match_all_ordinal_lookup.store(true, .release);
+        writer_thread.join();
+    };
+
+    // Wait until a cleanup-style writer owns the reader gate and is blocked on
+    // the outer query lease. A recursive shared acquisition from the ordinal
+    // callback would now deadlock: it cannot cross the gate, while the writer
+    // cannot pass the lease held by that same query.
+    var writer_queued = false;
+    for (0..200_000) |_| {
+        if (!db.core.tryLockApplyShared()) {
+            writer_queued = true;
+            break;
+        }
+        db.core.unlockApplyShared();
+        std.Thread.yield() catch {};
+    }
+    if (!writer_queued) return error.TestTimeout;
+    try std.testing.expect(!reader.completed.load(.acquire));
+    try std.testing.expect(!writer.completed.load(.acquire));
+
+    test_release_match_all_ordinal_lookup.store(true, .release);
+    reader_thread.join();
+    reader_joined = true;
+    writer_thread.join();
+    writer_joined = true;
+    if (reader.err) |err| return err;
+    try std.testing.expectEqual(doc_count, reader.total_hits);
+    try std.testing.expect(writer.completed.load(.acquire));
 }
 
 test "db search runtime reopen delete index persists across reopen with durable lsm primary backend" {
@@ -8891,7 +9256,7 @@ test "db search runtime reopen updateRange constrains index backfill" {
     });
 
     const text_index = db.core.index_manager.textIndex("ft_range").?;
-    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().liveDocCount());
 }
 
 test "db search runtime projection lookup projects nested document fields" {
@@ -9147,7 +9512,7 @@ test "db search runtime full-text chunk consumer returns parent and chunk modes"
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
     try std.testing.expect(chunk_records.len > 0);
-    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().global_doc_count > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().liveDocCount() > 0);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",
@@ -9560,6 +9925,7 @@ test "db search runtime dense chunk consumer supports parent and parent_with_chu
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -14855,6 +15221,10 @@ test "db search runtime text schema search_as_you_type schema emits Elasticsearc
         \\          "description": {
         \\            "type": "string",
         \\            "x-antfly-types": ["text"]
+        \\          },
+        \\          "state": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["keyword"]
         \\          }
         \\        }
         \\      }
@@ -14877,10 +15247,12 @@ test "db search runtime text schema search_as_you_type schema emits Elasticsearc
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:1", .value = "{\"name\":\"Smartphone Apple iPhone\",\"description\":\"Latest iPhone model\"}" },
-            .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\"}" },
-            .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\"}" },
-            .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\"}" },
+            .{ .key = "doc:1", .value = "{\"name\":\"Smartphone Apple iPhone\",\"description\":\"Latest iPhone model\",\"state\":\"published\"}" },
+            .{ .key = "doc:2", .value = "{\"name\":\"Smart Television Samsung\",\"description\":\"High-definition smart TV\",\"state\":\"draft\"}" },
+            .{ .key = "doc:3", .value = "{\"name\":\"Smartwatch Fitbit\",\"description\":\"Fitness tracker\",\"state\":\"published\"}" },
+            .{ .key = "doc:4", .value = "{\"name\":\"Gaming Console PlayStation\",\"description\":\"Next-generation gaming console\",\"state\":\"published\"}" },
+            .{ .key = "doc:5", .value = "{\"name\":\"The Happy Catalog\",\"description\":\"Stop-word prefix coverage\",\"state\":\"published\"}" },
+            .{ .key = "doc:6", .value = "{\"name\":\"Happiness Catalog\",\"description\":\"Stemmed root coverage\",\"state\":\"published\"}" },
         },
         .sync_level = .full_index,
     });
@@ -14932,6 +15304,318 @@ test "db search runtime text schema search_as_you_type schema emits Elasticsearc
     defer bool_prefix_results.deinit();
     try std.testing.expectEqual(@as(u32, 1), bool_prefix_results.total_hits);
     try std.testing.expectEqualStrings("doc:1", bool_prefix_results.hits[0].id);
+
+    var filtered_bool_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "sm",
+            .fields = &multi_match_fields,
+        } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer filtered_bool_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 2), filtered_bool_prefix_results.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), filtered_bool_prefix_results.hits.len);
+
+    var stop_word_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "the",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer stop_word_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 1), stop_word_prefix_results.total_hits);
+    try std.testing.expectEqualStrings("doc:5", stop_word_prefix_results.hits[0].id);
+
+    var stemmed_prefix_results = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "happy",
+            .fields = &multi_match_fields,
+        } },
+        .limit = 10,
+    });
+    defer stemmed_prefix_results.deinit();
+    try std.testing.expectEqual(@as(u32, 2), stemmed_prefix_results.total_hits);
+}
+
+fn expectFilteredFullTextDeleteCliffProbe(
+    db: anytype,
+    alloc: Allocator,
+    expected_total: u32,
+    forbidden_id: ?[]const u8,
+) !void {
+    const fields = [_]types.TextMultiMatchField{.{ .field = "title" }};
+    var bool_prefix = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .multi_match_bool_prefix = .{
+            .query = "catalog item",
+            .fields = &fields,
+        } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer bool_prefix.deinit();
+    const expected_page_len: usize = @intCast(@min(expected_total, 10));
+    const expected_page_total: u32 = @intCast(expected_page_len);
+    try std.testing.expectEqual(expected_page_len, bool_prefix.hits.len);
+    switch (bool_prefix.total_hits_relation) {
+        .exact => try std.testing.expectEqual(expected_total, bool_prefix.total_hits),
+        .gte => {
+            try std.testing.expect(bool_prefix.total_hits >= expected_page_total);
+            try std.testing.expect(bool_prefix.total_hits <= expected_total);
+        },
+    }
+
+    var match = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 10,
+    });
+    defer match.deinit();
+    try std.testing.expectEqual(expected_page_len, match.hits.len);
+    switch (match.total_hits_relation) {
+        .exact => try std.testing.expectEqual(expected_total, match.total_hits),
+        .gte => {
+            try std.testing.expect(match.total_hits >= expected_page_total);
+            try std.testing.expect(match.total_hits <= expected_total);
+        },
+    }
+
+    if (forbidden_id) |deleted_id| {
+        for (bool_prefix.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
+        for (match.hits) |hit| try std.testing.expect(!std.mem.eql(u8, deleted_id, hit.id));
+
+        var deleted_term = try db.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .query = .{ .term = .{ .field = "title", .term = "00000" } },
+            .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+            .limit = 10,
+        });
+        defer deleted_term.deinit();
+        try std.testing.expectEqual(@as(u32, 0), deleted_term.total_hits);
+        try std.testing.expectEqual(@as(usize, 0), deleted_term.hits.len);
+    }
+}
+
+test "db one real delete keeps filtered full text on complement path across restart" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{
+        \\  "default_type": "product",
+        \\  "document_schemas": {
+        \\    "product": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": true,
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text","search_as_you_type"]},
+        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    // The reported release cliff starts between 5k and 10k documents. Keep
+    // this regression above the knee so a delete cannot silently switch large
+    // segments back to a full reconciliation/full-visibility scan.
+    const initial_count: usize = 10_000;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const writes = try alloc.alloc(types.BatchWrite, initial_count);
+        defer {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i}),
+                .value = try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"title\":\"Catalog item {d:0>5}\",\"state\":\"published\"}}",
+                    .{i},
+                ),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .full_index });
+
+        // Zero-mutation and phantom-delete controls retain identical results.
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, null);
+        try db.batch(.{ .deletes = &.{"doc:missing"}, .sync_level = .full_index });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, null);
+
+        // An insertion-only upsert changes the corpus without creating a text
+        // tombstone and must remain on the same fast query path.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:new",
+                .value = "{\"title\":\"Catalog item new\",\"state\":\"published\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count + 1, null);
+
+        const visibility_before_delete = db.snapshotVisibilityStats();
+        try db.batch(.{ .deletes = &.{"doc:00000"}, .sync_level = .full_index });
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, "doc:00000");
+        const visibility_after_delete = db.snapshotVisibilityStats();
+        try std.testing.expect(visibility_after_delete.mask_builds_total > visibility_before_delete.mask_builds_total);
+        try std.testing.expectEqual(visibility_before_delete.full_scan_fallbacks_total, visibility_after_delete.full_scan_fallbacks_total);
+        try std.testing.expectEqual(@as(u64, 1), visibility_after_delete.cache_entries);
+
+        // Repeated filtered queries reuse the small complement rather than
+        // probing every matching ordinal in the primary store.
+        try expectFilteredFullTextDeleteCliffProbe(&db, alloc, initial_count, "doc:00000");
+        const visibility_after_repeat = db.snapshotVisibilityStats();
+        try std.testing.expect(visibility_after_repeat.cache_hits_total > visibility_after_delete.cache_hits_total);
+    }
+
+    // The persisted deletion state reconstructs the complement on reopen;
+    // immutable segment BM25 statistics remain unchanged until merge.
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        try expectFilteredFullTextDeleteCliffProbe(&reopened, alloc, initial_count, "doc:00000");
+    }
+}
+
+fn expectHighFrequencyKeywordRecall(db: anytype, alloc: Allocator) !void {
+    var published = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .query = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"published\"}}",
+        .limit = 5_000,
+    });
+    defer published.deinit();
+    try std.testing.expectEqual(@as(u32, 4_237), published.total_hits);
+    try std.testing.expectEqual(@as(usize, 4_237), published.hits.len);
+
+    var draft = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .query = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .filter_query_json = "{\"term\":{\"state\":\"draft\"}}",
+        .limit = 5_000,
+    });
+    defer draft.deinit();
+    try std.testing.expectEqual(@as(u32, 763), draft.total_hits);
+    try std.testing.expectEqual(@as(usize, 763), draft.hits.len);
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .query = .{ .match = .{ .field = "title", .text = "catalog" } },
+        .limit = 5_000,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 5_000), unfiltered.total_hits);
+    try std.testing.expectEqual(@as(usize, 5_000), unfiltered.hits.len);
+}
+
+test "db production ingest preserves high-frequency keyword recall across clean restarts" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{
+        \\  "default_type": "product",
+        \\  "document_schemas": {
+        \\    "product": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": true,
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text"]},
+        \\          "state": {"type":"string","x-antfly-types":["keyword"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{
+            .name = "full_text_index_v0",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        // Production fixture loading reaches the table in many API-sized
+        // batches, not as one already-materialized segment. Exercise segment
+        // publication/merge state throughout the high-frequency transition.
+        const batch_size = 100;
+        var batch_start: usize = 0;
+        while (batch_start < 5_000) : (batch_start += batch_size) {
+            const batch_len = @min(batch_size, 5_000 - batch_start);
+            const writes = try alloc.alloc(types.BatchWrite, batch_len);
+            defer {
+                for (writes) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                alloc.free(writes);
+            }
+            for (writes, 0..) |*write, offset| {
+                const i = batch_start + offset;
+                const state = if (i < 4_237) "published" else "draft";
+                write.* = .{
+                    .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                    .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"Catalog document {d}\",\"state\":\"{s}\"}}", .{ i, state }),
+                };
+            }
+            try db.batch(.{ .writes = writes, .sync_level = .full_index });
+        }
+        try expectHighFrequencyKeywordRecall(&db, alloc);
+    }
+
+    // Exercise the same catalog/schema/index reload used by a clean service
+    // restart. No re-upsert or write-side repair is allowed between checks.
+    for (0..2) |_| {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        try expectHighFrequencyKeywordRecall(&reopened, alloc);
+    }
 }
 
 test "db search runtime text schema versioned full text indexes reload matching schema mappings after reopen" {
@@ -16483,6 +17167,211 @@ test "db search runtime identity sparse hits resolve doc ordinals through identi
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
 }
 
+test "db index catalog barrier disables published dense fast path" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    db.endPublishedDenseSearch();
+
+    try std.testing.expect(db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
+    defer db.endIndexCatalogBarrier();
+    // A competing writer must not acquire ownership or clear the first
+    // writer's closed bit.
+    try std.testing.expect(!db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
+    try std.testing.expect(!db.beginPublishedDenseSearch());
+}
+
+test "db index catalog barrier and apply acquisition honor activation deadline" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    try std.testing.expect(!db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_ms));
+    try std.testing.expect(!db.indexCatalogBarrierActive());
+    try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    db.endPublishedDenseSearch();
+    db.endPublishedDenseSearch();
+
+    db.core.lockApplyExclusive();
+    defer db.core.unlockApplyExclusive();
+    try std.testing.expect(!db.lockApplyUntil(monotonicTimeNs() + std.time.ns_per_ms));
+}
+
+test "db published dense admission cannot overflow into catalog closure" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    db.published_dense_admission.store(DB.published_dense_reader_mask - 1, .monotonic);
+    defer db.published_dense_admission.store(0, .monotonic);
+
+    try std.testing.expect(db.beginPublishedDenseSearch());
+    try std.testing.expectEqual(DB.published_dense_reader_mask, db.published_dense_admission.load(.monotonic));
+    try std.testing.expect(!db.beginPublishedDenseSearch());
+    try std.testing.expectEqual(DB.published_dense_reader_mask, db.published_dense_admission.load(.monotonic));
+}
+
+test "db dense fast path registers before catalog lookup during index deletion" {
+    const DB = @import("mod.zig").DB;
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const wait_timeout_ns = 5 * std.time.ns_per_s;
+    const EventWaiter = struct {
+        fn wait(runtime_io: std.Io, event: *std.Io.Event, timeout_ns: u64) !void {
+            const deadline_ns = monotonicTimeNs() +| timeout_ns;
+            while (!event.isSet()) {
+                const now_ns = monotonicTimeNs();
+                if (now_ns >= deadline_ns) return error.TestTimeout;
+                event.waitTimeout(runtime_io, .{ .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(@as(i96, deadline_ns - now_ns)),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    // Event waits permit spurious wakeups. Preserve the single
+                    // absolute deadline rather than treating one as a failure.
+                    error.Timeout => continue,
+                    error.Canceled => return error.Canceled,
+                };
+            }
+        }
+    };
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    // Keep this fixture limited to the catalog-admission race under test.
+    // Autonomous index and maintenance workers can legitimately retire an
+    // empty index before the hook is reached, turning this into an unrelated
+    // and intermittent IndexNotFound test failure.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var lookup_hook = PublishedDenseCatalogLookupTestHook{ .io = io };
+    test_published_dense_catalog_lookup_hook = &lookup_hook;
+    defer {
+        lookup_hook.release.set(io);
+        test_published_dense_catalog_lookup_hook = null;
+    }
+
+    const Searcher = struct {
+        db: *DB,
+        io: std.Io,
+        completed: std.Io.Event = .unset,
+        total_hits: u32 = 0,
+        err: ?anyerror = null,
+
+        fn run(searcher: *@This()) void {
+            defer searcher.completed.set(searcher.io);
+            var result = searcher.db.search(std.heap.smp_allocator, .{
+                .index_name = "dv_v1",
+                .limit = 1,
+                .include_stored = false,
+                .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+            }) catch |err| {
+                searcher.err = err;
+                return;
+            };
+            defer result.deinit();
+            searcher.total_hits = result.total_hits;
+        }
+    };
+    var searcher = Searcher{ .db = &db, .io = io };
+    var search_future = try io.concurrent(Searcher.run, .{&searcher});
+    var search_pending = true;
+    defer if (search_pending) {
+        lookup_hook.release.set(io);
+        EventWaiter.wait(io, &searcher.completed, wait_timeout_ns) catch @panic("dense catalog lookup test search did not stop");
+        _ = search_future.await(io);
+    };
+
+    try EventWaiter.wait(io, &lookup_hook.entered, wait_timeout_ns);
+    try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+
+    const Deleter = struct {
+        db: *DB,
+        io: std.Io,
+        completed: std.Io.Event = .unset,
+        removed: bool = false,
+        err: ?anyerror = null,
+
+        fn run(deleter: *@This()) void {
+            defer deleter.completed.set(deleter.io);
+            deleter.removed = deleter.db.deleteIndex("dv_v1") catch |err| {
+                deleter.err = err;
+                return;
+            };
+        }
+    };
+    var deleter = Deleter{ .db = &db, .io = io };
+    var delete_future = try io.concurrent(Deleter.run, .{&deleter});
+    var delete_pending = true;
+    defer if (delete_pending) {
+        lookup_hook.release.set(io);
+        EventWaiter.wait(io, &deleter.completed, wait_timeout_ns) catch @panic("dense catalog lookup test deletion did not stop");
+        _ = delete_future.await(io);
+    };
+
+    var barrier_entered = false;
+    const barrier_deadline_ns = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (monotonicTimeNs() < barrier_deadline_ns) {
+        if (db.indexCatalogBarrierActive()) {
+            barrier_entered = true;
+            break;
+        }
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!barrier_entered) return error.TestTimeout;
+    // The deletion must wait for the already-registered lookup rather than
+    // moving or freeing the dense entry underneath it.
+    try std.testing.expect(!searcher.completed.isSet());
+    try std.testing.expect(!deleter.completed.isSet());
+
+    lookup_hook.release.set(io);
+    try EventWaiter.wait(io, &searcher.completed, wait_timeout_ns);
+    try EventWaiter.wait(io, &deleter.completed, wait_timeout_ns);
+    _ = search_future.await(io);
+    search_pending = false;
+    _ = delete_future.await(io);
+    delete_pending = false;
+
+    if (searcher.err) |err| return err;
+    if (deleter.err) |err| return err;
+    try std.testing.expectEqual(@as(u32, 0), searcher.total_hits);
+    try std.testing.expect(deleter.removed);
+    try std.testing.expect(!db.hasIndex("dv_v1"));
+}
+
 test "db search runtime identity dense index stores stable vector ids with ordinal filter mappings" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -16969,6 +17858,161 @@ test "db dense default dynamic one percent filters exact score top one hundred" 
     }
 }
 
+test "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const default_schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, default_schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    const doc_count: usize = 10_000;
+    // Reproduce the campaign's 0.2% selectivity cell. The public page still
+    // asks for top-100, while native planning must score only the 20 eligible
+    // vectors and return exact ordering instead of traversing filtered ANN.
+    const eligible_count: usize = 20;
+    const writes = try alloc.alloc(types.BatchWrite, doc_count);
+    defer {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i}),
+            .value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"id\":{d},\"bucket\":\"{s}\",\"embedding\":[{d},0]}}",
+                .{ i, if (i >= doc_count - eligible_count) "selected" else "other", i },
+            ),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .full_index,
+    });
+
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
+    };
+    var vector_load_counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&vector_load_counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    const cases = [_]struct {
+        filter_query_json: []const u8,
+        exclusion_query_json: []const u8 = "",
+        filter_prefix: []const u8 = "",
+        expected_candidates: usize = eligible_count,
+        expected_scored: usize = eligible_count,
+        expected_route: []const u8 = "exact_native_filter",
+        expected_route_reason: []const u8 = "candidate_count_within_budget",
+    }{
+        .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
+        .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
+        // Prefix metadata is resolved before vector IO. Only the ten matching
+        // candidates should incur a distance evaluation.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .filter_prefix = "doc:0999",
+            .expected_scored = 10,
+        },
+        // Exercise a highly selective positive filter together with a large,
+        // disjoint native exclusion set. Exact scoring must subtract the two
+        // ordered sets linearly instead of probing every exclusion for every
+        // candidate.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
+        },
+        // Overlap half of the positive set while retaining the same large
+        // exclusion range. Telemetry must report actual distance evaluations,
+        // not the pre-exclusion planner cardinality.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9989,\"inclusive_max\":true}}",
+            .expected_scored = 10,
+        },
+        // A completely excluded native filter is authoritative and should
+        // return immediately without entering either exact scoring or ANN.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
+            .expected_scored = 0,
+            .expected_route = "empty_result",
+            .expected_route_reason = "empty_native_filter",
+        },
+        // The positive set alone exceeds the exact-scoring budget, but the
+        // ordered exclusion leaves only 20 effective candidates. Route on the
+        // allocation-free set-difference cardinality instead of falling back
+        // to filtered ANN for this highly selective result.
+        .{
+            .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":6000,\"inclusive_min\":true}}",
+            .exclusion_query_json = "{\"numeric_range\":{\"field\":\"id\",\"max\":9979,\"inclusive_max\":true}}",
+            .expected_candidates = 4000,
+        },
+    };
+    var expected_vector_loads: usize = 0;
+    for (cases) |case| {
+        var profiled = try db.searchDenseProfiled(alloc, .{
+            .index_name = "dv_v1",
+            .primary_text_index_name = "ft_v1",
+            .limit = 100,
+            .include_stored = false,
+            .filter_prefix = case.filter_prefix,
+            .filter_query_json = case.filter_query_json,
+            .exclusion_query_json = case.exclusion_query_json,
+        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });
+        defer profiled.result.deinit();
+
+        expected_vector_loads += case.expected_scored;
+        try std.testing.expectEqual(@as(u32, @intCast(case.expected_scored)), profiled.result.total_hits);
+        try std.testing.expectEqual(case.expected_scored, profiled.result.hits.len);
+        try std.testing.expectEqual(@as(u64, @intCast(case.expected_candidates)), profiled.profile.native_filter_candidate_count);
+        try std.testing.expectEqual(@as(u64, @intCast(case.expected_scored)), profiled.profile.hbc_exact_vectors_scored);
+        try std.testing.expectEqualStrings(case.expected_route, profiled.profile.search_route);
+        try std.testing.expectEqualStrings(case.expected_route_reason, profiled.profile.route_reason);
+        try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
+        for (profiled.result.hits, 0..) |hit, rank| {
+            const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
+            defer alloc.free(expected);
+            try std.testing.expectEqualStrings(expected, hit.id);
+        }
+    }
+    try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
+}
+
 test "db exact sort resolves explicit keyword metadata filters natively" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -17396,6 +18440,7 @@ test "db search runtime identity non chunked search paths apply broad live doc f
     }
     db.identity_visibility_summary_cache = null;
     db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var dense_live = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -18025,7 +19070,6 @@ test "db search runtime dense lsm cache profile benchmark" {
     const DB = @import("mod.zig").DB;
     const profileBenchTestsEnabled = TestHelpers.profileBenchTestsEnabled;
     const cacheBlockHitsForBench = TestHelpers.cacheBlockHitsForBench;
-    const monotonicTimeNs = platform_time.monotonicNs;
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 

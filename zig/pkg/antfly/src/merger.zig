@@ -171,11 +171,20 @@ pub fn mergeSegments(
 
     var inputs = try alloc.alloc(segment_mod.MergeInput, segment_indices.len);
     defer alloc.free(inputs);
+    const deleted_docs = try alloc.alloc(?roaring.RoaringBitmap, segment_indices.len);
+    defer {
+        for (deleted_docs) |*maybe_deleted| {
+            if (maybe_deleted.*) |*deleted| deleted.deinit();
+        }
+        alloc.free(deleted_docs);
+    }
+    @memset(deleted_docs, null);
     for (segment_indices, 0..) |si, i| {
         const seg = &snap.segments[si];
+        deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = seg.shared.deleted,
+            .deleted = deleted_docs[i],
         };
     }
     const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(alloc, inputs);
@@ -200,14 +209,26 @@ pub fn mergeSegmentsBounded(
 
     var inputs = try alloc.alloc(segment_mod.MergeInput, segment_indices.len);
     defer alloc.free(inputs);
+    const owned_deleted_docs = try alloc.alloc(
+        ?roaring.RoaringBitmap,
+        if (options.deleted_docs == null) segment_indices.len else 0,
+    );
+    defer {
+        for (owned_deleted_docs) |*maybe_deleted| {
+            if (maybe_deleted.*) |*deleted| deleted.deinit();
+        }
+        alloc.free(owned_deleted_docs);
+    }
+    if (owned_deleted_docs.len > 0) @memset(owned_deleted_docs, null);
 
     var total_input_bytes: u64 = 0;
     for (segment_indices, 0..) |si, i| {
         const seg = &snap.segments[si];
         total_input_bytes += seg.data.bytes().len;
+        if (options.deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else seg.shared.deleted,
+            .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else owned_deleted_docs[i],
         };
     }
     const common_index_sort = if (options.index_sort.len == 0)
@@ -575,12 +596,13 @@ test "merge policy picks small segments and applyMerge replaces them" {
     defer alloc.free(infos);
 
     for (snap.segments, 0..) |seg, i| {
+        const deletion_summary = seg.deletionSummary();
         infos[i] = .{
             .index = i,
             .size = seg.data.bytes().len,
             .doc_count = seg.reader.doc_count,
-            .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-            .has_deletions = seg.shared.deleted != null,
+            .deleted_count = deletion_summary.count,
+            .has_deletions = deletion_summary.has_deletions,
         };
     }
 

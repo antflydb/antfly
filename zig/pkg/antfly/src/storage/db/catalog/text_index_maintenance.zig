@@ -128,12 +128,13 @@ fn buildSegmentInfosAlloc(
 ) ![]merger_mod.SegmentInfo {
     const infos = try alloc.alloc(merger_mod.SegmentInfo, snap.segments.len);
     for (snap.segments, 0..) |seg, i| {
+        const deletion_summary = seg.deletionSummary();
         infos[i] = .{
             .index = i,
             .size = seg.data.bytes().len,
             .doc_count = seg.reader.doc_count,
-            .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-            .has_deletions = seg.shared.deleted != null,
+            .deleted_count = deletion_summary.count,
+            .has_deletions = deletion_summary.has_deletions,
         };
     }
     return infos;

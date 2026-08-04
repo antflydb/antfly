@@ -1685,7 +1685,7 @@ test "public table batch handler rejects unsupported missing-document transform 
 
     var backend = Backend{};
     var resp = try handleTableBatch(std.testing.allocator, "docs",
-        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$push","path":"tags","value":"new"}]}]}
+        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$pull","path":"tags","value":"new"}]}]}
     , backend.iface());
     defer resp.deinit(std.testing.allocator);
 

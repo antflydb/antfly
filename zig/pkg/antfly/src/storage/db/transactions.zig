@@ -106,6 +106,9 @@ pub fn Impl(comptime DB: type) type {
         pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
             var effective_ops = try self.coalesceKeyValueRequest(types.TransactionWrite, req.writes, req.deletes, req.transforms);
             defer effective_ops.deinit(self.alloc);
+            // Transaction intents currently carry primary rows only. Reject
+            // graph projection deltas so a transform cannot be half-committed.
+            if (effective_ops.graph_writes.items.len != 0) return error.UnsupportedTransformOperation;
             try validateForeignKeyConstraintTimingOverrides(self, req.foreign_key_constraint_timing_overrides);
             if (req.foreign_key_externalized_parent_checks.len > 0) {
                 try validateExternalizedForeignKeyParentChecks(self, req.foreign_key_externalized_parent_checks, req.foreign_key_constraint_timing_overrides, effective_ops.writes);

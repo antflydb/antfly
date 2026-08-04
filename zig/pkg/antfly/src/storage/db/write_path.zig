@@ -48,6 +48,7 @@ else
     @import("antfly_scraping");
 const internal_keys = @import("../internal_keys.zig");
 const introducer_mod = @import("../../introducer.zig");
+const graph_mod = @import("../../graph/graph.zig");
 const relational_store_mod = @import("relational_store.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const range_state_mod = @import("range_state.zig");
@@ -74,6 +75,14 @@ const containsStoreWriteKey = db_internal.containsStoreWriteKey;
 const filterChangedGraphMaterializationBatch = db_internal.filterChangedGraphMaterializationBatch;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+
+fn tempPath(buf: []u8) [*:0]const u8 {
+    return TestHelpers.tempPath(buf);
+}
+
+fn cleanupTempDir(path: [*:0]const u8) void {
+    TestHelpers.cleanupTempDir(path);
+}
 
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
@@ -4453,6 +4462,112 @@ test "db write path transform keeps delete when same-batch transform targets del
     try std.testing.expect((try db.get(alloc, "doc:delete_transform")) == null);
 }
 
+test "db graph push transform appends projected edge across restart" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\",\"weight\":2,\"metadata\":{\"since\":2024}}]}}}" },
+                .{ .key = "b", .value = "{\"title\":\"B\"}" },
+                .{ .key = "c", .value = "{\"title\":\"C\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        try db.batch(.{
+            .transforms = &.{.{
+                .key = "a",
+                .operations = &.{
+                    .{ .op = .push, .path = "$._edges.graph.FRIEND", .value_json = "{\"target\":\"c\",\"weight\":3}" },
+                    .{ .op = .set, .path = "title", .value_json = "\"A updated\"" },
+                },
+            }},
+            .sync_level = .full_index,
+        });
+
+        const stored = (try db.get(alloc, "a")) orelse return error.TestExpectedEqual;
+        defer alloc.free(stored);
+        try std.testing.expect(std.mem.indexOf(u8, stored, "A updated") != null);
+
+        const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+        var saw_b = false;
+        var saw_c = false;
+        for (edges) |edge| {
+            if (std.mem.eql(u8, edge.target, "b")) {
+                saw_b = true;
+                try std.testing.expectEqual(@as(f64, 2), edge.weight);
+                try std.testing.expect(std.mem.indexOf(u8, edge.metadata, "2024") != null);
+            }
+            if (std.mem.eql(u8, edge.target, "c")) {
+                saw_c = true;
+                try std.testing.expectEqual(@as(f64, 3), edge.weight);
+            }
+        }
+        try std.testing.expect(saw_b and saw_c);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 2), reopened_edges.len);
+}
+
+test "db graph transforms fail closed for replacement operations" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\"}]}}}" }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectError(error.UnsupportedTransformOperation, db.batch(.{
+        .transforms = &.{.{
+            .key = "a",
+            .operations = &.{.{ .op = .set, .path = "$._edges.graph.FRIEND", .value_json = "[]" }},
+        }},
+        .sync_level = .full_index,
+    }));
+
+    // Validation is state-independent: an invalid projected edge cannot be
+    // acknowledged as a no-op just because its source document is absent.
+    try std.testing.expectError(error.InvalidGraphEdges, db.batch(.{
+        .transforms = &.{.{
+            .key = "missing",
+            .operations = &.{.{ .op = .push, .path = "$._edges.graph.FRIEND", .value_json = "{\"weight\":2}" }},
+        }},
+        .sync_level = .full_index,
+    }));
+
+    const edges = try db.getEdges(alloc, "graph", "a", "FRIEND", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("b", edges[0].target);
+}
+
 test "db write path transform relational batch keeps delete when same-batch transform targets deleted key" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -8342,6 +8457,7 @@ pub fn CoalescedKeyValueRequest(comptime T: type) type {
         entries: []Entry = &.{},
         writes: []T = &.{},
         deletes: [][]const u8 = &.{},
+        graph_writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.entries) |entry| {
@@ -8351,6 +8467,8 @@ pub fn CoalescedKeyValueRequest(comptime T: type) type {
             if (self.entries.len > 0) alloc.free(self.entries);
             if (self.writes.len > 0) alloc.free(self.writes);
             if (self.deletes.len > 0) alloc.free(self.deletes);
+            for (self.graph_writes.items) |*write| deinitOwnedGraphEdgeWrite(alloc, write);
+            self.graph_writes.deinit(alloc);
             self.* = .{};
         }
     };
@@ -8395,6 +8513,62 @@ const BulkIngestRequestView = struct {
         if (self.deletes.len > 0) alloc.free(self.deletes);
     }
 };
+
+fn deinitOwnedGraphEdgeWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
+    alloc.free(@constCast(write.index_name));
+    alloc.free(@constCast(write.source));
+    alloc.free(@constCast(write.target));
+    alloc.free(@constCast(write.edge_type));
+    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    write.* = undefined;
+}
+
+fn appendGraphTransformWrite(
+    self: anytype,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    source: []const u8,
+    path: transform_mod.GraphProjectionPath,
+    value_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGraphEdges;
+
+    const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
+    if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
+
+    const weight: f64 = if (parsed.value.object.get("weight")) |value| switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |number| try std.fmt.parseFloat(f64, number),
+        else => return error.InvalidGraphEdges,
+    } else 1.0;
+    if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
+
+    const metadata_json: []const u8 = if (parsed.value.object.get("metadata")) |metadata|
+        try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
+    else
+        "";
+    errdefer if (metadata_json.len > 0) self.alloc.free(@constCast(metadata_json));
+
+    const index_name = try self.alloc.dupe(u8, path.index_name);
+    errdefer self.alloc.free(index_name);
+    const owned_source = try self.alloc.dupe(u8, source);
+    errdefer self.alloc.free(owned_source);
+    const target = try self.alloc.dupe(u8, target_value.string);
+    errdefer self.alloc.free(target);
+    const edge_type = try self.alloc.dupe(u8, path.edge_type);
+    errdefer self.alloc.free(edge_type);
+
+    try writes.append(self.alloc, .{
+        .index_name = index_name,
+        .source = owned_source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = weight,
+        .metadata_json = metadata_json,
+    });
+}
 
 pub fn BulkIngestCoalescer(comptime DB: type) type {
     return struct {
@@ -10529,11 +10703,23 @@ pub fn Impl(comptime DB: type) type {
 
             const merge_effective_req_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
 
+            var owned_effective_graph_writes: ?[]types.GraphEdgeWrite = null;
+            defer if (owned_effective_graph_writes) |owned| self.alloc.free(owned);
+            const effective_graph_writes = if (effective_ops.graph_writes.items.len == 0)
+                req.graph_writes
+            else blk: {
+                const combined = try self.alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
+                @memcpy(combined[0..req.graph_writes.len], req.graph_writes);
+                @memcpy(combined[req.graph_writes.len..], effective_ops.graph_writes.items);
+                owned_effective_graph_writes = combined;
+                break :blk combined;
+            };
+
             const effective_req: types.BatchRequest = .{
                 .writes = effective_ops.writes,
                 .deletes = effective_ops.deletes,
                 .relational_identity_rewrites = req.relational_identity_rewrites,
-                .graph_writes = req.graph_writes,
+                .graph_writes = effective_graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .transforms = &.{},
                 .predicates = req.predicates,
@@ -11784,13 +11970,16 @@ pub fn Impl(comptime DB: type) type {
         ) !CoalescedKeyValueRequest(T) {
             var result = CoalescedKeyValueRequest(T){};
             var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
+            defer order.deinit(self.alloc);
+            var entries_transferred = false;
             errdefer {
-                result.entries = order.items;
-                order.items = &.{};
-                order.capacity = 0;
+                if (!entries_transferred) {
+                    result.entries = order.items;
+                    order.items = &.{};
+                    order.capacity = 0;
+                }
                 result.deinit(self.alloc);
             }
-            defer order.deinit(self.alloc);
 
             var positions = std.StringHashMapUnmanaged(usize){};
             defer positions.deinit(self.alloc);
@@ -11841,30 +12030,71 @@ pub fn Impl(comptime DB: type) type {
                     if (base_json) |body| self.alloc.free(body);
                 };
 
-                const resolved = try transform_mod.resolveDocumentTransform(self.alloc, base_json, transform) orelse {
-                    if (maybe_index == null) continue;
-                    const entry = order.items[maybe_index.?];
-                    if (entry.kind == .delete) continue;
-                    continue;
+                var document_operations = std.ArrayListUnmanaged(types.TransformOp).empty;
+                defer document_operations.deinit(self.alloc);
+                var graph_operations = std.ArrayListUnmanaged(struct {
+                    path: transform_mod.GraphProjectionPath,
+                    value_json: []const u8,
+                }).empty;
+                defer graph_operations.deinit(self.alloc);
+                for (transform.operations) |operation| {
+                    const graph_path = try transform_mod.graphProjectionPath(operation.path);
+                    if (graph_path) |path| {
+                        switch (operation.op) {
+                            .push, .add_to_set => {},
+                            else => return error.UnsupportedTransformOperation,
+                        }
+                        try graph_operations.append(self.alloc, .{
+                            .path = path,
+                            .value_json = operation.value_json orelse return error.InvalidArgument,
+                        });
+                    } else {
+                        try document_operations.append(self.alloc, operation);
+                    }
+                }
+
+                const graph_writes_start = result.graph_writes.items.len;
+                for (graph_operations.items) |operation| {
+                    try appendGraphTransformWrite(self, &result.graph_writes, transform.key, operation.path, operation.value_json);
+                }
+
+                const document_transform: types.DocumentTransform = .{
+                    .key = transform.key,
+                    .operations = document_operations.items,
+                    .upsert = transform.upsert,
                 };
-                errdefer self.alloc.free(resolved);
+                if (base_json == null and !transform.upsert) {
+                    try transform_mod.validateDocumentTransform(self.alloc, document_transform);
+                    for (result.graph_writes.items[graph_writes_start..]) |*write| {
+                        deinitOwnedGraphEdgeWrite(self.alloc, write);
+                    }
+                    result.graph_writes.shrinkRetainingCapacity(graph_writes_start);
+                    continue;
+                }
+
+                const resolved = try transform_mod.resolveDocumentTransform(self.alloc, base_json, document_transform);
+                const resolved_document = resolved orelse continue;
+                var resolved_document_owned = true;
+                defer if (resolved_document_owned) self.alloc.free(resolved_document);
 
                 const gop = try positions.getOrPut(self.alloc, transform.key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = order.items.len;
                     try order.append(self.alloc, .{
                         .key = try self.alloc.dupe(u8, transform.key),
-                        .value = resolved,
+                        .value = resolved_document,
                         .kind = .write,
                         .owned_key = true,
                         .owned_value = true,
                     });
+                    resolved_document_owned = false;
                     continue;
                 }
 
                 const entry = &order.items[gop.value_ptr.*];
                 if (entry.owned_value) self.alloc.free(@constCast(entry.value.?));
-                try setCoalescedEntryToOwnedWrite(T, self.alloc, entry, transform.key, resolved);
+                try setCoalescedEntryToOwnedWrite(T, self.alloc, entry, transform.key, resolved_document);
+                resolved_document_owned = false;
             }
 
             var write_count: usize = 0;
@@ -11878,6 +12108,7 @@ pub fn Impl(comptime DB: type) type {
 
             const final_entries = try order.toOwnedSlice(self.alloc);
             result.entries = final_entries;
+            entries_transferred = true;
             if (write_count > 0) result.writes = try self.alloc.alloc(T, write_count);
             if (delete_count > 0) result.deletes = try self.alloc.alloc([]const u8, delete_count);
 

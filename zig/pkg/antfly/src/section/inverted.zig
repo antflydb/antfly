@@ -2224,6 +2224,14 @@ pub const InvertedIndexReader = struct {
         return decodeNormValue(self.norms_data, doc_id);
     }
 
+    /// Decoded BM25 field length for one document. The value uses the same
+    /// norm representation as scoring, so deletion-adjusted aggregate stats
+    /// remain consistent with the lengths consumed by the scorer.
+    pub fn docLength(self: *const InvertedIndexReader, doc_id: u32) u32 {
+        if (doc_id >= self.doc_count) return 0;
+        return self.normForDoc(doc_id);
+    }
+
     /// Average document length for BM25.
     pub fn avgDocLen(self: *const InvertedIndexReader) f32 {
         if (self.doc_count == 0) return 0;
@@ -2687,6 +2695,16 @@ pub const TermIterator = struct {
     pub const Entry = struct { term: []const u8, result: LookupResult };
 
     pub fn next(self: *TermIterator) !?Entry {
+        return self.nextInternal(false, null);
+    }
+
+    /// Diagnostic iterator path. The normal next() instantiation contains no
+    /// counter update or conditional branch in its term-decoding hot loop.
+    pub fn nextWithDecodedCount(self: *TermIterator, decoded_count: *u64) !?Entry {
+        return self.nextInternal(true, decoded_count);
+    }
+
+    fn nextInternal(self: *TermIterator, comptime track_decoded: bool, decoded_count: ?*u64) !?Entry {
         while (true) {
             if (self.current_block_remaining == 0) {
                 if (!try self.loadNextBlock()) return null;
@@ -2700,6 +2718,7 @@ pub const TermIterator = struct {
             self.current_block_cursor += leaf_len;
             const value = decodeTermDictBlockValueDelta(readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData, &self.current_block_last_postings_offset);
             self.current_block_remaining -= 1;
+            if (comptime track_decoded) decoded_count.?.* += 1;
 
             self.current_key.shrinkRetainingCapacity(self.current_block_prefix.len + shared_len);
             try self.current_key.appendSlice(self.alloc, leaf);

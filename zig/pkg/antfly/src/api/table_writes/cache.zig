@@ -3103,10 +3103,8 @@ pub const ProvisionedTableWriteCache = struct {
         return if (stats.obsolete_paths_pinned_by_versions != 0) 1 else 0;
     }
 
-    fn leaseLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+    pub fn leaseLsmMaintenanceDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
             if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) return self.leaseEntryLocked(entry);
             }
@@ -3114,9 +3112,8 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
-    fn leasePrimaryLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+    pub fn leasePrimaryLsmMaintenanceDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
             if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                 if (delay_ns == 0) return self.leaseEntryLocked(entry);
             }
@@ -3168,8 +3165,6 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn nextLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
         var delay_ns: ?u64 = null;
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
             if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
                 delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
             }
@@ -3180,7 +3175,6 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn nextPrimaryLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
         var delay_ns: ?u64 = null;
         for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
             if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
                 delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
             }

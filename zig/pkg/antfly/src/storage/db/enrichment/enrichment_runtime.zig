@@ -11005,7 +11005,7 @@ test "db asset enrichment full_text_index feeds default full text index after fu
     const asset_value = try db.core.store.get(alloc, asset_key);
     defer alloc.free(asset_value);
     try std.testing.expect(std.mem.indexOf(u8, asset_value, "crimson sunset harbor") != null);
-    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().global_doc_count > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().liveDocCount() > 0);
 
     var results = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
@@ -13546,6 +13546,8 @@ test "db enrichment runtime chunked generated dense and sparse embeddings search
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
+    db.clearNonVisibleDocSetCache();
 
     var stale_sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",

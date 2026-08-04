@@ -557,6 +557,10 @@ jobs:
           fi
           exit "$status"
 
+      - name: Run corpus-scale release regressions
+        working-directory: zig
+        run: taskset -c ${{ steps.cpus.outputs.list }} zig build release-scale-test -j${{ steps.cpus.outputs.build_jobs }}
+
       - name: Set up Java for TLA+
         uses: actions/setup-java@v5
         with:
@@ -724,6 +728,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
+      # Keep production optimization while preserving runtime-safety checks and
+      # std.debug.assert invariants exercised by the full E2E suite.
+      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
     steps:
       - uses: actions/checkout@v6
         with:
@@ -811,7 +818,8 @@ jobs:
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
-          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
+          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: unsloth/Qwen3-1.7B-GGUF
+          ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
       - name: Report full E2E result

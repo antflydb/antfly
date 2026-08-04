@@ -24,6 +24,7 @@ const hbc_mod = @import("../hbc_adapter.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
+const persistent_mod = @import("../persistent.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const types = @import("types.zig");
@@ -1580,6 +1581,11 @@ test "db generation repair generated artifact cleanup retries beyond the transie
     });
     defer db.close();
     try db.addIndex(cfg);
+    const old_provenance = (try db.core.textIndexEntry(cfg.name).?.persistent.readGenerationMetadataAlloc(
+        alloc,
+        persistent_mod.text_projection_provenance_meta_key,
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_provenance);
 
     index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(12, .release);
     defer index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
@@ -1591,6 +1597,12 @@ test "db generation repair generated artifact cleanup retries beyond the transie
         index_manager_mod.test_generated_artifact_cleanup_failures_remaining.load(.acquire),
     );
     try db.addIndex(cfg);
+    const new_provenance = (try db.core.textIndexEntry(cfg.name).?.persistent.readGenerationMetadataAlloc(
+        alloc,
+        persistent_mod.text_projection_provenance_meta_key,
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(new_provenance);
+    try std.testing.expect(!std.mem.eql(u8, old_provenance, new_provenance));
 }
 
 test "db generation repair generated artifact finalization releases page arbitration and preserves admission fence" {

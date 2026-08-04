@@ -33,7 +33,6 @@ const addFilteredTestRunArtifactWithRuntimeFilters = antfly_tests_build.addFilte
 const addRuntimeTestFilters = antfly_tests_build.addRuntimeTestFilters;
 const chainLabeledRun = antfly_tests_build.chainLabeledRun;
 const chainLabeledRunStep = antfly_tests_build.chainLabeledRunStep;
-const compileFiltersWithAnchors = antfly_tests_build.compileFiltersWithAnchors;
 const configureEmbeddedModule = antfly_embedded_build.configureModule;
 const lmdb_c_flags = antfly_storage_build.lmdb_c_flags;
 const makeLmdbBuildOptions = antfly_storage_build.makeLmdbBuildOptions;
@@ -170,6 +169,16 @@ fn addLocalHttpxModule(
         .target = target,
         .optimize = optimize,
     });
+}
+
+fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {
+    const result = visited.getOrPut(module) catch @panic("OOM");
+    if (result.found_existing) return;
+
+    module.strip = true;
+    for (module.import_table.values()) |imported_module| {
+        setStripRecursively(imported_module, visited);
+    }
 }
 
 const AntflyRootImports = struct {
@@ -360,6 +369,7 @@ pub fn build(b: *std.Build) void {
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -1184,6 +1194,7 @@ pub fn build(b: *std.Build) void {
         .b = b,
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .lib_mod = lib_mod,
         .structlog_mod = structlog_mod,
     });
@@ -1700,6 +1711,17 @@ pub fn build(b: *std.Build) void {
         .usermgr = usermgr_mod,
         .template = template_test_mod,
     });
+    const httpx_transport_regression = antfly_tests_build.addModuleTestStep(
+        b,
+        httpx_mod,
+        "lib-httpx-transport-regression-test",
+        "Run focused HTTP transport response serialization regressions",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.httpx_transport_regression,
+            .simple_runner = true,
+        },
+    );
+    unit_test_step.dependOn(&httpx_transport_regression.run.step);
 
     const audio_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/audio_test_root.zig"),
@@ -1833,7 +1855,7 @@ pub fn build(b: *std.Build) void {
     if (include_ha_tests_in_aggregates) {
         unit_progress_tail = chainLabeledRun(b, storage_tests.ha.tests, "ha-test", unit_progress_tail);
     }
-    unit_progress_tail = chainLabeledRun(b, lib_db_test.tests, antfly_tests_build.db_root_step_name, unit_progress_tail);
+    unit_progress_tail = chainLabeledRunStep(b, lib_db_test.run, antfly_tests_build.db_root_step_name, unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, metadata_root_tests, "metadata-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft.transport", unit_progress_tail);
@@ -1934,6 +1956,45 @@ pub fn build(b: *std.Build) void {
 
     const db_storage_tests = antfly_tests_build.addDBStorageTestSteps(b, db_test_mod);
     sim_test_step.dependOn(&db_storage_tests.sim.step);
+
+    const release_blocker_regression_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = antfly_tests_build.compileFiltersWithAnchors(
+            b,
+            &antfly_tests_build.release_blocker_compile_anchors,
+            &antfly_tests_build.release_blocker_regression_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_release_blocker_regression_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        release_blocker_regression_tests,
+        &antfly_tests_build.release_blocker_regression_filters,
+    );
+    const release_blocker_regression_step = b.step(
+        "release-blocker-regression-test",
+        "Run selective ANN and post-delete full-text release-blocker regressions",
+    );
+    release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
+    unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
+
+    const release_scale_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &antfly_tests_build.release_scale_test_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_release_scale_tests = addFilteredTestRunArtifact(b, release_scale_tests);
+    const release_scale_test_step = b.step(
+        "release-scale-test",
+        "Run corpus-scale ANN and full-text release regressions",
+    );
+    release_scale_test_step.dependOn(&run_release_scale_tests.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
@@ -2072,6 +2133,11 @@ pub fn build(b: *std.Build) void {
         break :blk mod;
     };
 
+    if (strip) {
+        var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        defer visited.deinit();
+        setStripRecursively(antfly_main_mod, &visited);
+    }
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
         .root_module = antfly_main_mod,

@@ -84,6 +84,7 @@ MANIFEST_SCHEMA: dict[str, str] = {
     "manual_review_acknowledgements": "map_string",
     "generated_file_provenance": "map_list",
     "same_path_const_false_positives": "map_list",
+    "same_path_function_false_positives": "map_list",
     "same_path_const_aliases": "nested_map_list",
     "test_name_aliases": "map_list",
     "declaration_name_aliases": "map_list",

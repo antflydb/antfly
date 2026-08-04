@@ -463,6 +463,14 @@ fn clearSplitMetadataFromStore(alloc: Allocator, dest_store: *docstore_mod.DocSt
 
 fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docstore_mod.DocStore) !void {
     try deleteKeysWithPrefixFromStore(alloc, dest_store, "\x00\x00__metadata__:");
+    // Split destinations register and populate their index generations
+    // synchronously below. A physical LSM split also carries replay-namespace
+    // control rows, including a tombstone-shadowed admission marker from the
+    // source's history. Never let source-generation admission state quarantine
+    // an independently constructed destination generation.
+    const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+    defer alloc.free(admission_prefix);
+    try deleteKeysWithPrefixFromStore(alloc, dest_store, admission_prefix);
 }
 
 const SplitDestinationStorePlan = union(enum) {

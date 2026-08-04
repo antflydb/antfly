@@ -174,6 +174,7 @@ pub const QueryPlanningContext = struct {
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
+    query_cancellation: ?*const std.atomic.Value(bool) = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -259,6 +260,7 @@ pub fn planSemanticQuery(
         .antfly_provider = planning.antfly_provider,
         .io = planning.io,
         .deadline_ns = embedding_deadline_ns,
+        .cancellation = planning.query_cancellation,
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,

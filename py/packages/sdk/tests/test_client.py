@@ -171,6 +171,8 @@ class TestAntflyClient:
             "SET_ON_INSERT": "$setOnInsert",
             "UNSET": "$unset",
             "INC": "$inc",
+            "PUSH": "$push",
+            "PULL": "$pull",
             "ADD_TO_SET": "$addToSet",
             "MAX": "$max",
         }

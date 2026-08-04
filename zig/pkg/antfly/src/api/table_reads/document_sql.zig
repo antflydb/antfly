@@ -306,6 +306,9 @@ pub fn aggregationFullResultBudget() u32 {
 }
 
 pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    if (req.cancellation) |value| {
+        if (value.load(.acquire)) return error.Cancelled;
+    }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
