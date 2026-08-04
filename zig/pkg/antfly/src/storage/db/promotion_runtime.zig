@@ -203,6 +203,15 @@ fn processRecordKeysMaybeSink(
 }
 
 pub const default_max_records_per_window: usize = 1024;
+/// Leadership is exposed as a live predicate, not an event source. Keep a
+/// bounded retry while promotion is pending so a follower that becomes leader
+/// cannot strand an already-observed target behind a missed condition wake.
+const blocked_retry_min_interval_ms: i64 = 50;
+const blocked_retry_max_interval_ms: i64 = 1000;
+
+fn nextBlockedRetryIntervalMs(current_ms: i64) i64 {
+    return @min(current_ms *| 2, blocked_retry_max_interval_ms);
+}
 
 const CatchUpWindowResult = struct {
     max_seen: u64,
@@ -428,7 +437,7 @@ pub const PromotionRuntime = struct {
         _ = self.worker_wake_generation.fetchAdd(1, .release);
     }
 
-    fn shouldWaitForBlockedRetry(self: *PromotionRuntime, observed_wake_generation: u64) bool {
+    fn shouldDelayBlockedRetry(self: *PromotionRuntime, observed_wake_generation: u64) bool {
         return !self.shutdown_flag.load(.acquire) and
             self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire) and
             self.worker_wake_generation.load(.acquire) == observed_wake_generation;
@@ -508,6 +517,8 @@ pub const PromotionRuntime = struct {
 
     fn workerMain(self: *PromotionRuntime) void {
         const io = (self.io_impl orelse return).io();
+        var retry_delay_ms = blocked_retry_min_interval_ms;
+        var retry_wake_generation = self.worker_wake_generation.load(.acquire);
         while (!self.shutdown_flag.load(.acquire)) {
             self.worker_mutex.lockUncancelable(io);
             while (!self.shutdown_flag.load(.acquire) and
@@ -520,17 +531,28 @@ pub const PromotionRuntime = struct {
 
             if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
                 const wake_generation = self.worker_wake_generation.load(.acquire);
+                if (wake_generation != retry_wake_generation) {
+                    retry_delay_ms = blocked_retry_min_interval_ms;
+                    retry_wake_generation = wake_generation;
+                }
                 self.catchUp() catch |err| {
                     std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
                     io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
                     continue;
                 };
                 if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                    self.worker_mutex.lockUncancelable(io);
-                    if (self.shouldWaitForBlockedRetry(wake_generation)) {
-                        self.worker_cond.waitUncancelable(io, &self.worker_mutex);
+                    // Sink/owner setters reset this backoff through the wake
+                    // generation, while ownership may also change behind the
+                    // dynamic predicate without calling either setter. A
+                    // finite delay is the correctness backstop for that case.
+                    // It runs only while work is pending and backs off so
+                    // long-lived follower shards do not create a hot loop.
+                    if (self.shouldDelayBlockedRetry(wake_generation)) {
+                        io.sleep(Io.Duration.fromMilliseconds(retry_delay_ms), .awake) catch {};
+                        retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
                     }
-                    self.worker_mutex.unlock(io);
+                } else {
+                    retry_delay_ms = blocked_retry_min_interval_ms;
                 }
             }
         }
@@ -732,6 +754,21 @@ const ToggleOwner = struct {
     fn isLocalOwner(ptr: *anyopaque) bool {
         const self: *ToggleOwner = @ptrCast(@alignCast(ptr));
         return self.local_owner;
+    }
+};
+
+const AtomicToggleOwner = struct {
+    local_owner: std.atomic.Value(bool) = .init(false),
+
+    fn owner(self: *AtomicToggleOwner) PromotionOwner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = PromotionOwner.VTable{ .is_local_owner = isLocalOwner };
+
+    fn isLocalOwner(ptr: *anyopaque) bool {
+        const self: *AtomicToggleOwner = @ptrCast(@alignCast(ptr));
+        return self.local_owner.load(.acquire);
     }
 };
 
@@ -1057,7 +1094,7 @@ test "PromotionRuntime missing sink blocks only on pending resolution artifacts"
     runtime.store_handle = undefined;
 }
 
-test "PromotionRuntime blocked wait observes sink wake generation" {
+test "PromotionRuntime blocked retry observes sink wake generation" {
     const alloc = testing.allocator;
     var map = MapStore{ .alloc = alloc };
     defer map.deinit();
@@ -1104,19 +1141,79 @@ test "PromotionRuntime blocked wait observes sink wake generation" {
     try testing.expect(blocked_stats.blocked);
     try testing.expectEqualStrings("missing_entity_sink", blocked_stats.blocked_reason);
     try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
-    try testing.expect(runtime.shouldWaitForBlockedRetry(observed_wake_generation));
+    try testing.expect(runtime.shouldDelayBlockedRetry(observed_wake_generation));
 
     runtime.sink = capture.sink();
     runtime.sink_available.store(true, .release);
     runtime.missing_sink_blocked.store(false, .release);
     runtime.recordWorkerWake();
 
-    try testing.expect(!runtime.shouldWaitForBlockedRetry(observed_wake_generation));
+    try testing.expect(!runtime.shouldDelayBlockedRetry(observed_wake_generation));
     try runtime.catchUp();
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
 
     runtime.store_handle = undefined;
+}
+
+test "PromotionRuntime retries pending work after dynamic leadership changes without a wake" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key, sample_resolution);
+
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 9,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.promotion},
+    });
+    defer alloc.free(payload);
+
+    var fake_source = FakeSource{ .records = &.{.{ .sequence = 9, .payload = payload }} };
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    var owner = AtomicToggleOwner{};
+    var backend_runtime = try background_runtime_mod.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    const test_io = (backend_runtime.io_impl orelse return error.TestUnexpectedResult).io();
+    var runtime = try PromotionRuntime.init(
+        alloc,
+        map.backendStore(),
+        fake_source.source(),
+        &backend_runtime,
+        owner.owner(),
+        capture.sink(),
+        .wait,
+    );
+    defer runtime.deinit();
+
+    try runtime.start();
+    runtime.notifySequence(9);
+    try test_io.sleep(
+        Io.Duration.fromMilliseconds(2 * blocked_retry_min_interval_ms),
+        .awake,
+    );
+    try testing.expectEqual(@as(u64, 0), runtime.applied_sequence.load(.acquire));
+
+    // Deliberately change only the predicate. This models a Raft leadership
+    // transition, which does not replace PromotionOwner or signal its worker.
+    owner.local_owner.store(true, .release);
+
+    var attempts: usize = 0;
+    while (runtime.applied_sequence.load(.acquire) < 9 and attempts < 1500) : (attempts += 1) {
+        try test_io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+}
+
+test "PromotionRuntime pending retry delay backs off to a bounded maximum" {
+    try testing.expectEqual(@as(i64, 100), nextBlockedRetryIntervalMs(50));
+    try testing.expectEqual(@as(i64, 1000), nextBlockedRetryIntervalMs(800));
+    try testing.expectEqual(@as(i64, 1000), nextBlockedRetryIntervalMs(1000));
 }
 
 test "catchUpWindow with no matching records returns from_sequence" {

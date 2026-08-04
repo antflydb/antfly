@@ -50,7 +50,8 @@ from .models import bootstrap_models_for_listing, inference_command, maybe_pull_
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
 DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
-SERVER_OUTPUT_LIMIT = 4000
+SERVER_OUTPUT_LIMIT = 64 * 1024
+_LOCAL_SERVERS_BY_URL: dict[str, "InferenceServer"] = {}
 
 
 def env_first(*names: str) -> str | None:
@@ -107,6 +108,7 @@ class InferenceServer:
         max_loaded_models: str | None = None,
     ):
         self.url = f"http://{host}:{port}"
+        self.failure_reported = False
         self.output = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen(
             [
@@ -136,8 +138,25 @@ class InferenceServer:
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
 
     def read_output(self) -> str:
-        self.output.seek(0)
+        self.output.flush()
+        self.output.seek(0, os.SEEK_END)
+        size = self.output.tell()
+        self.output.seek(max(0, size - SERVER_OUTPUT_LIMIT))
         return self.output.read(SERVER_OUTPUT_LIMIT).decode(errors="replace")
+
+    def failure_diagnostic(self) -> str:
+        returncode = self.proc.poll()
+        if returncode is None:
+            status = "still running"
+        elif returncode < 0:
+            try:
+                signal_name = signal.Signals(-returncode).name
+            except ValueError:
+                signal_name = "unknown signal"
+            status = f"terminated by {signal_name} ({returncode})"
+        else:
+            status = f"exited with status {returncode}"
+        return f"Local inference server {status}. Output tail:\n{self.read_output()}"
 
     def stop(self, close_output: bool = True):
         if self.proc and self.proc.poll() is None:
@@ -183,8 +202,15 @@ def base_url():
         port,
         max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
     )
+    _LOCAL_SERVERS_BY_URL[server.url] = server
     yield server.url
-    server.stop()
+    _LOCAL_SERVERS_BY_URL.pop(server.url, None)
+    unexpected_exit = server.proc.poll() is not None
+    diagnostic = server.failure_diagnostic() if unexpected_exit else None
+    server.stop(close_output=False)
+    server.output.close()
+    if unexpected_exit and not server.failure_reported:
+        pytest.fail(diagnostic, pytrace=False)
 
 
 @pytest.fixture(scope="session")
@@ -221,10 +247,24 @@ def api(base_url):
             request = getattr(self.s, method)
             normalized_path = api_path(path)
             kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
-            response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
+            try:
+                response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
+            except requests.RequestException as exc:
+                local_server = _LOCAL_SERVERS_BY_URL.get(self.url)
+                if local_server is not None and local_server.proc.poll() is not None:
+                    local_server.failure_reported = True
+                    raise AssertionError(local_server.failure_diagnostic()) from exc
+                raise
             if retry_on_missing_model and maybe_pull_missing_model(normalized_path, json, response):
                 response.close()
-                response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
+                try:
+                    response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
+                except requests.RequestException as exc:
+                    local_server = _LOCAL_SERVERS_BY_URL.get(self.url)
+                    if local_server is not None and local_server.proc.poll() is not None:
+                        local_server.failure_reported = True
+                        raise AssertionError(local_server.failure_diagnostic()) from exc
+                    raise
             return response
 
         def post(self, path: str, json=None, **kwargs):

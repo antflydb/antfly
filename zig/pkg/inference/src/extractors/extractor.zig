@@ -130,11 +130,17 @@ const RecognizerExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
-        if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
+        // Validate the requested extractor without pinning it across the read
+        // stage. With bounded residency (especially max_loaded_models=1), the
+        // reader must be able to evict GLiNER, finish OCR, and release its own
+        // handle before extractText reacquires GLiNER below.
+        {
+            var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+            defer model_handle.release();
+            const model = model_handle.get();
+            if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
+            if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
+        }
 
         const texts = try readTextsForExtraction(ctx, self.model_name, image_datas, read_options);
         defer {
@@ -243,10 +249,10 @@ fn readTextsForExtraction(
 
 fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []const u8) ![]const u8 {
     if (platform.env.getenv("TERMITE_EXTRACT_DEFAULT_READER_MODEL")) |override| {
-        return resolveNamedReaderPath(ctx, override);
+        return resolveSupportedNamedReaderPath(ctx, override);
     }
 
-    if (resolveNamedReaderPath(ctx, extractor_model_name)) |path| {
+    if (resolveSupportedNamedReaderPath(ctx, extractor_model_name)) |path| {
         return path;
     } else |_| {}
 
@@ -265,6 +271,12 @@ fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []con
     for (discovered) |entry| {
         if (entry.kind != .reader) continue;
         if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(ctx.allocator, entry.path)) continue;
+        // Registry capabilities describe the artifact's intended task, while
+        // the reader implementation knows whether this concrete layout is
+        // executable by the current build. Do not select a stale or partial
+        // reader merely because its manifest says `reader`: fallback discovery
+        // must only return a model that LoadedReader can actually construct.
+        if (!readers_mod.isSupportedModelDir(ctx.allocator, entry.path)) continue;
 
         const rank = extractionReaderPreference(entry.name, extractor_model_name);
         if (best_name == null or rank < best_rank or (rank == best_rank and std.mem.lessThan(u8, entry.name, best_name.?))) {
@@ -274,7 +286,7 @@ fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []con
     }
 
     const reader_name = best_name orelse return error.NoReaderModelAvailable;
-    return resolveNamedReaderPath(ctx, reader_name);
+    return resolveSupportedNamedReaderPath(ctx, reader_name);
 }
 
 fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
@@ -325,6 +337,13 @@ fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []
 
 fn resolveNamedReaderPath(ctx: Context, requested_name: []const u8) ![]const u8 {
     return resolveNamedModelPath(ctx, requested_name, "readers");
+}
+
+fn resolveSupportedNamedReaderPath(ctx: Context, requested_name: []const u8) ![]const u8 {
+    const path = try resolveNamedReaderPath(ctx, requested_name);
+    errdefer ctx.allocator.free(path);
+    if (!readers_mod.isSupportedModelDir(ctx.allocator, path)) return error.ModelNotFound;
+    return path;
 }
 
 fn extractionReaderPreference(reader_name: []const u8, extractor_model_name: []const u8) u8 {
@@ -398,6 +417,52 @@ test "resolveNamedReaderPath supports flat default model layout" {
     defer allocator.free(path);
 
     try std.testing.expect(std.mem.endsWith(u8, path, "Xenova/trocr-base-printed"));
+}
+
+test "image extraction fallback ignores manifest-only unsupported readers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestManifest(
+        tmp.dir,
+        "readers/monkt/paddleocr-onnx",
+        "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}",
+    );
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+    }, "fastino/gliner2-base-v1"));
+}
+
+test "image extraction does not reinterpret the extractor root as a reader" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestManifest(
+        tmp.dir,
+        "fastino/gliner2-base-v1",
+        "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}",
+    );
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+    }, "fastino/gliner2-base-v1"));
 }
 
 test "resolve prefers recognizer for text extraction when both exist" {

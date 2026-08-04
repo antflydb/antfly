@@ -188,8 +188,7 @@ pub const TranscriptionPipeline = struct {
             defer dec_tensor.deinit();
 
             // Rename encoder output to match decoder's expected input name
-            var enc_hidden = encoder_outputs[0];
-            enc_hidden.name = "encoder_hidden_states";
+            const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
 
             const dec_outputs = try self.decoder.run(&.{ dec_tensor, enc_hidden }, allocator);
             defer {
