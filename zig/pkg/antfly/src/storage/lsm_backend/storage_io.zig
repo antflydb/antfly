@@ -2707,20 +2707,17 @@ const NativeAtomicWriteSink = struct {
         };
         closeFd(self.fd);
         self.fd = -1;
-        // Transfer the permit from the closed data file to the parent
-        // directory sync. The sink's independent state reference keeps the
-        // runtime alive across the transfer.
-        self.fd_permit.release();
+        // The data-file descriptor is closed, so its existing admission slot
+        // can be transferred directly to the parent-directory descriptor.
+        // Do not relinquish and reacquire it here: another opener could claim
+        // the slot and make finish fail after the rename has already published
+        // the destination.
 
         self.state.invalidateRename(self.tmp_path, self.final_path);
         renameAbsoluteDirectPosix(self.tmp_path, self.final_path) catch |err| {
             deleteFilePathPosix(self.tmp_path) catch {};
             return err;
         };
-        const io = self.state.threaded.io();
-        const cache = self.state.fdCache();
-        try cache.reserveDescriptors(io, 1);
-        defer cache.releaseDescriptors(io, 1);
         try syncParentDirectoryPosix(self.final_path);
     }
 
@@ -3197,6 +3194,42 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native atomic write finish retains admission through parent sync" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-admission-handoff-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+
+    var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
+    var writer_active = true;
+    defer if (writer_active) writer.abort();
+    try writer.appendSlice("durable");
+
+    // Fill the persistent class to the point where relinquishing the writer's
+    // transient slot would make reacquisition fail. The closed data file and
+    // parent-directory fsync are sequential users of that same admitted slot.
+    const io = native.state.threaded.io();
+    try pool.fd_cache.reservePersistentDescriptors(io, 2);
+    var persistent_held = true;
+    defer if (persistent_held) pool.fd_cache.releasePersistentDescriptors(io, 2);
+
+    writer_active = false;
+    try writer.finish();
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+
+    pool.fd_cache.releasePersistentDescriptors(io, 2);
+    persistent_held = false;
+    const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("durable", written);
 }
 
 test "native atomic write sink cleans temporary file when content sync fails" {
