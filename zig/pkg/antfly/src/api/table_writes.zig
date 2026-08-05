@@ -6590,6 +6590,14 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_db_mutex.unlock();
     }
 
+    fn beginLocalStructuralCachedDbMutationFromPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.beginStructuralTableActivityFromRestorePreparation(table_name);
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+    }
+
     fn finishLocalStructuralCachedDbMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
@@ -6664,6 +6672,27 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginLocalTableGenerationTransitionFromPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) !LocalTableGenerationTransition {
+        self.beginStructuralTableActivityFromRestorePreparation(table_name);
+        errdefer self.endStructuralTableActivity(table_name);
+
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
+
+        return .{
+            .source = self,
+            .table_name = table_name,
+            .read_cache_exclusive = read_cache_exclusive,
+        };
+    }
+
+    fn beginStructuralTableActivityFromRestorePreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -6686,23 +6715,6 @@ pub const ProvisionedTableWriteSource = struct {
             self.table_activity_mutex.unlock(io);
             self.beginStructuralTableActivity(table_name);
         }
-        errdefer self.endStructuralTableActivity(table_name);
-
-        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
-        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateWriteCache(table_name);
-        self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
-        self.local_db_mutex.unlock();
-        self.drainWriteCachePendingCloses();
-
-        return .{
-            .source = self,
-            .table_name = table_name,
-            .read_cache_exclusive = read_cache_exclusive,
-        };
     }
 
     fn finishLocalTableGenerationTransitionMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -10434,25 +10446,114 @@ pub const ProvisionedTableWriteSource = struct {
             if (schema_json_override) |schema_json| {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
-
-            const timeout_ns = 30 * std.time.ns_per_s;
-            const start_ns = platform_time.monotonicNs();
-            var attempts: usize = 0;
-            std.log.info("restore foreground repair begin group_id={d}", .{group_id});
-            while (try db.restoreRuntimeRepairNeeded()) {
-                attempts += 1;
-                if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
-                    db.clearDenseHbcCaches();
-                }
-                if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-            }
-            std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
-                group_id,
-                attempts,
-                open_attempts,
-            });
+            try repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
             return;
         }
+    }
+
+    fn repairRestoredDbRuntimeStateBlocking(
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        group_id: u64,
+        open_attempts: usize,
+    ) !void {
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const start_ns = platform_time.monotonicNs();
+        var attempts: usize = 0;
+        std.log.info("restore foreground repair begin group_id={d}", .{group_id});
+        while (try db.restoreRuntimeRepairNeeded()) {
+            attempts += 1;
+            if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
+                db.clearDenseHbcCaches();
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+        }
+        std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
+            group_id,
+            attempts,
+            open_attempts,
+        });
+    }
+
+    /// Complete an idempotent restore retry through the authoritative cached
+    /// writer when one is already open. Opening a second repair DB would
+    /// contend with that writer and could make an exact-identity retry report
+    /// success while the durable runtime-repair marker remained incomplete.
+    fn repairPublishedRestoreRuntimeStateBlocking(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
+
+        self.beginLocalStructuralCachedDbMutationFromPreparation(table_name);
+        errdefer self.abortLocalStructuralCachedDbMutation(table_name);
+
+        // The catalog is authoritative once a generation is published. The
+        // durable restore identity intentionally describes only the imported
+        // artifact, so a retry manifest at the same location is not proof of
+        // the table definition that was admitted with that artifact. Sampling
+        // the definition only after structural admission prevents local table
+        // mutation from racing this repair contract.
+        const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse
+            return error.TableVisibilityTimeout;
+        defer {
+            if (metadata.indexes_json) |value| alloc.free(value);
+            if (metadata.schema_json) |value| alloc.free(value);
+        }
+        const indexes_json = metadata.indexes_json orelse tables_api.default_indexes_json;
+        const schema_json = metadata.schema_json orelse "";
+
+        if (self.write_cache orelse self.startup_write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbForLocalMutation(
+                alloc,
+                cache,
+                path,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                table_name,
+                false,
+            );
+            defer cached.deinit(alloc);
+            try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(
+                alloc,
+                cached.db,
+                indexes_json,
+                .{ .drain_resolver_backfill = false },
+            );
+            try repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
+
+            const entry = cached.entry orelse return error.StaleCachedDbLease;
+            {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                if (entry.retired) return error.StaleCachedDbLease;
+                try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+                try cache.replaceEntrySchemaLocked(entry, schema_json);
+                ProvisionedTableWriteCache.publishEntryManagedConfig(entry, indexes_json);
+                cached.schema_json = entry.schema_json;
+            }
+            if (reconcile_summary.indexes_pending != 0) {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+            }
+        } else {
+            try self.repairRestoredTableRuntimeStateBlocking(
+                alloc,
+                path,
+                group_id,
+                table_name,
+                indexes_json,
+                schema_json,
+                null,
+            );
+        }
+
+        self.finishLocalStructuralCachedDbMutation(table_name);
+        self.publishRestoreRepairComplete(table_name);
+        self.notifyLocalChange(table_name, .structural);
     }
 
     const RestoreRepairCatchUpWork = struct {
@@ -12731,7 +12832,16 @@ pub const ProvisionedTableWriteSource = struct {
                 else => return err,
             };
         }
-        if (all_groups_already_admitted and plan.publication_hook == null) return;
+        if (all_groups_already_admitted and plan.publication_hook == null) {
+            if (plan.reconcile_only) return;
+            try self.repairPublishedRestoreRuntimeStateBlocking(
+                alloc,
+                path,
+                group_id,
+                table_name,
+            );
+            return;
+        }
         if (plan.reconcile_only and admitted_identity_mismatch) return error.RestoreIdentityMismatch;
 
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
@@ -12835,7 +12945,6 @@ pub const ProvisionedTableWriteSource = struct {
         transition.finishMutation();
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
-        self.notifyLocalChange(table_name, .data);
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
@@ -21869,7 +21978,7 @@ test "provisioned table restore rejects multi-range manifests before opening sto
     }));
 }
 
-test "provisioned table restore retry skips exact incomplete restore state with active writer" {
+test "provisioned table restore retry repairs exact incomplete restore state through active writer" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -21913,7 +22022,7 @@ test "provisioned table restore retry skips exact incomplete restore state with 
                     .table_id = 7,
                     .name = "docs",
                     .description = "docs table",
-                    .schema_json = "",
+                    .schema_json = tables_api.default_schema_json,
                     .read_schema_json = "",
                     .indexes_json = tables_api.default_indexes_json,
                     .replication_sources_json = "[]",
@@ -21957,7 +22066,7 @@ test "provisioned table restore retry skips exact incomplete restore state with 
         .table_id = 7,
         .name = "docs",
         .description = "docs table",
-        .schema_json = "",
+        .schema_json = tables_api.default_schema_json,
         .read_schema_json = "",
         .indexes_json = tables_api.default_indexes_json,
         .replication_sources_json = "[]",
@@ -21986,6 +22095,13 @@ test "provisioned table restore retry skips exact incomplete restore state with 
         7001,
     );
 
+    // An object-store key can be overwritten between retries without changing
+    // the imported artifact. The admitted catalog definition, not mutable
+    // manifest metadata, must remain authoritative for runtime repair.
+    const original_manifest_schema = manifest.schema_json;
+    manifest.schema_json = try alloc.dupe(u8, "{}");
+    alloc.free(@constCast(original_manifest_schema));
+
     var cached = try write_cache.getOrOpenLocked(db_path, FakeCatalog.iface(), 7001, 0, "docs");
     defer cached.deinit(alloc);
     try cached.db.batch(.{
@@ -21999,6 +22115,13 @@ test "provisioned table restore retry skips exact incomplete restore state with 
         .artifact_backup_id = manifest.backup_id,
         .source_location = location,
     });
+    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, io_impl.io(), db_path)));
+    const beta = (try cached.db.get(alloc, "doc:b")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(beta);
+    try std.testing.expectEqualStrings("{\"title\":\"beta\"}", beta);
+    const repaired_schema = (try loadLocalTableSchemaJson(alloc, cached.db)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(repaired_schema);
+    try std.testing.expectEqualStrings(tables_api.default_schema_json, repaired_schema);
 }
 
 test "provisioned restore repair source deinit cancels sleeping retry worker" {

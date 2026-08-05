@@ -120,7 +120,10 @@ def sync_detailed(
 
     Set `stream: true` to receive Server-Sent Events (SSE) with incremental
     token deltas. Each event contains a `ChatCompletionChunk` object.
-    The stream ends with `data: [DONE]`.
+    A successful stream ends with `data: [DONE]`. If generation or stream
+    writing fails after the HTTP response starts, the server instead emits
+    an `event: error` frame whose data is a plain-text error message, then
+    closes the stream without a `[DONE]` frame.
 
     ## Input Format
 
@@ -181,7 +184,10 @@ def sync(
 
     Set `stream: true` to receive Server-Sent Events (SSE) with incremental
     token deltas. Each event contains a `ChatCompletionChunk` object.
-    The stream ends with `data: [DONE]`.
+    A successful stream ends with `data: [DONE]`. If generation or stream
+    writing fails after the HTTP response starts, the server instead emits
+    an `event: error` frame whose data is a plain-text error message, then
+    closes the stream without a `[DONE]` frame.
 
     ## Input Format
 
@@ -237,7 +243,10 @@ async def asyncio_detailed(
 
     Set `stream: true` to receive Server-Sent Events (SSE) with incremental
     token deltas. Each event contains a `ChatCompletionChunk` object.
-    The stream ends with `data: [DONE]`.
+    A successful stream ends with `data: [DONE]`. If generation or stream
+    writing fails after the HTTP response starts, the server instead emits
+    an `event: error` frame whose data is a plain-text error message, then
+    closes the stream without a `[DONE]` frame.
 
     ## Input Format
 
@@ -296,7 +305,10 @@ async def asyncio(
 
     Set `stream: true` to receive Server-Sent Events (SSE) with incremental
     token deltas. Each event contains a `ChatCompletionChunk` object.
-    The stream ends with `data: [DONE]`.
+    A successful stream ends with `data: [DONE]`. If generation or stream
+    writing fails after the HTTP response starts, the server instead emits
+    an `event: error` frame whose data is a plain-text error message, then
+    closes the stream without a `[DONE]` frame.
 
     ## Input Format
 

@@ -445,6 +445,7 @@ pub const TableRestoreStatus = types.TableRestoreStatus;
 pub const TableSchema = types.TableSchema;
 pub const TableStatistics = types.TableStatistics;
 pub const TableStatus = types.TableStatus;
+pub const TableStorageUnreadableError = types.TableStorageUnreadableError;
 pub const TavilySearchConfig = types.TavilySearchConfig;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;
 pub const TermQuery = types.TermQuery;

@@ -180,6 +180,7 @@ pub const TableRepairRunResult = types.TableRepairRunResult;
 pub const TableRestoreStatus = types.TableRestoreStatus;
 pub const TableStatistics = types.TableStatistics;
 pub const TableStatus = types.TableStatus;
+pub const TableStorageUnreadableError = types.TableStorageUnreadableError;
 pub const TransactionBeginRequest = types.TransactionBeginRequest;
 pub const TransactionBeginResponse = types.TransactionBeginResponse;
 pub const TransactionCommitRequest = types.TransactionCommitRequest;

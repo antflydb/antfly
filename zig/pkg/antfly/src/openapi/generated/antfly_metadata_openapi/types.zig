@@ -3047,6 +3047,18 @@ pub const TableStatus = struct {
     artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,
 };
 
+/// A non-retryable table-storage integrity or format failure.
+pub const TableStorageUnreadableError = struct {
+    /// Stable client-routing code for unreadable table storage.
+    code: []const u8,
+    /// Concrete storage error class, such as InvalidManifest.
+    @"error": []const u8,
+    /// Human-readable summary.
+    message: []const u8,
+    /// Always false; recovery requires repair, restore, or table replacement.
+    retryable: bool,
+};
+
 pub const TransactionBeginRequest = struct {
     sync_level: ?SyncLevel = null,
 };
