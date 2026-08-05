@@ -15,11 +15,12 @@
 """Tests for /api/extract (structured extraction) endpoint."""
 
 import pytest
-from .helpers import TINY_PNG_URI, assert_openai_list_response, make_text_png_uri
+from .helpers import TINY_PNG_URI, assert_extraction_response, make_text_png_uri
+from .models import DEFAULT_EXTRACTOR_MODEL
 
 pytestmark = pytest.mark.model_integration
 
-GLINER_MODEL = "fastino/gliner2-base-v1"
+GLINER_MODEL = DEFAULT_EXTRACTOR_MODEL
 
 
 def _has_reader_model(api) -> bool:
@@ -50,11 +51,11 @@ def test_extract_basic(api):
         schema={"person": ["name::str", "company::str", "location::str"]},
         model=GLINER_MODEL,
     )
-    assert_openai_list_response(resp, expected_len=1)
+    assert_extraction_response(resp, expected_len=1)
     results = resp["data"]
     assert len(results) == 1
 
-    result = results[0]["results"]
+    result = results[0]["structures"]
     assert "person" in result
     assert isinstance(result["person"], list)
     if result["person"]:
@@ -95,7 +96,7 @@ def test_extract_include_confidence_and_spans(api):
         include_confidence=True,
         include_spans=True,
     )
-    person_instances = resp["data"][0]["results"]["person"]
+    person_instances = resp["data"][0]["structures"]["person"]
     if person_instances:
         for value in person_instances[0].values():
             values = value if isinstance(value, list) else [value]
@@ -128,24 +129,23 @@ def test_extract_from_images_via_reader(api):
     )
     results = resp["data"]
     assert len(results) == 1
-    assert "person" in results[0]["results"]
-    assert isinstance(results[0]["results"]["person"], list)
+    assert "person" in results[0]["structures"]
+    assert isinstance(results[0]["structures"]["person"], list)
 
 
 def test_extract_rejects_missing_texts_and_images(api):
-    """The server should require exactly one extraction input source."""
+    """The canonical contract requires at least one input."""
     resp = api.post(
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "texts": [],
-            "schema": {"person": ["name::str"]},
+            "inputs": [],
+            "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
         },
     )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "exactly one of texts or images" in body["message"]
 
 
 def test_extract_rejects_both_texts_and_images(api):
@@ -155,12 +155,44 @@ def test_extract_rejects_both_texts_and_images(api):
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "texts": ["John Smith works at Google."],
-            "images": [{"url": test_image}],
-            "schema": {"person": ["name::str"]},
+            "inputs": [
+                {"content": "John Smith works at Google."},
+                {"content": [{"type": "image_url", "image_url": {"url": test_image}}]},
+            ],
+            "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
         },
     )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "exactly one of texts or images" in body["message"]
+
+
+def test_extract_rejects_missing_structured_schema(api):
+    response = api.post(
+        "/extract",
+        json={"model": GLINER_MODEL, "inputs": [{"content": "John Smith"}], "schema": {}},
+    )
+    assert response.status_code == 400
+    assert "schema" in response.json()["message"]
+
+
+def test_extract_rejects_images_for_entity_mode(api):
+    response = api.post(
+        "/extract",
+        json={
+            "model": GLINER_MODEL,
+            "inputs": [{"content": [{"type": "image_url", "image_url": {"url": TINY_PNG_URI}}]}],
+            "schema": {"entities": ["person"]},
+        },
+    )
+    assert response.status_code == 400
+    assert "text" in response.json()["message"]
+
+
+def test_extract_rejects_relations_without_labels(api):
+    response = api.post(
+        "/extract",
+        json={"model": GLINER_MODEL, "inputs": [{"content": "John works at Google"}], "schema": {"relations": []}},
+    )
+    assert response.status_code == 400
+    assert "schema" in response.json()["message"]

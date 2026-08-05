@@ -251,7 +251,7 @@ and GLiNER extraction paths automatically apply cleanup after entity detection:
 
 If no cleanup artifact is present, recognition behaves exactly as before.
 
-Recognize and extraction responses preserve the representative mention span
+Entity extraction responses preserve the representative mention span
 chosen by the cleanup stage. A bundled GLiNER2 cleanup smoke workflow now
 exists for cache prep, cleanup-head training, and materialization, but there is
 still not a separate OCR-to-recognize request-path smoke test.

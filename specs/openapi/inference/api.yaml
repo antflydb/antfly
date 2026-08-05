@@ -629,7 +629,7 @@ paths:
     get:
       summary: List available models
       description: |
-        Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and transcriber models.
+        Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader, and transcriber models.
 
         ## Embedders
 
@@ -652,10 +652,10 @@ paths:
         - LLM models from `models_dir/generators/`
         - Empty if no models configured
 
-        ## Recognizers
+        ## Extractors
 
-        - ONNX models from `models_dir/recognizers/`
-        - Includes GLiNER models for zero-shot recognition
+        - Extraction-capable models from the managed model registry
+        - Includes GLiNER models for zero-shot entity and relation extraction
 
         ## Rewriters
 
@@ -1323,191 +1323,6 @@ components:
           type: number
           format: float
           description: Relevance score for this prompt.
-    RecognizeEntity:
-      type: object
-      required:
-        - text
-        - label
-        - start
-        - end
-        - score
-      properties:
-        text:
-          type: string
-          description: The entity text
-          example: John Smith
-        label:
-          type: string
-          description: Entity type (PER, ORG, LOC, MISC)
-          example: PER
-        start:
-          type: integer
-          description: Character offset where entity begins
-          example: 0
-        end:
-          type: integer
-          description: Character offset where entity ends (exclusive)
-          example: 10
-        score:
-          type: number
-          format: float
-          description: Confidence score (0.0 to 1.0)
-          example: 0.99
-    RecognizeRequest:
-      type: object
-      required:
-        - model
-        - texts
-      properties:
-        model:
-          type: string
-          description: Name of recognizer model from models_dir/recognizers/
-          example: dslim/bert-base-NER
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to extract entities from
-          example:
-            - John Smith works at Google.
-            - Apple Inc. is in Cupertino.
-        labels:
-          type: array
-          items:
-            type: string
-          description: |
-            Custom entity labels to extract (GLiNER models only).
-            When using a GLiNER model, you can specify any entity types to extract,
-            enabling zero-shot NER without model retraining.
-            If not provided, the model's default labels are used.
-          example:
-            - person
-            - company
-            - product
-            - date
-        relation_labels:
-          type: array
-          items:
-            type: string
-          description: |
-            Relation types to extract (for models with 'relations' capability).
-            Only used when the model supports relation extraction (GLiNER multitask, REBEL).
-            Relation extraction runs only when this array is provided and non-empty.
-            GLiNER labels may be relation names (works_for), head-qualified
-            labels (person::works_for), or head/tail-qualified labels
-            (person::works_for::organization).
-          example:
-            - founded
-            - works_at
-            - located_in
-        resolver:
-          $ref: '#/components/schemas/ResolverConfig'
-    ResolverConfig:
-      type: object
-      description: |
-        Configuration for entity resolution. When present in a RecognizeRequest,
-        the response entities and relations are deduplicated via entity resolution
-        (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-      properties:
-        similarity_threshold:
-          type: number
-          format: float
-          default: 0.85
-          description: Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-        type_must_match:
-          type: boolean
-          default: true
-          description: Whether entity types must match for merging
-        min_entity_confidence:
-          type: number
-          format: float
-          default: 0
-          description: Minimum confidence score for entities to be included
-        min_relation_confidence:
-          type: number
-          format: float
-          default: 0
-          description: Minimum confidence score for relations to be included
-        deduplicate_relations:
-          type: boolean
-          default: true
-          description: Whether to deduplicate relations after entity resolution
-        track_provenance:
-          type: boolean
-          default: true
-          description: Whether to track mention provenance for resolved entities
-    Relation:
-      type: object
-      required:
-        - head
-        - tail
-        - label
-        - score
-      properties:
-        head:
-          $ref: '#/components/schemas/RecognizeEntity'
-          description: The subject/head entity in the relationship
-        tail:
-          $ref: '#/components/schemas/RecognizeEntity'
-          description: The object/tail entity in the relationship
-        label:
-          type: string
-          description: The relationship type
-          example: founded
-        score:
-          type: number
-          format: float
-          description: Confidence score for the relation (0.0 to 1.0)
-          example: 0.95
-    RecognizeResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/RecognizeObject'
-          description: Recognition result objects, one per input text.
-        model:
-          type: string
-          description: Name of model used for NER
-        usage:
-          $ref: '#/components/schemas/GenerateUsage'
-    RecognizeObject:
-      type: object
-      required:
-        - object
-        - index
-        - entities
-      properties:
-        object:
-          type: string
-          enum:
-            - recognition
-        index:
-          type: integer
-          description: Original input text index.
-        entities:
-          type: array
-          items:
-            $ref: '#/components/schemas/RecognizeEntity'
-          description: Entities recognized for this input text.
-        relations:
-          type: array
-          items:
-            $ref: '#/components/schemas/Relation'
-          description: |
-            Relations recognized for this input text. Only present when using
-            a model with 'relations' capability (GLiNER multitask, REBEL).
     RewriteRequest:
       type: object
       required:
@@ -1983,154 +1798,6 @@ components:
           description: Token classification predictions sorted by score descending.
           items:
             $ref: '#/components/schemas/DocumentTokenClassificationPrediction'
-    ExtractRequest:
-      type: object
-      required:
-        - model
-        - schema
-      description: |
-        Exactly one of `texts` or `images` must be provided.
-        When using `images`, the server selects a compatible reader internally
-        and processes the request as: read document text -> run structured extraction.
-      properties:
-        model:
-          type: string
-          description: Name of extractor model with 'extraction' capability
-          example: fastino/gliner2-base-v1
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to extract structured data from
-          example:
-            - John Smith is 30 years old and works at Google.
-        images:
-          type: array
-          minItems: 1
-          maxItems: 64
-          items:
-            $ref: '#/components/schemas/ImageURL'
-          description: |
-            Optional images to extract structured data from.
-            When provided, the server first reads document text with a compatible reader
-            and then runs schema extraction on the read text.
-        prompt:
-          type: string
-          description: |
-            Optional read-stage prompt used only when `images` are provided.
-            Passed through to the reader before schema extraction.
-          example: <OCR>
-        max_tokens:
-          type: integer
-          description: |
-            Maximum tokens for the read stage when `images` are provided.
-            Ignored for text-only extraction requests.
-          minimum: 1
-          maximum: 1024
-          default: 256
-        schema:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: string
-          description: |
-            Extraction schema mapping structure names to field definitions.
-            Each field is defined as "field_name::type" where type is "str" or "list".
-            Optional choice fields: "field_name::[opt1|opt2]::str".
-            If no type is specified, defaults to "str".
-          example:
-            person:
-              - name::str
-              - age::str
-              - company::str
-        threshold:
-          type: number
-          format: float
-          description: Score threshold for span extraction (0.0-1.0)
-          default: 0.3
-        flat_ner:
-          type: boolean
-          description: If true, don't allow nested/overlapping entities
-          default: true
-        include_confidence:
-          type: boolean
-          description: If true, include confidence scores in output
-          default: false
-        include_spans:
-          type: boolean
-          description: If true, include character offset spans in output
-          default: false
-    ExtractFieldValue:
-      type: object
-      required:
-        - value
-      properties:
-        value:
-          type: string
-          description: The extracted text value
-          example: John Smith
-        score:
-          type: number
-          format: float
-          description: Confidence score (only present when include_confidence=true)
-          example: 0.95
-        start:
-          type: integer
-          description: Character offset where value begins (only present when include_spans=true)
-          example: 0
-        end:
-          type: integer
-          description: Character offset where value ends (only present when include_spans=true)
-          example: 10
-    ExtractResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/ExtractObject'
-          description: Extraction result objects, one per input.
-        model:
-          type: string
-          description: Name of model used for extraction
-        usage:
-          $ref: '#/components/schemas/GenerateUsage'
-    ExtractObject:
-      type: object
-      required:
-        - object
-        - index
-        - results
-      properties:
-        object:
-          type: string
-          enum:
-            - extraction
-        index:
-          type: integer
-          description: Original input index.
-        results:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: object
-              additionalProperties: true
-          description: |
-            Extraction result for this input. Maps structure names to arrays of extracted instances.
-            Each instance maps field names to ExtractFieldValue (for ::str fields)
-            or arrays of ExtractFieldValue (for ::list fields).
     ReadRequest:
       type: object
       required:
@@ -2346,7 +2013,6 @@ components:
         - rerankers
         - embedders
         - generators
-        - recognizers
         - extractors
         - rewriters
         - classifiers
@@ -2400,11 +2066,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/ModelInfo'
           description: Available generator/LLM models from models_dir/generators/
-        recognizers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/ModelInfo'
-          description: Available recognizer models from models_dir/recognizers/
         rewriters:
           type: object
           additionalProperties:
@@ -2968,7 +2629,6 @@ components:
         - reranker
         - chunker
         - classifier
-        - recognizer
         - rewriter
         - reader
         - transcriber
@@ -3103,7 +2763,7 @@ components:
             - `{models_dir}/embedders/` - Embedding models (ONNX)
             - `{models_dir}/chunkers/` - Chunking models (ONNX)
             - `{models_dir}/rerankers/` - Reranking models (ONNX)
-            - `{models_dir}/recognizers/` - Recognition models (ONNX)
+            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
             - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
 
             Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.

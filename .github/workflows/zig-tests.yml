@@ -704,6 +704,16 @@ jobs:
           SKIP_BUILD: "1"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
+      - name: Run low-FD Autograph regression
+        env:
+          SKIP_BUILD: "1"
+          ANTFLY_E2E_NOFILE_LIMIT: "256"
+          ANTFLY_E2E_REGRESSION_REPEATS: "3"
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          scripts/ci/zig-e2e-regression-loop.sh
+          e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+
   e2e-full:
     name: e2e-full
     needs: changes

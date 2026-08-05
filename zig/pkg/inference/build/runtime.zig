@@ -72,6 +72,7 @@ pub const SharedModules = struct {
     generating_openapi: ?*std.Build.Module = null,
     chunking_api_openapi: ?*std.Build.Module = null,
     extraction_openapi: ?*std.Build.Module = null,
+    extracting: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
 
@@ -117,6 +118,8 @@ pub const Graph = struct {
     inference_chunker_mod: *std.Build.Module,
     generating_openapi_mod: *std.Build.Module,
     chunking_api_openapi_mod: *std.Build.Module,
+    extraction_openapi_mod: *std.Build.Module,
+    extracting_mod: *std.Build.Module,
     inference_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
 };
@@ -211,6 +214,18 @@ pub fn create(config: Config) Graph {
     shared_with_generating.generating_openapi = generating_openapi_mod;
     const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
     shared_with_generating.chunking_api_openapi = chunking_api_openapi_mod;
+    const extraction_openapi_mod = shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
+    shared_with_generating.extraction_openapi = extraction_openapi_mod;
+    const extracting_mod = shared.extracting orelse blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/extracting/src/mod.zig")),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+        break :blk mod;
+    };
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
@@ -296,6 +311,8 @@ pub fn create(config: Config) Graph {
         .inference_client_mod = inference_client_mod,
     });
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    inference_mod.addImport("antfly_extracting", extracting_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
 
@@ -355,6 +372,8 @@ pub fn create(config: Config) Graph {
         .inference_chunker_mod = inference_chunker_mod,
         .generating_openapi_mod = generating_openapi_mod,
         .chunking_api_openapi_mod = chunking_api_openapi_mod,
+        .extraction_openapi_mod = extraction_openapi_mod,
+        .extracting_mod = extracting_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
     };

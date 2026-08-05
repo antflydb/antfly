@@ -32,7 +32,7 @@ describe("InferenceClient", () => {
     expect(typeof client.extract).toBe("function");
     expect(typeof client.extractRaw).toBe("function");
     expect(typeof client.classify).toBe("function");
-    expect(typeof client.recognize).toBe("function");
+    expect(typeof client.extractEntities).toBe("function");
     expect(typeof client.rewrite).toBe("function");
     expect(typeof client.transcribe).toBe("function");
     expect(typeof client.listModels).toBe("function");
@@ -477,7 +477,7 @@ describe("InferenceClient with mock fetch", () => {
       });
     });
 
-    it("should recognize entities through the canonical extract endpoint", async () => {
+    it("should extract entities through the canonical extract endpoint", async () => {
       const mockResponse = {
         object: "extraction",
         model: "gliner2-base-v1",
@@ -500,7 +500,7 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      const result = await client.recognize(
+      const result = await client.extractEntities(
         "gliner2-base-v1",
         ["John Smith works at Google."],
         ["person", "company"]

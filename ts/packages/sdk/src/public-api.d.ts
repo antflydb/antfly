@@ -2281,7 +2281,7 @@ export interface paths {
         };
         /**
          * List available models
-         * @description Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and transcriber models.
+         * @description Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader, and transcriber models.
          *
          *     ## Embedders
          *
@@ -2304,10 +2304,10 @@ export interface paths {
          *     - LLM models from `models_dir/generators/`
          *     - Empty if no models configured
          *
-         *     ## Recognizers
+         *     ## Extractors
          *
-         *     - ONNX models from `models_dir/recognizers/`
-         *     - Includes GLiNER models for zero-shot recognition
+         *     - Extraction-capable models from the managed model registry
+         *     - Includes GLiNER models for zero-shot entity and relation extraction
          *
          *     ## Rewriters
          *
@@ -2760,7 +2760,7 @@ export interface components {
          *     classify.
          * @enum {string}
          */
-        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "recognizer" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
         ConnectedModel: {
             /** @description Model identifier as reported by the provider. */
             name: string;
@@ -2788,7 +2788,7 @@ export interface components {
             /**
              * @description Models reported by the provider, grouped by model type. Keys are
              *     pluralized ConnectedModelType values ("embedders", "generators",
-             *     "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+             *     "rerankers", "chunkers", "classifiers", "rewriters",
              *     "readers", "transcribers", "extractors") plus "other" for models
              *     the provider's listing API does not classify by task. Populated
              *     only when the request includes the "models" expansion.
@@ -11565,10 +11565,6 @@ export interface components {
             generators: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
-            /** @description Available recognizer models from models_dir/recognizers/ */
-            recognizers: {
-                [key: string]: components["schemas"]["InferenceModelInfo"];
-            };
             /** @description Available Seq2Seq rewriter models from models_dir/rewriters/ */
             rewriters: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
@@ -11930,7 +11926,7 @@ export interface components {
          * @description Model registry kind.
          * @enum {string}
          */
-        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "recognizer" | "rewriter" | "reader" | "transcriber" | "extractor";
+        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor";
         /**
          * @description Optional backend preference for model loading or request execution.
          *     `auto` keeps the node default behavior.
@@ -12033,7 +12029,7 @@ export interface components {
              *     - `{models_dir}/embedders/` - Embedding models (ONNX)
              *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
              *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
-             *     - `{models_dir}/recognizers/` - Recognition models (ONNX)
+             *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
              *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
              *
              *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
@@ -12539,6 +12535,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
         ExtractionRelationSchema: {
             type: string;
             source?: string;
@@ -12550,16 +12547,25 @@ export interface components {
             /** @default false */
             multi_label?: boolean;
         };
-        ExtractionStructureField: string | {
+        ExtractionStructureField: string | ({
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            enum?: string[];
+        } & {
             [key: string]: unknown;
-        };
+        });
         ExtractionStructureSchema: {
-            fields?: {
+            fields: {
                 [key: string]: components["schemas"]["ExtractionStructureField"];
             };
         } & {
             [key: string]: unknown;
         };
+        /**
+         * @description Selects one extraction operation family per request. Entity labels may
+         *     accompany relation schemas so relation extraction can return its
+         *     participating entities in the same response.
+         */
         ExtractionSchema: {
             entities?: string[];
             relations?: components["schemas"]["ExtractionRelationSchema"][];
@@ -12578,6 +12584,30 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description Optional cross-input entity and relation deduplication. */
+        ExtractionResolverOptions: {
+            /**
+             * Format: float
+             * @default 0.85
+             */
+            similarity_threshold?: number;
+            /** @default true */
+            type_must_match?: boolean;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_entity_confidence?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_relation_confidence?: number;
+            /** @default true */
+            deduplicate_relations?: boolean;
+            /** @default true */
+            track_provenance?: boolean;
+        };
         ExtractionOptions: {
             /** Format: float */
             threshold?: number;
@@ -12585,6 +12615,7 @@ export interface components {
             include_confidence?: boolean;
             include_spans?: boolean;
             reader?: components["schemas"]["ExtractionReaderOptions"];
+            resolver?: components["schemas"]["ExtractionResolverOptions"];
         } & {
             [key: string]: unknown;
         };
@@ -12926,7 +12957,7 @@ export interface operations {
             path: {
                 connection_id: string;
                 /** @description Requires the connection capability `models.<operation>`. */
-                operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
+                operation: "embed" | "generate" | "rerank" | "chunk" | "extract" | "rewrite" | "read" | "transcribe";
             };
             cookie?: never;
         };

@@ -55,6 +55,7 @@ import { ConnectedProvidersSummary } from "@/components/ConnectedProvidersSummar
 import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
+  type ExtractorCapability,
   getDownloadCommand,
   getHardwareCapabilities,
   HARDWARE_INFO,
@@ -65,7 +66,6 @@ import {
   type ModelType,
   type QuantizationOption,
   type QuantizationType,
-  type RecognizerCapability,
   VARIANT_PRESETS,
   type VariantPreset,
 } from "@/data/inference-models";
@@ -78,7 +78,7 @@ const MODEL_TYPE_ICONS: Record<ModelType, React.FC<{ className?: string }>> = {
   embedder: Fingerprint,
   reranker: ArrowUpDown,
   chunker: Scissors,
-  recognizer: Tag,
+  extractor: Tag,
   rewriter: RefreshCw,
   generator: Sparkles,
   reader: BookOpen,
@@ -95,7 +95,7 @@ const NEUTRAL_ACCENT = {
 // Capability chips are neutral mono — the capability is carried by its label.
 const CAPABILITY_CHIP = "bg-muted text-muted-foreground border-border";
 
-const CAPABILITY_LABELS: Record<RecognizerCapability, string> = {
+const CAPABILITY_LABELS: Record<ExtractorCapability, string> = {
   labels: "NER",
   zeroshot: "Zero-Shot",
   relations: "Relations",
@@ -970,7 +970,7 @@ const ModelsPage: React.FC = () => {
       embedder: [],
       reranker: [],
       chunker: [],
-      recognizer: [],
+      extractor: [],
       rewriter: [],
       generator: [],
       reader: [],
@@ -989,7 +989,7 @@ const ModelsPage: React.FC = () => {
       embedder: 0,
       reranker: 0,
       chunker: 0,
-      recognizer: 0,
+      extractor: 0,
       rewriter: 0,
       generator: 0,
       reader: 0,

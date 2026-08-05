@@ -177,8 +177,6 @@ pub fn runFromIterator(
         return try inference.native_transcribe.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "read")) {
         return try inference.native_read.main(alloc, io, try collectArgs(alloc, args));
-    } else if (std.mem.eql(u8, command, "recognize")) {
-        return try inference.native_recognize.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "extract")) {
         return try inference.native_extract.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "compare")) {
@@ -593,8 +591,7 @@ fn printUsage() void {
         \\  run-artifact Run or validate compiled artifacts
         \\  transcribe  Run audio transcription
         \\  read        Run image/document reading
-        \\  recognize   Run entity recognition
-        \\  extract     Run structured extraction
+        \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
         \\  smoke       Run a model smoke test

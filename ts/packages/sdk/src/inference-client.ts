@@ -280,7 +280,7 @@ export class InferenceClient {
   /**
    * Extract structured data from text using GLiNER2 models
    *
-   * @param model - Name of the extractor model (e.g., "fastino/gliner2-base-v1")
+   * @param model - Name of the extractor model (e.g., "antflydb/gliner2-base-v1")
    * @param texts - Array of texts to extract from
    * @param schema - Extraction schema mapping structure names to field definitions
    * @param options - Optional parameters
@@ -289,7 +289,7 @@ export class InferenceClient {
    * @example
    * ```typescript
    * const result = await client.extract(
-   *   "fastino/gliner2-base-v1",
+   *   "antflydb/gliner2-base-v1",
    *   ["John Smith is 30 years old and works at Google."],
    *   { person: ["name::str", "age::str", "company::str"] }
    * );
@@ -374,7 +374,7 @@ export class InferenceClient {
   /**
    * Extract named entities through the canonical /ai/v1/extract endpoint.
    */
-  async recognize(
+  async extractEntities(
     model: string,
     texts: string[],
     labels: string[],

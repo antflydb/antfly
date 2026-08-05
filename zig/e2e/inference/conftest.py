@@ -48,7 +48,14 @@ import time
 import pytest
 import requests
 
-from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, ml_dir, models_dir
+from .models import (
+    DEFAULT_EXTRACTOR_MODEL,
+    bootstrap_models_for_listing,
+    inference_command,
+    maybe_pull_missing_model,
+    ml_dir,
+    models_dir,
+)
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
@@ -315,11 +322,11 @@ def api(base_url):
         session.headers["Authorization"] = f"Bearer {token}"
 
     def _check(r):
-        """Raise for status, but skip test on 404 or model-unavailable errors."""
+        """Raise for status, skipping only explicit model-unavailable errors."""
         if r.status_code == 404:
             body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-            msg = body.get("error", "model not found")
-            pytest.skip(f"Model unavailable: {msg}")
+            if body.get("error") == "MODEL_NOT_FOUND":
+                pytest.skip(f"Model unavailable: {body.get('message', 'model not found')}")
         if r.status_code == 400:
             body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
             err = body.get("error", "")
@@ -433,18 +440,22 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def recognize(self, text: list[str], model: str = "", labels: list[str] | None = None, **kwargs):
-            relation_labels = kwargs.pop("relation_labels", None)
+        def extract_entities(self, text: list[str], model: str = "", labels: list[str] | None = None, relations: list[str | dict] | None = None, **kwargs):
             body: dict = {
-                "model": model or "fastino/gliner2-base-v1",
-                "texts": text,
-                **kwargs,
+                "model": model or DEFAULT_EXTRACTOR_MODEL,
+                "inputs": [{"content": value} for value in text],
+                "schema": {},
             }
             if labels is not None:
-                body["labels"] = labels
-            if relation_labels is not None:
-                body["relation_labels"] = relation_labels
-            r = self.post("/recognize", json=body)
+                body["schema"]["entities"] = labels
+            if relations is not None:
+                body["schema"]["relations"] = [
+                    value if isinstance(value, dict) else {"type": value}
+                    for value in relations
+                ]
+            if kwargs:
+                body["options"] = kwargs
+            r = self.post("/extract", json=body)
             _check(r)
             return r.json()
 
@@ -469,15 +480,27 @@ def api(base_url):
             return r.json()
 
         def extract(self, texts: list[str] | None = None, images: list[str] | None = None, schema: dict | None = None, model: str = "", **kwargs):
+            structures = {}
+            for structure_name, field_defs in (schema or {}).items():
+                fields = {}
+                for field_def in field_defs:
+                    parts = field_def.split("::")
+                    field_name = parts[0]
+                    field_type = "list" if "list" in parts[1:] or "array" in parts[1:] else "str"
+                    fields[field_name] = field_type
+                structures[structure_name] = {"fields": fields}
+            inputs = []
+            if texts is not None:
+                inputs.extend({"content": text} for text in texts)
+            if images is not None:
+                inputs.extend({"content": [{"type": "image_url", "image_url": {"url": image}}]} for image in images)
             body = {
                 "model": model,
-                "schema": schema or {},
-                **kwargs,
+                "inputs": inputs,
+                "schema": {"structures": structures},
             }
-            if texts is not None:
-                body["texts"] = texts
-            if images is not None:
-                body["images"] = [{"url": image} if isinstance(image, str) else image for image in images]
+            if kwargs:
+                body["options"] = kwargs
             r = self.post("/extract", json=body)
             _check(r)
             return r.json()

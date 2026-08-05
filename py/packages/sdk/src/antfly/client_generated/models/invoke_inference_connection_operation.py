@@ -7,7 +7,6 @@ class InvokeInferenceConnectionOperation(str, Enum):
     EXTRACT = "extract"
     GENERATE = "generate"
     READ = "read"
-    RECOGNIZE = "recognize"
     RERANK = "rerank"
     REWRITE = "rewrite"
     TRANSCRIBE = "transcribe"

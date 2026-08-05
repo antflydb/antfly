@@ -61,7 +61,7 @@ MLX_HOSTFILE=<path>
 
 - Bounded BLAS-vs-TP parity run on a real local GLiNER2 model bundle
 - Server-path orchestration for distributed multi-rank GLiNER2 execution
-- Thread the same server/reporting semantics through the native `/classify` and `/recognize` paths
+- Thread the same server/reporting semantics through the native `/classify` and `/extract` paths
 
 ---
 
