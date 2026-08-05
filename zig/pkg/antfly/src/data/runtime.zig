@@ -9519,6 +9519,10 @@ pub const DataServer = struct {
 
     fn runProvisionedStartupCatchUp(self: *DataServer) ProvisionedStartupCatchUpStats {
         const started_epoch = self.provisioned_startup_catch_up_epoch.load(.acquire);
+        // Consume the work that launched this pass. Producers only raise this
+        // level-triggered bit, so work published while the scan is running
+        // remains armed for the next pass.
+        _ = self.provisioned_startup_catch_up_dirty.swap(false, .acq_rel);
         const started_ns = platform_time.monotonicNs();
         const started_at_ms: u64 = @intCast(@divTrunc(started_ns, std.time.ns_per_ms));
         self.provisioned_startup_catch_up_last_run_at_ms.store(started_at_ms, .monotonic);
@@ -9539,10 +9543,7 @@ pub const DataServer = struct {
                 started_epoch,
                 self.provisioned_startup_catch_up_epoch.load(.acquire),
             );
-            // Publish the deadline before dirty; the release store makes both
-            // fields visible as one scheduler decision.
-            self.provisioned_startup_catch_up_not_before_ms.store(completion.not_before_ms, .monotonic);
-            self.provisioned_startup_catch_up_dirty.store(completion.dirty, .release);
+            self.publishProvisionedStartupCatchUpCompletion(completion);
         }
         defer _ = self.provisioned_startup_catch_up_completed.fetchAdd(1, .monotonic);
 
@@ -10610,7 +10611,13 @@ pub const DataServer = struct {
             refresh_retry_pending = retry_result.hasRejectedTables() or retry_result.removals_deferred;
         }
         refresh_retry_pending = refresh_retry_pending or publish_result.removals_deferred;
-        self.provisioned_startup_catch_up_dirty.store(startup_catch_up_debt_present, .release);
+        // Runtime status is an observational producer of catch-up work, not
+        // the owner of the scheduler's retry state. A synthetic or temporarily
+        // unavailable runtime has no debt to report, but that absence must not
+        // erase a retry concurrently published by a failed catch-up pass. Only
+        // the catch-up worker's authoritative, complete inspection may clear
+        // this bit.
+        self.noteProvisionedStartupCatchUpDebt(startup_catch_up_debt_present);
         self.runtime_status_last_refresh_at_ms.store(
             @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
             .monotonic,
@@ -10640,6 +10647,18 @@ pub const DataServer = struct {
             }
         }
         return false;
+    }
+
+    fn noteProvisionedStartupCatchUpDebt(self: *DataServer, debt_present: bool) void {
+        if (debt_present) self.provisioned_startup_catch_up_dirty.store(true, .release);
+    }
+
+    fn publishProvisionedStartupCatchUpCompletion(self: *DataServer, completion: StartupCatchUpCompletion) void {
+        // Publish the deadline before dirty; the release store makes both
+        // fields visible as one scheduler decision. Never write false here:
+        // that would erase a producer wake published during this pass.
+        self.provisioned_startup_catch_up_not_before_ms.store(completion.not_before_ms, .monotonic);
+        if (completion.dirty) self.provisioned_startup_catch_up_dirty.store(true, .release);
     }
 
     fn cachedRuntimeStatusHasStartupCatchUpDebt(self: *DataServer, table_name: []const u8, group_id: u64) !?bool {
@@ -19837,6 +19856,46 @@ test "data runtime keeps status refresh dirty for non-startup async index work" 
     }};
     try std.testing.expect(DataServer.runtimeStatusWorkPending(bulk_statuses[0..]));
     try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(bulk_statuses[0..]));
+}
+
+test "runtime status observation cannot erase a startup catch-up retry" {
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+
+    // A failed catch-up pass owns this retry. A concurrent synthetic status
+    // observation cannot prove that the durable replay debt was cleared.
+    server.provisioned_startup_catch_up_dirty.store(true, .release);
+    server.noteProvisionedStartupCatchUpDebt(false);
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    // Positive observations still wake an otherwise idle scheduler.
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.noteProvisionedStartupCatchUpDebt(true);
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    // A producer wake raised while a successful pass is running must survive
+    // that pass's no-debt completion.
+    server.publishProvisionedStartupCatchUpCompletion(.{
+        .dirty = false,
+        .not_before_ms = 0,
+    });
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.publishProvisionedStartupCatchUpCompletion(.{
+        .dirty = true,
+        .not_before_ms = 42,
+    });
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 42), server.provisioned_startup_catch_up_not_before_ms.load(.acquire));
 }
 
 test "data runtime defers replica-root reconcile only while startup catch-up owns the shard" {

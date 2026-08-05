@@ -3729,6 +3729,7 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh budget preserves fresh cached group status for visible generation",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
         "data runtime keeps status refresh dirty for non-startup async index work",
+        "runtime status observation cannot erase a startup catch-up retry",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime runRound backs off retryable provision metadata failures",
         "data runtime provisioned root refresh worker backs off retryable metadata failures",
