@@ -284,8 +284,6 @@ test {
     _ = bloom;
     _ = jsonschema;
     _ = common;
-    _ = @import("common/http/peer_disconnect_observer.zig");
-    _ = @import("common/http/std_http_listener.zig");
     _ = foreign;
     _ = @import("foreign/postgres_libpq.zig");
     _ = embeddings;

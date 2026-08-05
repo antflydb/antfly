@@ -23,7 +23,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
-from .helpers import TINY_PNG_URI
+from .helpers import TINY_PNG_URI, make_wav_b64
 from .models import (
     default_generator_model_name,
     find_multimodal_generator_model_name,
@@ -379,6 +379,42 @@ def test_multimodal_generation(api):
     resp = r.json()
     content = _message_content(resp)
     assert content, f"No multimodal generated content in response: {resp}"
+
+
+@pytest.mark.multimodal
+@pytest.mark.slow
+def test_multimodal_audio_generation(api):
+    """The shipped unified Gemma projector must execute audio inference."""
+    if not run_multimodal_generator_tests():
+        pytest.skip(
+            "Multimodal generation uses a large model; set "
+            "RUN_MULTIMODAL_GENERATOR_TESTS=1 to run it"
+        )
+    model = _first_multimodal_generator_model(api)
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this audio in one short sentence."},
+            {
+                "type": "media",
+                "mime_type": "audio/wav",
+                "data": make_wav_b64(0.1, 16000),
+            },
+        ],
+    }]
+
+    response = api.post("/generate", json={
+        "model": model,
+        "messages": messages,
+        "max_tokens": 20,
+    })
+    assert response.status_code == 200, (
+        "shipped Gemma decoder/projector failed audio inference: "
+        f"{response.status_code} {response.text[:2000]}"
+    )
+    resp = response.json()
+    content = _message_content(resp)
+    assert content, f"No audio-conditioned generated content in response: {resp}"
 
 
 def test_generate_rejects_tool_choice_without_tools(api):

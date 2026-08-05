@@ -296,7 +296,10 @@ Common inference E2E environment variables:
   inference pull` when tests request unavailable models.
 - `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
 - `RUN_MULTIMODAL_GENERATOR_TESTS=1`: require the shipped multimodal generator
-  to be advertised, loadable, and able to complete live image inference.
+  to be advertised, loadable, and able to complete live image and audio
+  inference.
+- `RUN_CLIPCLAP_CONTRACT_TESTS=1`: require the published ClipClap GGUF pair to
+  pass strict server admission and complete live image and audio embedding.
 
 ## TypeScript Components
 

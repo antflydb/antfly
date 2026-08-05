@@ -827,6 +827,7 @@ jobs:
           # This is a release contract, not an optional capability probe. Keep
           # it targeted so unrelated large-model suites do not inflate this job.
           RUN_MULTIMODAL_GENERATOR_TESTS: "1"
+          RUN_CLIPCLAP_CONTRACT_TESTS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference

@@ -24,6 +24,11 @@ pub const StdHttpExecutorConfig = struct {
     write_buffer_size: usize = 1024,
     max_response_bytes: usize = 4 << 20,
     thread_stack_size: usize = std_http_listener.default_request_stack_size,
+    /// Hard ceiling for retained workers used by timeout/cancellation-aware
+    /// requests. Callers normally stay well below this through listener and
+    /// query admission; the finite limit prevents an abnormal fan-out from
+    /// permanently growing the owned Threaded executor without bound.
+    io_concurrent_limit: u32 = std_http_listener.default_process_io_concurrent_limit,
     keep_alive: bool = false,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
@@ -52,7 +57,10 @@ pub const StdHttpExecutor = struct {
 
     pub fn initInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) void {
         const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
-        io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.thread_stack_size });
+        io_impl.* = std.Io.Threaded.init(alloc, .{
+            .stack_size = cfg.thread_stack_size,
+            .concurrent_limit = .limited(cfg.io_concurrent_limit),
+        });
         const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
@@ -471,6 +479,15 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
 test "std http executor module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpExecutor;
+}
+
+test "std http executor owns a finite controlled request worker budget" {
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{
+        .io_concurrent_limit = 7,
+    });
+    defer executor.deinit();
+
+    try std.testing.expectEqual(std.Io.Limit.limited(7), executor.io_impl.concurrent_limit);
 }
 
 test "std http executor forwards only end-to-end request headers" {

@@ -3511,21 +3511,18 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        // The top-level declaration walk makes the transport and shared HTTP
-        // tests reachable; qualified filters keep this focused bucket scoped
-        // to those layers.
-        .filters = &.{ "raft integration module compiles", "raft.transport.", "common.http." },
+        .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
     const http_low_fd_ratchet_filter = "std http listener process threads and descriptors recover after cancellation storms";
     const http_low_fd_ratchet_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        // Keep the Raft integration anchor for declaration reachability, but
-        // execute only the process-level regression below. The wider transport
-        // bucket contains high-cardinality socket tests that intentionally do
+        // Compile the shared HTTP module for declaration reachability, but
+        // execute only the process-level regression below. The wider common
+        // and transport buckets contain high-cardinality socket tests that do
         // not fit inside this target's 256-descriptor process limit.
-        .filters = &.{ "raft integration module compiles", http_low_fd_ratchet_filter },
+        .filters = &.{ "common.", http_low_fd_ratchet_filter },
     });
     const run_http_low_fd_ratchet_tests = addFilteredTestRunArtifactWithRuntimeFilters(
         b,

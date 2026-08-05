@@ -379,6 +379,15 @@ def run_multimodal_generator_tests() -> bool:
     )
 
 
+def run_clipclap_contract_tests() -> bool:
+    """Require the published ClipClap pair to pass live server admission."""
+
+    value = os.environ.get("RUN_CLIPCLAP_CONTRACT_TESTS", "")
+    return run_large_model_tests() or (
+        value != "" and value not in {"0", "false", "False"}
+    )
+
+
 def inference_command() -> list[str]:
     explicit = os.environ.get("ANTFLY_BIN")
     if explicit:

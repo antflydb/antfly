@@ -42,6 +42,7 @@ from .models import (
     inference_command,
     inference_download_enabled,
     local_model_exists,
+    run_clipclap_contract_tests,
 )
 
 pytestmark = pytest.mark.model_integration
@@ -169,6 +170,44 @@ def _assert_distinct_rows(*embs):
         for j in range(i + 1, len(embs)):
             delta = sum(abs(a - b) for a, b in zip(embs[i], embs[j]))
             assert delta > 1e-5
+
+
+@pytest.mark.multimodal
+@pytest.mark.slow
+def test_published_clipclap_pair_server_contract(api):
+    """The shipped CLIP and CLAP artifacts must admit and execute as one model."""
+    if not run_clipclap_contract_tests():
+        pytest.skip(
+            "ClipClap uses a large paired model; set "
+            "RUN_CLIPCLAP_CONTRACT_TESTS=1 to require its release contract"
+        )
+
+    response = api.post(
+        "/embed",
+        json={
+            "model": CLIPCLAP_MODEL,
+            "input": [
+                _image_part(make_solid_png_uri(255, 255, 255)),
+                _media_wav_part(),
+            ],
+        },
+    )
+    assert response.status_code == 200, (
+        "published ClipClap pair failed server admission or inference: "
+        f"{response.status_code} {response.text[:2000]}"
+    )
+    embeddings = [item["embedding"] for item in response.json()["data"]]
+    _assert_clipclap_embeddings(embeddings, 2)
+    _assert_distinct_rows(*embeddings)
+    for embedding in embeddings:
+        assert all(math.isfinite(value) for value in embedding)
+        assert abs(l2_norm(embedding) - 1.0) < 1e-4
+
+    embedders = api.models().get("embedders", {})
+    assert CLIPCLAP_MODEL in embedders, (
+        f"{CLIPCLAP_MODEL} executed but is absent from /models embedders: "
+        f"{sorted(embedders)}"
+    )
 
 
 @pytest.mark.multimodal

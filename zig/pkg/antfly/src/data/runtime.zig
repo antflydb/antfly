@@ -10300,7 +10300,10 @@ pub const DataServer = struct {
         defer self.auto_bulk_finish_mutex.unlock();
         if (self.auto_bulk_finish_future != null) return;
         if (self.auto_bulk_finish_io == null) {
-            self.auto_bulk_finish_io = std.Io.Threaded.init(self.alloc, .{});
+            self.auto_bulk_finish_io = std.Io.Threaded.init(self.alloc, .{
+                // requestAutoBulkFinishBackground serializes one worker.
+                .concurrent_limit = .limited(1),
+            });
         }
         self.auto_bulk_finish_stop.store(false, .release);
         const io = self.auto_bulk_finish_io.?.io();
