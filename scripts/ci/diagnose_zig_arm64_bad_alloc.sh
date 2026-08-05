@@ -6,10 +6,42 @@ diagnostic_root="${RUNNER_TEMP:-/tmp}/zig-arm64-bad-alloc"
 baseline_log="$diagnostic_root/baseline-build.log"
 backtrace_log="$diagnostic_root/gdb-backtrace.log"
 replay_log="$diagnostic_root/gdb-build-runner.log"
+direct_time_log="$diagnostic_root/direct-compiler-time.log"
+direct_gdb_log="$diagnostic_root/direct-compiler-gdb.log"
+direct_strace_log="$diagnostic_root/direct-compiler-strace.log"
 compiler_command_file="$diagnostic_root/compiler-command.txt"
 build_runner_command_file="$diagnostic_root/build-runner-command.txt"
 
 mkdir -p "$diagnostic_root"
+
+capture_memory_snapshot() {
+  local label="$1"
+
+  {
+    echo
+    echo "=== memory snapshot: $label ==="
+    date -u '+utc: %Y-%m-%dT%H:%M:%SZ'
+    echo
+    free -h || true
+    echo
+    grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|CommitLimit|Committed_AS):' /proc/meminfo || true
+    echo
+    echo "cgroup memory files:"
+    for path in \
+      /sys/fs/cgroup/memory.max \
+      /sys/fs/cgroup/memory.current \
+      /sys/fs/cgroup/memory.peak \
+      /sys/fs/cgroup/memory.high \
+      /sys/fs/cgroup/memory.events \
+      /sys/fs/cgroup/memory.events.local
+    do
+      if [ -e "$path" ]; then
+        echo "--- $path"
+        cat "$path" || true
+      fi
+    done
+  } >> "$diagnostic_root/system-info.txt"
+}
 
 {
   echo "commit: $(git -C "$repo_root" rev-parse HEAD)"
@@ -20,6 +52,7 @@ mkdir -p "$diagnostic_root"
   echo
   ulimit -a
 } > "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "initial"
 
 echo "Reproducing the release failure and retaining its generated modules..."
 set +e
@@ -35,6 +68,7 @@ set +e
 baseline_status=${PIPESTATUS[0]}
 set -e
 printf 'baseline exit status: %s\n' "$baseline_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after baseline build"
 
 if [ "$baseline_status" -eq 0 ]; then
   echo "The baseline build unexpectedly succeeded; there is no failed compiler command to diagnose." >&2
@@ -89,10 +123,58 @@ build_runner_argv[1]="$repo_root/scripts/ci/zig_gdb_wrapper.sh"
 
 echo "Replaying the failing build-runner/compiler protocol under GDB..."
 set +e
-(cd "$repo_root/zig" && "${build_runner_argv[@]}") 2>&1 | tee "$replay_log"
+(cd "$repo_root/zig" && timeout 40m "${build_runner_argv[@]}") 2>&1 | tee "$replay_log"
 replay_status=${PIPESTATUS[0]}
 set -e
 printf 'gdb build-runner exit status: %s\n' "$replay_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after build-runner gdb replay"
+
+echo "Replaying the extracted compiler command directly under /usr/bin/time -v..."
+set +e
+(cd "$repo_root/zig" && timeout 40m /usr/bin/time -v "${compiler_argv[@]}") 2>&1 | tee "$direct_time_log"
+direct_time_status=${PIPESTATUS[0]}
+set -e
+printf 'direct compiler time exit status: %s\n' "$direct_time_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after direct compiler time replay"
+
+echo "Replaying the extracted compiler command directly under GDB..."
+set +e
+(
+  cd "$repo_root/zig"
+  timeout 40m gdb --quiet --batch \
+    -ex 'set pagination off' \
+    -ex 'set confirm off' \
+    -ex 'set print demangle on' \
+    -ex 'set breakpoint pending on' \
+    -ex 'break _ZSt17__throw_bad_allocv' \
+    -ex 'break _ZN4llvm22report_bad_alloc_errorEPKcb' \
+    -ex 'catch throw' \
+    -ex run \
+    -ex 'echo \n=== selected thread backtrace ===\n' \
+    -ex 'bt full' \
+    -ex 'echo \n=== all thread backtraces ===\n' \
+    -ex 'thread apply all bt full' \
+    -ex 'echo \n=== registers ===\n' \
+    -ex 'info registers' \
+    --args "${compiler_argv[@]}"
+) 2>&1 | tee "$direct_gdb_log"
+direct_gdb_status=${PIPESTATUS[0]}
+set -e
+printf 'direct compiler gdb exit status: %s\n' "$direct_gdb_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after direct compiler gdb replay"
+
+echo "Replaying the extracted compiler command under strace memory syscall tracing..."
+set +e
+(
+  cd "$repo_root/zig"
+  timeout 30m strace -f \
+    -e trace=brk,mmap,mmap2,munmap,mremap,execve \
+    -o "$direct_strace_log" \
+    "${compiler_argv[@]}"
+)
+direct_strace_status=$?
+set -e
+printf 'direct compiler strace exit status: %s\n' "$direct_strace_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after direct compiler strace replay"
 
 echo "Diagnostics written to $diagnostic_root"
-

@@ -15,7 +15,7 @@ jobs:
     name: Capture failing compiler backtrace
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish-arm64
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v6
@@ -26,7 +26,7 @@ jobs:
       - name: Install Linux diagnostic dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates gdb
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates gdb strace time
 
       - name: Install Zig
         run: |
