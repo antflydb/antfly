@@ -14,6 +14,14 @@ if [ "${1:-}" = "build-exe" ]; then
         break
       fi
     fi
+    if [[ "${!i}" == *"/zig/pkg/antfly/src/main.zig" ]]; then
+      is_antfly_build=true
+      break
+    fi
+    if [[ "${!i}" == "-Dantfly-bin-name=antfly" ]]; then
+      is_antfly_build=true
+      break
+    fi
   done
 fi
 
@@ -32,6 +40,9 @@ exec gdb --quiet --batch \
   -ex 'set confirm off' \
   -ex 'set print demangle on' \
   -ex 'set breakpoint pending on' \
+  -ex 'set follow-fork-mode child' \
+  -ex 'set detach-on-fork off' \
+  -ex 'catch signal SIGABRT' \
   -ex 'break _ZSt17__throw_bad_allocv' \
   -ex 'break _ZN4llvm22report_bad_alloc_errorEPKcb' \
   -ex 'catch throw' \

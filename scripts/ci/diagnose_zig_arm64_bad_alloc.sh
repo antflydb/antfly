@@ -10,6 +10,7 @@ core_replay_log="$diagnostic_root/core-build-runner.log"
 direct_time_log="$diagnostic_root/direct-compiler-time.log"
 direct_gdb_log="$diagnostic_root/direct-compiler-gdb.log"
 direct_strace_log="$diagnostic_root/direct-compiler-strace.log"
+protocol_strace_log="$diagnostic_root/build-runner-protocol-strace.log"
 compiler_command_file="$diagnostic_root/compiler-command.txt"
 build_runner_command_file="$diagnostic_root/build-runner-command.txt"
 core_marker="$diagnostic_root/core-marker"
@@ -114,6 +115,7 @@ if [ "${#build_runner_argv[@]}" -lt 6 ] || [ ! -x "${build_runner_argv[0]}" ] ||
   echo "Extracted command is not the expected Zig build-runner invocation." >&2
   exit 1
 fi
+original_build_runner_argv=("${build_runner_argv[@]}")
 
 # The node's core pattern is /core.<exe>.<pid>.<time>. Re-run the cached build
 # runner uninstrumented as root so the failing Zig child can write there, then
@@ -172,6 +174,20 @@ set -e
 printf 'gdb build-runner exit status: %s\n' "$gdb_replay_status" >> "$diagnostic_root/system-info.txt"
 capture_memory_snapshot "after build-runner gdb replay"
 
+echo "Replaying the original build-runner/compiler protocol under strace..."
+set +e
+(
+  cd "$repo_root/zig"
+  timeout 30m strace -f \
+    -e trace=brk,mmap,mmap2,munmap,mremap,execve,clone,clone3,fork,vfork,wait4 \
+    -o "$protocol_strace_log" \
+    "${original_build_runner_argv[@]}"
+)
+protocol_strace_status=$?
+set -e
+printf 'build-runner protocol strace exit status: %s\n' "$protocol_strace_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after build-runner protocol strace replay"
+
 echo "Replaying the extracted compiler command directly under /usr/bin/time -v..."
 set +e
 (cd "$repo_root/zig" && timeout 40m /usr/bin/time -v "${compiler_argv[@]}") 2>&1 | tee "$direct_time_log"
@@ -189,6 +205,9 @@ set +e
     -ex 'set confirm off' \
     -ex 'set print demangle on' \
     -ex 'set breakpoint pending on' \
+    -ex 'set follow-fork-mode child' \
+    -ex 'set detach-on-fork off' \
+    -ex 'catch signal SIGABRT' \
     -ex 'break _ZSt17__throw_bad_allocv' \
     -ex 'break _ZN4llvm22report_bad_alloc_errorEPKcb' \
     -ex 'catch throw' \
