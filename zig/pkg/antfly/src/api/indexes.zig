@@ -1526,16 +1526,20 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
-    const complete_dense_coverage = aggregate.coverage_identity_ready and
+    const complete_materialization = aggregate.coverage_identity_ready and
         aggregate.coverage_summary_ready and
         aggregate.coverage_config_mismatch_count == 0 and
-        aggregate.coverage_produced_count == aggregate.table_doc_count and
-        aggregate.coverage_skipped_count == 0 and
-        aggregate.coverage_terminal_failed_count == 0;
+        aggregate.coverage_terminal_failed_count == 0 and
+        coverageAllSourcesTerminal(
+            aggregate.table_doc_count,
+            aggregate.coverage_produced_count,
+            aggregate.coverage_skipped_count,
+            aggregate.coverage_terminal_failed_count,
+        );
     if (aggregate.catch_up_active or
-        (aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence and !complete_dense_coverage)) return;
-    if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.table_doc_count)) return;
-    if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
+        (aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence and !complete_materialization)) return;
+    if (!complete_materialization) return;
+    if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.coverage_produced_count)) return;
 
     aggregate.replay_applied_sequence = @max(aggregate.replay_applied_sequence, aggregate.replay_target_sequence);
     aggregate.catch_up_applied_sequence = @max(aggregate.catch_up_applied_sequence, aggregate.catch_up_target_sequence);
@@ -1787,6 +1791,10 @@ fn coverageOutcomeTotal(produced: u64, skipped: u64, terminal_failed: u64) ?u64 
 
 fn coverageCountersValid(source_total: u64, produced: u64, skipped: u64, terminal_failed: u64) bool {
     return (coverageOutcomeTotal(produced, skipped, terminal_failed) orelse return false) <= source_total;
+}
+
+fn coverageAllSourcesTerminal(source_total: u64, produced: u64, skipped: u64, terminal_failed: u64) bool {
+    return (coverageOutcomeTotal(produced, skipped, terminal_failed) orelse return false) == source_total;
 }
 
 fn coverageReplayCurrent(applied_sequence: u64, target_sequence: u64, catch_up_required: bool) bool {
@@ -2217,14 +2225,19 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
     const source_coverage_visible = coverage.source_visible;
     const dense_coverage_complete = coverage.complete;
+    const materialization_complete = !coverage_incomplete and
+        replay_current and
+        terminal_failed_count == 0 and
+        coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count) and
+        embeddingsArtifactPublishComplete(item, sparse, produced_count);
     // External indexes are query-ready once their published artifacts and
     // replay are current. Their coverage remains independently observable and
     // may be incomplete because callers are not required to supply a vector
     // for every source document.
-    const policy_readiness_complete = if (coverage_policy == .external)
+    const readiness_complete = if (coverage_policy == .external)
         !coverage_incomplete and replay_current
     else
-        dense_coverage_complete;
+        materialization_complete;
     if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -2252,7 +2265,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
-    if (policy_readiness_complete and source_coverage_visible and !enrichment_pending) {
+    if (readiness_complete and !enrichment_pending) {
         view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
         view.replay_catch_up_required = false;
         view.backfill_active = false;
@@ -2262,13 +2275,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     const replay_ready = view.replay_target_sequence > 0 and
         view.replay_target_sequence <= view.replay_applied_sequence and
         !(if (enrichment) |stats| stats.retrying or stats.worker_failed else false);
-    const artifact_visible = observation_current and embeddingsArtifactPublishComplete(item, sparse, table_doc_count);
+    const artifact_visible = observation_current and embeddingsArtifactPublishComplete(item, sparse, produced_count);
     if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
         return view;
     }
-    if (policy_readiness_complete and source_coverage_visible and !enrichment_pending) {
+    if (readiness_complete and !enrichment_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
     } else if (!coverage_incomplete and replay_ready and source_coverage_visible and (!require_table_coverage or table_doc_count == 0) and !enrichment_pending) {
@@ -2276,13 +2289,10 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         view.backfill_progress = 1.0;
     } else if (table_doc_count > 0 and !dense_coverage_complete) {
         view.backfill_active = true;
-        if (view.replay_target_sequence > 0 and view.replay_applied_sequence >= view.replay_target_sequence) {
-            view.replay_applied_sequence = view.replay_target_sequence - 1;
-            view.replay_catch_up_required = true;
-        }
+        const terminal_outcomes = coverageOutcomeTotal(produced_count, skipped_count, terminal_failed_count) orelse 0;
         view.backfill_progress = @min(
             1.0,
-            @as(f64, @floatFromInt(coverage.covered)) /
+            @as(f64, @floatFromInt(terminal_outcomes)) /
                 @as(f64, @floatFromInt(table_doc_count)),
         );
     }
@@ -2392,9 +2402,9 @@ fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
 }
 
-fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, table_doc_count: u64) bool {
-    if (table_doc_count == 0 and item.doc_count == 0) return true;
-    return embeddingsArtifactVisible(item, sparse);
+fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, expected_doc_count: u64) bool {
+    if (expected_doc_count == 0) return item.doc_count == 0;
+    return item.doc_count >= expected_doc_count and embeddingsArtifactVisible(item, sparse);
 }
 
 fn backfillState(index_type: ApiIndexType, active: bool, enrichment_failed: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
@@ -2768,7 +2778,7 @@ fn appendSingleIndexRuntimeStatus(
         const coverage_complete = coverage.complete;
         const artifact_publish_pending = !embeddings_materialization_current or
             (replay_target_sequence > 0 and
-                !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count) and
+                !embeddingsArtifactPublishComplete(item, embeddings_sparse, produced_count) and
                 !coverage_complete);
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
         try appendIntValue(alloc, out, visible_doc_count);
@@ -4873,7 +4883,7 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
 }
 
-test "managed embeddings coverage debt does not fabricate replay debt" {
+test "managed embeddings skipped terminal sources complete backfill without fabricating replay debt" {
     const config_json = "{\"type\":\"embeddings\",\"field\":\"semantic_content\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
     var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
     defer parsed_config.deinit();
@@ -4882,36 +4892,36 @@ test "managed embeddings coverage debt does not fabricate replay debt" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
-        .doc_count = 6,
+        .doc_count = 12,
         .node_count = 1,
         .root_node = 1,
-        .coverage_produced_count = 6,
-        .coverage_skipped_count = 3,
+        .coverage_produced_count = 12,
+        .coverage_skipped_count = 4,
         .coverage_generation = 42,
         .coverage_config_hash = config_hash,
         .coverage_identity_ready = true,
-        .replay_applied_sequence = 12,
-        .replay_target_sequence = 12,
+        .replay_applied_sequence = 20,
+        .replay_target_sequence = 20,
         .replay_catch_up_required = false,
         .catch_up_active = false,
         .catch_up_phase = .idle,
-        .catch_up_applied_sequence = 10,
-        .catch_up_target_sequence = 12,
+        .catch_up_applied_sequence = 20,
+        .catch_up_target_sequence = 20,
     }};
     var items = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
-            .source_doc_count = 9,
-            .doc_count = 9,
+            .source_doc_count = 16,
+            .doc_count = 16,
             .index_count = 1,
             .indexes = indexes[0..],
             .enrichment = .{
                 .enabled = true,
-                .target_sequence = 10,
-                .applied_sequence = 10,
-                .processed_requests = 9,
-                .skipped_source_count = 3,
+                .target_sequence = 20,
+                .applied_sequence = 20,
+                .processed_requests = 16,
+                .skipped_source_count = 4,
             },
         },
     }};
@@ -4933,12 +4943,16 @@ test "managed embeddings coverage debt does not fabricate replay debt" {
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":12") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":20") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"policy\":\"strict\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_total\":16,\"produced\":12,\"skipped\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":false") != null);
 }
 

@@ -8713,6 +8713,12 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.InvalidManifest => return error.InvalidManifest,
+            error.InvalidTableFile => return error.InvalidTableFile,
+            error.TableBlockChecksumMismatch => return error.TableBlockChecksumMismatch,
+            error.CorruptInput => return error.CorruptInput,
+            error.UnsupportedVersion => return error.UnsupportedVersion,
+            error.Corrupted => return error.Corrupted,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8841,6 +8847,13 @@ pub const ApiHttpServer = struct {
                 => return error.ReadUnavailable,
                 error.Timeout => return error.Timeout,
                 error.Cancelled => return error.Cancelled,
+                error.InvalidManifest,
+                error.InvalidTableFile,
+                error.TableBlockChecksumMismatch,
+                error.CorruptInput,
+                error.UnsupportedVersion,
+                error.Corrupted,
+                => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -8879,6 +8892,13 @@ pub const ApiHttpServer = struct {
             => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8945,6 +8965,13 @@ pub const ApiHttpServer = struct {
             => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -10982,6 +11009,17 @@ pub const ApiHttpServer = struct {
             error.ReadUnavailable,
             => try textResponse(self.alloc, 503, "standby read unavailable"),
             error.PersistentDescriptorAdmissionExhausted => try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => .{
+                .status = 500,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = try public_table_http.tableStorageUnreadableBody(self.alloc, err),
+            },
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
@@ -26319,12 +26357,14 @@ test "api http server preserves public query availability errors" {
         query_error: anyerror,
         status: u16,
         body: []const u8,
+        json: bool = false,
     }{
         .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
-        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}" },
+        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
+        .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
     for (cases) |case| {
         var reads = FakeReads{ .query_error = case.query_error };
@@ -26338,6 +26378,7 @@ test "api http server preserves public query availability errors" {
 
         try std.testing.expectEqual(case.status, resp.status);
         try std.testing.expectEqualStrings(case.body, resp.body);
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type.?);
 
         var multi_resp = try server.handlePublicTableMultiQuery("docs",
             \\{"query":{"match_all":{}}}
@@ -26345,6 +26386,7 @@ test "api http server preserves public query availability errors" {
         defer multi_resp.deinit(alloc);
         try std.testing.expectEqual(case.status, multi_resp.status);
         try std.testing.expectEqualStrings(case.body, multi_resp.body);
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type.?);
     }
 }
 
@@ -29082,9 +29124,12 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.doc_count);
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.total_indexed);
     try std.testing.expectEqual(@as(?u64, 17), parsed.value.status.node_count);
-    try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_applied_sequence);
+    // This legacy-shaped observation has no generation-scoped coverage
+    // witness. Preserve its authoritative replay debt instead of inferring
+    // readiness from physical index cardinality alone.
+    try std.testing.expectEqual(@as(?u64, 3), parsed.value.status.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_target_sequence);
-    try std.testing.expectEqual(@as(?bool, false), parsed.value.status.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
     const shard_status = parsed.value.shard_status.?;
     const shard_10 = shard_status.@"10".?;
     try std.testing.expectEqual(@as(?u64, 9), shard_10.doc_count);

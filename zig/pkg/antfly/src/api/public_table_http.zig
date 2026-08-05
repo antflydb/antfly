@@ -90,6 +90,12 @@ pub const TableApi = struct {
         EmbedRateLimited,
         EmbedTransientFailure,
         EmbedUpstreamFailure,
+        InvalidManifest,
+        InvalidTableFile,
+        TableBlockChecksumMismatch,
+        CorruptInput,
+        UnsupportedVersion,
+        Corrupted,
         InternalFailure,
     };
 
@@ -511,6 +517,29 @@ pub const OwnedResponse = struct {
     }
 };
 
+pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidManifest,
+        error.InvalidTableFile,
+        error.TableBlockChecksumMismatch,
+        error.CorruptInput,
+        error.UnsupportedVersion,
+        error.Corrupted,
+        => true,
+        else => false,
+    };
+}
+
+pub fn tableStorageUnreadableBody(alloc: std.mem.Allocator, err: anyerror) ![]u8 {
+    std.debug.assert(isNonRetryableTableStorageReadError(err));
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "table_storage_unreadable",
+        .@"error" = @errorName(err),
+        .message = "table storage unreadable",
+        .retryable = false,
+    }, .{});
+}
+
 fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
     const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
@@ -697,6 +726,20 @@ pub fn handleTableQueryRequest(
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
+            },
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => {
+                std.log.err("public table query storage unreadable table={s} err={}", .{ table_name, err });
+                return .{
+                    .status = 500,
+                    .body = try tableStorageUnreadableBody(alloc, err),
+                    .json = true,
+                };
             },
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
@@ -2058,6 +2101,8 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
+        .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
 
     for (cases) |tc| {

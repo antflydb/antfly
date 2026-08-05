@@ -759,7 +759,7 @@ components:
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
-          description: "Whether the index enricher is currently backfilling"
+          description: "Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true."
         repair:
           $ref: '#/components/schemas/IndexRepairStatus'
         wal_backlog:
@@ -775,7 +775,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
-          description: "Backfill progress as a ratio from 0.0 to 1.0"
+          description: "Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current."
         backfill_items_processed:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -784,7 +784,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Operational readiness state such as ready, running, retrying, or failed."
+          description: "Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal."
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer

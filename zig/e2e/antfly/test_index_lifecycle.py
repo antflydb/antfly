@@ -649,9 +649,14 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     coverage = converged["coverage"]
     assert coverage["policy"] == "strict"
     assert coverage["complete"] is False
-    assert coverage["pending"] >= 3
-    assert converged["backfill_active"] is True
-    assert converged["rebuilding"] is True
+    assert coverage["source_total"] == 9
+    assert coverage["produced"] == 6
+    assert coverage["skipped"] == 3
+    assert coverage["pending"] == 3
+    assert converged["backfill_active"] is False
+    assert converged["rebuilding"] is False
+    assert converged["backfill_progress"] == pytest.approx(1.0)
+    assert converged["backfill_state"] == "ready"
 
 
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited_enrichment(
