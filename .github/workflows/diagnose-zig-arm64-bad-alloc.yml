@@ -1,0 +1,48 @@
+name: Diagnose Zig ARM64 bad_alloc
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  diagnose:
+    name: Capture compiler backtrace and test non-LLVM backend
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: arc-antfly-publish-arm64
+    timeout-minutes: 90
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          submodules: true
+
+      - name: Install Linux diagnostic dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates gdb
+
+      - name: Install Zig
+        run: |
+          curl -L "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Capture bad_alloc diagnostics
+        run: scripts/ci/diagnose_zig_arm64_bad_alloc.sh
+
+      - name: Upload compiler diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: zig-arm64-bad-alloc-diagnostics
+          path: ${{ runner.temp }}/zig-arm64-bad-alloc
+          if-no-files-found: error
+
