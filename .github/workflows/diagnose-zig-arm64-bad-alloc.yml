@@ -12,7 +12,7 @@ env:
 
 jobs:
   diagnose:
-    name: Capture failing compiler backtrace
+    name: Capture failing compiler core backtrace
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 180

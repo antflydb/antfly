@@ -5,12 +5,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 diagnostic_root="${RUNNER_TEMP:-/tmp}/zig-arm64-bad-alloc"
 baseline_log="$diagnostic_root/baseline-build.log"
 backtrace_log="$diagnostic_root/gdb-backtrace.log"
-replay_log="$diagnostic_root/gdb-build-runner.log"
+gdb_replay_log="$diagnostic_root/gdb-build-runner.log"
+core_replay_log="$diagnostic_root/core-build-runner.log"
 direct_time_log="$diagnostic_root/direct-compiler-time.log"
 direct_gdb_log="$diagnostic_root/direct-compiler-gdb.log"
 direct_strace_log="$diagnostic_root/direct-compiler-strace.log"
 compiler_command_file="$diagnostic_root/compiler-command.txt"
 build_runner_command_file="$diagnostic_root/build-runner-command.txt"
+core_marker="$diagnostic_root/core-marker"
 
 mkdir -p "$diagnostic_root"
 
@@ -108,25 +110,66 @@ fi
 printf '%s\n' "$build_runner_command" > "$build_runner_command_file"
 
 read -r -a build_runner_argv <<< "$build_runner_command"
-if [ "${#build_runner_argv[@]}" -lt 3 ] || [ ! -x "${build_runner_argv[0]}" ] || [ ! -x "${build_runner_argv[1]}" ]; then
+if [ "${#build_runner_argv[@]}" -lt 6 ] || [ ! -x "${build_runner_argv[0]}" ] || [ ! -x "${build_runner_argv[1]}" ]; then
   echo "Extracted command is not the expected Zig build-runner invocation." >&2
   exit 1
 fi
 
-# Re-run the cached build runner, replacing only its Zig executable argument
-# with a wrapper. The wrapper starts GDB for the antfly build-exe child while
-# preserving --listen=- and the build-runner protocol that were present in the
-# original failure.
+# The node's core pattern is /core.<exe>.<pid>.<time>. Re-run the cached build
+# runner uninstrumented as root so the failing Zig child can write there, then
+# inspect the core after the process has already failed. This preserves the
+# original --listen=- compiler protocol without live-debugger interference.
+touch "$core_marker"
+core_local_cache="${RUNNER_TEMP:-/tmp}/antfly-zig-core-local-cache"
+core_global_cache="${RUNNER_TEMP:-/tmp}/antfly-zig-core-global-cache"
+mkdir -p "$core_local_cache" "$core_global_cache"
+cp -a "${build_runner_argv[4]}/." "$core_local_cache/"
+core_build_runner_argv=("${build_runner_argv[@]}")
+core_build_runner_argv[4]="$core_local_cache"
+core_build_runner_argv[5]="$core_global_cache"
+
+echo "Replaying the failing build-runner/compiler protocol for a core dump..."
+set +e
+(cd "$repo_root/zig" && timeout 40m sudo bash -c 'ulimit -c unlimited; exec "$@"' _ "${core_build_runner_argv[@]}") 2>&1 | tee "$core_replay_log"
+replay_status=${PIPESTATUS[0]}
+set -e
+printf 'core build-runner exit status: %s\n' "$replay_status" >> "$diagnostic_root/system-info.txt"
+capture_memory_snapshot "after core build-runner replay"
+
+core_path="$(sudo find / -maxdepth 1 -type f -name 'core.zig.*' -newer "$core_marker" -print | tail -1)"
+if [ -n "$core_path" ]; then
+  printf 'core path: %s\n' "$core_path" >> "$diagnostic_root/system-info.txt"
+  set +e
+  sudo gdb --quiet --batch \
+    -ex 'set pagination off' \
+    -ex 'set print demangle on' \
+    -ex 'echo \n=== selected thread backtrace ===\n' \
+    -ex 'bt 100' \
+    -ex 'echo \n=== all thread backtraces ===\n' \
+    -ex 'thread apply all bt 30' \
+    -ex 'echo \n=== registers ===\n' \
+    -ex 'info registers' \
+    "${build_runner_argv[1]}" "$core_path" 2>&1 | tee "$backtrace_log"
+  core_gdb_status=${PIPESTATUS[0]}
+  set -e
+  printf 'post-mortem gdb exit status: %s\n' "$core_gdb_status" >> "$diagnostic_root/system-info.txt"
+  sudo rm -f -- "$core_path"
+else
+  echo "The uninstrumented compiler replay did not produce a Zig core dump." | tee "$backtrace_log"
+fi
+
+# Preserve the additional replay diagnostics added during investigation.
 export ANTFLY_GDB_REAL_ZIG="${build_runner_argv[1]}"
-export ANTFLY_GDB_LOG="$backtrace_log"
-build_runner_argv[1]="$repo_root/scripts/ci/zig_gdb_wrapper.sh"
+export ANTFLY_GDB_LOG="$diagnostic_root/build-runner-gdb-backtrace.log"
+gdb_build_runner_argv=("${build_runner_argv[@]}")
+gdb_build_runner_argv[1]="$repo_root/scripts/ci/zig_gdb_wrapper.sh"
 
 echo "Replaying the failing build-runner/compiler protocol under GDB..."
 set +e
-(cd "$repo_root/zig" && timeout 40m "${build_runner_argv[@]}") 2>&1 | tee "$replay_log"
-replay_status=${PIPESTATUS[0]}
+(cd "$repo_root/zig" && timeout 40m "${gdb_build_runner_argv[@]}") 2>&1 | tee "$gdb_replay_log"
+gdb_replay_status=${PIPESTATUS[0]}
 set -e
-printf 'gdb build-runner exit status: %s\n' "$replay_status" >> "$diagnostic_root/system-info.txt"
+printf 'gdb build-runner exit status: %s\n' "$gdb_replay_status" >> "$diagnostic_root/system-info.txt"
 capture_memory_snapshot "after build-runner gdb replay"
 
 echo "Replaying the extracted compiler command directly under /usr/bin/time -v..."
