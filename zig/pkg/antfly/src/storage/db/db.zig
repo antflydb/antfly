@@ -15187,16 +15187,16 @@ pub const DB = struct {
     ) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const reservation_limit = if (self.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
+        var publication_plan = try self.core.index_manager.planTextKernelPublication(self.alloc, docs, reservation_limit);
+        defer publication_plan.deinit();
         var segment_count: usize = 0;
         var start: usize = 0;
-        while (start < docs.len) {
-            const end = textKernelPublicationChunkEnd(self.core.index_manager, docs, start, reservation_limit);
-            const chunk = docs[start..end];
+        for (publication_plan.chunks) |planned| {
+            const chunk = docs[start..planned.end];
             {
                 var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                 if (self.text_merge_runtime) |runtime| {
-                    const estimate = self.core.index_manager.estimateTextKernelPublication(chunk);
-                    merge_permit = try runtime.acquireProducerPermit(index_name, estimate.segment_count, estimate.byte_count);
+                    merge_permit = try runtime.acquireProducerPermit(index_name, planned.estimate.segment_count, planned.estimate.byte_count);
                 }
                 defer if (merge_permit) |*permit| permit.release();
                 lockApply(self);
@@ -15208,33 +15208,10 @@ pub const DB = struct {
                 segment_count += published;
                 if (self.text_merge_runtime) |runtime| runtime.notify();
             }
-            start = end;
+            start = planned.end;
         }
+        std.debug.assert(start == docs.len);
         return segment_count;
-    }
-
-    fn textKernelPublicationChunkEnd(
-        index_manager: *index_manager_mod.IndexManager,
-        docs: []const introducer_mod.TextDocument,
-        start: usize,
-        reservation_limit: usize,
-    ) usize {
-        if (reservation_limit == std.math.maxInt(usize)) return docs.len;
-        const remaining_estimate = index_manager.estimateTextKernelPublication(docs[start..]);
-        if (remaining_estimate.segment_count <= reservation_limit) return docs.len;
-
-        var low = start + 1;
-        var high = docs.len;
-        while (low < high) {
-            const mid = low + (high - low + 1) / 2;
-            const estimate = index_manager.estimateTextKernelPublication(docs[start..mid]);
-            if (estimate.segment_count <= reservation_limit) {
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
-        return low;
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
@@ -32889,12 +32866,14 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         };
         const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
         defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+        var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
+        defer publication_context.deinit();
         var collected = try collectTextDocumentWritesForIndex(
             ctx.alloc,
             ctx.store,
-            ctx.index_manager,
             batch.documents,
             index_ref.name,
+            publication_context.chunk_backed,
             ctx.index_manager.byte_range,
             .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
         );
@@ -32902,30 +32881,32 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
 
         const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
+        var publication_plan = try ctx.index_manager.planTextBatchPublication(
+            index_ref.name,
+            publication_context,
+            collected.writes.items,
+            reservation_limit,
+        );
+        defer publication_plan.deinit();
         var write_start: usize = 0;
         var applied_first_chunk = false;
-        while (!applied_first_chunk or write_start < collected.writes.items.len) {
-            const write_end = if (write_start == collected.writes.items.len)
-                write_start
-            else
-                try textBatchPublicationChunkEnd(
-                    ctx.index_manager,
-                    index_ref.name,
-                    collected.writes.items,
-                    write_start,
-                    reservation_limit,
-                );
-            const write_chunk = collected.writes.items[write_start..write_end];
+        for (publication_plan.chunks) |planned| {
+            const write_chunk = collected.writes.items[write_start..planned.end];
             {
                 var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                 if (ctx.text_merge_runtime) |runtime| {
-                    const estimate = try ctx.index_manager.estimateTextBatchPublicationByName(index_ref.name, write_chunk);
-                    merge_permit = try runtime.acquireProducerPermit(index_ref.name, estimate.segment_count, estimate.byte_count);
+                    merge_permit = try runtime.acquireProducerPermit(
+                        index_ref.name,
+                        planned.estimate.segment_count,
+                        planned.estimate.byte_count,
+                    );
                 }
                 defer if (merge_permit) |*permit| permit.release();
 
                 var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
                 defer index_apply_guard.unlock();
+                if (!ctx.index_manager.textPublicationContextCurrentAssumeCatalogLocked(index_ref.name, publication_context))
+                    return error.IndexNotFound;
                 try ctx.index_manager.applyTextBatchByNameWithOptions(
                     ctx.store,
                     index_ref.name,
@@ -32936,8 +32917,9 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 if (ctx.text_merge_runtime) |runtime| runtime.notify();
             }
             applied_first_chunk = true;
-            write_start = write_end;
+            write_start = planned.end;
         }
+        std.debug.assert(applied_first_chunk and write_start == collected.writes.items.len);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
         return;
     }
@@ -33152,31 +33134,6 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
         },
     }
-}
-
-fn textBatchPublicationChunkEnd(
-    index_manager: *index_manager_mod.IndexManager,
-    index_name: []const u8,
-    writes: []const types.BatchWrite,
-    start: usize,
-    reservation_limit: usize,
-) !usize {
-    if (reservation_limit == std.math.maxInt(usize)) return writes.len;
-    const remaining_estimate = try index_manager.estimateTextBatchPublicationByName(index_name, writes[start..]);
-    if (remaining_estimate.segment_count <= reservation_limit) return writes.len;
-
-    var low = start + 1;
-    var high = writes.len;
-    while (low < high) {
-        const mid = low + (high - low + 1) / 2;
-        const estimate = try index_manager.estimateTextBatchPublicationByName(index_name, writes[start..mid]);
-        if (estimate.segment_count <= reservation_limit) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    return low;
 }
 
 fn batchHasEmbeddingArtifactForManagedIndex(
@@ -33959,13 +33916,12 @@ const CollectedTextDocumentWrites = struct {
 fn collectTextDocumentWritesForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
-    index_manager: *index_manager_mod.IndexManager,
     documents: []const derived_types.DerivedDocument,
     index_name: []const u8,
+    chunk_backed: bool,
     byte_range: types.ByteRange,
     opts: CollectTextDocumentWritesOptions,
 ) !CollectedTextDocumentWrites {
-    const chunk_name = index_manager.textChunkName(index_name);
     const PendingTextWrite = struct {
         doc_key: []const u8,
         store_key: []u8,
@@ -33989,7 +33945,7 @@ fn collectTextDocumentWritesForIndex(
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
         if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
-        if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
+        if (!documentTargetsTextIndex(doc, index_name, chunk_backed)) continue;
         if (trust_inline and doc.cleaned_value != null) {
             try result.writes.append(alloc, .{
                 .key = doc.key,

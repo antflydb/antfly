@@ -6576,6 +6576,14 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_db_mutex.unlock();
     }
 
+    fn beginLocalStructuralCachedDbMutationFromPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.beginStructuralTableActivityFromRestorePreparation(table_name);
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+    }
+
     fn finishLocalStructuralCachedDbMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
@@ -6650,6 +6658,27 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginLocalTableGenerationTransitionFromPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) !LocalTableGenerationTransition {
+        self.beginStructuralTableActivityFromRestorePreparation(table_name);
+        errdefer self.endStructuralTableActivity(table_name);
+
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
+
+        return .{
+            .source = self,
+            .table_name = table_name,
+            .read_cache_exclusive = read_cache_exclusive,
+        };
+    }
+
+    fn beginStructuralTableActivityFromRestorePreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -6672,23 +6701,6 @@ pub const ProvisionedTableWriteSource = struct {
             self.table_activity_mutex.unlock(io);
             self.beginStructuralTableActivity(table_name);
         }
-        errdefer self.endStructuralTableActivity(table_name);
-
-        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
-        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateWriteCache(table_name);
-        self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
-        self.local_db_mutex.unlock();
-        self.drainWriteCachePendingCloses();
-
-        return .{
-            .source = self,
-            .table_name = table_name,
-            .read_cache_exclusive = read_cache_exclusive,
-        };
     }
 
     fn finishLocalTableGenerationTransitionMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -10420,25 +10432,82 @@ pub const ProvisionedTableWriteSource = struct {
             if (schema_json_override) |schema_json| {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
-
-            const timeout_ns = 30 * std.time.ns_per_s;
-            const start_ns = platform_time.monotonicNs();
-            var attempts: usize = 0;
-            std.log.info("restore foreground repair begin group_id={d}", .{group_id});
-            while (try db.restoreRuntimeRepairNeeded()) {
-                attempts += 1;
-                if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
-                    db.clearDenseHbcCaches();
-                }
-                if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-            }
-            std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
-                group_id,
-                attempts,
-                open_attempts,
-            });
+            try repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
             return;
         }
+    }
+
+    fn repairRestoredDbRuntimeStateBlocking(
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        group_id: u64,
+        open_attempts: usize,
+    ) !void {
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const start_ns = platform_time.monotonicNs();
+        var attempts: usize = 0;
+        std.log.info("restore foreground repair begin group_id={d}", .{group_id});
+        while (try db.restoreRuntimeRepairNeeded()) {
+            attempts += 1;
+            if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
+                db.clearDenseHbcCaches();
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+        }
+        std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
+            group_id,
+            attempts,
+            open_attempts,
+        });
+    }
+
+    /// Complete an idempotent restore retry through the authoritative cached
+    /// writer when one is already open. Opening a second repair DB would
+    /// contend with that writer and could make an exact-identity retry report
+    /// success while the durable runtime-repair marker remained incomplete.
+    fn repairPublishedRestoreRuntimeStateBlocking(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
+
+        self.beginLocalStructuralCachedDbMutationFromPreparation(table_name);
+        errdefer self.abortLocalStructuralCachedDbMutation(table_name);
+
+        if (self.write_cache orelse self.startup_write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbForLocalMutation(
+                alloc,
+                cache,
+                path,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                table_name,
+                false,
+            );
+            defer cached.deinit(alloc);
+            try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            try repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
+        } else {
+            try self.repairRestoredTableRuntimeStateBlocking(
+                alloc,
+                path,
+                group_id,
+                table_name,
+                indexes_json,
+                schema_json,
+                null,
+            );
+        }
+
+        self.finishLocalStructuralCachedDbMutation(table_name);
+        self.publishRestoreRepairComplete(table_name);
+        self.notifyLocalChange(table_name, .structural);
+        self.notifyLocalChange(table_name, .data);
     }
 
     const RestoreRepairCatchUpWork = struct {
@@ -12717,7 +12786,18 @@ pub const ProvisionedTableWriteSource = struct {
                 else => return err,
             };
         }
-        if (all_groups_already_admitted and plan.publication_hook == null) return;
+        if (all_groups_already_admitted and plan.publication_hook == null) {
+            if (plan.reconcile_only) return;
+            try self.repairPublishedRestoreRuntimeStateBlocking(
+                alloc,
+                path,
+                group_id,
+                table_name,
+                plan.manifest.indexes_json,
+                plan.manifest.schema_json,
+            );
+            return;
+        }
         if (plan.reconcile_only and admitted_identity_mismatch) return error.RestoreIdentityMismatch;
 
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
@@ -21850,7 +21930,7 @@ test "provisioned table restore rejects multi-range manifests before opening sto
     }));
 }
 
-test "provisioned table restore retry skips exact incomplete restore state with active writer" {
+test "provisioned table restore retry repairs exact incomplete restore state through active writer" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -21980,6 +22060,10 @@ test "provisioned table restore retry skips exact incomplete restore state with 
         .artifact_backup_id = manifest.backup_id,
         .source_location = location,
     });
+    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, io_impl.io(), db_path)));
+    const beta = (try cached.db.get(alloc, "doc:b")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(beta);
+    try std.testing.expectEqualStrings("{\"title\":\"beta\"}", beta);
 }
 
 test "provisioned restore repair source deinit cancels sleeping retry worker" {

@@ -6,6 +6,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
+from ...models.table_storage_unreadable_error import TableStorageUnreadableError
 from ...types import UNSET, Response, Unset
 
 
@@ -32,14 +33,32 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Error | Error | TableStorageUnreadableError | None:
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 500:
-        response_500 = Error.from_dict(response.json())
+
+        def _parse_response_500(data: object) -> Error | TableStorageUnreadableError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_500_type_0 = Error.from_dict(data)
+
+                return response_500_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            response_500_type_1 = TableStorageUnreadableError.from_dict(data)
+
+            return response_500_type_1
+
+        response_500 = _parse_response_500(response.json())
 
         return response_500
 
@@ -49,7 +68,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Error]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Error | Error | TableStorageUnreadableError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -63,7 +84,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
-) -> Response[Error]:
+) -> Response[Error | Error | TableStorageUnreadableError]:
     """List all tables
 
     Args:
@@ -75,7 +96,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error]
+        Response[Error | Error | TableStorageUnreadableError]
     """
 
     kwargs = _get_kwargs(
@@ -95,7 +116,7 @@ def sync(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
-) -> Error | None:
+) -> Error | Error | TableStorageUnreadableError | None:
     """List all tables
 
     Args:
@@ -107,7 +128,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error
+        Error | Error | TableStorageUnreadableError
     """
 
     return sync_detailed(
@@ -122,7 +143,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
-) -> Response[Error]:
+) -> Response[Error | Error | TableStorageUnreadableError]:
     """List all tables
 
     Args:
@@ -134,7 +155,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error]
+        Response[Error | Error | TableStorageUnreadableError]
     """
 
     kwargs = _get_kwargs(
@@ -152,7 +173,7 @@ async def asyncio(
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
     pattern: str | Unset = UNSET,
-) -> Error | None:
+) -> Error | Error | TableStorageUnreadableError | None:
     """List all tables
 
     Args:
@@ -164,7 +185,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error
+        Error | Error | TableStorageUnreadableError
     """
 
     return (
