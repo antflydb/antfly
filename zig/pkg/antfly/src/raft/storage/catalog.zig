@@ -25,6 +25,14 @@ const max_replica_catalog_record_bytes = 64 * 1024;
 const max_replica_catalog_records = 1_000_000;
 const max_replica_catalog_bytes = 256 * 1024 * 1024;
 
+fn logInvalidReplicaCatalog(reason: []const u8, record_index: ?usize) void {
+    if (record_index) |index| {
+        std.debug.print("antfly: invalid replica catalog reason={s} record_index={d}\n", .{ reason, index });
+    } else {
+        std.debug.print("antfly: invalid replica catalog reason={s}\n", .{reason});
+    }
+}
+
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
@@ -54,18 +62,33 @@ fn parseCatalogFooter(line: []const u8) !struct {
     record_count: usize,
     digest: [Sha256.digest_length]u8,
 } {
-    if (!std.mem.startsWith(u8, line, replica_catalog_footer_prefix))
+    if (!std.mem.startsWith(u8, line, replica_catalog_footer_prefix)) {
+        logInvalidReplicaCatalog("invalid-footer-prefix", null);
         return error.InvalidReplicaCatalog;
+    }
     const payload = line[replica_catalog_footer_prefix.len..];
-    const separator = std.mem.indexOfScalar(u8, payload, ' ') orelse
+    const separator = std.mem.indexOfScalar(u8, payload, ' ') orelse {
+        logInvalidReplicaCatalog("invalid-footer", null);
         return error.InvalidReplicaCatalog;
-    if (separator == 0 or separator + 1 >= payload.len) return error.InvalidReplicaCatalog;
-    const record_count = std.fmt.parseInt(usize, payload[0..separator], 10) catch
+    };
+    if (separator == 0 or separator + 1 >= payload.len) {
+        logInvalidReplicaCatalog("invalid-footer", null);
         return error.InvalidReplicaCatalog;
+    }
+    const record_count = std.fmt.parseInt(usize, payload[0..separator], 10) catch {
+        logInvalidReplicaCatalog("invalid-footer-record-count", null);
+        return error.InvalidReplicaCatalog;
+    };
     const encoded_digest = payload[separator + 1 ..];
-    if (encoded_digest.len != Sha256.digest_length * 2) return error.InvalidReplicaCatalog;
+    if (encoded_digest.len != Sha256.digest_length * 2) {
+        logInvalidReplicaCatalog("invalid-footer-digest", null);
+        return error.InvalidReplicaCatalog;
+    }
     var digest: [Sha256.digest_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, encoded_digest) catch return error.InvalidReplicaCatalog;
+    _ = std.fmt.hexToBytes(&digest, encoded_digest) catch {
+        logInvalidReplicaCatalog("invalid-footer-digest", null);
+        return error.InvalidReplicaCatalog;
+    };
     return .{ .record_count = record_count, .digest = digest };
 }
 
@@ -615,11 +638,19 @@ pub const FileReplicaCatalog = struct {
         var read_buffer: [max_replica_catalog_record_bytes + 1]u8 = undefined;
         var reader = file.reader(self.io(), &read_buffer);
         const header = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => return error.InvalidReplicaCatalog,
+            error.StreamTooLong => {
+                logInvalidReplicaCatalog("header-too-large", null);
+                return error.InvalidReplicaCatalog;
+            },
             else => return err,
-        }) orelse return error.InvalidReplicaCatalog;
-        if (!std.mem.eql(u8, header, replica_catalog_header))
+        }) orelse {
+            logInvalidReplicaCatalog("missing-header", null);
             return error.InvalidReplicaCatalog;
+        };
+        if (!std.mem.eql(u8, header, replica_catalog_header)) {
+            logInvalidReplicaCatalog("invalid-header", null);
+            return error.InvalidReplicaCatalog;
+        }
 
         var hasher = Sha256.init(.{});
         hasher.update(replica_catalog_digest_domain);
@@ -629,10 +660,16 @@ pub const FileReplicaCatalog = struct {
             error.StreamTooLong => return error.ReplicaCatalogRecordTooLarge,
             else => return err,
         })) |line| {
-            if (footer_seen or line.len == 0) return error.InvalidReplicaCatalog;
+            if (footer_seen or line.len == 0) {
+                logInvalidReplicaCatalog("unexpected-line", record_count);
+                return error.InvalidReplicaCatalog;
+            }
             if (std.mem.startsWith(u8, line, replica_catalog_footer_prefix)) {
                 const footer = try parseCatalogFooter(line);
-                if (footer.record_count != record_count) return error.InvalidReplicaCatalog;
+                if (footer.record_count != record_count) {
+                    logInvalidReplicaCatalog("footer-record-count-mismatch", record_count);
+                    return error.InvalidReplicaCatalog;
+                }
                 const actual_digest = finalizeCatalogDigest(&hasher, record_count);
                 if (!std.crypto.timing_safe.eql(
                     [Sha256.digest_length]u8,
@@ -649,17 +686,28 @@ pub const FileReplicaCatalog = struct {
             updateCatalogDigest(&hasher, line);
             var parsed = std.json.parseFromSlice(ReplicaRecord, self.alloc, line, .{
                 .allocate = .alloc_always,
-            }) catch return error.InvalidReplicaCatalog;
+            }) catch {
+                logInvalidReplicaCatalog("malformed-record", record_count);
+                return error.InvalidReplicaCatalog;
+            };
             defer parsed.deinit();
-            try validateReplicaRecord(parsed.value);
+            validateReplicaRecord(parsed.value) catch {
+                logInvalidReplicaCatalog("invalid-record", record_count);
+                return error.InvalidReplicaCatalog;
+            };
             var record = try parsed.value.clone(self.alloc);
             errdefer record.deinit(self.alloc);
-            if (self.records.contains(record.group_id))
+            if (self.records.contains(record.group_id)) {
+                logInvalidReplicaCatalog("duplicate-group", record_count);
                 return error.InvalidReplicaCatalog;
+            }
             try self.records.put(self.alloc, record.group_id, record);
             record_count += 1;
         }
-        if (!footer_seen) return error.InvalidReplicaCatalog;
+        if (!footer_seen) {
+            logInvalidReplicaCatalog("missing-footer", record_count);
+            return error.InvalidReplicaCatalog;
+        }
     }
 
     fn persist(self: *FileReplicaCatalog) !void {
