@@ -46,6 +46,12 @@ fn monotonicNowNs() ?u64 {
 /// threads per listener while retaining O(n) descriptors and a small, fixed
 /// polling cadence.
 pub const Observer = struct {
+    pub const DeadlineOutcome = enum {
+        completed,
+        expired,
+        observer_failed,
+    };
+
     pub const Deadline = struct {
         const State = enum(u8) {
             pending,
@@ -96,6 +102,19 @@ pub const Observer = struct {
             const observer = self.observer orelse return;
             observer.unregister(self.id);
             self.* = .{};
+        }
+
+        /// Atomically retires a deadline registration before publishing its
+        /// terminal outcome to the socket owner. A pending deadline becomes a
+        /// successful completion only after unregister() has excluded the
+        /// observer from any later shutdown of the descriptor.
+        pub fn finishDeadline(self: *Registration, deadline: *const Deadline) DeadlineOutcome {
+            self.deinit();
+            return switch (deadline.state.load(.acquire)) {
+                .pending => .completed,
+                .expired => .expired,
+                .observer_failed => .observer_failed,
+            };
         }
     };
 
@@ -628,12 +647,18 @@ test "std http listener socket observer unregisters completed deadline without f
     defer observer.deinit();
     var deadline: Observer.Deadline = .{};
     var registration = try observer.registerDeadline(sockets[1], 50, &deadline, null);
-    registration.deinit();
+    try std.testing.expectEqual(Observer.DeadlineOutcome.completed, registration.finishDeadline(&deadline));
     sleepMs(100);
 
     try std.testing.expect(!deadline.didExpire());
     try std.testing.expectEqual(@as(usize, 0), observer.activeCount());
     try std.testing.expectEqual(@as(u64, 0), observer.deadlineExpirationsTotal());
+    // Completion owns the socket once unregister returns; a stale observer
+    // must never shut it down after the stack-backed deadline leaves scope.
+    try std.testing.expectEqual(@as(isize, 1), std.c.send(sockets[0], "C", 1, 0));
+    var received: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), std.c.recv(sockets[1], &received, received.len, 0));
+    try std.testing.expectEqualStrings("C", &received);
 }
 
 test "std http listener socket observer distinguishes observer failure from timeout" {

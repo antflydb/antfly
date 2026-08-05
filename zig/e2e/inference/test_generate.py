@@ -29,7 +29,7 @@ from .models import (
     find_multimodal_generator_model_name,
     find_tool_model_name,
     response_indicates_missing_model,
-    run_large_model_tests,
+    run_multimodal_generator_tests,
 )
 
 pytestmark = pytest.mark.model_integration
@@ -101,7 +101,10 @@ def _first_multimodal_generator_model(api):
         return model
     if os.environ.get("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL"):
         return os.environ["ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL"]
-    pytest.skip("No multimodal generator model available; set ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL or place one under models")
+    pytest.fail(
+        "Required multimodal generator is absent from /models; set "
+        "ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL or install the shipped default"
+    )
 
 
 def _assert_chat_completion(resp: dict) -> dict:
@@ -353,8 +356,11 @@ def test_stream_delta_structure(api):
 @pytest.mark.slow
 def test_multimodal_generation(api):
     """The shipped Gemma decoder/projector pair must execute image inference."""
-    if not run_large_model_tests():
-        pytest.skip("Multimodal generation uses a large model; set RUN_LARGE_MODEL_TESTS=1 to run it")
+    if not run_multimodal_generator_tests():
+        pytest.skip(
+            "Multimodal generation uses a large model; set "
+            "RUN_MULTIMODAL_GENERATOR_TESTS=1 to run it"
+        )
     model = _first_multimodal_generator_model(api)
     messages = [{
         "role": "user",
@@ -369,7 +375,6 @@ def test_multimodal_generation(api):
         "messages": messages,
         "max_tokens": 20,
     })
-    _skip_missing_generator_response(r)
     r.raise_for_status()
     resp = r.json()
     content = _message_content(resp)

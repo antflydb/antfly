@@ -304,7 +304,7 @@ fn validateClapStages(
                     dim,
                 );
             }
-            try tensors.validateOptionalElementCount(
+            try tensors.validateOptionalVector(
                 try fieldName(&field_buf, prefix, "attention.self.relative_position_bias_table"),
                 relative_bias_elements,
             );
@@ -346,25 +346,23 @@ const TensorValidator = struct {
             return error.InvalidClipclapTensorContract;
     }
 
-    fn requireMatrix(self: TensorValidator, name: []const u8, a: u64, b: u64) !void {
+    fn requireMatrix(self: TensorValidator, name: []const u8, gguf_axis_0: u64, gguf_axis_1: u64) !void {
         const tensor = try self.require(name);
         if (tensor.dimensions.len != 2 or
-            !((tensor.dimensions[0] == a and tensor.dimensions[1] == b) or
-                (tensor.dimensions[0] == b and tensor.dimensions[1] == a)))
+            tensor.dimensions[0] != gguf_axis_0 or
+            tensor.dimensions[1] != gguf_axis_1)
         {
             return error.InvalidClipclapTensorContract;
         }
     }
 
-    fn validateOptionalElementCount(self: TensorValidator, name: []const u8, expected: u64) !void {
+    fn validateOptionalVector(self: TensorValidator, name: []const u8, expected: u64) !void {
         const tensor = self.catalog.find(name) orelse return;
-        var count: u64 = 1;
-        for (tensor.dimensions) |dimension| {
-            if (dimension == 0) return error.InvalidClipclapTensorContract;
-            count = std.math.mul(u64, count, dimension) catch
-                return error.InvalidClipclapTensorContract;
-        }
-        if (count != expected) return error.InvalidClipclapTensorContract;
+        // GGUF axes are reversed once by the tensor store. The graph runtime
+        // binds this optional parameter as a vector, so accepting an arbitrary
+        // equal-element layout would pass admission and then fail graph binding.
+        if (tensor.dimensions.len != 1 or tensor.dimensions[0] != expected)
+            return error.InvalidClipclapTensorContract;
     }
 
     fn requireConv2dElements(
@@ -681,6 +679,15 @@ test "ClipClap GGUF contract validates paired encoder fixtures" {
     const contract = try inspectFilePair(&clip_file, &clap_file);
     try std.testing.expectEqual(@as(u32, 3), contract.projection_dim);
 
+    const text_projection = gguf_tensor_catalog.Catalog.init(&clip_file).find(
+        "text_projection.weight",
+    ).?;
+    text_projection.dimensions[0] = 3;
+    text_projection.dimensions[1] = 4;
+    try std.testing.expectError(error.InvalidClipclapTensorContract, inspectFilePair(&clip_file, &clap_file));
+    text_projection.dimensions[0] = 4;
+    text_projection.dimensions[1] = 3;
+
     depths[0] = .{ .u32 = 0 };
     try std.testing.expectError(error.InvalidClipclapContract, inspectFilePair(&clip_file, &clap_file));
     depths[0] = .{ .u32 = 1 };
@@ -698,6 +705,15 @@ test "ClipClap GGUF contract validates paired encoder fixtures" {
     relative_bias.dimensions[0] = 2;
     try std.testing.expectError(error.InvalidClipclapTensorContract, inspectFilePair(&clip_file, &clap_file));
     relative_bias.dimensions[0] = 1;
+
+    const mutable_relative_bias = @constCast(relative_bias);
+    const vector_dimensions = mutable_relative_bias.dimensions;
+    mutable_relative_bias.dimensions = try allocator.dupe(u64, &.{ 1, 1 });
+    allocator.free(vector_dimensions);
+    try std.testing.expectError(error.InvalidClipclapTensorContract, inspectFilePair(&clip_file, &clap_file));
+    const matrix_dimensions = mutable_relative_bias.dimensions;
+    mutable_relative_bias.dimensions = try allocator.dupe(u64, &.{1});
+    allocator.free(matrix_dimensions);
 
     clap_metadata[17].value = .{ .bool_ = true };
     try std.testing.expectError(error.UnsupportedClipclapArchitecture, inspectFilePair(&clip_file, &clap_file));

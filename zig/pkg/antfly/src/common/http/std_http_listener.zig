@@ -547,17 +547,23 @@ pub const StdHttpListener = struct {
                 _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
                 return err;
             };
-            defer registration.deinit();
-
             const receive_result = server.receiveHead();
-            if (deadline.observerFailed()) {
-                _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
-                _ = receive_result catch {};
-                return error.ObserverUnavailable;
-            }
-            if (deadline.didExpire()) {
-                _ = receive_result catch {};
-                return error.Timeout;
+            // Retire the registration before inspecting its outcome. This is
+            // the completion/expiration arbitration point: once deinit()
+            // returns, the observer no longer owns the stack-backed deadline
+            // and cannot shut down a successfully completed socket between
+            // the state check and this function returning.
+            switch (registration.finishDeadline(&deadline)) {
+                .completed => {},
+                .observer_failed => {
+                    _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                    _ = receive_result catch {};
+                    return error.ObserverUnavailable;
+                },
+                .expired => {
+                    _ = receive_result catch {};
+                    return error.Timeout;
+                },
             }
             return try receive_result;
         }
@@ -953,17 +959,20 @@ pub const StdHttpListener = struct {
                 _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
                 return err;
             };
-            defer registration.deinit();
-
             const read_result = body_reader.allocRemaining(self.alloc, .limited(self.cfg.max_request_bytes));
-            if (deadline.observerFailed()) {
-                _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
-                if (read_result) |body| self.alloc.free(body) else |_| {}
-                return error.ObserverUnavailable;
-            }
-            if (deadline.didExpire()) {
-                if (read_result) |body| self.alloc.free(body) else |_| {}
-                return error.Timeout;
+            // See receiveHeadWithTimeout: unregister synchronously so normal
+            // completion and expiration have one mutex-ordered winner.
+            switch (registration.finishDeadline(&deadline)) {
+                .completed => {},
+                .observer_failed => {
+                    _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                    if (read_result) |body| self.alloc.free(body) else |_| {}
+                    return error.ObserverUnavailable;
+                },
+                .expired => {
+                    if (read_result) |body| self.alloc.free(body) else |_| {}
+                    return error.Timeout;
+                },
             }
             return try read_result;
         }
@@ -2303,6 +2312,114 @@ test "std http listener body timeout releases accepted slow body connection slot
     try std.testing.expect(stats.deadline_expirations_total >= 1);
     try std.testing.expectEqual(@as(u64, 0), stats.deadline_observer_failures_total);
     try std.testing.expectEqual(@as(usize, 0), stats.active_deadline_observers);
+}
+
+fn countLinuxProcEntries(path: []const u8) !usize {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
+}
+
+test "std http listener process threads and descriptors recover after cancellation storms" {
+    if (comptime builtin.os.tag != .linux) return;
+
+    if (std.c.getenv("ANTFLY_REQUIRE_LOW_FD_HTTP_RATCHET") != null) {
+        const nofile = try std.posix.getrlimit(.NOFILE);
+        try std.testing.expectEqual(@as(u64, 256), nofile.cur);
+    }
+
+    const App = struct {
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return .{ .status = 200, .body = try alloc.dupe(u8, "ok") };
+        }
+    };
+
+    const batch_size = 48;
+    const rounds = 4;
+    const thread_slack = 4;
+    const fd_slack = 8;
+    var app = App{};
+    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+        .serve_in_connection_threads = true,
+        .max_connection_threads = 64,
+        .header_read_timeout_ms = 30_000,
+    }, app.executor());
+    defer listener.deinit();
+    try listener.start();
+    const bound_addr = listener.boundAddress().?;
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+
+    // Let the accept and observer owners reach their steady idle state before
+    // measuring the process. The accept loop reserves one connection slot
+    // while blocked in accept(); no client socket is active at this point.
+    sleepMs(100);
+    const baseline_threads = try countLinuxProcEntries("/proc/self/task");
+    const baseline_fds = try countLinuxProcEntries("/proc/self/fd");
+    var recovered_thread_min = std.math.maxInt(usize);
+    var recovered_thread_max: usize = 0;
+
+    for (0..rounds) |_| {
+        var clients = [_]?std.Io.net.Stream{null} ** batch_size;
+        defer for (&clients) |*maybe_stream| {
+            if (maybe_stream.*) |*stream| stream.close(client_io);
+        };
+
+        for (&clients) |*slot| slot.* = try bound_addr.connect(client_io, .{ .mode = .stream });
+
+        var loaded = false;
+        for (0..400) |_| {
+            const stats = listener.runtimeStats();
+            if (stats.active_deadline_observers >= batch_size and
+                stats.active_connection_threads >= batch_size)
+            {
+                loaded = true;
+                break;
+            }
+            sleepMs(5);
+        }
+        try std.testing.expect(loaded);
+        try std.testing.expect((try countLinuxProcEntries("/proc/self/task")) >= baseline_threads + batch_size);
+
+        for (&clients) |*maybe_stream| {
+            if (maybe_stream.*) |*stream| {
+                stream.shutdown(client_io, .both) catch {};
+                stream.close(client_io);
+                maybe_stream.* = null;
+            }
+        }
+
+        var recovered = false;
+        var recovered_threads: usize = 0;
+        for (0..2_000) |_| {
+            const stats = listener.runtimeStats();
+            const threads = try countLinuxProcEntries("/proc/self/task");
+            const fds = try countLinuxProcEntries("/proc/self/fd");
+            if (stats.active_deadline_observers == 0 and
+                stats.active_peer_observers == 0 and
+                stats.active_connection_threads <= 1 and
+                threads <= baseline_threads + thread_slack and
+                fds <= baseline_fds + fd_slack)
+            {
+                recovered = true;
+                recovered_threads = threads;
+                break;
+            }
+            sleepMs(5);
+        }
+        try std.testing.expect(recovered);
+        recovered_thread_min = @min(recovered_thread_min, recovered_threads);
+        recovered_thread_max = @max(recovered_thread_max, recovered_threads);
+    }
+
+    try std.testing.expect(recovered_thread_max - recovered_thread_min <= thread_slack);
 }
 
 test "std http listener stop interrupts accepted header read" {

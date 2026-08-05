@@ -3518,6 +3518,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
+    const http_low_fd_ratchet_filter = "std http listener process threads and descriptors recover after cancellation storms";
+    const http_low_fd_ratchet_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        // Keep the Raft integration anchor for declaration reachability, but
+        // execute only the process-level regression below. The wider transport
+        // bucket contains high-cardinality socket tests that intentionally do
+        // not fit inside this target's 256-descriptor process limit.
+        .filters = &.{ "raft integration module compiles", http_low_fd_ratchet_filter },
+    });
+    const run_http_low_fd_ratchet_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        http_low_fd_ratchet_tests,
+        &.{http_low_fd_ratchet_filter},
+    );
+    const http_low_fd_ratchet_test_step = b.step(
+        "http-low-fd-ratchet-test",
+        "Run the process-level low-FD HTTP worker ratchet regression",
+    );
+    http_low_fd_ratchet_test_step.dependOn(&run_http_low_fd_ratchet_tests.step);
+
     const lib_raft_sim_default_filters = [_][]const u8{
         "managed host simulation drives add and peer refresh through deterministic steps",
         "managed host simulation restores through both raft state backends",
