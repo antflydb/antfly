@@ -32881,18 +32881,24 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
 
         const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
-        var publication_plan = try ctx.index_manager.planTextBatchPublication(
-            index_ref.name,
-            publication_context,
-            collected.writes.items,
-            reservation_limit,
-        );
-        defer publication_plan.deinit();
         var write_start: usize = 0;
         var applied_first_chunk = false;
-        for (publication_plan.chunks) |planned| {
-            const write_chunk = collected.writes.items[write_start..planned.end];
-            {
+        while (!applied_first_chunk or write_start < collected.writes.items.len) {
+            const plan_base = write_start;
+            var publication_plan = try ctx.index_manager.planTextBatchPublication(
+                index_ref.name,
+                publication_context,
+                collected.writes.items[plan_base..],
+                reservation_limit,
+            );
+            defer publication_plan.deinit();
+
+            var relative_start: usize = 0;
+            var replan_suffix = false;
+            for (publication_plan.chunks) |planned| {
+                const write_end = plan_base + planned.end;
+                const write_chunk = collected.writes.items[plan_base + relative_start .. write_end];
+                var applied_chunk = false;
                 var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                 if (ctx.text_merge_runtime) |runtime| {
                     merge_permit = try runtime.acquireProducerPermit(
@@ -32905,19 +32911,43 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
                 var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
                 defer index_apply_guard.unlock();
-                if (!ctx.index_manager.textPublicationContextCurrentAssumeCatalogLocked(index_ref.name, publication_context))
-                    return error.IndexNotFound;
-                try ctx.index_manager.applyTextBatchByNameWithOptions(
-                    ctx.store,
+
+                // Admission may wait without holding catalog/apply locks. A
+                // same-instance schema or analyzer update invalidates only
+                // the unpublished suffix, which is replanned below. An index
+                // replacement still fails closed through IndexNotFound.
+                const before_apply = try ctx.index_manager.refreshTextPublicationContextAssumeCatalogLocked(
                     index_ref.name,
-                    if (applied_first_chunk) &.{} else delete_keys,
-                    write_chunk,
-                    text_replay_options,
+                    &publication_context,
                 );
-                if (ctx.text_merge_runtime) |runtime| runtime.notify();
+                if (before_apply == .projection_changed) {
+                    replan_suffix = true;
+                } else {
+                    try ctx.index_manager.applyTextBatchByNameWithOptions(
+                        ctx.store,
+                        index_ref.name,
+                        if (applied_first_chunk) &.{} else delete_keys,
+                        write_chunk,
+                        text_replay_options,
+                    );
+                    applied_chunk = true;
+                    const after_apply = try ctx.index_manager.refreshTextPublicationContextAssumeCatalogLocked(
+                        index_ref.name,
+                        &publication_context,
+                    );
+                    replan_suffix = after_apply == .projection_changed;
+                    if (ctx.text_merge_runtime) |runtime| runtime.notify();
+                }
+
+                if (!applied_chunk) break;
+                applied_first_chunk = true;
+                write_start = write_end;
+                relative_start = planned.end;
+                if (replan_suffix and write_start < collected.writes.items.len) break;
             }
-            applied_first_chunk = true;
-            write_start = planned.end;
+
+            if (write_start == collected.writes.items.len) break;
+            std.debug.assert(replan_suffix);
         }
         std.debug.assert(applied_first_chunk and write_start == collected.writes.items.len);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);

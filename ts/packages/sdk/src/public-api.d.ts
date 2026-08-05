@@ -13906,7 +13906,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
-            500: components["responses"]["QueryInternalServerError"];
+            500: components["responses"]["InternalServerError"];
         };
     };
     getTable: {
@@ -14013,7 +14013,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["UnsupportedExactSort"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     batchWrite: {

@@ -10471,13 +10471,26 @@ pub const ProvisionedTableWriteSource = struct {
         path: []const u8,
         group_id: u64,
         table_name: []const u8,
-        indexes_json: []const u8,
-        schema_json: []const u8,
     ) !void {
         if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
 
         self.beginLocalStructuralCachedDbMutationFromPreparation(table_name);
         errdefer self.abortLocalStructuralCachedDbMutation(table_name);
+
+        // The catalog is authoritative once a generation is published. The
+        // durable restore identity intentionally describes only the imported
+        // artifact, so a retry manifest at the same location is not proof of
+        // the table definition that was admitted with that artifact. Sampling
+        // the definition only after structural admission prevents local table
+        // mutation from racing this repair contract.
+        const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse
+            return error.TableVisibilityTimeout;
+        defer {
+            if (metadata.indexes_json) |value| alloc.free(value);
+            if (metadata.schema_json) |value| alloc.free(value);
+        }
+        const indexes_json = metadata.indexes_json orelse tables_api.default_indexes_json;
+        const schema_json = metadata.schema_json orelse "";
 
         if (self.write_cache orelse self.startup_write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbForLocalMutation(
@@ -10491,7 +10504,27 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer cached.deinit(alloc);
             try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(
+                alloc,
+                cached.db,
+                indexes_json,
+                .{ .drain_resolver_backfill = false },
+            );
             try repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
+
+            const entry = cached.entry orelse return error.StaleCachedDbLease;
+            {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                if (entry.retired) return error.StaleCachedDbLease;
+                try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+                try cache.replaceEntrySchemaLocked(entry, schema_json);
+                ProvisionedTableWriteCache.publishEntryManagedConfig(entry, indexes_json);
+                cached.schema_json = entry.schema_json;
+            }
+            if (reconcile_summary.indexes_pending != 0) {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+            }
         } else {
             try self.repairRestoredTableRuntimeStateBlocking(
                 alloc,
@@ -10507,7 +10540,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.finishLocalStructuralCachedDbMutation(table_name);
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
-        self.notifyLocalChange(table_name, .data);
     }
 
     const RestoreRepairCatchUpWork = struct {
@@ -12793,8 +12825,6 @@ pub const ProvisionedTableWriteSource = struct {
                 path,
                 group_id,
                 table_name,
-                plan.manifest.indexes_json,
-                plan.manifest.schema_json,
             );
             return;
         }
@@ -12901,7 +12931,6 @@ pub const ProvisionedTableWriteSource = struct {
         transition.finishMutation();
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
-        self.notifyLocalChange(table_name, .data);
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
@@ -21974,7 +22003,7 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
                     .table_id = 7,
                     .name = "docs",
                     .description = "docs table",
-                    .schema_json = "",
+                    .schema_json = tables_api.default_schema_json,
                     .read_schema_json = "",
                     .indexes_json = tables_api.default_indexes_json,
                     .replication_sources_json = "[]",
@@ -22018,7 +22047,7 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
         .table_id = 7,
         .name = "docs",
         .description = "docs table",
-        .schema_json = "",
+        .schema_json = tables_api.default_schema_json,
         .read_schema_json = "",
         .indexes_json = tables_api.default_indexes_json,
         .replication_sources_json = "[]",
@@ -22047,6 +22076,13 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
         7001,
     );
 
+    // An object-store key can be overwritten between retries without changing
+    // the imported artifact. The admitted catalog definition, not mutable
+    // manifest metadata, must remain authoritative for runtime repair.
+    const original_manifest_schema = manifest.schema_json;
+    manifest.schema_json = try alloc.dupe(u8, "{}");
+    alloc.free(@constCast(original_manifest_schema));
+
     var cached = try write_cache.getOrOpenLocked(db_path, FakeCatalog.iface(), 7001, 0, "docs");
     defer cached.deinit(alloc);
     try cached.db.batch(.{
@@ -22064,6 +22100,9 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
     const beta = (try cached.db.get(alloc, "doc:b")) orelse return error.TestUnexpectedResult;
     defer alloc.free(beta);
     try std.testing.expectEqualStrings("{\"title\":\"beta\"}", beta);
+    const repaired_schema = (try loadLocalTableSchemaJson(alloc, cached.db)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(repaired_schema);
+    try std.testing.expectEqualStrings(tables_api.default_schema_json, repaired_schema);
 }
 
 test "provisioned restore repair source deinit cancels sleeping retry worker" {

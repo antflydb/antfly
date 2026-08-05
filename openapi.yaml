@@ -3554,7 +3554,7 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
-          $ref: '#/components/responses/QueryInternalServerError'
+          $ref: '#/components/responses/InternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -3783,7 +3783,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/QueryInternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []

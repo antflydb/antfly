@@ -8898,7 +8898,7 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":
-          $ref: "#/components/responses/QueryInternalServerError"
+          $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}:
     parameters:
       - name: tableName
@@ -9093,7 +9093,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "500":
-          $ref: "#/components/responses/InternalServerError"
+          $ref: "#/components/responses/QueryInternalServerError"
   /tables/{tableName}/batch:
     parameters:
       - name: tableName

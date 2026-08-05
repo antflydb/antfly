@@ -556,11 +556,17 @@ pub const TextPublicationPlan = struct {
 pub const TextPublicationContext = struct {
     alloc: Allocator,
     instance_id: u64,
+    projection_revision: u64,
     chunk_backed: bool,
 
     pub fn deinit(self: *TextPublicationContext) void {
         self.* = undefined;
     }
+};
+
+pub const TextPublicationContextRefresh = enum {
+    current,
+    projection_changed,
 };
 
 const TextPublicationAtomicRange = struct {
@@ -1242,6 +1248,10 @@ pub const IndexManager = struct {
         /// catalog lock while it waits, then reject a delete/recreate ABA
         /// before publishing a plan derived from the old schema.
         instance_id: u64 = 0,
+        /// Protected by analysis_mutex. Planning captures this revision so a
+        /// runtime schema or analyzer configuration refresh cannot invalidate
+        /// producer admission estimates while the caller waits for a permit.
+        projection_revision: u64 = 1,
         apply_mutex: *std.atomic.Mutex,
         merge_delta_mutex: std.atomic.Mutex = .unlocked,
         merge_deletion_states: std.ArrayListUnmanaged(*TextMergeDeletionState) = .empty,
@@ -2152,6 +2162,11 @@ pub const IndexManager = struct {
         return instance_id;
     }
 
+    fn advanceTextProjectionRevisionAssumeAnalysisLocked(entry: *TextIndex) void {
+        entry.projection_revision = std.math.add(u64, entry.projection_revision, 1) catch
+            @panic("text projection revision exhausted");
+    }
+
     fn destroyIndexApplyMutex(self: *IndexManager, mutex: *std.atomic.Mutex) void {
         mutex.* = undefined;
         self.alloc.destroy(mutex);
@@ -2734,6 +2749,7 @@ pub const IndexManager = struct {
             const previous_analysis = entry.text_analysis;
             entry.runtime_schema = runtime_schema_owned;
             entry.text_analysis = text_analysis;
+            advanceTextProjectionRevisionAssumeAnalysisLocked(entry);
             runtime_schema_owned = null;
             text_analysis_owned = false;
 
@@ -7944,9 +7960,12 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
         return .{
             .alloc = alloc,
             .instance_id = entry.instance_id,
+            .projection_revision = entry.projection_revision,
             .chunk_backed = entry.chunk_name != null,
         };
     }
@@ -7959,7 +7978,30 @@ pub const IndexManager = struct {
         context: TextPublicationContext,
     ) bool {
         const entry = self.textIndexEntry(index_name) orelse return false;
-        return entry.instance_id == context.instance_id;
+        if (entry.instance_id != context.instance_id) return false;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        return entry.projection_revision == context.projection_revision;
+    }
+
+    /// Refresh a same-instance publication context after producer admission.
+    /// A projection change requires the caller to discard estimates for work
+    /// it has not published yet; a delete/recreate ABA remains IndexNotFound.
+    /// The caller must hold the catalog shared lock, normally through a
+    /// ManagedIndexApplyGuard.
+    pub fn refreshTextPublicationContextAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: *TextPublicationContext,
+    ) !TextPublicationContextRefresh {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision == context.projection_revision) return .current;
+        context.projection_revision = entry.projection_revision;
+        context.chunk_backed = entry.chunk_name != null;
+        return .projection_changed;
     }
 
     /// Plan the natural segment fan-out before producer admission. Projection
@@ -7992,6 +8034,7 @@ pub const IndexManager = struct {
         if (entry.instance_id != context.instance_id) return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
 
         var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
         errdefer chunks.deinit(context.alloc);
@@ -21243,6 +21286,73 @@ test "text publication planning rejects a same-name catalog replacement" {
     try std.testing.expectEqual(@as(usize, 1), plan.chunks.len);
     try std.testing.expectEqual(@as(usize, 1), plan.chunks[0].end);
     try std.testing.expectEqual(@as(u64, 1), plan.chunks[0].estimate.segment_count);
+}
+
+test "text publication admission refreshes a projection revision change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    try manager.addAllNoBackfill(&store, &.{config});
+
+    const writes = [_]types.BatchWrite{.{
+        .key = "doc:a",
+        .value = "{\"state\":\"alpha\"}",
+    }};
+    var stale_context = try manager.acquireTextPublicationContext(alloc, config.name);
+    defer stale_context.deinit();
+    var stale_plan = try manager.planTextBatchPublication(config.name, stale_context, &writes, 1);
+    defer stale_plan.deinit();
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    const schema = schema_mod.TableSchema{
+        .version = 0,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    };
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, schema));
+    try manager.refreshEmptyTextIndexSchemas(&store);
+
+    manager.catalog_mutex.lockShared();
+    const stale_after_admission = manager.textPublicationContextCurrentAssumeCatalogLocked(config.name, stale_context);
+    manager.catalog_mutex.unlockShared();
+    try std.testing.expect(!stale_after_admission);
+    try std.testing.expectError(
+        error.IndexNotFound,
+        manager.planTextBatchPublication(config.name, stale_context, &writes, 1),
+    );
+
+    manager.catalog_mutex.lockShared();
+    const refresh = try manager.refreshTextPublicationContextAssumeCatalogLocked(config.name, &stale_context);
+    manager.catalog_mutex.unlockShared();
+    try std.testing.expectEqual(TextPublicationContextRefresh.projection_changed, refresh);
+    var current_plan = try manager.planTextBatchPublication(config.name, stale_context, &writes, 1);
+    defer current_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), current_plan.chunks.len);
+    try std.testing.expectEqual(@as(u64, 1), current_plan.chunks[0].estimate.segment_count);
 }
 
 test "observed dynamic sortable field capability reports covered queryable state" {
