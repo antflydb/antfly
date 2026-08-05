@@ -4749,6 +4749,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup maintenance queue expires inactive repositories",
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
+            "owned backup runtime has a finite worker ceiling",
             "backup staging uses configured storage authority and exclusive generations",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
@@ -5045,6 +5046,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
+            "provisioned table write source has a finite worker ceiling",
             "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
@@ -5125,6 +5127,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "aggregation completeness requires exact total relation",
+            "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
             "provisioned read cache group exclusive drains only the published group",

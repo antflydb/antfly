@@ -25,6 +25,7 @@ pub const data_format = @import("data_format.zig");
 pub const fs_paths = @import("fs_paths.zig");
 pub const byte_copy = @import("byte_copy.zig");
 pub const cache_budget = @import("cache_budget.zig");
+pub const threaded_io_limits = @import("threaded_io_limits.zig");
 
 test {
     _ = provider_registry;
@@ -40,4 +41,5 @@ test {
     _ = fs_paths;
     _ = byte_copy;
     _ = cache_budget;
+    _ = threaded_io_limits;
 }

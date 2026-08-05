@@ -17,6 +17,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const common = @import("http_common.zig");
 const PeerObserver = @import("peer_disconnect_observer.zig").Observer;
+const threaded_io_limits = @import("../threaded_io_limits.zig");
 
 pub const default_max_request_bytes: usize = 32 * 1024 * 1024;
 pub const default_request_stack_size: usize = 8 * 1024 * 1024;
@@ -24,7 +25,7 @@ pub const default_header_read_timeout_ms: u32 = 30_000;
 pub const default_body_read_timeout_ms: u32 = 120_000;
 pub const default_accept_error_backoff_initial_ms: u32 = 5;
 pub const default_accept_error_backoff_max_ms: u32 = 1_000;
-pub const default_process_io_concurrent_limit: u32 = 256;
+pub const default_process_io_concurrent_limit: u32 = threaded_io_limits.service;
 
 const ProcessIo = struct {
     var lock: std.atomic.Mutex = .unlocked;

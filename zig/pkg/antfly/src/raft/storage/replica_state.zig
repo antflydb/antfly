@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const raft_engine = @import("raft_engine");
 const storage_mod = @import("mod.zig");
 const snapshot_payload_store = @import("snapshot_payload_store.zig");
@@ -51,7 +52,7 @@ pub const PersistentReplicaState = struct {
         alloc: std.mem.Allocator,
         layout: storage_mod.ReplicaPathLayout,
     ) !PersistentReplicaState {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         var io_owned = true;
         errdefer if (io_owned) io_impl.deinit();
         const root_dir = try alloc.dupe(u8, layout.root_dir);

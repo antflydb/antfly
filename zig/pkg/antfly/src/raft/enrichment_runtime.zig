@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const leader_runtime = @import("leader_runtime.zig");
 const read_state_observer_mod = @import("state_machine/read_state_observer.zig");
+const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 
 pub const ExecutorBackend = enum {
     simulated,
@@ -141,7 +142,7 @@ pub const ThreadedExecutor = struct {
     pub fn init(alloc: std.mem.Allocator) ThreadedExecutor {
         return .{
             .alloc = alloc,
-            .threaded = std.Io.Threaded.init(alloc, .{}),
+            .threaded = threaded_io_limits.initService(alloc),
         };
     }
 

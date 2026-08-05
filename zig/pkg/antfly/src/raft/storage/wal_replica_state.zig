@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const raft_engine = @import("raft_engine");
 const platform_time = @import("antfly_platform").time;
 const wal_mod = @import("../../storage/wal.zig");
@@ -116,7 +117,7 @@ pub const WalReplicaState = struct {
         layout: storage_mod.ReplicaPathLayout,
         cfg: WalReplicaStateConfig,
     ) !WalReplicaState {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         var io_owned = true;
         errdefer if (io_owned) io_impl.deinit();
 
