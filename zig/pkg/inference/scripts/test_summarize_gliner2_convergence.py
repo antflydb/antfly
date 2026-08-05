@@ -116,7 +116,7 @@ class ConvergenceSummaryTest(unittest.TestCase):
             "metal_finite_step_loss": True,
             "metal_training_precision_fp32": True,
             "metal_graph_executor_fallback_reasons_empty": True,
-            "metal_graph_executor_true_host_outputs_zero": True,
+            "metal_graph_executor_true_host_outputs_within_threshold": True,
             "metal_interpreter_fallbacks_within_threshold": True,
         }
         summary = {"strict_mode": True, "strict_checks": strict_checks}
@@ -318,7 +318,7 @@ class ConvergenceSummaryTest(unittest.TestCase):
                             "metal_finite_step_loss": True,
                             "metal_training_precision_fp32": True,
                             "metal_graph_executor_fallback_reasons_empty": True,
-                            "metal_graph_executor_true_host_outputs_zero": True,
+                            "metal_graph_executor_true_host_outputs_within_threshold": True,
                             "metal_interpreter_fallbacks_within_threshold": True,
                         },
                     },

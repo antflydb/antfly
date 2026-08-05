@@ -40911,6 +40911,21 @@ static int termite_metal_buffer_reuse_enabled(termite_metal_decode_runtime *runt
     return runtime->buffer_reuse_enabled;
 }
 
+static void *termite_metal_buffer_alloc_new(
+    termite_metal_decode_runtime *runtime,
+    size_t length,
+    int storage_mode
+) {
+    @autoreleasepool {
+        MTLResourceOptions options = (storage_mode == 1)
+            ? MTLResourceStorageModePrivate
+            : MTLResourceStorageModeShared;
+        id<MTLBuffer> buffer = [runtime->device newBufferWithLength:length options:options];
+        if (buffer == nil) return NULL;
+        return (__bridge_retained void *)buffer;
+    }
+}
+
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode) {
     if (runtime == NULL || runtime->device == nil || length == 0) return NULL;
     // In-frame reuse: serve a same-or-larger released private buffer from the
@@ -40939,14 +40954,12 @@ void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t l
             }
         }
     }
-    @autoreleasepool {
-        MTLResourceOptions options = (storage_mode == 1)
-            ? MTLResourceStorageModePrivate
-            : MTLResourceStorageModeShared;
-        id<MTLBuffer> buffer = [runtime->device newBufferWithLength:length options:options];
-        if (buffer == nil) return NULL;
-        return (__bridge_retained void *)buffer;
-    }
+    return termite_metal_buffer_alloc_new(runtime, length, storage_mode);
+}
+
+void *termite_metal_buffer_alloc_fresh(termite_metal_decode_runtime *runtime, size_t length, int storage_mode) {
+    if (runtime == NULL || runtime->device == nil || length == 0) return NULL;
+    return termite_metal_buffer_alloc_new(runtime, length, storage_mode);
 }
 
 void termite_metal_buffer_release(void *handle) {

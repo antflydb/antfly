@@ -74,7 +74,7 @@ BACKEND_STOCHASTIC_STRICT_CHECKS = {
         "metal_finite_step_loss",
         "metal_training_precision_fp32",
         "metal_graph_executor_fallback_reasons_empty",
-        "metal_graph_executor_true_host_outputs_zero",
+        "metal_graph_executor_true_host_outputs_within_threshold",
         "metal_interpreter_fallbacks_within_threshold",
     ),
     "cuda": (

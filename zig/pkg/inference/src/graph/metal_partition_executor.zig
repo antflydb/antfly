@@ -2222,8 +2222,13 @@ pub const MetalPartitionExecutor = struct {
                 } else if (execution_kind != null) {
                     stats.device_resident_outputs += 1;
                 } else {
+                    // Residency inspection is optional on the hot path, but a
+                    // null execution kind is not unattributed: it is exactly
+                    // the interpreter fallback counted above. Keep the
+                    // conservative host classification while preserving its
+                    // known provenance for strict accelerator diagnostics.
                     stats.host_materialized_outputs += 1;
-                    stats.host_materialized_unattributed_outputs += 1;
+                    stats.host_materialized_interpreter_outputs += 1;
                 }
             }
             if (collect_loop_profile) loop_profile.stats_ns += metalPartitionElapsedNs(stats_start_ns, metalPartitionNowNs());

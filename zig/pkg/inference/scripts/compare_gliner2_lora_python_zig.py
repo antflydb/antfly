@@ -680,6 +680,49 @@ def _derived_grad_head(m_now: list[Any], m_prev: list[Any], beta1: float) -> lis
     return out
 
 
+_INERT_PYTHON_MHA_OUT_PROJ = re.compile(
+    r"^count_embed\.transformer\.transformer\.layers\.[01]\.self_attn\.out_proj\.lora_[AB]$"
+)
+
+
+def _is_inert_python_mha_out_proj(
+    name: str,
+    tensors: dict[str, dict[str, Any]],
+) -> bool:
+    """Recognize PEFT adapters that upstream registers but never executes.
+
+    PyTorch's ``MultiheadAttention`` reads ``out_proj.weight`` directly instead
+    of calling the wrapped module's forward method. PEFT still exposes LoRA A/B
+    as trainable parameters, but neither tensor receives a gradient, Adam state,
+    or a step; the zero-initialized B tensor therefore keeps the pair
+    functionally inert. Zig intentionally omits these adapters because applying
+    them in its explicit attention graph would diverge from upstream behavior.
+
+    Keep the exception narrow and evidence-based: both members of the exact
+    count-embedding MHA pair must be present, unstepped, gradient-free, and
+    state-free, and B must remain identically zero.
+    """
+    if _INERT_PYTHON_MHA_OUT_PROJ.fullmatch(name) is None:
+        return False
+    pair_prefix = name.rsplit(".lora_", 1)[0]
+    pair = [tensors.get(f"{pair_prefix}.lora_A"), tensors.get(f"{pair_prefix}.lora_B")]
+    if any(tensor is None for tensor in pair):
+        return False
+    for tensor in pair:
+        assert tensor is not None
+        if "step_count" not in tensor or int(tensor["step_count"] or 0) != 0:
+            return False
+        if tensor.get("grad"):
+            return False
+        for quantity in ("m", "v"):
+            abs_sum = tensor.get(f"{quantity}_abs_sum")
+            if quantity not in tensor or tensor[quantity] or not finite_number(abs_sum) or float(abs_sum) != 0.0:
+                return False
+    b_tensor = pair[1]
+    assert b_tensor is not None
+    return finite_number(b_tensor.get("weight_abs_sum")) and float(b_tensor["weight_abs_sum"]) == 0.0
+
+
 def compare_optimizer_parity(
     py_steps: list[dict[str, Any]] | None,
     zig_steps: list[dict[str, Any]] | None,
@@ -716,6 +759,12 @@ def compare_optimizer_parity(
         py_tensors = py_idx[step_i]
         zig_tensors = zig_idx[step_i]
         common = sorted(set(py_tensors) & set(zig_tensors))
+        raw_python_only = sorted(set(py_tensors) - set(zig_tensors))
+        ignored_python_only = sorted(
+            name for name in raw_python_only if _is_inert_python_mha_out_proj(name, py_tensors)
+        )
+        actionable_python_only = sorted(set(raw_python_only) - set(ignored_python_only))
+        zig_only = sorted(set(zig_tensors) - set(py_tensors))
         head_max = {q: {"max_abs_delta": 0.0, "tensor": None} for q in quantities}
         abs_sum_max = {q: {"max_abs_delta": 0.0, "tensor": None} for q in quantities}
         derived_grad_max = {"max_abs_delta": 0.0, "tensor": None}
@@ -764,8 +813,13 @@ def compare_optimizer_parity(
         step_reports.append({
             "step": step_i + 1,
             "tensors_compared": len(common),
-            "python_only_tensors": len(py_tensors) - len(common),
-            "zig_only_tensors": len(zig_tensors) - len(common),
+            "python_only_tensors": len(actionable_python_only),
+            "python_only_tensor_names": actionable_python_only,
+            "python_only_inert_tensors_ignored": len(ignored_python_only),
+            "python_only_inert_tensor_names": ignored_python_only,
+            "raw_python_only_tensors": len(raw_python_only),
+            "zig_only_tensors": len(zig_only),
+            "zig_only_tensor_names": zig_only,
             "step_count_mismatch_count": len(step_count_mismatches),
             "step_count_mismatches": step_count_mismatches[:10],
             "weight_head_max_abs_delta": head_max["weight"],
@@ -934,7 +988,9 @@ def summarize_accelerator_readiness(
             )
         )
 
-    total_true_host_outputs = sum(row_true_host_outputs(row) for row in zig_step_rows)
+    true_host_outputs_per_step = [row_true_host_outputs(row) for row in zig_step_rows]
+    total_true_host_outputs = sum(true_host_outputs_per_step)
+    max_true_host_outputs_per_step = max(true_host_outputs_per_step or [0])
     total_parameter_materializations = sum(
         int(row.get("graph_executor_host_output_parameter") or 0) for row in zig_step_rows
     )
@@ -1071,6 +1127,9 @@ def summarize_accelerator_readiness(
         args.zig_backend == backend and getattr(args, "zig_training_graph_executor", False)
     )
     max_interpreter_fallbacks = int(getattr(args, "metal_max_interpreter_fallbacks", 64))
+    max_metal_true_host_outputs = (
+        int(getattr(args, "metal_max_true_host_outputs_per_step", 6)) if backend == "metal" else None
+    )
     if graph_executor_requested:
         # When the training graph executor was explicitly requested, zero
         # dispatches means every step silently fell back to interpreter-only
@@ -1081,7 +1140,22 @@ def summarize_accelerator_readiness(
         # perf/coverage signal gated by an explicit ceiling (regression guard
         # against drifting into broad interpreter-only execution).
         checks["graph_executor_fallback_reasons_empty"] = not graph_executor_fallback_reasons
-        checks["graph_executor_true_host_outputs_zero"] = total_true_host_outputs == 0
+        if backend == "metal":
+            # The only admitted host values are the bounded interpreter-side
+            # i64 index conversions used by device gathers. Require complete
+            # category telemetry so command/runtime/unattributed host output
+            # cannot hide behind the same numeric ceiling.
+            checks["graph_executor_true_host_outputs_within_threshold"] = bool(zig_step_rows) and all(
+                row.get("graph_executor_host_output_command") == 0
+                and row.get("graph_executor_host_output_pre_materialized_constant") == 0
+                and row.get("graph_executor_host_output_runtime_region") == 0
+                and row.get("graph_executor_host_output_unattributed") == 0
+                and row.get("graph_executor_host_output_interpreter") == row_true_host_outputs(row)
+                and row_true_host_outputs(row) <= max_metal_true_host_outputs
+                for row in zig_step_rows
+            )
+        else:
+            checks["graph_executor_true_host_outputs_zero"] = total_true_host_outputs == 0
         checks["interpreter_fallbacks_within_threshold"] = total_interpreter_fallbacks <= max_interpreter_fallbacks
     elif zero_dispatches:
         warnings.append(f"{backend.upper()} run reported no graph command/planned dispatches; check for interpreter-only execution")
@@ -1110,6 +1184,8 @@ def summarize_accelerator_readiness(
         "total_graph_interpreter_fallbacks": total_interpreter_fallbacks,
         "total_graph_host_outputs": total_host_outputs,
         "total_graph_true_host_outputs": total_true_host_outputs,
+        "max_graph_true_host_outputs_per_step": max_true_host_outputs_per_step,
+        "max_graph_true_host_outputs_per_step_threshold": max_metal_true_host_outputs if backend == "metal" else 0,
         "total_graph_parameter_materializations": total_parameter_materializations,
         "total_graph_device_parameter_outputs": total_device_parameter_outputs,
         "graph_executor_fallback_reasons": graph_executor_fallback_reasons,
@@ -2904,6 +2980,13 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
     return result
 
 
+def zig_training_environment(args: argparse.Namespace) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if args.zig_backend in ("metal", "cuda") and args.zig_training_graph_executor:
+        env["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
+    return env
+
+
 def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     zig_local_cache = out_dir / "zig-local-cache"
     zig_global_cache = out_dir / "zig-global-cache"
@@ -2991,9 +3074,7 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         cmd.append("--dump-span-parity")
     if args.dump_optimizer_parity:
         cmd.append("--dump-optimizer-parity")
-    zig_env: dict[str, str] = {}
-    if args.zig_backend in ("metal", "cuda") and args.zig_training_graph_executor:
-        zig_env["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
+    zig_env = zig_training_environment(args)
     result = run_command(cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env)
     result["cache_fallback"] = False
     if result.get("returncode") != 0 and "manifest_create PermissionDenied" in result.get("output", ""):
@@ -3152,10 +3233,19 @@ def main() -> int:
         default=64,
         help=(
             "Explicit ceiling on per-op graph-executor interpreter fallbacks for the strict Metal "
-            "gate (default: 64; the GLiNER2 LoRA step currently uses 44 generic fallbacks). "
+            "gate (default: 64; the GLiNER2 LoRA step currently uses six i64 conversions). "
             "Exceeding this fails --strict when --zig-backend metal and the graph executor ran — it "
             "catches a regression into broad interpreter-only execution. A full-step fallback "
             "(graph_executor_fallback_reason non-empty) fails regardless of this ceiling."
+        ),
+    )
+    p.add_argument(
+        "--metal-max-true-host-outputs-per-step",
+        type=int,
+        default=6,
+        help=(
+            "Maximum bounded host metadata outputs per Metal step; the current six are i64 index "
+            "conversions consumed by device gathers, while trainable transfers remain zero"
         ),
     )
     p.add_argument(
@@ -3228,6 +3318,10 @@ def main() -> int:
     args = p.parse_args()
     if args.structure_span_chunk_samples < 0:
         p.error("--structure-span-chunk-samples must be non-negative")
+    if args.metal_max_interpreter_fallbacks < 0:
+        p.error("--metal-max-interpreter-fallbacks must be non-negative")
+    if args.metal_max_true_host_outputs_per_step < 0:
+        p.error("--metal-max-true-host-outputs-per-step must be non-negative")
     if args.zig_backend == "cuda" and not args.skip_python and args.python_device != "cuda":
         p.error("CUDA comparisons require --python-device cuda; auto/CPU fallback is not release evidence")
     for name in (
@@ -3355,6 +3449,8 @@ def main() -> int:
             "dump_preprocess_parity": args.dump_preprocess_parity,
             "dump_optimizer_parity": args.dump_optimizer_parity,
             "structure_span_chunk_samples": args.structure_span_chunk_samples,
+            "metal_max_interpreter_fallbacks": args.metal_max_interpreter_fallbacks,
+            "metal_max_true_host_outputs_per_step": args.metal_max_true_host_outputs_per_step,
             "loss_parity_tolerance": args.loss_parity_tolerance,
             "loss_parity_relative_tolerance": args.loss_parity_relative_tolerance,
             "perf_target_only_python": args.perf_target_only_python,
@@ -4043,13 +4139,14 @@ def main() -> int:
     step_loss_applicable = both_sides_ran and args.deterministic and not args.perf_target_only_python
     preprocess_applicable = both_sides_ran and args.deterministic and args.dump_parity
     full_loss_applicable = both_sides_ran and args.deterministic and is_total_loss_objective and not args.perf_target_only_python
-    # Same-artifact interchange is a fail-closed contract once both trainers
-    # succeed. Independently trained tensor equality is deliberately diagnostic:
-    # cancellation-sensitive encoder reductions can change near-zero gradient
-    # signs across frameworks, which Adam amplifies to roughly 2*lr despite
-    # matching forward loss and task-head gradients. Result/convergence parity
-    # belongs in the held-out release gate, not this one-step tensor check.
+    # Same-artifact interchange is a fail-closed exact contract once both
+    # trainers succeed. Independently trained adapter outputs are diagnostic by
+    # default: cancellation-sensitive encoder reductions can amplify tiny
+    # cross-framework weight differences. The dedicated multi-step optimizer
+    # gate promotes its explicit drift bound because it also dumps and verifies
+    # every per-parameter Adam update.
     roundtrip_applicable = args.adapter_roundtrip and both_sides_ran and not args.perf_target_only_python
+    trained_adapter_gate_applicable = roundtrip_applicable and args.dump_optimizer_parity
     step_count_gate_applicable = (
         (not args.skip_python or not args.skip_zig)
         and (args.skip_python or report.get("python", {}).get("returncode") == 0)
@@ -4080,6 +4177,9 @@ def main() -> int:
         "preprocess_parity_matches": preprocess_matches if preprocess_applicable else None,
         "valid_full_loss_parity": report["summary"]["valid_full_loss_parity"] if full_loss_applicable else None,
         "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
+        "trained_adapter_parity_ok": (
+            bool(trained_adapter_parity.get("ok")) if trained_adapter_gate_applicable else None
+        ),
         "optimizer_parity_ran": (
             bool(optimizer_parity.get("ran")) if args.dump_optimizer_parity and optimizer_parity is not None else None
         ),
@@ -4104,7 +4204,7 @@ def main() -> int:
             "metal_finite_step_loss": _metal("finite_step_loss"),
             "metal_training_precision_fp32": _metal("training_precision_fp32"),
             "metal_graph_executor_fallback_reasons_empty": _metal("graph_executor_fallback_reasons_empty"),
-            "metal_graph_executor_true_host_outputs_zero": _metal("graph_executor_true_host_outputs_zero"),
+            "metal_graph_executor_true_host_outputs_within_threshold": _metal("graph_executor_true_host_outputs_within_threshold"),
             "metal_interpreter_fallbacks_within_threshold": _metal("interpreter_fallbacks_within_threshold"),
         })
     if cuda_backend_ran:

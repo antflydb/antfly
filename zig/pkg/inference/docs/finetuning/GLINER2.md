@@ -73,6 +73,10 @@ before training if that path is disabled. CUDA provides dedicated forward and
 two-stage backward DeBERTa kernels at the same production geometry. Production
 accelerator runs should use `--compiled-required`; checkpoint/resume then
 cannot silently cross between compiled and interpreter execution.
+Metal's strict graph-executor contract allows at most six host metadata outputs
+per step. Op tracing binds those to the `i64` index conversions consumed by
+device gathers; trainable transfers remain zero, and any seventh host output or
+full-step fallback fails the gate.
 The CUDA training executor caches a single-device partition and buffer plan,
 keeps graph constants and runtime placeholders resident, uses page-locked
 asynchronous input staging, and applies clipping plus AdamW as batched device
@@ -263,6 +267,13 @@ the mean Zig deficit for each metric must be at most 0.02, and no paired
 deficit may exceed 0.05. Zig and Python use independent RNG streams, so exact
 stochastic traces are intentionally not part of the contract.
 
+The pinned PEFT configuration registers 184 adapter tensors, but four of them
+are inert `count_embed` `MultiheadAttention.out_proj` A/B pairs: PyTorch reads
+the projection weight directly instead of invoking the wrapped module. Zig
+therefore trains the 180 effective tensors. Optimizer parity waives only these
+exact pairs and only when the Python dump proves zero steps, gradients, Adam
+state, and `lora_B`; any active or differently named missing tensor fails.
+
 Both scorers identify exact-match normalization as
 `unicode_nfc_collapsed_whitespace_casefold/v1`. Python implements the complete
 normalizer. Zig admits a conservative Unicode 15 subset for which NFC and
@@ -380,11 +391,14 @@ five-seed quality, and the L4 plus A100/H100 release matrix pass under a new
 explicit precision contract.
 
 The batch-32 Metal profile chunks structure-loss span work in groups of 16
-samples. On the synthetic all-task diagnostic this reduced the device-owned
-tensor peak from about 2.63 GB to 2.41 GB without changing the reported loss,
-while keeping dispatch, barrier, and scope counts inside their production
-ceilings. The release gate uses a 3 GiB peak-live ceiling; this metric is the
-sum of simultaneously live device-owned tensors, not process RSS.
+samples. This preserves the reported loss and bounds the structure-head tensor
+shapes, but it is an optimization hint rather than a guaranteed whole-graph
+peak reduction: other live tensors can dominate as the executor evolves. The
+performance report always records peak live device-owned bytes (the sum of
+simultaneously live device tensors, not process RSS). Deployments with a fixed
+memory budget can enforce it with
+`--max-zig-metal-peak-live-bytes-median`; the generic release gate does not
+assume one device-independent ceiling.
 
 ## Focused verification
 
@@ -416,13 +430,11 @@ python3.12 -m unittest \
   test_finalize_gliner2_readiness.py
 ```
 
-CI runs the Python contract tests on Python 3.12 and the required native/Metal
-gradient gate on a macOS runner. Relevant Zig changes also require the
-self-hosted CUDA job, which emits a source-bound lane after artifact validation,
-the fail-closed full-task parity, resident post-step evaluation, resident
-optimizer, VRAM query, checkpoint/resume, memcheck, initcheck, and racecheck.
-Manual workflow dispatch additionally runs SM80, SM89, and SM90 lanes and emits
-the hardware-matrix artifact required by CUDA production readiness. The scoped readiness command trains on
+The real-model Python-oracle and Metal/CUDA hardware gates are currently
+operator-run rather than provisioned by CI. Their retained, source-bound
+artifacts remain required for a production-readiness claim; ordinary unit and
+contract tests validate the implementation surfaces but do not substitute for
+that evidence. The scoped readiness command trains on
 the selected accelerator but evaluates saved full-task adapters on native by
 default; `--eval-backend` and `--eval-compiled-required` control that policy
 independently. Real-model release readiness still requires

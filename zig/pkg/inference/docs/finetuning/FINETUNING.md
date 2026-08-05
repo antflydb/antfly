@@ -392,9 +392,11 @@ surfaced and fixed three further defects the gates had never executed:
   fixture could satisfy; they now require only the families present in the
   source fixture, and the multicount fixture moved a multi-instance
   relations record into the compared slice.
-- The multi-step gate required `trained_adapter_parity_ok`, which the
-  harness never emitted into `strict_checks`; it is now reported alongside
-  `adapter_roundtrip_ok`.
+- The dedicated multi-step optimizer gate requires
+  `trained_adapter_parity_ok`; one-step independently trained output deltas
+  remain diagnostic because tiny cross-framework weight differences are
+  amplified by the near-zero fixture. Same-artifact round-trip parity remains
+  exact in every gate.
 - `--deterministic` now also pins training data order on both sides (the
   Zig CLI skips its epoch shuffle; the harness passes the Python loader
   `--no-train-shuffle`), so deterministic comparisons cannot silently train
@@ -410,9 +412,11 @@ wrapper now requires exactly five paired independent seeds, all deployment
 floors, at most 0.02 mean Zig metric deficit, and at most 0.05 deficit in any
 paired run.
 
-The production batch-32 profile uses 16-sample structure-loss chunks and gates
-the graph executor's device-owned peak-live metric at 3 GiB. This is distinct
-from process RSS and remains fail-closed on representative release data.
+The production batch-32 profile uses 16-sample structure-loss chunks and
+reports the graph executor's device-owned peak-live metric separately from
+process RSS. There is no generic release ceiling: operators can set an
+explicit device-memory limit for their deployment, and that limit remains
+fail-closed on representative release data.
 
 Accepted, deliberately not "fixed":
 
@@ -432,9 +436,10 @@ Accepted, deliberately not "fixed":
   (`flat = start_word * max_span_width + (end - start)`) is the intended
   tightening once the Python dump's span serialization (single `[s,e]` vs
   list-of-subspans) is pinned against a live run.
-- CI runs the Python release-contract tests under Python 3.12 and requires the
-  native/Metal per-parameter gradient gate on a macOS runner. Real-model
-  performance and five-seed quality remain artifact-driven release jobs.
+- Python release-contract tests and the native/Metal per-parameter gradient
+  gate are operator-run release checks. Real-model performance and five-seed
+  quality likewise remain artifact-driven release jobs; ordinary CI does not
+  provide that evidence.
 The native trainer supports recoverable optimizer checkpoints at complete
 epoch boundaries with `--checkpoint-every-epochs`, and exact-run resume with
 `--resume-checkpoint`. Checkpoints include trainable weights, Adam moments,

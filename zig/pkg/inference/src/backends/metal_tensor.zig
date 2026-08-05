@@ -390,6 +390,11 @@ extern fn termite_metal_buffer_alloc(
     length: usize,
     storage_mode: c_int,
 ) ?*anyopaque;
+extern fn termite_metal_buffer_alloc_fresh(
+    runtime: *anyopaque,
+    length: usize,
+    storage_mode: c_int,
+) ?*anyopaque;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
 extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
@@ -559,15 +564,42 @@ pub const MetalTensor = struct {
         }
     }
 
-    /// Allocate a fresh device buffer of `byte_len` bytes on the runtime's
-    /// Metal device and wrap it as an owned device tensor.
+    /// Allocate a device buffer of `byte_len` bytes on the runtime's Metal
+    /// device, permitting same-frame pool reuse, and wrap it as an owned
+    /// device tensor.
     pub fn deviceAllocate(
         runtime: *anyopaque,
         byte_len: usize,
         mode: StorageMode,
         dims: []const i32,
     ) !MetalTensor {
-        const handle = termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode)) orelse
+        return deviceAllocateImpl(runtime, byte_len, mode, dims, false);
+    }
+
+    /// Allocate a new Metal buffer even when in-frame reuse is enabled. This
+    /// is reserved for operations whose encoded reads can outlive the Zig
+    /// tensor wrapper that owns a potential reuse candidate. Once the fresh
+    /// tensor itself dies it may enter the normal reuse pool.
+    pub fn deviceAllocateFresh(
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+    ) !MetalTensor {
+        return deviceAllocateImpl(runtime, byte_len, mode, dims, true);
+    }
+
+    fn deviceAllocateImpl(
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+        fresh: bool,
+    ) !MetalTensor {
+        const handle = (if (fresh)
+            termite_metal_buffer_alloc_fresh(runtime, byte_len, @intFromEnum(mode))
+        else
+            termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode))) orelse
             return error.MetalBufferAllocFailed;
         var tensor = deviceOwned(runtime, handle, 0, byte_len, dims);
         errdefer tensor.deinit();

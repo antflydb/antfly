@@ -9882,7 +9882,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
 
-        var output = try MetalTensor.deviceAllocate(
+        // The axis-generic path encodes one or more blits from input tensors.
+        // A pooled destination can alias storage whose GPU reads are still
+        // pending even though its Zig wrapper reached refcount zero. Allocate
+        // this destination fresh; it can re-enter the pool after the concat's
+        // own logical lifetime ends.
+        var output = try MetalTensor.deviceAllocateFresh(
             @ptrCast(runtime),
             out_numel * @sizeOf(f32),
             .private,

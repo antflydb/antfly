@@ -33,6 +33,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
     return switch (err) {
         error.InvalidCreateTableRequest,
         error.InvalidCreateTableSchemaRequest,
+        error.SchemaVersionManagedByBackend,
         error.InvalidSchemaUpdateRequest,
         error.SyntaxError,
         error.UnexpectedEndOfInput,
@@ -69,6 +70,9 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     };
     if (raw_root.get("indexes")) |indexes_value| {
         if (indexes_value != .null) try validateCreateTableIndexesValue(indexes_value);
+    }
+    if (raw_root.get("schema")) |schema_value| {
+        if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
@@ -222,19 +226,32 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidSchemaUpdateRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidSchemaUpdateRequest;
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("version")) |version| {
+            if (version != .null) return error.SchemaVersionManagedByBackend;
+        }
+    }
     // Pass the raw body directly to preserve x-antfly-* extension properties
     // that would be lost if round-tripped through the typed OpenAPI TableSchema struct.
     return try tables_api.parseSchemaUpdateRequest(alloc, body);
 }
 
-pub fn schemaUpdateRequestErrorMessage(body: []const u8) []const u8 {
+pub fn schemaUpdateRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {
+    if (err == error.SchemaVersionManagedByBackend) {
+        return "schema.version is managed by Antfly; omit it";
+    }
     if (std.mem.indexOf(u8, body, "\"doc_values\"") != null) {
         return "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings";
     }
     return "invalid schema update request";
 }
 
-pub fn createTableRequestErrorMessage(body: []const u8) []const u8 {
+pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {
+    if (err == error.SchemaVersionManagedByBackend) {
+        return "schema.version is managed by Antfly; omit it";
+    }
     if (std.mem.indexOf(u8, body, "\"doc_values\"") != null) {
         return "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings";
     }
@@ -638,7 +655,7 @@ test "table contract encodes internal create table request back to public json" 
     var req: tables_api.CreateTableRequest = .{
         .num_shards = 1,
         .description = try std.testing.allocator.dupe(u8, "docs"),
-        .indexes_json = try std.testing.allocator.dupe(u8, "{\"full_text_index_v0\":{\"type\":\"full_text\"}}"),
+        .indexes_json = try std.testing.allocator.dupe(u8, "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}"),
         .schema_json = try std.testing.allocator.dupe(
             u8,
             "{\"version\":0,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
@@ -687,6 +704,28 @@ test "table contract rejects malformed schema payloads" {
     try std.testing.expectError(
         error.InvalidCreateTableSchemaRequest,
         parseCreateTableRequest(std.testing.allocator, "{\"schema\":{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":true}}]}}"),
+    );
+}
+
+test "table contract rejects caller-managed schema update versions" {
+    try std.testing.expectError(
+        error.SchemaVersionManagedByBackend,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"version\":7,\"document_schemas\":{}}"),
+    );
+}
+
+test "table contract rejects caller-managed create schema versions" {
+    try std.testing.expectError(
+        error.SchemaVersionManagedByBackend,
+        parseCreateTableRequest(std.testing.allocator, "{\"schema\":{\"version\":7}}"),
+    );
+    try std.testing.expectEqual(
+        CreateTableRequestErrorDisposition.bad_request,
+        classifyCreateTableRequestError(error.SchemaVersionManagedByBackend),
+    );
+    try std.testing.expectEqualStrings(
+        "schema.version is managed by Antfly; omit it",
+        createTableRequestErrorMessage(error.SchemaVersionManagedByBackend, "{\"schema\":{\"version\":7}}"),
     );
 }
 
@@ -774,9 +813,16 @@ test "table contract ignores create-table full text entries and preserves non-fu
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("docs", req.description.?);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"full_text_index_v0\":{\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"default\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}") != null);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.indexes_json.?, .{});
+    defer indexes.deinit();
+    try std.testing.expect(indexes.value.object.get("default") == null);
+    const full_text = indexes.value.object.get("full_text_index_v0").?.object;
+    try std.testing.expectEqualStrings("full_text_index_v0", full_text.get("name").?.string);
+    try std.testing.expectEqualStrings("full_text", full_text.get("type").?.string);
+    const embedding = indexes.value.object.get("embed_idx").?.object;
+    try std.testing.expect(embedding.get("name") == null);
+    try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 384), embedding.get("dimension").?.integer);
 }
 
 test "table contract accepts public full text create index" {
@@ -944,18 +990,18 @@ test "table contract skips arbitrary public full text names in table-definition 
 test "table contract schema update error message explains public sortable replacement for doc values" {
     try std.testing.expectEqualStrings(
         "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings",
-        schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}"),
+        schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, "{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}"),
     );
     try std.testing.expectEqualStrings(
         "invalid schema update request",
-        schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"),
+        schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, "{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"),
     );
     try std.testing.expectEqualStrings(
         "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings",
-        createTableRequestErrorMessage("{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}}"),
+        createTableRequestErrorMessage(error.InvalidCreateTableSchemaRequest, "{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}}"),
     );
     try std.testing.expectEqualStrings(
         "invalid create table request",
-        createTableRequestErrorMessage("{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}}"),
+        createTableRequestErrorMessage(error.InvalidCreateTableSchemaRequest, "{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}}"),
     );
 }
