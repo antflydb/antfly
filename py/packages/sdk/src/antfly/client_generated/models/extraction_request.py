@@ -23,7 +23,9 @@ class ExtractionRequest:
     Attributes:
         model (str):
         inputs (list[ExtractionInput]):
-        schema (ExtractionSchema):
+        schema (ExtractionSchema): Selects one extraction operation family per request. Entity labels may
+            accompany relation schemas so relation extraction can return its
+            participating entities in the same response.
         options (ExtractionOptions | Unset):
     """
 

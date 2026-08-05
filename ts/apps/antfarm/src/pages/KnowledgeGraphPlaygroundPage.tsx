@@ -40,8 +40,8 @@ import { useApiConfig } from "@/hooks/use-api-config";
 import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { fetchWithRetry } from "@/lib/utils";
 
-// Recognition response types matching the Antfly inference extraction API.
-interface RecognizeEntity {
+// Entity and relation response types matching the Antfly extraction API.
+interface ExtractEntity {
   text: string;
   label: string;
   start?: number;
@@ -49,20 +49,22 @@ interface RecognizeEntity {
   score: number;
 }
 
-interface RecognizeRelation {
-  head: RecognizeEntity;
-  tail: RecognizeEntity;
-  label: string;
-  score: number;
+interface ExtractRelation {
+  source?: { entity_index?: number };
+  target?: { entity_index?: number };
+  type: string;
+  score?: number;
 }
 
-interface RecognizeResponse {
+interface ExtractResponse {
   model: string;
-  entities: RecognizeEntity[][];
-  relations?: RecognizeRelation[][];
+  data: Array<{
+    entities?: ExtractEntity[];
+    relations?: ExtractRelation[];
+  }>;
 }
 
-// Graph visualization types (derived from RecognizeResponse)
+// Graph visualization types (derived from ExtractResponse)
 interface KGNode {
   id: string;
   canonical_name: string;
@@ -118,18 +120,16 @@ const SAMPLE_TEXTS = [
   "Tesla acquired SolarCity in 2016 and is based in Austin, Texas.",
 ];
 
-// Convert RecognizeResponse to graph nodes and edges for visualization.
-// When resolver is used, entities[0] contains deduplicated entities and
-// relations[0] contains resolved relations.
-function buildGraphFromResponse(data: RecognizeResponse): KGResult {
-  // Flatten all entities across text arrays.
-  const allEntities: RecognizeEntity[] = [];
-  for (const textEntities of data.entities) {
-    allEntities.push(...textEntities);
+// Convert ExtractResponse to graph nodes and edges for visualization.
+function buildGraphFromResponse(data: ExtractResponse): KGResult {
+  // Flatten all entities across input result objects.
+  const allEntities: ExtractEntity[] = [];
+  for (const item of data.data) {
+    allEntities.push(...(item.entities ?? []));
   }
 
   // Deduplicate entities by (text, label) to build nodes.
-  const nodeKey = (e: RecognizeEntity) => `${e.text.toLowerCase()}::${e.label.toLowerCase()}`;
+  const nodeKey = (e: ExtractEntity) => `${e.text.toLowerCase()}::${e.label.toLowerCase()}`;
   const nodeMap = new Map<string, KGNode>();
   let nodeIdx = 0;
   for (const e of allEntities) {
@@ -155,21 +155,22 @@ function buildGraphFromResponse(data: RecognizeResponse): KGResult {
 
   // Build edges from relations.
   const edges: KGEdge[] = [];
-  if (data.relations) {
-    let edgeIdx = 0;
-    for (const textRelations of data.relations) {
-      for (const rel of textRelations) {
-        const sourceNode = nodeMap.get(nodeKey(rel.head));
-        const targetNode = nodeMap.get(nodeKey(rel.tail));
-        if (sourceNode && targetNode) {
-          edges.push({
-            id: `edge-${edgeIdx++}`,
-            source_id: sourceNode.id,
-            target_id: targetNode.id,
-            type: rel.label,
-            confidence: rel.score,
-          });
-        }
+  let edgeIdx = 0;
+  for (const item of data.data) {
+    for (const rel of item.relations ?? []) {
+      const sourceEntity = item.entities?.[rel.source?.entity_index ?? -1];
+      const targetEntity = item.entities?.[rel.target?.entity_index ?? -1];
+      if (!sourceEntity || !targetEntity) continue;
+      const sourceNode = nodeMap.get(nodeKey(sourceEntity));
+      const targetNode = nodeMap.get(nodeKey(targetEntity));
+      if (sourceNode && targetNode) {
+        edges.push({
+          id: `edge-${edgeIdx++}`,
+          source_id: sourceNode.id,
+          target_id: targetNode.id,
+          type: rel.type,
+          confidence: rel.score ?? 0,
+        });
       }
     }
   }
@@ -267,7 +268,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   const [selectedEdge, setSelectedEdge] = useState<KGEdge | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const { models: connectionModels, loading: modelsLoading } =
-    useSelectedInferenceModelNames("recognizer");
+    useSelectedInferenceModelNames("extractor");
 
   // Persist state to localStorage
   useEffect(() => {
@@ -344,22 +345,26 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         .map((t: string) => t.trim())
         .filter((t: string) => t.length > 0);
 
-      // Build request body for /api/recognize with resolver config
+      // Build a relation extraction request with resolver config.
       const requestBody: Record<string, unknown> = {
         model: getModelName(selectedModel),
-        texts: texts,
-        resolver: config,
+        inputs: texts.map((content: string) => ({ content })),
+        schema: {
+          relations: relationLabels.map((type) => ({ type })),
+        },
+        options: {
+          resolver: config,
+          include_confidence: true,
+          include_spans: true,
+        },
       };
 
       // Only include labels for GLiNER models
       if (!isRebelModel) {
-        requestBody.labels = entityLabels;
-        if (relationLabels.length > 0) {
-          requestBody.relation_labels = relationLabels;
-        }
+        (requestBody.schema as Record<string, unknown>).entities = entityLabels;
       }
 
-      const response = await fetchWithRetry(inferenceUrl("recognize"), {
+      const response = await fetchWithRetry(inferenceUrl("extract"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -373,7 +378,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         throw new Error(errorText || `HTTP ${response.status}`);
       }
 
-      const data: RecognizeResponse = await response.json();
+      const data: ExtractResponse = await response.json();
       setResult(buildGraphFromResponse(data));
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
@@ -635,7 +640,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
       {modelsLoaded && availableModels.length === 0 && (
         <NoModelsGuide
-          modelType="recognizer"
+          modelType="extractor"
           requiredCapability="relations"
           typeName="relation extraction"
         />

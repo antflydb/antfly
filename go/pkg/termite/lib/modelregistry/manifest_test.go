@@ -31,9 +31,9 @@ func TestParseModelType(t *testing.T) {
 		{"chunkers", ModelTypeChunker, false},
 		{"reranker", ModelTypeReranker, false},
 		{"rerankers", ModelTypeReranker, false},
-		{"recognizer", ModelTypeRecognizer, false},
-		{"recognizers", ModelTypeRecognizer, false},
-		{"RECOGNIZER", ModelTypeRecognizer, false},
+		{"extractor", ModelTypeExtractor, false},
+		{"extractors", ModelTypeExtractor, false},
+		{"EXTRACTOR", ModelTypeExtractor, false},
 		{"rewriter", ModelTypeRewriter, false},
 		{"rewriters", ModelTypeRewriter, false},
 		{"REWRITER", ModelTypeRewriter, false},
@@ -83,10 +83,10 @@ func TestPipelineTagToModelType(t *testing.T) {
 		{"text-classification", ModelTypeClassifier, true},
 		{"token-classification", ModelTypeClassifier, true},
 		{"zero-shot-classification", ModelTypeClassifier, true},
-		// Recognizer
-		{"object-detection", ModelTypeRecognizer, true},
-		{"image-classification", ModelTypeRecognizer, true},
-		{"image-segmentation", ModelTypeRecognizer, true},
+		// Extractor
+		{"object-detection", ModelTypeExtractor, true},
+		{"image-classification", ModelTypeExtractor, true},
+		{"image-segmentation", ModelTypeExtractor, true},
 		// Unknown
 		{"unknown-task", "", false},
 		{"", "", false},
@@ -114,7 +114,7 @@ func TestModelTypeDirName(t *testing.T) {
 		{ModelTypeEmbedder, "embedders"},
 		{ModelTypeChunker, "chunkers"},
 		{ModelTypeReranker, "rerankers"},
-		{ModelTypeRecognizer, "recognizers"},
+		{ModelTypeExtractor, "extractors"},
 		{ModelTypeRewriter, "rewriters"},
 	}
 
@@ -398,7 +398,7 @@ func TestManifestValidate(t *testing.T) {
 		{
 			name: "non-standard onnx filenames valid",
 			modify: func(m *ModelManifest) {
-				m.Type = ModelTypeRecognizer
+				m.Type = ModelTypeExtractor
 				m.Files = []ModelFile{
 					{Name: "det.onnx", Digest: "sha256:def456", Size: 5000},
 					{Name: "rec.onnx", Digest: "sha256:ghi789", Size: 8000},

@@ -2233,7 +2233,6 @@ paths:
               - generate
               - rerank
               - chunk
-              - recognize
               - extract
               - rewrite
               - read
@@ -6731,8 +6730,8 @@ paths:
     get:
       summary: List available models
       description: >
-        Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
-        transcriber models.
+        Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader,
+        and transcriber models.
 
 
         ## Embedders
@@ -6770,12 +6769,12 @@ paths:
         - Empty if no models configured
 
 
-        ## Recognizers
+        ## Extractors
 
 
-        - ONNX models from `models_dir/recognizers/`
+        - Extraction-capable models from the managed model registry
 
-        - Includes GLiNER models for zero-shot recognition
+        - Includes GLiNER models for zero-shot entity and relation extraction
 
 
         ## Rewriters
@@ -7549,7 +7548,6 @@ components:
         - generator
         - reranker
         - chunker
-        - recognizer
         - classifier
         - rewriter
         - reader
@@ -7620,7 +7618,7 @@ components:
 
             pluralized ConnectedModelType values ("embedders", "generators",
 
-            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+            "rerankers", "chunkers", "classifiers", "rewriters",
 
             "readers", "transcribers", "extractors") plus "other" for models
 
@@ -21048,7 +21046,6 @@ components:
         - rerankers
         - embedders
         - generators
-        - recognizers
         - extractors
         - rewriters
         - classifiers
@@ -21102,11 +21099,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/InferenceModelInfo'
           description: Available generator/LLM models from models_dir/generators/
-        recognizers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/InferenceModelInfo'
-          description: Available recognizer models from models_dir/recognizers/
         rewriters:
           type: object
           additionalProperties:
@@ -21681,7 +21673,6 @@ components:
         - reranker
         - chunker
         - classifier
-        - recognizer
         - rewriter
         - reader
         - transcriber
@@ -21847,7 +21838,7 @@ components:
 
             - `{models_dir}/rerankers/` - Reranking models (ONNX)
 
-            - `{models_dir}/recognizers/` - Recognition models (ONNX)
+            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
 
             - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
 
@@ -22676,15 +22667,20 @@ components:
           additionalProperties: true
     ExtractionRelationSchema:
       type: object
+      description: Optional source and target labels constrain relation endpoints. A target requires a
+        source.
       required:
         - type
       properties:
         type:
           type: string
+          minLength: 1
         source:
           type: string
+          minLength: 1
         target:
           type: string
+          minLength: 1
     ExtractionClassificationSchema:
       type: object
       required:
@@ -22704,22 +22700,46 @@ components:
       oneOf:
         - type: string
         - type: object
+          properties:
+            type:
+              type: string
+              enum:
+                - str
+                - string
+                - list
+                - array
+            enum:
+              type: array
+              minItems: 2
+              items:
+                type: string
+                minLength: 1
           additionalProperties: true
     ExtractionStructureSchema:
       type: object
+      required:
+        - fields
       properties:
         fields:
           type: object
+          minProperties: 1
           additionalProperties:
             $ref: '#/components/schemas/ExtractionStructureField'
       additionalProperties: true
     ExtractionSchema:
       type: object
+      description: >
+        Selects one extraction operation family per request. Entity labels may
+
+        accompany relation schemas so relation extraction can return its
+
+        participating entities in the same response.
       properties:
         entities:
           type: array
           items:
             type: string
+            minLength: 1
         relations:
           type: array
           items:
@@ -22745,6 +22765,37 @@ components:
         api_url:
           type: string
       additionalProperties: true
+    ExtractionResolverOptions:
+      type: object
+      description: Optional cross-input entity and relation deduplication.
+      properties:
+        similarity_threshold:
+          type: number
+          format: float
+          default: 0.85
+          minimum: 0
+          maximum: 1
+        type_must_match:
+          type: boolean
+          default: true
+        min_entity_confidence:
+          type: number
+          format: float
+          default: 0
+          minimum: 0
+          maximum: 1
+        min_relation_confidence:
+          type: number
+          format: float
+          default: 0
+          minimum: 0
+          maximum: 1
+        deduplicate_relations:
+          type: boolean
+          default: true
+        track_provenance:
+          type: boolean
+          default: true
     ExtractionOptions:
       type: object
       properties:
@@ -22759,6 +22810,8 @@ components:
           type: boolean
         reader:
           $ref: '#/components/schemas/ExtractionReaderOptions'
+        resolver:
+          $ref: '#/components/schemas/ExtractionResolverOptions'
       additionalProperties: true
     ExtractionRequest:
       type: object
@@ -22769,8 +22822,10 @@ components:
       properties:
         model:
           type: string
+          minLength: 1
         inputs:
           type: array
+          minItems: 1
           items:
             $ref: '#/components/schemas/ExtractionInput'
         schema:

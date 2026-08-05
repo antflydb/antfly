@@ -213,7 +213,6 @@ pub const ModelRegistry = struct {
             .{ .dir = "chunkers", .kind = .chunker },
             .{ .dir = "rerankers", .kind = .reranker },
             .{ .dir = "generators", .kind = .generator },
-            .{ .dir = "recognizers", .kind = .recognizer },
             .{ .dir = "classifiers", .kind = .classifier },
             .{ .dir = "rewriters", .kind = .rewriter },
             .{ .dir = "readers", .kind = .reader },
@@ -456,6 +455,20 @@ pub const ModelRegistry = struct {
                 return;
             }
 
+            if (p.cached) {
+                var total_buf: [32]u8 = undefined;
+                var elapsed_buf: [32]u8 = undefined;
+                const size = p.total_bytes orelse p.bytes_downloaded;
+                std.debug.print("  [{d}/{d}] {s} cached ({s}, verified in {s})\n", .{
+                    p.files_done,
+                    p.files_total,
+                    p.file,
+                    formatBytes(size, &total_buf),
+                    formatDurationNs(@max(monotonicNowNs() - self.started_ns, 1), &elapsed_buf),
+                });
+                return;
+            }
+
             const elapsed_ns = @max(monotonicNowNs() - self.started_ns, 1);
             const bytes_per_sec = (@as(f64, @floatFromInt(p.bytes_downloaded)) * @as(f64, std.time.ns_per_s)) / @as(f64, @floatFromInt(elapsed_ns));
             var elapsed_buf: [32]u8 = undefined;
@@ -519,6 +532,10 @@ pub const ModelRegistry = struct {
             } else {
                 std.debug.print("  [{d}/{d}] {s}...\n", .{ p.files_done + 1, p.files_total, p.file });
             }
+        } else if (p.cached) {
+            var total_buf: [32]u8 = undefined;
+            const size = p.total_bytes orelse p.bytes_downloaded;
+            std.debug.print("  [{d}/{d}] {s} cached ({s})\n", .{ p.files_done, p.files_total, p.file, formatBytes(size, &total_buf) });
         } else if (p.total_bytes) |total| {
             if (p.bytes_downloaded < total) {
                 var done_buf: [32]u8 = undefined;
@@ -570,7 +587,6 @@ fn isLegacyTaskDir(name: []const u8) bool {
         std.mem.eql(u8, name, "chunkers") or
         std.mem.eql(u8, name, "rerankers") or
         std.mem.eql(u8, name, "generators") or
-        std.mem.eql(u8, name, "recognizers") or
         std.mem.eql(u8, name, "classifiers") or
         std.mem.eql(u8, name, "rewriters") or
         std.mem.eql(u8, name, "readers") or
@@ -600,7 +616,6 @@ fn inferModelKindFromPath(path: []const u8) ModelKind {
         if (std.mem.eql(u8, component, "chunkers")) return .chunker;
         if (std.mem.eql(u8, component, "rerankers")) return .reranker;
         if (std.mem.eql(u8, component, "generators")) return .generator;
-        if (std.mem.eql(u8, component, "recognizers")) return .recognizer;
         if (std.mem.eql(u8, component, "classifiers")) return .classifier;
         if (std.mem.eql(u8, component, "rewriters")) return .rewriter;
         if (std.mem.eql(u8, component, "readers")) return .reader;
@@ -661,7 +676,7 @@ fn appendManifestTasks(
         .chunker => try appendUniqueOwnedString(allocator, tasks, "chunk"),
         .reranker => try appendUniqueOwnedString(allocator, tasks, "rerank"),
         .generator => try appendUniqueOwnedString(allocator, tasks, "generate"),
-        .recognizer => try appendUniqueOwnedString(allocator, tasks, "recognize"),
+        .recognizer => try appendUniqueOwnedString(allocator, tasks, "extract"),
         .classifier => try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
@@ -737,8 +752,6 @@ fn normalizeTaskHint(raw_task: []const u8) []const u8 {
         "chunk"
     else if (std.mem.eql(u8, raw_task, "generators"))
         "generate"
-    else if (std.mem.eql(u8, raw_task, "recognizers"))
-        "recognize"
     else if (std.mem.eql(u8, raw_task, "classifiers"))
         "classify"
     else if (std.mem.eql(u8, raw_task, "rewriters"))
@@ -844,8 +857,7 @@ fn appendJsonStringArray(
 
 fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.ModelType) manifest_mod.ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "recognizers") or
-            std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;

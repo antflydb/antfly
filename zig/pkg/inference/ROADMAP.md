@@ -83,7 +83,7 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 - [ ] **GLiNER parity validation**: GLiNER has a native DeBERTa + span-head path. Remaining work: prove parity with real GLiNER models across MLX/BLAS, add backend-specific tests, tighten performance gaps in the native head.
 - [ ] **Bounded BLAS-vs-TP parity run** on a real local GLiNER2 bundle
 - [ ] **Server-path orchestration** for distributed multi-rank GLiNER2 execution
-- [ ] **Thread server/reporting semantics** through native `/classify` and `/recognize`
+- [ ] **Thread server/reporting semantics** through native `/classify` and `/extract`
 
 ### LayoutDoc
 
@@ -104,7 +104,7 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 | `/api/rerank_multimodal` | Working end-to-end; verification ongoing |
 | `/api/generate` | Working (autoregressive, streaming, tool-calling) |
 | `/api/chunk` | Basic fixed chunking; semantic chunking pending |
-| `/api/recognize` | GLiNER native path; parity validation pending |
+| `/api/extract` | GLiNER native path; parity validation pending |
 | `/api/classify` | Stub |
 | `/api/rewrite` | Stub |
 | `/api/read` | Stub |

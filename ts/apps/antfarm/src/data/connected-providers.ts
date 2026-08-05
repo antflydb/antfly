@@ -16,7 +16,6 @@ import {
   Scissors,
   Server,
   Sparkles,
-  Tag,
   Tags,
 } from "lucide-react";
 
@@ -58,7 +57,6 @@ export const CONNECTED_MODEL_KINDS: ConnectedModelKindInfo[] = [
   { kind: "generator", label: "Generators", icon: Sparkles },
   { kind: "reranker", label: "Rerankers", icon: ArrowUpDown },
   { kind: "chunker", label: "Chunkers", icon: Scissors },
-  { kind: "recognizer", label: "Recognizers", icon: Tag },
   { kind: "classifier", label: "Classifiers", icon: Tags },
   { kind: "rewriter", label: "Rewriters", icon: RefreshCw },
   { kind: "reader", label: "Readers", icon: BookOpen },

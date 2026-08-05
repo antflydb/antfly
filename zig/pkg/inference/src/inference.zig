@@ -61,7 +61,6 @@ pub const native_rerank = @import("native_rerank.zig");
 pub const native_transcribe = @import("native_transcribe.zig");
 pub const native_read = @import("native_read.zig");
 pub const scraping = @import("antfly_scraping");
-pub const native_recognize = @import("native_recognize.zig");
 pub const native_extract = @import("native_extract.zig");
 pub const compare_generate = @import("cli/compare_generate.zig");
 pub const run_options = @import("cli/run_options.zig");
@@ -120,7 +119,6 @@ test {
     _ = native_transcribe;
     _ = native_read;
     _ = @import("readers/reader.zig");
-    _ = native_recognize;
     _ = native_extract;
     _ = compare_generate;
     _ = run_options;

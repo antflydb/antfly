@@ -13,6 +13,7 @@ output-options:
   prefer-skip-optional-pointer: true
   prefer-skip-optional-pointer-with-omitzero: true
 import-mapping:
+  ../ai/extraction.yaml: github.com/antflydb/antfly/go/pkg/generating/extracting
   ../shared/chunking.yaml: github.com/antflydb/antfly/go/pkg/libaf/chunking
   ../shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating
   ../shared/logging.yaml: github.com/antflydb/antfly/go/pkg/libaf/logging

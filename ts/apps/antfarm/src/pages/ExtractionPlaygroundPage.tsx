@@ -56,12 +56,6 @@ interface NEREntity {
   score: number;
 }
 
-interface NERResponse {
-  model: string;
-  entities: NEREntity[][];
-}
-
-// Extract response types
 interface ExtractFieldValue {
   value: string;
   score?: number;
@@ -70,11 +64,16 @@ interface ExtractFieldValue {
 }
 
 interface ExtractResponse {
+  object: "extraction";
   model: string;
-  results: Record<string, Record<string, unknown>[]>[];
+  data: Array<{
+    id?: string;
+    entities?: NEREntity[];
+    structures?: Record<string, Record<string, unknown>[]>;
+  }>;
 }
 
-type PlaygroundMode = "recognize" | "extract";
+type PlaygroundMode = "entities" | "structured";
 
 // Schema field for extract mode
 interface SchemaField {
@@ -90,7 +89,7 @@ interface SchemaStructure {
 // Default entity labels for GLiNER
 const DEFAULT_LABELS = ["person", "organization", "location"];
 
-const STORAGE_KEY = "antfarm-playground-ner";
+const STORAGE_KEY = "antfarm-playground-extraction";
 
 // Default extract schema
 const DEFAULT_SCHEMA: SchemaStructure[] = [
@@ -239,12 +238,12 @@ const ExtractionPlaygroundPage: React.FC = () => {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved).mode;
-        if (parsed === "recognize" || parsed === "extract") return parsed;
+        if (parsed === "entities" || parsed === "structured") return parsed;
       }
     } catch {
       /* ignore */
     }
-    return "recognize";
+    return "entities";
   });
   const [inputText, setInputText] = useState(() => {
     try {
@@ -265,7 +264,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     return "";
   });
 
-  // Recognize mode state
+  // Entity extraction state
   const [labels, setLabels] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -291,7 +290,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     }
     return 0.5;
   });
-  const [recognizeResult, setRecognizeResult] = useState<NERResponse | null>(null);
+  const [entityResult, setEntityResult] = useState<ExtractResponse | null>(null);
 
   // Extract mode state (restored from localStorage)
   const [schema, setSchema] = useState<SchemaStructure[]>(() => {
@@ -342,13 +341,10 @@ const ExtractionPlaygroundPage: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
-  const [recognizerModels, setRecognizerModels] = useState<string[]>([]);
   const [extractorModels, setExtractorModels] = useState<string[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const labelColorMapRef = useRef<Map<string, number>>(new Map());
-  const { models: connectionRecognizers, loading: recognizersLoading } =
-    useSelectedInferenceModelNames("recognizer");
   const { models: connectionExtractors, loading: extractorsLoading } =
     useSelectedInferenceModelNames("extractor");
 
@@ -380,26 +376,24 @@ const ExtractionPlaygroundPage: React.FC = () => {
     includeSpans,
   ]);
 
-  const availableModels = mode === "recognize" ? recognizerModels : extractorModels;
+  const availableModels = extractorModels;
 
   useEffect(() => {
-    setRecognizerModels(connectionRecognizers);
-    setExtractorModels(
-      connectionExtractors.length > 0 ? connectionExtractors : connectionRecognizers
-    );
-    setModelsLoaded(!recognizersLoading && !extractorsLoading);
-  }, [connectionRecognizers, connectionExtractors, recognizersLoading, extractorsLoading]);
+    setExtractorModels(connectionExtractors);
+    setModelsLoaded(!extractorsLoading);
+  }, [connectionExtractors, extractorsLoading]);
 
   // Update selected model when mode changes
   useEffect(() => {
-    const models = mode === "recognize" ? recognizerModels : extractorModels;
-    setSelectedModel((prev: string) => (prev && models.includes(prev) ? prev : models[0] || ""));
-  }, [mode, recognizerModels, extractorModels]);
+    setSelectedModel((prev: string) =>
+      prev && extractorModels.includes(prev) ? prev : extractorModels[0] || ""
+    );
+  }, [extractorModels]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded && recognizerModels.includes(modelParam)) {
+    if (modelParam && modelsLoaded && extractorModels.includes(modelParam)) {
       setSelectedModel(modelParam);
       setSearchParams(
         (prev) => {
@@ -409,7 +403,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
         { replace: true }
       );
     }
-  }, [searchParams, modelsLoaded, recognizerModels, setSearchParams]);
+  }, [searchParams, modelsLoaded, extractorModels, setSearchParams]);
 
   const getColorForLabel = (label: string) => {
     const normalizedLabel = label.toLowerCase();
@@ -429,7 +423,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     return DYNAMIC_COLORS[colorIndex ?? 0];
   };
 
-  const handleRecognize = useCallback(async () => {
+  const handleExtractionSubmit = useCallback(async () => {
     if (!inputText.trim()) {
       setError("Please enter some text to analyze");
       return;
@@ -440,12 +434,12 @@ const ExtractionPlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (mode === "recognize" && labels.length === 0) {
+    if (mode === "entities" && labels.length === 0) {
       setError("Please add at least one entity label");
       return;
     }
 
-    if (mode === "extract" && schema.length === 0) {
+    if (mode === "structured" && schema.length === 0) {
       setError("Please add at least one structure to the schema");
       return;
     }
@@ -458,21 +452,22 @@ const ExtractionPlaygroundPage: React.FC = () => {
     abortControllerRef.current = new AbortController();
     setIsLoading(true);
     setError(null);
-    setRecognizeResult(null);
+    setEntityResult(null);
     setExtractResult(null);
     labelColorMapRef.current.clear();
 
     const startTime = performance.now();
 
     try {
-      if (mode === "recognize") {
-        const response = await fetchWithRetry(inferenceUrl("recognize"), {
+      if (mode === "entities") {
+        const response = await fetchWithRetry(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            texts: [inputText],
-            labels: labels,
+            inputs: [{ content: inputText }],
+            schema: { entities: labels },
+            options: { include_confidence: true, include_spans: true },
           }),
           signal: abortControllerRef.current.signal,
         });
@@ -482,13 +477,15 @@ const ExtractionPlaygroundPage: React.FC = () => {
           throw new Error(errorText || `HTTP ${response.status}`);
         }
 
-        const data: NERResponse = await response.json();
-        setRecognizeResult(data);
+        const data: ExtractResponse = await response.json();
+        setEntityResult(data);
       } else {
         // Build schema for extract API
-        const apiSchema: Record<string, string[]> = {};
+        const apiSchema: Record<string, { fields: Record<string, "str" | "list"> }> = {};
         for (const structure of schema) {
-          apiSchema[structure.name] = structure.fields.map((f) => `${f.name}::${f.type}`);
+          apiSchema[structure.name] = {
+            fields: Object.fromEntries(structure.fields.map((field) => [field.name, field.type])),
+          };
         }
 
         const response = await fetchWithRetry(inferenceUrl("extract"), {
@@ -496,11 +493,13 @@ const ExtractionPlaygroundPage: React.FC = () => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            texts: [inputText],
-            schema: apiSchema,
-            threshold: extractThreshold,
-            include_confidence: includeConfidence,
-            include_spans: includeSpans,
+            inputs: [{ content: inputText }],
+            schema: { structures: apiSchema },
+            options: {
+              threshold: extractThreshold,
+              include_confidence: includeConfidence,
+              include_spans: includeSpans,
+            },
           }),
           signal: abortControllerRef.current.signal,
         });
@@ -543,19 +542,19 @@ const ExtractionPlaygroundPage: React.FC = () => {
     const down = (e: KeyboardEvent) => {
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
-        handleRecognize();
+        handleExtractionSubmit();
       }
     };
     document.addEventListener("keydown", down);
     return () => document.removeEventListener("keydown", down);
-  }, [handleRecognize]);
+  }, [handleExtractionSubmit]);
 
   const handleReset = () => {
     setInputText("");
     setLabels(DEFAULT_LABELS);
     setNewLabel("");
     setConfidenceThreshold(0.5);
-    setRecognizeResult(null);
+    setEntityResult(null);
     setExtractResult(null);
     setSchema(DEFAULT_SCHEMA);
     setExtractThreshold(0.3);
@@ -632,10 +631,11 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
   // Get filtered entities based on confidence threshold
   const getFilteredEntities = (): NEREntity[] => {
-    if (!recognizeResult?.entities || recognizeResult.entities.length === 0) {
+    const entities = entityResult?.data[0]?.entities;
+    if (!entities || entities.length === 0) {
       return [];
     }
-    return recognizeResult.entities[0].filter((entity) => entity.score >= confidenceThreshold);
+    return entities.filter((entity) => entity.score >= confidenceThreshold);
   };
 
   // Get entity count per label
@@ -653,7 +653,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     const entities = getFilteredEntities();
 
     if (entities.length === 0) {
-      if (recognizeResult) {
+      if (entityResult) {
         return (
           <div className="text-sm text-muted-foreground">
             No entities found{" "}
@@ -716,7 +716,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
   };
 
   const samplePresets: SamplePreset[] =
-    mode === "recognize"
+    mode === "entities"
       ? Object.values(SAMPLE_TEXTS).map((sample) => ({
           name: sample.name,
           description: sample.description,
@@ -736,7 +736,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
   // Render extract results
   const renderExtractResults = () => {
-    if (!extractResult?.results || extractResult.results.length === 0) {
+    if (!extractResult?.data || extractResult.data.length === 0) {
       return (
         <div className="h-100 flex items-center justify-center text-muted-foreground">
           <div className="text-center">
@@ -747,7 +747,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
       );
     }
 
-    const textResult = extractResult.results[0];
+    const textResult = extractResult.data[0]?.structures ?? {};
 
     return (
       <div className="h-100 overflow-y-auto space-y-4">
@@ -808,8 +808,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
     );
   };
 
-  const hasResult = mode === "recognize" ? recognizeResult !== null : extractResult !== null;
-  const resultModel = mode === "recognize" ? recognizeResult?.model : extractResult?.model;
+  const hasResult = mode === "entities" ? entityResult !== null : extractResult !== null;
+  const resultModel = mode === "entities" ? entityResult?.model : extractResult?.model;
 
   return (
     <DashboardPage className="h-full">
@@ -832,7 +832,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
       <BackendInfoBar />
 
       {modelsLoaded && availableModels.length === 0 && (
-        <NoModelsGuide modelType="recognizer" typeName="extraction model" />
+        <NoModelsGuide modelType="extractor" typeName="extraction model" />
       )}
 
       {/* Configuration Panel */}
@@ -844,17 +844,17 @@ const ExtractionPlaygroundPage: React.FC = () => {
           {/* Mode Toggle */}
           <div className="flex gap-2">
             <Button
-              variant={mode === "recognize" ? "default" : "outline"}
+              variant={mode === "entities" ? "default" : "outline"}
               size="sm"
-              onClick={() => setMode("recognize")}
+              onClick={() => setMode("entities")}
             >
               <Tag className="h-4 w-4 mr-1" />
               Entities
             </Button>
             <Button
-              variant={mode === "extract" ? "default" : "outline"}
+              variant={mode === "structured" ? "default" : "outline"}
               size="sm"
-              onClick={() => setMode("extract")}
+              onClick={() => setMode("structured")}
             >
               <SlidersHorizontal className="h-4 w-4 mr-1" />
               Extract
@@ -891,8 +891,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
               </Select>
             </div>
 
-            {/* Confidence Threshold (recognize mode) */}
-            {mode === "recognize" && (
+            {/* Confidence Threshold (entity mode) */}
+            {mode === "entities" && (
               <div className="space-y-2">
                 <Label htmlFor="threshold">Confidence Threshold</Label>
                 <div className="flex items-center gap-2">
@@ -917,7 +917,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
             )}
 
             {/* Threshold (extract mode) */}
-            {mode === "extract" && (
+            {mode === "structured" && (
               <div className="space-y-2">
                 <Label htmlFor="extract-threshold">Threshold</Label>
                 <div className="flex items-center gap-2">
@@ -943,7 +943,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           </div>
 
           {/* Extract mode options */}
-          {mode === "extract" && (
+          {mode === "structured" && (
             <div className="flex gap-6">
               <div className="flex items-center gap-2">
                 <Switch
@@ -968,8 +968,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
             </div>
           )}
 
-          {/* Entity Labels (recognize mode) */}
-          {mode === "recognize" && (
+          {/* Entity Labels (entity mode) */}
+          {mode === "entities" && (
             <div className="space-y-2">
               <Label>Entity Labels (GLiNER)</Label>
               <div className="flex flex-wrap gap-2 mb-2">
@@ -1017,7 +1017,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           )}
 
           {/* Schema Builder (extract mode) */}
-          {mode === "extract" && (
+          {mode === "structured" && (
             <div className="space-y-3">
               <Label>Extraction Schema</Label>
               {schema.map((structure, si) => (
@@ -1103,7 +1103,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
           <FormActions>
             <Button
-              onClick={handleRecognize}
+              onClick={handleExtractionSubmit}
               disabled={isLoading || !inputText.trim() || !selectedModel}
             >
               {isLoading ? (
@@ -1113,12 +1113,12 @@ const ExtractionPlaygroundPage: React.FC = () => {
                 </>
               ) : (
                 <>
-                  {mode === "recognize" ? (
+                  {mode === "entities" ? (
                     <Tag className="h-4 w-4 mr-2" />
                   ) : (
                     <SlidersHorizontal className="h-4 w-4 mr-2" />
                   )}
-                  {mode === "recognize" ? "Extract Entities" : "Extract Data"}
+                  {mode === "entities" ? "Extract Entities" : "Extract Data"}
                 </>
               )}
             </Button>
@@ -1136,7 +1136,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
       {/* Results Stats Bar */}
       {hasResult && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          {mode === "recognize" && (
+          {mode === "entities" && (
             <>
               <Badge className="gap-1.5">
                 <Hash className="h-3 w-3" />
@@ -1178,7 +1178,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           <CardContent className="flex-1">
             <Textarea
               placeholder={
-                mode === "recognize"
+                mode === "entities"
                   ? "Paste or type your text here to extract named entities..."
                   : "Paste or type your text here to extract structured data..."
               }
@@ -1194,7 +1194,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           <CardHeader className="pb-3">
             <CardTitle className="text-lg">
               {hasResult
-                ? mode === "recognize"
+                ? mode === "entities"
                   ? "Extracted Entities"
                   : "Extracted Data"
                 : "Preview"}
@@ -1213,8 +1213,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
                 <Skeleton className="h-8 w-full" />
                 <Skeleton className="h-8 w-3/4" />
               </div>
-            ) : mode === "recognize" ? (
-              recognizeResult ? (
+            ) : mode === "entities" ? (
+              entityResult ? (
                 <div className="h-100 overflow-y-auto space-y-4">
                   {/* Legend with entity counts */}
                   {getUniqueLabels().length > 0 && (
@@ -1322,7 +1322,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
-        {mode === "recognize" ? (
+        {mode === "entities" ? (
           <>
             <p>
               <strong>GLiNER Models:</strong> Zero-shot named entity recognition. Add custom labels
