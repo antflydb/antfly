@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 import antfly.client as client_module
-from antfly import AntflyClient, AntflyException, InferenceAPIError
+from antfly import AntflyClient, AntflyException, InferenceAPIError, InferenceCapacityError
 from antfly.client_generated.models import (
     InferenceChatMessage,
     InferenceGenerateChatTemplateKwargs,
@@ -126,6 +126,33 @@ def test_generate_stream_returns_typed_507_and_requires_done() -> None:
     with pytest.raises(AntflyException, match=r"ended before \[DONE\]"):
         with client.generate_stream(generation_request()) as chunks:
             list(chunks)
+
+
+def test_generate_returns_typed_capacity_error() -> None:
+    client = AntflyClient("http://test")
+    install_transport(
+        client,
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                503,
+                json={
+                    "error": "MODEL_RESOURCE_BUSY",
+                    "message": "model resources are temporarily busy",
+                    "reason": "inference_capacity",
+                    "retryable": True,
+                    "retry_after_ms": 1000,
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(InferenceCapacityError) as exc_info:
+        client.generate(generation_request())
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "MODEL_RESOURCE_BUSY"
+    assert exc_info.value.reason == "inference_capacity"
+    assert exc_info.value.retry_after_ms == 1000
+    assert exc_info.value.retryable is True
 
 
 def test_generate_stream_bounds_sse_lines(monkeypatch: pytest.MonkeyPatch) -> None:

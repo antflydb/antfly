@@ -3037,6 +3037,17 @@ pub const ModelHandle = struct {
     }
 };
 
+pub const LoadedModelSnapshot = struct {
+    allocator: std.mem.Allocator,
+    handles: []ModelHandle,
+
+    pub fn deinit(self: *LoadedModelSnapshot) void {
+        for (self.handles) |*handle| handle.release();
+        self.allocator.free(self.handles);
+        self.handles = &.{};
+    }
+};
+
 pub const ModelManager = struct {
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
 
@@ -3905,6 +3916,29 @@ pub const ModelManager = struct {
         return .{ .manager = self, .model = model };
     }
 
+    /// Pin one handle for every currently published model. Callers may release
+    /// load_lock before taking per-model locks without racing model eviction or
+    /// retirement destruction.
+    pub fn acquireLoadedModelSnapshot(
+        self: *ModelManager,
+        allocator: std.mem.Allocator,
+    ) !LoadedModelSnapshot {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+
+        const handles = try allocator.alloc(ModelHandle, self.loaded.count());
+        var index: usize = 0;
+        var it = self.loaded.valueIterator();
+        while (it.next()) |model_ptr| {
+            const model = model_ptr.*;
+            model.active_handles += 1;
+            handles[index] = .{ .manager = self, .model = model };
+            index += 1;
+        }
+        std.debug.assert(index == handles.len);
+        return .{ .allocator = allocator, .handles = handles };
+    }
+
     pub fn loadedChatTemplateFailed(
         self: *ModelManager,
         model_dir: []const u8,
@@ -3999,8 +4033,10 @@ pub const ModelManager = struct {
     }
 
     /// Apply one node-wide prompt-cache target to the cache being activated and
-    /// every cache that is already active. configure() synchronously evicts
-    /// entries against their estimated logical cache bytes.
+    /// schedule that target for every other active cache. The caller owns the
+    /// included model's generation lock, so its configure() may evict safely.
+    /// Foreign caches must defer eviction until their own serialized request
+    /// boundary; their KvManager pools are otherwise concurrently mutable.
     pub fn rebalancePromptCaches(
         self: *ModelManager,
         include: *LoadedModel,
@@ -4011,15 +4047,26 @@ pub const ModelManager = struct {
         include.prompt_prefix_cache.reserveActivation();
         var per_cache = node_config;
         per_cache.max_bytes /= self.participatingPromptCacheCount(include);
-        include.prompt_prefix_cache.configure(per_cache);
 
+        var foreign_live_bytes: usize = 0;
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model != include and model.prompt_prefix_cache.isParticipating()) {
-                model.prompt_prefix_cache.configure(per_cache);
+                model.prompt_prefix_cache.scheduleConfigure(per_cache);
+                foreign_live_bytes = std.math.add(
+                    usize,
+                    foreign_live_bytes,
+                    model.prompt_prefix_cache.stats().live_bytes,
+                ) catch std.math.maxInt(usize);
             }
         }
+        var include_config = per_cache;
+        include_config.max_bytes = @min(
+            include_config.max_bytes,
+            node_config.max_bytes -| foreign_live_bytes,
+        );
+        include.prompt_prefix_cache.configure(include_config);
     }
 
     /// Remove a failed first-use reservation and restore the full node target
@@ -4047,7 +4094,7 @@ pub const ModelManager = struct {
         while (rebalance_it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model.prompt_prefix_cache.isParticipating()) {
-                model.prompt_prefix_cache.configure(per_cache);
+                model.prompt_prefix_cache.scheduleConfigure(per_cache);
             }
         }
     }
@@ -4683,6 +4730,33 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     manager.unlockLoadedModels();
     try std.testing.expect(after_eviction == null);
     allocator.free(evicted.?.key);
+}
+
+test "loaded model snapshot pins model lifetimes until release" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    var model: LoadedModel = undefined;
+    model.active_handles = 0;
+    model.last_used_ns = 1;
+    model.pinned = false;
+    model.retired = false;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "model"), &model);
+
+    var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.handles.len);
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    try std.testing.expect(snapshot.handles[0].get() == &model);
+
+    snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
 }
 
 test "failed loaded model retires from lookup while active handles unwind" {

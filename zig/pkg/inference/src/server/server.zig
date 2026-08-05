@@ -493,13 +493,17 @@ test "concurrent first prompt cache activations share the node budget" {
     manager.rebalancePromptCaches(&first, node_config);
     manager.rebalancePromptCaches(&second, node_config);
 
+    // Rebalancing a foreign cache must not synchronously evict from its pool;
+    // its owning generation path applies the queued budget on the next request.
     try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.pending_config.?.max_bytes);
     try std.testing.expectEqual(@as(usize, 512), second.prompt_prefix_cache.config.max_bytes);
     try std.testing.expect(first.prompt_prefix_cache.isParticipating());
     try std.testing.expect(second.prompt_prefix_cache.isParticipating());
 
     manager.cancelPromptCacheActivation(&second, node_config);
-    try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.pending_config.?.max_bytes);
     try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
 }
 
@@ -8392,7 +8396,9 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
+        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
+            defer ctx.allocator.free(model_path);
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
@@ -8432,7 +8438,9 @@ pub const Node = struct {
             .invalid, .internal => return requestModelResolutionError(ctx, err),
         }
 
-        if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
+        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "recognizers")) |model_path| {
+            defer ctx.allocator.free(model_path);
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
@@ -9863,34 +9871,42 @@ pub const Node = struct {
         var writer: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer writer.deinit();
 
+        // Pin model lifetimes while load_lock is held, then read lazy-session
+        // counters only after releasing it. Optional-session loading takes the
+        // inverse embedding-session -> load-lock path under admission pressure.
+        var loaded_snapshot = try node.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
+        defer loaded_snapshot.deinit();
+
         // Core metrics via prometheus lib
         try @constCast(&node.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
-        node.model_manager.lockLoadedModels();
-        defer node.model_manager.unlockLoadedModels();
-        const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_waits_total", "counter", "Decode steps intentionally delayed to form a batch", aggregate.stats.decode_coalesce_waits_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_wait_us_total", "counter", "Configured microseconds spent waiting to coalesce decode work", aggregate.stats.decode_coalesce_wait_us_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_2_total", "counter", "Unified scheduler steps containing two items", aggregate.stats.step_batch_size_2_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_3_4_total", "counter", "Unified scheduler steps containing three or four items", aggregate.stats.step_batch_size_3_4_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
-        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
-        try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
-        try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(node.model_manager.loaded));
-        try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
+        {
+            node.model_manager.lockLoadedModels();
+            defer node.model_manager.unlockLoadedModels();
+            const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_waits_total", "counter", "Decode steps intentionally delayed to form a batch", aggregate.stats.decode_coalesce_waits_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_wait_us_total", "counter", "Configured microseconds spent waiting to coalesce decode work", aggregate.stats.decode_coalesce_wait_us_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_2_total", "counter", "Unified scheduler steps containing two items", aggregate.stats.step_batch_size_2_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_3_4_total", "counter", "Unified scheduler steps containing three or four items", aggregate.stats.step_batch_size_3_4_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
+            try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
+            try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
+            try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
+        }
+        try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_snapshot.handles));
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());
@@ -10639,13 +10655,9 @@ fn appendMetalExactJitMetrics(writer: *std.Io.Writer, stats: session_factory.Met
     try appendPromMetric(writer, "antfly_inference_metal_jit_exact_q4_k_hits", "gauge", "Exact-profile Q4_K JIT dispatches retained by currently loaded sessions", stats.q4_k_hits);
 }
 
-fn aggregateMetalExactJitStats(models: anytype) session_factory.MetalExactJitDispatchStats {
+fn aggregateMetalExactJitStats(handles: []const model_manager_mod.ModelHandle) session_factory.MetalExactJitDispatchStats {
     var aggregate = session_factory.MetalExactJitDispatchStats{};
-    var it = models.iterator();
-    while (it.next()) |entry| {
-        const model = entry.value_ptr.*;
-        aggregate.add(model.metalExactJitDispatchStats());
-    }
+    for (handles) |handle| aggregate.add(handle.get().metalExactJitDispatchStats());
     return aggregate;
 }
 

@@ -7367,6 +7367,32 @@ var planned_counters_memo_len = std.atomic.Value(usize).init(0);
 // memo insert, never across the registry scan.
 var planned_counters_memo_mutex: std.atomic.Mutex = .unlocked;
 
+const PlannedPlanCountersKey = struct {
+    backend: Backend,
+    dispatch: quant_matmul.DispatchKind,
+    primitive: quant_matmul.Primitive,
+    operator: quant_matmul.Operator,
+    row_bucket: quant_matmul.RowBucket,
+    format: quant_matmul.Format,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    epilogue: Epilogue,
+
+    fn eql(a: @This(), b: @This()) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
+const PlannedPlanCountersMemoEntry = struct {
+    key: PlannedPlanCountersKey,
+    counters: PlanCounters,
+};
+const planned_plan_counters_memo_capacity = 128;
+var planned_plan_counters_memo: [planned_plan_counters_memo_capacity]PlannedPlanCountersMemoEntry = undefined;
+var planned_plan_counters_memo_len = std.atomic.Value(usize).init(0);
+var planned_plan_counters_memo_mutex: std.atomic.Mutex = .unlocked;
+
 fn plannedCountersKey(
     backend: Backend,
     format: quant_matmul.Format,
@@ -7407,6 +7433,45 @@ pub fn plannedCountersFor(
     if (locked_len < planned_counters_memo_capacity) {
         planned_counters_memo[locked_len] = .{ .key = key, .counters = counters };
         planned_counters_memo_len.store(locked_len + 1, .release);
+    }
+    return counters;
+}
+
+/// Shape-aware counterpart used by CUDA plan recording. Unlike the route-only
+/// memo above, this retains the full runtime plan because promoted artifacts
+/// may fall back below their minimum input dimension.
+pub fn plannedCountersForPlan(
+    backend: Backend,
+    plan: quant_matmul.Plan,
+    epilogue: Epilogue,
+) PlanCounters {
+    const key = PlannedPlanCountersKey{
+        .backend = backend,
+        .dispatch = plan.dispatch,
+        .primitive = plan.primitive,
+        .operator = plan.operator,
+        .row_bucket = plan.row_bucket,
+        .format = plan.format,
+        .rows = plan.rows,
+        .in_dim = plan.in_dim,
+        .out_dim = plan.out_dim,
+        .epilogue = epilogue,
+    };
+    const len = planned_plan_counters_memo_len.load(.acquire);
+    for (planned_plan_counters_memo[0..len]) |entry| {
+        if (entry.key.eql(key)) return entry.counters;
+    }
+
+    const counters = countersForLowering(registryLoweringForPlan(backend, plan, epilogue));
+    platform.sync.lockYielding(&planned_plan_counters_memo_mutex);
+    defer planned_plan_counters_memo_mutex.unlock();
+    const locked_len = planned_plan_counters_memo_len.load(.acquire);
+    for (planned_plan_counters_memo[len..locked_len]) |entry| {
+        if (entry.key.eql(key)) return entry.counters;
+    }
+    if (locked_len < planned_plan_counters_memo_capacity) {
+        planned_plan_counters_memo[locked_len] = .{ .key = key, .counters = counters };
+        planned_plan_counters_memo_len.store(locked_len + 1, .release);
     }
     return counters;
 }
@@ -7454,12 +7519,12 @@ pub fn addCountersToStats(stats: anytype, counters: PlanCounters) void {
 fn promotedArtifactFor(lowering: QuantKernelLowering) ?GeneratedMatmulArtifact {
     if (lowering.production_route != .generated_production) return null;
     for (first_generated_matmul_artifacts) |artifact| {
-        if (artifactHasPromotionEvidence(artifact) and
-            artifact.backend == lowering.backend and
+        if (artifact.backend == lowering.backend and
             artifact.format == lowering.format and
             artifact.row_bucket == lowering.row_bucket and
             artifact.epilogue == lowering.epilogue and
-            std.mem.eql(u8, artifact.kernel_id, lowering.production_kernel_id))
+            std.mem.eql(u8, artifact.kernel_id, lowering.production_kernel_id) and
+            artifactHasPromotionEvidence(artifact))
         {
             return artifact;
         }
@@ -10277,6 +10342,9 @@ test "quant kernel compiler applies CUDA production shape constraints" {
     try std.testing.expectEqual(LoweringRoute.handwritten_production, narrow_lowering.production_route);
     try std.testing.expectEqualStrings("termite_linear_q4_0_f32", narrow_lowering.production_kernel_id);
     try std.testing.expect(!generatedArtifactSupportsPlan(.cuda, narrow, .none));
+    const narrow_counters = plannedCountersForPlan(.cuda, narrow, .none);
+    try std.testing.expectEqual(@as(usize, 1), narrow_counters.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 0), narrow_counters.quant_kernel_generated_production);
 
     const wide = quant_matmul.plan(.{
         .rows = 22,
@@ -10288,6 +10356,9 @@ test "quant kernel compiler applies CUDA production shape constraints" {
     try std.testing.expectEqual(LoweringRoute.generated_production, wide_lowering.production_route);
     try std.testing.expectEqualStrings(first_general_cuda_q4_0_mm_kernel_id, wide_lowering.production_kernel_id);
     try std.testing.expect(generatedArtifactSupportsPlan(.cuda, wide, .none));
+    const wide_counters = plannedCountersForPlan(.cuda, wide, .none);
+    try std.testing.expectEqual(@as(usize, 0), wide_counters.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 1), wide_counters.quant_kernel_generated_production);
 }
 
 test "quant kernel compiler uses exact CUDA renderer launch schedules" {

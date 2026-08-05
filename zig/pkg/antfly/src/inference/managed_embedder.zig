@@ -1956,17 +1956,16 @@ fn embedWithEntryParts(
     }
 
     if (isAntflyProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
-        const selected = selectAntflyEmbedPart(parts) orelse return error.EmptyEmbeddingResponse;
-        const selected_parts = [_]template_mod.ContentPart{selected};
+        if (parts.len == 0) return error.EmptyEmbeddingResponse;
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
                 try waitForEntryPacer(entry);
                 const context = embeddingRequestContext(entry);
                 try context.check();
                 const vectors = if (local.embed_dense_parts_with_context) |embed_parts_with_context|
-                    embed_parts_with_context(local.ptr, alloc, entry.model, &selected_parts, context) catch |err| return normalizeLocalEmbeddingError(err)
+                    embed_parts_with_context(local.ptr, alloc, entry.model, parts, context) catch |err| return normalizeLocalEmbeddingError(err)
                 else
-                    embed_parts(local.ptr, alloc, entry.model, &selected_parts) catch |err| return normalizeLocalEmbeddingError(err);
+                    embed_parts(local.ptr, alloc, entry.model, parts) catch |err| return normalizeLocalEmbeddingError(err);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 try context.check();
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -1989,7 +1988,7 @@ fn embedWithEntryParts(
             }
         }
 
-        var result = provider.embedParts(alloc, entry.model, &selected_parts) catch |err| switch (err) {
+        var result = provider.embedParts(alloc, entry.model, parts) catch |err| switch (err) {
             error.EmptyResponse => return error.EmptyEmbeddingResponse,
             else => return err,
         };
@@ -2094,17 +2093,6 @@ fn partsContainMedia(parts: []const template_mod.ContentPart) bool {
         }
     }
     return false;
-}
-
-fn selectAntflyEmbedPart(parts: []const template_mod.ContentPart) ?template_mod.ContentPart {
-    var text_fallback: ?template_mod.ContentPart = null;
-    for (parts) |part| switch (part) {
-        .text => if (text_fallback == null) {
-            text_fallback = part;
-        },
-        .media_url, .binary => return part,
-    };
-    return text_fallback;
 }
 
 fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
@@ -3849,8 +3837,10 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
         fn parts(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, parts_slice: []const template_mod.ContentPart) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("local-model", model);
-            try std.testing.expectEqual(@as(usize, 1), parts_slice.len);
-            try std.testing.expectEqualStrings("data:image/png;base64,aaa", parts_slice[0].media_url);
+            try std.testing.expectEqual(@as(usize, 3), parts_slice.len);
+            try std.testing.expectEqualStrings("caption", parts_slice[0].text);
+            try std.testing.expectEqualStrings("data:image/png;base64,aaa", parts_slice[1].media_url);
+            try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
             self.saw_parts = true;
 
             const vectors = try alloc.alloc([]f32, self.response_count);
@@ -3903,28 +3893,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     local.response_count = 2;
     try std.testing.expectError(error.InvalidEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
 
-    const binary_first = [_]template_mod.ContentPart{
-        .{ .text = "before" },
-        .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{9} } },
-        .{ .media_url = "data:image/png;base64,second" },
-    };
-    const selected_binary = selectAntflyEmbedPart(&binary_first).?;
-    try std.testing.expectEqualStrings("image/png", selected_binary.binary.mime_type);
-    try std.testing.expectEqualSlices(u8, &[_]u8{9}, selected_binary.binary.data);
-
-    const text_only = [_]template_mod.ContentPart{
-        .{ .text = "first" },
-        .{ .text = "last" },
-    };
-    try std.testing.expectEqualStrings("first", selectAntflyEmbedPart(&text_only).?.text);
-
-    const caption_after_media = [_]template_mod.ContentPart{
-        .{ .text = "before" },
-        .{ .media_url = "data:image/png;base64,selected" },
-        .{ .text = "caption" },
-    };
-    try std.testing.expectEqualStrings("data:image/png;base64,selected", selectAntflyEmbedPart(&caption_after_media).?.media_url);
-    try std.testing.expect(selectAntflyEmbedPart(&.{}) == null);
+    try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &.{}, 3));
 }
 
 test "managed embedder preserves antfly api_url path for shared antfly endpoint" {

@@ -814,6 +814,7 @@ pub const NativeGenerateCoordinator = struct {
         var leader_total_sequence_len: usize = 0;
         var leader_kv_sequence_len: usize = 0;
         var leader_kv_position_offset: usize = 0;
+        var decode_geometry_initialized = leader_phase == .decode;
 
         switch (leader_phase) {
             .decode => {
@@ -867,6 +868,7 @@ pub const NativeGenerateCoordinator = struct {
             if (pending.work_ptr == leader_work_ptr) continue;
             if (pending.exclusive_step) continue;
             if (!self.policy.allow_mixed_sequence_lengths and
+                decode_geometry_initialized and
                 !decodeWorkCompatible(
                     pending,
                     leader_total_sequence_len,
@@ -885,6 +887,12 @@ pub const NativeGenerateCoordinator = struct {
                     continue;
                 }
                 kv_blocks_total = next_kv;
+            }
+            if (!self.policy.allow_mixed_sequence_lengths and !decode_geometry_initialized) {
+                leader_total_sequence_len = pending.total_sequence_len;
+                leader_kv_sequence_len = pending.kv_sequence_len;
+                leader_kv_position_offset = pending.kv_position_offset;
+                decode_geometry_initialized = true;
             }
             try out.append(allocator, .{
                 .work_ptr = pending.work_ptr,
@@ -2252,6 +2260,47 @@ test "completeStep updates step stats and removes pending work" {
     try std.testing.expectEqual(@as(?usize, null), coordinator.findPendingDecode(@ptrCast(&dec_w)));
     try std.testing.expectEqual(@as(?usize, null), coordinator.findPendingPrefill(@ptrCast(&pre_w)));
     try std.testing.expectEqual(@as(?RequestId, null), coordinator.in_turn);
+}
+
+test "prefill leader packs compatible decode peers by default" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.policy.max_step_items = 3;
+
+    var prefill = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128, .max_tokens = 8 });
+    defer coordinator.release(prefill);
+    var first_decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(first_decode);
+    var second_decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(second_decode);
+
+    coordinator.notePrefillProgress(&prefill, 0, 8);
+    coordinator.beginDecode(&first_decode, 4);
+    coordinator.beginDecode(&second_decode, 4);
+    coordinator.consecutive_decode_turns = coordinator.max_decode_streak_before_prefill;
+
+    var prefill_work: u8 = 1;
+    var first_decode_work: u8 = 2;
+    var second_decode_work: u8 = 3;
+    try coordinator.enqueuePrefillWork(prefill, @ptrCast(&prefill_work), 8, 4, 4, 0, .{});
+    try coordinator.enqueueDecodeWork(first_decode, @ptrCast(&first_decode_work), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(second_decode, @ptrCast(&second_decode_work), 5, 5, 0, .{});
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &prefill,
+        @ptrCast(&prefill_work),
+        .prefill,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), step.items.len);
+    try std.testing.expectEqual(Phase.prefill, step.items[0].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[1].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[2].phase);
 }
 
 test "mixed step fairness follows the prefill leader" {

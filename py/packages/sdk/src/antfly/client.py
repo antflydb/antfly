@@ -25,7 +25,7 @@ from antfly.client_generated.models import (
 )
 from antfly.client_generated.types import UNSET
 
-from .exceptions import AntflyException, InferenceAPIError
+from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -51,6 +51,7 @@ def _raise_inference_error(response: Response) -> None:
     body, truncated = _read_limited_response(response, MAX_INFERENCE_ERROR_BYTES)
     code: str | None = None
     retryable: bool | None = None
+    capacity: tuple[str, str, int] | None = None
     message = body.decode("utf-8", errors="replace").strip()
     if not truncated:
         try:
@@ -64,12 +65,26 @@ def _raise_inference_error(response: Response) -> None:
                     message = code
                 if isinstance(payload.get("retryable"), bool):
                     retryable = payload["retryable"]
+                reason = payload.get("reason")
+                retry_after_ms = payload.get("retry_after_ms")
+                if (
+                    response.status_code == 503
+                    and code is not None
+                    and retryable is True
+                    and reason in {"inference_capacity", "request_queue"}
+                    and type(retry_after_ms) is int
+                    and retry_after_ms > 0
+                ):
+                    capacity = (code, reason, retry_after_ms)
         except (TypeError, ValueError):
             pass
     else:
         message = f"{response.reason_phrase or f'HTTP {response.status_code}'} (response body exceeded {MAX_INFERENCE_ERROR_BYTES} bytes)"
     if not message:
         message = response.reason_phrase or f"HTTP {response.status_code}"
+    if capacity is not None:
+        capacity_code, reason, retry_after_ms = capacity
+        raise InferenceCapacityError(capacity_code, message, reason, retry_after_ms)
     raise InferenceAPIError(response.status_code, code, message, retryable)
 
 

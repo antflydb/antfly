@@ -543,6 +543,23 @@ fn emitCompletedStreamingText(ctx: *anyopaque, on_token: TokenCallback, text: []
     return on_token(ctx, text);
 }
 
+/// Reconcile the final buffered projection with deltas already emitted. This
+/// preserves fail-closed streaming while supporting checkpoints that reveal
+/// the public answer only through the bare-channel-close convention: their
+/// content is emitted once generation proves that no later explicit header
+/// supersedes it.
+fn emitCompletedProjectionDelta(
+    state: *const StreamingTextState,
+    ctx: *anyopaque,
+    on_token: TokenCallback,
+    completed_text: []const u8,
+) bool {
+    if (!std.mem.startsWith(u8, completed_text, state.emitted_text)) return true;
+    const delta = completed_text[state.emitted_text.len..];
+    if (delta.len == 0) return true;
+    return emitCompletedStreamingText(ctx, on_token, delta);
+}
+
 const StreamingTextState = struct {
     emitted_text: []u8,
     /// Set from the model contract, independently of tokenizer resolution.
@@ -4080,6 +4097,14 @@ pub const NativeGenerationPipeline = struct {
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const text = try self.tokenizer.decode(allocator, text_gen_ids);
+        if (stream_enabled) {
+            _ = emitCompletedProjectionDelta(
+                &streaming_text,
+                on_token_ctx.?,
+                on_token_fn.?,
+                text,
+            );
+        }
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
             .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
@@ -9767,7 +9792,14 @@ fn runStepLoop(
         }
         if (@hasDecl(DriverChild, "preStep")) driver.preStep();
         const budget = driver.stepBudget();
-        if (try scheduler.claimStep(allocator, lease, leader_work_ptr, leader_phase, budget, &step)) {
+        const claimed = scheduler.claimStep(allocator, lease, leader_work_ptr, leader_phase, budget, &step) catch |err| {
+            // A peer may already own this request's stack-backed work pointer.
+            // Enter the same drain-or-cancel path as I/O cancellation instead
+            // of unwinding it while a claimed step can still publish to it.
+            wait_error = err;
+            continue;
+        };
+        if (claimed) {
             driver.execute(scheduler, lease, step.items);
         } else {
             io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch |err| {
@@ -10435,6 +10467,31 @@ test "bare channel close projects public content when no final header exists" {
         &.{},
         finalResponseTokenSlice(&.{ 102, 103, 7, 8 }, true, false, 101, &header, 102, 106),
     );
+}
+
+test "streaming completion emits bare-channel public content once" {
+    const Capture = struct {
+        text: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, delta: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.text.appendSlice(std.testing.allocator, delta) catch return false;
+            return true;
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.text.deinit(std.testing.allocator);
+    const emitted = try std.testing.allocator.dupe(u8, "");
+    defer std.testing.allocator.free(emitted);
+    const state = StreamingTextState{ .emitted_text = emitted };
+
+    try std.testing.expect(emitCompletedProjectionDelta(&state, &capture, Capture.callback, "public answer"));
+    try std.testing.expectEqualStrings("public answer", capture.text.items);
+
+    const already_emitted = StreamingTextState{ .emitted_text = capture.text.items };
+    try std.testing.expect(emitCompletedProjectionDelta(&already_emitted, &capture, Capture.callback, "public answer"));
+    try std.testing.expectEqualStrings("public answer", capture.text.items);
 }
 
 test "raw token diagnostics retain private generated ids" {

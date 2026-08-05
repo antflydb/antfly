@@ -6066,7 +6066,9 @@ fn ensureBf16PairMirror(
     const half_bytes = try checkedMul(half_elems, @sizeOf(u16));
     if (gate_mirror.len < half_bytes or up_mirror.len < half_bytes) return null;
     var combined = try allocDeviceBuffer(self, try checkedMul(half_bytes, 2));
-    errdefer combined.free(&self.ctx);
+    // Both device copies are asynchronous. A later failure must retire the
+    // destination through the stream-ordered temporary-buffer path.
+    errdefer releaseDeviceBuffer(self, &combined);
     var lo = buffer_mod.DeviceBuffer{ .ptr = combined.ptr, .len = half_bytes };
     try lo.copyFromDevice(&self.ctx, gate_mirror, half_bytes);
     var hi = buffer_mod.DeviceBuffer{ .ptr = combined.ptr + half_bytes, .len = half_bytes };
@@ -6101,7 +6103,8 @@ fn tryFusedGateUpBf16(
     const two_ffn = try checkedMul(ffn, 2);
     const combined_count = try checkedMul(rows, two_ffn);
     var combined_out = try allocDeviceBuffer(self, try checkedMul(combined_count, @sizeOf(f32)));
-    defer combined_out.free(&self.ctx);
+    // The activation kernel below consumes this buffer asynchronously.
+    defer releaseDeviceBuffer(self, &combined_out);
     if (!runCublasLtBf16Matmul(self, combined_out, input_bf16, combined, workspace, rows, in_dim, two_ffn)) return null;
     self.stats.bf16_cublaslt_linear_calls += 1;
 
@@ -10242,8 +10245,7 @@ fn recordQuantKernelCompilerPlan(
     plan: quant_matmul.Plan,
     epilogue: quant_kernel_compiler.Epilogue,
 ) void {
-    const lowering = quant_kernel_compiler.registryLoweringForPlan(.cuda, plan, epilogue);
-    const counters = quant_kernel_compiler.countersForLowering(lowering);
+    const counters = quant_kernel_compiler.plannedCountersForPlan(.cuda, plan, epilogue);
     quant_kernel_compiler.addCountersToStats(&self.stats, counters);
 }
 

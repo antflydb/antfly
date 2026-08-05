@@ -4376,11 +4376,14 @@ fn detectModelType(allocator: std.mem.Allocator, json: []const u8) !?[]const u8 
 fn makeBertConfig(mf: manifest_mod.ModelManifest) bert.Config {
     return .{
         .model_type = mf.bert_model_type,
+        .vocab_size = mf.bert_vocab_size,
         .hidden_size = mf.hidden_size,
         .num_hidden_layers = mf.num_hidden_layers,
         .num_attention_heads = mf.num_attention_heads,
         .intermediate_size = mf.intermediate_size,
         .max_position_embeddings = mf.max_position_embeddings,
+        .type_vocab_size = mf.bert_type_vocab_size,
+        .layer_norm_eps = mf.bert_layer_norm_eps,
         .num_labels = mf.num_labels,
         .pad_token_id = mf.bert_pad_token_id,
         .position_id_mode = if (mf.bert_model_type == .roberta) .roberta_padding else .absolute,
@@ -4397,6 +4400,9 @@ test "makeBertConfig carries num_labels from manifest" {
         .num_attention_heads = 12,
         .intermediate_size = 1536,
         .max_position_embeddings = 256,
+        .bert_vocab_size = 250002,
+        .bert_type_vocab_size = 1,
+        .bert_layer_norm_eps = 0.00001,
         .num_labels = 3,
         .bert_pad_token_id = 1,
     };
@@ -4404,6 +4410,9 @@ test "makeBertConfig carries num_labels from manifest" {
 
     const cfg = makeBertConfig(mf);
     try std.testing.expectEqual(@as(bert.ModelType, .roberta), cfg.model_type);
+    try std.testing.expectEqual(@as(u32, 250002), cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 1), cfg.type_vocab_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.00001), cfg.layer_norm_eps, 0.0000001);
     try std.testing.expectEqual(@as(u32, 3), cfg.num_labels);
     try std.testing.expectEqual(@as(i64, 1), cfg.pad_token_id);
     try std.testing.expectEqual(@as(bert.PositionIdMode, .roberta_padding), cfg.position_id_mode);

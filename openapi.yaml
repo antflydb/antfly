@@ -6394,7 +6394,13 @@ paths:
 
         token deltas. Each event contains a `ChatCompletionChunk` object.
 
-        The stream ends with `data: [DONE]`.
+        A successful stream ends with `data: [DONE]`. If generation or stream
+
+        writing fails after the HTTP response starts, the server instead emits
+
+        an `event: error` frame whose data is a plain-text error message, then
+
+        closes the stream without a `[DONE]` frame.
 
 
         ## Input Format

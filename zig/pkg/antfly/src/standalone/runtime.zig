@@ -2742,8 +2742,12 @@ fn inferenceAuthMiddleware() httpx.Middleware {
                     else => return inferenceUnauthorizedResponse(ctx),
                 };
                 defer identity.deinit(server.alloc);
-                if (!antfly.public_api.http_server.permissionsAllow(identity.permissions, .inference, "*", .read)) {
-                    return inferenceForbiddenResponse(ctx);
+                const permission: antfly.usermgr.PermissionType = switch (ctx.request.method) {
+                    .GET, .HEAD, .OPTIONS => .read,
+                    else => .write,
+                };
+                if (!antfly.public_api.http_server.permissionsAllow(identity.permissions, .inference, "*", permission)) {
+                    return inferenceForbiddenResponse(ctx, permission);
                 }
                 return next.call(ctx);
             }
@@ -3014,10 +3018,14 @@ fn inferenceUnauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
     });
 }
 
-fn inferenceForbiddenResponse(ctx: *httpx.Context) !httpx.Response {
+fn inferenceForbiddenResponse(ctx: *httpx.Context, permission: antfly.usermgr.PermissionType) !httpx.Response {
     return ctx.status(403).json(.{
         .@"error" = "forbidden",
-        .message = "inference read permission is required",
+        .message = switch (permission) {
+            .read => "inference read permission is required",
+            .write => "inference write permission is required",
+            .admin => "inference admin permission is required",
+        },
         .retryable = false,
     });
 }
@@ -4857,7 +4865,17 @@ test "standalone inference middleware reuses public API authentication" {
             authorization: ?[]const u8,
             expected_status: u16,
         ) !void {
-            var request = try httpx.Request.init(std.testing.allocator, .GET, path);
+            return expectMethod(middleware, .GET, path, authorization, expected_status);
+        }
+
+        fn expectMethod(
+            middleware: httpx.Middleware,
+            method: httpx.Method,
+            path: []const u8,
+            authorization: ?[]const u8,
+            expected_status: u16,
+        ) !void {
+            var request = try httpx.Request.init(std.testing.allocator, method, path);
             defer request.deinit();
             if (authorization) |value| try request.setHeader("authorization", value);
 
@@ -4878,8 +4896,15 @@ test "standalone inference middleware reuses public API authentication" {
                     response.headers.get("WWW-Authenticate").?,
                 );
             } else if (expected_status == 403) {
+                const required = if (method == .GET or method == .HEAD or method == .OPTIONS) "read" else "write";
+                const expected = try std.fmt.allocPrint(
+                    std.testing.allocator,
+                    "{{\"error\":\"forbidden\",\"message\":\"inference {s} permission is required\",\"retryable\":false}}",
+                    .{required},
+                );
+                defer std.testing.allocator.free(expected);
                 try std.testing.expectEqualStrings(
-                    "{\"error\":\"forbidden\",\"message\":\"inference read permission is required\",\"retryable\":false}",
+                    expected,
                     response.body.?,
                 );
             } else if (expected_status == 503) {
@@ -4934,6 +4959,12 @@ test "standalone inference middleware reuses public API authentication" {
     for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
     }
+    try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 403);
+
+    var inference_write = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .write);
+    defer inference_write.deinit(alloc);
+    try manager.addPermissionToUser("admin", inference_write);
+    try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 204);
 
     var global_read = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .read);
     defer global_read.deinit(alloc);

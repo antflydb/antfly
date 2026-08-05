@@ -133,6 +133,11 @@ pub const PromptPrefixCache = struct {
     /// concurrent stats() reads from the metrics endpoint.
     mutex: std.atomic.Mutex = .unlocked,
     config: Config = .{},
+    /// A node-wide rebalance may discover this cache while another request is
+    /// actively mutating its KV manager. Foreign requests may publish the next
+    /// budget here, but only this model's serialized generation path may apply
+    /// it and evict retained blocks.
+    pending_config: ?Config = null,
     manager: manager_mod.KvManager,
     storage: ?storage_runtime_mod.KvStorageRuntime = null,
     pool_id: ?block.KvPoolId = null,
@@ -185,6 +190,23 @@ pub const PromptPrefixCache = struct {
     pub fn configure(self: *PromptPrefixCache, config: Config) void {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
+        self.pending_config = null;
+        self.configureLocked(config);
+    }
+
+    /// Queue a configuration change without touching the shared KV pool. The
+    /// owning model applies it at its next request boundary via configure().
+    pub fn scheduleConfigure(self: *PromptPrefixCache, config: Config) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.pending_config = config;
+        // Publish a tighter cap immediately so owner-side stores cannot grow
+        // the cache beyond the node rebalance target. Existing entries remain
+        // untouched until the owning generation lane applies the full config.
+        self.config.max_bytes = @min(self.config.max_bytes, config.max_bytes);
+    }
+
+    fn configureLocked(self: *PromptPrefixCache, config: Config) void {
         if (self.config.resource_usage_observer) |old_observer| {
             const same_observer = if (config.resource_usage_observer) |new_observer|
                 old_observer.context == new_observer.context and old_observer.update == new_observer.update
@@ -206,6 +228,7 @@ pub const PromptPrefixCache = struct {
             observer.update(observer.context, &self.resource_accounted_bytes, 0);
         }
         self.config.resource_usage_observer = null;
+        if (self.pending_config) |*pending| pending.resource_usage_observer = null;
         self.resource_accounted_bytes = 0;
     }
 
@@ -224,6 +247,7 @@ pub const PromptPrefixCache = struct {
         defer self.mutex.unlock();
         if (!self.activation_pending) return false;
         self.activation_pending = false;
+        self.pending_config = null;
         self.config.enabled = false;
         return true;
     }
@@ -1406,6 +1430,35 @@ test "prompt cache evicts retained blocks by budget" {
     try cache.manager.appendTokens(source_id, 2);
     try cache.storeFromSequence("", &.{ 1, 2 }, source_id);
 
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+}
+
+test "prompt cache defers foreign rebalance eviction until owner configure" {
+    const allocator = std.testing.allocator;
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 << 20 });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 2);
+    try cache.storeFromSequence("", &.{ 1, 2 }, source_id);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats().live_entries);
+
+    cache.scheduleConfigure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 });
+    try std.testing.expectEqual(@as(usize, 1), cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.pending_config.?.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats().live_entries);
+
+    cache.configure(cache.pending_config.?);
+    try std.testing.expect(cache.pending_config == null);
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
 }
 

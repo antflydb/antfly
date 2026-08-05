@@ -202,6 +202,9 @@ pub const ModelManifest = struct {
     max_position_embeddings: u32 = 512,
     num_hidden_layers: u32 = 12,
     num_attention_heads: u32 = 12,
+    bert_vocab_size: u32 = 30522,
+    bert_type_vocab_size: u32 = 2,
+    bert_layer_norm_eps: f32 = 1e-12,
     bert_model_type: bert.ModelType = .bert,
     bert_pad_token_id: i64 = 0,
     config_model_arch: []const u8 = "",
@@ -1117,6 +1120,9 @@ fn applyGgufTokenizerMetadata(
         manifest.max_position_embeddings = config.max_position_embeddings;
         manifest.num_hidden_layers = config.num_hidden_layers;
         manifest.num_attention_heads = config.num_attention_heads;
+        manifest.bert_vocab_size = config.vocab_size;
+        manifest.bert_type_vocab_size = config.type_vocab_size;
+        manifest.bert_layer_norm_eps = config.layer_norm_eps;
         manifest.bert_model_type = config.model_type;
         manifest.bert_pad_token_id = config.pad_token_id;
     }
@@ -1569,6 +1575,19 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     }
     if (obj.get("num_attention_heads")) |v| {
         if (jsonU32(v)) |val| manifest.num_attention_heads = val;
+    }
+    if (obj.get("vocab_size")) |v| {
+        if (jsonU32(v)) |val| manifest.bert_vocab_size = val;
+    }
+    if (obj.get("type_vocab_size")) |v| {
+        if (jsonU32(v)) |val| manifest.bert_type_vocab_size = val;
+    }
+    if (obj.get("layer_norm_eps")) |v| {
+        manifest.bert_layer_norm_eps = switch (v) {
+            .float => |value| @floatCast(value),
+            .integer => |value| @floatFromInt(value),
+            else => manifest.bert_layer_norm_eps,
+        };
     }
 
     if (obj.get("num_labels")) |v| {
@@ -2683,13 +2702,16 @@ test "manifest from config.json" {
     defer manifest.deinit();
 
     const config_json =
-        \\{"model_type": "bert", "hidden_size": 384, "max_position_embeddings": 256, "num_hidden_layers": 6}
+        \\{"model_type": "bert", "hidden_size": 384, "max_position_embeddings": 256, "num_hidden_layers": 6, "vocab_size": 250002, "type_vocab_size": 1, "layer_norm_eps": 0.00001}
     ;
     try parseConfigJson(&manifest, allocator, config_json);
 
     try std.testing.expectEqual(@as(u32, 384), manifest.hidden_size);
     try std.testing.expectEqual(@as(u32, 256), manifest.max_position_embeddings);
     try std.testing.expectEqual(@as(u32, 6), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 250002), manifest.bert_vocab_size);
+    try std.testing.expectEqual(@as(u32, 1), manifest.bert_type_vocab_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.00001), manifest.bert_layer_norm_eps, 0.0000001);
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
     try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);

@@ -328,18 +328,21 @@ pub const MetalKvStorage = struct {
     /// remain live because retained physical block ids may still reference
     /// their bytes; only sequence-owned ring/legacy slots are reset/reclaimed.
     fn releaseSequenceSlots(self: *MetalKvStorage, sequence_id: storage_runtime.SequenceId) void {
-        var it = self.slot_map.iterator();
         var keys: [metal_runtime.attention_span_slot_capacity]SlotKey = undefined;
-        var key_count: usize = 0;
-        while (it.next()) |entry| {
-            if (entry.key_ptr.sequence_id != sequence_id) continue;
-            if (key_count == keys.len) break;
-            keys[key_count] = entry.key_ptr.*;
-            key_count += 1;
-        }
-        for (keys[0..key_count]) |key| {
-            if (self.slot_map.fetchRemove(key)) |removed| {
-                if (removed.value.ownsSlot()) self.reclaimSlot(removed.value.slot);
+        while (true) {
+            var it = self.slot_map.iterator();
+            var key_count: usize = 0;
+            while (it.next()) |entry| {
+                if (entry.key_ptr.sequence_id != sequence_id) continue;
+                keys[key_count] = entry.key_ptr.*;
+                key_count += 1;
+                if (key_count == keys.len) break;
+            }
+            if (key_count == 0) return;
+            for (keys[0..key_count]) |key| {
+                if (self.slot_map.fetchRemove(key)) |removed| {
+                    if (removed.value.ownsSlot()) self.reclaimSlot(removed.value.slot);
+                }
             }
         }
     }
@@ -926,6 +929,36 @@ test "KeyFormat.fromKvDType covers supported dtypes" {
     try std.testing.expect(!KeyFormat.raw_f32.isCompressed());
     try std.testing.expect(!KeyFormat.f16.isCompressed());
     try std.testing.expect(KeyFormat.int8_per_head.isCompressed());
+}
+
+test "Metal KV sequence release removes more bindings than one slot batch" {
+    const allocator = std.testing.allocator;
+    var storage: MetalKvStorage = undefined;
+    storage.allocator = allocator;
+    storage.slot_map = .empty;
+    defer storage.slot_map.deinit(allocator);
+
+    const target_sequence: storage_runtime.SequenceId = 7;
+    for (0..metal_runtime.attention_span_slot_capacity + 1) |layer_index| {
+        try storage.slot_map.put(allocator, .{
+            .sequence_id = target_sequence,
+            .layer_index = @intCast(layer_index),
+        }, .{
+            .slot = 0,
+            .sequence_owned = false,
+        });
+    }
+    try storage.slot_map.put(allocator, .{
+        .sequence_id = 8,
+        .layer_index = 0,
+    }, .{
+        .slot = 0,
+        .sequence_owned = false,
+    });
+
+    storage.releaseSequenceSlots(target_sequence);
+    try std.testing.expectEqual(@as(usize, 1), storage.slot_map.count());
+    try std.testing.expect(storage.slot_map.contains(.{ .sequence_id = 8, .layer_index = 0 }));
 }
 
 test "Metal paged KV hooks sharing a runtime lease disjoint slots" {

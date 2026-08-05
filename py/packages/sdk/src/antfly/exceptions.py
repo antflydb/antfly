@@ -34,3 +34,18 @@ class InferenceAPIError(AntflyException):
         self.detail = message
         self.retryable = retryable
         super().__init__(f"inference request failed ({status_code}): {message}")
+
+
+class InferenceCapacityError(InferenceAPIError):
+    """Temporary inference-capacity rejection with an actionable retry delay."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        reason: str,
+        retry_after_ms: int,
+    ) -> None:
+        self.reason = reason
+        self.retry_after_ms = retry_after_ms
+        super().__init__(503, code, message, True)
