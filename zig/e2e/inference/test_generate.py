@@ -352,7 +352,7 @@ def test_stream_delta_structure(api):
 @pytest.mark.multimodal
 @pytest.mark.slow
 def test_multimodal_generation(api):
-    """Multimodal generation should either succeed or fail explicitly."""
+    """The shipped Gemma decoder/projector pair must execute image inference."""
     if not run_large_model_tests():
         pytest.skip("Multimodal generation uses a large model; set RUN_LARGE_MODEL_TESTS=1 to run it")
     model = _first_multimodal_generator_model(api)
@@ -370,12 +370,6 @@ def test_multimodal_generation(api):
         "max_tokens": 20,
     })
     _skip_missing_generator_response(r)
-    if r.status_code == 400:
-        payload = r.json()
-        assert payload.get("error") == "INVALID_REQUEST", payload
-        assert "native multimodal generation is not implemented yet" in payload.get("message", ""), payload
-        return
-
     r.raise_for_status()
     resp = r.json()
     content = _message_content(resp)
