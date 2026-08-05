@@ -1462,6 +1462,11 @@ pub const FusedTrainer = struct {
             if (!has_m) continue;
 
             const ps = try self.optimizer_state.getOrCreate(pname, psize, has_v);
+            // Seed the per-param step count from the restored global step so Adam
+            // bias correction resumes at the right t (optimizers.step() bumps and
+            // reads ps.step_count); otherwise resume restarts at t=1 and mis-scales
+            // the first ~tens of updates.
+            ps.step_count = self.optimizer_state.step_count;
 
             var m_tensor = try reader.readTensor(m_name);
             defer m_tensor.deinit();

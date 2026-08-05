@@ -24,6 +24,8 @@ const bootstrap_layoutlmv3_lora = @import("../tools/bootstrap_layoutlmv3_lora.zi
 const bootstrap_reranker_lora = @import("../tools/bootstrap_reranker_lora.zig");
 const compose_lora_adapters = @import("../tools/compose_lora_adapters.zig");
 const eval_fused_chunker = @import("../eval/eval_fused_chunker.zig");
+const eval_gliner2_autodiff_adapter = @import("../tools/eval_gliner2_autodiff_adapter.zig");
+const eval_gliner2_autodiff_adapter_dataset = @import("../tools/eval_gliner2_autodiff_adapter_dataset.zig");
 const eval_gliner2_boundary_head = @import("../eval/eval_gliner2_top_layer_boundary_head.zig");
 const eval_gliner2_boundary_task_head = @import("../eval/eval_gliner2_top_layer_boundary_task_head.zig");
 const eval_reranker_checkpoint = @import("../eval/eval_reranker_checkpoint.zig");
@@ -61,11 +63,11 @@ const run_gemma4_recursive_lora_smoke_workflow = @import("../train/run_gemma4_re
 const run_gemma4_recursive_lora_sweep = @import("../train/run_gemma4_recursive_lora_sweep.zig");
 const run_gliner2_boundary_task_head_smoke_workflow = @import("../train/run_gliner2_boundary_task_head_smoke_workflow.zig");
 const run_gliner2_entity_cleanup_smoke_workflow = @import("../train/run_gliner2_entity_cleanup_smoke_workflow.zig");
+const run_gliner2_production_readiness = @import("../run_gliner2_production_readiness.zig");
 const run_layoutlmv3_lora_smoke_workflow = @import("../train/run_layoutlmv3_lora_smoke_workflow.zig");
 const train_eval_colqwen2_lora_bundle = @import("../train/train_eval_colqwen2_lora_bundle.zig");
 const train_eval_entity_cleanup_head = @import("../train/train_eval_entity_cleanup_head.zig");
 const train_eval_gemma4_lora_bundle = @import("../train/train_eval_gemma4_lora_bundle.zig");
-const train_eval_gliner2_lora_bundle = @import("../train/train_eval_gliner2_lora_bundle.zig");
 const train_eval_gliner2_boundary_head = @import("../train/train_eval_gliner2_top_layer_boundary_head.zig");
 const train_eval_gliner2_boundary_task_head = @import("../train/train_eval_gliner2_top_layer_boundary_task_head.zig");
 const train_eval_layoutlmv3_lora_sequence = @import("../train/train_eval_layoutlmv3_lora_sequence.zig");
@@ -78,6 +80,7 @@ const train_eval_reranker_lora_surrogate_cached = @import("../train/train_eval_r
 const train_eval_reranker_lora_top_layer_cached_surrogate = @import("../train/train_eval_reranker_lora_top_layer_cached_surrogate.zig");
 const train_gliner2_autodiff = @import("../train/train_gliner2_autodiff.zig");
 const train_layoutlmv3_lora_one_step = @import("../train/train_layoutlmv3_lora_one_step.zig");
+const validate_gliner2_autodiff_run = @import("../tools/validate_gliner2_autodiff_run.zig");
 
 const CommandMain = *const fn (std.process.Init) anyerror!void;
 
@@ -127,9 +130,9 @@ const commands = [_]Command{
     .{ .domain = "adapter", .action = "materialize", .subject = "layoutlmv3", .adapter_argv0 = "materialize-layoutlmv3-checkpoint", .main_fn = materialize_layoutlmv3_checkpoint.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "reranker-head", .adapter_argv0 = "materialize-reranker-head", .main_fn = materialize_reranker_head.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "reranker", .adapter_argv0 = "materialize-reranker-lora", .main_fn = materialize_reranker_lora.main },
+    .{ .domain = "adapter", .action = "validate", .subject = "gliner2-run", .adapter_argv0 = "validate-gliner2-autodiff-run", .main_fn = validate_gliner2_autodiff_run.main },
 
     .{ .domain = "train", .action = "run", .subject = "gemma4-lora", .adapter_argv0 = "train-eval-gemma4-lora-bundle", .main_fn = train_eval_gemma4_lora_bundle.main },
-    .{ .domain = "train", .action = "run", .subject = "gliner2-lora", .adapter_argv0 = "train-eval-gliner2-lora-bundle", .main_fn = train_eval_gliner2_lora_bundle.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-autodiff", .adapter_argv0 = "train-gliner2-autodiff", .main_fn = train_gliner2_autodiff.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-boundary-head", .adapter_argv0 = "train-eval-gliner2-top-layer-boundary-head", .main_fn = train_eval_gliner2_boundary_head.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-boundary-task-head", .adapter_argv0 = "train-eval-gliner2-top-layer-boundary-task-head", .main_fn = train_eval_gliner2_boundary_task_head.main },
@@ -147,6 +150,8 @@ const commands = [_]Command{
 
     .{ .domain = "eval", .action = "run", .subject = "reranker-checkpoint", .adapter_argv0 = "eval-reranker-checkpoint", .main_fn = eval_reranker_checkpoint.main },
     .{ .domain = "eval", .action = "run", .subject = "fused-chunker", .adapter_argv0 = "eval-fused-chunker", .main_fn = eval_fused_chunker.main },
+    .{ .domain = "eval", .action = "run", .subject = "gliner2-adapter", .adapter_argv0 = "eval-gliner2-autodiff-adapter", .main_fn = eval_gliner2_autodiff_adapter.main },
+    .{ .domain = "eval", .action = "run", .subject = "gliner2-adapter-dataset", .adapter_argv0 = "eval-gliner2-autodiff-adapter-dataset", .main_fn = eval_gliner2_autodiff_adapter_dataset.main },
     .{ .domain = "eval", .action = "run", .subject = "gliner2-boundary-head", .adapter_argv0 = "eval-gliner2-top-layer-boundary-head", .main_fn = eval_gliner2_boundary_head.main },
     .{ .domain = "eval", .action = "run", .subject = "gliner2-boundary-task-head", .adapter_argv0 = "eval-gliner2-top-layer-boundary-task-head", .main_fn = eval_gliner2_boundary_task_head.main },
 
@@ -156,6 +161,7 @@ const commands = [_]Command{
     .{ .domain = "workflow", .action = "run", .subject = "gemma4-recursive-lora-sweep-analyze", .adapter_argv0 = "analyze-gemma4-recursive-lora-sweep", .main_fn = analyze_gemma4_recursive_lora_sweep.main },
     .{ .domain = "workflow", .action = "run", .subject = "gliner2-boundary-task-head-smoke", .adapter_argv0 = "run-gliner2-boundary-task-head-smoke-workflow", .main_fn = run_gliner2_boundary_task_head_smoke_workflow.main },
     .{ .domain = "workflow", .action = "run", .subject = "gliner2-entity-cleanup-smoke", .adapter_argv0 = "run-gliner2-entity-cleanup-smoke-workflow", .main_fn = run_gliner2_entity_cleanup_smoke_workflow.main },
+    .{ .domain = "workflow", .action = "run", .subject = "gliner2-production-readiness", .adapter_argv0 = "gliner2-entity-training-readiness", .main_fn = run_gliner2_production_readiness.main },
     .{ .domain = "workflow", .action = "run", .subject = "layoutlmv3-lora-smoke", .adapter_argv0 = "run-layoutlmv3-lora-smoke-workflow", .main_fn = run_layoutlmv3_lora_smoke_workflow.main },
 };
 
@@ -347,6 +353,7 @@ fn usage() void {
         \\  antfly inference finetune adapter bootstrap <family> ...
         \\  antfly inference finetune adapter inspect <family> ...
         \\  antfly inference finetune adapter materialize <family> ...
+        \\  antfly inference finetune adapter validate gliner2-run ...
         \\  antfly inference finetune adapter compose lora ...
         \\  antfly inference finetune train <task> ...
         \\  antfly inference finetune eval <task> ...

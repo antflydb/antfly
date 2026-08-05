@@ -141,7 +141,7 @@ const inference_delegated_steps = [_][]const u8{
     "bench-linalg",
     "bench-audio",
     "bench-gliner2-native",
-    "gliner2-production-readiness",
+    "gliner2-entity-training-readiness",
     "test-finetune",
     "test",
     "wasm",

@@ -51,12 +51,18 @@ pub const CheckpointStrategy = enum {
     every_n_layers,
     /// Save only attention output activations.
     attention_outputs,
+    /// Save only graph roots and loss; recompute all forward activations used by backward.
+    parameters_only,
 };
 
 pub const CheckpointConfig = struct {
     strategy: CheckpointStrategy = .every_n_layers,
     /// For every_n_layers: interval between saved activations.
     layer_interval: u32 = 1,
+    /// Experimental: recursively clone non-checkpoint dependencies for each
+    /// recompute activation. This can reduce retained activations but may
+    /// explode compute/memory on broad training graphs, so it is opt-in.
+    recursive_recompute_dependencies: bool = false,
 };
 
 /// Identifies which forward nodes should be treated as checkpoint boundaries.
@@ -72,27 +78,23 @@ pub fn identifyCheckpoints(
 
     switch (config.strategy) {
         .every_n_layers => {
-            // Count linear-like ops and mark every N-th one.
-            var linear_count: u32 = 0;
+            // Count layer-boundary projections rather than every linear-like
+            // op. Transformer blocks contain several internal linear
+            // projections (Q/K/V, FFN up) whose activations are exactly what
+            // checkpointing should be allowed to drop and recompute. The most
+            // stable generic signal for a block boundary in lowered graphs is
+            // the FFN down projection: rank-2 input/output with the last
+            // dimension shrinking back to hidden size.
+            var layer_boundary_count: u32 = 0;
             for (0..forward_count) |i| {
-                const n = graph.node(@intCast(i));
-                if (isLinearLikeOp(n.op)) {
-                    linear_count += 1;
-                    if (linear_count % config.layer_interval == 0) {
+                if (isLayerBoundaryProjection(graph, @intCast(i))) {
+                    layer_boundary_count += 1;
+                    if (layer_boundary_count % config.layer_interval == 0) {
                         is_checkpoint[i] = true;
                     }
                 }
             }
-            // Always checkpoint parameters and the first/last forward nodes.
-            for (0..forward_count) |i| {
-                const n = graph.node(@intCast(i));
-                if (n.op == .parameter or n.op == .constant) {
-                    is_checkpoint[i] = true;
-                }
-            }
-            if (forward_count > 0) {
-                is_checkpoint[forward_count - 1] = true; // loss node
-            }
+            markParameterAndLossCheckpoints(graph, forward_count, is_checkpoint);
         },
         .attention_outputs => {
             // Mark parameters, constants, and nodes that look like attention outputs.
@@ -104,13 +106,26 @@ pub fn identifyCheckpoints(
                     is_checkpoint[i] = true;
                 }
             }
-            if (forward_count > 0) {
-                is_checkpoint[forward_count - 1] = true;
-            }
+            markParameterAndLossCheckpoints(graph, forward_count, is_checkpoint);
+        },
+        .parameters_only => {
+            markParameterAndLossCheckpoints(graph, forward_count, is_checkpoint);
         },
     }
 
     return is_checkpoint;
+}
+
+fn markParameterAndLossCheckpoints(graph: *const Graph, forward_count: u32, is_checkpoint: []bool) void {
+    for (0..forward_count) |i| {
+        const n = graph.node(@intCast(i));
+        if (n.op == .parameter or n.op == .constant) {
+            is_checkpoint[i] = true;
+        }
+    }
+    if (forward_count > 0) {
+        is_checkpoint[forward_count - 1] = true;
+    }
 }
 
 /// Analyze a gradient graph to determine memory savings from checkpointing.
@@ -190,7 +205,26 @@ pub fn applyCheckpointing(
     const is_checkpoint = try identifyCheckpoints(allocator, g, forward_count, config);
     defer allocator.free(is_checkpoint);
 
-    // Find which non-checkpoint forward nodes are referenced by backward nodes.
+    if (config.recursive_recompute_dependencies) {
+        try applyRecursiveDependencyRecompute(allocator, grad_result, forward_count, total_nodes, is_checkpoint);
+    } else {
+        try applyDirectRecompute(allocator, grad_result, forward_count, total_nodes, is_checkpoint);
+    }
+
+    try reorderGradientGraphTopologically(allocator, grad_result);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn applyDirectRecompute(
+    allocator: std.mem.Allocator,
+    grad_result: *GradientResult,
+    forward_count: u32,
+    total_nodes: u32,
+    is_checkpoint: []const bool,
+) !void {
+    const g = &grad_result.graph;
+
     var needs_recompute = try allocator.alloc(bool, forward_count);
     defer allocator.free(needs_recompute);
     @memset(needs_recompute, false);
@@ -204,22 +238,16 @@ pub fn applyCheckpointing(
         }
     }
 
-    // For each non-checkpoint forward node referenced by backward nodes,
-    // duplicate it (and its non-checkpoint dependencies) in the graph.
-    // The duplicated nodes will be computed just-in-time during backward.
     var remap = try allocator.alloc(NodeId, forward_count);
     defer allocator.free(remap);
     for (0..forward_count) |i| {
-        remap[i] = @intCast(i); // identity by default
+        remap[i] = @intCast(i);
     }
 
-    // Process in topological order (low to high ID).
     for (0..forward_count) |i| {
         if (!needs_recompute[i]) continue;
 
         const orig_node = g.node(@intCast(i));
-
-        // Build a duplicate node with remapped inputs.
         var new_node = orig_node.*;
         for (&new_node.inputs, 0..) |*inp, j| {
             if (j >= new_node.num_inputs) break;
@@ -227,13 +255,12 @@ pub fn applyCheckpointing(
                 inp.* = remap[inp.*];
             }
         }
-        new_node.vjp_alternate = null_node; // no VJP needed for recomputation
+        new_node.vjp_alternate = null_node;
 
         const new_id = try g.addNode(new_node);
         remap[i] = new_id;
     }
 
-    // Redirect backward nodes to use recomputed activations.
     const updated_total = g.nodeCount();
     for (forward_count..updated_total) |i| {
         const n = g.nodeMut(@intCast(i));
@@ -245,24 +272,86 @@ pub fn applyCheckpointing(
         }
     }
 
-    // Update output references.
     for (g.outputs.items) |*out| {
         if (out.* < forward_count) {
             out.* = remap[out.*];
         }
     }
 
-    // Update param_grads references.
     for (grad_result.param_grads) |*pg| {
         if (pg.* != null_node and pg.* < forward_count) {
             pg.* = remap[pg.*];
         }
     }
-
-    try reorderGradientGraphTopologically(allocator, grad_result);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+fn applyRecursiveDependencyRecompute(
+    allocator: std.mem.Allocator,
+    grad_result: *GradientResult,
+    forward_count: u32,
+    total_nodes: u32,
+    is_checkpoint: []const bool,
+) !void {
+    const g = &grad_result.graph;
+
+    var remap = try allocator.alloc(NodeId, forward_count);
+    defer allocator.free(remap);
+    for (0..forward_count) |i| {
+        remap[i] = if (is_checkpoint[i]) @intCast(i) else null_node;
+    }
+
+    for (forward_count..total_nodes) |i| {
+        const node_id: NodeId = @intCast(i);
+        // duplicateForwardForRecompute -> g.addNode appends to g.nodes, which can
+        // reallocate the backing array and invalidate any held node pointer. Re-fetch
+        // g.nodeMut(node_id) before every read/write instead of caching a pointer.
+        const num_inputs = g.nodeMut(node_id).num_inputs;
+        for (0..num_inputs) |j| {
+            const cur = g.nodeMut(node_id).inputs[j];
+            if (cur != null_node and cur < forward_count and !is_checkpoint[cur]) {
+                const new_id = try duplicateForwardForRecompute(g, forward_count, is_checkpoint, remap, cur);
+                g.nodeMut(node_id).inputs[j] = new_id;
+            }
+        }
+    }
+
+    for (g.outputs.items) |*out| {
+        if (out.* < forward_count and !is_checkpoint[out.*]) {
+            out.* = try duplicateForwardForRecompute(g, forward_count, is_checkpoint, remap, out.*);
+        }
+    }
+
+    for (grad_result.param_grads) |*pg| {
+        if (pg.* != null_node and pg.* < forward_count and !is_checkpoint[pg.*]) {
+            pg.* = try duplicateForwardForRecompute(g, forward_count, is_checkpoint, remap, pg.*);
+        }
+    }
+}
+
+fn duplicateForwardForRecompute(
+    g: *Graph,
+    forward_count: u32,
+    is_checkpoint: []const bool,
+    remap: []NodeId,
+    node_id: NodeId,
+) !NodeId {
+    if (node_id == null_node or node_id >= forward_count) return node_id;
+    if (is_checkpoint[node_id]) return node_id;
+    if (remap[node_id] != null_node) return remap[node_id];
+
+    var new_node = g.node(node_id).*;
+    for (&new_node.inputs, 0..) |*inp, idx| {
+        if (idx >= new_node.num_inputs) break;
+        if (inp.* != null_node and inp.* < forward_count and !is_checkpoint[inp.*]) {
+            inp.* = try duplicateForwardForRecompute(g, forward_count, is_checkpoint, remap, inp.*);
+        }
+    }
+    new_node.vjp_alternate = null_node;
+
+    const new_id = try g.addNode(new_node);
+    remap[node_id] = new_id;
+    return new_id;
+}
 
 fn reorderGradientGraphTopologically(
     allocator: std.mem.Allocator,
@@ -380,6 +469,30 @@ fn isLinearLikeOp(op: OpCode) bool {
     };
 }
 
+fn lastDim(shape: Shape) ?i64 {
+    if (shape.rank() == 0) return null;
+    return shape.dim(shape.rank() - 1);
+}
+
+fn isLayerBoundaryProjection(graph: *const Graph, node_id: NodeId) bool {
+    const n = graph.node(node_id);
+    switch (n.op) {
+        .fused_linear, .fused_linear_no_bias => |attrs| {
+            return attrs.num_projections == 0 and
+                attrs.in_dim > attrs.out_dim and
+                attrs.out_dim > 0;
+        },
+        .dot_general => {},
+        else => return false,
+    }
+
+    const inputs = n.getInputs();
+    if (inputs.len == 0 or inputs[0] == null_node) return false;
+    const in_last = lastDim(graph.node(inputs[0]).output_shape) orelse return false;
+    const out_last = lastDim(n.output_shape) orelse return false;
+    return in_last > out_last and out_last > 0;
+}
+
 fn isAttentionOutput(op: OpCode) bool {
     return switch (op) {
         .fused_sdpa => true,
@@ -455,6 +568,63 @@ test "analyzeCheckpointSavings reports correct counts" {
     try std.testing.expect(analysis.total_forward_activations > 0);
     try std.testing.expect(analysis.savingsRatio() >= 0.0);
     try std.testing.expect(analysis.savingsRatio() <= 1.0);
+}
+
+test "every-N checkpointing marks FFN down projection boundaries only" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w_up = try bld.parameter("w_up", Shape.init(.f32, &.{ 16, 4 }));
+    const w_down = try bld.parameter("w_down", Shape.init(.f32, &.{ 4, 16 }));
+    const up = try bld.linearNoBias(x, w_up, 2, 4, 16);
+    const act = try bld.gelu(up);
+    const down = try bld.linearNoBias(act, w_down, 2, 16, 4);
+    const loss = try bld.reduceSum(down, &.{ 0, 1 });
+    _ = loss;
+
+    const forward_count = g.nodeCount();
+    const checkpoints = try identifyCheckpoints(allocator, &g, forward_count, .{
+        .strategy = .every_n_layers,
+        .layer_interval = 1,
+    });
+    defer allocator.free(checkpoints);
+
+    try std.testing.expect(!checkpoints[up]);
+    try std.testing.expect(!checkpoints[act]);
+    try std.testing.expect(checkpoints[down]);
+    try std.testing.expect(checkpoints[forward_count - 1]);
+}
+
+test "parameters-only checkpointing marks roots and loss only" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const c = try bld.tensorConst(&.{2.0}, Shape.init(.f32, &.{1}));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{ 4, 4 }));
+    const y = try bld.linearNoBias(x, w, 2, 4, 4);
+    const scaled = try bld.mul(y, c);
+    const loss = try bld.reduceSum(scaled, &.{ 0, 1 });
+    _ = loss;
+
+    const forward_count = g.nodeCount();
+    const checkpoints = try identifyCheckpoints(allocator, &g, forward_count, .{
+        .strategy = .parameters_only,
+    });
+    defer allocator.free(checkpoints);
+
+    for (0..forward_count) |i| {
+        const n = g.node(@intCast(i));
+        const expected = n.op == .parameter or n.op == .constant or i == forward_count - 1;
+        try std.testing.expectEqual(expected, checkpoints[i]);
+    }
 }
 
 test "applyCheckpointing produces valid graph" {
@@ -547,6 +717,56 @@ test "applyCheckpointing handles duplicate inputs (x * x)" {
             }
         }
     }
+}
+
+test "parameters-only checkpointing recursively duplicates dropped dependencies" {
+    const allocator = std.testing.allocator;
+    const autodiff = @import("autodiff.zig");
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w_up = try bld.parameter("w_up", Shape.init(.f32, &.{ 8, 4 }));
+    const w_down = try bld.parameter("w_down", Shape.init(.f32, &.{ 4, 8 }));
+    const up = try bld.linearNoBias(x, w_up, 2, 4, 8);
+    const act = try bld.gelu(up);
+    const down = try bld.linearNoBias(act, w_down, 2, 8, 4);
+    const loss = try bld.reduceSum(down, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var grad = try autodiff.gradient(allocator, &g, loss, &.{ x, w_up, w_down });
+    defer grad.deinit();
+
+    try applyCheckpointing(allocator, &grad, .{
+        .strategy = .parameters_only,
+        .recursive_recompute_dependencies = true,
+    });
+
+    const mapped_up = grad.id_map[up];
+    const mapped_act = grad.id_map[act];
+    const mapped_down = grad.id_map[down];
+
+    var found_recomputed_act = false;
+    for (grad.graph.nodes.items, 0..) |node, node_id| {
+        if (node.op != .fused_gelu) continue;
+        if (node_id == mapped_act) continue;
+        const inputs = node.getInputs();
+        if (inputs.len == 0) continue;
+        const input_id = inputs[0];
+        if (input_id == mapped_up or input_id == mapped_act or input_id == mapped_down) {
+            return error.RecomputedActivationStillReferencesOriginalForwardActivation;
+        }
+        if (input_id != null_node and input_id < grad.graph.nodeCount()) {
+            const input_node = grad.graph.node(input_id);
+            if (input_node.op == .dot_general or input_node.op == .fused_linear_no_bias) {
+                found_recomputed_act = true;
+            }
+        }
+    }
+
+    try std.testing.expect(found_recomputed_act);
 }
 
 test "applyCheckpointing with multi-layer graph" {

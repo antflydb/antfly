@@ -8275,6 +8275,7 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
     try appendPromMetric(writer, "inference_graph_executor_planned_operator_dispatches_total", "counter", "Total graph executor planned operator dispatches", stats.planned_operator_dispatches);
     try appendPromMetric(writer, "inference_graph_executor_interpreter_fallbacks_total", "counter", "Total graph executor interpreter fallback partitions", stats.interpreter_fallbacks);
     try appendPromMetric(writer, "inference_graph_executor_device_resident_outputs_total", "counter", "Total graph executor device-resident outputs", stats.device_resident_outputs);
+    try appendPromMetric(writer, "inference_graph_executor_device_resident_parameter_outputs_total", "counter", "Total graph executor device-resident parameter outputs", stats.device_resident_parameter_outputs);
     try appendPromMetric(writer, "inference_graph_executor_host_materialized_outputs_total", "counter", "Total graph executor host-materialized outputs", stats.host_materialized_outputs);
     try appendPromMetric(writer, "inference_graph_executor_boundary_output_materializations_total", "counter", "Total graph executor boundary output materializations", stats.boundary_output_materializations);
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_slots_reserved_total", "counter", "Total graph executor planned buffer slots reserved", stats.graph_plan_slots_reserved);

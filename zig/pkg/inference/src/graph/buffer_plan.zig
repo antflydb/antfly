@@ -182,10 +182,56 @@ pub const BufferPlan = struct {
         if (part_index >= partition_plan.partitions.len) return error.InvalidPartitionPlan;
         const part = partition_plan.partitions[part_index];
 
+        if (partition_plan.partitions.len == 1 and partition_index == 0 and self.transfers.len == 0) {
+            const slots = try allocator.alloc(PartitionSlotView, self.slots.len);
+            errdefer allocator.free(slots);
+            for (self.slots, slots) |slot, *slot_view| {
+                const graph_output = slot.roles.graph_output;
+                slot_view.* = .{
+                    .slot = slot,
+                    .roles = .{
+                        .local = true,
+                        .output = graph_output,
+                        .graph_output = graph_output,
+                    },
+                };
+            }
+            return .{
+                .partition_index = partition_index,
+                .backend = part.backend,
+                .slots = slots,
+                .transfers_in = &.{},
+                .transfers_out = &.{},
+            };
+        }
+
         var slots = std.ArrayListUnmanaged(PartitionSlotView).empty;
         errdefer slots.deinit(allocator);
-        for (self.slots) |slot| {
-            const roles = partitionSlotRoles(self, slot, partition_index);
+        try slots.ensureTotalCapacity(allocator, self.slots.len);
+        const slot_roles = try allocator.alloc(PartitionSlotRoles, self.slots.len);
+        defer allocator.free(slot_roles);
+        for (self.slots, slot_roles) |slot, *roles| {
+            const graph_output = slot.roles.graph_output and slot.partition_index == partition_index;
+            roles.* = .{
+                .local = slot.partition_index == partition_index,
+                .output = graph_output,
+                .graph_output = graph_output,
+            };
+        }
+        for (self.transfers) |transfer| {
+            const source_slot_index: usize = @intCast(transfer.source_slot);
+            if (source_slot_index >= slot_roles.len) return error.InvalidBufferPlan;
+            const roles = &slot_roles[source_slot_index];
+            if (transfer.source_partition == partition_index) {
+                roles.output = true;
+                roles.transfer_source = true;
+            }
+            if (transfer.target_partition == partition_index) {
+                roles.input = true;
+                roles.transfer_target = true;
+            }
+        }
+        for (self.slots, slot_roles) |slot, roles| {
             if (roles.local or roles.input or roles.output or roles.graph_output)
                 try slots.append(allocator, .{ .slot = slot, .roles = roles });
         }
@@ -194,6 +240,8 @@ pub const BufferPlan = struct {
         errdefer transfers_in.deinit(allocator);
         var transfers_out = std.ArrayListUnmanaged(TransferEdge).empty;
         errdefer transfers_out.deinit(allocator);
+        try transfers_in.ensureTotalCapacity(allocator, self.transfers.len);
+        try transfers_out.ensureTotalCapacity(allocator, self.transfers.len);
         for (self.transfers) |transfer| {
             if (transfer.target_partition == partition_index) try transfers_in.append(allocator, transfer);
             if (transfer.source_partition == partition_index) try transfers_out.append(allocator, transfer);
