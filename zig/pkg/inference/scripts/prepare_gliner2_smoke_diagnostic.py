@@ -10,16 +10,16 @@ from pathlib import Path
 
 
 NER_SOURCES = (
-    "gliner2_ner_smoke.jsonl",
+    "ner_smoke.jsonl",
 )
 
 FULL_TASK_SOURCES = (
-    "gliner2_ner_smoke.jsonl",
-    "gliner2_cls_smoke.jsonl",
-    "gliner2_json_smoke.jsonl",
-    "gliner2_rel_smoke.jsonl",
-    "gliner2_alltask_smoke.jsonl",
-    "gliner2_multicount_smoke.jsonl",
+    "ner_smoke.jsonl",
+    "classification_smoke.jsonl",
+    "json_smoke.jsonl",
+    "relation_smoke.jsonl",
+    "mixed_task_smoke.jsonl",
+    "multicount_smoke.jsonl",
 )
 
 PROFILES = {
@@ -51,7 +51,11 @@ def write_jsonl(path: Path, rows: list[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--testdata-dir", type=Path, default=Path(__file__).resolve().parents[1] / "testdata")
+    parser.add_argument(
+        "--testdata-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "testdata" / "gliner2",
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("/private/tmp/termite-gliner2-smoke-diagnostic"))
     parser.add_argument(
         "--profile",
