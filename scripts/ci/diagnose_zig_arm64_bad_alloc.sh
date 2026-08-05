@@ -5,8 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 diagnostic_root="${RUNNER_TEMP:-/tmp}/zig-arm64-bad-alloc"
 baseline_log="$diagnostic_root/baseline-build.log"
 backtrace_log="$diagnostic_root/gdb-backtrace.log"
-native_log="$diagnostic_root/no-llvm-build.log"
+replay_log="$diagnostic_root/gdb-build-runner.log"
 compiler_command_file="$diagnostic_root/compiler-command.txt"
+build_runner_command_file="$diagnostic_root/build-runner-command.txt"
 
 mkdir -p "$diagnostic_root"
 
@@ -65,39 +66,33 @@ for arg in "${compiler_argv[@]}"; do
   fi
 done
 
-echo "Replaying the compiler under GDB until the bad allocation is raised..."
-set +e
-gdb --quiet --batch \
-  -ex 'set pagination off' \
-  -ex 'set confirm off' \
-  -ex 'set print demangle on' \
-  -ex 'break _ZSt17__throw_bad_allocv' \
-  -ex 'break _ZN4llvm22report_bad_alloc_errorEPKcb' \
-  -ex run \
-  -ex 'echo \n=== selected thread backtrace ===\n' \
-  -ex 'bt 100' \
-  -ex 'echo \n=== all thread backtraces ===\n' \
-  -ex 'thread apply all bt 30' \
-  -ex 'echo \n=== registers ===\n' \
-  -ex 'info registers' \
-  --args "${compiler_argv[@]}" 2>&1 | tee "$backtrace_log"
-gdb_status=${PIPESTATUS[0]}
-set -e
-printf 'gdb exit status: %s\n' "$gdb_status" >> "$diagnostic_root/system-info.txt"
+build_runner_command="$(awk '/^error: the following build command failed/{getline; print}' "$baseline_log" | tail -1)"
+if [ -z "$build_runner_command" ]; then
+  echo "Could not extract the failed Zig build-runner command from the baseline log." >&2
+  exit 1
+fi
+printf '%s\n' "$build_runner_command" > "$build_runner_command_file"
 
-echo "Replaying the same compiler command with the LLVM backend disabled..."
-native_argv=("${compiler_argv[0]}" "${compiler_argv[1]}" -fno-llvm "${compiler_argv[@]:2}")
-{
-  printf 'native command:'
-  printf ' %q' "${native_argv[@]}"
-  printf '\n'
-} > "$diagnostic_root/no-llvm-command.txt"
+read -r -a build_runner_argv <<< "$build_runner_command"
+if [ "${#build_runner_argv[@]}" -lt 3 ] || [ ! -x "${build_runner_argv[0]}" ] || [ ! -x "${build_runner_argv[1]}" ]; then
+  echo "Extracted command is not the expected Zig build-runner invocation." >&2
+  exit 1
+fi
 
+# Re-run the cached build runner, replacing only its Zig executable argument
+# with a wrapper. The wrapper starts GDB for the antfly build-exe child while
+# preserving --listen=- and the build-runner protocol that were present in the
+# original failure.
+export ANTFLY_GDB_REAL_ZIG="${build_runner_argv[1]}"
+export ANTFLY_GDB_LOG="$backtrace_log"
+build_runner_argv[1]="$repo_root/scripts/ci/zig_gdb_wrapper.sh"
+
+echo "Replaying the failing build-runner/compiler protocol under GDB..."
 set +e
-timeout --signal=TERM 45m "${native_argv[@]}" 2>&1 | tee "$native_log"
-native_status=${PIPESTATUS[0]}
+(cd "$repo_root/zig" && "${build_runner_argv[@]}") 2>&1 | tee "$replay_log"
+replay_status=${PIPESTATUS[0]}
 set -e
-printf 'no-llvm exit status: %s\n' "$native_status" | tee -a "$native_log" "$diagnostic_root/system-info.txt"
+printf 'gdb build-runner exit status: %s\n' "$replay_status" >> "$diagnostic_root/system-info.txt"
 
 echo "Diagnostics written to $diagnostic_root"
 
