@@ -35,6 +35,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.issue443_attempts != '0'
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
     steps:
       - uses: actions/checkout@v6
         with:
@@ -45,7 +50,17 @@ jobs:
           version: 0.16.0
           use-cache: false
       - uses: astral-sh/setup-uv@v8.1.0
-      - run: make -C zig build ZIG_BUILD_FLAGS='-Doptimize=ReleaseSafe'
+      - name: Restore ARC cache dirs
+        run: |
+          mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
+          rm -rf ~/.cache ~/.antfly
+          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
+          ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
+      - name: Build E2E binary
+        env:
+          ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+        run: scripts/ci/zig-build-e2e-binaries.sh
       - name: Repeat isolated sparse batch with server diagnostics
         working-directory: zig
         env:
@@ -412,7 +427,7 @@ jobs:
   zig-full:
     name: zig-full
     needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *') && !(github.event_name == 'workflow_dispatch' && inputs.issue443_attempts != '0')
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
@@ -588,7 +603,7 @@ jobs:
   e2e-full:
     name: e2e-full
     needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *') && !(github.event_name == 'workflow_dispatch' && inputs.issue443_attempts != '0')
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
