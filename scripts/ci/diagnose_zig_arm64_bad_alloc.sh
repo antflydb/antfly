@@ -46,6 +46,47 @@ capture_memory_snapshot() {
   } >> "$diagnostic_root/system-info.txt"
 }
 
+capture_overcommit_policy() {
+  {
+    echo
+    echo "=== kernel overcommit policy ==="
+    for path in \
+      /proc/sys/vm/overcommit_memory \
+      /proc/sys/vm/overcommit_ratio \
+      /proc/sys/vm/overcommit_kbytes \
+      /proc/sys/vm/admin_reserve_kbytes \
+      /proc/sys/vm/user_reserve_kbytes
+    do
+      if [ -e "$path" ]; then
+        echo "--- $path"
+        cat "$path" || true
+      fi
+    done
+  } >> "$diagnostic_root/system-info.txt"
+}
+
+sample_zig_memory() {
+  local label="$1"
+  local watched_pid="$2"
+  local output="$3"
+
+  while kill -0 "$watched_pid" 2>/dev/null; do
+    {
+      echo
+      date -u "+utc: %Y-%m-%dT%H:%M:%SZ label: $label"
+      for comm_path in /proc/[0-9]*/comm; do
+        [ -r "$comm_path" ] || continue
+        [ "$(cat "$comm_path" 2>/dev/null)" = zig ] || continue
+        status_path="${comm_path%/comm}/status"
+        [ -r "$status_path" ] || continue
+        grep -E '^(Name|Pid|PPid|VmPeak|VmSize|VmHWM|VmRSS|RssAnon|RssFile|VmSwap|Threads):' "$status_path" || true
+      done
+      grep -E '^(CommitLimit|Committed_AS|MemAvailable):' /proc/meminfo || true
+    } >> "$output"
+    sleep 5
+  done
+}
+
 {
   echo "commit: $(git -C "$repo_root" rev-parse HEAD)"
   echo "zig: $(zig version)"
@@ -55,6 +96,7 @@ capture_memory_snapshot() {
   echo
   ulimit -a
 } > "$diagnostic_root/system-info.txt"
+capture_overcommit_policy
 capture_memory_snapshot "initial"
 
 echo "Reproducing the release failure and retaining its generated modules..."
@@ -116,6 +158,81 @@ if [ "${#build_runner_argv[@]}" -lt 6 ] || [ ! -x "${build_runner_argv[0]}" ] ||
   exit 1
 fi
 original_build_runner_argv=("${build_runner_argv[@]}")
+
+if [ "${ANTFLY_CACHE_AB_ONLY:-false}" = true ]; then
+  # Both replays start from byte-for-byte copies of the same local cache state
+  # and empty private global caches. Neither replay can warm the other. The only
+  # intentional compiler-mode difference is the build protocol's --listen=-.
+  ab_root="${RUNNER_TEMP:-/tmp}/antfly-zig-cache-ab"
+  seed_local_cache="$ab_root/seed-local"
+  server_local_cache="$ab_root/server-local"
+  server_global_cache="$ab_root/server-global"
+  direct_local_cache="$ab_root/direct-local"
+  direct_global_cache="$ab_root/direct-global"
+  mkdir -p \
+    "$seed_local_cache" \
+    "$server_local_cache" \
+    "$server_global_cache" \
+    "$direct_local_cache" \
+    "$direct_global_cache"
+  cp -a "${build_runner_argv[4]}/." "$seed_local_cache/"
+  cp -a "$seed_local_cache/." "$server_local_cache/"
+  cp -a "$seed_local_cache/." "$direct_local_cache/"
+
+  server_build_runner_argv=("${build_runner_argv[@]}")
+  server_build_runner_argv[4]="$server_local_cache"
+  server_build_runner_argv[5]="$server_global_cache"
+
+  direct_compiler_argv=()
+  for arg in "${compiler_argv[@]}"; do
+    arg="${arg//${build_runner_argv[4]}/$direct_local_cache}"
+    arg="${arg//${build_runner_argv[5]}/$direct_global_cache}"
+    direct_compiler_argv+=("$arg")
+  done
+
+  printf '%q ' "${server_build_runner_argv[@]}" > "$diagnostic_root/cache-ab-server-command.txt"
+  printf '\n' >> "$diagnostic_root/cache-ab-server-command.txt"
+  printf '%q ' "${direct_compiler_argv[@]}" > "$diagnostic_root/cache-ab-direct-command.txt"
+  printf '\n' >> "$diagnostic_root/cache-ab-direct-command.txt"
+
+  echo "Running build-runner/server mode against isolated cache clone A..."
+  set +e
+  (cd "$repo_root/zig" && /usr/bin/time -v timeout 40m "${server_build_runner_argv[@]}") \
+    > "$diagnostic_root/cache-ab-server.log" 2>&1 &
+  server_pid=$!
+  sample_zig_memory "server-listen" "$server_pid" "$diagnostic_root/cache-ab-server-memory.log" &
+  server_sampler_pid=$!
+  wait "$server_pid"
+  server_status=$?
+  wait "$server_sampler_pid" 2>/dev/null
+  set -e
+  printf 'cache A/B server exit status: %s\n' "$server_status" >> "$diagnostic_root/system-info.txt"
+  capture_memory_snapshot "after isolated server cache replay"
+  tail -n 40 "$diagnostic_root/cache-ab-server.log"
+
+  echo "Running direct compiler mode against isolated cache clone B..."
+  set +e
+  (cd "$repo_root/zig" && /usr/bin/time -v timeout 40m "${direct_compiler_argv[@]}") \
+    > "$diagnostic_root/cache-ab-direct.log" 2>&1 &
+  direct_pid=$!
+  sample_zig_memory "direct-no-listen" "$direct_pid" "$diagnostic_root/cache-ab-direct-memory.log" &
+  direct_sampler_pid=$!
+  wait "$direct_pid"
+  direct_status=$?
+  wait "$direct_sampler_pid" 2>/dev/null
+  set -e
+  printf 'cache A/B direct exit status: %s\n' "$direct_status" >> "$diagnostic_root/system-info.txt"
+  capture_memory_snapshot "after isolated direct cache replay"
+  tail -n 40 "$diagnostic_root/cache-ab-direct.log"
+
+  if [ "$server_status" -eq 0 ] || [ "$direct_status" -ne 0 ]; then
+    echo "Cache A/B did not reproduce the expected server-fails/direct-succeeds split." >&2
+    exit 1
+  fi
+
+  echo "Cache A/B reproduced server failure and direct success from isolated identical cache snapshots."
+  exit 0
+fi
 
 # The node's core pattern is /core.<exe>.<pid>.<time>. Re-run the cached build
 # runner uninstrumented as root so the failing Zig child can write there, then

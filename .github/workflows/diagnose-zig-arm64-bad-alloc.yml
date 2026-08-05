@@ -9,11 +9,11 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ANTFLY_CORE_ONLY: true
+  ANTFLY_CACHE_AB_ONLY: true
 
 jobs:
   diagnose:
-    name: Capture failing compiler core backtrace
+    name: Isolate compiler server cache state
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 180
