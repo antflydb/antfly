@@ -33,6 +33,7 @@ pub const SnapshotReader = source.SnapshotReader;
 pub const PreparedReplicationSnapshot = source.PreparedReplicationSnapshot;
 pub const ReplicationOp = source.ReplicationOp;
 pub const ReplicationChange = source.ReplicationChange;
+pub const ExactCutoverIntent = source.ExactCutoverIntent;
 pub const ReplicationPrepareResult = source.ReplicationPrepareResult;
 pub const ReplicationCleanupParams = source.ReplicationCleanupParams;
 pub const ReplicationPollParams = source.ReplicationPollParams;
@@ -62,6 +63,7 @@ pub const PreparedQuery = sql.PreparedQuery;
 pub const SqlSourceConfig = sql.SqlSourceConfig;
 pub const SelectStatementOptions = sql.SelectStatementOptions;
 pub const postgresDialect = sql.postgresDialect;
+pub const quotePostgresRelationAlloc = sql.quotePostgresRelationAlloc;
 pub const placeholderAlloc = sql.placeholderAlloc;
 pub const buildSelectStatementAlloc = sql.buildSelectStatementAlloc;
 
@@ -115,6 +117,7 @@ test "foreign module compiles" {
     _ = SqlSourceConfig;
     _ = SelectStatementOptions;
     _ = postgresDialect;
+    _ = quotePostgresRelationAlloc;
     _ = placeholderAlloc;
     _ = buildSelectStatementAlloc;
 }

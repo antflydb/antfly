@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -41,22 +42,43 @@ const portableBatchTarget = 4 * 1024 * 1024
 // summaries, chunks, and outgoing edges at the semantic level. Indexes are
 // NOT exported — they are rebuilt on restore.
 func (db *DBImpl) ExportPortable(ctx context.Context, w io.Writer) error {
+	return db.exportPortableWithOptions(ctx, w, portableExportOptions{
+		backupID:  uuid.New(),
+		createdAt: time.Now().UTC(),
+		compress:  true,
+	})
+}
+
+type portableExportOptions struct {
+	backupID  uuid.UUID
+	createdAt time.Time
+	compress  bool
+}
+
+func (db *DBImpl) exportPortableWithOptions(
+	ctx context.Context,
+	w io.Writer,
+	options portableExportOptions,
+) error {
 	pdb := db.getPDB()
 	if pdb == nil {
 		return pebble.ErrClosed
 	}
+	if options.backupID == uuid.Nil || options.createdAt.IsZero() {
+		return errors.New("invalid portable export identity")
+	}
 
 	byteRange := db.getByteRange()
 
-	writer, err := common.NewAFBWriter(w, true) // compress data blocks
+	writer, err := common.NewAFBWriter(w, options.compress)
 	if err != nil {
 		return fmt.Errorf("creating AFB writer: %w", err)
 	}
 	defer writer.Close()
 
 	// Generate backup metadata
-	backupID := uuid.New()
-	header := common.NewFileHeader(backupID, 1, 1, true)
+	header := common.NewFileHeader(options.backupID, 1, 1, options.compress)
+	header.CreatedAtNs = options.createdAt.UnixNano()
 
 	if err := writer.WriteHeader(header); err != nil {
 		return fmt.Errorf("writing AFB header: %w", err)
@@ -64,8 +86,8 @@ func (db *DBImpl) ExportPortable(ctx context.Context, w io.Writer) error {
 
 	// Write cluster manifest
 	clusterManifest, _ := json.Marshal(map[string]any{
-		"backup_id":      backupID.String(),
-		"created_at":     time.Now().UTC().Format(time.RFC3339),
+		"backup_id":      options.backupID.String(),
+		"created_at":     options.createdAt.Format(time.RFC3339Nano),
 		"source_backend": "go",
 	})
 	if err := writer.WriteBlock(common.BlockClusterManifest, clusterManifest); err != nil {

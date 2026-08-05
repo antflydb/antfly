@@ -424,8 +424,12 @@ export interface paths {
          *     - Table metadata (schema, indexes, shard configuration)
          *     - All shard data (compressed with zstd)
          *
-         *     The backup creates a cluster-level manifest that tracks all included tables
-         *     and their individual backup locations.
+         *     A non-empty backup publishes a cluster-level manifest only after every
+         *     requested table backup is durable. The manifest is the final commit
+         *     point and records complete expected/completed table counts. A `partial`
+         *     or `failed` attempt returns per-table diagnostics but does not publish a
+         *     restorable aggregate manifest. A cluster with no selected tables returns
+         *     `400` without writing a backup artifact.
          *
          *     Backup IDs are immutable. Reusing an ID that already has a published
          *     cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -2596,6 +2600,23 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        /** @description A non-retryable table-storage integrity or format failure. */
+        TableStorageUnreadableError: {
+            /**
+             * @description Stable client-routing code for unreadable table storage.
+             * @enum {string}
+             */
+            code: "table_storage_unreadable";
+            /** @description Concrete storage error class, such as InvalidManifest. */
+            error: string;
+            /** @description Human-readable summary. */
+            message: string;
+            /**
+             * @description Always false; recovery requires repair, restore, or table replacement.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
@@ -2999,18 +3020,6 @@ export interface components {
             unit_count: number;
             /** @description Number of indexable chunks derived from the units. */
             chunk_count: number;
-            /** @description Number of pages for which OCR was attempted. */
-            ocr_attempted_count?: number;
-            /** @description Number of pages where OCR text was selected over embedded text. */
-            ocr_selected_count?: number;
-            /** @description Number of attempted pages where embedded text remained preferable. */
-            ocr_retained_embedded_count?: number;
-            /** @description Number of pages whose OCR rendering or recognition failed. */
-            ocr_failed_count?: number;
-            /** @description Up to 32 one-based page numbers with retryable OCR failures. */
-            ocr_failed_page_numbers?: number[];
-            /** @description Whether additional failed page numbers were omitted from the summary. */
-            ocr_failed_pages_truncated?: boolean;
             /** @description Parsed child range descriptors for this artifact generation. */
             child_ranges: components["schemas"]["DocumentArtifactChildRange"][];
             /** @description Number of storage child ranges used by this artifact. */
@@ -4177,6 +4186,37 @@ export interface components {
             read_snapshot_mutable_rotation_bytes?: number;
             /** Format: uint64 */
             wal_retained_bytes?: number;
+            /** @description Whether WAL checkpoint maintenance is pending. */
+            wal_checkpoint_pending?: boolean;
+            /** @description Whether WAL hard-limit admission is currently blocked. */
+            wal_pressure_blocked?: boolean;
+            /** @description Representative reason for the earliest pending WAL checkpoint retry. */
+            wal_checkpoint_retry_reason?: string;
+            /**
+             * Format: uint64
+             * @description Consecutive failures for the representative WAL checkpoint retry.
+             */
+            wal_checkpoint_retry_attempts?: number;
+            /**
+             * Format: uint64
+             * @description Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+             */
+            wal_checkpoint_retry_delay_ns?: number;
+            /**
+             * Format: uint64
+             * @description Logical bytes in immutable memtables awaiting run publication.
+             */
+            active_immutable_logical_bytes?: number;
+            /**
+             * Format: uint64
+             * @description Logical bytes in runs awaiting durable manifest publication.
+             */
+            unpublished_wal_logical_bytes?: number;
+            /**
+             * Format: uint64
+             * @description Largest logical batch awaiting durable manifest publication.
+             */
+            unpublished_wal_max_batch_logical_bytes?: number;
             /** Format: uint64 */
             compaction_backlog_bytes?: number;
             /** Format: uint64 */
@@ -4295,7 +4335,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$addToSet" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -4303,7 +4343,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
+            /** @description Value for operation (not required for $unset). Type depends on the supported operator. */
             value?: unknown;
         };
         /**
@@ -4322,8 +4362,9 @@ export interface components {
          *           "value": 1
          *         },
          *         {
-         *           "op": "$currentDate",
-         *           "path": "$.lastViewed"
+         *           "op": "$set",
+         *           "path": "$.lastViewed",
+         *           "value": "2026-07-28T12:00:00Z"
          *         }
          *       ]
          *     }
@@ -4386,14 +4427,16 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Antfly query to filter documents. Only documents matching this query
-             *     are included in results. Uses the sear library for efficient per-document
-             *     matching without requiring a full index.
+             * @description Structured subset of the Antfly query AST used to filter a primary-key
+             *     scan. Only documents matching this query are included in results.
+             *     Because scans do not open a text index, text-index-only variants such
+             *     as phrase and multi-match queries are rejected with a validation error
+             *     instead of being evaluated with slower stored-document semantics.
              *
              *     Examples:
-             *     - Status filtering: `{"query": "status:published"}`
-             *     - Date ranges: `{"query": "created_at:>2023-01-01"}`
-             *     - Field matching: `{"query": "category:technology"}`
+             *     - Status filtering: `{"term":{"path":"/status","value":"published"}}`
+             *     - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
+             *     - Field existence: `{"exists":{"path":"/category"}}`
              */
             filter_query?: components["schemas"]["Query"] & unknown;
             /**
@@ -4509,12 +4552,12 @@ export interface components {
              *     Transform operations allow you to modify documents without read-modify-write races:
              *     - Operations are applied atomically on the server
              *     - Multiple operations per document are applied in sequence
-             *     - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+             *     - Supports numeric and set-like operations ($inc, $max, $addToSet)
              *
              *     Common use cases:
              *     - Increment counters (views, likes, votes)
-             *     - Update timestamps ($currentDate)
-             *     - Manage arrays (add/remove tags, items)
+             *     - Update timestamps ($set)
+             *     - Add unique array values ($addToSet)
              *     - Update nested fields without overwriting the entire document
              * @example [
              *       {
@@ -4526,8 +4569,9 @@ export interface components {
              *             "value": 1
              *           },
              *           {
-             *             "op": "$currentDate",
-             *             "path": "$.lastViewed"
+             *             "op": "$set",
+             *             "path": "$.lastViewed",
+             *             "value": "2026-07-28T12:00:00Z"
              *           }
              *         ]
              *       },
@@ -4535,7 +4579,7 @@ export interface components {
              *         "key": "user:456",
              *         "operations": [
              *           {
-             *             "op": "$push",
+             *             "op": "$addToSet",
              *             "path": "$.tags",
              *             "value": "vip"
              *           }
@@ -5500,6 +5544,10 @@ export interface components {
          *
          *     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
          *     call, using the queries to determine available tables and indexes.
+         *
+         *     Authenticated row filters are enforced on every initial and generated
+         *     operation in both modes, including scans, aggregates, and graph/tree
+         *     traversal. They cannot be replaced or weakened by model tool arguments.
          */
         RetrievalAgentRequest: {
             /**
@@ -5513,6 +5561,13 @@ export interface components {
              *
              *     In pipeline mode (max_internal_iterations=0), these are executed directly.
              *     In agentic mode, these declare which table and indexes are available.
+             *
+             *     `filter_query` and `exclusion_query` are mandatory table predicates
+             *     for retrieval-agent execution. Predicates declared by any query for
+             *     a table are conjoined (or unioned for exclusions) and applied to
+             *     every initial query, generated refinement, probe, aggregation,
+             *     graph/tree traversal, root scan, and follow-up for that table.
+             *     They cannot be weakened by generated operations.
              * @example [
              *       {
              *         "table": "docs",
@@ -5534,11 +5589,13 @@ export interface components {
              */
             agent_knowledge?: string;
             /**
-             * @description Pre-applied filters from prior interactions. These are applied to
-             *     all search tool invocations.
+             * @description Mandatory filters from prior interactions. These are converted to
+             *     structured Antfly predicates and applied to every table and every
+             *     search tool invocation, including generated follow-ups, graph/tree
+             *     traversal, aggregations, and root scans.
              */
             accumulated_filters?: components["schemas"]["FilterSpec"][];
-            /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
+            /** @description Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence. */
             session_id?: string;
             /** @description Structured answers provided by the user as part of client-carried continuation. */
             decisions?: components["schemas"]["AgentDecision"][];
@@ -5798,12 +5855,12 @@ export interface components {
              *
              *     Boolean clauses are normalized before planning:
              *     - `bool.must` is scoring query input.
-             *     - `bool.filter` is a non-scoring structured filter.
-             *     - `bool.must_not` is a structured exclusion filter.
+             *     - `bool.filter` is non-scoring query input.
+             *     - `bool.must_not` is non-scoring exclusion query input.
              *
-             *     The same AST accepts direct structured filters using `field` or JSON-pointer
-             *     `path`, scalar `term` values, multi-value `terms`, and `exists`.
-             *     Query-string objects remain supported as a full-text escape hatch.
+             *     Filter branches accept the same query variants as `filter_query` and
+             *     `exclusion_query`. Structured clauses use the native document-value
+             *     path; text clauses are resolved through the text index before scoring.
              * @example {
              *       "bool": {
              *         "must": [
@@ -7358,8 +7415,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-             *     `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
@@ -8767,9 +8823,9 @@ export interface components {
         TableSchema: {
             /**
              * Format: uint32
-             * @description Version of the schema. Used for migrations.
+             * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
-            version?: number;
+            readonly version?: number;
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
@@ -8809,18 +8865,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        /** @description The fuzziness of the query. Can be an integer or "auto". */
-        Fuzziness: number | "auto";
         MatchQuery: {
             match: string;
             field?: string;
             analyzer?: string;
             boost?: components["schemas"]["Boost"];
-            /** Format: int32 */
-            prefix_length?: number;
-            fuzziness?: components["schemas"]["Fuzziness"];
-            /** @enum {string} */
-            operator?: "or" | "and";
         };
         MultiMatchBody: {
             query: string;
@@ -8832,6 +8881,8 @@ export interface components {
         MultiMatchQuery: {
             multi_match: components["schemas"]["MultiMatchBody"];
         };
+        /** @description The fuzziness of the query. Can be an integer or "auto". */
+        Fuzziness: number | "auto";
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;
@@ -9104,11 +9155,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9208,6 +9256,80 @@ export interface components {
             /** @description Whether coverage is complete under best_effort but includes terminal failures. */
             degraded: boolean;
         };
+        /** @description Runtime state for the durable embeddings enrichment worker. */
+        EnrichmentRuntimeStatus: {
+            enabled: boolean;
+            /** Format: uint64 */
+            target_sequence: number;
+            /** Format: uint64 */
+            applied_sequence: number;
+            /** Format: uint64 */
+            pending_sequence_count: number;
+            projection_checkpoint_status: string;
+            /** Format: uint64 */
+            projection_checkpoint_applied_sequence: number;
+            /** Format: uint64 */
+            projection_checkpoint_generation: number;
+            projection_checkpoint_config_fingerprint: string;
+            /** @description Whether every shard contributing to this status reports the same checkpoint generation and configuration identity. */
+            projection_checkpoint_identity_consistent: boolean;
+            /** Format: uint64 */
+            checkpoint_replay_tail_sequence_count: number;
+            /** Format: uint64 */
+            processed_requests: number;
+            /** Format: uint64 */
+            error_count: number;
+            /** Format: uint64 */
+            retryable_error_count: number;
+            /** Format: uint64 */
+            fatal_error_count: number;
+            retrying: boolean;
+            worker_failed: boolean;
+            /** @description Whether the background enrichment worker is currently running. */
+            worker_started: boolean;
+            /** @description Whether work is pending with no running worker, retry, or terminal failure explaining the backlog. */
+            stalled: boolean;
+            /** Format: uint64 */
+            skip_by_hash_count: number;
+            /** Format: uint64 */
+            skipped_source_count: number;
+            /** Format: uint64 */
+            codec_decode_failures: number;
+            /** Format: uint64 */
+            embed_batches_started: number;
+            /** Format: uint64 */
+            embed_batches_completed: number;
+            /** Format: uint64 */
+            embed_items_started: number;
+            /** Format: uint64 */
+            embed_items_completed: number;
+            /** Format: uint64 */
+            active_embed_batch_items: number;
+            /** Format: uint64 */
+            active_embed_batch_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_max_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_started_ms: number;
+            /** Format: uint64 */
+            last_embed_batch_items: number;
+            /** Format: uint64 */
+            last_embed_batch_bytes: number;
+            /** Format: uint64 */
+            last_embed_batch_max_bytes: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_completed_ms: number;
+            /**
+             * Format: uint64
+             * @description Elapsed duration in nanoseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_ns: number;
+            /** Format: uint64 */
+            total_embed_ns: number;
+        };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
             /**
@@ -9237,7 +9359,7 @@ export interface components {
              * @description Number of unique terms in the inverted index (sparse only)
              */
             total_terms?: number;
-            /** @description Whether the index enricher is currently backfilling */
+            /** @description Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true. */
             rebuilding?: boolean;
             repair?: components["schemas"]["IndexRepairStatus"];
             /**
@@ -9249,7 +9371,7 @@ export interface components {
             backfill_active?: boolean;
             /**
              * Format: double
-             * @description Backfill progress as a ratio from 0.0 to 1.0
+             * @description Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
              */
             backfill_progress?: number;
             /**
@@ -9257,7 +9379,7 @@ export interface components {
              * @description Total items processed during backfill
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -9300,13 +9422,7 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Embedding enrichment worker runtime diagnostics. */
-            enrichment_runtime?: {
-                /** Format: uint64 */
-                pending_sequence_count?: number;
-            } & {
-                [key: string]: unknown;
-            };
+            enrichment_runtime?: components["schemas"]["EnrichmentRuntimeStatus"];
             hbc_cache?: {
                 [key: string]: unknown;
             };
@@ -9328,11 +9444,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9463,11 +9576,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9641,11 +9751,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -10878,6 +10985,8 @@ export interface components {
         GraphResultNode: {
             /** @description Document key */
             key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
             /** @description Distance from start node */
             depth?: number;
             /**
@@ -10951,8 +11060,38 @@ export interface components {
             retrieved_ids?: string[];
         };
         InferenceError: {
-            /** @description Error message */
+            /** @description Stable machine-readable error code */
             error: string;
+            /** @description Human-readable error description */
+            message?: string;
+            /**
+             * @description Machine-readable capacity source when the failure is retryable
+             * @enum {string}
+             */
+            reason?: "inference_capacity" | "request_queue";
+            /** @description Whether retrying the same request may succeed */
+            retryable?: boolean;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms?: number;
+        };
+        /** @description Actionable retry contract for temporary inference-capacity failures. */
+        InferenceTransientCapacityError: {
+            /** @description Stable machine-readable error code */
+            error: string;
+            /** @description Human-readable error description */
+            message: string;
+            /**
+             * @description Machine-readable capacity source
+             * @enum {string}
+             */
+            reason: "inference_capacity" | "request_queue";
+            /**
+             * @description Always true for a transient-capacity response
+             * @enum {boolean}
+             */
+            retryable: true;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms: number;
         };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
@@ -11072,11 +11211,13 @@ export interface components {
              * @description Pipeline stage that classified the failure
              * @enum {string}
              */
-            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "model_admission" | "inference";
             /** @description Whether retrying the same item may succeed */
             retryable: boolean;
             /** @description HTTP-style status classification for this item */
             status: number;
+            /** @description Minimum retry delay in milliseconds for a retryable transient failure */
+            retry_after_ms?: number | null;
         };
         /** @description Counts for per-item embedding responses */
         InferenceEmbeddingBatchSummary: {
@@ -11713,7 +11854,9 @@ export interface components {
             code: string;
             message: string;
             /** @default false */
-            retryable?: boolean;
+            retryable: boolean;
+            /** @description Minimum retry delay in milliseconds for a retryable capacity failure. */
+            retry_after_ms?: number | null;
         };
         InferenceGenerateBatchResultItem: {
             custom_id: string;
@@ -11929,9 +12072,9 @@ export interface components {
             /**
              * @description How long to keep models loaded in memory after last use (Ollama-compatible).
              *     Models are automatically unloaded after this duration of inactivity.
-             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-             *     Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-             *     where all models are loaded at startup and never unloaded.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+             *     Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+             *     still be evicted under resource pressure or to enforce max_loaded_models.
              * @default 5m
              * @example 5m
              */
@@ -11939,8 +12082,9 @@ export interface components {
             /**
              * @description Maximum total models loaded across all registry types (embedders, rerankers,
              *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
-             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-             * @default 0
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             *     Defaults to 10.
+             * @default 10
              * @example 3
              */
             max_loaded_models?: number;
@@ -12030,9 +12174,8 @@ export interface components {
             max_memory_mb?: number;
             /**
              * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
-             *     Models not in this map use the default strategy based on keep_alive:
-             *     - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-             *     - If keep_alive="0": eager loading (load at startup, never unload)
+             *     Models not in this map load on demand. keep_alive controls their idle
+             *     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
              *
              *     When a model has strategy "eager" in this map:
              *     - It is loaded at startup through the same startup warmup path
@@ -12653,6 +12796,26 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Query failure. Storage integrity failures use a stable non-retryable error payload. */
+        QueryInternalServerError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"] | components["schemas"]["TableStorageUnreadableError"];
+            };
+        };
+        /** @description Inference capacity is temporarily unavailable */
+        TransientCapacity: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["InferenceTransientCapacityError"];
             };
         };
     };
@@ -13380,6 +13543,7 @@ export interface operations {
              * @description Backup attempt completed. Inspect the response `status`: `completed`
              *     is fully successful, while `partial` or `failed` reports per-table
              *     failures even though the request itself was processed successfully.
+             *     Only `completed` publishes a restorable cluster manifest.
              */
             200: {
                 headers: {
@@ -13573,15 +13737,7 @@ export interface operations {
                 };
             };
             422: components["responses"]["UnsupportedExactSort"];
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     evaluate: {
@@ -13857,7 +14013,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["UnsupportedExactSort"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     batchWrite: {
@@ -15983,6 +16139,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chunkText: {
@@ -16025,6 +16182,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankMultimodalPrompts: {
@@ -16076,6 +16234,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankPrompts: {
@@ -16127,15 +16286,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reranking service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateContent: {
@@ -16191,15 +16342,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateBatchContent: {
@@ -16242,15 +16385,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chatCompletions: {
@@ -16306,15 +16441,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rewriteText: {
@@ -16366,15 +16493,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     readImages: {
@@ -16426,15 +16545,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reader service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     transcribeAudio: {
@@ -16486,15 +16597,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Transcription service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     extract: {
@@ -16546,15 +16649,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Extraction service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listModels: {
@@ -16644,6 +16739,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listPredictors: {

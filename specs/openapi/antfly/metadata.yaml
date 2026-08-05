@@ -30,7 +30,7 @@ info:
     ### Developer Experience
     - **Client Libraries**: Auto-generated SDKs for Go, TypeScript, and Python from OpenAPI spec
     - **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing
-    - **MongoDB-Style Transforms**: In-place updates ($inc, $set, $push) without read-modify-write
+    - **MongoDB-Style Transforms**: In-place updates ($inc, $set, $addToSet) without read-modify-write
     - **Linear Merge**: Stateless import of sorted records from external sources
     - **Template Rendering**: Handlebars templates for custom document rendering
     - **Graph Operations**: Declarative queries with traversals and pathfinding
@@ -1433,6 +1433,32 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    TableStorageUnreadableError:
+      type: object
+      additionalProperties: false
+      description: A non-retryable table-storage integrity or format failure.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - table_storage_unreadable
+          description: Stable client-routing code for unreadable table storage.
+        error:
+          type: string
+          description: Concrete storage error class, such as InvalidManifest.
+        message:
+          type: string
+          description: Human-readable summary.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Always false; recovery requires repair, restore, or table replacement.
     ExactSortError:
       type: object
       additionalProperties: false
@@ -3794,6 +3820,35 @@ components:
         wal_retained_bytes:
           type: integer
           format: uint64
+        wal_checkpoint_pending:
+          type: boolean
+          description: Whether WAL checkpoint maintenance is pending.
+        wal_pressure_blocked:
+          type: boolean
+          description: Whether WAL hard-limit admission is currently blocked.
+        wal_checkpoint_retry_reason:
+          type: string
+          description: Representative reason for the earliest pending WAL checkpoint retry.
+        wal_checkpoint_retry_attempts:
+          type: integer
+          format: uint64
+          description: Consecutive failures for the representative WAL checkpoint retry.
+        wal_checkpoint_retry_delay_ns:
+          type: integer
+          format: uint64
+          description: Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+        active_immutable_logical_bytes:
+          type: integer
+          format: uint64
+          description: Logical bytes in immutable memtables awaiting run publication.
+        unpublished_wal_logical_bytes:
+          type: integer
+          format: uint64
+          description: Logical bytes in runs awaiting durable manifest publication.
+        unpublished_wal_max_batch_logical_bytes:
+          type: integer
+          format: uint64
+          description: Largest logical batch awaiting durable manifest publication.
         compaction_backlog_bytes:
           type: integer
           format: uint64
@@ -3976,14 +4031,16 @@ components:
         - $unset
         - $inc
         - $push
-        - $pull
         - $addToSet
-        - $pop
-        - $mul
-        - $min
         - $max
-        - $currentDate
-        - $rename
+      x-enum-varnames:
+        - SET
+        - SET_ON_INSERT
+        - UNSET
+        - INC
+        - PUSH
+        - ADD_TO_SET
+        - MAX
       description: MongoDB-style update operator
     TransformOp:
       type: object
@@ -3998,7 +4055,7 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: "$.views"
         value:
-          description: Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+          description: Value for operation (not required for $unset). Type depends on the supported operator.
 
     Transform:
       type: object
@@ -4031,8 +4088,9 @@ components:
           - op: "$inc"
             path: "$.views"
             value: 1
-          - op: "$currentDate"
+          - op: "$set"
             path: "$.lastViewed"
+            value: "2026-07-28T12:00:00Z"
 
     ScanKeysRequest:
       type: object
@@ -4084,14 +4142,16 @@ components:
             - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
-            Antfly query to filter documents. Only documents matching this query
-            are included in results. Uses the sear library for efficient per-document
-            matching without requiring a full index.
+            Structured subset of the Antfly query AST used to filter a primary-key
+            scan. Only documents matching this query are included in results.
+            Because scans do not open a text index, text-index-only variants such
+            as phrase and multi-match queries are rejected with a validation error
+            instead of being evaluated with slower stored-document semantics.
 
             Examples:
-            - Status filtering: `{"query": "status:published"}`
-            - Date ranges: `{"query": "created_at:>2023-01-01"}`
-            - Field matching: `{"query": "category:technology"}`
+            - Status filtering: `{"term":{"path":"/status","value":"published"}}`
+            - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
+            - Field existence: `{"exists":{"path":"/category"}}`
         limit:
           type: integer
           minimum: 1
@@ -4176,12 +4236,12 @@ components:
             Transform operations allow you to modify documents without read-modify-write races:
             - Operations are applied atomically on the server
             - Multiple operations per document are applied in sequence
-            - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+            - Supports numeric and set-like operations ($inc, $max, $addToSet)
 
             Common use cases:
             - Increment counters (views, likes, votes)
-            - Update timestamps ($currentDate)
-            - Manage arrays (add/remove tags, items)
+            - Update timestamps ($set)
+            - Add unique array values ($addToSet)
             - Update nested fields without overwriting the entire document
           items:
             $ref: "#/components/schemas/Transform"
@@ -4191,11 +4251,12 @@ components:
                 - op: "$inc"
                   path: "$.views"
                   value: 1
-                - op: "$currentDate"
+                - op: "$set"
                   path: "$.lastViewed"
+                  value: "2026-07-28T12:00:00Z"
             - key: "user:456"
               operations:
-                - op: "$push"
+                - op: "$addToSet"
                   path: "$.tags"
                   value: "vip"
         sync_level:
@@ -4739,6 +4800,7 @@ components:
           example: "portable"
         table_names:
           type: array
+          minItems: 1
           maxItems: 256
           uniqueItems: true
           items:
@@ -5585,6 +5647,10 @@ components:
 
         **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
         call, using the queries to determine available tables and indexes.
+
+        Authenticated row filters are enforced on every initial and generated
+        operation in both modes, including scans, aggregates, and graph/tree
+        traversal. They cannot be replaced or weakened by model tool arguments.
       required:
         - query
         - queries
@@ -5603,6 +5669,13 @@ components:
 
             In pipeline mode (max_internal_iterations=0), these are executed directly.
             In agentic mode, these declare which table and indexes are available.
+
+            `filter_query` and `exclusion_query` are mandatory table predicates
+            for retrieval-agent execution. Predicates declared by any query for
+            a table are conjoined (or unioned for exclusions) and applied to
+            every initial query, generated refinement, probe, aggregation,
+            graph/tree traversal, root scan, and follow-up for that table.
+            They cannot be weakened by generated operations.
           example:
             - table: "docs"
               semantic_search: "How do I configure OAuth?"
@@ -5624,11 +5697,13 @@ components:
           items:
             $ref: "generating.yaml#/components/schemas/FilterSpec"
           description: |
-            Pre-applied filters from prior interactions. These are applied to
-            all search tool invocations.
+            Mandatory filters from prior interactions. These are converted to
+            structured Antfly predicates and applied to every table and every
+            search tool invocation, including generated follow-ups, graph/tree
+            traversal, aggregations, and root scans.
         session_id:
           type: string
-          description: Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+          description: Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence.
         decisions:
           type: array
           items:
@@ -6003,12 +6078,12 @@ components:
 
             Boolean clauses are normalized before planning:
             - `bool.must` is scoring query input.
-            - `bool.filter` is a non-scoring structured filter.
-            - `bool.must_not` is a structured exclusion filter.
+            - `bool.filter` is non-scoring query input.
+            - `bool.must_not` is non-scoring exclusion query input.
 
-            The same AST accepts direct structured filters using `field` or JSON-pointer
-            `path`, scalar `term` values, multi-value `terms`, and `exists`.
-            Query-string objects remain supported as a full-text escape hatch.
+            Filter branches accept the same query variants as `filter_query` and
+            `exclusion_query`. Structured clauses use the native document-value
+            path; text clauses are resolved through the text index before scoring.
           example:
             bool:
               must:
@@ -7589,8 +7664,7 @@ components:
         op:
           type: string
           description: |
-            Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-            `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`.
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
             `$delete_document` (delete entire Antfly doc, `on_delete` only).
           example: "$set"
@@ -7670,6 +7744,14 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    QueryInternalServerError:
+      description: Query failure. Storage integrity failures use a stable non-retryable error payload.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
   /status:
@@ -8319,8 +8401,12 @@ paths:
         - Table metadata (schema, indexes, shard configuration)
         - All shard data (compressed with zstd)
 
-        The backup creates a cluster-level manifest that tracks all included tables
-        and their individual backup locations.
+        A non-empty backup publishes a cluster-level manifest only after every
+        requested table backup is durable. The manifest is the final commit
+        point and records complete expected/completed table counts. A `partial`
+        or `failed` attempt returns per-table diagnostics but does not publish a
+        restorable aggregate manifest. A cluster with no selected tables returns
+        `400` without writing a backup artifact.
 
         Backup IDs are immutable. Reusing an ID that already has a published
         cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -8348,6 +8434,7 @@ paths:
             Backup attempt completed. Inspect the response `status`: `completed`
             is fully successful, while `partial` or `failed` reports per-table
             failures even though the request itself was processed successfully.
+            Only `completed` publishes a restorable cluster manifest.
           content:
             application/json:
               schema:
@@ -8643,11 +8730,7 @@ paths:
         "422":
           $ref: "#/components/responses/UnsupportedExactSort"
         "500":
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/QueryInternalServerError"
   /eval:
     post:
       summary: Standalone evaluation endpoint
@@ -9031,7 +9114,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "500":
-          $ref: "#/components/responses/InternalServerError"
+          $ref: "#/components/responses/QueryInternalServerError"
   /tables/{tableName}/batch:
     parameters:
       - name: tableName

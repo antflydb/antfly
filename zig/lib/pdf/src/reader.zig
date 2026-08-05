@@ -1546,7 +1546,7 @@ pub const Reader = struct {
         return try decodeStreamFiltersAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"));
     }
 
-    pub fn pageCount(self: *const Reader) !usize {
+    pub fn pageCount(self: *Reader) !usize {
         try self.ensurePageIndex();
         return self.page_index.?.len;
     }
@@ -1555,7 +1555,7 @@ pub const Reader = struct {
         return self.bytes;
     }
 
-    pub fn readPageObject(self: *const Reader, page_num: usize) !syntax.Object {
+    pub fn readPageObject(self: *Reader, page_num: usize) !syntax.Object {
         if (page_num == 0) return error.PageOutOfRange;
         try self.ensurePageIndex();
         const pages = self.page_index.?;
@@ -1563,7 +1563,7 @@ pub const Reader = struct {
         return try pages[page_num - 1].clone(self.alloc);
     }
 
-    pub fn extractPageTextAlloc(self: *const Reader, page_num: usize) ![]u8 {
+    pub fn extractPageTextAlloc(self: *Reader, page_num: usize) ![]u8 {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1585,7 +1585,7 @@ pub const Reader = struct {
     /// Extracts canonical page text and positioned text runs while sharing the
     /// page object, resource collection, content stream resolution, and stream
     /// decoding work between both representations.
-    pub fn extractPageTextAnalysisAlloc(self: *const Reader, page_num: usize) !PageTextAnalysis {
+    pub fn extractPageTextAnalysisAlloc(self: *Reader, page_num: usize) !PageTextAnalysis {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1615,7 +1615,7 @@ pub const Reader = struct {
         return analysis;
     }
 
-    pub fn extractPageTextRunsAlloc(self: *const Reader, page_num: usize) ![]TextRun {
+    pub fn extractPageTextRunsAlloc(self: *Reader, page_num: usize) ![]TextRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1639,7 +1639,7 @@ pub const Reader = struct {
         return try self.extractContentsTextRunsAlloc(contents, fonts, gstates, forms);
     }
 
-    pub fn extractPageImageRunsAlloc(self: *const Reader, page_num: usize) ![]ImageRun {
+    pub fn extractPageImageRunsAlloc(self: *Reader, page_num: usize) ![]ImageRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1663,7 +1663,7 @@ pub const Reader = struct {
         return try self.extractContentsImageRunsAlloc(contents, images, gstates, forms);
     }
 
-    pub fn extractPageShadingRunsAlloc(self: *const Reader, page_num: usize) ![]ShadingRun {
+    pub fn extractPageShadingRunsAlloc(self: *Reader, page_num: usize) ![]ShadingRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1687,7 +1687,7 @@ pub const Reader = struct {
         return try self.extractContentsShadingRunsAlloc(contents, shadings, gstates, forms);
     }
 
-    pub fn extractPagePatternRunsAlloc(self: *const Reader, page_num: usize) ![]PatternRun {
+    pub fn extractPagePatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1711,7 +1711,7 @@ pub const Reader = struct {
         return try self.extractContentsPatternRunsAlloc(contents, patterns, gstates, forms);
     }
 
-    pub fn extractPageRenderRunsAlloc(self: *const Reader, page_num: usize) !PageRenderRuns {
+    pub fn extractPageRenderRunsAlloc(self: *Reader, page_num: usize) !PageRenderRuns {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         const page_box = try self.extractPageBoxFromObject(&page);
@@ -1797,13 +1797,13 @@ pub const Reader = struct {
         return result;
     }
 
-    pub fn extractPageBox(self: *const Reader, page_num: usize) !PageBox {
+    pub fn extractPageBox(self: *Reader, page_num: usize) !PageBox {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         return try self.extractPageBoxFromObject(&page);
     }
 
-    pub fn extractPageRotation(self: *const Reader, page_num: usize) !?i32 {
+    pub fn extractPageRotation(self: *Reader, page_num: usize) !?i32 {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         if (try self.findInheritedPageValue(&page, "Rotate")) |rotation_value| {
@@ -1829,7 +1829,7 @@ pub const Reader = struct {
         return .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 };
     }
 
-    pub fn extractPageShapeRunsAlloc(self: *const Reader, page_num: usize) ![]ShapeRun {
+    pub fn extractPageShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         const gstates = try self.collectPageExtGStatesAlloc(&page);
@@ -1846,11 +1846,11 @@ pub const Reader = struct {
         return try self.extractContentsShapeRunsAlloc(contents, gstates, forms);
     }
 
-    pub fn extractPageType3TextShapeRunsAlloc(self: *const Reader, page_num: usize) ![]ShapeRun {
+    pub fn extractPageType3TextShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
         return try self.extractPageVectorTextShapeRunsAlloc(page_num);
     }
 
-    pub fn extractPageVectorTextShapeRunsAlloc(self: *const Reader, page_num: usize) ![]ShapeRun {
+    pub fn extractPageVectorTextShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -1893,7 +1893,7 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    pub fn extractPageVectorTextPatternRunsAlloc(self: *const Reader, page_num: usize) ![]PatternRun {
+    pub fn extractPageVectorTextPatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2026,7 +2026,7 @@ pub const Reader = struct {
         }
     }
 
-    pub fn extractPlainTextAlloc(self: *const Reader) ![]u8 {
+    pub fn extractPlainTextAlloc(self: *Reader) ![]u8 {
         const count = try self.pageCount();
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
@@ -2213,9 +2213,8 @@ pub const Reader = struct {
         };
     }
 
-    fn ensurePageIndex(self: *const Reader) !void {
-        const mutable = @constCast(self);
-        if (mutable.page_index != null) return;
+    fn ensurePageIndex(self: *Reader) !void {
+        if (self.page_index != null) return;
 
         var root = try self.resolveValue(self.trailerGet("Root") orelse return error.MissingRoot);
         defer root.deinit(self.alloc);
@@ -2228,7 +2227,7 @@ pub const Reader = struct {
         defer guard.deinit(self.alloc);
         try self.appendPageTreeLeaves(&pages, pages_obj, 0, &guard);
         if (pages.items.len == 0) return error.EmptyPdfPageTree;
-        mutable.page_index = try pages.toOwnedSlice(self.alloc);
+        self.page_index = try pages.toOwnedSlice(self.alloc);
     }
 
     fn appendPageTreeLeaves(self: *const Reader, out: *std.ArrayList(syntax.Object), node_obj: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {

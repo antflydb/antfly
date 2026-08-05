@@ -17,6 +17,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,10 +31,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/snapstore"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
 	"github.com/blevesearch/bleve/v2"
@@ -64,8 +68,8 @@ type MockShard struct {
 	raftNode *MockRaftNode // Add this if Shard methods interact with raftNode directly
 }
 
-func (m *MockShard) Backup(ctx context.Context, location, backupID string) error {
-	args := m.Called(ctx, location, backupID)
+func (m *MockShard) Backup(ctx context.Context, backup common.BackupConfig) error {
+	args := m.Called(ctx, backup.Location, backup.BackupID)
 	return args.Error(0)
 }
 
@@ -407,7 +411,7 @@ func TestHandleBackup_FileLocation_Success(t *testing.T) {
 	// fullBackupFilePath := filepath.Join(tempDir, expectedBackupFileName)
 
 	// Simulate the backup file being created by the Shard.Backup method
-	mockShard.On("Backup", mock.Anything, backupLocation, fmt.Sprintf("%s-%s", backupID, shardID)).
+	mockShard.On("Backup", mock.Anything, "", fmt.Sprintf("%s-%s", backupID, shardID)).
 		Return(nil).
 		Run(func(args mock.Arguments) {
 			snapDir := common.SnapDir(baseDir, shardID, mockStore.ID())
@@ -501,11 +505,22 @@ func TestHandleBackup_DefaultsToPortable(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Equal(t, "attachment; filename="+common.ShardPortableBackupFileName(backupID, shardID), rr.Header().Get("Content-Disposition"))
 	assert.Equal(t, "portable backup data", rr.Body.String())
+	assert.Equal(t, common.ShardPortableBackupFileName(backupID, shardID), rr.Header().Get(common.BackupArtifactNameHeader))
+	assert.Equal(t, strconv.Itoa(len("portable backup data")), rr.Header().Get(common.BackupArtifactSizeHeader))
+	assert.Equal(
+		t,
+		"789146fe47e143e9e33e1d83942d0d019baf0f6a4465df201892035461cd1550",
+		rr.Header().Get(common.BackupArtifactSHA256Header),
+	)
 
-	expectedPath := filepath.Join(tempDir, common.ShardPortableBackupFileName(backupID, shardID))
-	content, err := os.ReadFile(expectedPath)
+	// The store streams from a temporary durable file. The coordinator owns
+	// publication into the authorized destination and the store must not retain
+	// a second copy after the response completes.
+	entries, err := os.ReadDir(common.SnapDir(baseDir, shardID, mockStore.ID()))
 	require.NoError(t, err)
-	assert.Equal(t, "portable backup data", string(content))
+	require.Empty(t, entries)
+	_, err = os.Stat(filepath.Join(tempDir, common.ShardPortableBackupFileName(backupID, shardID)))
+	require.ErrorIs(t, err, os.ErrNotExist)
 
 	mockShard.AssertExpectations(t)
 	mockStore.AssertExpectations(t)
@@ -603,7 +618,7 @@ func TestHandleBackup_ShardBackupFails(t *testing.T) {
 	backupLocation := "file://" + tempDir
 
 	mockStore.On("Shard", shardID).Return(mockShard, true)
-	mockShard.On("Backup", mock.Anything, backupLocation, fmt.Sprintf("%s-%s", backupID, shardID)).
+	mockShard.On("Backup", mock.Anything, "", fmt.Sprintf("%s-%s", backupID, shardID)).
 		Return(errors.New("shard backup failed"))
 
 	backupReq := common.BackupConfig{
@@ -646,7 +661,7 @@ func TestHandleBackup_FileLocation_BackupFileNotCreated(t *testing.T) {
 	backupLocation := "file://" + tempDir
 
 	// Simulate Shard.Backup succeeding but somehow not creating the file (or it gets deleted)
-	mockShard.On("Backup", mock.Anything, backupLocation, fmt.Sprintf("%s-%s", backupID, shardID)).
+	mockShard.On("Backup", mock.Anything, "", fmt.Sprintf("%s-%s", backupID, shardID)).
 		Return(nil)
 	mockStore.On("Shard", shardID).Return(mockShard, true)
 
@@ -740,10 +755,19 @@ func setupStoreAPI(t *testing.T, storeNodeID types.ID) (http.Handler, *MockStore
 	logger := zaptest.NewLogger(t)
 	mockStore := &MockStore{logger: logger, nodeID: storeNodeID}
 	baseDir := t.TempDir()
+	var filesystemConnection common.ConnectionConfig
+	require.NoError(t, filesystemConnection.UnmarshalJSON([]byte(fmt.Sprintf(`{
+		"kind":"external_io",
+		"capabilities":["backup.write","restore.read"],
+		"external_io":{"protocol":"filesystem","root":%q}
+	}`, baseDir))))
 	api := &StoreAPI{
 		logger: logger,
 		store:  mockStore,
 		antflyConfig: &common.Config{
+			Connections: map[string]common.ConnectionConfig{
+				"filesystem": filesystemConnection,
+			},
 			Storage: common.StorageConfig{
 				Local: common.LocalStorageConfig{
 					BaseDir: baseDir,
@@ -987,8 +1011,11 @@ func TestHandleStartShard_Success_Multipart_WithFile(t *testing.T) {
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			ByteRange:     types.Range{[]byte("e"), []byte("f")},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID},
+			ByteRange: types.Range{[]byte("e"), []byte("f")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Format:   common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 3}},
 	}
@@ -1031,11 +1058,313 @@ func TestHandleStartShard_Success_Multipart_WithFile(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
-func TestHandleStartShard_Failure_RestoreConfig_S3_CannotCreateClientOrDownloadFails(t *testing.T) {
+func TestHandleStartShard_MultipartRejectsFilenameFormatMismatch(t *testing.T) {
+	api, mockStore, baseDir := setupStoreAPI(t, types.ID(1))
+	newShardID := types.ID(0x301)
+	backupID := "native-declaration"
+	portableFileName := common.ShardPortableBackupFileName(backupID, newShardID)
+	startReq := ShardStartRequest{
+		ShardConfig: ShardConfig{
+			ByteRange: types.Range{[]byte("e"), []byte("f")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Format:   common.BackupFormatNative,
+			},
+		},
+		Peers: []common.Peer{{ID: 3}},
+	}
+	payloadBytes, err := json.Marshal(startReq)
+	require.NoError(t, err)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("payload", string(payloadBytes)))
+	fileWriter, err := writer.CreateFormFile("backup_file", portableFileName)
+	require.NoError(t, err)
+	_, err = fileWriter.Write([]byte("unverified portable payload"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	mockStore.On("Shard", newShardID).Return(nil, false)
+	req := httptest.NewRequest(http.MethodPost, "/shard", &body)
+	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, req)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "does not match canonical native backup file")
+	mockStore.AssertNotCalled(t, "StartRaftGroup")
+	require.NoFileExists(t, filepath.Join(
+		common.SnapDir(baseDir, newShardID, mockStore.ID()),
+		portableFileName,
+	))
+	mockStore.AssertExpectations(t)
+}
+
+func TestHandleStartShard_PortableMultipartVerifiesArtifactIntegrity(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		corrupt    bool
+		statusCode int
+	}{
+		{name: "valid", statusCode: http.StatusOK},
+		{name: "corrupt", corrupt: true, statusCode: http.StatusInternalServerError},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			api, mockStore, baseDir := setupStoreAPI(t, types.ID(1))
+			newShardID := types.ID(0x302)
+			backupID := "portable-backup"
+			fileName := common.ShardPortableBackupFileName(backupID, newShardID)
+			payload := []byte("portable backup data")
+			digest := sha256.Sum256(payload)
+			declaredDigest := digest
+			if testCase.corrupt {
+				declaredDigest[0] ^= 0xff
+			}
+			startReq := ShardStartRequest{
+				ShardConfig: ShardConfig{
+					ByteRange: types.Range{[]byte("e"), []byte("f")},
+					RestoreConfig: &common.BackupConfig{
+						BackupID: backupID,
+						Format:   common.BackupFormatPortable,
+						Artifact: &common.BackupArtifactIntegrity{
+							Name:      fileName,
+							SizeBytes: uint64(len(payload)),
+							SHA256:    hex.EncodeToString(declaredDigest[:]),
+						},
+					},
+				},
+				Peers: []common.Peer{{ID: 3}},
+			}
+			payloadBytes, err := json.Marshal(startReq)
+			require.NoError(t, err)
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("payload", string(payloadBytes)))
+			fileWriter, err := writer.CreateFormFile("backup_file", fileName)
+			require.NoError(t, err)
+			_, err = fileWriter.Write(payload)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+
+			mockStore.On("Shard", newShardID).Return(nil, false)
+			var started <-chan struct{}
+			if !testCase.corrupt {
+				signal := signalOnCall(mockStore.On(
+					"StartRaftGroup",
+					newShardID,
+					startReq.Peers,
+					startReq.Join,
+					mock.MatchedBy(func(config *ShardStartConfig) bool {
+						return config.InitWithDBArchive == fileName
+					}),
+				).Return())
+				started = signal
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/shard", &body)
+			req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, req)
+			require.Equal(t, testCase.statusCode, response.Code)
+			if started != nil {
+				<-started
+				require.FileExists(t, filepath.Join(
+					common.SnapDir(baseDir, newShardID, mockStore.ID()),
+					fileName,
+				))
+			} else {
+				mockStore.AssertNotCalled(t, "StartRaftGroup")
+			}
+			mockStore.AssertExpectations(t)
+		})
+	}
+}
+
+func TestDownloadFromS3VerifiesBeforeAtomicPublication(t *testing.T) {
+	validBody := []byte("portable-artifact")
+	corruptBody := append([]byte(nil), validBody...)
+	corruptBody[0] ^= 0xff
+	currentBody := validBody
+	digest := sha256.Sum256(validBody)
+	artifact := &common.BackupArtifactIntegrity{
+		Name:      "backup-1-1.afb",
+		SizeBytes: uint64(len(validBody)),
+		SHA256:    hex.EncodeToString(digest[:]),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bucket" || r.URL.Path == "/bucket/" {
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(
+				`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint></LocationConstraint>`,
+			))
+			return
+		}
+		if r.URL.Path != "/bucket/backups/"+artifact.Name {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"artifact-etag"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(currentBody)))
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		switch r.Method {
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.Header.Get("If-Match") != `"artifact-etag"` {
+				http.Error(w, "missing object identity precondition", http.StatusPreconditionFailed)
+				return
+			}
+			_, _ = w.Write(currentBody)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	s3Info := &common.S3Info{
+		Endpoint:           server.URL,
+		Bucket:             "bucket",
+		Prefix:             "backups",
+		AddressingStyle:    common.S3ExternalIoConfigAddressingStylePath,
+		CredentialSource:   common.AwsCredentialConfigSourceStatic,
+		AccessKeyId:        "access",
+		SecretAccessKey:    "secret",
+		BucketProvisioning: common.S3ExternalIoConfigBucketProvisioningRequireExisting,
+	}
+	destPath := filepath.Join(t.TempDir(), artifact.Name)
+	require.NoError(t, downloadFromS3(
+		context.Background(),
+		zaptest.NewLogger(t),
+		artifact.Name,
+		destPath,
+		s3Info,
+		artifact,
+	))
+	require.FileExists(t, destPath)
+	published, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, validBody, published)
+
+	currentBody = corruptBody
+	require.ErrorIs(t, downloadFromS3(
+		context.Background(),
+		zaptest.NewLogger(t),
+		artifact.Name,
+		destPath,
+		s3Info,
+		artifact,
+	), common.ErrBackupArtifactIntegrityMismatch)
+	published, err = os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, validBody, published)
+}
+
+func TestOpenLocalRestoreArtifactIsRootedAndDescriptorValidated(t *testing.T) {
+	root := t.TempDir()
+	const artifactName = "backup-1-1.afb"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifactName),
+		[]byte("portable artifact"),
+		0o600,
+	))
+	restoreRoot, err := os.OpenRoot(root)
+	require.NoError(t, err)
+	defer func() { _ = restoreRoot.Close() }()
+	file, err := openLocalRestoreArtifact(restoreRoot, artifactName)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	for _, invalidName := range []string{
+		"../" + artifactName,
+		"nested/" + artifactName,
+		`nested\` + artifactName,
+		filepath.Join(string(filepath.Separator), artifactName),
+	} {
+		file, err = openLocalRestoreArtifact(restoreRoot, invalidName)
+		require.Nil(t, file)
+		require.Error(t, err)
+	}
+
+	outside := filepath.Join(t.TempDir(), artifactName)
+	require.NoError(t, os.WriteFile(outside, []byte("outside artifact"), 0o600))
+	require.NoError(t, os.Remove(filepath.Join(root, artifactName)))
+	if err := os.Symlink(outside, filepath.Join(root, artifactName)); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	file, err = openLocalRestoreArtifact(restoreRoot, artifactName)
+	if file != nil {
+		_ = file.Close()
+	}
+	require.Error(t, err)
+}
+
+func TestCopyLocalBackupToSnapDirVerifiesBeforePublishing(t *testing.T) {
+	const backupID = "portable-local"
+	shardID := types.ID(0x302)
+	nodeID := types.ID(1)
+	sourceDir := t.TempDir()
+	payload := []byte("portable local backup")
+	fileName := common.ShardPortableBackupFileName(backupID, shardID)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sourceDir, fileName),
+		payload,
+		0o600,
+	))
+	digest := sha256.Sum256(payload)
+	config := &common.BackupConfig{
+		BackupID: backupID,
+		Format:   common.BackupFormatPortable,
+		Artifact: &common.BackupArtifactIntegrity{
+			Name:      fileName,
+			SizeBytes: uint64(len(payload)),
+			SHA256:    hex.EncodeToString(digest[:]),
+		},
+	}
+	snapStore, err := snapstore.NewLocalSnapStore(t.TempDir(), shardID, nodeID)
+	require.NoError(t, err)
+
+	archiveName, err := copyLocalBackupToSnapDir(
+		context.Background(),
+		zaptest.NewLogger(t),
+		snapStore,
+		shardID,
+		sourceDir,
+		config,
+	)
+	require.NoError(t, err)
+	require.Equal(t, fileName, archiveName)
+	stored, err := snapStore.Get(context.Background(), fileName)
+	require.NoError(t, err)
+	defer func() { _ = stored.Close() }()
+	storedPayload, err := io.ReadAll(stored)
+	require.NoError(t, err)
+	require.Equal(t, payload, storedPayload)
+
+	corruptStore, err := snapstore.NewLocalSnapStore(t.TempDir(), shardID, nodeID)
+	require.NoError(t, err)
+	corruptConfig := *config
+	corruptArtifact := *config.Artifact
+	corruptArtifact.SHA256 = strings.Repeat("0", sha256.Size*2)
+	corruptConfig.Artifact = &corruptArtifact
+	_, err = copyLocalBackupToSnapDir(
+		context.Background(),
+		zaptest.NewLogger(t),
+		corruptStore,
+		shardID,
+		sourceDir,
+		&corruptConfig,
+	)
+	require.ErrorIs(t, err, common.ErrBackupArtifactIntegrityMismatch)
+	exists, err := corruptStore.Exists(context.Background(), fileName)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+func TestHandleStartShard_RejectsS3RestoreWithoutAuthorizedConnection(t *testing.T) {
 	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
 	newShardID := types.ID(103)
 	backupID := "s3backup"
-	// Using a clearly invalid hostname to ensure NewMinioClient or FGetObject fails.
 	s3BucketURL := "s3://invalid-s3-endpoint-for-test.localdomain"
 	restoreLocation := s3BucketURL + "/backups"
 
@@ -1045,8 +1374,12 @@ func TestHandleStartShard_Failure_RestoreConfig_S3_CannotCreateClientOrDownloadF
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			ByteRange:     types.Range{[]byte("g"), []byte("h")},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID, Location: restoreLocation},
+			ByteRange: types.Range{[]byte("g"), []byte("h")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Location: restoreLocation,
+				Format:   common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 4}},
 	}
@@ -1063,11 +1396,12 @@ func TestHandleStartShard_Failure_RestoreConfig_S3_CannotCreateClientOrDownloadF
 
 	assert.Equal(
 		t,
-		http.StatusInternalServerError,
+		http.StatusBadRequest,
 		rr.Code,
-		"Expected server error due to S3 download failure",
+		"Expected an unauthorized S3 location to fail before network access",
 	)
-	assert.Contains(t, rr.Body.String(), "downloading s3 backup")
+	assert.Contains(t, rr.Body.String(), "authorizing S3 restore")
+	assert.Contains(t, rr.Body.String(), "connection is required")
 	mockStore.AssertNotCalled(
 		t,
 		"StartRaftGroup",
@@ -1076,6 +1410,36 @@ func TestHandleStartShard_Failure_RestoreConfig_S3_CannotCreateClientOrDownloadF
 		mock.Anything,
 		mock.Anything,
 	)
+	mockStore.AssertExpectations(t)
+}
+
+func TestHandleStartShard_RejectsLocalRestoreWithoutNamedConnection(t *testing.T) {
+	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
+	newShardID := types.ID(0x103)
+	startReq := ShardStartRequest{
+		ShardConfig: ShardConfig{
+			ByteRange: types.Range{[]byte("g"), []byte("h")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: "local-backup",
+				Location: "file:///backups",
+				Format:   common.BackupFormatNative,
+			},
+		},
+		Peers: []common.Peer{{ID: 4}},
+	}
+	body, err := json.Marshal(startReq)
+	require.NoError(t, err)
+	mockStore.On("Shard", newShardID).Return(nil, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/shard", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, req)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "named filesystem connection")
+	mockStore.AssertNotCalled(t, "StartRaftGroup")
 	mockStore.AssertExpectations(t)
 }
 
@@ -1094,14 +1458,19 @@ func TestHandleStartShard_Success_RestoreConfig_File(t *testing.T) {
 	err = os.WriteFile(srcBackupFilePath, []byte("local backup data"), 0o644)
 	require.NoError(t, err)
 
-	restoreLocation := "file://" + srcBackupDir
+	restoreLocation := "file:///restore-source-root/source_backups"
 
 	snapDir := common.SnapDir(baseDir, newShardID, mockStore.ID())
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			ByteRange:     types.Range{[]byte("i"), []byte("j")},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID, Location: restoreLocation},
+			ByteRange: types.Range{[]byte("i"), []byte("j")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID:   backupID,
+				Connection: "filesystem",
+				Location:   restoreLocation,
+				Format:     common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 5}},
 	}
@@ -1337,31 +1706,29 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 	newShardID := types.ID(204)
 	backupID := "filenotfoundbackup"
 
-	nonExistentSrcDir := filepath.Join(baseDir, "non_existent_source_backups")
-	restoreLocation := "file://" + nonExistentSrcDir
-	expectedArchiveName := fmt.Sprintf("%s-%s.tar.zst", backupID, newShardID)
+	require.NoError(t, os.Mkdir(
+		filepath.Join(baseDir, "non_existent_source_backups"),
+		0o750,
+	))
+	restoreLocation := "file:///non_existent_source_backups"
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
 			ByteRange: types.Range{[]byte("o"), []byte("p")},
 			// FIXME (ajr) Why doesn't the below line work with the DeepEqual of assert.ObjectsAreEqual?
 			// ByteRange:     types.Range{[]byte{0x00}, []byte{0xFF}},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID, Location: restoreLocation},
+			RestoreConfig: &common.BackupConfig{
+				BackupID:   backupID,
+				Connection: "filesystem",
+				Location:   restoreLocation,
+				Format:     common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 1}},
 	}
 	jsonBody, _ := json.Marshal(startReq)
 
 	mockStore.On("Shard", newShardID).Return(nil, false)
-	started := signalOnCall(mockStore.On("StartRaftGroup", newShardID, startReq.Peers, startReq.Join, mock.MatchedBy(func(ssc *ShardStartConfig) bool {
-		snapDir := common.SnapDir(baseDir, newShardID, mockStore.ID())
-		destPath := filepath.Join(snapDir, expectedArchiveName)
-		_, statErr := os.Stat(destPath)
-		assert.Error(t, statErr, "Backup file should NOT have been copied as source doesn't exist")
-		return ssc.InitWithDBArchive == "" &&
-			assert.ObjectsAreEqual(ssc.ShardConfig, startReq.ShardConfig)
-	})).
-		Return())
 
 	req := httptest.NewRequest(http.MethodPost, "/shard", bytes.NewReader(jsonBody))
 	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
@@ -1370,8 +1737,16 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	api.ServeHTTP(rr, req)
 
-	assert.Equal(t, http.StatusOK, rr.Code) // Handler proceeds with warning, Pebble will fail later
-	<-started
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Contains(t, rr.Body.String(), "local restore artifact")
+	mockStore.AssertNotCalled(
+		t,
+		"StartRaftGroup",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	)
 	mockStore.AssertExpectations(t)
 }
 
@@ -1389,7 +1764,10 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			RestoreConfig: &common.BackupConfig{BackupID: backupID},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Format:   common.BackupFormatNative,
+			},
 		},
 	}
 	payloadBytes, _ := json.Marshal(startReq)
@@ -1397,7 +1775,10 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 	var reqBodyBuf bytes.Buffer
 	writer := multipart.NewWriter(&reqBodyBuf)
 	writer.WriteField("payload", string(payloadBytes))
-	_, err = writer.CreateFormFile("backup_file", "backup_snap_fail-205.tar.zst")
+	_, err = writer.CreateFormFile(
+		"backup_file",
+		common.ShardBackupFileName(backupID, newShardID),
+	)
 	require.NoError(t, err)
 	err = writer.Close()
 	require.NoError(t, err)
@@ -1412,7 +1793,7 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 	api.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusInternalServerError, rr.Code)
-	assert.Contains(t, rr.Body.String(), "creating snapshot directory")
+	assert.Contains(t, rr.Body.String(), "creating restore directory")
 	mockStore.AssertNotCalled(
 		t,
 		"StartRaftGroup",
@@ -1498,7 +1879,9 @@ func TestHandleBackup_AllowsConfiguredLocalBackupDir(t *testing.T) {
 	mockStore.On("Shard", shardID).Return(mockShard, true)
 	mockShard.On("Backup", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		backupName := args.String(2) + ".tar.zst"
-		require.NoError(t, os.WriteFile(filepath.Join(allowedDir, backupName), []byte("backup"), 0o600))
+		snapDir := common.SnapDir(baseDir, shardID, mockStore.ID())
+		require.NoError(t, os.MkdirAll(snapDir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(snapDir, backupName), []byte("backup"), 0o600))
 	}).Return(nil)
 
 	body, err := json.Marshal(common.BackupConfig{BackupID: "safe-id", Location: "file://" + allowedDir, Format: common.BackupFormatNative})

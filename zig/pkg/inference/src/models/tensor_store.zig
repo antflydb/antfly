@@ -338,6 +338,7 @@ pub const GgufStore = struct {
 
         var parsed = try gguf_mod.format.parse(allocator, mmap_region.data);
         errdefer parsed.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&parsed, mmap_region.data.len);
 
         // Mark the tensor data region as random-access to prevent kernel
         // readahead from faulting the entire file into RAM. Header/metadata
@@ -367,6 +368,7 @@ pub const GgufStore = struct {
 
         var parsed = try gguf_mod.format.parse(allocator, owned_bytes);
         errdefer parsed.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&parsed, owned_bytes.len);
 
         self.* = .{
             .allocator = allocator,
@@ -1084,19 +1086,14 @@ pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.Mod
         const store = try CompositeGlinerStore.initAbsolute(allocator, manifest.gguf_path.?, head_path, manifest.gliner_head_gguf_path != null);
         return store.tensorStore();
     }
-    if (manifest.safetensors_path) |path| {
-        const store = try SafetensorsStore.initAbsolute(allocator, path);
-        return store.tensorStore();
-    }
-    if (manifest.safetensors_index_path) |path| {
-        const store = try ShardedSafetensorsStore.initAbsolute(allocator, path);
-        return store.tensorStore();
-    }
-    if (manifest.gguf_path) |path| {
-        const store = try GgufStore.initAbsolute(allocator, path);
-        return store.tensorStore();
-    }
-    return error.NoTensorStoreFound;
+    return switch (manifest.nativeWeightArtifactKind() orelse return error.NoTensorStoreFound) {
+        .gguf => (try GgufStore.initAbsolute(allocator, manifest.gguf_path.?)).tensorStore(),
+        .safetensors => (try SafetensorsStore.initAbsolute(allocator, manifest.safetensors_path.?)).tensorStore(),
+        .sharded_safetensors => (try ShardedSafetensorsStore.initAbsolute(
+            allocator,
+            manifest.safetensors_index_path.?,
+        )).tensorStore(),
+    };
 }
 
 test "open sharded safetensors tensor store from manifest" {
@@ -1187,15 +1184,22 @@ test "safetensors tensor store preserves f16 dtype" {
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = file.items });
+    const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "export.gguf" });
+    defer allocator.free(gguf_path);
+    // A default export is colocated with its safetensors source. Keep this
+    // deliberately invalid so the test proves the runtime never opens it.
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = "stale export" });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
         .safetensors_path = try allocator.dupe(u8, path),
+        .gguf_path = try allocator.dupe(u8, gguf_path),
     };
     defer manifest.deinit();
 
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
+    try std.testing.expectEqual(StoreKind.safetensors, store.kind());
 
     var tensor_ref = try store.describeTensor(allocator, "weights");
     defer tensor_ref.deinit(allocator);
@@ -1274,7 +1278,10 @@ test "open gguf tensor store from manifest" {
     defer allocator.free(path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data.items });
 
-    var manifest = manifest_mod.ModelManifest{ .allocator = allocator, .gguf_path = try allocator.dupe(u8, path) };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, path),
+    };
     defer manifest.deinit();
 
     const store = try openFromManifest(allocator, manifest);

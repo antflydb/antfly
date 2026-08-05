@@ -26,7 +26,8 @@ const platform_time = @import("antfly_platform").time;
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
 const checkpoint_file_name = "derived_apply.checkpoint";
 const checkpoint_magic = "AFPRJCP1";
-const projection_checkpoint_format_version: u32 = 1;
+const projection_checkpoint_format_version: u32 = 2;
+const checkpoint_checksum_len: usize = @sizeOf(u32);
 const checkpoint_max_bytes: usize = 16 * 1024 * 1024;
 
 const checkpoint_lock_alloc = std.heap.page_allocator;
@@ -155,13 +156,14 @@ pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const
 
 pub fn loadAppliedSequenceWithCheckpoint(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !u64 {
     if (comptime builtin.os.tag == .freestanding) return try loadAppliedSequence(alloc, store, index_name);
     const path = checkpoint_path orelse return try loadAppliedSequence(alloc, store, index_name);
-    const checkpoint = loadProjectionCheckpoint(alloc, path, index_name) catch |err| switch (err) {
+    const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
@@ -170,6 +172,7 @@ pub fn loadAppliedSequenceWithCheckpoint(
 
 pub fn loadProjectionCheckpointWithSidecar(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
@@ -178,7 +181,7 @@ pub fn loadProjectionCheckpointWithSidecar(
         return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
     }
     const path = checkpoint_path orelse return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
-    const checkpoint = loadProjectionCheckpoint(alloc, path, index_name) catch |err| switch (err) {
+    const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -219,6 +222,7 @@ pub fn saveAppliedSequences(store: anytype, updates: []const AppliedSequenceUpda
 
 pub fn saveAppliedSequenceWithCheckpoint(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
@@ -226,7 +230,7 @@ pub fn saveAppliedSequenceWithCheckpoint(
 ) !void {
     if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, sequence);
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, path, &[_]AppliedSequenceUpdate{.{
+        try setAppliedSequencesCheckpoint(alloc, io, path, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = sequence,
         }});
@@ -237,13 +241,14 @@ pub fn saveAppliedSequenceWithCheckpoint(
 
 pub fn saveAppliedSequenceUpdateWithCheckpoint(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     update: AppliedSequenceUpdate,
 ) !void {
     if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, update.index_name, update.sequence);
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, path, &[_]AppliedSequenceUpdate{update});
+        try setAppliedSequencesCheckpoint(alloc, io, path, &[_]AppliedSequenceUpdate{update});
         return;
     }
     try saveAppliedSequence(store, update.index_name, update.sequence);
@@ -251,6 +256,7 @@ pub fn saveAppliedSequenceUpdateWithCheckpoint(
 
 pub fn saveProjectionCheckpointWithSidecar(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
@@ -258,7 +264,7 @@ pub fn saveProjectionCheckpointWithSidecar(
 ) !void {
     if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
     if (checkpoint_path) |path| {
-        try setProjectionCheckpoints(alloc, path, &[_]AppliedSequenceUpdate{.{
+        try setProjectionCheckpoints(alloc, io, path, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = checkpoint.applied_sequence,
             .status = checkpoint.status,
@@ -272,6 +278,7 @@ pub fn saveProjectionCheckpointWithSidecar(
 
 pub fn saveAppliedSequencesWithCheckpoint(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     updates: []const AppliedSequenceUpdate,
@@ -279,7 +286,7 @@ pub fn saveAppliedSequencesWithCheckpoint(
     if (updates.len == 0) return;
     if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequences(store, updates);
     if (checkpoint_path) |path| {
-        try saveAppliedSequencesCheckpoint(alloc, path, updates);
+        try saveAppliedSequencesCheckpoint(alloc, io, path, updates);
         return;
     }
     try saveAppliedSequences(store, updates);
@@ -296,13 +303,14 @@ pub fn clearAppliedSequence(store: anytype, index_name: []const u8) !void {
 
 pub fn clearAppliedSequenceWithCheckpoint(
     alloc: Allocator,
+    io: std.Io,
     store: anytype,
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !void {
     if (comptime builtin.os.tag == .freestanding) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
-        try clearAppliedSequenceCheckpoint(alloc, path, index_name);
+        try clearAppliedSequenceCheckpoint(alloc, io, path, index_name);
         return;
     }
     try clearAppliedSequence(store, index_name);
@@ -456,34 +464,32 @@ fn mergeSequenceMetadata(checkpoint: *ProjectionCheckpoint, update: AppliedSeque
     if (update.config_hash != 0) checkpoint.config_hash = update.config_hash;
 }
 
-fn loadProjectionCheckpoint(alloc: Allocator, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    var checkpoint = try loadCheckpoint(alloc, path);
+fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
+    var checkpoint = try loadCheckpoint(alloc, io, path);
     defer checkpoint.deinit(alloc);
     return checkpoint.map.get(index_name);
 }
 
-fn saveAppliedSequencesCheckpoint(alloc: Allocator, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
-        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
 
     for (updates) |update| try checkpoint.putMaxSequenceUpdate(alloc, update);
-    try writeCheckpointAtomically(alloc, path, &checkpoint);
+    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn saveProjectionCheckpoints(alloc: Allocator, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
-        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
@@ -491,31 +497,29 @@ fn saveProjectionCheckpoints(alloc: Allocator, path: []const u8, updates: []cons
     for (updates) |update| {
         try checkpoint.putMax(alloc, update.index_name, update.checkpoint());
     }
-    try writeCheckpointAtomically(alloc, path, &checkpoint);
+    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn setAppliedSequencesCheckpoint(alloc: Allocator, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
-        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
 
     for (updates) |update| try checkpoint.putSequenceUpdate(alloc, update);
-    try writeCheckpointAtomically(alloc, path, &checkpoint);
+    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn setProjectionCheckpoints(alloc: Allocator, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
-        error.InvalidDerivedApplyState => CheckpointMap{},
         else => return err,
     };
     defer checkpoint.deinit(alloc);
@@ -523,54 +527,60 @@ fn setProjectionCheckpoints(alloc: Allocator, path: []const u8, updates: []const
     for (updates) |update| {
         try checkpoint.put(alloc, update.index_name, update.checkpoint());
     }
-    try writeCheckpointAtomically(alloc, path, &checkpoint);
+    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn clearAppliedSequenceCheckpoint(alloc: Allocator, path: []const u8, index_name: []const u8) !void {
+fn clearAppliedSequenceCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return,
-        error.InvalidDerivedApplyState => return,
         else => return err,
     };
     defer checkpoint.deinit(alloc);
 
     checkpoint.remove(alloc, index_name);
-    try writeCheckpointAtomically(alloc, path, &checkpoint);
+    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
 }
 
-fn loadCheckpoint(alloc: Allocator, path: []const u8) !CheckpointMap {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(checkpoint_max_bytes));
+fn loadCheckpoint(alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
     defer alloc.free(raw);
     return try decodeCheckpoint(alloc, raw);
 }
 
 fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
-    if (raw.len < checkpoint_magic.len + 4) return error.InvalidDerivedApplyState;
-    if (!std.mem.eql(u8, raw[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidDerivedApplyState;
-    if (raw.len < checkpoint_magic.len + 8) return error.InvalidDerivedApplyState;
+    if (raw.len < checkpoint_magic.len + 8 + checkpoint_checksum_len) return error.InvalidDerivedApplyState;
+    const body = raw[0 .. raw.len - checkpoint_checksum_len];
+    const stored_checksum = std.mem.readInt(
+        u32,
+        raw[raw.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len],
+        .little,
+    );
+    if (std.hash.Crc32.hash(body) != stored_checksum) return error.InvalidDerivedApplyState;
+    if (!std.mem.eql(u8, body[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidDerivedApplyState;
     var pos: usize = checkpoint_magic.len;
-    const format_version = try readCheckpointInt(raw, &pos, u32);
+    const format_version = try readCheckpointInt(body, &pos, u32);
     if (format_version != projection_checkpoint_format_version) return error.InvalidDerivedApplyState;
-    const count = try readCheckpointInt(raw, &pos, u32);
+    const count = try readCheckpointInt(body, &pos, u32);
+    const minimum_entry_bytes = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u64) + 1;
+    if (count > (body.len - pos) / minimum_entry_bytes) return error.InvalidDerivedApplyState;
 
     var checkpoint = CheckpointMap{};
     errdefer checkpoint.deinit(alloc);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        const name_len = try readCheckpointInt(raw, &pos, u32);
-        const applied_sequence = try readCheckpointInt(raw, &pos, u64);
-        const status_raw = try readCheckpointInt(raw, &pos, u8);
-        const generation = try readCheckpointInt(raw, &pos, u64);
-        const config_hash = try readCheckpointInt(raw, &pos, u64);
+        const name_len = try readCheckpointInt(body, &pos, u32);
+        const applied_sequence = try readCheckpointInt(body, &pos, u64);
+        const status_raw = try readCheckpointInt(body, &pos, u8);
+        const generation = try readCheckpointInt(body, &pos, u64);
+        const config_hash = try readCheckpointInt(body, &pos, u64);
         if (name_len == 0 or name_len > std.math.maxInt(u16)) return error.InvalidDerivedApplyState;
-        if (pos + name_len > raw.len) return error.InvalidDerivedApplyState;
-        const name = raw[pos .. pos + name_len];
+        if (name_len > body.len - pos) return error.InvalidDerivedApplyState;
+        const name = body[pos .. pos + name_len];
         pos += name_len;
+        if (checkpoint.map.contains(name)) return error.InvalidDerivedApplyState;
         const status: ProjectionStatus = switch (status_raw) {
             @intFromEnum(ProjectionStatus.clean) => .clean,
             @intFromEnum(ProjectionStatus.rebuilding) => .rebuilding,
@@ -585,7 +595,7 @@ fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
             .config_hash = config_hash,
         });
     }
-    if (pos != raw.len) return error.InvalidDerivedApplyState;
+    if (pos != body.len) return error.InvalidDerivedApplyState;
     return checkpoint;
 }
 
@@ -598,21 +608,36 @@ fn readCheckpointInt(raw: []const u8, pos: *usize, comptime T: type) !T {
 }
 
 fn encodeCheckpoint(alloc: Allocator, checkpoint: *const CheckpointMap) ![]u8 {
+    if (checkpoint.map.count() > std.math.maxInt(u32)) return error.InvalidDerivedApplyState;
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, checkpoint_magic);
     try appendCheckpointInt(alloc, &out, u32, projection_checkpoint_format_version);
     try appendCheckpointInt(alloc, &out, u32, @intCast(checkpoint.map.count()));
+
+    const names = try alloc.alloc([]const u8, checkpoint.map.count());
+    defer alloc.free(names);
     var it = checkpoint.map.iterator();
-    while (it.next()) |entry| {
-        if (entry.key_ptr.*.len == 0 or entry.key_ptr.*.len > std.math.maxInt(u16)) return error.InvalidDerivedApplyState;
-        try appendCheckpointInt(alloc, &out, u32, @intCast(entry.key_ptr.*.len));
-        try appendCheckpointInt(alloc, &out, u64, entry.value_ptr.*.applied_sequence);
-        try appendCheckpointInt(alloc, &out, u8, @intFromEnum(entry.value_ptr.*.status));
-        try appendCheckpointInt(alloc, &out, u64, entry.value_ptr.*.generation);
-        try appendCheckpointInt(alloc, &out, u64, entry.value_ptr.*.config_hash);
-        try out.appendSlice(alloc, entry.key_ptr.*);
+    var name_idx: usize = 0;
+    while (it.next()) |entry| : (name_idx += 1) names[name_idx] = entry.key_ptr.*;
+    std.mem.sort([]const u8, names, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.order(u8, lhs, rhs) == .lt;
+        }
+    }.lessThan);
+
+    for (names) |name| {
+        if (name.len == 0 or name.len > std.math.maxInt(u16)) return error.InvalidDerivedApplyState;
+        const value = checkpoint.map.get(name) orelse return error.InvalidDerivedApplyState;
+        try appendCheckpointInt(alloc, &out, u32, @intCast(name.len));
+        try appendCheckpointInt(alloc, &out, u64, value.applied_sequence);
+        try appendCheckpointInt(alloc, &out, u8, @intFromEnum(value.status));
+        try appendCheckpointInt(alloc, &out, u64, value.generation);
+        try appendCheckpointInt(alloc, &out, u64, value.config_hash);
+        try out.appendSlice(alloc, name);
     }
+    try appendCheckpointInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
+    if (out.items.len > checkpoint_max_bytes) return error.InvalidDerivedApplyState;
     return try out.toOwnedSlice(alloc);
 }
 
@@ -627,22 +652,17 @@ fn appendCheckpointInt(
     try out.appendSlice(alloc, &buf);
 }
 
-fn writeCheckpointAtomically(alloc: Allocator, path: []const u8, checkpoint: *const CheckpointMap) !void {
+fn writeCheckpointAtomically(alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
     const encoded = try encodeCheckpoint(alloc, checkpoint);
     defer alloc.free(encoded);
 
     if (std.fs.path.dirname(path)) |parent| {
-        var io_parent = std.Io.Threaded.init(alloc, .{});
-        defer io_parent.deinit();
-        try fs_paths.createDirPathPortable(io_parent.io(), parent);
+        try fs_paths.createDirPathPortable(io, parent);
     }
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     {
         var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
         defer file.close(io);
@@ -773,33 +793,33 @@ test "derived apply checkpoint is authoritative when configured" {
     try saveAppliedSequence(runtime, "legacy_idx", 7);
     try std.testing.expectEqual(
         @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "legacy_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "legacy_idx"),
     );
     try std.testing.expectEqual(
         @as(u64, 7),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, null, "legacy_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, null, "legacy_idx"),
     );
 
-    try saveAppliedSequencesWithCheckpoint(alloc, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
         .{ .index_name = "dense_idx", .sequence = 10 },
         .{ .index_name = "sparse_idx", .sequence = 3 },
     });
-    try saveAppliedSequencesWithCheckpoint(alloc, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
         .{ .index_name = "dense_idx", .sequence = 12 },
         .{ .index_name = "sparse_idx", .sequence = 2 },
     });
 
     try std.testing.expectEqual(
         @as(u64, 12),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
     try std.testing.expectEqual(
         @as(u64, 3),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "sparse_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "sparse_idx"),
     );
     try std.testing.expectEqual(
         @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "legacy_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "legacy_idx"),
     );
 }
 
@@ -818,15 +838,15 @@ test "derived apply checkpoint clear removes sidecar entry" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx", 22);
+    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", 22);
     try std.testing.expectEqual(
         @as(u64, 22),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
-    try clearAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx");
+    try clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(
         @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
 }
 
@@ -845,22 +865,101 @@ test "projection checkpoint sidecar persists status and identity fields" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx", .{
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
         .applied_sequence = 44,
         .status = .degraded,
         .generation = 9,
         .config_hash = 0x1234,
     });
 
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx");
+    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(@as(u64, 44), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.degraded, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
     try std.testing.expectEqual(@as(u64, 0x1234), checkpoint.config_hash);
     try std.testing.expectEqual(
         @as(u64, 44),
-        try loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
+}
+
+test "projection checkpoint rejects plausible cursor corruption" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
+    defer alloc.free(checkpoint_path);
+
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
+        .applied_sequence = 44,
+        .status = .clean,
+        .generation = 9,
+        .config_hash = 0x1234,
+    });
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        checkpoint_path,
+        alloc,
+        .limited(checkpoint_max_bytes),
+    );
+    defer alloc.free(raw);
+    const applied_sequence_offset = checkpoint_magic.len + @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u32);
+    raw[applied_sequence_offset] ^= 0x40;
+    try writeRawCheckpointTestFile(std.testing.io, checkpoint_path, raw);
+
+    try std.testing.expectError(
+        error.InvalidDerivedApplyState,
+        loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+    );
+    try std.testing.expectError(
+        error.InvalidDerivedApplyState,
+        loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+    );
+    try std.testing.expectError(
+        error.InvalidDerivedApplyState,
+        setProjectionCheckpoints(alloc, std.testing.io, checkpoint_path, &.{.{
+            .index_name = "other_idx",
+            .sequence = 99,
+        }}),
+    );
+    const after_failed_update = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        checkpoint_path,
+        alloc,
+        .limited(checkpoint_max_bytes),
+    );
+    defer alloc.free(after_failed_update);
+    try std.testing.expectEqualSlices(u8, raw, after_failed_update);
+}
+
+test "projection checkpoint encoding is deterministic by index name" {
+    const alloc = std.testing.allocator;
+    var left = CheckpointMap{};
+    defer left.deinit(alloc);
+    try left.put(alloc, "zeta", .{ .applied_sequence = 3 });
+    try left.put(alloc, "alpha", .{ .applied_sequence = 7 });
+
+    var right = CheckpointMap{};
+    defer right.deinit(alloc);
+    try right.put(alloc, "alpha", .{ .applied_sequence = 7 });
+    try right.put(alloc, "zeta", .{ .applied_sequence = 3 });
+
+    const left_encoded = try encodeCheckpoint(alloc, &left);
+    defer alloc.free(left_encoded);
+    const right_encoded = try encodeCheckpoint(alloc, &right);
+    defer alloc.free(right_encoded);
+    try std.testing.expectEqualSlices(u8, left_encoded, right_encoded);
 }
 
 test "applied sequence checkpoint preserves projection metadata" {
@@ -878,36 +977,31 @@ test "applied sequence checkpoint preserves projection metadata" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx", .{
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
         .applied_sequence = 44,
         .status = .repair_required,
         .generation = 9,
         .config_hash = 0x1234,
     });
-    try saveAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx", 45);
-    try saveAppliedSequencesWithCheckpoint(alloc, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{.{
+    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", 45);
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{.{
         .index_name = "dense_idx",
         .sequence = 40,
         .generation = 10,
         .config_hash = 0x5678,
     }});
 
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx");
+    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(@as(u64, 45), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.repair_required, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
     try std.testing.expectEqual(@as(u64, 0x5678), checkpoint.config_hash);
 }
 
-fn writeRawCheckpointTestFile(alloc: Allocator, path: []const u8, raw: []const u8) !void {
+fn writeRawCheckpointTestFile(io: std.Io, path: []const u8, raw: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        var io_parent = std.Io.Threaded.init(alloc, .{});
-        defer io_parent.deinit();
-        try fs_paths.createDirPathPortable(io_parent.io(), parent);
+        try fs_paths.createDirPathPortable(io, parent);
     }
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
     defer file.close(io);
     var buf: [4096]u8 = undefined;
@@ -933,7 +1027,7 @@ test "projection checkpoint rejects unknown checkpoint format" {
     try appendCheckpointInt(alloc, &raw, u32, @intCast("dense_idx".len));
     try appendCheckpointInt(alloc, &raw, u64, 77);
     try raw.appendSlice(alloc, "dense_idx");
-    try writeRawCheckpointTestFile(alloc, checkpoint_path, raw.items);
+    try writeRawCheckpointTestFile(std.testing.io, checkpoint_path, raw.items);
 
     var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
     defer backend.close();
@@ -942,11 +1036,11 @@ test "projection checkpoint rejects unknown checkpoint format" {
 
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        loadProjectionCheckpointWithSidecar(alloc, runtime, checkpoint_path, "dense_idx"),
+        loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        loadAppliedSequenceWithCheckpoint(alloc, runtime, checkpoint_path, "dense_idx"),
+        loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
 }
 
@@ -995,6 +1089,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
 
     const Worker = struct {
         alloc: Allocator,
+        io: std.Io,
         path: []const u8,
         name: []const u8,
         sequence: u64,
@@ -1003,7 +1098,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
 
         fn run(self: *@This()) void {
             self.barrier.wait(worker_count);
-            saveAppliedSequencesCheckpoint(self.alloc, self.path, &[_]AppliedSequenceUpdate{.{
+            saveAppliedSequencesCheckpoint(self.alloc, self.io, self.path, &[_]AppliedSequenceUpdate{.{
                 .index_name = self.name,
                 .sequence = self.sequence,
             }}) catch |err| {
@@ -1019,6 +1114,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
     for (&workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
+            .io = std.testing.io,
             .path = checkpoint_path,
             .name = names[i],
             .sequence = @intCast(i + 1),
@@ -1032,7 +1128,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
     }
 
     for (names, 0..) |name, i| {
-        const checkpoint = (try loadProjectionCheckpoint(alloc, checkpoint_path, name)) orelse return error.TestUnexpectedResult;
+        const checkpoint = (try loadProjectionCheckpoint(alloc, std.testing.io, checkpoint_path, name)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u64, @intCast(i + 1)), checkpoint.applied_sequence);
         try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
     }

@@ -14,7 +14,6 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const structlog = @import("structlog");
 const testing = std.testing;
 
 pub const std_options: std.Options = .{
@@ -86,6 +85,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (missing_filter_count != 0) {
         std.process.exit(1);
     }
+    if (total_count == 0) {
+        std.debug.print("test selection matched no runnable tests\n", .{});
+        std.process.exit(1);
+    }
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     var current_count: usize = 0;
@@ -112,7 +115,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
             else => {
                 fail_count += 1;
-                std.debug.print("FAIL ({t})\n", .{err});
+                // Logs emitted by a test can split the leading test name from
+                // its result. Repeat it on failure so CI attribution survives
+                // interleaved diagnostics and truncated log windows.
+                std.debug.print("FAIL ({t}) {s}\n", .{ err, test_fn.name });
                 if (@errorReturnTrace()) |trace| {
                     std.debug.dumpErrorReturnTrace(trace);
                 }
@@ -179,6 +185,9 @@ fn appendFilter(
     count: *usize,
     filter: []const u8,
 ) void {
+    if (filter.len == 0) {
+        std.debug.panic("missing value for {s}", .{kind});
+    }
     if (count.* >= max_filters) {
         std.debug.panic("too many {s} arguments", .{kind});
     }
@@ -214,5 +223,10 @@ pub fn log(
     if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    structlog.logFn(message_level, scope, format, args);
+    std.debug.print("[{s}] ({s}): ", .{
+        @tagName(message_level),
+        @tagName(scope),
+    });
+    std.debug.print(format, args);
+    std.debug.print("\n", .{});
 }

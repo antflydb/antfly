@@ -150,7 +150,7 @@ into another.
 file format, the selected engine, the primary, replay, and index layouts, the
 native format revision, page size, and active checkpoint sequence. That makes the
 public native `.aflite` path observable and keeps internal bridge profiles from
-being mistaken for the v1 contract.
+being mistaken for the format revision 2 contract.
 
 For native `.aflite`, the public status contract should report
 `primary_layout: native_document_pages`,

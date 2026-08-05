@@ -113,11 +113,14 @@ pub const DocumentTransform = struct {
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
-        destination,
+        destination_begin,
+        destination_complete,
         source_ack,
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     range_start: []const u8 = "",
@@ -129,9 +132,23 @@ pub const SplitReplicationCheckpoint = struct {
 /// destination batch carries this context so all replicas create the physical
 /// DB with the same namespace before the destination range is catalog-visible.
 pub const SplitReplicationContext = struct {
+    pub const Operation = enum {
+        bootstrap_chunk,
+        delta,
+        checkpoint,
+    };
+
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    /// Present only while streaming a baseline bootstrap. Catch-up deltas use
+    /// null and are fenced by the completed destination marker.
+    bootstrap_sequence: ?u64 = null,
+    operation: Operation = .bootstrap_chunk,
+    /// Source split-delta sequence. Zero for bootstrap chunks.
+    sequence: u64 = 0,
 };
 
 pub const SplitTransitionMutation = struct {
@@ -143,6 +160,8 @@ pub const SplitTransitionMutation = struct {
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     destination_group_id: u64,
     split_key: []const u8 = "",
 };
@@ -623,6 +642,9 @@ pub const TextBoolQuery = struct {
     should: []const TextQuery = &.{},
     must_not: []const TextQuery = &.{},
     min_should: u32 = 0,
+    /// Distinguishes an explicitly optional pure-`should` query from the
+    /// conventional pure disjunction whose implicit minimum is one.
+    pure_should_optional: bool = false,
     boost: f32 = 1.0,
 };
 
@@ -1195,6 +1217,12 @@ pub const SearchRequest = struct {
     count_only: bool = false,
     profile: bool = false,
     full_text: ?TextQuery = null,
+    /// Text-native positive filter. Unlike `full_text`, this constrains every
+    /// retrieval source without contributing a score.
+    filter_text: ?TextQuery = null,
+    /// Text-native negative filter. Matches are removed from every retrieval
+    /// source without contributing a score.
+    exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
@@ -1239,10 +1267,46 @@ pub const SearchRequest = struct {
     resolved_text_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    /// Request-local authorization hook used only by the distributed graph
+    /// coordinator when an edge names a document in another table. The hook is
+    /// never serialized to a shard worker; it resolves the target table to a
+    /// trusted internal row predicate before owner-routed admission.
+    graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
+    /// Borrowed listener lifecycle signal. It is request-local and must never
+    /// be retained by asynchronous work after query execution returns.
+    cancellation: ?*const std.atomic.Value(bool) = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const GraphTableReadAuthorization = struct {
+    allowed: bool,
+    /// Owned by this value when non-null.
+    filter_query_json: ?[]u8 = null,
+
+    pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.filter_query_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const GraphTableReadAuthorizer = struct {
+    ctx: ?*const anyopaque,
+    authorize_table: *const fn (
+        ctx: ?*const anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) anyerror!GraphTableReadAuthorization,
+
+    pub fn authorize(
+        self: GraphTableReadAuthorizer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !GraphTableReadAuthorization {
+        return try self.authorize_table(self.ctx, alloc, table_name);
+    }
 };
 
 pub const SortField = struct {
@@ -1304,6 +1368,9 @@ pub const MergeConfig = struct {
 
 pub const SearchHit = struct {
     id: []u8,
+    /// Internal graph-hydration namespace. Null means the query's source
+    /// table. This is not serialized as part of the public search-hit shape.
+    source_table: ?[]u8 = null,
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
     score: ?f32 = null,
@@ -1316,21 +1383,10 @@ pub const SearchHit = struct {
     chunk_hits: []ChunkHit = &.{},
 
     pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
-        var cloned = SearchHit{
-            .id = try alloc.dupe(u8, self.id),
-            .doc_ordinal = self.doc_ordinal,
-            .native_text_doc_id = self.native_text_doc_id,
-            .score = self.score,
-            .index_scores = try cloneIndexScores(alloc, self.index_scores),
-            .sort_values = try cloneJsonValues(alloc, self.sort_values),
-            .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
-            .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
-            .chunk_hits = &.{},
-        };
+        var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.source_table) |table| alloc.free(table);
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
@@ -1338,24 +1394,36 @@ pub const SearchHit = struct {
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
+        cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
+        cloned.doc_ordinal = self.doc_ordinal;
+        cloned.native_text_doc_id = self.native_text_doc_id;
+        cloned.score = self.score;
+        cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
+        cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
 
         if (self.chunk_hits.len == 0) return cloned;
 
-        cloned.chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
+        const chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
         var initialized: usize = 0;
         errdefer {
-            for (cloned.chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
-            alloc.free(cloned.chunk_hits);
+            for (chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
+            alloc.free(chunk_hits);
         }
         for (self.chunk_hits, 0..) |chunk, i| {
-            cloned.chunk_hits[i] = try chunk.clone(alloc);
+            chunk_hits[i] = try chunk.clone(alloc);
             initialized += 1;
         }
+        cloned.chunk_hits = chunk_hits;
         return cloned;
     }
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.source_table) |table| alloc.free(table);
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
@@ -1698,6 +1766,7 @@ pub const EnrichmentStats = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    projection_checkpoint_identity_consistent: bool = true,
     checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
@@ -1705,6 +1774,8 @@ pub const EnrichmentStats = struct {
     fatal_error_count: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
+    worker_started: bool = false,
+    stalled: bool = false,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -1719,6 +1790,7 @@ pub const EnrichmentStats = struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -1777,6 +1849,9 @@ pub const TransactionRecoveryStats = struct {
 
 pub const TextMergeStats = struct {
     enabled: bool = false,
+    active_indexes: u64 = 0,
+    active_segments: u64 = 0,
+    max_active_segments_per_index: u64 = 0,
     pending_indexes: u64 = 0,
     pending_segments: u64 = 0,
     pending_bytes: u64 = 0,
@@ -1806,12 +1881,17 @@ pub const TextMergeStats = struct {
     deferred_for_pressure: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
+    backpressure_timeouts: u64 = 0,
+    backpressure_failures: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
 };
 
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
     dst.enabled = dst.enabled or src.enabled;
+    dst.active_indexes +|= src.active_indexes;
+    dst.active_segments +|= src.active_segments;
+    dst.max_active_segments_per_index = @max(dst.max_active_segments_per_index, src.max_active_segments_per_index);
     dst.pending_indexes +|= src.pending_indexes;
     dst.pending_segments +|= src.pending_segments;
     dst.pending_bytes +|= src.pending_bytes;
@@ -1841,6 +1921,8 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
+    dst.backpressure_timeouts +|= src.backpressure_timeouts;
+    dst.backpressure_failures +|= src.backpressure_failures;
     dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
     dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
 }
@@ -1900,6 +1982,9 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Process-local fingerprint of physical LSM/WAL publications. Runtime
+    /// status uses it only to invalidate cached directory-byte observations.
+    storage_change_token: u64 = 0,
     /// Canonical live primary-document cardinality from durable identity metadata.
     /// Unlike doc_count, this is independent of derived index fan-out.
     source_doc_count: u64 = 0,
@@ -2745,6 +2830,19 @@ pub const AsyncIndexingStats = struct {
     startup: StartupCatchUpStats = .{},
     dense_catch_up: DenseCatchUpStats = .{},
     bulk_coalescing: BulkCoalescingStats = .{},
+    derived_workers: DerivedWorkerStats = .{},
+};
+
+pub const DerivedWorkerStats = struct {
+    workers: u64 = 0,
+    workers_with_replay_debt: u64 = 0,
+    max_replay_lag_sequences: u64 = 0,
+    recoverable_retries: u64 = 0,
+    writer_locked_retries: u64 = 0,
+    resource_budget_retries: u64 = 0,
+    replay_document_not_visible_retries: u64 = 0,
+    artifact_repair_required_retries: u64 = 0,
+    not_found_retries: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -2882,6 +2980,15 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.stage_transforms += src.bulk_coalescing.stage_transforms;
     dst.bulk_coalescing.flush_calls += src.bulk_coalescing.flush_calls;
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
+    dst.derived_workers.workers += src.derived_workers.workers;
+    dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
+    dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
+    dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
+    dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;
+    dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
+    dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
+    dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {

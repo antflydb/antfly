@@ -77,6 +77,7 @@ pub const Config = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
+    inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
 };
 
 pub const RuntimeError = error{ EnrichmentWorkerFailed, EnrichmentRetryInProgress };
@@ -96,7 +97,7 @@ pub const scope_name = "generated";
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
 const generated_replay_default_window_items: usize = 2048;
-const generated_embed_default_batch_items: usize = 32;
+const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
 const generated_ocr_default_batch_items: usize = 4;
 const generated_ocr_default_batch_max_items: usize = 8;
@@ -105,6 +106,7 @@ const transient_embed_retry_max_attempts: u32 = 6;
 const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
 const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
+const lease_denied_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
 const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
@@ -365,6 +367,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -385,6 +388,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -399,6 +403,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -407,42 +412,6 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
     }
-}
-
-pub fn beginEmbedBatch(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize) u64 {
-    noteEmbedBatchStarted(runtime, items, bytes, max_bytes);
-    return runtime.config.clock.nowRealtimeNs();
-}
-
-pub fn finishEmbedBatch(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize, started_ns: u64, success: bool) void {
-    noteEmbedBatchFinished(runtime, items, bytes, max_bytes, elapsedNsSince(runtime, started_ns), success);
-}
-
-pub fn persistStatus(runtime: *EnrichmentRuntime) !void {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    const status = runtimeStatusSnapshot(runtime);
-    if (maybe_io) |io| runtime.mutex.unlock(io);
-    try saveRuntimeStatusWithRetry(runtime, scope_name, status);
-}
-
-pub fn statsIncludingPersistedTelemetry(runtime: *EnrichmentRuntime) !types.EnrichmentStats {
-    var live = runtime.stats();
-    const persisted = try enrichment_state.loadRuntimeStatus(runtime.alloc, runtime.store, scope_name);
-    const use_persisted_last = persisted.embed_batches_completed > live.embed_batches_completed or
-        persisted.total_embed_ns > live.total_embed_ns;
-    live.embed_batches_started = @max(live.embed_batches_started, persisted.embed_batches_started);
-    live.embed_batches_completed = @max(live.embed_batches_completed, persisted.embed_batches_completed);
-    live.embed_items_started = @max(live.embed_items_started, persisted.embed_items_started);
-    live.embed_items_completed = @max(live.embed_items_completed, persisted.embed_items_completed);
-    live.total_embed_ns = @max(live.total_embed_ns, persisted.total_embed_ns);
-    if (use_persisted_last) {
-        live.last_embed_batch_items = persisted.last_embed_batch_items;
-        live.last_embed_batch_bytes = persisted.last_embed_batch_bytes;
-        live.last_embed_batch_max_bytes = persisted.last_embed_batch_max_bytes;
-        live.last_embed_batch_ns = persisted.last_embed_batch_ns;
-    }
-    return live;
 }
 
 const TextBatchByteStats = struct {
@@ -455,20 +424,6 @@ fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
     for (texts) |text| {
         stats.total_bytes += text.len;
         stats.max_bytes = @max(stats.max_bytes, text.len);
-    }
-    return stats;
-}
-
-fn contentPartsByteStats(parts: []const template.ContentPart) TextBatchByteStats {
-    var stats = TextBatchByteStats{};
-    for (parts) |part| {
-        const bytes = switch (part) {
-            .text => |value| value.len,
-            .media_url => |value| value.len,
-            .binary => |value| value.data.len,
-        };
-        stats.total_bytes += bytes;
-        stats.max_bytes = @max(stats.max_bytes, bytes);
     }
     return stats;
 }
@@ -494,7 +449,7 @@ fn transientEmbedRetryDecision(runtime: *EnrichmentRuntime, attempt: u32) Transi
     if (comptime builtin.os.tag != .freestanding) {
         if (runtimeShuttingDown(runtime)) return .abort_shutdown;
     }
-    if (attempt + 1 >= transient_embed_retry_max_attempts) return .yield_to_worker;
+    if (attempt + 1 >= @max(runtime.config.inline_retry_max_attempts, 1)) return .yield_to_worker;
     return .retry_inline;
 }
 
@@ -557,15 +512,6 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retryable_error_count = runtime.retryable_error_count,
         .fatal_error_count = runtime.fatal_error_count,
         .skipped_source_count = runtime.skipped_source_count,
-        .embed_batches_started = runtime.embed_batches_started,
-        .embed_batches_completed = runtime.embed_batches_completed,
-        .embed_items_started = runtime.embed_items_started,
-        .embed_items_completed = runtime.embed_items_completed,
-        .last_embed_batch_items = runtime.last_embed_batch_items,
-        .last_embed_batch_bytes = runtime.last_embed_batch_bytes,
-        .last_embed_batch_max_bytes = runtime.last_embed_batch_max_bytes,
-        .last_embed_batch_ns = runtime.last_embed_batch_ns,
-        .total_embed_ns = runtime.total_embed_ns,
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
@@ -582,15 +528,6 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
     runtime.skipped_source_count = persisted_status.skipped_source_count;
-    runtime.embed_batches_started = persisted_status.embed_batches_started;
-    runtime.embed_batches_completed = persisted_status.embed_batches_completed;
-    runtime.embed_items_started = persisted_status.embed_items_started;
-    runtime.embed_items_completed = persisted_status.embed_items_completed;
-    runtime.last_embed_batch_items = persisted_status.last_embed_batch_items;
-    runtime.last_embed_batch_bytes = persisted_status.last_embed_batch_bytes;
-    runtime.last_embed_batch_max_bytes = persisted_status.last_embed_batch_max_bytes;
-    runtime.last_embed_batch_ns = persisted_status.last_embed_batch_ns;
-    runtime.total_embed_ns = persisted_status.total_embed_ns;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.worker_failed = persisted_status.worker_failed;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
@@ -604,15 +541,6 @@ test "enrichment runtime restore preserves retry target across restart" {
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
         skipped_source_count: u64 = 0,
-        embed_batches_started: u64 = 0,
-        embed_batches_completed: u64 = 0,
-        embed_items_started: u64 = 0,
-        embed_items_completed: u64 = 0,
-        last_embed_batch_items: u64 = 0,
-        last_embed_batch_bytes: u64 = 0,
-        last_embed_batch_max_bytes: u64 = 0,
-        last_embed_batch_ns: u64 = 0,
-        total_embed_ns: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -622,15 +550,6 @@ test "enrichment runtime restore preserves retry target across restart" {
         .error_count = 2,
         .retryable_error_count = 2,
         .fatal_error_count = 0,
-        .embed_batches_started = 4,
-        .embed_batches_completed = 3,
-        .embed_items_started = 12,
-        .embed_items_completed = 10,
-        .last_embed_batch_items = 2,
-        .last_embed_batch_bytes = 64,
-        .last_embed_batch_max_bytes = 40,
-        .last_embed_batch_ns = 200,
-        .total_embed_ns = 900,
         .retrying = true,
         .worker_failed = false,
     });
@@ -638,8 +557,6 @@ test "enrichment runtime restore preserves retry target across restart" {
     try std.testing.expectEqual(@as(u64, 9), runtime.target_sequence);
     try std.testing.expectEqual(@as(u64, 2), runtime.error_count);
     try std.testing.expectEqual(@as(u64, 2), runtime.retryable_error_count);
-    try std.testing.expectEqual(@as(u64, 3), runtime.embed_batches_completed);
-    try std.testing.expectEqual(@as(u64, 900), runtime.total_embed_ns);
     try std.testing.expect(runtime.retrying);
     try std.testing.expect(!runtime.worker_failed);
 }
@@ -652,15 +569,6 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
         skipped_source_count: u64 = 0,
-        embed_batches_started: u64 = 0,
-        embed_batches_completed: u64 = 0,
-        embed_items_started: u64 = 0,
-        embed_items_completed: u64 = 0,
-        last_embed_batch_items: u64 = 0,
-        last_embed_batch_bytes: u64 = 0,
-        last_embed_batch_max_bytes: u64 = 0,
-        last_embed_batch_ns: u64 = 0,
-        total_embed_ns: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -1189,6 +1097,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -1234,6 +1143,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .remote_content = config.remote_content,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
+                .inline_retry_max_attempts = config.inline_retry_max_attempts,
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
@@ -1388,6 +1298,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .last_embed_batch_items = self.last_embed_batch_items,
             .last_embed_batch_bytes = self.last_embed_batch_bytes,
             .last_embed_batch_max_bytes = self.last_embed_batch_max_bytes,
+            .last_embed_batch_completed_ms = self.last_embed_batch_completed_ms,
             .last_embed_batch_ns = self.last_embed_batch_ns,
             .total_embed_ns = self.total_embed_ns,
             .dense_artifact_bytes_written = self.dense_artifact_bytes_written,
@@ -1440,6 +1351,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -1492,6 +1404,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .remote_content = config.remote_content,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
+                .inline_retry_max_attempts = config.inline_retry_max_attempts,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
                 .lease_owned = true,
@@ -1674,8 +1587,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         const ownership_stats = self.ownership.stats();
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
+        const enabled = self.config.dense_embedder != null or
+            self.config.sparse_embedder != null or
+            self.config.asset_producer != null or
+            self.config.enable_without_producers;
+        const worker_started = self.future != null;
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
+            .enabled = enabled,
             .lease_owned = ownership_stats.lease_owned,
             .has_lease = ownership_stats.has_lease,
             .acquisition_count = ownership_stats.acquisition_count,
@@ -1694,6 +1612,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .fatal_error_count = self.fatal_error_count,
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
+            .worker_started = worker_started,
+            .stalled = enrichmentWorkerStalled(
+                enabled,
+                self.target_sequence,
+                self.applied_sequence,
+                worker_started,
+                self.retrying,
+                self.worker_failed,
+            ),
             .skip_by_hash_count = self.skip_by_hash_count,
             .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
@@ -1708,6 +1635,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .last_embed_batch_items = self.last_embed_batch_items,
             .last_embed_batch_bytes = self.last_embed_batch_bytes,
             .last_embed_batch_max_bytes = self.last_embed_batch_max_bytes,
+            .last_embed_batch_completed_ms = self.last_embed_batch_completed_ms,
             .last_embed_batch_ns = self.last_embed_batch_ns,
             .total_embed_ns = self.total_embed_ns,
             .dense_artifact_bytes_written = self.dense_artifact_bytes_written,
@@ -1758,6 +1686,30 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifyStatusHook();
     }
 };
+
+fn enrichmentWorkerStalled(
+    enabled: bool,
+    target_sequence: u64,
+    applied_sequence: u64,
+    worker_started: bool,
+    retrying: bool,
+    worker_failed: bool,
+) bool {
+    return enabled and
+        target_sequence > applied_sequence and
+        !worker_started and
+        !retrying and
+        !worker_failed;
+}
+
+test "enrichment runtime status reports worker lifecycle diagnostics" {
+    try std.testing.expect(enrichmentWorkerStalled(true, 5, 1, false, false, false));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, true, false, false));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, false, true, false));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, false, false, true));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 5, false, false, false));
+    try std.testing.expect(!enrichmentWorkerStalled(false, 5, 1, false, false, false));
+}
 
 fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
@@ -1904,7 +1856,14 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     };
     runtime.mutex.unlock(io);
     if (!acquired) {
-        io.sleep(Io.Duration.zero, .awake) catch {};
+        // A live lease held by another owner can remain valid for the full
+        // 30-second TTL. Pace denial retries so failover does not monopolize a
+        // core or hammer the durable lease record while still reacting quickly
+        // after expiry.
+        io.sleep(
+            Io.Duration.fromMilliseconds(@intCast(lease_denied_retry_sleep_ns / std.time.ns_per_ms)),
+            .awake,
+        ) catch {};
         return;
     }
 
@@ -1914,7 +1873,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     var processed_request_count: u64 = 0;
     var max_seen = runtime.applied_sequence;
 
-    retry_pending: while (true) {
+    while (true) {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
         defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
@@ -1940,36 +1899,34 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
             max_seen = @max(max_seen, group.sequence);
             processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                if (isRetryableEnrichmentError(err)) continue :retry_pending;
+                // The embedder already performed its bounded inline retry
+                // budget. Yield durable pending work to the supervised
+                // worker/scheduler boundary instead of spinning this entire
+                // replay window without backoff.
                 return err;
             };
             flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                if (isRetryableEnrichmentError(err)) continue :retry_pending;
                 return err;
             };
         }
         flushAssetProducerBatch(runtime, &deferred_assets, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
         processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
         processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
         flushGeneratedReplayWindow(runtime, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
-        break :retry_pending;
+        break;
     }
     if (pending.len == 0) {
         max_seen = target_sequence;
@@ -2482,6 +2439,12 @@ fn processDocumentExtractionAsset(
         if (std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
                 if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                    // Full-index writes may precompute and persist document
+                    // extraction before the generated replay reaches this
+                    // worker. Preserve the terminal coverage outcome for a
+                    // successfully empty extraction even when the replay can
+                    // otherwise skip all work by hash.
+                    if (desired_chunk_keys.items.len == 0) try queueTerminalCoverageForRequest(runtime, window, request);
                     runtime.skip_by_hash_count += 1;
                     return;
                 }
@@ -2702,6 +2665,11 @@ fn processDocumentExtractionAsset(
         .mode = .publish_replay,
     };
     try document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink());
+    // A successful extraction can legitimately produce no chunk artifacts (for
+    // example, an image-only PDF whose OCR output is rejected as trivial). No
+    // downstream chunk or embedding request will exist to close coverage for
+    // that source, so make the terminal outcome explicit here.
+    if (desired_chunk_keys.items.len == 0) try queueTerminalCoverageForRequest(runtime, window, request);
     try flushGeneratedReplayWindow(runtime, window);
 
     try writes.append(runtime.alloc, .{
@@ -6168,14 +6136,7 @@ fn processDenseEmbedding(
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
-            const part_stats = contentPartsByteStats(parts);
-            noteEmbedBatchStarted(runtime, 1, part_stats.total_bytes, part_stats.max_bytes);
-            const embed_started_ns = runtime.config.clock.nowRealtimeNs();
-            const vector = embedDensePartsWithRetry(dense_embedder, runtime, embedding_artifact_name, parts, request.expected_dims) catch |err| {
-                noteEmbedBatchFinished(runtime, 1, part_stats.total_bytes, part_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-                return err;
-            };
-            noteEmbedBatchFinished(runtime, 1, part_stats.total_bytes, part_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+            const vector = try embedDensePartsWithRetry(dense_embedder, runtime, embedding_artifact_name, parts, request.expected_dims);
             defer runtime.alloc.free(vector);
 
             try writeEmbeddingArtifact(runtime, .{
@@ -6219,13 +6180,7 @@ fn processDenseEmbedding(
         return;
     }
 
-    noteEmbedBatchStarted(runtime, 1, source_text.len, source_text.len);
-    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
-    const vector = embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims) catch |err| {
-        noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), false);
-        return err;
-    };
-    noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
+    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims);
     defer runtime.alloc.free(vector);
 
     try writeEmbeddingArtifact(runtime, .{
@@ -6326,13 +6281,7 @@ fn processSparseEmbedding(
         return;
     }
 
-    noteEmbedBatchStarted(runtime, 1, source_text.len, source_text.len);
-    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
-    var sparse = embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text) catch |err| {
-        noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), false);
-        return err;
-    };
-    noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
+    var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
     try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);

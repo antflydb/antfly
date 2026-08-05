@@ -16,7 +16,9 @@ package sim
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -94,37 +96,124 @@ func (c *directStoreClient) ApplyMergeChunk(
 	}.Build())
 }
 
-func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
+func (c *directStoreClient) Backup(
+	ctx context.Context,
+	shardID types.ID,
+	backup common.BackupConfig,
+) (*common.BackupArtifactIntegrity, error) {
 	shard, err := c.shard(shardID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := shard.Backup(ctx, loc, id); err != nil {
-		return err
+	backup.Format, err = common.ValidateBackupFormat(backup.Format)
+	if err != nil {
+		return nil, err
 	}
-	backupDir, ok := strings.CutPrefix(loc, "file://")
+	if backup.Format == common.BackupFormatPortable {
+		backupLocation := backup.Location
+		if backup.ResolvedLocation != "" {
+			backupLocation = backup.ResolvedLocation
+		}
+		backupDir, ok := strings.CutPrefix(backupLocation, "file://")
+		if !ok {
+			return nil, errors.New("simulator portable backups require a filesystem location")
+		}
+		if err := os.MkdirAll(backupDir, 0o750); err != nil {
+			return nil, fmt.Errorf("creating portable backup directory: %w", err)
+		}
+		fileName := common.ShardPortableBackupFileName(backup.BackupID, shardID)
+		file, err := os.CreateTemp(backupDir, "."+fileName+".tmp-*") //nolint:gosec // simulator-controlled directory
+		if err != nil {
+			return nil, fmt.Errorf("creating temporary portable backup: %w", err)
+		}
+		tempPath := file.Name()
+		defer func() {
+			_ = file.Close()
+			_ = os.Remove(tempPath)
+		}()
+		if err := file.Chmod(0o600); err != nil {
+			return nil, fmt.Errorf("setting portable backup permissions: %w", err)
+		}
+		hasher := sha256.New()
+		if err := shard.ExportPortable(ctx, io.MultiWriter(file, hasher)); err != nil {
+			return nil, fmt.Errorf("exporting portable backup: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := file.Sync(); err != nil {
+			return nil, fmt.Errorf("syncing portable backup: %w", err)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stating portable backup: %w", err)
+		}
+		if info.Size() <= 0 {
+			return nil, errors.New("portable backup export is empty")
+		}
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("closing portable backup: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := os.Link(tempPath, filepath.Join(backupDir, fileName)); err != nil {
+			if os.IsExist(err) {
+				return nil, fmt.Errorf("%w: %s", common.ErrBackupAlreadyExists, fileName)
+			}
+			return nil, fmt.Errorf("publishing portable backup: %w", err)
+		}
+		dir, err := os.Open(backupDir) //nolint:gosec // simulator-controlled directory
+		if err != nil {
+			return nil, fmt.Errorf("opening portable backup directory: %w", err)
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			return nil, fmt.Errorf("syncing portable backup directory: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return nil, fmt.Errorf("closing portable backup directory: %w", err)
+		}
+		return &common.BackupArtifactIntegrity{
+			Name:      fileName,
+			SizeBytes: uint64(info.Size()),
+			SHA256:    hex.EncodeToString(hasher.Sum(nil)),
+		}, nil
+	}
+	shardBackup := backup
+	shardBackup.BackupID = strings.TrimSuffix(
+		common.ShardBackupFileName(backup.BackupID, shardID),
+		".tar.zst",
+	)
+	if err := shard.Backup(ctx, shardBackup); err != nil {
+		return nil, err
+	}
+	backupDir, ok := strings.CutPrefix(backup.Location, "file://")
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	if err := os.MkdirAll(backupDir, os.ModePerm); err != nil && !os.IsExist(err) { //nolint:gosec // G301: test/sim data dir
-		return fmt.Errorf("creating backup directory: %w", err)
+		return nil, fmt.Errorf("creating backup directory: %w", err)
 	}
-	srcPath := filepath.Join(common.SnapDir(c.h.config.GetBaseDir(), shardID, c.nodeID), id+".tar.zst")
-	dstPath := filepath.Join(backupDir, common.ShardBackupFileName(id, shardID))
+	srcPath := filepath.Join(
+		common.SnapDir(c.h.config.GetBaseDir(), shardID, c.nodeID),
+		shardBackup.BackupID+".tar.zst",
+	)
+	dstPath := filepath.Join(backupDir, common.ShardBackupFileName(backup.BackupID, shardID))
 	src, err := os.Open(filepath.Clean(srcPath))
 	if err != nil {
-		return fmt.Errorf("opening backup archive %s: %w", srcPath, err)
+		return nil, fmt.Errorf("opening backup archive %s: %w", srcPath, err)
 	}
 	defer func() { _ = src.Close() }()
 	dst, err := os.Create(filepath.Clean(dstPath))
 	if err != nil {
-		return fmt.Errorf("creating backup archive %s: %w", dstPath, err)
+		return nil, fmt.Errorf("creating backup archive %s: %w", dstPath, err)
 	}
 	defer func() { _ = dst.Close() }()
 	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("copying backup archive to %s: %w", dstPath, err)
+		return nil, fmt.Errorf("copying backup archive to %s: %w", dstPath, err)
 	}
-	return nil
+	return nil, nil
 }
 
 func (c *directStoreClient) Lookup(ctx context.Context, shardID types.ID, keys []string) (map[string][]byte, error) {

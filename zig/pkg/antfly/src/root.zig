@@ -226,6 +226,7 @@ test {
     _ = fusion;
     _ = regex;
     _ = query_string;
+    _ = @import("search/pattern_filter.zig");
     _ = @import("hbc_recall_test.zig");
 
     // Graph
@@ -260,6 +261,7 @@ test {
 
     // Raft integration
     _ = raft;
+    _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = metadata;
     _ = metadata_api;
@@ -283,6 +285,7 @@ test {
     _ = jsonschema;
     _ = common;
     _ = foreign;
+    _ = @import("foreign/postgres_libpq.zig");
     _ = embeddings;
     _ = generating;
     _ = generating_runtime;

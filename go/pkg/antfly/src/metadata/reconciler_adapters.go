@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
@@ -47,6 +48,26 @@ func NewMetadataShardOperations(ms *MetadataStore) *MetadataShardOperations {
 	return &MetadataShardOperations{ms: ms}
 }
 
+func (m *MetadataShardOperations) resolveRestoreLocation(req *store.ShardStartRequest) error {
+	if req.RestoreConfig == nil ||
+		req.RestoreConfig.Connection == "" ||
+		!strings.HasPrefix(req.RestoreConfig.Location, "file://") {
+		return nil
+	}
+	resolved, err := m.ms.config.ResolveFilesystemPath(
+		req.RestoreConfig.Connection,
+		"restore.read",
+		req.RestoreConfig.Location,
+	)
+	if err != nil {
+		return fmt.Errorf("authorizing filesystem restore: %w", err)
+	}
+	restoreConfig := *req.RestoreConfig
+	restoreConfig.ResolvedLocation = "file://" + resolved
+	req.RestoreConfig = &restoreConfig
+	return nil
+}
+
 func (m *MetadataShardOperations) StartShard(
 	ctx context.Context,
 	shardID types.ID,
@@ -71,6 +92,9 @@ func (m *MetadataShardOperations) StartShard(
 		Join:        join,
 		SplitStart:  splitStart,
 		Timestamp:   time.Now().UTC().AppendFormat(nil, time.RFC3339),
+	}
+	if err := m.resolveRestoreLocation(req); err != nil {
+		return err
 	}
 	m.ms.logger.Info(
 		"Starting shard on peers",
@@ -139,6 +163,9 @@ func (m *MetadataShardOperations) StartShardOnNode(
 		Join:        true, // Always joining an existing group
 		SplitStart:  splitStart,
 		Timestamp:   time.Now().UTC().AppendFormat(nil, time.RFC3339),
+	}
+	if err := m.resolveRestoreLocation(req); err != nil {
+		return err
 	}
 
 	m.ms.logger.Info(

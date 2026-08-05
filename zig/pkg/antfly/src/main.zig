@@ -22,23 +22,25 @@ const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
 
 const antfly_cloud_binary = "antfly-cloud";
-const recommended_server_fd_limit: u64 = 4096;
-
-const ServerSubcommand = enum {
-    data,
-    metadata,
-    standalone,
-    inference,
-    serverless,
-    lite,
-    ha,
-};
 
 pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    mainImpl(init) catch |err| {
+        const message = switch (err) {
+            error.FileNotFound => "required file was not found; check the configured path",
+            error.AddressInUse => "listen address is already in use",
+            error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
+            else => "startup failed; see the preceding diagnostic for details",
+        };
+        std.debug.print("antfly: {s}\n", .{message});
+        std.process.exit(1);
+    };
+}
+
+fn mainImpl(init: std.process.Init) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -59,18 +61,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (serverSubcommand(subcommand)) |server_command| {
-        ensureServerFileDescriptorLimit();
-        return switch (server_command) {
-            .data => try cmd.data.runFromIterator(runtimeInit(init), argv0, &args),
-            .metadata => try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args),
-            .standalone => try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args),
-            .inference => try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args),
-            .serverless => try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args),
-            .lite => try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args),
-            .ha => try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args),
-        };
-    }
+    // Server-side subcommands
+    if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -100,31 +98,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
-}
-
-fn serverSubcommand(subcommand: []const u8) ?ServerSubcommand {
-    return std.meta.stringToEnum(ServerSubcommand, subcommand);
-}
-
-fn ensureServerFileDescriptorLimit() void {
-    const limit = platform.process.ensureFileDescriptorSoftLimitAtLeast(recommended_server_fd_limit) catch |err| {
-        std.log.warn("server file-descriptor limit unavailable platform={s} recommended={d} error={s}", .{ @tagName(builtin.os.tag), recommended_server_fd_limit, @errorName(err) });
-        return;
-    };
-    if (limit.soft < recommended_server_fd_limit) {
-        std.log.warn("LOW SERVER FILE-DESCRIPTOR LIMIT soft={d} hard={d} recommended={d} index creation may fail with ProcessFdQuotaExceeded", .{ limit.soft, limit.hard, recommended_server_fd_limit });
-    } else if (limit.soft != limit.initial_soft) {
-        std.log.info("raised server file-descriptor limit initial_soft={d} soft={d} hard={d} recommended={d}", .{ limit.initial_soft, limit.soft, limit.hard, recommended_server_fd_limit });
-    } else {
-        std.log.info("server file-descriptor limit soft={d} hard={d} recommended={d}", .{ limit.soft, limit.hard, recommended_server_fd_limit });
-    }
-}
-
-test "server subcommand classification includes every server dispatch" {
-    inline for (std.meta.tags(ServerSubcommand)) |server_command| {
-        try std.testing.expectEqual(server_command, serverSubcommand(@tagName(server_command)).?);
-    }
-    try std.testing.expect(serverSubcommand("table") == null);
 }
 
 fn cliHelpRequested(args: *std.process.Args.Iterator) bool {

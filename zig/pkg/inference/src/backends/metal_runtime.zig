@@ -10941,7 +10941,12 @@ pub fn isMetalNativeSupported(tensor_type: gguf_tensor_types.TensorType) bool {
             .F32, .F16, .BF16 => true,
             .Q1_0, .Q4_0, .Q4_1, .Q5_0, .Q5_1, .Q8_0, .Q8_1, .Q2_K, .Q3_K, .Q4_K, .Q5_K, .Q6_K, .Q8_K => true,
             .I8_S => true,
-            .IQ4_NL, .IQ4_XS => true,
+            .IQ4_NL => true,
+            // The current IQ4_XS Metal paths (including the reference dequantize +
+            // SGEMM path) produce incorrect logits for a real Gemma 4
+            // UD-Q4_K_XL artifact. Fail closed so automatic backend selection can
+            // fall back to the native implementation instead of returning token soup.
+            .IQ4_XS => false,
             .MXFP4, .NVFP4, .IQ2_XS => true,
             .I2_S, .TL1 => true,
             else => false,
@@ -18206,7 +18211,6 @@ test "metal native quant support map matches direct runtime slot coverage" {
         .{ .known = .Q8_1 },
         .{ .known = .Q8_K },
         .{ .known = .IQ4_NL },
-        .{ .known = .IQ4_XS },
         .{ .known = .MXFP4 },
         .{ .known = .NVFP4 },
         .{ .known = .IQ2_XS },
@@ -18218,6 +18222,7 @@ test "metal native quant support map matches direct runtime slot coverage" {
     }
 
     const unsupported = [_]gguf_tensor_types.TensorType{
+        .{ .known = .IQ4_XS },
         .{ .known = .TQ1_0 },
         .{ .unknown = 0xffff },
     };

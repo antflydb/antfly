@@ -105,7 +105,7 @@ pub const AlgebraicIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -491,18 +491,18 @@ pub const EmbeddingsIndexStats = struct {
     total_nodes: ?i64 = null,
     /// Number of unique terms in the inverted index (sparse only)
     total_terms: ?i64 = null,
-    /// Whether the index enricher is currently backfilling
+    /// Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true.
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
     backfill_active: ?bool = null,
-    /// Backfill progress as a ratio from 0.0 to 1.0
+    /// Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
     backfill_progress: ?f64 = null,
     /// Total items processed during backfill
     backfill_items_processed: ?i64 = null,
-    /// Operational readiness state such as ready, running, retrying, or failed.
+    /// Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal.
     backfill_state: ?[]const u8 = null,
     /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
@@ -529,8 +529,7 @@ pub const EmbeddingsIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    /// Embedding enrichment worker runtime diagnostics.
-    enrichment_runtime: ?std.json.Value = null,
+    enrichment_runtime: ?EnrichmentRuntimeStatus = null,
     hbc_cache: ?std.json.Value = null,
     hbc_posting: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
@@ -541,7 +540,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -621,6 +620,50 @@ pub const EnrichmentKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Runtime state for the durable embeddings enrichment worker.
+pub const EnrichmentRuntimeStatus = struct {
+    enabled: bool,
+    target_sequence: i64,
+    applied_sequence: i64,
+    pending_sequence_count: i64,
+    projection_checkpoint_status: []const u8,
+    projection_checkpoint_applied_sequence: i64,
+    projection_checkpoint_generation: i64,
+    projection_checkpoint_config_fingerprint: []const u8,
+    /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
+    projection_checkpoint_identity_consistent: bool,
+    checkpoint_replay_tail_sequence_count: i64,
+    processed_requests: i64,
+    error_count: i64,
+    retryable_error_count: i64,
+    fatal_error_count: i64,
+    retrying: bool,
+    worker_failed: bool,
+    /// Whether the background enrichment worker is currently running.
+    worker_started: bool,
+    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    stalled: bool,
+    skip_by_hash_count: i64,
+    skipped_source_count: i64,
+    codec_decode_failures: i64,
+    embed_batches_started: i64,
+    embed_batches_completed: i64,
+    embed_items_started: i64,
+    embed_items_completed: i64,
+    active_embed_batch_items: i64,
+    active_embed_batch_bytes: i64,
+    active_embed_batch_max_bytes: i64,
+    active_embed_batch_started_ms: i64,
+    last_embed_batch_items: i64,
+    last_embed_batch_bytes: i64,
+    last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
+    last_embed_batch_ns: i64,
+    total_embed_ns: i64,
 };
 
 /// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
@@ -708,7 +751,7 @@ pub const FullTextIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -816,7 +859,7 @@ pub const GraphIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -957,6 +1000,8 @@ pub const GraphQueryType = enum {
 pub const GraphResultNode = struct {
     /// Document key
     key: []const u8,
+    /// Owning table for a cross-table node; omitted for nodes in the queried table
+    table: ?[]const u8 = null,
     /// Distance from start node
     depth: ?i64 = null,
     /// Weighted distance

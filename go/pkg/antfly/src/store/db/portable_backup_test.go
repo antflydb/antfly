@@ -18,16 +18,27 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"flag"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/encoding"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/vectorindex"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/storeutils"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+)
+
+var updateProductionPortableGolden = flag.Bool(
+	"update-production-portable-golden",
+	false,
+	"regenerate the production Go portable fixture consumed by Zig",
 )
 
 func TestExportImportPortable_Documents(t *testing.T) {
@@ -327,6 +338,73 @@ func TestExportPortable_EmptyDB(t *testing.T) {
 	// Should still produce a valid AFB file
 	assert.True(t, common.IsAFBFormat(buf.Bytes()))
 	assert.Greater(t, buf.Len(), common.AFBHeaderSize)
+}
+
+func TestExportPortable_ProductionCrossRuntimeFixture(t *testing.T) {
+	srcDB := setupTestDB(t)
+	defer cleanupTestDB(t, srcDB)
+
+	docs := []struct {
+		key   string
+		value []byte
+	}{
+		{"prod-alpha", []byte(`{"id":"prod-alpha","title":"Alpha","body":"` + string(bytes.Repeat([]byte("portable production payload "), 128)) + `"}`)},
+		{"prod-beta", []byte(`{"id":"prod-beta","title":"Beta","body":"` + string(bytes.Repeat([]byte("cross runtime compressed data "), 128)) + `"}`)},
+		{"prod-gamma", []byte(`{"id":"prod-gamma","title":"Gamma","body":"` + string(bytes.Repeat([]byte("deterministic backup fixture "), 128)) + `"}`)},
+	}
+	batch := srcDB.pdb.NewBatch()
+	for _, doc := range docs {
+		require.NoError(t, batch.Set(storeutils.KeyRangeStart([]byte(doc.key)), doc.value, nil))
+	}
+	require.NoError(t, batch.Commit(pebble.Sync))
+
+	var got bytes.Buffer
+	require.NoError(t, srcDB.exportPortableWithOptions(
+		context.Background(),
+		&got,
+		portableExportOptions{
+			backupID:  uuid.MustParse("12345678-1234-5678-9abc-def012345678"),
+			createdAt: time.Date(2026, time.July, 26, 12, 0, 0, 123456789, time.UTC),
+			compress:  true,
+		},
+	))
+	require.True(t, productionFixtureHasCompressedDocumentBlock(got.Bytes()))
+
+	goldenPath := filepath.Join("testdata", "production_portable_v1.afb")
+	zigGoldenPath := filepath.Join(
+		"..", "..", "..", "..", "..", "..",
+		"zig", "pkg", "antfly", "src", "storage", "testdata",
+		"production_portable_v1.afb",
+	)
+	if *updateProductionPortableGolden {
+		require.NoError(t, os.MkdirAll(filepath.Dir(goldenPath), 0o755))
+		require.NoError(t, os.WriteFile(goldenPath, got.Bytes(), 0o644))
+		require.NoError(t, os.MkdirAll(filepath.Dir(zigGoldenPath), 0o755))
+		require.NoError(t, os.WriteFile(zigGoldenPath, got.Bytes(), 0o644))
+		return
+	}
+	want, err := os.ReadFile(goldenPath)
+	require.NoError(t, err, "run with -update-production-portable-golden")
+	require.Equal(t, want, got.Bytes())
+	zigWant, err := os.ReadFile(zigGoldenPath)
+	require.NoError(t, err, "Zig production fixture is missing")
+	require.Equal(t, want, zigWant, "Go and Zig production fixtures diverged")
+}
+
+func productionFixtureHasCompressedDocumentBlock(data []byte) bool {
+	for offset := common.AFBHeaderSize; offset+10 <= len(data); {
+		blockType := common.AFBBlockType(data[offset])
+		flags := common.AFBBlockFlag(data[offset+1])
+		payloadBytes := int(binary.LittleEndian.Uint32(data[offset+2 : offset+6]))
+		if offset+10+payloadBytes > len(data) {
+			return false
+		}
+		if blockType == common.BlockDocumentBatch {
+			return flags&common.BlockFlagCompressed != 0
+		}
+		offset += 10 + payloadBytes
+	}
+	return false
 }
 
 func TestKeyClassification(t *testing.T) {

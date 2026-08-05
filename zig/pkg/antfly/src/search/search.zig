@@ -346,6 +346,10 @@ pub const PhraseQuery = struct {
 pub const PrefixQuery = struct {
     field: []const u8,
     prefix: []const u8,
+    /// Optional materialized prefix field. Execution uses an exact lookup when
+    /// the field exists in a segment and transparently falls back to the source
+    /// dictionary for older segments.
+    indexed_field: ?[]const u8 = null,
     boost: f32 = 1.0,
 };
 
@@ -369,6 +373,7 @@ pub const BoolQuery = struct {
     should: []const SearchQuery = &.{},
     must_not: []const SearchQuery = &.{},
     min_should: u32 = 0,
+    pure_should_optional: bool = false,
     boost: f32 = 1.0,
 };
 
@@ -463,7 +468,7 @@ pub const ScoredHit = struct {
 fn effectiveK(request: SearchRequest, snap: *const index_mod.IndexSnapshot) u32 {
     if (request.search_after != null) {
         // Retrieve all matching results so cursor filtering works correctly
-        return snap.global_doc_count;
+        return snap.liveDocCount();
     }
     return request.k + request.offset;
 }
@@ -836,11 +841,12 @@ fn executeScoredPhraseFilter(
         return executeFilterQuery(alloc, snap, .{ .phrase = phrase_filter }, request, boost);
     }
 
+    const scoring_doc_count = snap.scoringDocCount();
     var phrase_idf_sum: f32 = 0;
     for (phrase_filter.terms) |term| {
         const df = try snap.termDocFreq(alloc, phrase_filter.field, term);
         if (df == 0) return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
-        phrase_idf_sum += inverted.bm25Idf(snap.global_doc_count, df);
+        phrase_idf_sum += inverted.bm25Idf(scoring_doc_count, df);
     }
 
     var collector = FastTopK{
@@ -860,6 +866,8 @@ fn executeScoredPhraseFilter(
         doc_offset += segment.reader.doc_count;
 
         const inv_reader = (try segment.reader.invertedIndex(phrase_filter.field)) orelse continue;
+        segment.shared.lockDeletionShared();
+        defer segment.shared.unlockDeletionShared();
         const PhraseScoreState = struct {
             iter: inverted.PostingsIterator,
             current: ?inverted.PostingsIterator.Hit = null,
@@ -1059,6 +1067,7 @@ fn executePrefix(
     return executeFilterQuery(alloc, snap, .{ .prefix = .{
         .field = pq.field,
         .prefix = pq.prefix,
+        .indexed_field = pq.indexed_field,
     } }, request, pq.boost);
 }
 
@@ -1203,8 +1212,17 @@ fn executeGeoShape(
 ) !SearchResult {
     return executeFilterQuery(alloc, snap, .{ .geo_shape = .{
         .field = gq.field,
+        .relation = geoShapeFilterRelation(gq.relation),
         .polygons = gq.polygons,
     } }, request, gq.boost);
+}
+
+fn geoShapeFilterRelation(relation: GeoShapeRelation) query_mod.GeoShapeRelation {
+    return switch (relation) {
+        .intersects => .intersects,
+        .within => .within,
+        .contains => .contains,
+    };
 }
 
 fn executeWildcard(
@@ -1304,7 +1322,7 @@ fn executeQueryAllScored(
 ) ![]scorer_mod.ScoredHit {
     var sub_request = request;
     sub_request.query = query;
-    sub_request.k = snap.global_doc_count;
+    sub_request.k = snap.liveDocCount();
     sub_request.offset = 0;
     sub_request.include_stored = false;
     sub_request.aggregations = &.{};
@@ -1347,6 +1365,28 @@ fn buildAllDocsScoreMap(alloc: Allocator, snap: *const index_mod.IndexSnapshot) 
     defer alloc.free(doc_ids);
     for (doc_ids) |doc_id| {
         try map.put(alloc, doc_id, 1.0);
+    }
+    return map;
+}
+
+fn buildOptionalShouldBaseScoreMap(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    request: SearchRequest,
+) !ScoreMap {
+    var map: ScoreMap = .{};
+    errdefer map.deinit(alloc);
+    const doc_ids = if (request.filter_doc_nums_positive)
+        try snap.executeFilter(alloc, .{ .doc_num = .{
+            .doc_nums = request.filter_doc_nums,
+        } })
+    else
+        try snap.executeFilter(alloc, .{ .match_all = {} });
+    defer alloc.free(doc_ids);
+    for (doc_ids) |doc_id| {
+        if (!containsSortedU32(request.exclude_doc_nums, doc_id)) {
+            try map.put(alloc, doc_id, 0.0);
+        }
     }
     return map;
 }
@@ -1638,6 +1678,7 @@ fn initFastTermStates(
         for (states.items) |*state| state.deinit();
         states.deinit(alloc);
     };
+    const scoring_doc_count = snap.scoringDocCount();
 
     for (terms) |term| {
         const lookup_result = inv_reader.lookup(term.term) orelse {
@@ -1657,7 +1698,7 @@ fn initFastTermStates(
         var state = FastTermState{
             .iter = iter,
             .doc_freq = df,
-            .idf = inverted.bm25Idf(snap.global_doc_count, df),
+            .idf = inverted.bm25Idf(scoring_doc_count, df),
             .boost = term.boost,
             .block_max = switch (lookup_result) {
                 .postings => |postings| postings.block_max,
@@ -1703,6 +1744,8 @@ fn scoreFastTerm(
 }
 
 fn isSegmentDocDeleted(seg: *const index_mod.SegmentEntry, doc_id: u32) bool {
+    // The segment-scoring callers hold the shared deletion lock for the whole
+    // postings walk, avoiding a lock/unlock for every candidate document.
     if (seg.shared.deleted) |deleted| return deleted.contains(doc_id);
     return false;
 }
@@ -2099,12 +2142,21 @@ fn executeSimpleTextBool(
     if (should_terms.items.len > 0) field = simpleTermsField(should_terms.items, field) orelse return null;
     if (must_not_terms.items.len > 0) field = simpleTermsField(must_not_terms.items, field) orelse return null;
     const text_field = field orelse return null;
-    if (snap.global_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+    const live_doc_count = snap.liveDocCount();
+    if (live_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+    const scoring_doc_count = snap.scoringDocCount();
 
-    const effective_min_should: u32 = if (should_terms.items.len > 0 and bq.min_should == 0 and must_terms.items.len == 0) 1 else bq.min_should;
+    const effective_min_should: u32 = if (should_terms.items.len > 0 and
+        bq.min_should == 0 and
+        must_terms.items.len == 0 and
+        !bq.pure_should_optional) 1 else bq.min_should;
     if (effective_min_should > should_terms.items.len) {
         return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
     }
+    // Optional pure-should queries require a zero-score candidate baseline.
+    // The all-hit path builds that baseline from the already-resolved positive
+    // document constraint, avoiding a full-index scan when a filter supplied it.
+    if (bq.pure_should_optional and must_terms.items.len == 0) return null;
 
     // A pure, minimum-one disjunction is exactly the query shape handled by
     // the production Block-Max WAND scorer. Keep constrained, prohibited,
@@ -2186,10 +2238,12 @@ fn executeSimpleTextBool(
                 diag.postings_iterators_opened +|= @intCast(must_states.len + should_states.len + must_not_states.len);
             }
 
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
             if (must_terms.items.len > 0) {
-                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
+                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
             } else if (should_states.len > 0) {
-                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost);
+                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost);
             }
         }
     }
@@ -2222,7 +2276,10 @@ fn executeBoolAllHit(
     var combined: ScoreMap = .{};
     var initialized = false;
     errdefer combined.deinit(alloc);
-    const effective_min_should: u32 = if (bq.should.len > 0 and bq.min_should == 0 and bq.must.len == 0) 1 else bq.min_should;
+    const effective_min_should: u32 = if (bq.should.len > 0 and
+        bq.min_should == 0 and
+        bq.must.len == 0 and
+        !bq.pure_should_optional) 1 else bq.min_should;
 
     for (bq.must) |sub_query| {
         const sub_hits = try executeQueryAllScored(alloc, snap, sub_query, request);
@@ -2233,6 +2290,11 @@ fn executeBoolAllHit(
         } else {
             try intersectScoresWithHits(alloc, &combined, sub_hits);
         }
+    }
+
+    if (bq.pure_should_optional and bq.must.len == 0) {
+        combined = try buildOptionalShouldBaseScoreMap(alloc, snap, request);
+        initialized = true;
     }
 
     if (bq.should.len > 0) {
@@ -2391,6 +2453,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         } },
         .geo_shape => |gq| .{ .geo_shape = .{
             .field = gq.field,
+            .relation = geoShapeFilterRelation(gq.relation),
             .polygons = gq.polygons,
         } },
         .match => |mq| blk: {
@@ -2414,20 +2477,33 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         },
         .phrase => |pq| (try buildPhraseFilter(alloc, pq.field, pq.text, pq.analyzer orelse &analysis_mod.default_analyzer, pq.max_edits, pq.auto_fuzzy)) orelse
             .{ .bool_filter = .{ .must = &.{}, .should = &.{}, .must_not = &.{} } },
-        .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix } },
+        .prefix => |pq| .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
         .wildcard => |wq| .{ .wildcard = .{ .field = wq.field, .pattern = wq.pattern } },
         .regexp => |rq| .{ .regexp = .{ .field = rq.field, .pattern = rq.pattern } },
         .bool_query => |bq| blk: {
             const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must);
             const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should);
             const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not);
-            const effective_min_should: u32 = if (should.len > 0 and bq.min_should == 0 and must.len == 0) 1 else bq.min_should;
-            break :blk .{ .bool_filter = .{
-                .must = must,
-                .should = should,
-                .must_not = must_not,
-                .min_should_match = effective_min_should,
-            } };
+            const filter_must = if (bq.pure_should_optional and must.len == 0) required: {
+                const match_all = try alloc.alloc(query_mod.Filter, 1);
+                match_all[0] = .{ .match_all = {} };
+                break :required match_all;
+            } else must;
+            const effective_min_should: u32 = if (should.len > 0 and
+                bq.min_should == 0 and
+                filter_must.len == 0 and
+                !bq.pure_should_optional) 1 else bq.min_should;
+            break :blk .{
+                .bool_filter = .{
+                    // The bitmap engine uses a missing required branch to infer a
+                    // one-clause should minimum. Preserve optional scoring should
+                    // semantics with an internal match-all membership anchor.
+                    .must = filter_must,
+                    .should = should,
+                    .must_not = must_not,
+                    .min_should_match = effective_min_should,
+                },
+            };
         },
         else => return error.InvalidArgument,
     };
@@ -2560,7 +2636,11 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .geo_shape => |gq| .{
-            .filter = .{ .geo_shape = .{ .field = gq.field, .polygons = gq.polygons } },
+            .filter = .{ .geo_shape = .{
+                .field = gq.field,
+                .relation = geoShapeFilterRelation(gq.relation),
+                .polygons = gq.polygons,
+            } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -2609,7 +2689,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             };
         },
         .prefix => |pq| .{
-            .filter = .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix } },
+            .filter = .{ .prefix = .{ .field = pq.field, .prefix = pq.prefix, .indexed_field = pq.indexed_field } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -3243,7 +3323,7 @@ fn collectStatsBatched(
 ) !void {
     // Build a set of matching doc IDs per segment
     for (snap.segments, 0..) |*seg, seg_idx| {
-        const section_data = seg.reader.getSection(field, .typed_doc_values) orelse continue;
+        const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse continue;
         var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
 
         // Collect local doc IDs that belong to this segment
@@ -3323,7 +3403,7 @@ fn readF64ForDoc(
 ) !?f64 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     return switch (reader.value_type) {
         .f64_val => try reader.getF64(resolved.local_id),
@@ -3344,7 +3424,7 @@ fn readBytesForDoc(
 ) !?[]u8 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .bytes_val) return null;
 
@@ -3372,7 +3452,7 @@ fn readU64ForDoc(
 ) !?u64 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .u64_val) return null;
     return try reader.getU64(resolved.local_id);
@@ -3387,7 +3467,7 @@ fn readGeoPointForDoc(
 ) !?geo_mod.GeoPoint {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
@@ -3510,6 +3590,110 @@ test "bool fallback applies native doc number constraints" {
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
 }
 
+test "exact inclusive term range preserves prefix constant scores" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "app", .freq = 1, .norm = 10 },
+            .{ .term = "apple", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "app", .freq = 1, .norm = 10 },
+            .{ .term = "application", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{}", .terms = &.{
+            .{ .term = "banana", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+
+    var prefix = try execute(alloc, snap, .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "app", .boost = 2.5 } },
+        .k = 10,
+    });
+    defer prefix.deinit();
+    var exact = try execute(alloc, snap, .{
+        .query = .{ .term_range = .{
+            .field = "title",
+            .min = "app",
+            .max = "app",
+            .inclusive_min = true,
+            .inclusive_max = true,
+            .boost = 2.5,
+        } },
+        .k = 10,
+    });
+    defer exact.deinit();
+
+    try std.testing.expectEqual(prefix.total_hits, exact.total_hits);
+    try std.testing.expectEqual(prefix.hits.len, exact.hits.len);
+    for (prefix.hits, exact.hits) |prefix_hit, exact_hit| {
+        try std.testing.expectEqual(prefix_hit.doc_id, exact_hit.doc_id);
+        try std.testing.expectApproxEqAbs(prefix_hit.score, exact_hit.score, 0.00001);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.5), exact_hit.score, 0.00001);
+    }
+}
+
+test "optional pure should preserves zero baseline and text scores" {
+    const alloc = std.testing.allocator;
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "beta", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+    const candidates = [_]u32{ 0, 1 };
+
+    var direct = try execute(alloc, snap, .{
+        .query = .{ .term = .{ .field = "title", .term = "alpha" } },
+        .k = 10,
+        .filter_doc_nums = &candidates,
+        .filter_doc_nums_positive = true,
+    });
+    defer direct.deinit();
+    const optional_query: SearchQuery = .{ .bool_query = .{
+        .should = &.{.{ .term = .{ .field = "title", .term = "alpha" } }},
+        .pure_should_optional = true,
+    } };
+    var optional = try execute(alloc, snap, .{
+        .query = optional_query,
+        .k = 10,
+        .filter_doc_nums = &candidates,
+        .filter_doc_nums_positive = true,
+    });
+    defer optional.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), optional.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), optional.hits.len);
+    try std.testing.expectEqualStrings("doc1", optional.hits[0].id.?);
+    try std.testing.expectApproxEqAbs(direct.hits[0].score, optional.hits[0].score, 0.00001);
+    try std.testing.expectEqual(@as(f32, 0.0), optional.hits[1].score);
+
+    var filter_arena = std.heap.ArenaAllocator.init(alloc);
+    defer filter_arena.deinit();
+    const membership_filter = try searchQueryToFilterArena(
+        filter_arena.allocator(),
+        optional_query,
+    );
+    const membership = try snap.executeFilter(alloc, membership_filter);
+    defer alloc.free(membership);
+    try std.testing.expectEqualSlices(u32, &candidates, membership);
+}
+
 test "search match query with analysis" {
     const alloc = std.testing.allocator;
 
@@ -3586,7 +3770,7 @@ test "search match query can use distributed text stats for shard-consistent bm2
 
     const distributed_stats = [_]distributed_stats_mod.TextFieldStats{.{
         .field = "title",
-        .global_doc_count = combined_snap.global_doc_count,
+        .global_doc_count = combined_snap.liveDocCount(),
         .global_total_field_len = combined_snap.global_total_field_len.get("title") orelse 0,
         .term_doc_freqs = &.{
             .{ .term = "alpha", .doc_freq = try combined_snap.termDocFreq(alloc, "title", "alpha") },
@@ -3788,7 +3972,7 @@ test "streaming boolean scorer matches all-hit reference on randomized corpus" {
         };
         const request = SearchRequest{
             .query = .{ .bool_query = bool_query },
-            .k = snap.global_doc_count,
+            .k = snap.liveDocCount(),
             .include_stored = false,
         };
         var streaming = (try executeSimpleTextBool(alloc, snap, bool_query, request)) orelse return error.TestExpectedEqual;
@@ -4344,7 +4528,7 @@ test "resolveDocId across segments" {
     try std.testing.expect(snap.resolveDocId(3) == null);
 
     // storedDoc by global ID
-    const stored = snap.storedDoc(2).?;
+    const stored = (try snap.storedDoc(2)).?;
     try std.testing.expectEqualStrings("c", stored.id);
 }
 

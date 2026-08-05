@@ -137,9 +137,6 @@ pub const MatchQuery = struct {
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
 };
 
 pub const MultiMatchBody = struct {
@@ -184,7 +181,6 @@ pub const PrefixQuery = struct {
 
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
-    match_query: *MatchQuery,
     boolean_query: *BooleanQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     numeric_range_query: *NumericRangeQuery,
@@ -193,6 +189,7 @@ pub const Query = union(enum) {
     match_phrase_query: *MatchPhraseQuery,
     disjunction_query: *DisjunctionQuery,
     geo_distance_query: *GeoDistanceQuery,
+    match_query: *MatchQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
@@ -237,15 +234,6 @@ pub const Query = union(enum) {
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "match",
-            "analyzer",
-            "prefix_length",
-            "fuzziness",
-            "operator",
-        })) {
-            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "must",
@@ -304,6 +292,12 @@ pub const Query = union(enum) {
             "distance",
         })) {
             if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "analyzer",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "terms",
@@ -393,7 +387,6 @@ pub const Query = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
-            .match_query => |v| try jw.write(v.*),
             .boolean_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
@@ -402,6 +395,7 @@ pub const Query = union(enum) {
             .match_phrase_query => |v| try jw.write(v.*),
             .disjunction_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),

@@ -437,8 +437,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const query_params = RemovePermissionFromUserParams{
-                .resource = ctx.query("resource") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resource" }),
-                .resource_type = ctx.query("resourceType") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resourceType" }),
+                .resource = (try ctx.queryDecoded("resource")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resource" }),
+                .resource_type = (try ctx.queryDecoded("resourceType")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resourceType" }),
             };
             return impl.removePermissionFromUser(ctx, user_name, query_params);
         }
@@ -465,7 +465,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const query_params = RemoveRoleFromUserParams{
-                .role = ctx.query("role") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: role" }),
+                .role = (try ctx.queryDecoded("role")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: role" }),
             };
             return impl.removeRoleFromUser(ctx, user_name, query_params);
         }

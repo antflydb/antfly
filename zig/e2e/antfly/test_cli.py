@@ -94,8 +94,14 @@ def test_table_create_list_get_drop(cli):
     # create
     cli("table", "create", "--table", table, "--shards", "1")
 
-    # list — should contain the new table
+    # list defaults to a compact summary rather than dumping full metadata
     result = cli("table", "list")
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "NAME\tSHARDS\tINDEXES\tSTORAGE"
+    assert any(line.startswith(f"{table}\t1\t") for line in lines[1:])
+
+    # detailed machine-readable output remains available explicitly
+    result = cli("table", "list", "--output", "json")
     tables = parse_json(result.stdout)
     assert isinstance(tables, list)
     names = [t["name"] for t in tables]
@@ -111,7 +117,7 @@ def test_table_create_list_get_drop(cli):
 
     # list again — should be gone (eventually)
     def table_gone() -> bool:
-        r = cli("table", "list")
+        r = cli("table", "list", "--output", "json")
         tbl_list = parse_json(r.stdout)
         return table not in [t["name"] for t in tbl_list]
 
@@ -136,7 +142,7 @@ def test_insert_lookup_delete(cli):
 
     # insert
     doc = json.dumps({"title": "Hello", "body": "world"})
-    cli("insert", "--table", table, "--key", "doc1", "--value", doc)
+    cli("insert", "--table", table, "--key", "doc1", "--document", doc)
 
     # lookup
     def lookup_succeeds() -> dict | None:

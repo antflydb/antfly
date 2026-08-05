@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/logger"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
@@ -85,6 +86,7 @@ type metadataKV struct {
 	// commitDoneC is closed when the ReadCommits goroutine exits,
 	// so Close() can wait for commit processing to finish before closing Pebble.
 	commitDoneC chan struct{}
+	ctx         context.Context
 	cancel      context.CancelFunc
 
 	// Pending batch for commit processing (implements raftkv.CommitProcessor).
@@ -97,6 +99,13 @@ type metadataKV struct {
 
 func (s *metadataKV) pebbleDir() string {
 	return s.dbDir + "/pebble"
+}
+
+func (s *metadataKV) ownedLifecycleContext() context.Context {
+	if s.ctx == nil || s.ctx.Err() != nil {
+		s.ctx, s.cancel = context.WithCancel(context.Background()) //nolint:gosec // owned and canceled by metadataKV.Close
+	}
+	return s.ctx
 }
 
 func newMetadataKV(
@@ -120,6 +129,7 @@ func newMetadataKV(
 		loadSnapshotID: loadSnapshotID,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx = ctx
 	s.cancel = cancel
 
 	// FIXME (ajr) If we gracefully shutdown we shouldn't need to load from the snapshot
@@ -299,7 +309,10 @@ func (s *metadataKV) getPebbleOpts() (*pebble.Options, error) {
 
 // configureS3Storage configures Pebble to use S3 for remote sstable storage.
 func (s *metadataKV) configureS3Storage(pebbleOpts *pebble.Options) error {
-	s3Info := s.antflyConfig.Storage.Local.S3
+	s3Info, err := s.antflyConfig.ResolveObjectStorageS3("catalog")
+	if err != nil {
+		return fmt.Errorf("resolving object storage catalog lane: %w", err)
+	}
 	s.logger.Info("Configuring S3 storage for metadata Pebble",
 		zap.String("endpoint", s3Info.Endpoint),
 		zap.String("bucket", s3Info.Bucket),
@@ -307,9 +320,11 @@ func (s *metadataKV) configureS3Storage(pebbleOpts *pebble.Options) error {
 		zap.Bool("useSSL", s3Info.UseSsl),
 	)
 
-	minioClient, err := s3Info.NewMinioClient()
+	bucketCtx, cancelBucket := context.WithTimeout(s.ownedLifecycleContext(), 30*time.Second)
+	defer cancelBucket()
+	minioClient, err := s3Info.EnsureBucket(bucketCtx)
 	if err != nil {
-		return fmt.Errorf("creating S3 client: %w", err)
+		return fmt.Errorf("preparing S3 bucket: %w", err)
 	}
 
 	baseS3Storage, err := s3storage.NewS3Storage(

@@ -8,14 +8,16 @@
 //! This file is deliberately separate from the primary document store: repair
 //! candidates and replay pins belong to one physical replica and must not be
 //! copied by logical table replication.  Intent and pin changes are rewritten
-//! as one checksummed, fsync+rename checkpoint so restart can never observe one
-//! without the other.
+//! as one checksummed atomic checkpoint. Native storage uses fsync+rename;
+//! external storage supplies equivalent atomic publication so restart can
+//! never observe one without the other.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
+const storage_io = @import("../../lsm_backend/storage_io.zig");
 const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
@@ -27,6 +29,24 @@ const max_index_name_bytes: usize = 4 * 1024;
 const max_candidate_path_bytes: usize = 16 * 1024;
 const max_build_resume_key_bytes: usize = 64 * 1024;
 const max_error_bytes: usize = 16 * 1024;
+
+/// Durable location for replica-local repair state. Filesystem-backed DBs use
+/// the native path, while externally owned roots (for example `.aflite`) keep
+/// the same checkpoint inside their storage namespace. `lock_key` identifies
+/// the physical replica and must be unique even when multiple containers use
+/// the same logical storage path.
+pub const Location = struct {
+    lock_key: []const u8,
+    path: []const u8,
+    storage: ?storage_io.Storage = null,
+
+    pub fn native(path: []const u8) Location {
+        return .{
+            .lock_key = path,
+            .path = path,
+        };
+    }
+};
 
 pub const Trigger = enum(u8) {
     incomplete_bulk_publish = 1,
@@ -339,13 +359,17 @@ pub fn newRepairId(alloc: Allocator) !u128 {
 }
 
 pub fn loadOrCreate(alloc: Allocator, path: []const u8, root_generation: u64) !State {
-    var guard = try acquire(path);
+    return try loadOrCreateAt(alloc, .native(path), root_generation);
+}
+
+pub fn loadOrCreateAt(alloc: Allocator, location: Location, root_generation: u64) !State {
+    var guard = try acquire(location.lock_key);
     defer guard.release();
-    return loadUnlocked(alloc, path) catch |err| switch (err) {
+    return loadUnlockedAt(alloc, location) catch |err| switch (err) {
         error.FileNotFound => blk: {
             var state = State{ .identity = try newReplicaIdentity(alloc, root_generation) };
             errdefer state.deinit(alloc);
-            try writeUnlocked(alloc, path, &state);
+            try writeUnlockedAt(alloc, location, &state);
             break :blk state;
         },
         else => return err,
@@ -353,9 +377,13 @@ pub fn loadOrCreate(alloc: Allocator, path: []const u8, root_generation: u64) !S
 }
 
 pub fn load(alloc: Allocator, path: []const u8) !State {
-    var guard = try acquire(path);
+    return try loadAt(alloc, .native(path));
+}
+
+pub fn loadAt(alloc: Allocator, location: Location) !State {
+    var guard = try acquire(location.lock_key);
     defer guard.release();
-    return try loadUnlocked(alloc, path);
+    return try loadUnlockedAt(alloc, location);
 }
 
 /// Rebinds an empty replica-local repair checkpoint to a new physical root
@@ -367,7 +395,7 @@ pub fn resetForRootGeneration(
     expected_identity: ReplicaIdentity,
     root_generation: u64,
 ) !State {
-    return try resetForRootGenerationWithIntents(alloc, path, expected_identity, root_generation, &.{});
+    return try resetForRootGenerationWithIntentsAt(alloc, .native(path), expected_identity, root_generation, &.{});
 }
 
 /// Atomically replace a retired physical-root identity and bind all supplied
@@ -381,9 +409,25 @@ pub fn resetForRootGenerationWithIntents(
     root_generation: u64,
     intents: []const IndexRepairIntent,
 ) !State {
-    var guard = try acquire(path);
+    return try resetForRootGenerationWithIntentsAt(
+        alloc,
+        .native(path),
+        expected_identity,
+        root_generation,
+        intents,
+    );
+}
+
+pub fn resetForRootGenerationWithIntentsAt(
+    alloc: Allocator,
+    location: Location,
+    expected_identity: ReplicaIdentity,
+    root_generation: u64,
+    intents: []const IndexRepairIntent,
+) !State {
+    var guard = try acquire(location.lock_key);
     defer guard.release();
-    var old = try loadUnlocked(alloc, path);
+    var old = try loadUnlockedAt(alloc, location);
     defer old.deinit(alloc);
     if (!old.identity.eql(expected_identity)) return error.ReplicaIdentityMismatch;
     var replacement = State{ .identity = try newReplicaIdentity(alloc, root_generation) };
@@ -404,7 +448,7 @@ pub fn resetForRootGenerationWithIntents(
         try replacement.entries.append(alloc, .{ .intent = owned });
         owned_transferred = true;
     }
-    try writeUnlocked(alloc, path, &replacement);
+    try writeUnlockedAt(alloc, location, &replacement);
     return replacement;
 }
 
@@ -415,12 +459,22 @@ pub fn putEntry(
     expected: ?ExpectedTransition,
     entry: Entry,
 ) !void {
+    return try putEntryAt(alloc, .native(path), expected_identity, expected, entry);
+}
+
+pub fn putEntryAt(
+    alloc: Allocator,
+    location: Location,
+    expected_identity: ReplicaIdentity,
+    expected: ?ExpectedTransition,
+    entry: Entry,
+) !void {
     try validateEntry(entry);
     if (!entry.intent.identity().eql(expected_identity)) return error.ReplicaIdentityMismatch;
 
-    var guard = try acquire(path);
+    var guard = try acquire(location.lock_key);
     defer guard.release();
-    var state = try loadUnlocked(alloc, path);
+    var state = try loadUnlockedAt(alloc, location);
     defer state.deinit(alloc);
     if (!state.identity.eql(expected_identity)) return error.ReplicaIdentityMismatch;
 
@@ -462,7 +516,7 @@ pub fn putEntry(
         try state.entries.append(alloc, owned);
         owned_transferred = true;
     }
-    try writeUnlocked(alloc, path, &state);
+    try writeUnlockedAt(alloc, location, &state);
 }
 
 fn phaseTransitionAllowed(from: Phase, to: Phase) bool {
@@ -488,9 +542,18 @@ pub fn removeEntryAndPin(
     expected_identity: ReplicaIdentity,
     expected: ExpectedTransition,
 ) !void {
-    var guard = try acquire(path);
+    return try removeEntryAndPinAt(alloc, .native(path), expected_identity, expected);
+}
+
+pub fn removeEntryAndPinAt(
+    alloc: Allocator,
+    location: Location,
+    expected_identity: ReplicaIdentity,
+    expected: ExpectedTransition,
+) !void {
+    var guard = try acquire(location.lock_key);
     defer guard.release();
-    var state = try loadUnlocked(alloc, path);
+    var state = try loadUnlockedAt(alloc, location);
     defer state.deinit(alloc);
     if (!state.identity.eql(expected_identity)) return error.ReplicaIdentityMismatch;
     const i = findIndexByRepairId(&state, expected.repair_id) orelse return error.RepairTransitionConflict;
@@ -505,7 +568,7 @@ pub fn removeEntryAndPin(
     }
     var removed = state.entries.orderedRemove(i);
     defer removed.deinit(alloc);
-    try writeUnlocked(alloc, path, &state);
+    try writeUnlockedAt(alloc, location, &state);
 }
 
 fn findIndexByRepairId(state: *const State, repair_id: u128) ?usize {
@@ -557,23 +620,42 @@ pub fn validateCandidateRelativePath(index_name: []const u8, path: []const u8) !
         std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidRepairCandidatePath;
 }
 
-fn loadUnlocked(alloc: Allocator, path: []const u8) !State {
+fn loadUnlockedAt(alloc: Allocator, location: Location) !State {
+    if (location.storage) |storage| {
+        const raw = try storage.readFileAlloc(alloc, location.path, max_file_bytes);
+        defer alloc.free(raw);
+        return try decode(alloc, raw);
+    }
+
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_file_bytes));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), location.path, alloc, .limited(max_file_bytes));
     defer alloc.free(raw);
     return try decode(alloc, raw);
 }
 
-fn writeUnlocked(alloc: Allocator, path: []const u8, state: *const State) !void {
+fn writeUnlockedAt(alloc: Allocator, location: Location, state: *const State) !void {
     const encoded = try encode(alloc, state);
     defer alloc.free(encoded);
-    if (std.fs.path.dirname(path)) |parent| {
+    if (location.storage) |storage| {
+        if (std.fs.path.dirname(location.path)) |parent| {
+            try storage.createDirPath(parent);
+        }
+        var sink = try storage.beginAtomicWrite(alloc, location.path);
+        var sink_active = true;
+        defer if (sink_active) sink.abort();
+        try sink.appendSlice(encoded);
+        sink_active = false;
+        try sink.finish();
+        return;
+    }
+
+    if (std.fs.path.dirname(location.path)) |parent| {
         var io_parent = std.Io.Threaded.init(alloc, .{});
         defer io_parent.deinit();
         try fs_paths.createDirPathPortable(io_parent.io(), parent);
     }
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ location.path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -587,11 +669,11 @@ fn writeUnlocked(alloc: Allocator, path: []const u8, state: *const State) !void 
         try writer.end();
         try file.sync(io);
     }
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
+    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), location.path, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         return err;
     };
-    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(location.path) orelse ".");
 }
 
 fn encode(alloc: Allocator, state: *const State) ![]u8 {
@@ -827,6 +909,31 @@ fn testEntry(alloc: Allocator, identity: ReplicaIdentity, phase: Phase) !Entry {
             .retain_after_sequence = 0,
         },
     };
+}
+
+test "index repair state persists through backend storage" {
+    const alloc = std.testing.allocator;
+    var memory = storage_io.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const location = Location{
+        .lock_key = "memory-replica:index-repair",
+        .path = "/replica/index_repair.checkpoint",
+        .storage = memory.storage(),
+    };
+
+    var initial = try loadOrCreateAt(alloc, location, 8);
+    const identity = initial.identity;
+    initial.deinit(alloc);
+
+    var detected = try testEntry(alloc, identity, .detected);
+    defer detected.deinit(alloc);
+    try putEntryAt(alloc, location, identity, null, detected);
+
+    var reopened = try loadAt(alloc, location);
+    defer reopened.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), reopened.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), reopened.entries.items[0].intent.revision);
+    try std.testing.expectEqualStrings("dense_idx", reopened.entries.items[0].intent.index_name);
 }
 
 test "index repair state persists intent and provisional replay pin atomically" {

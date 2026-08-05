@@ -47,7 +47,17 @@ const McpToolSpec = struct {
     kind: McpToolKind,
     name: []const u8,
     description: []const u8,
+    permission: McpToolPermission,
+    table_argument: ?[]const u8 = null,
+    wildcard_table: bool = false,
     fields: []const McpToolFieldSpec = &.{},
+};
+
+const McpToolPermission = enum {
+    none,
+    read,
+    write,
+    admin,
 };
 
 const McpToolFieldType = enum {
@@ -89,6 +99,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .create_table,
         .name = "create_table",
         .description = "Create an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             // The runtime default is topology-aware: one for standalone and
@@ -102,19 +114,25 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .drop_table,
         .name = "drop_table",
         .description = "Drop an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
-    .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables", .permission = .read, .wildcard_table = true },
     .{
         .kind = .describe_table,
         .name = "describe_table",
         .description = "Describe an Antfly table, including schema, indexes, ranges, and storage status when available",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
         .kind = .create_index,
         .name = "create_index",
         .description = "Create an Antfly index",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
@@ -129,6 +147,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .drop_index,
         .name = "drop_index",
         .description = "Drop an Antfly index",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
@@ -138,18 +158,24 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .list_indexes,
         .name = "list_indexes",
         .description = "List indexes for an Antfly table",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
         .kind = .describe_indexes,
         .name = "describe_indexes",
         .description = "Describe indexes for an Antfly table",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
         .kind = .get_document,
         .name = "get_document",
         .description = "Get an Antfly document by key",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "key", .schema_type = .string, .required = true },
@@ -160,6 +186,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .sample_documents,
         .name = "sample_documents",
         .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
@@ -173,6 +201,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .query,
         .name = "query",
         .description = "Run an Antfly table query",
+        .permission = .read,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
@@ -191,16 +221,20 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .describe_query_request,
         .name = "describe_query_request",
         .description = "Return compact guidance for the raw Antfly QueryRequest accepted by query.queryRequest",
+        .permission = .none,
     },
     .{
         .kind = .describe_mcp_capabilities,
         .name = "describe_mcp_capabilities",
         .description = "Describe Antfly MCP capabilities, deterministic tools, and A2A query-builder handoff guidance",
+        .permission = .none,
     },
     .{
         .kind = .backup,
         .name = "backup",
         .description = "Backup an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
@@ -211,6 +245,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .restore,
         .name = "restore",
         .description = "Restore an Antfly table",
+        .permission = .admin,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
@@ -221,6 +257,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .batch,
         .name = "batch",
         .description = "Insert and delete documents in an Antfly table",
+        .permission = .write,
+        .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "writes", .schema_type = .object },
@@ -289,7 +327,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         server: Server,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8,
-        kind: McpToolKind,
+        permissions: ?[]const usermgr.Permission,
+        spec: McpToolSpec,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -297,7 +336,10 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            return switch (ctx.kind) {
+            if (!mcpToolInvocationAllowed(ctx.spec, args, ctx.permissions)) {
+                return mcpError(alloc, "permission denied");
+            }
+            return switch (ctx.spec.kind) {
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
                 .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
@@ -507,6 +549,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         server: Server,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8,
+        permissions: ?[]const usermgr.Permission,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
 
@@ -516,6 +559,11 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            if (ctx.permissions) |permissions| {
+                if (!extensionMcpToolAllowedForPermissions(ctx.installed.*, ctx.tool.*, permissions)) {
+                    return mcpError(alloc, "permission denied");
+                }
+            }
             return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.installed, ctx.tool.*, args);
         }
     };
@@ -526,7 +574,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             .server = server_ptr,
             .authorization = req.authorization,
             .trusted_principal = req.header(trusted_principal_header),
-            .kind = spec.kind,
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
+            .spec = spec,
         };
     }
 
@@ -563,6 +612,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             .server = server_ptr,
             .authorization = req.authorization,
             .trusted_principal = req.header(trusted_principal_header),
+            .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
         };
@@ -585,7 +635,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     defer protocol_server.deinit(server_ptr.alloc);
     if (extension_name_filter == null) {
         for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
-            if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
+            if (!mcpToolVisibleForIdentity(spec, authenticated_identity)) continue;
             try protocol_server.addTool(server_ptr.alloc, .{
                 .name = spec.name,
                 .description = spec.description,
@@ -604,19 +654,25 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         });
     }
 
-    const is_initialize = req.method == .POST and isJsonRpcMethod(server_ptr.alloc, req.body, "initialize");
-    if (!is_initialize) {
-        if (try validateMcpSession(server_ptr, req)) |err_resp| return err_resp;
-    }
-
     var transport = switch (req.method) {
-        .GET => try protocol_server.handleStreamableHttpGetWithSession(
+        .GET => protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
             endpoint_path,
             req.header(mcp.session_id_header),
             req.header(mcp.last_event_id_header),
-        ),
-        .POST => try protocol_server.handleStreamableHttpPost(server_ptr.alloc, req.body),
+        ) catch |err| switch (err) {
+            error.InvalidLastEventId => return try textResponse(server_ptr.alloc, 400, "invalid Last-Event-ID"),
+            error.McpEventIdExhausted => return try textResponse(server_ptr.alloc, 409, "MCP event sequence exhausted"),
+            else => return err,
+        },
+        .POST => protocol_server.handleStreamableHttpPostWithSession(
+            server_ptr.alloc,
+            req.body,
+            req.header(mcp.session_id_header),
+        ) catch |err| switch (err) {
+            error.McpSessionCapacityExceeded => return try textResponse(server_ptr.alloc, 429, "MCP session capacity exceeded"),
+            else => return err,
+        },
         .DELETE => try protocol_server.handleStreamableHttpDelete(server_ptr.alloc, req.header(mcp.session_id_header)),
         else => return try textResponse(server_ptr.alloc, 405, "method not allowed"),
     };
@@ -624,31 +680,69 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     return try mcpBodyResponseWithStatus(server_ptr.alloc, transport);
 }
 
-fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype) bool {
+fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
-    return switch (kind) {
-        .describe_query_request, .describe_mcp_capabilities => true,
-        .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
-        .query, .describe_table, .describe_indexes, .get_document, .sample_documents, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
-        .batch => identityHasAnyPermission(identity.permissions, .table, .write),
-        .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
+    const required = permissionTypeForMcpTool(spec.permission) orelse return true;
+    if (spec.wildcard_table) {
+        return identityHasPermission(identity.permissions, .table, "*", required);
+    }
+    return identityHasAnyPermission(identity.permissions, .table, required);
+}
+
+/// Discovery filtering is useful UX, but it is not an authorization boundary:
+/// a client can retain an old tool schema or hand-craft tools/call. Enforce the
+/// effective table permission again immediately before dispatch so denied MCP
+/// calls cannot reach an extension, router, or metadata mutation path.
+fn mcpToolInvocationAllowed(
+    spec: McpToolSpec,
+    args: std.json.Value,
+    permissions: ?[]const usermgr.Permission,
+) bool {
+    const effective_permissions = permissions orelse return true;
+    const required = permissionTypeForMcpTool(spec.permission) orelse return true;
+    if (spec.wildcard_table) {
+        return identityHasPermission(effective_permissions, .table, "*", required);
+    }
+    const table_argument = spec.table_argument orelse return false;
+    // Malformed or missing resource identity must fail closed here. The tool
+    // handler will still return its normal validation error to callers that
+    // are permitted to invoke it, but an unscoped call must never cross the
+    // authorization boundary.
+    const table_name = jsonStringArg(args, table_argument) orelse return false;
+    return identityHasPermission(effective_permissions, .table, table_name, required);
+}
+
+fn permissionTypeForMcpTool(permission: McpToolPermission) ?usermgr.PermissionType {
+    return switch (permission) {
+        .none => null,
+        .read => .read,
+        .write => .write,
+        .admin => .admin,
     };
 }
 
 fn extensionMcpToolVisibleForIdentity(installed: *const extension_domain.InstalledExtension, tool: *const ExtensionMcpTool, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
+    return extensionMcpToolAllowedForPermissions(installed.*, tool.*, identity.permissions);
+}
+
+fn extensionMcpToolAllowedForPermissions(
+    installed: extension_domain.InstalledExtension,
+    tool: ExtensionMcpTool,
+    permissions: []const usermgr.Permission,
+) bool {
     if (tool.required_capabilities.len == 0) {
-        return extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+        return extensionScopeVisibleForIdentity(installed, tool.member.*, permissions);
     }
 
     var checked_table_permission = false;
     for (tool.required_capabilities) |capability| {
         const permission_type = permissionTypeForExtensionCapability(capability.name) orelse continue;
         checked_table_permission = true;
-        const table = tableResourceForExtensionCapability(installed.*, tool.member.*, capability);
-        if (!identityHasPermission(identity.permissions, .table, table, permission_type)) return false;
+        const table = tableResourceForExtensionCapability(installed, tool.member.*, capability);
+        if (!identityHasPermission(permissions, .table, table, permission_type)) return false;
     }
-    return checked_table_permission or extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+    return checked_table_permission or extensionScopeVisibleForIdentity(installed, tool.member.*, permissions);
 }
 
 fn extensionScopeVisibleForIdentity(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, permissions: []const usermgr.Permission) bool {
@@ -697,12 +791,6 @@ fn identityHasPermission(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
-}
-
-fn validateMcpSession(server_ptr: anytype, req: http_common.HttpRequest) !?http_common.HttpResponse {
-    const session_id = req.header(mcp.session_id_header) orelse return try textResponse(server_ptr.alloc, 400, "missing MCP session");
-    if (!server_ptr.mcp_sessions.iface().exists(session_id)) return try textResponse(server_ptr.alloc, 404, "unknown MCP session");
-    return null;
 }
 
 fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, snapshot: anytype) !ExtensionMcpTool {
@@ -1247,10 +1335,21 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest, query_embedding_security_scope: anytype) !http_common.HttpResponse {
+pub fn handleA2aRequest(
+    server_ptr: anytype,
+    req: http_common.HttpRequest,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
+    var dispatcher = try buildA2aDispatcher(
+        server_ptr,
+        arena_impl.allocator(),
+        req.authorization,
+        query_embedding_security_scope,
+        authenticated_identity,
+    );
     if (isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) {
         var sink = A2aSseSink{};
         defer sink.out.deinit(server_ptr.alloc);
@@ -1267,7 +1366,13 @@ pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequ
     return req.method == .POST and isJsonRpcMethod(alloc, req.body, "message/stream");
 }
 
-pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter, query_embedding_security_scope: anytype) !bool {
+pub fn handleA2aStreamingRequest(
+    server_ptr: anytype,
+    req: http_common.HttpRequest,
+    writer: http_common.StreamWriter,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+) !bool {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     if (!isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) return false;
@@ -1277,7 +1382,13 @@ pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpReque
         .content_type = "text/event-stream",
     });
 
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
+    var dispatcher = try buildA2aDispatcher(
+        server_ptr,
+        arena_impl.allocator(),
+        req.authorization,
+        query_embedding_security_scope,
+        authenticated_identity,
+    );
     var sink = A2aLiveSseSink{ .writer = writer };
     try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
     try writer.writeAll("event: done\ndata: {}\n\n");
@@ -1312,10 +1423,20 @@ const A2aLiveSseSink = struct {
     }
 };
 
-pub fn handleA2aCard(server_ptr: anytype, query_embedding_security_scope: anytype) !http_common.HttpResponse {
+pub fn handleA2aCard(
+    server_ptr: anytype,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null, query_embedding_security_scope);
+    var dispatcher = try buildA2aDispatcher(
+        server_ptr,
+        arena_impl.allocator(),
+        null,
+        query_embedding_security_scope,
+        authenticated_identity,
+    );
     const card = try dispatcher.agentCard(arena_impl.allocator());
     const body = try stringifyJsonValue(server_ptr.alloc, card);
     defer server_ptr.alloc.free(body);
@@ -1327,6 +1448,7 @@ fn buildA2aDispatcher(
     dispatcher_alloc: std.mem.Allocator,
     authorization: ?[]const u8,
     query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval };
@@ -1334,6 +1456,7 @@ fn buildA2aDispatcher(
         server: Server,
         authorization: ?[]const u8,
         query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
+        authenticated_identity: @TypeOf(authenticated_identity),
         kind: HandlerKind,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
@@ -1429,27 +1552,41 @@ fn buildA2aDispatcher(
                 request_ctx.context_id,
                 queue,
                 ctx.query_embedding_security_scope,
+                ctx.authenticated_identity,
             );
         }
     };
 
+    const task_authority = try std.fmt.allocPrint(
+        dispatcher_alloc,
+        "{s}:{d}:{s}",
+        .{
+            @tagName(query_embedding_security_scope.domain),
+            query_embedding_security_scope.value.len,
+            query_embedding_security_scope.value,
+        },
+    );
     var dispatcher = a2a.Dispatcher{
+        .io = server_ptr.inferenceIo(),
         .name = "Antfly",
         .version = "1.0.0",
         .base_url = routes.Routes.a2a,
         .task_store = server_ptr.a2a_tasks.iface(),
+        .task_authority = task_authority,
     };
     const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
     contexts[0] = .{
         .server = server_ptr,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
+        .authenticated_identity = authenticated_identity,
         .kind = .query_builder,
     };
     contexts[1] = .{
         .server = server_ptr,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
+        .authenticated_identity = authenticated_identity,
         .kind = .retrieval,
     };
     try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());

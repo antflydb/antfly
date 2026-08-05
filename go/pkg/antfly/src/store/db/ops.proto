@@ -167,6 +167,7 @@ message DeleteIndexOp {
 message BackupOp {
   string backup_id = 1 [ features.field_presence = IMPLICIT ];
   string location = 2 [ features.field_presence = IMPLICIT ];
+  string connection = 3 [ features.field_presence = IMPLICIT ];
 }
 
 message InitTransactionOp {

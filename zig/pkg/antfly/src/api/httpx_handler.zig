@@ -22,6 +22,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const http_common = @import("../raft/transport/http_common.zig");
+const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
 const http_server_mod = @import("http_server.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
@@ -55,6 +56,7 @@ const usermgr = @import("../usermgr/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const casbin = @import("antfly_casbin");
+const builtin = @import("builtin");
 
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -85,8 +87,104 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
+/// Bounded admission for expensive public query execution.  This lives at the
+/// httpx adapter boundary so status, auth, and other control routes retain a
+/// path even when query workers are saturated.
+pub const QueryAdmission = struct {
+    /// Match the provisioned public listener's expensive-request budget so
+    /// standalone and clustered deployments shed load at the same point.
+    capacity: usize = 32,
+    in_flight: std.atomic.Value(usize) = .init(0),
+    rejected_total: std.atomic.Value(u64) = .init(0),
+    peak_in_flight: std.atomic.Value(usize) = .init(0),
+
+    pub fn init(capacity: usize) QueryAdmission {
+        return .{ .capacity = capacity };
+    }
+
+    pub fn tryAcquire(self: *QueryAdmission) bool {
+        var observed = self.in_flight.load(.acquire);
+        while (observed < self.capacity) {
+            if (self.in_flight.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire) == null) {
+                const admitted = observed + 1;
+                var peak = self.peak_in_flight.load(.acquire);
+                while (peak < admitted) {
+                    if (self.peak_in_flight.cmpxchgWeak(peak, admitted, .acq_rel, .acquire) == null) break;
+                    peak = self.peak_in_flight.load(.acquire);
+                }
+                return true;
+            }
+            observed = self.in_flight.load(.acquire);
+        }
+        _ = self.rejected_total.fetchAdd(1, .monotonic);
+        return false;
+    }
+
+    pub fn release(self: *QueryAdmission) void {
+        _ = self.in_flight.fetchSub(1, .acq_rel);
+    }
+
+    pub const Stats = struct {
+        capacity: usize,
+        in_flight: usize,
+        peak_in_flight: usize,
+        rejected_total: u64,
+    };
+
+    pub fn stats(self: *const QueryAdmission) Stats {
+        return .{
+            .capacity = self.capacity,
+            .in_flight = self.in_flight.load(.acquire),
+            .peak_in_flight = self.peak_in_flight.load(.acquire),
+            .rejected_total = self.rejected_total.load(.acquire),
+        };
+    }
+};
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
+    query_admission: QueryAdmission = .{},
+    /// Separate phase admission for H2 query bodies. Slow uploads must not
+    /// consume execution permits, but still need a global waiter bound.
+    query_body_admission: QueryAdmission = .{},
+    peer_observer: ?PeerObserver = null,
+    cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
+    peer_disconnect_cancellations_total: std.atomic.Value(u64) = .init(0),
+    peer_observer_failures_total: std.atomic.Value(u64) = .init(0),
+
+    pub const RuntimeStats = struct {
+        cancellation_watcher_start_failures_total: u64,
+        peer_disconnect_cancellations_total: u64,
+        peer_observer_failures_total: u64,
+        active_peer_observers: usize,
+    };
+
+    pub fn runtimeStats(self: *const AntflyApiHandler) RuntimeStats {
+        return .{
+            .cancellation_watcher_start_failures_total = self.cancellation_watcher_start_failures_total.load(.acquire),
+            .peer_disconnect_cancellations_total = self.peer_disconnect_cancellations_total.load(.acquire),
+            .peer_observer_failures_total = self.peer_observer_failures_total.load(.acquire),
+            .active_peer_observers = if (self.peer_observer) |*observer| observer.activeCount() else 0,
+        };
+    }
+
+    /// Starts the one-thread, multiplexed H1 cancellation observer after the
+    /// handler has reached its stable address. Query handlers fail closed if
+    /// this runtime is unavailable.
+    pub fn initRuntime(self: *AntflyApiHandler, alloc: std.mem.Allocator) !void {
+        if (self.peer_observer != null) return error.AlreadyStarted;
+        self.peer_observer = PeerObserver.init(alloc, self.query_admission.capacity);
+        self.peer_observer.?.start() catch |err| {
+            self.peer_observer.?.deinit();
+            self.peer_observer = null;
+            return err;
+        };
+    }
+
+    pub fn deinitRuntime(self: *AntflyApiHandler) void {
+        if (self.peer_observer) |*observer| observer.deinit();
+        self.peer_observer = null;
+    }
 
     // ---------------------------------------------------------------
     // Response conversion: http_common.HttpResponse -> httpx.Response
@@ -97,6 +195,11 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
+        } else if (resp.status >= 200 and resp.status < 300) {
+            // Legacy API responses without an explicit type are JSON.  Keep
+            // this compatibility default at the shared adapter so every
+            // successful route presents the same wire contract.
+            try ctx.setHeader("content-type", "application/json");
         }
         for (resp.headers) |hdr| {
             try ctx.setHeader(hdr.name, hdr.value);
@@ -110,6 +213,8 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
+        } else if (resp.status >= 200 and resp.status < 300) {
+            try ctx.setHeader("content-type", "application/json");
         }
         for (resp.headers) |hdr| {
             try ctx.setHeader(hdr.name, hdr.value);
@@ -203,9 +308,15 @@ pub const AntflyApiHandler = struct {
         const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         const job_alloc = std.heap.page_allocator;
-        const owned_table_name = try job_alloc.dupe(u8, table_name);
+        const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
+            std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        };
         defer job_alloc.free(owned_table_name);
-        const owned_body_data = try job_alloc.dupe(u8, body_data);
+        const owned_body_data = job_alloc.dupe(u8, body_data) catch |err| {
+            std.log.warn("batch offload body allocation failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        };
         defer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
             .alloc = job_alloc,
@@ -213,7 +324,13 @@ pub const AntflyApiHandler = struct {
             .body_data = owned_body_data,
             .api = api,
         };
-        var future = try runtime_io.concurrent(OffloadedTableBatch.run, .{&job});
+        var future = runtime_io.concurrent(OffloadedTableBatch.run, .{&job}) catch |err| {
+            // Saturating the backend executor must not turn a valid write into
+            // an empty HTTP disconnect. The request still owns its buffers, so
+            // executing synchronously is a safe bounded degradation path.
+            std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        };
         while (!job.done.load(.acquire)) {
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
         }
@@ -224,7 +341,17 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !http_common.HttpRequest {
+    pub const ConvertedHttpRequest = struct {
+        value: http_common.HttpRequest,
+        alloc: std.mem.Allocator,
+
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.value.headers);
+            self.* = undefined;
+        }
+    };
+
+    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !ConvertedHttpRequest {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
@@ -235,17 +362,21 @@ pub const AntflyApiHandler = struct {
             },
         };
         const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
+        errdefer ctx.allocator.free(headers);
         for (ctx.request.headers.entries.items, 0..) |entry, i| {
             headers[i] = .{ .name = entry.name, .value = entry.value };
         }
         const body_data = body_data_opt orelse (try ctx.body()) orelse "";
         return .{
-            .method = method,
-            .uri = ctx.request.uri.raw,
-            .headers = headers,
-            .authorization = ctx.header("authorization"),
-            .content_type = ctx.header("content-type"),
-            .body = body_data,
+            .value = .{
+                .method = method,
+                .uri = ctx.request.uri.raw,
+                .headers = headers,
+                .authorization = ctx.header("authorization"),
+                .content_type = ctx.header("content-type"),
+                .body = body_data,
+            },
+            .alloc = ctx.allocator,
         };
     }
 
@@ -296,6 +427,49 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "text/plain");
         _ = ctx.response.body(body);
         return ctx.response.build();
+    }
+
+    fn queryOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        // HTTP/2 has stream-local overload and forbids connection-specific
+        // headers. HTTP/1 must close rejected keep-alive sockets promptly so
+        // they do not retain connection-admission permits.
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return textResponse(ctx, 429, "query capacity exhausted");
+    }
+
+    fn queryBodyOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return textResponse(ctx, 429, "query body capacity exhausted");
+    }
+
+    fn queryCancellationUnavailableResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return textResponse(ctx, 503, "query cancellation capacity unavailable");
+    }
+
+    fn startPeerCancellationWatcher(self: *AntflyApiHandler, ctx: *httpx.Context, cancellation: *http_common.RequestCancellation, registration: *PeerObserver.Registration) !void {
+        const socket = ctx.h1_sock orelse return;
+        // Once a following request has been read into the connection parser,
+        // the kernel can no longer distinguish an intentional SHUT_WR after a
+        // valid pipeline from a client that abandoned both requests. Never run
+        // expensive work without a trustworthy cancellation source: reject
+        // this request and make the client retry it on an unpipelined socket.
+        if (ctx.h1_has_buffered_input) {
+            _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
+            return error.PipelinedQueryCancellationUnsafe;
+        }
+        const observer = if (self.peer_observer) |*value| value else return error.ObserverUnavailable;
+        registration.* = observer.register(
+            socket.handle,
+            cancellation,
+            &self.peer_disconnect_cancellations_total,
+            &self.peer_observer_failures_total,
+        ) catch |err| {
+            _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
+            return err;
+        };
     }
 
     fn unauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
@@ -525,6 +699,10 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer commit_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
@@ -643,7 +821,10 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = self.api_server.alloc;
-        const sessions = try self.api_server.txn_sessions.listStatuses(alloc);
+        const sessions = try self.api_server.txn_sessions.listStatusesForPrincipal(
+            alloc,
+            if (authenticated_identity) |identity| identity.username else null,
+        );
         defer alloc.free(sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -681,7 +862,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction begin request");
         };
-        const session = try self.api_server.txn_sessions.begin(alloc, begin_req, self.api_server.localSessionNodeId());
+        const session = try self.api_server.txn_sessions.beginForPrincipal(
+            alloc,
+            begin_req,
+            self.api_server.localSessionNodeId(),
+            if (authenticated_identity) |identity| identity.username else null,
+        );
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
@@ -697,13 +883,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, "") catch {
+        var converted_req = httpRequestFromContext(ctx, "") catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const alloc = self.api_server.alloc;
         var details = (self.api_server.txn_sessions.getDetails(alloc, txn_id) catch |err| switch (err) {
@@ -732,13 +923,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
@@ -749,6 +945,10 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer stage_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
         const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -774,13 +974,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const alloc = self.api_server.alloc;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
@@ -788,6 +993,12 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction read request");
         };
         defer read_req.deinit(alloc);
+        if (authenticated_identity) |identity| {
+            if (!http_server_mod.permissionsAllow(identity.permissions, .table, read_req.table_name, .read)) {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            }
+        }
 
         var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshot(alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
             error.SessionLeaseLost => {
@@ -816,6 +1027,18 @@ pub const AntflyApiHandler = struct {
             if (fetched.document_json) |document_json| alloc.free(document_json);
         } else if (owned_snapshot.version == 0) {
             owned_snapshot.version = read_req.version;
+        }
+        if (!(try self.api_server.transactionReadSnapshotVisible(
+            authenticated_identity,
+            owned_snapshot.table_name,
+            owned_snapshot.key,
+            owned_snapshot.document_json,
+        ))) {
+            if (owned_snapshot.document_json) |document_json| {
+                alloc.free(document_json);
+                owned_snapshot.document_json = null;
+            }
+            owned_snapshot.version = 0;
         }
         if (owned_snapshot.version != read_req.version) {
             var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -869,13 +1092,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const alloc = self.api_server.alloc;
         var stage_req = switch (kind) {
@@ -889,6 +1117,10 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer stage_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
         const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -914,13 +1146,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, txn_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
@@ -955,13 +1192,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid savepoint id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
@@ -992,13 +1234,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         const alloc = self.api_server.alloc;
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
@@ -1036,6 +1283,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("transaction has no staged writes");
         };
         defer commit_req.deinit(alloc);
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+            _ = ctx.status(403);
+            return ctx.text("forbidden");
+        }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
@@ -1167,13 +1418,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
+        }
+        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
         }
         if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
             _ = ctx.status(404);
@@ -1279,14 +1535,30 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
+        const body_data = body: {
+            const needs_h2_body_slot = ctx.h2_body_reader != null;
+            if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
+                return queryBodyOverloadedResponse(ctx);
+            defer if (needs_h2_body_slot) self.query_body_admission.release();
+            break :body (try ctx.body()) orelse {
+                _ = ctx.status(400);
+                return ctx.text("missing body");
+            };
         };
+        // Body admission is released before expensive execution starts so
+        // slow ingress and query compute cannot starve one another.
+        if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
+        defer self.query_admission.release();
+        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
+        var peer_registration: PeerObserver.Registration = .{};
+        self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
+            return queryCancellationUnavailableResponse(ctx);
+        defer peer_registration.deinit();
         if (isNdjsonContentType(ctx.header("content-type"))) {
-            var resp = try self.api_server.handlePublicGlobalMultiQuery(
+            var resp = try self.api_server.handlePublicGlobalMultiQueryWithCancellation(
                 body_data,
                 authenticated_identity,
+                &cancellation,
             );
             return respondWithAllocator(ctx, &resp, self.api_server.alloc);
         }
@@ -1295,10 +1567,12 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var resp = try self.api_server.handlePublicTableQuery(
+        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             parsed_table.table_name,
             body_data,
+            ctx.header("content-type"),
             authenticated_identity,
+            &cancellation,
         );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
@@ -1443,13 +1717,15 @@ pub const AntflyApiHandler = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
             query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
+            authenticated_identity: ?AuthenticatedIdentity,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
                         .run_query = runQuery,
-                        .scan_keys = runScanKeys,
+                        .scan_key_page = runScanKeyPage,
+                        .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
             }
@@ -1462,9 +1738,11 @@ pub const AntflyApiHandler = struct {
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
-                var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
-                    error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
-                    else => return err,
+                var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
+                    if (query_api.isPublicQueryValidationError(err)) {
+                        return error.InvalidRetrievalAgentRequest;
+                    }
+                    return err;
                 };
                 defer query_req.deinit(a);
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
@@ -1472,6 +1750,19 @@ pub const AntflyApiHandler = struct {
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
+                const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(
+                    a,
+                    runner.authenticated_identity,
+                    table_name,
+                );
+                defer if (row_filter_json) |value| a.free(value);
+                if (row_filter_json) |value| {
+                    http_server_mod.injectRowFilterIntoSearchRequest(a, &query_req.req, value) catch
+                        return error.InvalidRetrievalAgentRequest;
+                }
+                if (runner.authenticated_identity) |*identity| {
+                    ApiHttpServer.attachGraphTableReadAuthorizer(&query_req.req, identity);
+                }
                 return (runner.source.query(
                     a,
                     table_name,
@@ -1484,35 +1775,43 @@ pub const AntflyApiHandler = struct {
                 }) orelse error.TableNotFound;
             }
 
-            fn runScanKeys(
+            fn runScanKeyPage(
                 ptr: *anyopaque,
                 a: std.mem.Allocator,
                 table_name: []const u8,
-            ) ![]const []const u8 {
+                after_key: []const u8,
+                limit: u32,
+                filter_query_json: ?[]const u8,
+                exclusion_query_json: ?[]const u8,
+            ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var scan = (try runner.source.scan(
+                return try runner.server.scanRetrievalKeyPage(
                     a,
+                    runner.source,
                     table_name,
-                    "",
-                    "",
-                    .{ .limit = 0 },
-                    .read_index,
-                )) orelse return error.TableNotFound;
-                defer scan.deinit(a);
+                    after_key,
+                    limit,
+                    filter_query_json,
+                    exclusion_query_json,
+                    runner.authenticated_identity,
+                );
+            }
 
-                var keys = std.ArrayListUnmanaged([]const u8).empty;
-                errdefer {
-                    for (keys.items) |key| a.free(key);
-                    keys.deinit(a);
-                }
-
-                var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
-                while (lines.next()) |line| {
-                    if (line.len == 0) continue;
-                    const key = http_server_mod.scanLineKey(a, line) catch return error.InvalidRetrievalAgentRequest;
-                    try keys.append(a, key);
-                }
-                return try keys.toOwnedSlice(a);
+            fn probeIncomingEdges(
+                ptr: *anyopaque,
+                a: std.mem.Allocator,
+                table_name: []const u8,
+                index_name: []const u8,
+                keys: []const []const u8,
+            ) ![]bool {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return try runner.server.probeRetrievalIncomingEdges(
+                    a,
+                    runner.source,
+                    table_name,
+                    index_name,
+                    keys,
+                );
             }
         };
 
@@ -1550,8 +1849,13 @@ pub const AntflyApiHandler = struct {
             .server = self.api_server,
             .source = source,
             .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
+            .authenticated_identity = authenticated_identity,
         };
         const retrieval_resp = retrieval_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body_data) catch |err| switch (err) {
+            error.TreeRootSetTooLarge => {
+                _ = ctx.status(422);
+                return ctx.text("tree root set exceeds the bounded retrieval limit");
+            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid retrieval agent request");
@@ -1619,7 +1923,7 @@ pub const AntflyApiHandler = struct {
         };
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &storage_status_buf);
+        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &snapshot, &storage_status_buf);
         const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(alloc, &snapshot, decoded_table_name, storage_statuses)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -1640,11 +1944,13 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
-            _ = ctx.status(400);
-            if (err == error.InvalidCreateTableSchemaRequest) {
-                return ctx.text(table_contract.createTableRequestErrorMessage(body_data));
+            if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
+                std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
+                return err;
             }
-            return ctx.text("invalid create table request");
+            std.log.debug("create table request rejected: {} body_len={d}", .{ err, body_data.len });
+            _ = ctx.status(400);
+            return ctx.text(table_contract.createTableRequestErrorMessage(err, body_data));
         };
         defer create_req.deinit(alloc);
         const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -1834,15 +2140,29 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
+        const body_data = body: {
+            const needs_h2_body_slot = ctx.h2_body_reader != null;
+            if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
+                return queryBodyOverloadedResponse(ctx);
+            defer if (needs_h2_body_slot) self.query_body_admission.release();
+            break :body (try ctx.body()) orelse {
+                _ = ctx.status(400);
+                return ctx.text("missing body");
+            };
         };
-        var resp = try self.api_server.handlePublicTableQueryWithContentType(
+        if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
+        defer self.query_admission.release();
+        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
+        var peer_registration: PeerObserver.Registration = .{};
+        self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
+            return queryCancellationUnavailableResponse(ctx);
+        defer peer_registration.deinit();
+        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
+            &cancellation,
         );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
@@ -1960,8 +2280,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
-        const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(body_data);
-        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch {
+        var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
+        const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |err| {
+            invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
             _ = ctx.status(400);
             return ctx.text(invalid_schema_message);
         };
@@ -1969,7 +2290,7 @@ pub const AntflyApiHandler = struct {
 
         const table_before = try self.api_server.loadOwnedTableRecord(alloc, decoded_table_name);
         if (table_before == null) {
-            self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
+            _ = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => {
                     _ = ctx.status(400);
                     return ctx.text(invalid_schema_message);
@@ -1978,7 +2299,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(404);
                     return ctx.text("not found");
                 },
-                error.UnsupportedOperation => {
+                error.UnsupportedOperation => blk: {
                     const table_writes_source = self.api_server.table_writes orelse {
                         _ = ctx.status(404);
                         return ctx.text("not found");
@@ -1993,6 +2314,7 @@ pub const AntflyApiHandler = struct {
                         _ = ctx.status(404);
                         return ctx.text("not found");
                     };
+                    break :blk null;
                 },
                 else => return err,
             };
@@ -2004,7 +2326,7 @@ pub const AntflyApiHandler = struct {
         defer metadata_table_manager.freeTable(alloc, table_before.?);
 
         var local_schema_applied = false;
-        self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
+        const committed_version = self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest => {
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
@@ -2013,7 +2335,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
-            error.UnsupportedOperation => {
+            error.UnsupportedOperation => blk: {
                 const table_writes_source = self.api_server.table_writes orelse {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
@@ -2026,33 +2348,30 @@ pub const AntflyApiHandler = struct {
                     else => return write_err,
                 };
                 local_schema_applied = true;
+                break :blk null;
             },
             else => return err,
         };
-        const expected_table = try tables_api.applySchemaUpdateRecord(alloc, &table_before.?, schema_json);
-        defer metadata_table_manager.freeTable(alloc, expected_table);
-        self.api_server.waitForMetadataProjection(decoded_table_name, expected_table.schema_json, expected_table.indexes_json) catch |err| switch (err) {
+        var expectation = try self.api_server.schemaProjectionExpectationAlloc(alloc, &table_before.?, schema_json, committed_version);
+        defer expectation.deinit(alloc);
+        self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
             error.TableVisibilityTimeout => {
                 _ = ctx.status(500);
                 return ctx.text("schema update did not converge");
             },
+            error.TableGenerationChanged => {
+                _ = ctx.status(409);
+                return ctx.text("schema update was superseded; retry request");
+            },
             else => return err,
         };
-        if (self.api_server.table_writes) |table_writes_source| {
-            if (!local_schema_applied) {
-                _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
-                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
-                        _ = ctx.status(400);
-                        return ctx.text(invalid_schema_message);
-                    },
-                    else => return write_err,
-                };
-            }
-            if (try self.api_server.source.runRound()) {
-                _ = try self.api_server.source.runRound();
-                _ = try self.api_server.source.runRound();
-            }
-        }
+        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text(invalid_schema_message);
+            },
+            else => return write_err,
+        };
 
         const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, schema_json);
         defer self.api_server.alloc.free(body);
@@ -2070,11 +2389,16 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
+        // The OpenAPI request body is optional; an absent body is the default
+        // unbounded-range scan, just like an explicitly empty legacy request.
+        const body_data = (try ctx.body()) orelse "";
+        var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
+            if (try http_route_helpers.scanRequestErrorResponse(alloc, err)) |response| {
+                var owned_response = response;
+                return respond(ctx, &owned_response);
+            }
+            return err;
         };
-        var scan_req = try http_route_helpers.parseScanKeysRequest(alloc, body_data);
         defer scan_req.deinit(alloc);
 
         var result = (try source.scan(
@@ -3140,19 +3464,37 @@ const HttpxE2eServer = struct {
     thread: ?std.Thread = null,
 
     fn init(self: *HttpxE2eServer, allocator: std.mem.Allocator, api_server: *ApiHttpServer) !void {
+        return self.initWithLimits(allocator, api_server, 32, 1_000);
+    }
+
+    fn initWithLimits(
+        self: *HttpxE2eServer,
+        allocator: std.mem.Allocator,
+        api_server: *ApiHttpServer,
+        query_capacity: usize,
+        max_connections: u32,
+    ) !void {
         self.* = .{
             .allocator = allocator,
             .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
             .server = undefined,
-            .handler = .{ .api_server = api_server },
+            .handler = .{
+                .api_server = api_server,
+                .query_admission = QueryAdmission.init(query_capacity),
+                .query_body_admission = QueryAdmission.init(query_capacity),
+            },
             .thread = null,
         };
         errdefer self.io_impl.deinit();
+
+        try self.handler.initRuntime(allocator);
+        errdefer self.handler.deinitRuntime();
 
         self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), .{
             .host = "127.0.0.1",
             .port = 0,
             .request_timeout_ms = 30_000,
+            .max_connections = max_connections,
         });
         errdefer self.server.deinit();
 
@@ -3172,6 +3514,7 @@ const HttpxE2eServer = struct {
             self.server.stop();
             thread.join();
         }
+        self.handler.deinitRuntime();
         self.server.deinit();
         self.io_impl.deinit();
         self.* = undefined;
@@ -3290,6 +3633,8 @@ const SchemaUpdateStatusSource = struct {
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
+    table_buf: [1]metadata_table_manager.TableRecord = undefined,
+    range_buf: [1]metadata_table_manager.RangeRecord = undefined,
 
     fn iface(self: *@This()) http_server_mod.StatusSource {
         return .{
@@ -3324,21 +3669,23 @@ const SchemaUpdateStatusSource = struct {
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.table_buf[0] = .{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        };
+        self.range_buf[0] = .{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        };
         return .{
             .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                .table_id = 7,
-                .name = "docs",
-                .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
-                .indexes_json = tables_api.default_indexes_json,
-                .placement_role = "data",
-            }})[0..]),
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                .group_id = 7001,
-                .table_id = 7,
-                .start_key = "",
-                .end_key = null,
-            }})[0..]),
+            .tables = &self.table_buf,
+            .ranges = &self.range_buf,
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
             .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
             .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -3360,8 +3707,54 @@ const SchemaUpdateStatusSource = struct {
         try std.testing.expect(indexes_json != null);
         try std.testing.expect(schema_json != null);
         try std.testing.expect(self.schema_json != null);
-        try std.testing.expectEqualStrings(self.schema_json.?, schema_json.?);
         _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
+    }
+};
+
+const SchemaReconcileWriteSource = struct {
+    reconcile_calls: std.atomic.Value(u32) = .init(0),
+    synchronous_update_calls: std.atomic.Value(u32) = .init(0),
+
+    fn iface(self: *@This()) table_writes.TableWriteSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .batch = batch,
+                .update_schema = updateSchema,
+                .request_table_structural_reconcile = requestStructuralReconcile,
+            },
+        };
+    }
+
+    fn batch(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: db_mod.types.BatchRequest,
+    ) !?void {
+        return {};
+    }
+
+    fn updateSchema(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = self.synchronous_update_calls.fetchAdd(1, .monotonic);
+        return {};
+    }
+
+    fn requestStructuralReconcile(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqualStrings("docs", table_name);
+        _ = self.reconcile_calls.fetchAdd(1, .monotonic);
+        return {};
     }
 };
 
@@ -3376,12 +3769,269 @@ test "httpx internal request conversion preserves protocol headers" {
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    const converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
-    defer alloc.free(converted.headers);
+    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
+    defer converted.deinit();
 
-    try std.testing.expectEqualStrings("session-123", converted.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("application/json", converted.content_type orelse return error.MissingContentType);
-    try std.testing.expectEqualStrings("{}", converted.body);
+    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
+    try std.testing.expectEqualStrings("{}", converted.value.body);
+}
+
+test "httpx query admission rejects saturated queries without blocking control routes" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var handler = AntflyApiHandler{
+        .api_server = &api_server,
+        .query_admission = QueryAdmission.init(1),
+        .query_body_admission = QueryAdmission.init(1),
+    };
+
+    try std.testing.expect(handler.query_admission.tryAcquire());
+    defer handler.query_admission.release();
+
+    var query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer query_request.deinit();
+    query_request.body = "{}";
+    var query_ctx = httpx.Context.init(alloc, undefined, &query_request);
+    defer query_ctx.deinit();
+    var rejected = try handler.queryTable(&query_ctx, "docs");
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+    try std.testing.expectEqualStrings("1", rejected.headers.get("Retry-After").?);
+    try std.testing.expect(rejected.headers.get("Connection") == null);
+    const admission_stats = handler.query_admission.stats();
+    try std.testing.expectEqual(@as(usize, 1), admission_stats.in_flight);
+    try std.testing.expectEqual(@as(usize, 1), admission_stats.peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), admission_stats.rejected_total);
+
+    var h1_query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer h1_query_request.deinit();
+    h1_query_request.body = "{}";
+    var h1_query_ctx = httpx.Context.init(alloc, std.testing.io, &h1_query_request);
+    defer h1_query_ctx.deinit();
+    var h1_socket = httpx.Socket{ .handle = 0, .io = std.testing.io };
+    h1_query_ctx.h1_sock = &h1_socket;
+    var h1_rejected = try handler.queryTable(&h1_query_ctx, "docs");
+    defer h1_rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), h1_rejected.status.code);
+    try std.testing.expectEqualStrings("close", h1_rejected.headers.get("Connection").?);
+
+    // Slow H2 upload admission is independent from query execution. Reject
+    // before reading the streaming body and leave the execution count intact.
+    try std.testing.expect(handler.query_body_admission.tryAcquire());
+    defer handler.query_body_admission.release();
+    var h2_query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer h2_query_request.deinit();
+    var h2_query_ctx = httpx.Context.init(alloc, std.testing.io, &h2_query_request);
+    defer h2_query_ctx.deinit();
+    var unused_body_reader: httpx.Context.H2StreamReader = undefined;
+    h2_query_ctx.h2_body_reader = &unused_body_reader;
+    var h2_rejected = try handler.queryTable(&h2_query_ctx, "docs");
+    defer h2_rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), h2_rejected.status.code);
+    try std.testing.expectEqualStrings("query body capacity exhausted", h2_rejected.body orelse "");
+    try std.testing.expectEqual(@as(usize, 1), handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), handler.query_body_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(u64, 1), handler.query_body_admission.stats().rejected_total);
+
+    var control_request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/status");
+    defer control_request.deinit();
+    var control_ctx = httpx.Context.init(alloc, undefined, &control_request);
+    defer control_ctx.deinit();
+    var control = try handler.getStatus(&control_ctx);
+    defer control.deinit();
+    try std.testing.expectEqual(@as(u16, 200), control.status.code);
+}
+
+test "httpx query admission releases a cancelled query slot" {
+    var admission = QueryAdmission.init(1);
+    try std.testing.expect(admission.tryAcquire());
+    var cancellation = http_common.RequestCancellation{};
+    cancellation.cancel();
+    try std.testing.expect(cancellation.isCancelled());
+    admission.release();
+    try std.testing.expect(admission.tryAcquire());
+    admission.release();
+}
+
+test "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var socket = httpx.Socket{ .handle = 0, .io = std.testing.io };
+    ctx.h1_sock = &socket;
+    ctx.h1_has_buffered_input = true;
+
+    var cancellation = http_common.RequestCancellation{};
+    var registration: PeerObserver.Registration = .{};
+    try std.testing.expectError(
+        error.PipelinedQueryCancellationUnsafe,
+        handler.startPeerCancellationWatcher(&ctx, &cancellation, &registration),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        handler.runtimeStats().cancellation_watcher_start_failures_total,
+    );
+    try std.testing.expect(!cancellation.isCancelled());
+    try std.testing.expect(registration.observer == null);
+}
+
+test "httpx production path sheds 128 abandoned queries and preserves control recovery" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const BlockingReads = struct {
+        started: std.atomic.Value(u32) = .init(0),
+        cancelled: std.atomic.Value(u32) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable = table_reads.TableReadSource.VTable{
+            .lookup = lookup,
+            .scan = scan,
+            .query = query,
+        };
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs")) return null;
+            _ = self.started.fetchAdd(1, .monotonic);
+            while (!self.release.load(.acquire)) {
+                if (req.cancellation) |signal| {
+                    if (signal.load(.acquire)) {
+                        _ = self.cancelled.fetchAdd(1, .monotonic);
+                        return error.Cancelled;
+                    }
+                }
+                var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = std.posix.system.nanosleep(&delay, &delay);
+            }
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var reads = BlockingReads{};
+    defer reads.release.store(true, .release);
+    var status_source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.initWithLimits(alloc, &api_server, 8, 32) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var clients = [_]?httpx.Socket{null} ** 128;
+    defer for (&clients) |*slot| {
+        if (slot.*) |*client| client.close();
+        slot.* = null;
+    };
+
+    const request =
+        "POST /db/v1/tables/docs/query HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Content-Length: 11\r\n\r\n" ++
+        "{\"limit\":1}";
+    for (&clients) |*slot| {
+        var client = try httpx.Socket.connect(address, client_io);
+        errdefer client.close();
+        try client.sendAll(request);
+        slot.* = client;
+    }
+
+    for (0..10_000) |_| {
+        const admission = e2e_server.handler.query_admission.stats();
+        if (admission.in_flight == 8 and admission.rejected_total == 120) break;
+        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&delay, &delay);
+    }
+    const saturated = e2e_server.handler.query_admission.stats();
+    try std.testing.expectEqual(@as(usize, 8), saturated.in_flight);
+    try std.testing.expectEqual(@as(u64, 120), saturated.rejected_total);
+    try std.testing.expectEqual(@as(u32, 8), reads.started.load(.acquire));
+    try std.testing.expect(e2e_server.server.runtimeStats().active_connections <= 32);
+    try std.testing.expectEqual(@as(usize, 8), e2e_server.handler.runtimeStats().active_peer_observers);
+
+    // Rejected keep-alive clients must not retain all connection permits. The
+    // real status route remains reachable while every expensive slot is held.
+    var control_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer control_io.deinit();
+    var control_client = httpx.Client.initWithConfig(alloc, control_io.io(), .{ .keep_alive = false });
+    defer control_client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base_url});
+    defer alloc.free(status_url);
+    var status = try getWithRetry(&control_client, control_io.io(), status_url, null, 20);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), status.status.code);
+
+    // Simulate all timed-out callers abandoning their sockets. The observer
+    // must terminate the eight admitted queries and release every slot.
+    for (&clients) |*slot| {
+        if (slot.*) |*client| client.close();
+        slot.* = null;
+    }
+    for (0..10_000) |_| {
+        const admission = e2e_server.handler.query_admission.stats();
+        const runtime = e2e_server.handler.runtimeStats();
+        if (admission.in_flight == 0 and runtime.active_peer_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
+        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&delay, &delay);
+    }
+    try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.runtimeStats().active_peer_observers);
+    try std.testing.expectEqual(@as(u32, 8), reads.cancelled.load(.acquire));
+
+    reads.release.store(true, .release);
+    const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});
+    defer alloc.free(query_url);
+    var recovered = try requestWithRetry(&control_client, control_io.io(), .POST, query_url, "{\"limit\":1}", null, 20);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u16, 200), recovered.status.code);
 }
 
 test "httpx antfly routes require auth and enforce admin middleware" {
@@ -3550,6 +4200,74 @@ test "httpx antfly lookup route preserves projection and headers" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
+test "httpx antfly scan honors optional body and documented bad requests" {
+    const alloc = std.testing.allocator;
+    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-scan-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(db_path);
+
+    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer fs_io.deinit();
+    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        // Restricted test environments may forbid even loopback listeners.
+        // The same test runs normally in CI and release validation.
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const scan_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents", .{base_url});
+    defer alloc.free(scan_url);
+
+    var bodyless = try requestWithRetry(&client, client_io.io(), .POST, scan_url, null, null, 20);
+    defer bodyless.deinit();
+    try std.testing.expectEqual(@as(u16, 200), bodyless.status.code);
+    try std.testing.expectEqualStrings("application/x-ndjson", bodyless.contentType().?);
+    try std.testing.expect(std.mem.indexOf(u8, bodyless.body.?, "\"_id\":\"doc:a\"") != null);
+
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var unsupported = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        scan_url,
+        "{\"filter_query\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}}",
+        &headers,
+        20,
+    );
+    defer unsupported.deinit();
+    try std.testing.expectEqual(@as(u16, 400), unsupported.status.code);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body.?);
+}
+
 test "httpx antfly lookup decodes percent-encoded path keys" {
     const LookupResponse = struct {
         title: []const u8,
@@ -3610,7 +4328,8 @@ test "httpx antfly schema update returns full table status after projection" {
 
     var source = SchemaUpdateStatusSource{};
     defer source.deinit(alloc);
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -3639,6 +4358,8 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqualStrings("docs", parsed.value.name);
     try std.testing.expect(parsed.value.schema != null);
     try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
 }
 
 test "httpx global query table name comes from request body" {

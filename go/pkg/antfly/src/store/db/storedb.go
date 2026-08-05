@@ -17,12 +17,12 @@ package db
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -65,6 +65,7 @@ type StoreDB struct {
 	schema          *schema.TableSchema
 	snapStore       snapstore.SnapStore
 	antflyConfig    *common.Config
+	backupMu        sync.Mutex
 
 	splitting                atomic.Bool
 	initializing             atomic.Bool
@@ -423,19 +424,19 @@ func (s *StoreDB) preEnrichBatch(
 	}.Build(), nil
 }
 
-const backupValidationRegex = `^[a-zA-Z0-9_-]+$`
-
-var backupRegex = regexp.MustCompile(backupValidationRegex)
-
-func (s *StoreDB) Backup(ctx context.Context, loc, id string) error {
-	if !backupRegex.MatchString(id) {
-		return fmt.Errorf("invalid backup ID: %s, must match regex %s", id, backupValidationRegex)
+func (s *StoreDB) Backup(ctx context.Context, backup common.BackupConfig) error {
+	if err := common.ValidateBackupID(backup.BackupID); err != nil {
+		return fmt.Errorf("invalid backup ID: %w", err)
 	}
-	loc = strings.TrimPrefix(loc, "file://") // Remove "file://" prefix if present
+	location := backup.Location
+	if strings.HasPrefix(location, "file://") {
+		location = strings.TrimPrefix(location, "file://")
+	}
 
 	backupOp := BackupOp_builder{
-		BackupId: id,
-		Location: loc,
+		BackupId:   backup.BackupID,
+		Connection: backup.Connection,
+		Location:   location,
 	}.Build()
 	return s.applyOpBackup(ctx, backupOp)
 
@@ -1113,90 +1114,260 @@ func (s *StoreDB) applyOpUpdateSchema(_ context.Context, updateSchema *UpdateSch
 	return s.coreDB.UpdateSchema(s.schema)
 }
 
-func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
+type backupContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r backupContextReader) Read(data []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(data)
+}
+
+func publishLocalBackup(ctx context.Context, sourcePath, targetPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sourcePath = filepath.Clean(sourcePath)
+	targetPath = filepath.Clean(targetPath)
+	if sourcePath == targetPath {
+		return nil
+	}
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("creating backup directory: %w", err)
+	}
+	source, err := os.Open(sourcePath) //nolint:gosec // internal snapshot path
+	if err != nil {
+		return fmt.Errorf("opening staged backup: %w", err)
+	}
+	defer func() { _ = source.Close() }()
+	target, err := os.CreateTemp(dir, "."+filepath.Base(targetPath)+".tmp-*") //nolint:gosec // authorized backup directory
+	if err != nil {
+		return fmt.Errorf("creating temporary backup: %w", err)
+	}
+	tempPath := target.Name()
+	defer func() {
+		_ = target.Close()
+		_ = os.Remove(tempPath)
+	}()
+	if err := target.Chmod(0o600); err != nil {
+		return fmt.Errorf("setting backup permissions: %w", err)
+	}
+	if _, err := io.Copy(target, backupContextReader{ctx: ctx, reader: source}); err != nil {
+		return fmt.Errorf("copying staged backup: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := target.Sync(); err != nil {
+		return fmt.Errorf("syncing staged backup: %w", err)
+	}
+	if err := target.Close(); err != nil {
+		return fmt.Errorf("closing staged backup: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Link(tempPath, targetPath); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("%w: %s", common.ErrBackupAlreadyExists, targetPath)
+		}
+		return fmt.Errorf("publishing backup: %w", err)
+	}
+	dirHandle, err := os.Open(dir) //nolint:gosec // authorized backup directory
+	if err != nil {
+		return fmt.Errorf("opening backup directory for sync: %w", err)
+	}
+	defer func() { _ = dirHandle.Close() }()
+	if err := dirHandle.Sync(); err != nil {
+		return fmt.Errorf("syncing backup directory: %w", err)
+	}
+	return nil
+}
+
+const nativeBackupStageIntentVersion = 1
+
+type nativeBackupStageIntent struct {
+	Version    int    `json:"version"`
+	BackupID   string `json:"backup_id"`
+	Location   string `json:"location"`
+	Connection string `json:"connection,omitempty"`
+}
+
+func readNativeBackupStageIntent(path string) (nativeBackupStageIntent, bool, error) {
+	raw, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // internal snapshot path
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nativeBackupStageIntent{}, false, nil
+		}
+		return nativeBackupStageIntent{}, false, err
+	}
+	var intent nativeBackupStageIntent
+	if err := json.Unmarshal(raw, &intent); err != nil {
+		return nativeBackupStageIntent{}, false, fmt.Errorf("decoding backup stage intent: %w", err)
+	}
+	return intent, true, nil
+}
+
+func writeNativeBackupStageIntent(path string, intent nativeBackupStageIntent) error {
+	raw, err := json.Marshal(intent)
+	if err != nil {
+		return fmt.Errorf("encoding backup stage intent: %w", err)
+	}
+	file, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // internal snapshot path
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+	if _, err := file.Write(raw); err != nil {
+		return fmt.Errorf("writing backup stage intent: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("syncing backup stage intent: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing backup stage intent: %w", err)
+	}
+	closed = true
+	dir, err := os.Open(filepath.Dir(path)) //nolint:gosec // internal snapshot path
+	if err != nil {
+		return fmt.Errorf("opening backup stage directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("syncing backup stage directory: %w", err)
+	}
+	return nil
+}
+
+func (s *StoreDB) applyOpBackup(ctx context.Context, backup *BackupOp) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	startTime := time.Now()
 	if backup == nil {
 		return errors.New("backup operation data is nil")
 	}
 	backupID := backup.GetBackupId()
+	connection := backup.GetConnection()
 	location := backup.GetLocation()
-	archiveFile, err := s.snapStore.Path(backupID)
+	stagedArchive, err := s.snapStore.Path(backupID)
 	if err != nil {
 		return fmt.Errorf("getting archive file path: %w", err)
 	}
+	targetArchive := stagedArchive
 	backupToBlobStore := false
+	var s3Info common.S3Info
 	if location != "" {
 		if strings.HasPrefix(location, "s3://") {
 			backupToBlobStore = true
+			s3Info, err = s.antflyConfig.ResolveS3Info(connection, "backup.write", location)
+			if err != nil {
+				return fmt.Errorf("authorizing S3 backup: %w", err)
+			}
 		} else {
-			archiveFile = filepath.Join(location, fmt.Sprintf("%v.tar.zst", backupID))
+			targetArchive = filepath.Join(location, fmt.Sprintf("%v.tar.zst", backupID))
 		}
 	}
 
 	s.logger.Info("Starting backup operation",
 		zap.String("backupID", backupID),
 		zap.String("location", location),
-		zap.String("archiveFile", archiveFile),
+		zap.String("archiveFile", targetArchive),
 		zap.Bool("backupToBlobStore", backupToBlobStore),
 	)
 
-	// Check if backup already exists
 	checkTime := time.Now()
-	if _, err := os.Stat(archiveFile); err == nil {
-		if backupToBlobStore {
-			s.logger.Debug("Backup exists locally, writing to blob store",
-				zap.String("backupID", backupID),
-				zap.Duration("checkDuration", time.Since(checkTime)),
-			)
-			blobTime := time.Now()
-			// Don't timeout the blob store write if the client times out, it might take a while
-			err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.Local.S3)
-			s.logger.Info("Blob store write completed",
-				zap.String("backupID", backupID),
-				zap.Duration("blobWriteDuration", time.Since(blobTime)),
-				zap.Duration("totalDuration", time.Since(startTime)),
-				zap.Error(err),
-			)
-			return err
+	_, statErr := os.Stat(stagedArchive)
+	stagedExists := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return fmt.Errorf("checking staged backup: %w", statErr)
+	}
+	intentPath := stagedArchive + ".intent.json"
+	expectedIntent := nativeBackupStageIntent{
+		Version:    nativeBackupStageIntentVersion,
+		BackupID:   backupID,
+		Location:   location,
+		Connection: connection,
+	}
+	stagedIntent, intentExists, err := readNativeBackupStageIntent(intentPath)
+	if err != nil {
+		return fmt.Errorf("reading staged backup intent: %w", err)
+	}
+	if stagedExists && (!intentExists || stagedIntent != expectedIntent) {
+		return fmt.Errorf(
+			"%w: backup ID %q is bound to another staged operation",
+			common.ErrBackupAlreadyExists,
+			backupID,
+		)
+	}
+	if intentExists && stagedIntent != expectedIntent {
+		return fmt.Errorf(
+			"%w: backup ID %q is bound to another staged operation",
+			common.ErrBackupAlreadyExists,
+			backupID,
+		)
+	}
+	if !intentExists {
+		if err := writeNativeBackupStageIntent(intentPath, expectedIntent); err != nil {
+			if !os.IsExist(err) {
+				return fmt.Errorf("recording staged backup intent: %w", err)
+			}
+			stagedIntent, intentExists, err = readNativeBackupStageIntent(intentPath)
+			if err != nil {
+				return fmt.Errorf("reading concurrently staged backup intent: %w", err)
+			}
+			if !intentExists || stagedIntent != expectedIntent {
+				return fmt.Errorf(
+					"%w: backup ID %q is bound to another staged operation",
+					common.ErrBackupAlreadyExists,
+					backupID,
+				)
+			}
 		}
-		s.logger.Warn("Backup already exists, skipping",
+	}
+
+	snapshotTime := time.Now()
+	if !stagedExists {
+		s.logger.Debug("Creating DB snapshot",
+			zap.String("backupID", backupID),
+			zap.Duration("setupDuration", time.Since(startTime)),
+		)
+		if err := s.CreateDBSnapshotContext(ctx, backupID); err != nil {
+			return fmt.Errorf("creating db snapshot: %w", err)
+		}
+	} else {
+		s.logger.Debug("Reusing staged backup from an interrupted publication",
 			zap.String("backupID", backupID),
 			zap.Duration("checkDuration", time.Since(checkTime)),
-			zap.Duration("totalDuration", time.Since(startTime)),
 		)
-		return nil
-	}
-
-	// Remove any partial backup file
-	_ = os.RemoveAll(archiveFile)
-
-	// Create the snapshot
-	snapshotTime := time.Now()
-	s.logger.Debug("Creating DB snapshot",
-		zap.String("backupID", backupID),
-		zap.Duration("setupDuration", time.Since(startTime)),
-	)
-	if err := s.CreateDBSnapshot(backupID); err != nil {
-		s.logger.Error(
-			"Failed to create db snapshot",
-			zap.String("backupID", backupID),
-			zap.Duration("snapshotDuration", time.Since(snapshotTime)),
-			zap.Duration("totalDuration", time.Since(startTime)),
-			zap.Error(err),
-		)
-		return fmt.Errorf("creating db snapshot: %w", err)
 	}
 	snapshotDuration := time.Since(snapshotTime)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	// Write to blob store if needed
 	if backupToBlobStore {
 		blobTime := time.Now()
 		s.logger.Debug("Writing backup to blob store",
 			zap.String("backupID", backupID),
 			zap.String("location", location),
 		)
-		// Don't timeout the blob store write if the client times out, it might take a while
-		err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.Local.S3)
+		err := WriteBackupToBlobStore(ctx, stagedArchive, &s3Info)
 		blobDuration := time.Since(blobTime)
 		s.logger.Info("Backup operation completed",
 			zap.String("backupID", backupID),
@@ -1206,6 +1377,11 @@ func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
 			zap.Error(err),
 		)
 		return err
+	}
+	if targetArchive != stagedArchive {
+		if err := publishLocalBackup(ctx, stagedArchive, targetArchive); err != nil {
+			return err
+		}
 	}
 
 	s.logger.Info("Backup operation completed",
@@ -1368,6 +1544,12 @@ func (s *StoreDB) applyOpSplit(_ context.Context, split *SplitOp) error {
 	archiveInfo, err := common.CreateArchiveWithOptions(combinedStagingDir, tmpArchiveFile, common.CreateArchiveOptions{
 		ArchiveType: common.ArchiveZstd,
 		Metadata: &common.ArchiveMetadata{
+			Shard: common.NewShardInfo(
+				newShardID,
+				nodeID,
+				types.Range{medianKey, oldByteRange[1]},
+				"",
+			),
 			Split: &common.SplitMetadata{
 				ParentShardID:  shardID.String(),
 				ReplayFenceSeq: replayFenceSeq,
@@ -2089,7 +2271,11 @@ func (s *StoreDB) readCommits(
 }
 
 func (s *StoreDB) CreateDBSnapshot(id string) error {
-	_, err := s.coreDB.Snapshot(id)
+	return s.CreateDBSnapshotContext(context.Background(), id)
+}
+
+func (s *StoreDB) CreateDBSnapshotContext(ctx context.Context, id string) error {
+	_, err := s.coreDB.Snapshot(ctx, id)
 	return err
 }
 
@@ -2206,6 +2392,9 @@ func (s *StoreDB) loadPersistentSnapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("extracting snapshot %s: %w", snapID, err)
 	}
+	if err := s.validateRestoredArchiveMetadata(metadata); err != nil {
+		return fmt.Errorf("validating snapshot %s identity: %w", snapID, err)
+	}
 	s.restoredArchiveMetadata = metadata
 
 	// Log metadata if present
@@ -2269,6 +2458,41 @@ func (s *StoreDB) loadPersistentSnapshot(ctx context.Context) error {
 		zap.Uint64("size", size),
 		zap.String("snapID", snapID),
 		zap.String("pebbleDir", targetPebbleDir))
+	return nil
+}
+
+func (s *StoreDB) validateRestoredArchiveMetadata(metadata *common.ArchiveMetadata) error {
+	if metadata == nil {
+		return errors.New("archive metadata is required")
+	}
+	if metadata.Shard == nil {
+		return errors.New("archive shard identity is required")
+	}
+	shardID, _, err := common.ParseStorageDBDir(s.dbDir)
+	if err != nil {
+		return fmt.Errorf("parsing target shard identity: %w", err)
+	}
+	if metadata.Shard.ShardID != shardID.String() {
+		return fmt.Errorf(
+			"archive shard %q does not match target shard %q",
+			metadata.Shard.ShardID,
+			shardID,
+		)
+	}
+	s.byteRangeMu.RLock()
+	expectedRange := s.byteRange
+	s.byteRangeMu.RUnlock()
+	expectedStart := base64.StdEncoding.EncodeToString(expectedRange[0])
+	expectedEnd := base64.StdEncoding.EncodeToString(expectedRange[1])
+	if metadata.Shard.RangeStart != expectedStart || metadata.Shard.RangeEnd != expectedEnd {
+		return fmt.Errorf(
+			"archive range [%q,%q) does not match target range [%q,%q)",
+			metadata.Shard.RangeStart,
+			metadata.Shard.RangeEnd,
+			expectedStart,
+			expectedEnd,
+		)
+	}
 	return nil
 }
 

@@ -32,7 +32,7 @@ pub const SearchRequest = struct {
         if (self.parsed) |parsed| parsed.deinit();
     }
 
-    pub fn facetFields(self: SearchRequest) []const []const u8 {
+    pub fn facetFields(self: *const SearchRequest) []const []const u8 {
         return self.facet_fields[0..self.facet_field_count];
     }
 };

@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const pdf = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
     struct {
         pub const reader = struct {
             pub const Reader = struct {
@@ -321,7 +321,9 @@ pub const Config = struct {
     last_modified_field: []const u8 = "",
     html_strip_tags: bool = true,
     ocr_enabled: bool = false,
-    ocr_pdf_fallback_enabled: bool = false,
+    // Preserve main's default: PDFs use the built-in OCR fallback unless an
+    // explicit document-extraction configuration disables it.
+    ocr_pdf_fallback_enabled: bool = true,
     ocr_mode: OcrMode = .auto,
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,

@@ -79,6 +79,8 @@ pub const MemoryStorage = struct {
     hard_state: types.HardState = .{},
     conf_state: types.ConfState = .{},
     snapshot_state: types.Snapshot = .{},
+    compacted_index: types.Index = 0,
+    compacted_term: types.Term = 0,
     entries_state: std.ArrayListUnmanaged(types.Entry) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) MemoryStorage {
@@ -111,7 +113,7 @@ pub const MemoryStorage = struct {
         var out = Diagnostics{
             .entries = self.entries_state.items.len,
             .entry_capacity = self.entries_state.capacity,
-            .first_index = if (self.entries_state.items.len > 0) self.entries_state.items[0].index else self.snapshot_state.metadata.index + 1,
+            .first_index = self.compacted_index + 1,
             .last_index = if (self.entries_state.items.len > 0) self.entries_state.items[self.entries_state.items.len - 1].index else self.snapshot_state.metadata.index,
             .snapshot_index = self.snapshot_state.metadata.index,
             .snapshot_bytes = self.snapshot_state.data.len,
@@ -129,6 +131,14 @@ pub const MemoryStorage = struct {
 
     pub fn setHardState(self: *MemoryStorage, hard_state: types.HardState) void {
         self.hard_state = hard_state;
+    }
+
+    pub fn compactedIndex(self: *const MemoryStorage) types.Index {
+        return self.compacted_index;
+    }
+
+    pub fn compactedTerm(self: *const MemoryStorage) types.Term {
+        return self.compacted_term;
     }
 
     pub fn setConfState(self: *MemoryStorage, conf_state: types.ConfState) !void {
@@ -158,7 +168,11 @@ pub const MemoryStorage = struct {
 
     pub fn append(self: *MemoryStorage, entries: []const types.Entry) !void {
         if (entries.len == 0) return;
-        const first_new_index = entries[0].index;
+        var first_new: usize = 0;
+        while (first_new < entries.len and entries[first_new].index <= self.compacted_index) : (first_new += 1) {}
+        if (first_new == entries.len) return;
+        const retained_entries = entries[first_new..];
+        const first_new_index = retained_entries[0].index;
         var truncate_at: ?usize = null;
         for (self.entries_state.items, 0..) |entry, i| {
             if (entry.index >= first_new_index) {
@@ -171,8 +185,8 @@ pub const MemoryStorage = struct {
             self.entries_state.shrinkRetainingCapacity(idx);
         }
 
-        try self.entries_state.ensureUnusedCapacity(self.alloc, entries.len);
-        for (entries) |entry| self.entries_state.appendAssumeCapacity(try entry.clone(self.alloc));
+        try self.entries_state.ensureUnusedCapacity(self.alloc, retained_entries.len);
+        for (retained_entries) |entry| self.entries_state.appendAssumeCapacity(try entry.clone(self.alloc));
     }
 
     pub fn applySnapshot(self: *MemoryStorage, snapshot: types.Snapshot) !void {
@@ -181,6 +195,80 @@ pub const MemoryStorage = struct {
         try self.setConfState(snapshot.metadata.conf_state);
         self.snapshot_state.deinit(self.alloc);
         self.snapshot_state = try snapshot.clone(self.alloc);
+        self.compacted_index = snapshot.metadata.index;
+        self.compacted_term = snapshot.metadata.term;
+    }
+
+    /// Installs a locally-created state-machine snapshot while retaining log
+    /// entries newer than compact_index for follower replication. The state
+    /// snapshot may be newer than the log compaction boundary.
+    pub fn compactToSnapshot(self: *MemoryStorage, snapshot: types.Snapshot, compact_index: types.Index) !void {
+        if (snapshot.metadata.index < self.snapshot_state.metadata.index) return error.SnapshotOutOfDate;
+        if (compact_index > snapshot.metadata.index or compact_index < self.compacted_index)
+            return error.InvalidCompactionBoundary;
+        const local_term = try termImpl(self, snapshot.metadata.index);
+        if (local_term != snapshot.metadata.term) return error.SnapshotTermMismatch;
+        const compact_term = if (compact_index == self.compacted_index)
+            self.compacted_term
+        else
+            try termImpl(self, compact_index);
+
+        var owned_snapshot = try snapshot.clone(self.alloc);
+        errdefer owned_snapshot.deinit(self.alloc);
+        try self.setConfState(snapshot.metadata.conf_state);
+
+        var remove_count: usize = 0;
+        while (remove_count < self.entries_state.items.len and
+            self.entries_state.items[remove_count].index <= compact_index)
+        {
+            remove_count += 1;
+        }
+        for (self.entries_state.items[0..remove_count]) |*entry| entry.deinit(self.alloc);
+        if (remove_count > 0) {
+            std.mem.copyForwards(
+                types.Entry,
+                self.entries_state.items[0 .. self.entries_state.items.len - remove_count],
+                self.entries_state.items[remove_count..],
+            );
+            self.entries_state.shrinkRetainingCapacity(self.entries_state.items.len - remove_count);
+        }
+
+        self.snapshot_state.deinit(self.alloc);
+        self.snapshot_state = owned_snapshot;
+        self.compacted_index = compact_index;
+        self.compacted_term = compact_term;
+    }
+
+    pub fn restoreCompactionBoundary(self: *MemoryStorage, index: types.Index, term: types.Term) !void {
+        if (index > self.snapshot_state.metadata.index) return error.InvalidCompactionBoundary;
+        if (index == 0 and term != 0) return error.InvalidCompactionBoundary;
+        self.compacted_index = index;
+        self.compacted_term = term;
+    }
+
+    pub fn validate(self: *const MemoryStorage) !void {
+        if (self.compacted_index > self.snapshot_state.metadata.index) return error.InvalidCompactionBoundary;
+        if (self.compacted_index == 0 and self.compacted_term != 0) return error.InvalidCompactionBoundary;
+        if (self.snapshot_state.metadata.index == self.compacted_index and
+            self.snapshot_state.metadata.term != self.compacted_term)
+        {
+            return error.SnapshotTermMismatch;
+        }
+        if (self.entries_state.items.len == 0) {
+            if (self.compacted_index != self.snapshot_state.metadata.index) return error.InvalidCompactionBoundary;
+            return;
+        }
+        if (self.entries_state.items[0].index != self.compacted_index + 1) return error.InvalidCompactionBoundary;
+        for (self.entries_state.items[1..], self.entries_state.items[0 .. self.entries_state.items.len - 1]) |entry, previous| {
+            if (entry.index != previous.index + 1) return error.InvalidCompactionBoundary;
+        }
+        if (self.entries_state.items[self.entries_state.items.len - 1].index < self.snapshot_state.metadata.index)
+            return error.InvalidCompactionBoundary;
+        if (self.snapshot_state.metadata.index > self.compacted_index and
+            try termImpl(@constCast(self), self.snapshot_state.metadata.index) != self.snapshot_state.metadata.term)
+        {
+            return error.SnapshotTermMismatch;
+        }
     }
 
     pub fn compactTo(self: *MemoryStorage, index: types.Index, conf_state: types.ConfState) !void {
@@ -210,6 +298,8 @@ pub const MemoryStorage = struct {
 
         self.snapshot_state.deinit(self.alloc);
         self.snapshot_state = new_snapshot;
+        self.compacted_index = index;
+        self.compacted_term = snap_term;
     }
 
     fn initialStateImpl(ptr: *anyopaque, alloc: std.mem.Allocator) !Storage.InitialState {
@@ -244,6 +334,7 @@ pub const MemoryStorage = struct {
 
     fn termImpl(ptr: *anyopaque, index: types.Index) !types.Term {
         const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
+        if (index == self.compacted_index) return self.compacted_term;
         if (index == self.snapshot_state.metadata.index) return self.snapshot_state.metadata.term;
         for (self.entries_state.items) |entry| {
             if (entry.index == index) return entry.term;
@@ -253,8 +344,7 @@ pub const MemoryStorage = struct {
 
     fn firstIndexImpl(ptr: *anyopaque) !types.Index {
         const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
-        if (self.entries_state.items.len > 0) return self.entries_state.items[0].index;
-        return self.snapshot_state.metadata.index + 1;
+        return self.compacted_index + 1;
     }
 
     fn lastIndexImpl(ptr: *anyopaque) !types.Index {
@@ -291,4 +381,35 @@ test "memory storage appends and serves entries" {
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqual(@as(types.Index, 1), try storage.storage().firstIndex());
     try std.testing.expectEqual(@as(types.Index, 2), try storage.storage().lastIndex());
+}
+
+test "memory storage keeps a replication suffix behind a newer state snapshot" {
+    var storage = MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.append(&.{
+        .{ .index = 1, .term = 1 },
+        .{ .index = 2, .term = 1 },
+        .{ .index = 3, .term = 2 },
+        .{ .index = 4, .term = 2 },
+        .{ .index = 5, .term = 2 },
+    });
+
+    try storage.compactToSnapshot(.{
+        .metadata = .{ .index = 5, .term = 2 },
+        .data = @constCast("state-at-five"),
+    }, 3);
+
+    try std.testing.expectEqual(@as(types.Index, 3), storage.compactedIndex());
+    try std.testing.expectEqual(@as(types.Term, 2), storage.compactedTerm());
+    try std.testing.expectEqual(@as(types.Index, 4), try storage.storage().firstIndex());
+    try std.testing.expectEqual(@as(types.Index, 5), try storage.storage().lastIndex());
+    try std.testing.expectEqual(@as(types.Term, 2), try storage.storage().term(3));
+    const retained = try storage.storage().entries(std.testing.allocator, 4, 6, 0);
+    defer types.freeEntries(std.testing.allocator, retained);
+    try std.testing.expectEqual(@as(usize, 2), retained.len);
+
+    var snapshot = try storage.storage().snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(types.Index, 5), snapshot.metadata.index);
+    try std.testing.expectEqualStrings("state-at-five", snapshot.data);
 }

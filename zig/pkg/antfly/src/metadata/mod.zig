@@ -12,9 +12,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const std = @import("std");
+
 pub const storage = @import("storage/mod.zig");
 pub const runtime = @import("runtime.zig");
 pub const api = @import("api.zig");
+pub const authority = @import("authority.zig");
+pub const incarnation = @import("incarnation.zig");
 pub const admin = @import("admin.zig");
 pub const http_routes = @import("http_routes.zig");
 pub const http_server = @import("http_server.zig");
@@ -41,6 +45,7 @@ pub const encodeTransitionCommand = storage.encodeTransitionCommand;
 pub const decodeTransitionCommand = storage.decodeTransitionCommand;
 pub const AdminSnapshot = api.AdminSnapshot;
 pub const MetadataStatus = api.MetadataStatus;
+pub const MetadataClusterIncarnation = incarnation.MetadataClusterIncarnation;
 pub const captureAdminSnapshot = api.captureSnapshot;
 pub const freeAdminSnapshot = api.freeSnapshot;
 pub const ActiveTransitionCounts = admin.ActiveTransitionCounts;
@@ -60,11 +65,13 @@ pub const MetadataState = state.MetadataState;
 pub const TableRecord = table_manager.TableRecord;
 pub const PlacementClass = table_manager.PlacementClass;
 pub const RangeRecord = table_manager.RangeRecord;
+pub const RestoreIntentIdentity = table_manager.RestoreIntentIdentity;
 pub const NodeRecord = table_manager.NodeRecord;
 pub const StoreRecord = table_manager.StoreRecord;
 pub const GroupStatusReport = table_manager.GroupStatusReport;
 pub const StoreStatusReport = table_manager.StoreStatusReport;
 pub const RuntimeGroupStatusReport = table_manager.RuntimeGroupStatusReport;
+pub const RuntimeEnrichmentStatusReport = table_manager.RuntimeEnrichmentStatusReport;
 pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatusReport;
 pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlanningStatusReport;
 pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;
@@ -79,6 +86,7 @@ pub const ReconcileLeaseRecord = reconcile_lease.ReconcileLeaseRecord;
 pub const ReconcileLeaseState = reconcile_lease.State;
 pub const ReconcileLeaseStats = reconcile_lease.Stats;
 pub const ReallocationRequestRecord = reallocation_request.ReallocationRequestRecord;
+pub const isValidReallocationRequest = reallocation_request.isValid;
 pub const applyStoreObservation = store_observer.applyObservation;
 pub const applyStoreObservations = store_observer.applyObservations;
 pub const classifyStore = store_observer.classifyStore;
@@ -96,6 +104,7 @@ pub const parsePlacementClass = table_manager.parsePlacementClass;
 pub const placementRoleCompatible = table_manager.placementRoleCompatible;
 pub const TransitionKind = transition_state.TransitionKind;
 pub const TransitionPhase = transition_state.TransitionPhase;
+pub const TransitionTableContract = transition_state.TransitionTableContract;
 pub const SplitTransitionRecord = transition_state.SplitTransitionRecord;
 pub const MergeTransitionRecord = transition_state.MergeTransitionRecord;
 pub const SplitObservation = transition_state.SplitObservation;
@@ -126,6 +135,8 @@ test "metadata module compiles" {
     _ = storage;
     _ = runtime;
     _ = api;
+    std.testing.refAllDecls(authority);
+    std.testing.refAllDecls(incarnation);
     _ = admin;
     _ = http_routes;
     _ = http_server;

@@ -92,6 +92,10 @@ pub const WalReplicaProvider = struct {
                 .ptr = self,
                 .vtable = &.{
                     .persist_ready = persistReady,
+                    .persist_ready_diagnostics = persistReadyWithDiagnostics,
+                    .compact_snapshot = compactSnapshot,
+                    .compact_snapshot_artifact = compactSnapshotArtifact,
+                    .retire_group = retireGroup,
                 },
             },
         };
@@ -134,7 +138,7 @@ pub const WalReplicaProvider = struct {
         var desc = try self.base_factory.buildDescriptor(record);
         errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
         const state = try self.ensureState(record);
-        try state.seedConfStateIfEmpty(desc.group.raft_config.peers);
+        try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
         desc.group.raft_config.applied = state.appliedIndex();
         return desc;
@@ -151,6 +155,35 @@ pub const WalReplicaProvider = struct {
         try state.groupStorage().persistReady(group_id, ready);
     }
 
+    fn persistReadyWithDiagnostics(
+        ptr: *anyopaque,
+        group_id: u64,
+        ready: raft_engine.core.Ready,
+        diag: *raft_engine.runtime.storage_iface.ReadyPersistenceDiagnostics,
+    ) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        try state.groupStorage().persistReadyWithDiagnostics(group_id, ready, diag);
+    }
+
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        try state.groupStorage().compactSnapshot(group_id, snapshot, compact_index);
+    }
+
+    fn compactSnapshotArtifact(
+        ptr: *anyopaque,
+        group_id: u64,
+        metadata: raft_engine.core.types.SnapshotMetadata,
+        artifact: raft_engine.runtime.storage_iface.SnapshotArtifact,
+        compact_index: u64,
+    ) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        try state.groupStorage().compactSnapshotArtifact(self.alloc, group_id, metadata, artifact, compact_index);
+    }
+
     fn setAppliedIndex(
         ptr: *anyopaque,
         group_id: raft_engine.core.types.GroupId,
@@ -161,10 +194,23 @@ pub const WalReplicaProvider = struct {
         try state.setAppliedIndex(index);
     }
 
+    fn retireGroup(ptr: *anyopaque, group_id: u64) void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse {
+            return;
+        };
+        if (self.cfg.flush_on_deinit) state.flushForShutdown() catch |err| {
+            std.log.err("raft WAL replica retirement flush failed group_id={d} error={s}", .{ group_id, @errorName(err) });
+        };
+        const removed = self.states.fetchRemove(group_id) orelse unreachable;
+        removed.value.deinit();
+        self.alloc.destroy(removed.value);
+    }
+
     fn ensureState(self: *WalReplicaProvider, record: catalog.ReplicaRecord) !*wal_replica_state.WalReplicaState {
         if (self.states.get(record.group_id)) |state| return state;
 
-        var layout = try storage_mod.ReplicaPathLayout.initForReplica(self.alloc, self.root_dir, record.group_id, record.replica_id);
+        var layout = try storage_mod.ReplicaPathLayout.initForLocalNode(self.alloc, self.root_dir, record.group_id, record.local_node_id);
         defer layout.deinit(self.alloc);
 
         const state = try self.alloc.create(wal_replica_state.WalReplicaState);
@@ -181,6 +227,8 @@ test "wal replica provider wires host through WAL-backed local state" {
     const BaseFactory = struct {
         alloc: std.mem.Allocator,
         dummy_store: *raft_engine.core.MemoryStorage,
+        transport_peers: []const u64 = &.{},
+        initial_voters: ?[]const u64 = null,
 
         fn iface(self: *@This()) host.ReplicaDescriptorFactory {
             return .{
@@ -194,7 +242,10 @@ test "wal replica provider wires host through WAL-backed local state" {
 
         fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const peers = try self.alloc.dupe(u64, &.{record.local_node_id});
+            const peer_source = if (self.transport_peers.len > 0) self.transport_peers else &.{record.local_node_id};
+            const peers = try self.alloc.dupe(u64, peer_source);
+            errdefer self.alloc.free(peers);
+            const initial_voters = if (self.initial_voters) |voters| try self.alloc.dupe(u64, voters) else null;
             return .{
                 .group = .{
                     .group_id = record.group_id,
@@ -210,6 +261,7 @@ test "wal replica provider wires host through WAL-backed local state" {
                     },
                     .storage = self.dummy_store.storage(),
                 },
+                .initial_voters = initial_voters,
                 .bootstrap = .persisted,
             };
         }
@@ -217,6 +269,7 @@ test "wal replica provider wires host through WAL-backed local state" {
         fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = alloc;
+            if (desc.initial_voters) |voters| self.alloc.free(voters);
             self.alloc.free(desc.group.raft_config.peers);
         }
     };
@@ -232,10 +285,12 @@ test "wal replica provider wires host through WAL-backed local state" {
     {
         var provider = try WalReplicaProvider.init(std.testing.allocator, .{ .root_dir = root }, base_factory.iface());
         defer provider.deinit();
+        const runtime_hooks = provider.runtimeHooks();
+        try std.testing.expect(runtime_hooks.group_storage.?.vtable.persist_ready_diagnostics != null);
 
         var local_host = host.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
             .descriptor_factory = provider.descriptorFactory(),
-            .runtime_hooks = provider.runtimeHooks(),
+            .runtime_hooks = runtime_hooks,
         });
         defer local_host.deinit();
 
@@ -248,13 +303,40 @@ test "wal replica provider wires host through WAL-backed local state" {
         try local_host.campaignGroup(501);
         _ = try local_host.runRound(1, 1);
         try local_host.propose(501, "wal-backed");
-        _ = try local_host.runRound(1, 1);
+        const persisted_round = try local_host.runRound(1, 1);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.encoded_bytes > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_append_elapsed_ns > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_commit_elapsed_ns > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_physical_commits > 0);
+        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_inner_segment_syncs > 0);
+        // The WAL index is synced only when its segment metadata changes.
+        // Campaign/bootstrap may initialize it in an earlier Ready; a
+        // steady-state proposal correctly persists with only a segment sync.
+        try std.testing.expectEqual(@as(u64, 0), persisted_round.slowest_ready_group.persist_ready_detail.wal_post_commit_segment_syncs);
+        try std.testing.expectEqual(@as(u64, 0), persisted_round.slowest_ready_group.persist_ready_detail.wal_post_commit_index_syncs);
 
         const state = provider.stateForGroup(501) orelse return error.MissingState;
         try std.testing.expect((try state.storage().lastIndex()) >= 1);
         var initial_state = try state.storage().initialState(std.testing.allocator);
         defer initial_state.deinit(std.testing.allocator);
         try std.testing.expectEqualSlices(u64, &.{1}, initial_state.conf_state.voters);
+
+        _ = try local_host.ensureReplica(.{
+            .group_id = 501,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        });
+        try local_host.removeReplica(501);
+        try std.testing.expect(provider.stateForGroup(501) == null);
+        _ = try local_host.ensureReplica(.{
+            .group_id = 501,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        });
+        const replacement = provider.stateForGroup(501) orelse return error.MissingState;
+        try std.testing.expect((try replacement.storage().lastIndex()) >= 1);
     }
 
     {
@@ -276,5 +358,32 @@ test "wal replica provider wires host through WAL-backed local state" {
 
         const state = provider.stateForGroup(501) orelse return error.MissingState;
         try std.testing.expect((try state.storage().lastIndex()) >= 1);
+    }
+
+    {
+        var relocation_factory = BaseFactory{
+            .alloc = std.testing.allocator,
+            .dummy_store = &dummy_store,
+            .transport_peers = &.{ 1, 2 },
+            .initial_voters = &.{1},
+        };
+        var provider = try WalReplicaProvider.init(std.testing.allocator, .{ .root_dir = root }, relocation_factory.iface());
+        defer provider.deinit();
+        var local_host = host.Host.init(std.testing.allocator, .{ .local_node_id = 2 }, .{
+            .descriptor_factory = provider.descriptorFactory(),
+            .runtime_hooks = provider.runtimeHooks(),
+        });
+        defer local_host.deinit();
+
+        _ = try local_host.ensureReplica(.{
+            .group_id = 502,
+            .replica_id = 2,
+            .local_node_id = 2,
+            .bootstrap_mode = .persisted,
+        });
+        const state = provider.stateForGroup(502) orelse return error.MissingState;
+        var initial_state = try state.storage().initialState(std.testing.allocator);
+        defer initial_state.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u64, &.{1}, initial_state.conf_state.voters);
     }
 }

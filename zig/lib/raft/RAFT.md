@@ -141,9 +141,16 @@ pub const MultiRaft = struct {
     pub fn tickGroup(self: *MultiRaft, group_id: GroupId) !void;
     pub fn tickBatch(self: *MultiRaft, alloc: Allocator) ![]GroupId;
     pub fn tickAll(self: *MultiRaft) void;
-    pub fn runRound(self: *MultiRaft, max_tick_groups: usize, max_ready_groups: usize) !HostRound;
+    pub fn runRound(self: *MultiRaft, max_tick_groups: usize, max_ready_steps: usize) !HostRound;
 };
 ```
+
+`max_ready_steps` bounds successful Ready state transitions, not distinct
+groups. A host round reports both `processed_ready_steps` and the number of
+distinct `processed_groups`. Every group receives a fair opportunity before
+same-round continuation work when the step budget permits. Only a successful
+Ready step that exposes another Ready frontier is eligible for continuation;
+backpressure and capacity denials are deferred to the next fair round.
 
 ## Transport Layering
 

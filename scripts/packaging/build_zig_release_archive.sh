@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -23,6 +23,7 @@ out_dir=
 metal=false
 system_blas=false
 optimize=ReleaseFast
+strip=true
 jobs=
 
 while [ "$#" -gt 0 ]; do
@@ -53,6 +54,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --optimize)
       optimize="${2:?missing --optimize value}"
+      shift 2
+      ;;
+    --strip)
+      strip="${2:?missing --strip value}"
       shift 2
       ;;
     --jobs)
@@ -87,6 +92,15 @@ case "$optimize" in
   *)
     usage
     echo "--optimize must be one of Debug, ReleaseSafe, ReleaseFast, ReleaseSmall; got: $optimize" >&2
+    exit 2
+    ;;
+esac
+
+case "$strip" in
+  true|false) ;;
+  *)
+    usage
+    echo "--strip must be true or false, got: $strip" >&2
     exit 2
     ;;
 esac
@@ -127,6 +141,7 @@ mkdir -p "$prefix" "$stage" "$local_cache" "$cache_root/global" "$out_dir"
 zig_build_options=(
   -Dtarget="$target"
   -Doptimize="$optimize"
+  -Dstrip="$strip"
   -Dcpu=baseline
   -Dedition=full
   -Dantfly-bin-name=antfly

@@ -323,7 +323,9 @@ func TestDBBatch_RejectsWriteInSplitOffRangeAfterRangeNarrowed(t *testing.T) {
 }
 
 func TestDBWrapperSnapshot(t *testing.T) {
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := common.StorageDBDir(root, 1, 1)
+	require.NoError(t, os.MkdirAll(dir, 0o750))
 	t.Cleanup(func() { os.RemoveAll("./antflydb") })
 	// Load test data
 	val := map[string]any{
@@ -339,18 +341,20 @@ func TestDBWrapperSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	coreDB := NewDBImplForTest(lg, snapStore)
+	byteRange := types.Range{nil, []byte{0xFF}}
 	s := &StoreDB{
 		logger:         lg,
 		dbDir:          dir,
 		snapStore:      snapStore,
 		coreDB:         coreDB,
+		byteRange:      byteRange,
 		loadSnapshotID: func(_ context.Context) (string, error) { return "foo", nil },
 	}
 	fs := []float32{1.0}
 	hashID := uint64(12345) // Test hash ID
 	vecBuf := make([]byte, 0)
 	vecBuf, _ = vectorindex.EncodeEmbeddingWithHashID(vecBuf, fs, hashID)
-	require.NoError(t, s.coreDB.Open(dir, false, nil, types.Range{nil, []byte{0xFF}}))
+	require.NoError(t, s.coreDB.Open(dir, false, nil, byteRange))
 	err = s.coreDB.Batch(
 		t.Context(),
 		[][2][]byte{{[]byte("foo"), b}, {[]byte("foo:i:bar:e"), vecBuf}},
@@ -390,6 +394,19 @@ func TestDBWrapperSnapshot(t *testing.T) {
 	require.NotEmpty(t, v["_embeddings"])
 	assert.Equal(t, "bazz", v["bar"])
 	assert.EqualValues(t, 1, v["other"])
+}
+
+func TestPublishLocalBackupDoesNotCommitAfterCancellation(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.tar.zst")
+	target := filepath.Join(root, "published", "backup.tar.zst")
+	require.NoError(t, os.WriteFile(source, []byte("snapshot"), 0o600))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, publishLocalBackup(ctx, source, target), context.Canceled)
+	_, err := os.Stat(target)
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestStoreDBCloseDB_WaitsForBackgroundGoroutines(t *testing.T) {

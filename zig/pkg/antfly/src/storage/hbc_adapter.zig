@@ -67,9 +67,15 @@ var temp_path_nonce: u64 = 0;
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
 
-const TestGetVectorViewOrScratchHook = *const fn (?*anyopaque, *HBCIndex, u64) void;
+pub const TestGetVectorViewOrScratchHook = *const fn (?*anyopaque, *HBCIndex, u64) void;
 var test_get_vector_view_or_scratch_ctx: ?*anyopaque = null;
 var test_get_vector_view_or_scratch_hook: ?TestGetVectorViewOrScratchHook = null;
+
+pub fn setTestGetVectorViewOrScratchHook(ctx: ?*anyopaque, hook: ?TestGetVectorViewOrScratchHook) void {
+    if (!builtin.is_test) return;
+    test_get_vector_view_or_scratch_ctx = ctx;
+    test_get_vector_view_or_scratch_hook = hook;
+}
 
 // ============================================================================
 // Configuration
@@ -1701,7 +1707,7 @@ pub const HBCIndex = struct {
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
         return switch (self.env_owner) {
-            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
             .lmdb => null,
         };
     }
@@ -1721,9 +1727,20 @@ pub const HBCIndex = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex) !bool {
-        if (self.shouldSuppressRoutineMaintenance()) return false;
         return switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |handle| blk: {
+                // An open HBC publication session suppresses compaction and
+                // ordinary flush work, but never a due WAL resource/durability
+                // checkpoint. Backend bulk-mode maintenance is pressure-only.
+                if (self.shouldSuppressRoutineMaintenance()) {
+                    const due = if (handle.backend.nextMaintenanceWakeDelayNsBestEffort()) |delay_ns|
+                        delay_ns == 0
+                    else
+                        false;
+                    if (!due) break :blk false;
+                }
+                break :blk try handle.backend.runMaintenanceStepBestEffort();
+            },
             .lmdb => false,
         };
     }
@@ -4712,6 +4729,9 @@ pub const HBCIndex = struct {
     }
 
     pub fn getVectorViewOrScratchWithCursor(self: *HBCIndex, cursor: *vectorindex_store.Cursor, vector_id: u64, scratch: []f32) ![]const f32 {
+        if (builtin.is_test) {
+            if (test_get_vector_view_or_scratch_hook) |hook| hook(test_get_vector_view_or_scratch_ctx, self, vector_id);
+        }
         return try vectorindex_hbc_index.getVectorViewOrScratchWithCursor(self, cursor, vector_id, scratch);
     }
 

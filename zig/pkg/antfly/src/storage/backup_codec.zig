@@ -453,49 +453,88 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
 }
 
 pub fn decodeDocumentBatch(alloc: Allocator, data: []const u8) ![]DocumentEntry {
-    if (data.len < 4) return error.BatchTooShort;
-
-    const count = std.mem.readInt(u32, data[0..4], .little);
+    const count = try documentBatchEntryCount(data);
     var off: usize = 4;
 
     var entries = try ArrayList(DocumentEntry).initCapacity(alloc, count);
-    errdefer entries.deinit(alloc);
+    errdefer {
+        for (entries.items) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+        entries.deinit(alloc);
+    }
 
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        if (off + 4 > data.len) return error.Truncated;
+        // documentBatchEntryCount already validated every boundary. Keep the
+        // checks here so this decoder remains independently robust if its
+        // preflight changes.
+        if (data.len - off < 4) return error.Truncated;
         const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
         off += 4;
 
-        if (off + key_len > data.len) return error.Truncated;
-        const key = try alloc.dupe(u8, data[off..][0..key_len]);
-        off += key_len;
+        if (key_len > data.len - off) return error.Truncated;
+        const entry = blk: {
+            const key = try alloc.dupe(u8, data[off..][0..key_len]);
+            errdefer alloc.free(key);
+            off += key_len;
 
-        if (off + 1 > data.len) return error.Truncated;
-        const value_flags = data[off];
-        off += 1;
+            if (data.len - off < 1 + 4) return error.Truncated;
+            const value_flags = data[off];
+            off += 1;
 
-        if (off + 4 > data.len) return error.Truncated;
-        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
-        off += 4;
+            const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
+            off += 4;
+            if (value_len > data.len - off) return error.Truncated;
+            const value = try alloc.dupe(u8, data[off..][0..value_len]);
+            errdefer alloc.free(value);
+            off += value_len;
 
-        if (off + value_len > data.len) return error.Truncated;
-        const value = try alloc.dupe(u8, data[off..][0..value_len]);
-        off += value_len;
+            if (data.len - off < 8) return error.Truncated;
+            const timestamp_ns = std.mem.readInt(u64, data[off..][0..8], .little);
+            off += 8;
 
-        if (off + 8 > data.len) return error.Truncated;
-        const timestamp_ns = std.mem.readInt(u64, data[off..][0..8], .little);
-        off += 8;
+            break :blk DocumentEntry{
+                .key = key,
+                .value_flags = value_flags,
+                .value = value,
+                .timestamp_ns = timestamp_ns,
+            };
+        };
 
-        try entries.append(alloc, .{
-            .key = key,
-            .value_flags = value_flags,
-            .value = value,
-            .timestamp_ns = timestamp_ns,
-        });
+        entries.appendAssumeCapacity(entry);
     }
 
     return entries.toOwnedSlice(alloc);
+}
+
+/// Validates a document batch and returns its entry count without allocating.
+/// Decoders use this bounded preflight before materializing keys and values.
+pub fn documentBatchEntryCount(data: []const u8) !u32 {
+    if (data.len < 4) return error.BatchTooShort;
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    var off: usize = 4;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (data.len - off < 4) return error.Truncated;
+        const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        if (key_len > data.len - off) return error.Truncated;
+        off += key_len;
+
+        if (data.len - off < 1 + 4) return error.Truncated;
+        off += 1;
+        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        if (value_len > data.len - off) return error.Truncated;
+        off += value_len;
+
+        if (data.len - off < 8) return error.Truncated;
+        off += 8;
+    }
+    if (off != data.len) return error.TrailingData;
+    return count;
 }
 
 pub fn encodeEmbeddingBatch(alloc: Allocator, index_name: []const u8, dimension: u16, entries: []const EmbeddingEntry) ![]u8 {
@@ -913,6 +952,28 @@ test "document batch round-trip" {
     try std.testing.expectEqualStrings("doc2", decoded[1].key);
     try std.testing.expectEqual(doc_value_flag_compressed, decoded[1].value_flags);
     try std.testing.expectEqual(@as(u64, 1234567890), decoded[1].timestamp_ns);
+
+    try std.testing.expectEqual(@as(u32, 2), try documentBatchEntryCount(encoded));
+    try std.testing.expectError(error.Truncated, documentBatchEntryCount(encoded[0 .. encoded.len - 1]));
+    const with_trailing = try alloc.alloc(u8, encoded.len + 1);
+    defer alloc.free(with_trailing);
+    @memcpy(with_trailing[0..encoded.len], encoded);
+    with_trailing[encoded.len] = 0;
+    try std.testing.expectError(error.TrailingData, documentBatchEntryCount(with_trailing));
+
+    const AllocationRunner = struct {
+        fn run(failing_alloc: Allocator, input: []const u8) !void {
+            const values = try decodeDocumentBatch(failing_alloc, input);
+            defer {
+                for (values) |value| {
+                    failing_alloc.free(value.key);
+                    failing_alloc.free(value.value);
+                }
+                failing_alloc.free(values);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{encoded});
 }
 
 test "embedding batch round-trip" {

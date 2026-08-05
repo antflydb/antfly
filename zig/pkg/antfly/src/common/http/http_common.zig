@@ -24,6 +24,39 @@ pub const Method = enum {
     DELETE,
 };
 
+/// Listener-owned signal that remains valid for the lifetime of one request.
+/// Executors must only borrow it synchronously; it is not serializable and
+/// must never outlive the request that supplied it.
+pub const RequestCancellation = struct {
+    cancelled: std.atomic.Value(bool) = .init(false),
+    /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
+    /// borrowed for the request lifetime and complements local cancellation.
+    borrowed: ?*const std.atomic.Value(bool) = null,
+
+    pub fn cancel(self: *RequestCancellation) void {
+        self.cancelled.store(true, .release);
+    }
+
+    pub fn isCancelled(self: *const RequestCancellation) bool {
+        return self.cancelled.load(.acquire) or
+            (self.borrowed != null and self.borrowed.?.load(.acquire));
+    }
+
+    /// The listener installs at most one cancellation source per transport:
+    /// H2 borrows the stream signal, while H1 uses the local socket watcher.
+    pub fn signal(self: *const RequestCancellation) *const std.atomic.Value(bool) {
+        return self.borrowed orelse &self.cancelled;
+    }
+};
+
+test "RequestCancellation observes a borrowed listener signal" {
+    var listener_signal = std.atomic.Value(bool).init(false);
+    const cancellation = RequestCancellation{ .borrowed = &listener_signal };
+    try std.testing.expect(!cancellation.isCancelled());
+    listener_signal.store(true, .release);
+    try std.testing.expect(cancellation.isCancelled());
+}
+
 pub const HttpRequest = struct {
     method: Method,
     uri: []const u8,
@@ -33,6 +66,7 @@ pub const HttpRequest = struct {
     content_type: ?[]const u8 = null,
     timeout_ms: ?u32 = null,
     body: []const u8 = &.{},
+    cancellation: ?*const RequestCancellation = null,
 
     pub fn header(self: HttpRequest, name: []const u8) ?[]const u8 {
         for (self.headers) |entry| {
@@ -134,6 +168,7 @@ pub const RequestExecutor = struct {
 
 test "http common types compile" {
     _ = Method;
+    _ = RequestCancellation;
     _ = HttpRequest;
     _ = RequestHeader;
     _ = Header;

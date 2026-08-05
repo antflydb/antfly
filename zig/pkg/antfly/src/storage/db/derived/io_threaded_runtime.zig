@@ -50,7 +50,7 @@ const Worker = struct {
     replay_cursor_open_sequence: u64 = 0,
     catch_up_active: bool = false,
     last_replay_tail_records: u64 = 0,
-    pressure_retry_backoff: catch_up_policy.PressureRetryBackoff = .{},
+    recoverable_retry_backoff: catch_up_policy.RecoverableRetryBackoff = .{},
 };
 
 const PersistSnapshot = struct {
@@ -147,6 +147,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return null;
     }
 
+    pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
+        return .{};
+    }
+
     pub fn notifySequence(self: *@This(), sequence: u64) void {
         _ = self;
         _ = sequence;
@@ -218,6 +222,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     last_notified_sequence: u64 = 0,
     truncates_in_flight: usize = 0,
     backlog: backlog_tracker_mod.Tracker,
+    recoverable_retry_counters: catch_up_policy.RecoverableRetryCounters = .{},
 
     pub fn init(
         alloc: Allocator,
@@ -432,6 +437,28 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             if (std.mem.eql(u8, worker.name, name)) return worker.applied_sequence;
         }
         return null;
+    }
+
+    pub fn snapshotStats(self: *DerivedRuntime) types.DerivedWorkerStats {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var stats = types.DerivedWorkerStats{
+            .workers = @intCast(self.workers.items.len),
+        };
+        for (self.workers.items) |worker| {
+            const lag = worker.target_sequence -| worker.applied_sequence;
+            if (lag > 0) stats.workers_with_replay_debt += 1;
+            stats.max_replay_lag_sequences = @max(stats.max_replay_lag_sequences, lag);
+        }
+        const retries = self.recoverable_retry_counters.snapshot();
+        stats.recoverable_retries = retries.total;
+        stats.writer_locked_retries = retries.writer_locked;
+        stats.resource_budget_retries = retries.resource_budget;
+        stats.replay_document_not_visible_retries = retries.replay_document_not_visible;
+        stats.artifact_repair_required_retries = retries.artifact_repair_required;
+        stats.not_found_retries = retries.not_found;
+        return stats;
     }
 
     pub fn notifySequence(self: *DerivedRuntime, sequence: u64) void {
@@ -736,7 +763,8 @@ fn workerMain(worker: *Worker) void {
                 const sequence = worker.applied_sequence;
                 runtime.mutex.unlock(io);
                 const persisted = persistIdleAppliedSequence(runtime, worker, sequence, io) catch |err| {
-                    if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                    if (err == error.WorkerStopping) return;
+                    if (catch_up_policy.isRecoverableAdmissionError(err)) {
                         sleepAfterRecoverableCatchUpError(worker, err, io);
                         runtime.mutex.lockUncancelable(io);
                         continue;
@@ -744,7 +772,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.recordError(io, worker.name, "idle_persist", err);
                     return;
                 };
-                worker.pressure_retry_backoff.reset();
+                worker.recoverable_retry_backoff.reset();
                 if (!persisted) io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
                 runtime.mutex.lockUncancelable(io);
                 continue;
@@ -921,7 +949,7 @@ fn workerMain(worker: *Worker) void {
         var persisted = false;
         if (caught_up_sequence > from_sequence) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
-                if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                if (catch_up_policy.isRecoverableAdmissionError(err)) {
                     sleepAfterRecoverableCatchUpError(worker, err, io);
                     continue;
                 }
@@ -955,26 +983,18 @@ fn workerMain(worker: *Worker) void {
         if (applied_sequence_advanced) if (runtime.applied_sequence_advanced_fn) |callback| {
             callback(runtime.ctx, worker.name, caught_up_sequence);
         };
-        worker.pressure_retry_backoff.reset();
 
         if (shouldRefreshReplayCursor(worker, caught_up_sequence)) {
             closeWorkerReplayCursor(runtime, worker);
         }
 
         if (truncate_sequence > 0) {
-            runtime.truncate_fn(runtime.ctx, truncate_sequence) catch |err| {
-                if (err == error.WriterLocked) {
-                    runtime.mutex.lockUncancelable(io);
-                    runtime.truncates_in_flight -= 1;
-                    runtime.cond.broadcast(io);
-                    runtime.mutex.unlock(io);
-                    io.sleep(Io.Duration.zero, .awake) catch {};
-                    continue;
-                }
+            truncateWithRecoverableRetry(runtime, worker, truncate_sequence, io) catch |err| {
                 runtime.mutex.lockUncancelable(io);
                 runtime.truncates_in_flight -= 1;
                 runtime.cond.broadcast(io);
                 runtime.mutex.unlock(io);
+                if (err == error.WorkerStopping) return;
                 runtime.recordError(io, worker.name, "truncate", err);
                 return;
             };
@@ -984,6 +1004,7 @@ fn workerMain(worker: *Worker) void {
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
         }
+        worker.recoverable_retry_backoff.reset();
     }
 }
 
@@ -1009,7 +1030,7 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
     runtime.mutex.unlock(io);
 
     if (truncate_sequence > 0) {
-        runtime.truncate_fn(runtime.ctx, truncate_sequence) catch |err| {
+        truncateWithRecoverableRetry(runtime, worker, truncate_sequence, io) catch |err| {
             runtime.mutex.lockUncancelable(io);
             runtime.truncates_in_flight -= 1;
             runtime.cond.broadcast(io);
@@ -1023,6 +1044,23 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
         runtime.mutex.unlock(io);
     }
     return persisted;
+}
+
+fn truncateWithRecoverableRetry(runtime: *DerivedRuntime, worker: *Worker, sequence: u64, io: Io) !void {
+    while (true) {
+        runtime.mutex.lockUncancelable(io);
+        const stopping = runtime.shutdown or worker.stop or runtime.last_error_name != null;
+        runtime.mutex.unlock(io);
+        if (stopping) return error.WorkerStopping;
+        runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
+            if (err == error.WriterLocked) {
+                sleepAfterRecoverableCatchUpError(worker, err, io);
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
 }
 
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {
@@ -1068,17 +1106,17 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
+    if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked, error.ResourceBudgetExceeded => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => true,
         else => false,
     };
 }
 
 fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
+    if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
-        error.WriterLocked,
-        error.ResourceBudgetExceeded,
         error.ReplayDocumentNotVisible,
         error.ArtifactRepairRequired,
         => true,
@@ -1088,16 +1126,16 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
 }
 
 fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror, io: Io) void {
-    if (err != error.ResourceBudgetExceeded) {
-        worker.pressure_retry_backoff.reset();
-        io.sleep(Io.Duration.zero, .awake) catch {};
-        return;
-    }
-    const delay_ns = worker.pressure_retry_backoff.nextDelayNs();
-    if (worker.pressure_retry_backoff.shouldLog()) {
+    const delay_ns = catch_up_policy.recordRecoverableRetry(
+        &worker.runtime.recoverable_retry_counters,
+        worker.runtime.backlog.resource_manager,
+        &worker.recoverable_retry_backoff,
+        err,
+    );
+    if (worker.recoverable_retry_backoff.shouldLog()) {
         std.log.warn(
-            "derived worker resource admission deferred worker={s} failures={} retry_ms={}",
-            .{ worker.name, worker.pressure_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
+            "derived worker retrying recoverable failure worker={s} error={s} failures={} retry_ms={}",
+            .{ worker.name, @errorName(err), worker.recoverable_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
         );
     }
     io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
@@ -1204,11 +1242,14 @@ const TestThreadedRuntimeCapture = struct {
     apply_not_found_failures: std.atomic.Value(u64) = .init(0),
     resource_budget_failures: std.atomic.Value(u64) = .init(0),
     persisted_sequence: std.atomic.Value(u64) = .init(0),
+    truncate_calls: std.atomic.Value(u64) = .init(0),
+    truncated_sequence: std.atomic.Value(u64) = .init(0),
     advanced_sequence: std.atomic.Value(u64) = .init(0),
     callback_observed_applied_sequence: std.atomic.Value(u64) = .init(0),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
+    fail_next_truncate_writer_locked: std.atomic.Value(bool) = .init(false),
 };
 
 fn testThreadedRuntimeAppliedSequenceAdvanced(ctx: *anyopaque, index_name: []const u8, sequence: u64) void {
@@ -1242,8 +1283,10 @@ fn testThreadedRuntimePersist(ctx: *anyopaque, index_name: []const u8, sequence:
 }
 
 fn testThreadedRuntimeTruncate(ctx: *anyopaque, sequence: u64) !void {
-    _ = ctx;
-    _ = sequence;
+    const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.truncate_calls.fetchAdd(1, .monotonic);
+    if (capture.fail_next_truncate_writer_locked.swap(false, .monotonic)) return error.WriterLocked;
+    capture.truncated_sequence.store(sequence, .monotonic);
 }
 
 fn testThreadedRuntimeBeginCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -1322,6 +1365,58 @@ test "io threaded applied callback observes published watermark outside runtime 
 
     try std.testing.expectEqual(@as(u64, 1), capture.advanced_sequence.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), capture.callback_observed_applied_sequence.load(.acquire));
+}
+
+test "io threaded worker backoffs and retries replay truncation writer lock" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-truncate-writer-lock-retry-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    });
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var capture = TestThreadedRuntimeCapture{};
+    capture.fail_next_truncate_writer_locked.store(true, .monotonic);
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+        &manager,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 2), capture.truncate_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.truncated_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), runtime.snapshotStats().writer_locked_retries);
+    try std.testing.expectEqual(@as(u64, 1), manager.derivedRecoverableRetryStats().writer_locked);
+    const io = runtime.ioContext();
+    runtime.mutex.lockUncancelable(io);
+    defer runtime.mutex.unlock(io);
+    try std.testing.expectEqual(@as(u8, 0), runtime.workers.items[0].recoverable_retry_backoff.failures);
 }
 
 test "io threaded dense catch-up NotFound closes session before retry" {

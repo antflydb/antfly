@@ -164,7 +164,6 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
 from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
 from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
@@ -172,6 +171,7 @@ from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
+from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -319,6 +319,7 @@ from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
 from .inference_error import InferenceError
+from .inference_error_reason import InferenceErrorReason
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
@@ -422,6 +423,8 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_transient_capacity_error import InferenceTransientCapacityError
+from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -457,7 +460,6 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
-from .match_query_operator import MatchQueryOperator
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -614,6 +616,8 @@ from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .table_storage_unreadable_error import TableStorageUnreadableError
+from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
@@ -836,7 +840,6 @@ __all__ = (
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
-    "EmbeddingsIndexStatsEnrichmentRuntime",
     "EmbeddingsIndexStatsHbcCache",
     "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
@@ -846,6 +849,7 @@ __all__ = (
     "EmbeddingType3",
     "EnrichmentConfig",
     "EnrichmentKind",
+    "EnrichmentRuntimeStatus",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -993,6 +997,7 @@ __all__ = (
     "InferenceEmbedResponse",
     "InferenceEmbedResponseObject",
     "InferenceError",
+    "InferenceErrorReason",
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
@@ -1097,6 +1102,8 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
+    "InferenceTransientCapacityError",
+    "InferenceTransientCapacityErrorReason",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -1131,7 +1138,6 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
-    "MatchQueryOperator",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
@@ -1288,6 +1294,8 @@ __all__ = (
     "TableSchemaDocumentSchemas",
     "TableStatistics",
     "TableStatisticsFieldStats",
+    "TableStorageUnreadableError",
+    "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",

@@ -25,8 +25,8 @@ class Transform:
     schema compliance.
 
         Example:
-            {'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op': '$currentDate',
-                'path': '$.lastViewed'}]}
+            {'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op': '$set', 'path':
+                '$.lastViewed', 'value': '2026-07-28T12:00:00Z'}]}
 
         Attributes:
             key (str): Document key (must be a string, not an object like inserts)

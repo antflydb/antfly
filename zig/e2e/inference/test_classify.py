@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for canonical /api/extract classification extraction.
+"""Tests for canonical /ai/v1/classify requests.
 
 Matches Go antfly's classifier_test.go patterns.
 """

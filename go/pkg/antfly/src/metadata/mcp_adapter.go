@@ -17,10 +17,12 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/blevesearch/bleve/v2/search/query"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
@@ -414,50 +416,136 @@ func (a *mcpAdapter) Batch(ctx context.Context, tableName string, inserts map[st
 }
 
 // Backup implements antflymcp.AntflyHandler.
-func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location string) error {
+func (a *mcpAdapter) Backup(
+	ctx context.Context,
+	tableName, backupID, connection, location string,
+) error {
+	if err := common.ValidateBackupID(backupID); err != nil {
+		return err
+	}
 	table, err := a.t.tm.GetTable(tableName)
 	if err != nil {
 		return fmt.Errorf("getting table %s: %w", tableName, err)
 	}
 
-	eg, egCtx := errgroup.WithContext(ctx)
-	for shardID := range table.Shards {
-		eg.Go(func() error {
-			if err := a.t.ln.forwardBackupToShard(egCtx, shardID, location, backupID, common.DefaultBackupFormat); err != nil {
-				return fmt.Errorf("backing up shard %s: %w", shardID, err)
-			}
-			return nil
-		})
+	backup := common.BackupConfig{
+		BackupID:   backupID,
+		Connection: connection,
+		Location:   location,
+		Format:     common.DefaultBackupFormat,
 	}
-	if err := eg.Wait(); err != nil {
+	metadataStore, err := newBackupStore(
+		a.t.ln.config,
+		connection,
+		"backup.write",
+		location,
+	)
+	if err != nil {
+		return err
+	}
+	defer closeBackupStore(metadataStore)
+	reservationOwner, err := newClusterBackupAttemptID()
+	if err != nil {
+		return fmt.Errorf("initializing backup attempt: %w", err)
+	}
+	if err := metadataStore.ReserveBackupID(ctx, backupID, reservationOwner); err != nil {
+		return err
+	}
+	committed := false
+	cleanupSafe := true
+	createdArtifacts := backupArtifactNamesForFormat(backupID, table, backup.Format)
+	defer func() {
+		if committed {
+			return
+		}
+		if !cleanupSafe {
+			a.t.logger.Error(
+				"MCP backup publication outcome is ambiguous; retaining fenced attempt",
+				zap.String("backup_id", backupID),
+			)
+			return
+		}
+		if err := cleanupBackupAttempt(
+			metadataStore,
+			backupID,
+			reservationOwner,
+			nil,
+			createdArtifacts,
+		); err != nil {
+			a.t.logger.Error("Failed to clean abandoned MCP backup", zap.String("backup_id", backupID), zap.Error(err))
+		}
+	}()
+	backup.ResolvedLocation = metadataStore.ResolvedLocation()
+	artifactIntegrities, err := a.t.backupShardsWithIntegrity(ctx, table, backup)
+	if err != nil {
 		return fmt.Errorf("backup failed: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Write backup metadata
-	if err := newBackupStore(location, &a.t.ln.config.Storage.Local.S3).WriteMetadata(ctx, backupID, table); err != nil {
+	cleanupSafe = false
+	if err := metadataStore.WriteMetadata(
+		ctx,
+		backupID,
+		table,
+		backup.Format,
+		artifactIntegrities,
+	); err != nil {
+		cleanupSafe = errors.Is(err, ErrBackupAlreadyExists) ||
+			errors.Is(err, ErrBackupMetadataTooLarge)
 		return fmt.Errorf("writing backup metadata: %w", err)
 	}
+	committed = true
 
 	return nil
 }
 
 // Restore implements antflymcp.AntflyHandler.
-func (a *mcpAdapter) Restore(ctx context.Context, tableName, backupID, location string) error {
-	tableMetadata, err := newBackupStore(location, &a.t.ln.config.Storage.Local.S3).ReadMetadata(ctx, backupID)
+func (a *mcpAdapter) Restore(
+	ctx context.Context,
+	tableName, backupID, connection, location string,
+) error {
+	if err := common.ValidateBackupID(backupID); err != nil {
+		return err
+	}
+	metadataStore, err := newBackupStore(
+		a.t.ln.config,
+		connection,
+		"restore.read",
+		location,
+	)
+	if err != nil {
+		return err
+	}
+	defer closeBackupStore(metadataStore)
+	metadata, err := metadataStore.ReadMetadata(ctx, backupID)
 	if err != nil {
 		return fmt.Errorf("reading backup metadata: %w", err)
 	}
+	tableMetadata := metadata.Table
 
 	if tableMetadata.Name != tableName {
 		return fmt.Errorf("table name mismatch: expected %s, but backup metadata is for %s",
 			tableName, tableMetadata.Name)
 	}
+	if err := validateBackupMetadataArtifactIdentities(
+		ctx,
+		metadataStore,
+		backupID,
+		metadata,
+	); err != nil {
+		return fmt.Errorf("validating backup artifacts: %w", err)
+	}
 
 	if err := a.t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
-		Location: location,
-		BackupID: backupID,
-		Format:   common.DefaultBackupFormat,
-	}); err != nil {
+		Location:         location,
+		ResolvedLocation: metadataStore.ResolvedLocation(),
+		Connection:       connection,
+		BackupID:         backupID,
+		Format:           metadata.Format,
+	}, metadata.Artifacts); err != nil {
 		return fmt.Errorf("restoring table: %w", err)
 	}
 

@@ -48,24 +48,21 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
 }
 
 fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
-    return .{
-        .compaction_retained_entries = metadata_raft_retained_entries,
-        .compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
-        .compaction_single_node_only = false,
-    };
+    return .{};
 }
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    experimental: bool = false,
     raft_host: ?[]const u8 = null,
     raft_port: ?u16 = null,
     api_host: ?[]const u8 = null,
     api_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
-    join: bool = false,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
-    tick_ms: ?u64 = null,
+    raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
+    control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
     local_node_id: ?u64 = null,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
@@ -125,6 +122,7 @@ const Factory = struct {
                     .heartbeat_tick = 1,
                     .pre_vote = true,
                     .check_quorum = true,
+                    .step_down_on_removal = true,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
                 .storage = self.store.storage(),
@@ -161,6 +159,7 @@ const ResolvedPaths = struct {
 /// metadata runtime and the standalone runtime so both expose the same metric set.
 pub const HealthSource = struct {
     server: *Server,
+    raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
 
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -178,7 +177,8 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.server.metadataHttpService().probeReady();
+        return self.server.metadataHttpService().probeReady() and
+            (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -205,6 +205,9 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
+        try append(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", @intCast(host_metrics.runtime_snapshot_compaction_completions));
+        try append(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", @intCast(host_metrics.runtime_snapshot_compaction_failures));
+        try append(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", @intCast(host_metrics.runtime_snapshot_compaction_candidates));
         try append(writer, "antfly_raft_backup_bootstrap_attempts_total", "counter", "Total backup bootstrap attempts", @intCast(host_metrics.backup_bootstrap_attempts));
         try append(writer, "antfly_raft_backup_bootstrap_failures_total", "counter", "Total backup bootstrap failures", @intCast(host_metrics.backup_bootstrap_failures));
         try append(writer, "antfly_raft_backup_bootstrap_successes_total", "counter", "Total backup bootstrap successes", @intCast(host_metrics.backup_bootstrap_successes));
@@ -585,6 +588,27 @@ pub const Server = struct {
         self.refreshMetadataRaftStorageDiagnostics();
     }
 
+    pub fn runRaftRoundOnly(self: *Server) !void {
+        try self.server.runRaftRoundOnly();
+        self.refreshMetadataRaftStorageDiagnostics();
+    }
+
+    fn raftProgressSource(self: *Server) antfly.raft.ProgressSource {
+        return .{
+            .ptr = self,
+            .run_once = runRaftProgressOnce,
+        };
+    }
+
+    fn runRaftProgressOnce(ptr: *anyopaque) !void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        return try self.runRaftRoundOnly();
+    }
+
+    pub fn runControlRoundOnly(self: *Server) !void {
+        try self.server.runControlRoundOnly();
+    }
+
     pub fn runCdcRound(self: *Server) !void {
         try self.server.runCdcRound();
     }
@@ -689,8 +713,11 @@ fn metadataRaftStatusIsVoter(status: raft_engine.core.Status, local_node_id: u64
 fn metadataRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
     const raft_status = status orelse return false;
     if (raft_status.soft.leader_id != null) return false;
+    // campaign() restarts pre-vote and clears collected votes. Let an
+    // in-flight election consume its randomized timeout before retrying.
     switch (raft_status.soft.role) {
-        .follower, .pre_candidate, .candidate => {},
+        .follower => {},
+        .pre_candidate, .candidate => if (raft_status.election_elapsed < raft_status.randomized_election_timeout) return false,
         .leader => return false,
     }
     return metadataRaftStatusIsVoter(raft_status, local_node_id);
@@ -739,6 +766,10 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
+        cli.raft_tick_ms,
+        cli.control_tick_ms,
+    ) catch return error.InvalidArguments;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -840,7 +871,6 @@ pub fn runFromIterator(
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
-    if (cli.join) return error.UnsupportedMetadataJoin;
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
@@ -859,6 +889,7 @@ pub fn runFromIterator(
         .secret_store = if (secret_store_initialized) &secret_store else null,
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
+            .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
@@ -885,7 +916,18 @@ pub fn runFromIterator(
     defer alloc.free(admin_uri);
     std.debug.print("metadata admin api listening on {s}\n", .{admin_uri});
 
-    var metadata_health = HealthSource{ .server = &server };
+    var raft_progress = antfly.raft.ManagedProgressDriver.init(
+        init.io,
+        server.raftProgressSource(),
+        runtime_cadence.raft_tick_ns,
+    );
+    defer raft_progress.deinit();
+    try raft_progress.start();
+
+    var metadata_health = HealthSource{
+        .server = &server,
+        .raft_progress = &raft_progress,
+    };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
@@ -900,15 +942,11 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 100;
-    var req = std.posix.timespec{
-        .sec = @intCast(tick_ms / std.time.ms_per_s),
-        .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
-    const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(tick_ms);
+    const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(cli.raft_tick_ms);
     var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
     while (true) {
+        try raft_progress.check();
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or
@@ -921,7 +959,7 @@ pub fn runFromIterator(
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        try server.runRound();
+        try server.runControlRoundOnly();
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
@@ -932,12 +970,7 @@ pub fn runFromIterator(
         if (cdc_round_elapsed_ns > std.time.ns_per_s) {
             std.log.warn("metadata runCdcRound slow elapsed_ms={d}", .{@divTrunc(cdc_round_elapsed_ns, std.time.ns_per_ms)});
         }
-        const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
-        switch (err) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return std.posix.unexpectedErrno(err),
-        }
+        try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
     }
 }
 
@@ -947,6 +980,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--experimental")) {
+            cfg.experimental = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--config")) {
@@ -977,10 +1014,6 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.cluster_json = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--join")) {
-            cfg.join = true;
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--health-port")) {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -994,8 +1027,12 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--tick-ms")) {
-            cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--raft-tick-ms")) {
+            cfg.raft_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--control-tick-ms")) {
+            cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -1356,10 +1393,11 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
-        \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
-        \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
+        \\  --experimental                 Enable experimental A2A protocol surfaces
+        \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
+        \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -1482,6 +1520,14 @@ test "metadata runtime cli accepts auth flag" {
     try std.testing.expectEqual(true, cfg.auth_enabled.?);
 }
 
+test "metadata runtime cli accepts experimental flag" {
+    var argv = [_][*:0]const u8{"--experimental"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.experimental);
+}
+
 test "metadata runtime preserves trusted principal auth material bytes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1497,7 +1543,6 @@ test "metadata runtime preserves trusted principal auth material bytes" {
     defer stored_secret.deinit(alloc);
     var stored_issuer = try secret_store.put(alloc, trusted_principal_issuer_key, "\ttrusted-upstream ");
     defer stored_issuer.deinit(alloc);
-
     const secret = try resolveTrustedPrincipalSecret(alloc, &secret_store);
     defer if (secret) |value| alloc.free(value);
     const issuer = try resolveTrustedPrincipalIssuer(alloc, &secret_store);
@@ -1599,11 +1644,6 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
     try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
-
-    const wal_cfg = metadataWalReplicaStateConfig();
-    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
-    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
-    try std.testing.expect(!wal_cfg.compaction_single_node_only);
 }
 
 test "metadata runtime chooses one preferred bootstrap campaigner" {
@@ -1632,9 +1672,17 @@ test "metadata runtime retries bootstrap campaign only for leaderless voters" {
     try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .pre_candidate;
+    status.election_elapsed = 4;
+    status.randomized_election_timeout = 5;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+    status.election_elapsed = 5;
     try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .candidate;
+    status.election_elapsed = 4;
+    status.randomized_election_timeout = 5;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+    status.election_elapsed = 5;
     try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .leader;
@@ -2032,9 +2080,14 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     const HookCtx = struct {
         runs: usize = 0,
 
-        fn run(ptr: *anyopaque) anyerror!void {
+        fn run(
+            ptr: *anyopaque,
+            request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+        ) anyerror!antfly.metadata.table_provisioner.ProvisionSummary {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.runs += 1;
+            _ = request;
+            return .{};
         }
     };
 
