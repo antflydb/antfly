@@ -2600,6 +2600,23 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        /** @description A non-retryable table-storage integrity or format failure. */
+        TableStorageUnreadableError: {
+            /**
+             * @description Stable client-routing code for unreadable table storage.
+             * @enum {string}
+             */
+            code: "table_storage_unreadable";
+            /** @description Concrete storage error class, such as InvalidManifest. */
+            error: string;
+            /** @description Human-readable summary. */
+            message: string;
+            /**
+             * @description Always false; recovery requires repair, restore, or table replacement.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
@@ -9342,7 +9359,7 @@ export interface components {
              * @description Number of unique terms in the inverted index (sparse only)
              */
             total_terms?: number;
-            /** @description Whether the index enricher is currently backfilling */
+            /** @description Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true. */
             rebuilding?: boolean;
             repair?: components["schemas"]["IndexRepairStatus"];
             /**
@@ -9354,7 +9371,7 @@ export interface components {
             backfill_active?: boolean;
             /**
              * Format: double
-             * @description Backfill progress as a ratio from 0.0 to 1.0
+             * @description Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
              */
             backfill_progress?: number;
             /**
@@ -9362,7 +9379,7 @@ export interface components {
              * @description Total items processed during backfill
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -12812,6 +12829,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Query failure. Storage integrity failures use a stable non-retryable error payload. */
+        QueryInternalServerError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"] | components["schemas"]["TableStorageUnreadableError"];
+            };
+        };
         /** @description Inference capacity is temporarily unavailable */
         TransientCapacity: {
             headers: {
@@ -13742,15 +13768,7 @@ export interface operations {
                 };
             };
             422: components["responses"]["UnsupportedExactSort"];
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     evaluate: {
@@ -14026,7 +14044,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["UnsupportedExactSort"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     batchWrite: {

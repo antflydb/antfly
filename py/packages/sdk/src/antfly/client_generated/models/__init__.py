@@ -617,6 +617,8 @@ from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .table_storage_unreadable_error import TableStorageUnreadableError
+from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
@@ -1294,6 +1296,8 @@ __all__ = (
     "TableSchemaDocumentSchemas",
     "TableStatistics",
     "TableStatisticsFieldStats",
+    "TableStorageUnreadableError",
+    "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",

@@ -2577,18 +2577,18 @@ pub const EmbeddingsIndexStats = struct {
     total_nodes: ?i64 = null,
     /// Number of unique terms in the inverted index (sparse only)
     total_terms: ?i64 = null,
-    /// Whether the index enricher is currently backfilling
+    /// Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true.
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
     backfill_active: ?bool = null,
-    /// Backfill progress as a ratio from 0.0 to 1.0
+    /// Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
     backfill_progress: ?f64 = null,
     /// Total items processed during backfill
     backfill_items_processed: ?i64 = null,
-    /// Operational readiness state such as ready, running, retrying, or failed.
+    /// Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal.
     backfill_state: ?[]const u8 = null,
     /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
@@ -3223,6 +3223,7 @@ pub const ExtractionRelationEndpoint = struct {
     id: ?[]const u8 = null,
 };
 
+/// Optional source and target labels constrain relation endpoints. A target requires a source.
 pub const ExtractionRelationSchema = struct {
     type: []const u8,
     source: ?[]const u8 = null,
@@ -3253,6 +3254,7 @@ pub const ExtractionResponse = struct {
     usage: ?std.json.Value = null,
 };
 
+/// Selects one extraction operation family per request. Entity labels may accompany relation schemas so relation extraction can return its participating entities in the same response.
 pub const ExtractionSchema = struct {
     entities: ?[]const []const u8 = null,
     relations: ?[]const ExtractionRelationSchema = null,
@@ -3263,7 +3265,7 @@ pub const ExtractionSchema = struct {
 pub const ExtractionStructureField = std.json.Value;
 
 pub const ExtractionStructureSchema = struct {
-    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
+    fields: std.json.ArrayHashMap(ExtractionStructureField),
 };
 
 pub const ExtractionToken = struct {
@@ -8026,6 +8028,18 @@ pub const TableStatus = struct {
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const EnrichmentConfig = null,
+};
+
+/// A non-retryable table-storage integrity or format failure.
+pub const TableStorageUnreadableError = struct {
+    /// Stable client-routing code for unreadable table storage.
+    code: []const u8,
+    /// Concrete storage error class, such as InvalidManifest.
+    @"error": []const u8,
+    /// Human-readable summary.
+    message: []const u8,
+    /// Always false; recovery requires repair, restore, or table replacement.
+    retryable: bool,
 };
 
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com

@@ -1433,6 +1433,32 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    TableStorageUnreadableError:
+      type: object
+      additionalProperties: false
+      description: A non-retryable table-storage integrity or format failure.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - table_storage_unreadable
+          description: Stable client-routing code for unreadable table storage.
+        error:
+          type: string
+          description: Concrete storage error class, such as InvalidManifest.
+        message:
+          type: string
+          description: Human-readable summary.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Always false; recovery requires repair, restore, or table replacement.
     ExactSortError:
       type: object
       additionalProperties: false
@@ -7696,6 +7722,14 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    QueryInternalServerError:
+      description: Query failure. Storage integrity failures use a stable non-retryable error payload.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
   /status:
@@ -8674,11 +8708,7 @@ paths:
         "422":
           $ref: "#/components/responses/UnsupportedExactSort"
         "500":
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/QueryInternalServerError"
   /eval:
     post:
       summary: Standalone evaluation endpoint
@@ -9062,7 +9092,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "500":
-          $ref: "#/components/responses/InternalServerError"
+          $ref: "#/components/responses/QueryInternalServerError"
   /tables/{tableName}/batch:
     parameters:
       - name: tableName

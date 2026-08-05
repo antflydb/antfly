@@ -34,14 +34,18 @@ class EmbeddingsIndexStats:
         disk_usage (int | Unset): Size of the index in bytes
         total_nodes (int | Unset): Total number of nodes in the index (dense only)
         total_terms (int | Unset): Number of unique terms in the inverted index (sparse only)
-        rebuilding (bool | Unset): Whether the index enricher is currently backfilling
+        rebuilding (bool | Unset): Whether enrichment, publication, or replay work is still pending. Documents that do
+            not contain the indexed field are terminal skipped outcomes and do not keep this true.
         repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
             diagnostics are available from the admin API and metrics.
         wal_backlog (int | Unset): Number of documents pending enrichment in the WAL
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, enriching, or catching up.
-        backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
+        backfill_progress (float | Unset): Fraction of source documents with a terminal materialization outcome,
+            including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending
+            and replay is current.
         backfill_items_processed (int | Unset): Total items processed during backfill
-        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+        backfill_state (str | Unset): Operational readiness state. Clients should use ready (or rebuilding=false) for
+            query readiness; replay watermarks diagnose replay progress but do not replace this signal.
         doc_count (int | Unset): Number of physical vectors or sparse entries visible to the index; chunked indexes may
             contain multiple entries per source document.
         coverage (DerivedCoverageStatus | Unset):
