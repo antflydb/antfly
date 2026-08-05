@@ -132,6 +132,12 @@ class InferenceServer:
                 self.proc.kill()
                 self.proc.wait()
         if close_output:
+            if os.environ.get("ANTFLY_INFERENCE_DIAGNOSTICS"):
+                print(
+                    "\n[inference diagnostics] "
+                    f"server_returncode={self.proc.poll()}\n{self.read_output()}",
+                    flush=True,
+                )
             self.output.close()
 
 
