@@ -2364,7 +2364,7 @@ test "std http listener process threads and descriptors recover after cancellati
     sleepMs(100);
     const baseline_threads = try countLinuxProcEntries("/proc/self/task");
     const baseline_fds = try countLinuxProcEntries("/proc/self/fd");
-    var recovered_thread_min = std.math.maxInt(usize);
+    var recovered_thread_min: usize = std.math.maxInt(usize);
     var recovered_thread_max: usize = 0;
 
     for (0..rounds) |_| {
