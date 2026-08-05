@@ -11,6 +11,11 @@ on:
     - cron: "0 8 * * *"
     - cron: "0 3 * * 0"
   workflow_dispatch:
+    inputs:
+      issue443_attempts:
+        description: "Run Issue 443 sparse diagnostic with this many fresh servers (0 disables)"
+        required: false
+        default: "0"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -26,6 +31,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  issue443-sparse-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.issue443_attempts != '0'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - uses: astral-sh/setup-uv@v8.1.0
+      - run: make -C zig build ZIG_BUILD_FLAGS='-Doptimize=ReleaseSafe'
+      - name: Repeat isolated sparse batch with server diagnostics
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          ANTFLY_INFERENCE_REQUEST_TIMEOUT: "330"
+          ANTFLY_INFERENCE_DIAGNOSTICS: "1"
+        run: |
+          set -o pipefail
+          for attempt in $(seq 1 '${{ inputs.issue443_attempts }}'); do
+            status=0
+            echo "::group::sparse batch attempt $attempt"
+            uv run --project e2e/inference pytest -vv -s e2e/inference/test_sparse_embed.py::test_sparse_batch || status=$?
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then exit "$status"; fi
+          done
+
   changes:
     runs-on: arc-antfly-standard
     outputs:
