@@ -247,6 +247,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var models_dir: []const u8 = defaultModelsDir(allocator);
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
+    const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
     var allow_unknown_models = false;
     var models_overridden = false;
@@ -337,6 +338,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .ttl_ms = value.ttl_ms,
         };
     }
+    if (max_loaded_models_override) |value| node_cfg.max_loaded_models = value;
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
@@ -491,6 +493,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --max-loaded-models <n> Bound resident model count with LRU eviction
         \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked

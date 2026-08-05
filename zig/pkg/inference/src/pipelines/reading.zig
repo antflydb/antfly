@@ -1259,10 +1259,7 @@ pub const ReadingPipeline = struct {
                 );
             }
 
-            var enc_hidden = encoder_outputs[0];
-            enc_hidden.name = "encoder_hidden_states";
-            enc_hidden.owns_data = false;
-            enc_hidden.owns_shape = false;
+            const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
             try decoder_inputs.append(allocator, enc_hidden);
 
             const decoder_run_start = nowNs();

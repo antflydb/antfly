@@ -105,8 +105,7 @@ pub const EncoderDecoderPipeline = struct {
 
         // Rename encoder hidden state for decoder input compatibility
         // (encoder outputs "last_hidden_state", decoder expects "encoder_hidden_states")
-        var enc_hidden_renamed = encoder_hidden.*;
-        enc_hidden_renamed.name = "encoder_hidden_states";
+        const enc_hidden_renamed = encoder_hidden.borrowedView("encoder_hidden_states");
 
         var decoder_outputs = try self.decoder.run(&.{
             dec_input_ids,
