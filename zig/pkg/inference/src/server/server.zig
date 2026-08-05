@@ -915,6 +915,79 @@ fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
     _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
 }
 
+fn isRecoverableDenseRuntimeIntegrityError(err: anyerror) bool {
+    return err == error.MissingWeight or err == error.WeightNotFound;
+}
+
+const DenseRuntimeAttemptFn = *const fn (
+    ctx: *anyopaque,
+    retire_on_integrity_failure: bool,
+) anyerror![][]f32;
+
+fn runDenseRuntimeWithRecovery(
+    ctx: *anyopaque,
+    attempt: DenseRuntimeAttemptFn,
+) anyerror![][]f32 {
+    var recovery_attempted = false;
+    while (true) {
+        const vectors = attempt(ctx, !recovery_attempted) catch |err| {
+            if (!recovery_attempted and isRecoverableDenseRuntimeIntegrityError(err)) {
+                recovery_attempted = true;
+                continue;
+            }
+            return err;
+        };
+        return vectors;
+    }
+}
+
+test "direct dense embedding recovery is limited to runtime weight integrity" {
+    try std.testing.expect(isRecoverableDenseRuntimeIntegrityError(error.MissingWeight));
+    try std.testing.expect(isRecoverableDenseRuntimeIntegrityError(error.WeightNotFound));
+    try std.testing.expect(!isRecoverableDenseRuntimeIntegrityError(error.ResourceLimitExceeded));
+    try std.testing.expect(!isRecoverableDenseRuntimeIntegrityError(error.Canceled));
+}
+
+test "direct dense embedding retries one retired runtime without restart" {
+    const Probe = struct {
+        calls: usize = 0,
+        retire_flags: [2]bool = .{ false, false },
+
+        fn run(ctx: *anyopaque, retire_on_integrity_failure: bool) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retire_flags[self.calls] = retire_on_integrity_failure;
+            self.calls += 1;
+            if (self.calls == 1) return error.MissingWeight;
+            return std.testing.allocator.alloc([]f32, 0);
+        }
+    };
+
+    var probe = Probe{};
+    const vectors = try runDenseRuntimeWithRecovery(&probe, Probe.run);
+    defer std.testing.allocator.free(vectors);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &probe.retire_flags);
+}
+
+test "direct dense embedding bounds persistent integrity recovery" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn run(ctx: *anyopaque, _: bool) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.MissingWeight;
+        }
+    };
+
+    var probe = Probe{};
+    try std.testing.expectError(
+        error.MissingWeight,
+        runDenseRuntimeWithRecovery(&probe, Probe.run),
+    );
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+}
+
 test "dense embed download deadline is a nonzero remaining ceiling" {
     try std.testing.expect((try remainingDirectEmbeddingDeadlineMs(null, 100)) == null);
     try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(100, 100));
@@ -2578,6 +2651,43 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        const Attempt = struct {
+            node: *Node,
+            allocator: std.mem.Allocator,
+            deadline_ns: ?u64,
+            model_path: []const u8,
+            texts: []const []const u8,
+
+            fn run(ctx: *anyopaque, retire_on_integrity_failure: bool) ![][]f32 {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                return attempt.node.embedDenseTextsDirectFromLoadedModel(
+                    attempt.allocator,
+                    attempt.deadline_ns,
+                    attempt.model_path,
+                    attempt.texts,
+                    retire_on_integrity_failure,
+                );
+            }
+        };
+        var attempt = Attempt{
+            .node = self,
+            .allocator = allocator,
+            .deadline_ns = deadline_ns,
+            .model_path = model_path,
+            .texts = texts,
+        };
+        return runDenseRuntimeWithRecovery(&attempt, Attempt.run);
+    }
+
+    fn embedDenseTextsDirectFromLoadedModel(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        deadline_ns: ?u64,
+        model_path: []const u8,
+        texts: []const []const u8,
+        retire_on_integrity_failure: bool,
+    ) ![][]f32 {
         try ensureDirectEmbeddingDeadline(deadline_ns);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
@@ -2585,15 +2695,36 @@ pub const Node = struct {
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         var asset_lease = model.acquireEmbeddingAssetLease(false);
         defer asset_lease.release();
-        try model.ensureEmbeddingAssets(true, false, false);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-
-        var pipeline = model.embeddingPipeline(allocator);
-        const vectors = try pipeline.embed(texts);
+        const vectors = embedDenseTextsOnLoadedModel(
+            allocator,
+            deadline_ns,
+            model,
+            texts,
+        ) catch |err| {
+            if (retire_on_integrity_failure and isRecoverableDenseRuntimeIntegrityError(err)) {
+                // The lease borrows the model-owned gate, so release it before
+                // retiring the final handle can destroy the failed runtime.
+                asset_lease.release();
+                model_handle.retire();
+            }
+            return err;
+        };
         asset_lease.release();
         errdefer freeDirectDenseVectors(allocator, vectors);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return vectors;
+    }
+
+    fn embedDenseTextsOnLoadedModel(
+        allocator: std.mem.Allocator,
+        deadline_ns: ?u64,
+        model: *model_manager_mod.LoadedModel,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        try model.ensureEmbeddingAssets(true, false, false);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        var pipeline = model.embeddingPipeline(allocator);
+        return pipeline.embed(texts);
     }
 
     pub fn embedSparseTextsDirect(

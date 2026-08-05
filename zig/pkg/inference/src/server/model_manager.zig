@@ -2156,6 +2156,10 @@ pub const LoadedModel = struct {
     active_handles: usize = 0,
     last_used_ns: u64 = 0,
     pinned: bool = false,
+    /// Removed from the lookup maps after a recoverable runtime-integrity
+    /// fault. Existing handles may finish unwinding; the last one destroys the
+    /// retired model while new requests load a fresh session.
+    retired: bool = false,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -2915,7 +2919,30 @@ const LoadFlight = struct {
     /// Protected by ModelManager.load_lock. The owner starts with one reference;
     /// every waiter takes one before dropping the manager lock.
     refs: usize = 1,
+    /// The owner already receives a model handle directly from the uncached
+    /// load. Keep its flight reference distinguishable so retirement reserves
+    /// handles only for waiters that have not adopted theirs yet.
+    owner_ref_pending: bool = true,
+    /// A retired model detaches its completed flight so a replacement can use
+    /// the same key. Detached flights live until existing waiters consume them.
+    registered: bool = true,
+    /// Retirement reserves one active model handle for every remaining flight
+    /// waiter. Waiters adopt those reservations instead of incrementing the
+    /// handle count a second time; the owner already has its handle.
+    handles_reserved: bool = false,
+
+    fn unadoptedWaiterRefs(self: *const LoadFlight) usize {
+        std.debug.assert(self.refs >= @intFromBool(self.owner_ref_pending));
+        return self.refs - @intFromBool(self.owner_ref_pending);
+    }
 };
+
+test "load flight retirement reservations exclude the owner handle" {
+    var flight = LoadFlight{ .io = std.testing.io, .refs = 3 };
+    try std.testing.expectEqual(@as(usize, 2), flight.unadoptedWaiterRefs());
+    flight.owner_ref_pending = false;
+    try std.testing.expectEqual(@as(usize, 3), flight.unadoptedWaiterRefs());
+}
 
 fn admissionBackendClassForRuntime(
     backend_runtime: backends.BackendRuntime,
@@ -2986,12 +3013,27 @@ pub const ModelHandle = struct {
 
     pub fn release(self: *ModelHandle) void {
         const model = self.model orelse return;
+        var destroy_retired = false;
         self.manager.lockLoadedModels();
         std.debug.assert(model.active_handles > 0);
         model.active_handles -= 1;
-        model.last_used_ns = platform.time.monotonicNs();
+        if (model.retired) {
+            destroy_retired = model.active_handles == 0;
+        } else {
+            model.last_used_ns = platform.time.monotonicNs();
+        }
         self.manager.unlockLoadedModels();
         self.model = null;
+        if (destroy_retired) self.manager.destroyRetiredModel(model);
+    }
+
+    /// Stop publishing this cached runtime and release this handle. A fresh
+    /// request can reload the same artifact without waiting for process
+    /// restart; concurrent users retain the retired object until they unwind.
+    pub fn retire(self: *ModelHandle) void {
+        const model = self.model orelse return;
+        self.manager.retireLoadedModel(model);
+        self.release();
     }
 };
 
@@ -3123,7 +3165,6 @@ pub const ModelManager = struct {
             self.keep_alive_ms,
             std.time.ns_per_ms,
         ) catch std.math.maxInt(u64);
-        var victim_key: ?[]const u8 = null;
         var victim: ?*LoadedModel = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
         var it = self.loaded.iterator();
@@ -3144,13 +3185,26 @@ pub const ModelManager = struct {
                 continue;
             }
             if (victim == null or model.last_used_ns < oldest_ns) {
-                victim_key = entry.key_ptr.*;
                 victim = model;
                 oldest_ns = model.last_used_ns;
             }
         }
-        const selected = victim orelse return null;
-        const removed = self.loaded.fetchRemove(victim_key.?) orelse unreachable;
+        return self.takeLoadedModelLocked(victim orelse return null);
+    }
+
+    fn takeLoadedModelLocked(
+        self: *ModelManager,
+        selected: *LoadedModel,
+    ) ?EvictedModel {
+        var canonical_key: ?[]const u8 = null;
+        var loaded_it = self.loaded.iterator();
+        while (loaded_it.next()) |entry| {
+            if (entry.value_ptr.* == selected) {
+                canonical_key = entry.key_ptr.*;
+                break;
+            }
+        }
+        const removed = self.loaded.fetchRemove(canonical_key orelse return null) orelse unreachable;
         std.debug.assert(removed.value == selected);
 
         // Aliases never own the model, but every alias must disappear in the
@@ -3169,6 +3223,67 @@ pub const ModelManager = struct {
             self.allocator.free(alias.key);
         }
         return .{ .key = removed.key, .model = selected };
+    }
+
+    /// Remove a runtime that returned an integrity error from future lookup.
+    /// Destruction is deferred to the final active handle, so concurrent
+    /// requests never observe freed session state.
+    fn retireLoadedModel(self: *ModelManager, model: *LoadedModel) void {
+        spinLock(&self.eviction_lock);
+        defer self.eviction_lock.unlock();
+
+        self.lockLoadedModels();
+        if (model.retired) {
+            self.unlockLoadedModels();
+            return;
+        }
+        const retired = self.takeLoadedModelLocked(model) orelse {
+            self.unlockLoadedModels();
+            return;
+        };
+        std.debug.assert(model.active_handles > 0);
+        model.retired = true;
+        model.pinned = false;
+
+        // A completed cold-load flight may still have waiters that have not
+        // adopted their model handles. Reserve those handles before detaching
+        // the old flight, so a replacement load can publish under the same key
+        // without freeing state an existing waiter is about to use.
+        while (true) {
+            var flight_key: ?[]const u8 = null;
+            var flight: ?*LoadFlight = null;
+            var flight_it = self.in_flight_loads.iterator();
+            while (flight_it.next()) |entry| {
+                if (entry.value_ptr.*.model == model) {
+                    flight_key = entry.key_ptr.*;
+                    flight = entry.value_ptr.*;
+                    break;
+                }
+            }
+            const pending = flight orelse break;
+            std.debug.assert(!pending.handles_reserved);
+            const waiter_refs = pending.unadoptedWaiterRefs();
+            std.debug.assert(std.math.maxInt(usize) - model.active_handles >= waiter_refs);
+            model.active_handles += waiter_refs;
+            pending.handles_reserved = true;
+            const detached = self.in_flight_loads.fetchRemove(flight_key.?) orelse unreachable;
+            std.debug.assert(detached.value == pending);
+            pending.registered = false;
+            self.allocator.free(detached.key);
+        }
+        self.unlockLoadedModels();
+
+        std.log.warn("retiring failed inference model path={s} backend={s}", .{
+            model.model_dir,
+            @tagName(model.session.backend()),
+        });
+        self.allocator.free(retired.key);
+    }
+
+    fn destroyRetiredModel(self: *ModelManager, model: *LoadedModel) void {
+        std.debug.assert(model.retired);
+        model.deinit();
+        self.allocator.destroy(model);
     }
 
     fn destroyEvictedModel(self: *ModelManager, evicted: EvictedModel) void {
@@ -4038,18 +4153,25 @@ pub const ModelManager = struct {
         flight_key: []const u8,
         flight: *LoadFlight,
     ) void {
+        var removed_key: ?[]const u8 = null;
         self.lockLoadedModels();
+        std.debug.assert(flight.owner_ref_pending);
+        flight.owner_ref_pending = false;
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         if (flight.refs != 0) {
             self.unlockLoadedModels();
             return;
         }
-        const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
-        std.debug.assert(removed.value == flight);
+        if (flight.registered) {
+            const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
+            std.debug.assert(removed.value == flight);
+            flight.registered = false;
+            removed_key = removed.key;
+        }
         self.unlockLoadedModels();
 
-        self.allocator.free(removed.key);
+        if (removed_key) |key| self.allocator.free(key);
         self.allocator.destroy(flight);
     }
 
@@ -4059,15 +4181,29 @@ pub const ModelManager = struct {
         flight: *LoadFlight,
     ) !ModelHandle {
         flight.completed.waitUncancelable(flight.io);
+        var removed_key: ?[]const u8 = null;
+        var destroy_flight = false;
+        self.lockLoadedModels();
         const model = flight.model;
         const maybe_err = flight.err;
-
         if (model) |loaded| {
-            self.lockLoadedModels();
-            loaded.active_handles += 1;
-            self.unlockLoadedModels();
+            if (!flight.handles_reserved) loaded.active_handles += 1;
         }
-        self.releaseLoadFlight(flight_key, flight);
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        if (flight.refs == 0) {
+            if (flight.registered) {
+                const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
+                std.debug.assert(removed.value == flight);
+                flight.registered = false;
+                removed_key = removed.key;
+            }
+            destroy_flight = true;
+        }
+        self.unlockLoadedModels();
+
+        if (removed_key) |key| self.allocator.free(key);
+        if (destroy_flight) self.allocator.destroy(flight);
         if (maybe_err) |err| return err;
         return .{
             .manager = self,
@@ -4547,6 +4683,72 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     manager.unlockLoadedModels();
     try std.testing.expect(after_eviction == null);
     allocator.free(evicted.?.key);
+}
+
+test "failed loaded model retires from lookup while active handles unwind" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    const SessionProbe = struct {
+        fn run(_: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) ![]backends.Tensor {
+            return alloc.alloc(backends.Tensor, 0);
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+
+        var state: u8 = 0;
+        const vtable = backends.Session.VTable{
+            .run = run,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+
+    var model: LoadedModel = undefined;
+    model.model_dir = "owner/model";
+    model.session = .{ .ptr = @ptrCast(&SessionProbe.state), .vtable = &SessionProbe.vtable };
+    model.active_handles = 2;
+    model.last_used_ns = 1;
+    model.pinned = true;
+    model.retired = false;
+
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "owner/model\nbackend=metal"), &model);
+    try manager.loaded_aliases.put(allocator, try allocator.dupe(u8, "owner/model"), &model);
+    const flight = try allocator.create(LoadFlight);
+    defer allocator.destroy(flight);
+    flight.* = .{
+        .io = std.testing.io,
+        .model = &model,
+        .refs = 2,
+        .owner_ref_pending = false,
+    };
+    try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
+
+    manager.retireLoadedModel(&model);
+
+    try std.testing.expect(model.retired);
+    try std.testing.expect(!model.pinned);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded_aliases.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.in_flight_loads.count());
+    try std.testing.expectEqual(@as(usize, 4), model.active_handles);
+    try std.testing.expect(!flight.registered);
+    try std.testing.expect(flight.handles_reserved);
 }
 
 test "model cache idle expiration can be disabled" {

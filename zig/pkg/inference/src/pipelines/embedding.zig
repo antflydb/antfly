@@ -301,6 +301,16 @@ pub const EmbeddingPipeline = struct {
             return try self.embedWithBatchPlan(texts, plan);
         }
 
+        return embedTextBatchAdaptive(
+            self.allocator,
+            self,
+            texts,
+            runDirectTextBatch,
+        );
+    }
+
+    fn runDirectTextBatch(ctx: *anyopaque, texts: []const []const u8) anyerror![][]f32 {
+        const self: *EmbeddingPipeline = @ptrCast(@alignCast(ctx));
         return self.embedDirect(texts, texts.len);
     }
 
@@ -2301,6 +2311,115 @@ fn clapInputFeatureFrames(session: backends.Session, default_frames: usize) usiz
 fn freeEmbeddingSlices(allocator: std.mem.Allocator, embeddings: [][]f32) void {
     for (embeddings) |emb| allocator.free(emb);
     allocator.free(embeddings);
+}
+
+const TextBatchRunner = *const fn (
+    ctx: *anyopaque,
+    texts: []const []const u8,
+) anyerror![][]f32;
+
+/// Preserve the requested batch on the fast path, but split an over-budget
+/// dynamic batch until it fits. A single-row resource failure is returned
+/// unchanged so a model that cannot fit at all still fails closed.
+fn embedTextBatchAdaptive(
+    allocator: std.mem.Allocator,
+    ctx: *anyopaque,
+    texts: []const []const u8,
+    run_batch: TextBatchRunner,
+) anyerror![][]f32 {
+    return run_batch(ctx, texts) catch |err| {
+        if (err != error.ResourceLimitExceeded or texts.len <= 1) return err;
+
+        const midpoint = (texts.len + 1) / 2;
+        const left = try embedTextBatchAdaptive(
+            allocator,
+            ctx,
+            texts[0..midpoint],
+            run_batch,
+        );
+        var left_owned = true;
+        defer if (left_owned) freeEmbeddingSlices(allocator, left);
+        if (left.len != midpoint) return error.UnexpectedOutputShape;
+
+        const right = try embedTextBatchAdaptive(
+            allocator,
+            ctx,
+            texts[midpoint..],
+            run_batch,
+        );
+        var right_owned = true;
+        defer if (right_owned) freeEmbeddingSlices(allocator, right);
+        if (right.len != texts.len - midpoint) return error.UnexpectedOutputShape;
+
+        const combined = try allocator.alloc([]f32, texts.len);
+        @memcpy(combined[0..left.len], left);
+        @memcpy(combined[left.len..], right);
+        allocator.free(left);
+        left_owned = false;
+        allocator.free(right);
+        right_owned = false;
+        return combined;
+    };
+}
+
+test "embedding text batch adaptively splits resource-limited requests" {
+    const allocator = std.testing.allocator;
+    const Probe = struct {
+        allocator: std.mem.Allocator,
+        max_batch: usize,
+        calls: usize = 0,
+        largest_success: usize = 0,
+
+        fn run(ctx: *anyopaque, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (texts.len > self.max_batch) return error.ResourceLimitExceeded;
+            self.largest_success = @max(self.largest_success, texts.len);
+
+            const vectors = try self.allocator.alloc([]f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| self.allocator.free(vector);
+                self.allocator.free(vectors);
+            }
+            for (texts, 0..) |text, index| {
+                vectors[index] = try self.allocator.dupe(f32, &.{@floatFromInt(text.len)});
+                initialized += 1;
+            }
+            return vectors;
+        }
+    };
+
+    var probe = Probe{ .allocator = allocator, .max_batch = 1 };
+    const texts = [_][]const u8{ "a", "bb", "ccc", "dddd" };
+    const vectors = try embedTextBatchAdaptive(allocator, &probe, &texts, Probe.run);
+    defer freeEmbeddingSlices(allocator, vectors);
+
+    try std.testing.expectEqual(@as(usize, 4), vectors.len);
+    try std.testing.expectEqualSlices(f32, &.{1}, vectors[0]);
+    try std.testing.expectEqualSlices(f32, &.{2}, vectors[1]);
+    try std.testing.expectEqualSlices(f32, &.{3}, vectors[2]);
+    try std.testing.expectEqualSlices(f32, &.{4}, vectors[3]);
+    try std.testing.expectEqual(@as(usize, 1), probe.largest_success);
+    try std.testing.expectEqual(@as(usize, 7), probe.calls);
+}
+
+test "embedding text batch preserves a single-row resource limit" {
+    const Probe = struct {
+        fn run(_: *anyopaque, _: []const []const u8) ![][]f32 {
+            return error.ResourceLimitExceeded;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        embedTextBatchAdaptive(
+            std.testing.allocator,
+            &context,
+            &.{"too large"},
+            Probe.run,
+        ),
+    );
 }
 
 const ProjectionSelection = struct {

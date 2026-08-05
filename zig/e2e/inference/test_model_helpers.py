@@ -105,7 +105,7 @@ def test_managed_completion_receipt_requires_every_artifact(tmp_path):
     assert not _looks_like_model_dir(model_dir)
 
 
-def test_managed_completion_receipt_accepts_complete_artifact_set(tmp_path):
+def test_managed_completion_receipt_accepts_v1_complete_artifact_set(tmp_path):
     model_dir = tmp_path / "owner" / "complete-shards"
     model_dir.mkdir(parents=True)
     (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"first")
@@ -120,6 +120,33 @@ def test_managed_completion_receipt_accepts_complete_artifact_set(tmp_path):
     (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
 
     assert _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_accepts_v2_complete_artifact_set(tmp_path):
+    model_dir = tmp_path / "owner" / "complete-v2"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"complete")
+    receipt = {
+        "version": 2,
+        "source": {"owner": "owner", "name": "complete-v2", "variant": "auto"},
+        "artifacts": [{"path": "model.gguf", "size": 8, "sha256": None}],
+    }
+    (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
+
+    assert _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_rejects_unknown_version(tmp_path):
+    model_dir = tmp_path / "owner" / "future-version"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"complete")
+    receipt = {
+        "version": 3,
+        "artifacts": [{"path": "model.gguf", "size": 8}],
+    }
+    (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
+
+    assert not _looks_like_model_dir(model_dir)
 
 
 def test_managed_completion_receipt_rejects_boolean_numeric_fields(tmp_path):

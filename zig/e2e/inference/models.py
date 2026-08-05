@@ -392,7 +392,10 @@ def _looks_like_model_dir(path: Path) -> bool:
             artifacts = completion["artifacts"]
         except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
             return False
-        if type(completion.get("version")) is not int or completion["version"] != 1:
+        if (
+            type(completion.get("version")) is not int
+            or completion["version"] not in {1, 2}
+        ):
             return False
         if not isinstance(artifacts, list) or not artifacts:
             return False
